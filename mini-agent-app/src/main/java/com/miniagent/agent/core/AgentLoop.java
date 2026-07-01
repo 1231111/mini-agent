@@ -645,7 +645,6 @@ public class AgentLoop {
         }
         return null; // 所有重试耗尽
     }
-
     /**
      * 判断异常根因是否为瞬时网络错误（值得重试）。
      * 流式 SSE 断流被 langchain4j 包成 LangChain4jException，原始 IOException 藏在 cause 链里，
