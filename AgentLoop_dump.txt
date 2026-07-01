@@ -1,0 +1,610 @@
+package com.miniagent.agent.core;
+
+import com.miniagent.agent.intent.TaskPlan;
+import com.miniagent.agent.tool.ToolRegistry;
+import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.Content;
+import dev.langchain4j.data.message.ImageContent;
+import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.TextContent;
+import dev.langchain4j.data.message.ToolExecutionResultMessage;
+import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.request.ChatRequest;
+import dev.langchain4j.model.chat.response.ChatResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
+import java.util.regex.Pattern;
+
+/**
+ * Agent 循环：解析 tool_calls → 执行 → 注入结果 → 重试，直到模型返回最终文本。
+ *
+ * 设计要点（2026-04 重写）：
+ *   之前的拦截逻辑过于激进：
+ *     - 仅靠用户原话关键词（"设计/生成/写"）判断是否需要文件产出；
+ *     - 验证证据全靠 finalText 关键词匹配，图片URL/Markdown图片不算数；
+ *     - 结果是"生成一张图"被误判为产出物任务，强行让 LLM 多调一次 write_file。
+ *   重写后：
+ *     - 任务类型基于本轮实际调用过的工具来判断（observable），不是靠关键词猜；
+ *     - 只有用户明确要求"保存为文件/写MD/出SQL等"才算 FILE 任务；
+ *     - 其他任务（包括图片生成、搜索、问答）直接放行，不再兜底塞 write_file。
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class AgentLoop {
+
+    private final ToolRegistry toolRegistry;
+    private final ContextCompressor contextCompressor;
+
+    private static final int MAX_ITERATIONS = 30;
+    private static final int MAX_CONTEXT_TOKENS = 8000;
+
+    /**
+     * 各工具结果的上下文字符上限（按信息密度分级）。
+     * 搜索/抓取类需要更多内容，命令/生图类结果本身较短不需要大限额。
+     */
+    private static final Map<String, Integer> TOOL_RESULT_LIMITS = Map.ofEntries(
+            Map.entry("web_search",        8000),
+            Map.entry("web_extract",       12000),
+            Map.entry("read_file",         10000),
+            Map.entry("browser_snapshot",   6000),
+            Map.entry("browser_navigate",   5000),
+            Map.entry("http_get",           8000),
+            Map.entry("exec_command",       4000),
+            Map.entry("list_files",         2000),
+            Map.entry("image_generate",     1000),
+            Map.entry("browser_screenshot", 1000)
+    );
+    /** 未在 TOOL_RESULT_LIMITS 中的工具使用此默认值 */
+    private static final int DEFAULT_TOOL_RESULT_MAX = 4000;
+
+    /**
+     * 产生直接交付物（图片/截图/音视频）的工具白名单。
+     * 这类工具一旦成功执行，就视为模型已经把产出物交付给了前端，
+     * 不再要求额外调 write_file。
+     */
+    private static final Set<String> MEDIA_TOOLS = Set.of(
+            "image_generate",
+            "browser_screenshot",
+            "video_generate",
+            "audio_generate",
+            "tts"
+    );
+
+    /** 会真正落盘的工具。 */
+    private static final Set<String> WRITE_TOOLS = Set.of(
+            "write_file"
+    );
+
+    /**
+     * 用户明确要求"保存成文件/写入文档"的信号词。
+     * 只认：
+     *   1) 明确的文件扩展名（.md/.sql/代码文件扩展名）；
+     *   2) 明确的"保存/写入/输出 → 文件"动作短语；
+     *   3) 明确的"脚手架/项目骨架/代码仓库"等需要落盘目录结构的关键词。
+     * 不再把"写个项目/写一个工程"这种有歧义的短语算进来，避免误伤。
+     */
+    private static final Pattern EXPLICIT_FILE_REQ = Pattern.compile(
+            "(?i)(" +
+            // 1) 明确的扩展名
+            "\\.(md|markdown|sql|java|py|ts|tsx|js|jsx|go|rs|rb|php|kt|swift|c|cpp|h|hpp|sh|yaml|yml|json|xml|html|css)\\b" +
+            // 2) 明确的"落盘/写入文件"动词短语
+            "|md\\s*文档|markdown\\s*文档|写\\s*md|保存到文件|保存为文件|另存为文件" +
+            "|输出到文件|写入文件|写到文件|落盘|落地文件" +
+            // 3) 明确要求生成代码产物 / 项目骨架
+            "|生成\\s*sql|写一?段?\\s*sql|输出\\s*sql" +
+            "|项目骨架|工程骨架|脚手架|代码仓库|单体仓库|monorepo" +
+            ")"
+    );
+
+    /** Markdown 图片语法：直接命中说明模型已经把图交付给了前端。 */
+    private static final Pattern MARKDOWN_IMAGE = Pattern.compile(
+            "!\\[[^\\]]*]\\((https?://|/static/|generated-images/|data:image/)[^)]+\\)"
+    );
+
+    /**
+     * 执行 Agent 循环（纯文本用户消息）
+     */
+    public String run(ChatModel chatModel,
+                      String systemMessage,
+                      String userMessage,
+                      List<ChatMessage> chatHistory,
+                      int maxIterations) {
+        return run(chatModel, systemMessage, userMessage, chatHistory, maxIterations, null);
+    }
+
+    public String run(ChatModel chatModel,
+                      String systemMessage,
+                      String userMessage,
+                      List<ChatMessage> chatHistory,
+                      int maxIterations,
+                      Consumer<String> progressCallback) {
+        return run(chatModel, systemMessage, userMessage, chatHistory, maxIterations, progressCallback, null);
+    }
+
+    public String run(ChatModel chatModel,
+                      String systemMessage,
+                      String userMessage,
+                      List<ChatMessage> chatHistory,
+                      int maxIterations,
+                      Consumer<String> progressCallback,
+                      TaskPlan taskPlan) {
+        List<ChatMessage> messages = new ArrayList<>();
+        if (systemMessage != null && !systemMessage.isBlank()) {
+            messages.add(new SystemMessage(systemMessage));
+        }
+        if (taskPlan != null) {
+            messages.add(new SystemMessage(taskPlan.toPromptBlock()));
+        }
+        if (chatHistory != null) {
+            messages.addAll(chatHistory);
+        }
+        messages.add(new UserMessage(userMessage));
+        return executeLoop(chatModel, messages, userMessage == null ? "" : userMessage, maxIterations, progressCallback, taskPlan);
+    }
+
+    /**
+     * 简化调用：无历史消息，默认最多 MAX_ITERATIONS 轮
+     */
+    public String run(ChatModel chatModel, String systemMessage, String userMessage) {
+        return run(chatModel, systemMessage, userMessage, null, MAX_ITERATIONS, null);
+    }
+
+    /**
+     * 多模态：最后一轮为 {@link UserMessage}（可含 {@link ImageContent}），与 {@link #run} 使用同一套工具循环与放行规则。
+     */
+    public String runWithMultimodal(ChatModel chatModel,
+                                    String systemMessage,
+                                    UserMessage userMessage,
+                                    List<ChatMessage> chatHistory,
+                                    int maxIterations) {
+        return runWithMultimodal(chatModel, systemMessage, userMessage, chatHistory, maxIterations, null);
+    }
+
+    public String runWithMultimodal(ChatModel chatModel,
+                                    String systemMessage,
+                                    UserMessage userMessage,
+                                    List<ChatMessage> chatHistory,
+                                    int maxIterations,
+                                    Consumer<String> progressCallback) {
+        return runWithMultimodal(chatModel, systemMessage, userMessage, chatHistory, maxIterations, progressCallback, null);
+    }
+
+    public String runWithMultimodal(ChatModel chatModel,
+                                    String systemMessage,
+                                    UserMessage userMessage,
+                                    List<ChatMessage> chatHistory,
+                                    int maxIterations,
+                                    Consumer<String> progressCallback,
+                                    TaskPlan taskPlan) {
+        List<ChatMessage> messages = new ArrayList<>();
+        if (systemMessage != null && !systemMessage.isBlank()) {
+            messages.add(new SystemMessage(systemMessage));
+        }
+        if (taskPlan != null) {
+            messages.add(new SystemMessage(taskPlan.toPromptBlock()));
+        }
+        if (chatHistory != null) {
+            messages.addAll(chatHistory);
+        }
+        messages.add(userMessage);
+        return executeLoop(chatModel, messages, firstUserTextForFileIntent(userMessage), maxIterations, progressCallback, taskPlan);
+    }
+
+    /**
+     * 与 {@link #run} 共用的主循环。
+     * {@code progressCallback} 非空时，每次工具调用前后推送进度文本（用于 SSE 实时反馈）。
+     */
+    private String executeLoop(ChatModel chatModel,
+                              List<ChatMessage> messages,
+                              String userTextForFilePattern,
+                              int maxIterations,
+                              Consumer<String> progressCallback,
+                              TaskPlan taskPlan) {
+        var toolSpecs = taskPlan == null
+                ? toolRegistry.getSpecifications()
+                : toolRegistry.getSpecifications(taskPlan.allowedToolSet());
+        boolean hasTools = !toolSpecs.isEmpty();
+
+        int iterations = Math.min(maxIterations, MAX_ITERATIONS);
+
+        Set<String> toolsInvoked = new HashSet<>();
+        boolean writeFileSucceeded = false;
+        boolean mediaDelivered = false;
+        boolean imageGenerateUnavailable = false;
+        // 死循环检测：tool|args 累计调用次数；同一组合命中 >= 3 次直接放弃后续工具调用。
+        java.util.Map<String, Integer> dupCallCounter = new java.util.HashMap<>();
+
+        boolean explicitlyNeedsFile = EXPLICIT_FILE_REQ.matcher(
+                userTextForFilePattern == null ? "" : userTextForFilePattern).find();
+        String taskGoal = summarizeTaskGoal(userTextForFilePattern);
+
+        if (taskPlan != null) {
+            taskGoal = summarizeTaskGoal(taskPlan.taskGoal());
+            log.info("Agent计划: intent={}, taskGoal='{}', allowedTools={}, steps={}",
+                    taskPlan.intent(), taskPlan.taskGoal(), taskPlan.allowedTools(), taskPlan.steps());
+        }
+
+        log.info("Agent任务开始: taskGoal='{}', maxIterations={}, toolsEnabled={}, explicitFileDelivery={}",
+                taskGoal, iterations, hasTools, explicitlyNeedsFile);
+
+        for (int turn = 0; turn < iterations; turn++) {
+            log.info("Agent循环第 {}/{} 轮开始: taskGoal='{}', messages={}, invokedTools={}, mediaDelivered={}, writeFileSucceeded={}, imageGenerateUnavailable={}",
+                    turn + 1, iterations, taskGoal, messages.size(), toolsInvoked,
+                    mediaDelivered, writeFileSucceeded, imageGenerateUnavailable);
+
+            ChatRequest.Builder reqBuilder = ChatRequest.builder().messages(messages);
+            if (hasTools) {
+                var specsForTurn = imageGenerateUnavailable
+                        ? toolSpecs.stream().filter(s -> !"image_generate".equals(s.name())).toList()
+                        : toolSpecs;
+                reqBuilder.toolSpecifications(specsForTurn);
+            }
+            ChatResponse response;
+            try {
+                response = chatModel.chat(reqBuilder.build());
+            } catch (dev.langchain4j.exception.InternalServerException e) {
+                log.warn("LLM API 服务不可用 (503): {}", e.getMessage());
+                return "抱歉，AI模型服务暂时不可用（可能负载较高）。请稍后重试。";
+            } catch (Exception e) {
+                log.error("LLM API 调用失败: {}", e.getMessage());
+                return "抱歉，AI模型调用出错：" + e.getMessage();
+            }
+
+            AiMessage aiMessage = response.aiMessage();
+            messages.add(aiMessage);
+
+            if (aiMessage.hasToolExecutionRequests()) {
+                var toolCalls = aiMessage.toolExecutionRequests();
+                log.info("模型请求执行 {} 个工具调用", toolCalls.size());
+                log.info("Agent步骤目标 第 {}/{} 轮: stepGoal='{}'",
+                        turn + 1, iterations, summarizeStepGoal(toolCalls));
+
+                // 死循环检测：本轮所有工具是否都已经反复调用过相同参数？
+                boolean allRepeated = true;
+                for (var tc : toolCalls) {
+                    String key = tc.name() + "|" + (tc.arguments() == null ? "" : tc.arguments());
+                    int count = dupCallCounter.getOrDefault(key, 0) + 1;
+                    dupCallCounter.put(key, count);
+                    if (count < 3) allRepeated = false;
+                }
+                if (allRepeated) {
+                    log.warn("死循环检测：本轮全部工具调用已重复 >= 3 次，提前终止。轮次 {}", turn + 1);
+                    String fallback = "我连续多次用相同参数调用同样的工具但没拿到新结果，停止继续尝试，避免空转。" +
+                            "已调用工具：" + toolsInvoked +
+                            "。请提供更具体的目标或文件路径后我再继续。";
+                    return fallback;
+                }
+
+                // 推送进度（所有工具名一起显示）
+                if (progressCallback != null && toolCalls.size() > 1) {
+                    String names = toolCalls.stream()
+                            .map(tc -> formatProgressMsg(tc.name(), tc.arguments()))
+                            .reduce((a, b) -> a + " | " + b).orElse("");
+                    progressCallback.accept(names);
+                }
+
+                // 多工具时并行执行，单工具直接串行（避免 overhead）
+                if (toolCalls.size() > 1) {
+                    // 并行：每个工具独立 CompletableFuture
+                    Map<String, String> results = new ConcurrentHashMap<>();
+                    List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+                    for (var toolCall : toolCalls) {
+                        String toolName = toolCall.name();
+                        String arguments = toolCall.arguments();
+                        log.info("  → [并行] 调用工具: {}({})", toolName, truncate(redactSensitive(arguments), 150));
+                        if (progressCallback != null) {
+                            progressCallback.accept(formatProgressMsg(toolName, arguments));
+                        }
+                        futures.add(CompletableFuture.runAsync(() -> {
+                            String r = toolRegistry.execute(toolName, arguments);
+                            results.put(toolCall.id() + "|" + toolName, r == null ? "" : r);
+                        }));
+                    }
+                    // 等待所有完成（最长等 120 秒）
+                    try {
+                        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                                .get(120, java.util.concurrent.TimeUnit.SECONDS);
+                    } catch (Exception e) {
+                        log.warn("并行工具执行超时或出错: {}", e.getMessage());
+                    }
+                    // 按原始顺序追加结果
+                    for (var toolCall : toolCalls) {
+                        String key = toolCall.id() + "|" + toolCall.name();
+                        String result = results.getOrDefault(key, "{\"error\":\"执行超时\"}");
+                        toolsInvoked.add(toolCall.name());
+                        log.info("  ← [并行] {}: {}", toolCall.name(), truncate(redactSensitive(result), 200));
+                        if (WRITE_TOOLS.contains(toolCall.name()) && result.contains("\"success\":true")) {
+                            writeFileSucceeded = true;
+                        }
+                        if ("image_generate".equals(toolCall.name()) && isImageGenerateUnavailable(result)) {
+                            imageGenerateUnavailable = true;
+                        }
+                        if (MEDIA_TOOLS.contains(toolCall.name()) && looksLikeMediaSuccess(result)) {
+                            mediaDelivered = true;
+                        }
+                        messages.add(ToolExecutionResultMessage.from(
+                                toolCall.id(), toolCall.name(), clampForContext(result, toolCall.name())));
+                    }
+                } else {
+                    // 单工具：串行执行
+                    var toolCall  = toolCalls.get(0);
+                    String toolName  = toolCall.name();
+                    String arguments = toolCall.arguments();
+                    log.info("  → 调用工具: {}({})", toolName, truncate(redactSensitive(arguments), 150));
+                    if (progressCallback != null) {
+                        progressCallback.accept(formatProgressMsg(toolName, arguments));
+                    }
+                    String result = toolRegistry.execute(toolName, arguments);
+                    toolsInvoked.add(toolName);
+                    if (WRITE_TOOLS.contains(toolName) && result != null
+                            && (result.contains("\"success\":true") || result.startsWith("写入成功"))) {
+                        writeFileSucceeded = true;
+                    }
+                    if ("image_generate".equals(toolName) && isImageGenerateUnavailable(result)) {
+                        imageGenerateUnavailable = true;
+                    }
+                    if (MEDIA_TOOLS.contains(toolName) && result != null && looksLikeMediaSuccess(result)) {
+                        mediaDelivered = true;
+                    }
+                    log.info("  ← 结果: {}", truncate(redactSensitive(result), 300));
+                    messages.add(ToolExecutionResultMessage.from(
+                            toolCall.id(), toolCall.name(), clampForContext(result, toolName)));
+                }
+
+                // 移除：mediaDelivered 后不再禁用 image_generate，允许用户修改后重新生成
+
+                messages = contextCompressor.maybeCompress(messages, MAX_CONTEXT_TOKENS);
+                continue;
+            }
+
+            String finalText = aiMessage.text();
+            log.info("Agent步骤目标 第 {}/{} 轮: stepGoal='生成最终回复/总结交付结果'", turn + 1, iterations);
+            if (finalText == null || finalText.isBlank()) {
+                if (mediaDelivered) return "（图片已生成，见上方）";
+                if (writeFileSucceeded) return "（文件已生成，见 workspace/）";
+                return "（模型未返回内容）";
+            }
+
+            if (mediaDelivered || MARKDOWN_IMAGE.matcher(finalText).find()) {
+                log.info("媒体交付完成，直接返回。轮次 {}，回复长度 {}，工具 {}",
+                        turn + 1, finalText.length(), toolsInvoked);
+                return finalText;
+            }
+
+            if (!explicitlyNeedsFile) {
+                log.info("非文件交付类任务，直接返回。轮次 {}，回复长度 {}，工具 {}",
+                        turn + 1, finalText.length(), toolsInvoked);
+                return finalText;
+            }
+
+            if (writeFileSucceeded) {
+                log.info("文件交付任务完成（write_file 成功），轮次 {}，回复长度 {}",
+                        turn + 1, finalText.length());
+                return finalText;
+            }
+
+            String key = "__file_reminder_sent";
+            boolean alreadyReminded = messages.stream()
+                    .anyMatch(m -> m instanceof UserMessage um
+                            && textOf(um).contains(key));
+            if (alreadyReminded) {
+                log.warn("已提醒过 write_file 仍未落盘，放行以避免死循环。轮次 {}", turn + 1);
+                return finalText;
+            }
+
+            log.info("文件交付任务尚未落盘，注入一次性提醒。轮次 {}", turn + 1);
+            messages.add(new UserMessage(
+                    key + "\n用户明确要求输出文件（.md/.sql/代码等），但你还没调用 write_file。" +
+                            "请把正文用 write_file 写入 workspace 下，然后再给出产出物清单。"
+            ));
+        }
+
+        log.warn("Agent 循环达到最大迭代次数 {}", iterations);
+        if (writeFileSucceeded || mediaDelivered) {
+            StringBuilder partial = new StringBuilder("任务执行轮次已达上限，但已有部分成果完成：");
+            if (writeFileSucceeded) {
+                partial.append("\n- 文件已写入 workspace 目录。");
+            }
+            if (mediaDelivered) {
+                partial.append("\n- 图片已生成并缓存到本地，可在上方或 /static/images 路径查看。");
+            }
+            partial.append("\n\n后续发布步骤尚未完全确认，请检查日志中的最后一个工具结果。");
+            return partial.toString();
+        }
+        return "（达到最大迭代次数 " + iterations + "，Agent 循环终止）";
+    }
+
+    /** 多模态消息中取第一段文字，供「显式要文件」正则使用；无文字则视为非文件类意图。 */
+    private static String firstUserTextForFileIntent(UserMessage um) {
+        if (um == null) {
+            return "";
+        }
+        if (um.hasSingleText()) {
+            return um.singleText();
+        }
+        for (Content c : um.contents()) {
+            if (c instanceof TextContent tc) {
+                return tc.text();
+            }
+        }
+        return "";
+    }
+
+    // ==================== 工具方法 ====================
+
+    /** 判断 image_generate / browser_screenshot 的返回值是否指示成功并附带了图片/文件。 */
+    private boolean looksLikeMediaSuccess(String result) {
+        if (result == null || result.isBlank()) return false;
+        // BuiltinTools.formatImageResult 会把成功结果包成 "![图片](url)"
+        if (result.startsWith("![") && result.contains("](")) return true;
+        // browser_screenshot 直接返回类似 "截图已保存: ..." 的字样
+        if (result.contains("截图已保存") || result.contains("saved screenshot")) return true;
+        // 兜底：JSON 里 success=true 且带 image
+        return result.contains("\"success\":true") && result.contains("\"image\"");
+    }
+
+    /**
+     * 生图后端不可用时，从下一轮请求中移除 image_generate，避免模型反复尝试生图、
+     * 退化成写脚本/找本地图片，最后撞 maxIterations。
+     */
+    private boolean isImageGenerateUnavailable(String result) {
+        if (result == null) return false;
+        return result.contains("图片生成失败")
+                || result.contains("API Key 无效")
+                || result.contains("Invalid token")
+                || result.contains("不要再重试");
+    }
+
+    /** 把工具结果压到可接受长度再塞进上下文（按工具类型取不同上限）。 */
+    private String clampForContext(String result, String toolName) {
+        if (result == null || result.isBlank()) return "{\"success\":true,\"message\":\"工具执行完成\"}";
+        int limit = TOOL_RESULT_LIMITS.getOrDefault(toolName, DEFAULT_TOOL_RESULT_MAX);
+        if (result.length() <= limit) return result;
+        return result.substring(0, limit)
+                + "\n... （结果过长已截断，共 " + result.length() + " 字符）";
+    }
+
+    /** 生成人可读的工具调用进度描述，推送给前端 */
+    private static String formatProgressMsg(String toolName, String arguments) {
+        return switch (toolName) {
+            case "web_search"        -> "🔍 正在搜索：" + extractJsonField(arguments, "query");
+            case "web_extract"       -> "🌐 正在抓取网页：" + extractJsonField(arguments, "url");
+            case "image_generate"    -> "🎨 正在生成图片：" + truncate(extractJsonField(arguments, "prompt"), 40);
+            case "read_file"         -> "📄 读取文件：" + extractJsonField(arguments, "path");
+            case "write_file"        -> "💾 写入文件：" + extractJsonField(arguments, "path");
+            case "exec_command"      -> "⚙️ 执行命令：" + truncate(extractJsonField(arguments, "command"), 50);
+            case "browser_navigate"  -> "🌍 打开网页：" + extractJsonField(arguments, "url");
+            case "browser_screenshot"-> "📸 截图中...";
+            case "browser_click"     -> "🖱️ 点击：" + extractJsonField(arguments, "ref");
+            case "browser_type"      -> "⌨️ 输入：" + truncate(extractJsonField(arguments, "text"), 30);
+            case "memory"            -> "🧠 更新记忆...";
+            case "http_get"          -> "📡 请求：" + extractJsonField(arguments, "url");
+            default                  -> "🔧 调用工具：" + toolName;
+        };
+    }
+
+    /** 根据本轮工具调用推断“当前子步骤目标”，用于日志观测模型规划进度。 */
+    private static String summarizeStepGoal(List<?> toolCalls) {
+        if (toolCalls == null || toolCalls.isEmpty()) {
+            return "生成最终回复/总结交付结果";
+        }
+
+        List<String> goals = new ArrayList<>();
+        for (Object call : toolCalls) {
+            try {
+                String name = (String) call.getClass().getMethod("name").invoke(call);
+                String args = (String) call.getClass().getMethod("arguments").invoke(call);
+                goals.add(stepGoalOf(name, args));
+            } catch (Exception e) {
+                goals.add("执行工具调用");
+            }
+        }
+        return goals.stream().distinct().reduce((a, b) -> a + "；" + b).orElse("执行工具调用");
+    }
+
+    private static String stepGoalOf(String toolName, String arguments) {
+        return switch (toolName) {
+            case "web_search" -> {
+                String q = truncate(extractJsonField(arguments, "query"), 50);
+                yield q.isBlank() ? "搜索外部资料" : "搜索资料：" + q;
+            }
+            case "web_extract" -> "抓取并阅读网页：" + truncate(extractJsonField(arguments, "url"), 60);
+            case "read_file" -> "读取已有文件：" + extractJsonField(arguments, "path");
+            case "write_file" -> "写入/更新文件：" + extractJsonField(arguments, "path");
+            case "image_generate" -> "生成图片素材：" + truncate(extractJsonField(arguments, "prompt"), 50);
+            case "http_get" -> {
+                String url = extractJsonField(arguments, "url");
+                if (url.contains("api.weixin.qq.com")) yield "请求微信接口";
+                yield "请求 HTTP 接口：" + truncate(url, 60);
+            }
+            case "exec_command" -> "执行系统命令：" + truncate(extractJsonField(arguments, "command"), 70);
+            case "list_files" -> "检查目录文件：" + extractJsonField(arguments, "path");
+            case "browser_navigate" -> "浏览网页：" + extractJsonField(arguments, "url");
+            case "browser_snapshot" -> "分析当前网页结构";
+            case "browser_click" -> "点击页面元素：" + extractJsonField(arguments, "ref");
+            case "browser_type" -> "填写页面内容";
+            case "browser_screenshot" -> "截取页面图片";
+            case "memory" -> "读取/更新长期记忆";
+            case "skill_list", "skill_view" -> "检查可用技能";
+            case "skill_manage" -> "管理技能";
+            default -> "执行工具：" + toolName;
+        };
+    }
+
+    /** 从 JSON 字符串里粗提取指定字段值（不引入 Jackson 依赖，轻量实现） */
+    private static String extractJsonField(String json, String field) {
+        if (json == null || json.isBlank()) return "";
+        String key = "\"" + field + "\"";
+        int ki = json.indexOf(key);
+        if (ki < 0) return "";
+        int colon = json.indexOf(':', ki + key.length());
+        if (colon < 0) return "";
+        int vs = colon + 1;
+        while (vs < json.length() && Character.isWhitespace(json.charAt(vs))) vs++;
+        if (vs >= json.length()) return "";
+        if (json.charAt(vs) == '"') {
+            int end = json.indexOf('"', vs + 1);
+            return end < 0 ? "" : json.substring(vs + 1, end);
+        }
+        int end = vs;
+        while (end < json.length() && json.charAt(end) != ',' && json.charAt(end) != '}') end++;
+        return json.substring(vs, end).trim();
+    }
+
+    /** 纯日志/匹配用的截断。 */
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max) + "...";
+    }
+
+    /** 提取一行可读任务目标用于日志，避免长 prompt/密钥污染日志。 */
+    private static String summarizeTaskGoal(String userText) {
+        if (userText == null || userText.isBlank()) return "(empty)";
+        String oneLine = userText.replaceAll("[\\r\\n]+", " ").trim();
+        return truncate(redactSensitive(oneLine), 120);
+    }
+
+    /** 日志脱敏：避免 access_token、secret、api-key 等敏感信息进入控制台。 */
+    private static String redactSensitive(String s) {
+        if (s == null) return "";
+        return s
+                .replaceAll("(?i)(access_token=)[^&\\s\"'}]+", "$1***")
+                .replaceAll("(?i)(secret=)[^&\\s\"'}]+", "$1***")
+                .replaceAll("(?i)(api[_-]?key=)[^&\\s\"'}]+", "$1***")
+                .replaceAll("(?i)(\"access_token\"\\s*:\\s*\")[^\"]+\"", "$1***\"")
+                .replaceAll("(?i)(\"secret\"\\s*:\\s*\")[^\"]+\"", "$1***\"")
+                .replaceAll("(?i)(\"api[_-]?key\"\\s*:\\s*\")[^\"]+\"", "$1***\"");
+    }
+
+    /** 反射拿 UserMessage 的纯文本，规避 1.x 没有 text() 的接口差异。 */
+    private static String textOf(UserMessage um) {
+        if (um == null) return "";
+        // 优先：单文本消息
+        if (um.hasSingleText()) {
+            return um.singleText();
+        }
+        // 多模态：遍历contents提取TextContent
+        StringBuilder sb = new StringBuilder();
+        for (Content c : um.contents()) {
+            if (c instanceof TextContent tc) {
+                if (!sb.isEmpty()) sb.append("\n");
+                sb.append(tc.text());
+            }
+        }
+        return sb.toString();
+    }
+}

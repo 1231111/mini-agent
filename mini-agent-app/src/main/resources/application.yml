@@ -1,0 +1,119 @@
+spring:
+  thymeleaf:
+    cache: false   # 开发期关闭模板缓存：改完 .html 刷新页面即可生效，无需重启
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 20MB
+      enabled: true
+  application:
+    name: mini-agent-springboot
+  mvc:
+    async:
+      request-timeout: 30000000
+  datasource:
+    url: jdbc:mysql://192.168.1.102:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
+    username: root
+    password: rootroot
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: true
+    open-in-view: false
+
+server:
+  port: 8080
+  tomcat:
+    connection-timeout: 30000000
+    max-http-request-header-size: 64KB
+    max-swallow-size: 64MB
+    max-http-header-size: 50MB
+
+# LangChain4j OpenAI 兼容客户端
+langchain4j:
+  open-ai:
+    chat-model:
+      api-key:
+      base-url: https://token-plan-cn.xiaomimimo.com/v1
+      model-name: mimo-v2.5-pro
+      timeout: 1200s
+      returnThinking: true
+      sendThinking: false   # 不把历史思考链回传给模型：UI 仍展示思考，但每轮输入大幅缩短，循环越往后省得越多
+    streaming-chat-model:
+      api-key:
+      base-url:
+      model-name: mimo-v2.5-pro
+      timeout: 1200s
+      returnThinking: true
+      sendThinking: false
+
+# Agent 配置
+agent:
+  chat-memory:
+    max-messages: 24
+  context:
+    # 上下文窗口上限（token）。按 mimo-v2-omni 保守设 256K。
+    # AgentLoop 与 ContextCompressor 共用此值，统一 token 预算。
+    max-tokens: 256000
+    # 压缩触发阈值：占比达到该比例即压缩，留出输出余量（0.75 → ~192K 触发）。
+    compress-threshold: 0.75
+  memory:
+    vector:
+      # 长期记忆向量召回。复用 agent.codebase 的 embedding key/model（bge-m3）。
+      # 启用后按当前对话语义召回 Top-K 记忆条目，替代全量注入；无 key 时自动回退全量注入。
+      enabled: true
+      top-k: 6
+      min-score: 0.4
+  sse:
+    # SSE 流式连接超时（毫秒）。长任务（生成整套项目等）可能跑 10 分钟以上，
+    # 默认放宽到 30 分钟。配合前端断流自动重连，超时也能续上。
+    timeout-ms: 18000000000
+  codebase:
+    # 代码库语义检索（codebase_search 工具）。用 siliconflow 的 OpenAI 兼容 embedding 接口。
+    # enabled=false 时该工具直接返回提示，不做索引，避免无 key 时报错。
+    embedding-enabled: true
+    embedding-api-key:
+    embedding-base-url: https://api.chatanywhere.tech/v1
+    embedding-model: BAAI/bge-m3
+    # 向量索引持久化文件（相对项目根）。增量索引按文件修改时间判断是否需要重嵌入。
+    index-file: ./workspace/.codebase-index.json
+logging:
+  level:
+    com.miniagent: DEBUG
+
+# Web 搜索配置
+web:
+  search:
+    backend:
+    tavily-api-key: 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
+    bing-api-key: 0b2cfa02558fbed1e87c58a7ad6ee4dd9bd74c2a5526fe55097e435ffdcd4d8d
+    google-api-key:
+    google-cse-id:
+
+# 图像生成配置
+image:
+  gen:
+    mimo-api-key:
+    mimo-base-url: https://token-plan-cn.xiaomimimo.com/v1
+    mimo-model: mimo-v2-image
+    siliconflow-api-key: cdfe3b37-673d-4830-9b27-621fd84193e1:d7706f80a383dad428e6f948b9b57e26
+    fal-key:
+    zhipu-api-key:
+
+# MySQL Database Configuration (merged above under spring.datasource / spring.jpa)
+
+# File Upload Configuration
+file:
+  upload:
+    base-dir: ./user-uploads
+    max-size: 10485760  # 10MB
+
+# ComfyUI 配置
+comfyui:
+  host: 127.0.0.1
+  port: 8188
