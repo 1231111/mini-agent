@@ -17,9 +17,9 @@ import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.chat.response.PartialThinking;
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
+import com.miniagent.agent.trace.TraceRecorder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -59,15 +59,13 @@ public class AgentLoop {
     private final ToolRegistry toolRegistry;
     private final ContextCompressor contextCompressor;
     private final StreamingChatModel streamingChatModel;
+    /** 轨迹记录器（可选，注入后自动记录每步执行） */
+    private TraceRecorder traceRecorder;
+    public void setTraceRecorder(TraceRecorder traceRecorder) { this.traceRecorder = traceRecorder; }
+    /** 流式事件中枢（用于运行中消息注入） */
+    private SessionStreamHub streamHub;
+    public void setStreamHub(SessionStreamHub streamHub) { this.streamHub = streamHub; }
     private final TaskTodoStore taskTodoStore;
-
-    /** 工具执行专用线程池（由 ToolExecutorConfig 创建） */
-    private ExecutorService toolExecutor;
-
-    @org.springframework.beans.factory.annotation.Autowired
-    public void setToolExecutor(@Qualifier("toolExecutor") ExecutorService toolExecutor) {
-        this.toolExecutor = toolExecutor;
-    }
 
     private static final int MAX_ITERATIONS = 90;
     /** 虚拟线程池：工具并行执行专用，IO 密集型任务零开销 */
@@ -109,7 +107,7 @@ public class AgentLoop {
      * 快工具（read_file/list_files）设短超时避免拖慢整体。
      */
     private static final Map<String, Long> TOOL_TIMEOUT_SECONDS = Map.ofEntries(
-            Map.entry("image_generate",     180L),
+            Map.entry("image_generate",     600L),
             Map.entry("web_search",          30L),
             Map.entry("web_extract",         30L),
             Map.entry("http_get",            30L),
@@ -160,7 +158,8 @@ public class AgentLoop {
 
     /** 可缓存的只读工具：同一请求内重复调用直接返回缓存 */
     private static final Set<String> CACHEABLE_TOOLS = Set.of(
-            "read_file", "list_files", "web_search"
+            "read_file", "list_files", "web_search", "web_extract", "http_get",
+            "exec_command", "browser_snapshot", "read_package"
     );
 
     /**
@@ -301,6 +300,7 @@ public class AgentLoop {
 
     /** Agent 循环可变状态，避免 executeLoop 里满天飞的局部变量 */
     private static class LoopState {
+        int currentTurn = 0;  // 当前迭代轮次，供工具执行路径使用
         final Set<String> toolsInvoked = new HashSet<>();
         boolean writeFileSucceeded = false;
         boolean mediaDelivered = false;
@@ -320,6 +320,7 @@ public class AgentLoop {
         int llmFailureCount = 0;  // 连续 LLM 调用失败计数（用于降级策略）
         int lengthTruncationCount = 0; // 连续输出被长度上限截断计数（用于分块续写引导/兜底终止）
         boolean injectAppendHintAfterTools = false; // tool_call 被长度截断：工具执行后需注入续写引导
+        boolean lengthTruncatedToolCalls = false; // 当前轮 tool_call 参数可能被截断
 
         /** 死循环检测：本轮全部工具是否已重复 >= 3 次 */
         boolean allCallsRepeated(List<?> toolCalls) {
@@ -363,6 +364,12 @@ public class AgentLoop {
 
         // sub-goal 栈播种：用意图规划的 steps 预填 todo（仅当该 session 还没有计划时）
         String sessionId = currentSessionId.get();
+        // 开始轨迹记录
+        String executionId = "exec_" + System.currentTimeMillis() + "_" + java.util.UUID.randomUUID().toString().substring(0, 8);
+        if (traceRecorder != null) {
+            traceRecorder.beginExecution(sessionId, executionId, userTextForFilePattern);
+        }
+        try {
         if (taskPlan != null && taskPlan.steps() != null && !taskPlan.steps().isEmpty()) {
             boolean seeded = taskTodoStore.seedFromSteps(sessionId, taskPlan.steps());
             if (seeded) log.info("sub-goal 栈已播种 {} 步: {}", taskPlan.steps().size(), taskGoal);
@@ -376,28 +383,78 @@ public class AgentLoop {
                 taskGoal, iterations, hasTools, explicitlyNeedsFile);
 
         for (int turn = 0; turn < iterations; turn++) {
+            // 检查用户执行中追加的消息
+            if (streamHub != null) {
+                java.util.List<String> injected = streamHub.drainMessages(sessionId);
+                if (!injected.isEmpty()) {
+                    for (String msg : injected) {
+                        messages.add(new UserMessage(msg));
+                        log.info("用户追加指令注入: {}", msg.length() > 100 ? msg.substring(0, 100) + "..." : msg);
+                    }
+                    if (streamSink != null) streamSink.onThinking("\n（已收到你的补充说明，正在融入当前任务...）\n");
+                    if (traceRecorder != null) traceRecorder.recordThinking(sessionId, turn,
+                            "【用户追加】" + injected.size() + " 条补充指令注入");
+                }
+            }
+
             // 刷新「当前子目标」可刷新指针：移除上一条，按栈顶活动项注入新的一条到末尾
             refreshSubGoal(messages, state, sessionId, streamSink);
 
             String subGoalLog = state.lastSubGoalText != null ? state.lastSubGoalText : taskGoal;
             log.info("Agent循环第 {}/{} 轮: {}, messages={}, tools={}",
                     turn + 1, iterations, subGoalLog, messages.size(), state.toolsInvoked);
+            state.currentTurn = turn;
+            if (traceRecorder != null) traceRecorder.recordTurnStart(sessionId, turn, state.lastSubGoalText);
 
             // 1) 构建请求（按需过滤工具）
             var specsForTurn = buildToolSpecsForTurn(toolSpecs, hasTools, state.mediaDelivered, state);
+            // 记录 LLM 请求上下文
+            if (traceRecorder != null) {
+                String promptCtx = formatMessagesForTrace(messages);
+                traceRecorder.recordThinking(sessionId, turn, "【LLM 请求】消息数: " + messages.size() + ", 工具数: " + specsForTurn.size() + "\n\n" + promptCtx);
+            }
+            long llmStartMs = System.currentTimeMillis();
             ChatResponse response = callLlm(chatModel, messages, specsForTurn, hasTools, streamSink);
+            long llmEndMs = System.currentTimeMillis();
+
+            // 记录 LLM 响应
+            if (traceRecorder != null && response != null) {
+                AiMessage ai = response.aiMessage();
+                // 记录 LLM 调用耗时
+                int inTokens = response.tokenUsage() != null ? response.tokenUsage().inputTokenCount() : 0;
+                int outTokens = response.tokenUsage() != null ? response.tokenUsage().outputTokenCount() : 0;
+                traceRecorder.recordLlmLatency(sessionId, turn, llmEndMs - llmStartMs, inTokens, outTokens);
+                // 记录决策推理（模型在调工具前的思考文字）
+                if (ai.hasToolExecutionRequests() && ai.text() != null && !ai.text().isBlank()) {
+                    traceRecorder.recordDecision(sessionId, turn, ai.text());
+                }
+                String respText = "【LLM 响应】";
+                if (ai.text() != null && !ai.text().isBlank()) respText += "\n文本: " + truncate(ai.text(), 2000);
+                if (ai.hasToolExecutionRequests()) {
+                    respText += "\n工具调用: " + ai.toolExecutionRequests().size() + " 个";
+                    for (var tc : ai.toolExecutionRequests()) {
+                        respText += "\n  - " + toolNameOf(tc) + "(" + truncate(argumentsOf(tc), 500) + ")";
+                    }
+                }
+                if (response.tokenUsage() != null) {
+                    respText += "\nToken: input=" + response.tokenUsage().inputTokenCount() + ", output=" + response.tokenUsage().outputTokenCount();
+                }
+                traceRecorder.recordThinking(sessionId, turn, respText);
+            }
 
             if (response == null) {
                 state.llmFailureCount++;
                 // 智能降级策略：不立即放弃，尝试恢复
                 if (state.llmFailureCount == 1) {
-                    // 首次失败：注入恢复提示，给模型一次重连机会
+                    // 首次失败：通知前端、注入恢复提示，给模型一次重连机会
                     log.warn("LLM 调用失败（第 {} 次），注入恢复提示后继续", state.llmFailureCount);
+                    if (streamSink != null) streamSink.onThinking("\n（模型响应超时，正在重试...）\n");
                     messages.add(new SystemMessage("【系统通知】上次模型调用遇到临时网络问题，已自动重连。请继续刚才的任务。"));
                     continue;
                 } else if (state.llmFailureCount == 2 && messages.size() > 20) {
-                    // 第二次失败 + 上下文过长：可能 token 过多超时，裁剪后重试
-                    log.warn("LLM 连续失败 2 次且上下文过长（{} 条），裁剪至最近 15 条后重试", messages.size());
+                    // 第二次失败 + 上下文过长：可能 token 过多超时，裁剪后做最后一次尝试
+                    log.warn("LLM 连续失败 2 次且上下文过长（{} 条），裁剪至最近 10 条后做最终尝试", messages.size());
+                    if (streamSink != null) streamSink.onThinking("\n（第二次重试失败，正在精简上下文后做最后尝试...）\n");
                     List<ChatMessage> trimmed = new ArrayList<>();
                     // 保留 system prompt（前几条 SystemMessage）
                     int sysEnd = 0;
@@ -406,14 +463,16 @@ public class AgentLoop {
                         else break;
                     }
                     trimmed.addAll(messages.subList(0, sysEnd));
-                    // 加最近 15 条对话
-                    int keep = Math.min(15, messages.size() - sysEnd);
+                    // 加最近 10 条对话（更激进裁剪，减少 token 数）
+                    int keep = Math.min(10, messages.size() - sysEnd);
                     trimmed.addAll(messages.subList(messages.size() - keep, messages.size()));
                     messages = trimmed;
+                    state.currentSubGoalMsg = null;
                     continue;
                 } else {
                     // 连续失败 3 次或降级策略用尽：最终放弃
                     log.error("LLM 调用连续失败 {} 次（已尝试恢复与降级），任务终止", state.llmFailureCount);
+                    if (traceRecorder != null) traceRecorder.recordError(sessionId, turn, "LLM 连续失败 " + state.llmFailureCount + " 次");
                     return "（模型连接异常，已自动重试但仍失败，请稍后再试或联系管理员）";
                 }
             }
@@ -442,6 +501,7 @@ public class AgentLoop {
                     // tool_call 被截断：先把工具结果产出（截断的 write_file 会回报参数错误），
                     // 再注入续写引导。这里只置标志，引导在工具执行后注入，确保紧贴工具结果。
                     state.injectAppendHintAfterTools = true;
+                    state.lengthTruncatedToolCalls = true;
                 } else {
                     // 纯文本被截断：直接引导续写，不要从头重来。
                     messages.add(new SystemMessage(
@@ -460,6 +520,11 @@ public class AgentLoop {
                 if (streamSink != null) streamSink.onAnswerReset();
                 var toolCalls = aiMessage.toolExecutionRequests();
                 log.info("模型请求 {} 个工具调用,tools:{}", toolCalls.size(),toolCalls);
+                if (traceRecorder != null) {
+                    for (var tc : toolCalls) {
+                        traceRecorder.recordToolCall(sessionId, turn, toolNameOf(tc), argumentsOf(tc));
+                    }
+                }
 
                 if (state.allCallsRepeated(toolCalls)) {
                     log.warn("死循环检测：全部工具已重复 >= 3 次，终止");
@@ -472,6 +537,7 @@ public class AgentLoop {
                 // 紧接着注入续写引导，让模型用 append 续写而不是重头再来。
                 if (state.injectAppendHintAfterTools) {
                     state.injectAppendHintAfterTools = false;
+                    state.lengthTruncatedToolCalls = false;
                     messages.add(new SystemMessage(
                             "【系统提醒】你上一次的工具调用因达到单轮输出上限被截断，参数没传完整。"
                             + "如果你在写文件：不要从头重写，请用 write_file 且 mode=\"append\"，"
@@ -483,7 +549,9 @@ public class AgentLoop {
                     boolean hasNonOutputTool = toolCalls.stream()
                             .anyMatch(tc -> {
                                 String name = toolNameOf(tc);
-                                return !"comfyui_txt2img".equals(name) && !"comfyui_img2img".equals(name);
+                                return !"comfyui_txt2img".equals(name)
+                                        && !"comfyui_img2img".equals(name)
+                                        && !"comfyui_check_quality".equals(name);
                             });
                     if (hasNonOutputTool) {
                         state.mediaReminderSent = true;
@@ -498,18 +566,32 @@ public class AgentLoop {
                     }
                 }
 
+                int msgCountBefore = messages.size();
                 messages = contextCompressor.maybeCompress(messages, maxContextTokens, sessionId);
+                if (traceRecorder != null && messages.size() < msgCountBefore) {
+                    traceRecorder.recordCompression(sessionId, turn, msgCountBefore, messages.size(), 0, 0);
+                }
                 continue;
             }
 
             // 3) 模型返回文本（无工具调用）→ 模型主动收尾，作为最终回复
             String result = tryReturnFinalText(aiMessage, messages, state, explicitlyNeedsFile, turn, iterations);
-            if (result != null) return result;
+            if (result != null) {
+                if (traceRecorder != null) {
+                    traceRecorder.recordAnswer(sessionId, turn, result);
+                    traceRecorder.recordLoopEnd(sessionId, turn, "SUCCESS", null, null);
+                }
+                return result;
+            }
             // tryReturnFinalText 注入了提醒，继续循环
         }
 
         log.warn("Agent 循环达到最大迭代次数 {}", iterations);
+        if (traceRecorder != null) traceRecorder.recordLoopEnd(sessionId, iterations - 1, "MAX_ITERATIONS", null, null);
         return buildMaxIterationFallback(state, iterations);
+        } finally {
+            if (traceRecorder != null) traceRecorder.endExecution();
+        }
     }
 
     // ==================== 工具过滤 ====================
@@ -527,6 +609,13 @@ public class AgentLoop {
         } catch (Exception e) {
             return; // 子目标机制是增强项，任何异常都不应中断主循环
         }
+
+        // 子目标未变且指针消息仍在 messages 中 → 跳过，避免每轮 remove+add 开销
+        if (sg != null && sg.text().equals(state.lastSubGoalText) && state.currentSubGoalMsg != null
+                && messages.contains(state.currentSubGoalMsg)) {
+            return;
+        }
+
         // 先移除上一条指针消息（如果还在 messages 里）
         if (state.currentSubGoalMsg != null) {
             messages.remove(state.currentSubGoalMsg);
@@ -546,6 +635,10 @@ public class AgentLoop {
             if (streamSink != null) {
                 try { streamSink.onSubGoal(sg.text(), sg.done(), sg.total()); }
                 catch (Exception ignored) {}
+            }
+            if (traceRecorder != null) {
+                String sid = currentSessionId.get();
+                if (sid != null) traceRecorder.recordSubGoal(sid, 0, sg.text(), sg.done(), sg.total());
             }
         }
     }
@@ -586,8 +679,8 @@ public class AgentLoop {
         }
         ChatRequest request = reqBuilder.build();
 
-        // 指数退避重试：临时性错误（网络抖动/超时/503）最多重试 3 次
-        int maxRetries = 3;
+        // 指数退避重试：临时性错误（网络抖动/超时/503）最多重试 1 次（超时类错误单次已很久）
+        int maxRetries = 1;
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
             try {
                 ChatResponse response = streamSink == null
@@ -679,11 +772,13 @@ public class AgentLoop {
         CountDownLatch latch = new CountDownLatch(1);
         AtomicReference<ChatResponse> responseRef = new AtomicReference<>();
         AtomicReference<Throwable> errorRef = new AtomicReference<>();
+        java.util.concurrent.atomic.AtomicBoolean receivedAny = new java.util.concurrent.atomic.AtomicBoolean(false);
 
         streamingChatModel.chat(request, new StreamingChatResponseHandler() {
             @Override
             public void onPartialThinking(PartialThinking partialThinking) {
                 if (partialThinking == null) return;
+                receivedAny.set(true);
                 String t = partialThinking.text();
                 if (t != null && !t.isEmpty()) {
                     try { streamSink.onThinking(t); } catch (Exception ignored) {}
@@ -693,6 +788,7 @@ public class AgentLoop {
             @Override
             public void onPartialResponse(String token) {
                 if (token != null && !token.isEmpty()) {
+                    receivedAny.set(true);
                     try { streamSink.onAnswerToken(token); } catch (Exception ignored) {}
                 }
             }
@@ -710,9 +806,17 @@ public class AgentLoop {
             }
         });
 
-        // 阻塞等待流式完成，使外层循环逻辑（工具解析/重试/收尾）保持原样
-        if (!latch.await(180, TimeUnit.SECONDS)) {
-            throw new java.util.concurrent.TimeoutException("流式 LLM 调用超时");
+        // 首次等待 90s；如果已收到部分数据则延长到 300s（大输出正常情况）
+        long timeoutSec = 90;
+        if (!latch.await(timeoutSec, TimeUnit.SECONDS)) {
+            if (receivedAny.get()) {
+                // 已有数据流入，给更多时间完成
+                if (!latch.await(210, TimeUnit.SECONDS)) {
+                    throw new java.util.concurrent.TimeoutException("流式 LLM 调用超时");
+                }
+            } else {
+                throw new java.util.concurrent.TimeoutException("流式 LLM 调用超时");
+            }
         }
         Throwable err = errorRef.get();
         if (err != null) {
@@ -793,7 +897,10 @@ public class AgentLoop {
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
                     .get(300, java.util.concurrent.TimeUnit.SECONDS);
         } catch (Exception e) {
-            log.warn("并行工具异常: {}", e.getMessage());
+            log.warn("并行工具异常: {}，等待剩余 future 完成", e.getMessage());
+            for (CompletableFuture<Void> f : futures) {
+                try { f.get(5, java.util.concurrent.TimeUnit.SECONDS); } catch (Exception ignored) {}
+            }
         }
 
         // 按顺序收集结果
@@ -811,7 +918,7 @@ public class AgentLoop {
             String resultForContext = clampForContext(result, name);
             if (parallelReflection != null) {
                 state.consecutiveFailures++;
-                if (!state.reflectionInjected && state.consecutiveFailures >= 1) {
+                if (!state.reflectionInjected && state.consecutiveFailures >= 2) {
                     resultForContext = resultForContext + "\n\n" + parallelReflection;
                     state.reflectionInjected = true;
                     log.info("  [反思-并行] 工具结果附加失败反思提示: {}", name);
@@ -822,6 +929,7 @@ public class AgentLoop {
             }
 
             log.info("  [并行] {}: {}", name, truncate(redactSensitive(result), 200));
+            if (traceRecorder != null) traceRecorder.recordToolResult(currentSessionId.get(), state.currentTurn, name, result, 0, result.contains("\"error\"") ? "FAILURE" : "SUCCESS");
             messages.add(ToolExecutionResultMessage.from(
                     toolIdOf(tc), name, resultForContext));
         }
@@ -832,6 +940,15 @@ public class AgentLoop {
                                          Consumer<String> progressCallback, LoopState state) {
         String name = toolNameOf(tc);
         String args = argumentsOf(tc);
+
+        // 截断保护：当本轮 tool_call 因 LENGTH 截断，非文件写入工具的参数大概率是半截 JSON，不执行
+        if (state.lengthTruncatedToolCalls && !"write_file".equals(name) && !"read_file".equals(name)) {
+            String truncErr = "{\"error\":\"本次工具调用的参数因模型输出长度上限被截断，无法执行。请用更短的参数重试。\"}";
+            log.warn("  [截断保护] 跳过执行 {}，参数可能不完整", name);
+            messages.add(ToolExecutionResultMessage.from(toolIdOf(tc), name, truncErr));
+            return;
+        }
+
         String cacheKey = name + ":" + args;
 
         log.info("  {}({})", name, truncate(redactSensitive(args), 150));
@@ -886,17 +1003,49 @@ public class AgentLoop {
         }
 
         log.info("  {}: {}", name, truncate(redactSensitive(result), 300));
+        if (traceRecorder != null) traceRecorder.recordToolResult(currentSessionId.get(), state.currentTurn, name, result, 0, result.contains("\"error\"") ? "FAILURE" : "SUCCESS");
         messages.add(ToolExecutionResultMessage.from(
                 toolIdOf(tc), name, resultForContext));
+    }
+
+    /** 格式化消息列表为可读的 trace 文本（截断长内容） */
+    private String formatMessagesForTrace(List<ChatMessage> messages) {
+        StringBuilder sb = new StringBuilder();
+        int shown = 0;
+        for (ChatMessage msg : messages) {
+            if (shown >= 15) { sb.append("\n... (共 ").append(messages.size()).append(" 条消息，已省略)"); break; }
+            String role = "unknown";
+            String text = "";
+            if (msg instanceof SystemMessage sm) { role = "system"; text = sm.text(); }
+            else if (msg instanceof UserMessage um) {
+                role = "user";
+                if (um.singleText() != null) text = um.singleText();
+                else text = um.contents().stream().map(c -> c instanceof TextContent tc ? tc.text() : "[图片]").reduce("", (a, b) -> a + b);
+            }
+            else if (msg instanceof AiMessage am) {
+                role = "assistant";
+                if (am.text() != null) text = am.text();
+                if (am.hasToolExecutionRequests()) text += " [tool_calls: " + am.toolExecutionRequests().size() + "]";
+            }
+            else if (msg instanceof ToolExecutionResultMessage tr) { role = "tool:" + tr.toolName(); text = tr.text(); }
+            sb.append("\n[").append(role).append("] ").append(truncate(text, 300));
+            shown++;
+        }
+        return sb.toString().trim();
     }
 
     /** 工具失败时注入反思上下文，引导模型换策略 */
     private String buildReflectionHint(String toolName, String args, String result) {
         if (result == null || result.isBlank()) return null;
-        boolean failed = result.contains("\"error\"") || result.contains("失败")
-                || result.contains("不存在") || result.contains("No such file")
-                || result.contains("拒绝") || result.contains("not found")
-                || result.contains("超时") || result.contains("Permission denied");
+        // 对于 read_file / search_code，只有明确的错误 JSON 才算失败，文件内容本身不算
+        if ("read_file".equals(toolName) || "search_code".equals(toolName) || "read_package".equals(toolName)) {
+            boolean isExplicitError = result.startsWith("{\"error\"");
+            if (!isExplicitError) return null;
+        }
+        boolean failed = result.startsWith("{\"error\"")
+                || (result.contains("\"error\"") && result.length() < 500)
+                || result.startsWith("错误：")
+                || result.startsWith("Error:");
         if (!failed) return null;
 
         StringBuilder hint = new StringBuilder();
@@ -942,6 +1091,17 @@ public class AgentLoop {
         if (WRITE_TOOLS.contains(toolName) && result != null
                 && (result.contains("\"success\":true") || result.startsWith("写入成功"))) {
             state.writeFileSucceeded = true;
+            // 写入成功后失效文件相关的缓存，避免后续读到过期内容
+            state.toolResultCache.entrySet().removeIf(e ->
+                    e.getKey().startsWith("read_file:") || e.getKey().startsWith("exec_command:")
+                            || e.getKey().startsWith("list_files:") || e.getKey().startsWith("read_package:"));
+        }
+        if ("exec_command".equals(toolName) && result != null
+                && !result.contains("\"error\"")) {
+            // exec_command 可能修改文件系统，失效 read_file 缓存
+            state.toolResultCache.entrySet().removeIf(e ->
+                    e.getKey().startsWith("read_file:") || e.getKey().startsWith("list_files:")
+                            || e.getKey().startsWith("read_package:"));
         }
         if ("image_generate".equals(toolName) && isImageGenerateUnavailable(result)) {
             state.imageGenerateUnavailable = true;
@@ -964,7 +1124,7 @@ public class AgentLoop {
         log.info("Agent收尾 {}/{}: 生成最终回复", turn + 1, iterations);
 
         if (finalText == null || finalText.isBlank()) {
-            if (state.mediaDelivered) return "（图片已生成，见上方）";
+            if (state.mediaDelivered) return ensureMarkdownImage(state.lastMediaResult);
             if (state.writeFileSucceeded) return "（文件已生成，见 workspace/）";
             return "（模型未返回内容）";
         }
@@ -972,7 +1132,7 @@ public class AgentLoop {
         // 媒体已交付 → 确保 markdown 图片在回复中
         if (state.mediaDelivered) {
             if (state.lastMediaResult != null && !MARKDOWN_IMAGE.matcher(finalText).find()) {
-                finalText = finalText.stripTrailing() + "\n\n" + state.lastMediaResult;
+                finalText = finalText.stripTrailing() + "\n\n" + ensureMarkdownImage(state.lastMediaResult);
             }
             return finalText;
         }
@@ -1002,13 +1162,15 @@ public class AgentLoop {
 
     /** 构建达到最大迭代次数时的兜底回复 */
     private String buildMaxIterationFallback(LoopState state, int iterations) {
+        StringBuilder sb = new StringBuilder();
         if (state.writeFileSucceeded || state.mediaDelivered) {
-            StringBuilder sb = new StringBuilder("任务轮次已达上限，但已有部分成果：");
-            if (state.writeFileSucceeded) sb.append("\n- 文件已写入 workspace。");
-            if (state.mediaDelivered) sb.append("\n- 图片已生成，可在上方查看。");
+            sb.append("任务轮次已达上限（").append(iterations).append("轮），但已有部分成果：");
+            if (state.writeFileSucceeded) sb.append("\n- 文件已写入 workspace/");
+            if (state.mediaDelivered) sb.append("\n- 图片已生成");
+            sb.append("\n\n剩余未完成的子任务可以通过发送「继续」来让我接着完成。");
             return sb.toString();
         }
-        return "（达到最大迭代次数 " + iterations + "，Agent 循环终止）";
+        return "（达到最大迭代次数 " + iterations + "，Agent 循环终止。发送「继续」可让我接着上次进度继续。）";
     }
 
     // ==================== 反射工具方法 ====================
@@ -1046,6 +1208,28 @@ public class AgentLoop {
     }
 
     // ==================== 工具方法 ====================
+
+    /**
+     * 兜底格式转换：确保工具返回的图片结果是 markdown 格式。
+     * 即使工具已统一返回 markdown，仍需兜底处理历史遗留的 JSON/纯文本格式。
+     */
+    private static String ensureMarkdownImage(String result) {
+        if (result == null || result.isBlank()) return result;
+        // 已是 markdown
+        if (result.startsWith("![") && result.contains("](")) return result;
+        // JSON 中提取 markdown_images 字段（ComfyUI 旧格式兼容）
+        if (result.contains("\"markdown_images\"")) {
+            String extracted = extractJsonField(result, "markdown_images");
+            if (extracted != null && extracted.startsWith("![")) return extracted;
+        }
+        // JSON 中提取 image URL（image_generate 旧格式兼容）
+        if (result.contains("\"image\"") && result.contains("\"success\"")) {
+            String url = extractJsonField(result, "image");
+            if (url != null && !url.isBlank()) return "![生成的图片](" + url + ")";
+        }
+        // 纯文本（如截图路径）— 无法转换，原样返回
+        return result;
+    }
 
     /** 判断 image_generate / browser_screenshot 的返回值是否指示成功并附带了图片/文件。 */
     private boolean looksLikeMediaSuccess(String result) {
@@ -1102,7 +1286,7 @@ public class AgentLoop {
     }
 
     /** 从 JSON 字符串里粗提取指定字段值（不引入 Jackson 依赖，轻量实现） */
-    private static String extractJsonField(String json, String field) {
+    static String extractJsonField(String json, String field) {
         if (json == null || json.isBlank()) return "";
         String key = "\"" + field + "\"";
         int ki = json.indexOf(key);

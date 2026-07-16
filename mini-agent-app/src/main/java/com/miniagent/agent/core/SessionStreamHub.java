@@ -4,9 +4,12 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -62,6 +65,7 @@ public class SessionStreamHub {
         volatile String errorMsg = "";
         volatile long doneAt = 0L;  // 结束时间戳，用于 TTL 驱逐
         final CopyOnWriteArrayList<SseEmitter> emitters = new CopyOnWriteArrayList<>();
+        final ConcurrentLinkedQueue<String> pendingUserMessages = new ConcurrentLinkedQueue<>();
     }
 
     private static String key(String sessionId) {
@@ -210,6 +214,28 @@ public class SessionStreamHub {
             try { em.complete(); } catch (Exception ignored) {}
         }
         ch.emitters.clear();
+    }
+
+    /** 用户在执行中追加消息：入队并通知前端已收到。 */
+    public boolean injectMessage(String sessionId, String message) {
+        Channel ch = channels.get(key(sessionId));
+        if (ch == null || ch.status != Status.running) return false;
+        ch.pendingUserMessages.offer(message);
+        fanOut(ch, "inject_ack", message.length() > 50 ? message.substring(0, 50) + "..." : message);
+        log.info("用户追加消息入队: sessionId={}, length={}", sessionId, message.length());
+        return true;
+    }
+
+    /** AgentLoop 每轮迭代开头调用：取出所有待处理消息（线程安全）。 */
+    public List<String> drainMessages(String sessionId) {
+        Channel ch = channels.get(key(sessionId));
+        if (ch == null) return List.of();
+        List<String> result = new ArrayList<>();
+        String msg;
+        while ((msg = ch.pendingUserMessages.poll()) != null) {
+            result.add(msg);
+        }
+        return result;
     }
 
     /** 周期清理：已结束且超过 TTL 的通道驱逐。 */

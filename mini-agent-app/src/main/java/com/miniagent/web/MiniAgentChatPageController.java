@@ -40,6 +40,8 @@ import com.miniagent.config.entity.ChatMessage;
 import com.miniagent.config.repository.ChatMessageRepository;
 import com.miniagent.config.repository.ChatTaskRepository;
 import com.miniagent.config.entity.ChatTask;
+import com.miniagent.config.repository.AgentTraceStepRepository;
+import com.miniagent.config.entity.AgentTraceStep;
 
 @Controller
 public class MiniAgentChatPageController {
@@ -56,6 +58,10 @@ public class MiniAgentChatPageController {
     private  ChatMessageRepository chatMessageRepository;
     @Autowired
     private  ChatTaskRepository chatTaskRepository;
+    @Autowired
+    private  AgentTraceStepRepository agentTraceStepRepository;
+    @Autowired
+    private  com.miniagent.agent.core.SessionStreamHub streamHub;
 
     @GetMapping("/")
     public String showChatPage(HttpServletRequest request) {
@@ -167,6 +173,27 @@ public class MiniAgentChatPageController {
         return null;
     }
 
+    // ========== 执行中追加消息 ==========
+
+    @PostMapping(value = "/api/chat/inject", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public java.util.Map<String, Object> injectMessage(@RequestBody java.util.Map<String, String> body, HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) {
+            return java.util.Map.of("success", false, "error", "Not authenticated");
+        }
+        String sessionId = body.get("sessionId");
+        String message = body.get("message");
+        if (sessionId == null || sessionId.isBlank() || message == null || message.isBlank()) {
+            return java.util.Map.of("success", false, "error", "sessionId and message required");
+        }
+        boolean ok = streamHub.injectMessage(sessionId, message);
+        if (!ok) {
+            return java.util.Map.of("success", false, "error", "No active task for this session");
+        }
+        return java.util.Map.of("success", true);
+    }
+
     // ========== SSE streaming ==========
 
     @PostMapping(value = "/chat/stream", consumes = MediaType.APPLICATION_JSON_VALUE)
@@ -184,6 +211,7 @@ public class MiniAgentChatPageController {
         }
         String message = req.getMessage();
         String sessionId = req.getSessionId();
+        String role = req.getRole();  // 获取角色选择
         List<String> images = req.getImages() == null ? List.of() : req.getImages();
         List<FileAttachment> files = req.getFiles() == null ? List.of() : req.getFiles();
         StringBuilder queryTask = new StringBuilder(message != null ? message : "");
@@ -191,7 +219,7 @@ public class MiniAgentChatPageController {
         if (req.getFileRefs() != null && !req.getFileRefs().isEmpty()) {
             queryTask.append(getFileMessageContext(req.getFileRefs()));
         }
-        return agentService.chatStreamMultimodal(userId, sessionId, message, images, files);
+        return agentService.chatStreamMultimodal(userId, sessionId, queryTask.toString(), images, files, role);
     }
 
     private String getFileMessageContext(List<FileRef> refs) {
@@ -368,5 +396,112 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public Map<String, TokenUsageTracker.UsageStats> allTokenUsage() {
         return TokenUsageTracker.getAll();
+    }
+
+    // ========== 轨迹监控 ==========
+
+    @GetMapping("/trace")
+    public String showTracePage(HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) {
+            return "login";
+        }
+        return "trace";
+    }
+
+    @GetMapping(value = "/api/traces", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public java.util.List<AgentTraceStep> getTraces(
+            @RequestParam(value = "sessionId", required = false) String sessionId,
+            @RequestParam(value = "executionId", required = false) String executionId) {
+        if (executionId != null && !executionId.isEmpty()) {
+            return agentTraceStepRepository.findByExecutionIdOrderByTurnIndexAscIdAsc(executionId);
+        }
+        return agentTraceStepRepository.findBySessionIdOrderByTurnIndexAscIdAsc(sessionId);
+    }
+
+    /** 获取某 session 下所有执行任务的列表（按 executionId 分组） */
+    @GetMapping(value = "/api/traces/executions", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public java.util.List<java.util.Map<String, Object>> getExecutions(@RequestParam("sessionId") String sessionId) {
+        java.util.List<AgentTraceStep> all = agentTraceStepRepository.findBySessionIdOrderByTurnIndexAscIdAsc(sessionId);
+        // 按 executionId 分组，返回每个执行的摘要
+        java.util.Map<String, java.util.List<AgentTraceStep>> grouped = new java.util.LinkedHashMap<>();
+        for (AgentTraceStep s : all) {
+            grouped.computeIfAbsent(s.getExecutionId(), k -> new java.util.ArrayList<>()).add(s);
+        }
+        java.util.List<java.util.Map<String, Object>> result = new java.util.ArrayList<>();
+        for (var entry : grouped.entrySet()) {
+            java.util.List<AgentTraceStep> steps = entry.getValue();
+            AgentTraceStep first = steps.get(0);
+            AgentTraceStep last = steps.get(steps.size() - 1);
+            String question = first.getUserQuestion();
+            // 尝试从 ANSWER 步骤获取答案摘要
+            String answerSummary = steps.stream()
+                    .filter(s -> "ANSWER".equals(s.getStepType()))
+                    .map(s -> s.getContent())
+                    .findFirst().orElse("");
+            if (answerSummary.length() > 100) answerSummary = answerSummary.substring(0, 100) + "...";
+            java.util.Map<String, Object> exec = new java.util.HashMap<>();
+            exec.put("executionId", entry.getKey());
+            exec.put("sessionId", sessionId);
+            exec.put("userQuestion", question != null ? question : "");
+            exec.put("answerSummary", answerSummary);
+            exec.put("stepCount", steps.size());
+            exec.put("startTime", first.getCreatedAt());
+            exec.put("endTime", last.getCreatedAt());
+            exec.put("status", last.getStatus());
+            result.add(exec);
+        }
+        return result;
+    }
+
+    @GetMapping(value = "/api/traces/summary", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public java.util.Map<String, Object> getTraceSummary(
+            @RequestParam(value = "sessionId", required = false) String sessionId,
+            @RequestParam(value = "executionId", required = false) String executionId) {
+        long totalSteps, totalTurns;
+        Long totalDuration;
+        java.util.List<Object[]> toolStats;
+        java.util.List<Object[]> slowestSteps = java.util.List.of();
+
+        if (executionId != null && !executionId.isEmpty()) {
+            totalSteps = agentTraceStepRepository.countByExecutionId(executionId);
+            totalTurns = agentTraceStepRepository.countDistinctTurnsByExecutionId(executionId);
+            totalDuration = agentTraceStepRepository.sumDurationByExecutionId(executionId);
+            toolStats = agentTraceStepRepository.toolStatsByExecutionId(executionId);
+            slowestSteps = agentTraceStepRepository.slowestStepsByExecutionId(executionId);
+        } else {
+            totalSteps = agentTraceStepRepository.countBySessionId(sessionId);
+            totalTurns = agentTraceStepRepository.countDistinctTurnsBySessionId(sessionId);
+            totalDuration = agentTraceStepRepository.sumDurationBySessionId(sessionId);
+            toolStats = agentTraceStepRepository.toolStatsBySessionId(sessionId);
+        }
+
+        java.util.List<java.util.Map<String, Object>> tools = new java.util.ArrayList<>();
+        for (Object[] row : toolStats) {
+            java.util.Map<String, Object> m = new java.util.HashMap<>();
+            m.put("name", row[0]);
+            m.put("count", row[1]);
+            m.put("avgDurationMs", Math.round(((Number) row[2]).doubleValue()));
+            tools.add(m);
+        }
+        java.util.List<java.util.Map<String, Object>> slowest = new java.util.ArrayList<>();
+        for (Object[] row : slowestSteps) {
+            if (slowest.size() >= 5) break;
+            java.util.Map<String, Object> m = new java.util.HashMap<>();
+            m.put("stepType", row[0]);
+            m.put("toolName", row[1]);
+            m.put("durationMs", row[2]);
+            slowest.add(m);
+        }
+        java.util.Map<String, Object> result = new java.util.HashMap<>();
+        result.put("totalSteps", totalSteps);
+        result.put("totalTurns", totalTurns);
+        result.put("totalDurationMs", totalDuration != null ? totalDuration : 0);
+        result.put("tools", tools);
+        result.put("slowestSteps", slowest);
+        return result;
     }
 }

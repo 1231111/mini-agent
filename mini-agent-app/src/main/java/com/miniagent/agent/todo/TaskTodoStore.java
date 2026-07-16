@@ -30,7 +30,7 @@ public class TaskTodoStore {
     private final Map<String, List<TodoItem>> todos = new ConcurrentHashMap<>();
 
     public synchronized List<TodoItem> get(String sessionId) {
-        return new ArrayList<>(todos.getOrDefault(safeKey(sessionId), Collections.emptyList()));
+        return Collections.unmodifiableList(todos.getOrDefault(safeKey(sessionId), Collections.emptyList()));
     }
 
     /**
@@ -146,11 +146,13 @@ public class TaskTodoStore {
         List<TodoItem> list = todos.getOrDefault(safeKey(sessionId), Collections.emptyList());
         if (list.isEmpty()) return null;
         int total = list.size();
-        long done = list.stream().filter(i -> i.status() == Status.completed).count();
+        int done = 0;
         TodoItem active = null;
         int position = 0;
         for (int i = 0; i < list.size(); i++) {
-            if (list.get(i).status() == Status.in_progress) { active = list.get(i); position = i + 1; break; }
+            TodoItem item = list.get(i);
+            if (item.status() == Status.completed) done++;
+            if (active == null && item.status() == Status.in_progress) { active = item; position = i + 1; }
         }
         if (active == null) {
             for (int i = 0; i < list.size(); i++) {
@@ -158,7 +160,7 @@ public class TaskTodoStore {
             }
         }
         if (active == null) return null;  // 全部完成 / 取消
-        return new SubGoal(active.content(), position, total, (int) done);
+        return new SubGoal(active.content(), position, total, done);
     }
 
     /** 当前子目标快照：文字 + 第几个/共几个 + 已完成数。 */
@@ -212,11 +214,16 @@ public class TaskTodoStore {
     /** 给系统提示用的 metadata：是否有计划、待办数 */
     public synchronized Map<String, Object> stats(String sessionId) {
         List<TodoItem> list = todos.getOrDefault(safeKey(sessionId), Collections.emptyList());
+        int pending = 0, inProg = 0, done = 0;
+        for (TodoItem item : list) {
+            switch (item.status()) {
+                case pending -> pending++;
+                case in_progress -> inProg++;
+                case completed -> done++;
+            }
+        }
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("total", list.size());
-        long pending = list.stream().filter(i -> i.status() == Status.pending).count();
-        long inProg  = list.stream().filter(i -> i.status() == Status.in_progress).count();
-        long done    = list.stream().filter(i -> i.status() == Status.completed).count();
         m.put("pending", pending);
         m.put("in_progress", inProg);
         m.put("completed", done);

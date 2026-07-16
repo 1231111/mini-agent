@@ -36,6 +36,7 @@ import com.miniagent.agent.web.FileContentExtractor;
 import com.miniagent.web.MiniAgentChatPageController;
 import com.miniagent.config.repository.ChatTaskRepository;
 import com.miniagent.config.entity.ChatTask;
+import com.miniagent.agent.delegate.RoleContext;
 
 import java.io.File;
 import java.io.IOException;
@@ -72,6 +73,7 @@ public class AgentChatApplicationService {
 
     private final AgentLoop agentLoop;
     private final ChatModel chatModel;
+    private final com.miniagent.agent.trace.TraceRecorder traceRecorder;
 
     private final ChatMemoryConfig.ChatMemoryProvider chatMemoryProvider;
     private final MemoryStore memoryStore;
@@ -90,6 +92,12 @@ public class AgentChatApplicationService {
 
     /** 正在运行的任务：sessionId -> true。用于前端查询任务状态。 */
     private final java.util.concurrent.ConcurrentHashMap<String, Boolean> runningTasks = new java.util.concurrent.ConcurrentHashMap<>();
+
+    @jakarta.annotation.PostConstruct
+    private void init() {
+        agentLoop.setTraceRecorder(traceRecorder);
+        agentLoop.setStreamHub(streamHub);
+    }
 
     /** 查询会话是否有正在运行的任务 */
     public boolean isTaskRunning(String sessionId) {
@@ -177,6 +185,9 @@ public class AgentChatApplicationService {
         if (toolNames.contains("comfyui_status")) {
             parts.add(PromptTemplates.COMFYUI_GUIDANCE);
         }
+        if (toolNames.contains("image_generate") && !toolNames.contains("comfyui_status")) {
+            parts.add(PromptTemplates.IMAGE_GENERATE_GUIDANCE);
+        }
         if (toolNames.contains("memory")) {
             parts.add(PromptTemplates.MEMORY_GUIDANCE);
         }
@@ -184,6 +195,11 @@ public class AgentChatApplicationService {
         // 任务规划/拆解（todo + delegate_task）
         if (toolNames.contains("todo") || toolNames.contains("delegate_task")) {
             parts.add(PromptTemplates.PLANNING_GUIDANCE);
+        }
+
+        // 角色化子Agent指导
+        if (toolNames.contains("delegate_task")) {
+            parts.add(PromptTemplates.ROLE_DELEGATION_GUIDANCE);
         }
 
         // 产出验证（能写代码又能执行命令时注入）
@@ -717,13 +733,18 @@ public class AgentChatApplicationService {
 
     public SseEmitter chatStreamWithImage(Long userId, String sessionId, String userMessage, String imageDataUrl) {
         return chatStreamMultimodal(userId, sessionId, userMessage,
-                (imageDataUrl == null || imageDataUrl.isBlank()) ? List.of() : List.of(imageDataUrl), null);
+                (imageDataUrl == null || imageDataUrl.isBlank()) ? List.of() : List.of(imageDataUrl), null, null);
     }
 
     /**
      * 统一多模态 SSE 入口：支持文字 + 任意张图片。
      */
-    public SseEmitter chatStreamMultimodal(Long userId, String sessionId, String userMessage, List<String> imageDataUrls, List<FileAttachment> files) {
+    public SseEmitter chatStreamMultimodal(Long userId, String sessionId, String userMessage, List<String> imageDataUrls, List<FileAttachment> files, String role) {
+        // 设置角色上下文
+        if (role != null && !role.isEmpty()) {
+            RoleContext.setRole(role);
+        }
+
         // 提取上传文件的文本内容
         List<FileAttachment> fileAttachments =
             files == null ? List.of() : files.stream()

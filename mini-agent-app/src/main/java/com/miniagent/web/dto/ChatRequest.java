@@ -17,5 +17,6 @@ public class ChatRequest {
     private List<String> images;
     private List<FileAttachment> files;
     private List<FileRef> fileRefs;
+    private String role;  // 角色选择：tester/developer/pm/designer/security/ops/dba/architect/tech_writer
 
 }

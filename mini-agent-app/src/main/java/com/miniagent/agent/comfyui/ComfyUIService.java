@@ -315,22 +315,16 @@ public class ComfyUIService {
             }
         });
 
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("status", "success");
-        result.put("prompt_id", promptId);
-        if (!images.isEmpty()) {
-            result.put("images", images);
-            result.put("image_count", images.size());
-            StringBuilder md = new StringBuilder();
-            for (String imgUrl : images) {
-                md.append("\n![生成的图片](").append(imgUrl).append(")");
-            }
-            result.put("markdown_images", md.toString().trim());
-            result.put("message", "图片生成成功！请把 markdown_images 中的链接原样输出给用户。");
-        } else {
-            result.put("message", "任务完成但未找到输出文件");
+        if (images.isEmpty()) {
+            return "{\"status\":\"error\",\"message\":\"任务完成但未找到输出文件\"}";
         }
-        return toJson(result);
+
+        // 直接返回 markdown 图片链接（前端可直接渲染，AgentLoop 可识别为媒体交付）
+        StringBuilder md = new StringBuilder();
+        for (String imgUrl : images) {
+            md.append("\n![生成的图片](").append(imgUrl).append(")");
+        }
+        return md.toString().trim();
     }
 
     /** 从 ComfyUI 下载文件到本地目录，返回本地文件名（不含路径），失败返回 null */

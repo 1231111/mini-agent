@@ -307,38 +307,51 @@
             align-items: center; text-align: center;
         }
         .welcome-logo {
-            width: 60px; height: 60px;
-            background: linear-gradient(135deg, #10a37f, #1a7f64);
+            width: 64px; height: 64px;
+            background: linear-gradient(135deg, #10a37f 0%, #1a7f64 50%, #0d6b55 100%);
             border-radius: 50%;
             display: flex; align-items: center; justify-content: center;
-            font-size: 28px; margin-bottom: 24px;
-            box-shadow: 0 0 0 8px rgba(16,163,127,.12);
+            font-size: 30px; margin-bottom: 28px;
+            box-shadow: 0 0 0 10px rgba(16,163,127,.1), 0 8px 24px rgba(16,163,127,.2);
+            animation: welcomePulse 3s ease-in-out infinite;
+        }
+        @keyframes welcomePulse {
+            0%,100%{box-shadow:0 0 0 10px rgba(16,163,127,.1),0 8px 24px rgba(16,163,127,.2)}
+            50%{box-shadow:0 0 0 14px rgba(16,163,127,.15),0 8px 32px rgba(16,163,127,.3)}
         }
         .welcome h1 {
-            font-size: 30px; font-weight: 600;
-            margin-bottom: 32px; color: var(--text);
+            font-size: 32px; font-weight: 700;
+            margin-bottom: 36px; color: var(--heading);
             line-height: 1.3;
+            background: linear-gradient(135deg, var(--text) 0%, var(--text2) 100%);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            background-clip: text;
         }
         .suggestion-grid {
             display: grid; grid-template-columns: 1fr 1fr;
-            gap: 10px; width: 100%; max-width: 560px;
+            gap: 12px; width: 100%; max-width: 560px;
             text-align: left;
         }
         .sug-card {
-            padding: 14px 16px;
+            padding: 16px 18px;
             border: 1px solid var(--border);
             border-radius: 14px;
             cursor: pointer;
             background: none;
-            transition: background .15s, border-color .15s;
+            transition: all .2s ease;
         }
-        .sug-card:hover { background: var(--surface); border-color: var(--border-strong); }
-        .sug-card .s-title { font-size: 13.5px; font-weight: 500; color: var(--text); margin-bottom: 3px; }
-        .sug-card .s-sub  { font-size: 12px; color: var(--text3); }
+        .sug-card:hover {
+            background: var(--surface);
+            border-color: var(--border-strong);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,.08);
+        }
+        .sug-card .s-title { font-size: 14px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+        .sug-card .s-sub  { font-size: 12.5px; color: var(--text3); line-height: 1.5; }
 
         /* ----- Message rows ----- */
-        .msg-row { padding: 4px 0; animation: msgIn .2s ease; }
-        @keyframes msgIn { from{opacity:0;transform:translateY(5px)} to{opacity:1;transform:translateY(0)} }
+        .msg-row { padding: 6px 0; animation: msgIn .3s ease; }
+        @keyframes msgIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
 
         /* Container limits width and centers */
         .msg-inner {
@@ -356,137 +369,242 @@
             background: var(--user-bubble);
             border: 1px solid var(--border);
             border-radius: 18px 18px 4px 18px;
-            padding: 11px 16px;
-            max-width: 90%;
+            padding: 12px 18px;
+            max-width: 85%;
             font-size: 15px;
-            line-height: 1.65;
+            line-height: 1.7;
             color: var(--text);
             word-break: break-word;
+            box-shadow: 0 1px 4px rgba(0,0,0,.04);
         }
         .user-bubble img {
             max-width: 260px; max-height: 200px;
-            border-radius: 10px; margin-bottom: 6px;
+            border-radius: 10px; margin-bottom: 8px;
             display: block;
         }
 
-        /* ---- BOT message: full-width, no background ---- */
+        /* ---- BOT message: card style with subtle background ---- */
         .bot-row .msg-inner {
             display: flex;
-            gap: 14px;
+            gap: 16px;
             align-items: flex-start;
         }
         .bot-avatar {
-            width: 28px; height: 28px; border-radius: 50%;
-            background: linear-gradient(135deg, #10a37f, #0d7a62);
+            width: 34px; height: 34px; border-radius: 50%;
+            background: linear-gradient(135deg, #10a37f 0%, #0d7a62 50%, #0a6b54 100%);
             display: flex; align-items: center; justify-content: center;
-            font-size: 13px; flex-shrink: 0;
-            margin-top: 4px;
+            font-size: 15px; flex-shrink: 0;
+            margin-top: 2px;
+            box-shadow: 0 0 0 3px rgba(16,163,127,.12), 0 2px 8px rgba(16,163,127,.2);
+            transition: box-shadow .2s ease;
         }
-        .bot-content { flex: 1; min-width: 0; }
+        .bot-row:hover .bot-avatar {
+            box-shadow: 0 0 0 4px rgba(16,163,127,.18), 0 4px 12px rgba(16,163,127,.28);
+        }
+        .bot-content {
+            flex: 1; min-width: 0;
+            background: var(--surface);
+            border-radius: 16px;
+            padding: 16px 20px;
+            transition: background .2s ease;
+        }
 
         /* Streaming blinking cursor */
         .bot-body.streaming::after {
             content: '▋';
             animation: cur 1s step-end infinite;
-            color: var(--accent); font-size: 13px; margin-left: 1px;
+            color: var(--accent); font-size: 14px; margin-left: 2px;
+            font-weight: 300;
         }
         @keyframes cur { 0%,100%{opacity:1} 50%{opacity:0} }
 
         /* Typing dots */
-        .typing-dots { display: flex; gap: 4px; padding: 6px 0; }
+        .typing-dots { display: flex; gap: 5px; padding: 8px 0; }
         .typing-dots span {
-            width: 7px; height: 7px; background: var(--text2);
+            width: 8px; height: 8px;
+            background: var(--accent);
             border-radius: 50%;
-            animation: td 1.2s infinite ease-in-out;
+            animation: td 1.4s infinite ease-in-out;
+            opacity: .5;
         }
         .typing-dots span:nth-child(2) { animation-delay: .2s; }
         .typing-dots span:nth-child(3) { animation-delay: .4s; }
-        @keyframes td { 0%,80%,100%{opacity:.3;transform:scale(.8)} 40%{opacity:1;transform:scale(1)} }
+        @keyframes td { 0%,80%,100%{opacity:.3;transform:scale(.7)} 40%{opacity:.8;transform:scale(1)} }
 
         /* Bot action row */
         .bot-actions {
-            display: flex; gap: 2px; margin-top: 8px;
-            opacity: 0; transition: opacity .15s;
+            display: flex; gap: 2px; margin-top: 10px;
+            opacity: 0; transition: opacity .2s ease;
         }
         .bot-row:hover .bot-actions { opacity: 1; }
         .ba-btn {
-            display: flex; align-items: center; gap: 4px;
-            padding: 4px 8px; border-radius: 7px;
-            border: none; background: none;
+            display: flex; align-items: center; gap: 5px;
+            padding: 5px 10px; border-radius: 8px;
+            border: 1px solid transparent; background: none;
             color: var(--text3); font-size: 12px; font-family: inherit;
-            cursor: pointer; transition: color .12s, background .12s;
+            cursor: pointer; transition: all .15s ease;
         }
-        .ba-btn:hover { color: var(--text2); background: var(--surface); }
+        .ba-btn:hover {
+            color: var(--text2);
+            background: var(--surface2);
+            border-color: var(--border);
+        }
         .ba-btn svg { width: 13px; height: 13px; }
 
         /* Markdown body */
         .bot-body {
-            font-size: 15px; line-height: 1.75;
+            font-size: 15px; line-height: 1.8;
             color: var(--text); word-wrap: break-word;
         }
-        .bot-body p { margin: 8px 0; }
+        .bot-body p { margin: 10px 0; }
         .bot-body p:first-child { margin-top: 0; }
         .bot-body p:last-child  { margin-bottom: 0; }
-        .bot-body h1 { font-size: 22px; font-weight: 700; margin: 20px 0 10px; color: var(--heading); }
-        .bot-body h2 { font-size: 18px; font-weight: 600; margin: 18px 0 8px; color: var(--heading); }
-        .bot-body h3 { font-size: 16px; font-weight: 600; margin: 14px 0 6px; color: var(--heading); }
-        .bot-body ul, .bot-body ol { padding-left: 22px; margin: 8px 0; }
-        .bot-body li { margin: 5px 0; }
+        .bot-body h1 {
+            font-size: 22px; font-weight: 700;
+            margin: 24px 0 12px; padding-bottom: 8px;
+            color: var(--heading);
+            border-bottom: 2px solid var(--border);
+        }
+        .bot-body h1:first-child { margin-top: 0; }
+        .bot-body h2 {
+            font-size: 18px; font-weight: 600;
+            margin: 20px 0 10px; padding-bottom: 6px;
+            color: var(--heading);
+            border-bottom: 1px solid var(--border);
+        }
+        .bot-body h2:first-child { margin-top: 0; }
+        .bot-body h3 {
+            font-size: 16px; font-weight: 600;
+            margin: 16px 0 8px;
+            color: var(--heading);
+        }
+        .bot-body h3:first-child { margin-top: 0; }
+        .bot-body ul, .bot-body ol { padding-left: 24px; margin: 10px 0; }
+        .bot-body li { margin: 6px 0; line-height: 1.7; }
+        .bot-body li::marker { color: var(--accent); }
         .bot-body strong { font-weight: 600; color: var(--strong); }
-        .bot-body a { color: var(--accent); text-decoration: none; }
-        .bot-body a:hover { text-decoration: underline; }
-        .bot-body hr { border:none; border-top:1px solid var(--border); margin:16px 0; }
+        .bot-body em { font-style: italic; opacity: .9; }
+        .bot-body a {
+            color: var(--accent); text-decoration: none;
+            border-bottom: 1px solid transparent;
+            transition: border-color .15s;
+        }
+        .bot-body a:hover { border-bottom-color: var(--accent); }
+        .bot-body hr {
+            border: none; height: 1px;
+            background: linear-gradient(90deg, transparent, var(--border-strong), transparent);
+            margin: 20px 0;
+        }
+
+        /* 引用块 */
+        .bot-body blockquote {
+            border-left: 3px solid var(--accent);
+            padding: 10px 16px;
+            margin: 14px 0;
+            background: var(--accent-soft);
+            border-radius: 0 8px 8px 0;
+            color: var(--text2);
+            font-size: 14px;
+        }
+        .bot-body blockquote p { margin: 4px 0; }
+        .bot-body blockquote p:first-child { margin-top: 0; }
+        .bot-body blockquote p:last-child { margin-bottom: 0; }
+
+        /* 表格 */
+        .bot-body table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 14px 0;
+            font-size: 14px;
+            border-radius: 10px;
+            overflow: hidden;
+            border: 1px solid var(--border);
+        }
+        .bot-body thead th {
+            background: var(--surface2);
+            padding: 10px 14px;
+            text-align: left;
+            font-weight: 600;
+            color: var(--heading);
+            border-bottom: 2px solid var(--border-strong);
+            font-size: 13px;
+        }
+        .bot-body tbody td {
+            padding: 9px 14px;
+            border-bottom: 1px solid var(--border);
+            vertical-align: top;
+        }
+        .bot-body tbody tr:last-child td { border-bottom: none; }
+        .bot-body tbody tr:hover { background: var(--accent-soft); }
+        .bot-body tbody tr:nth-child(even) { background: rgba(255,255,255,.02); }
+        [data-theme="light"] .bot-body tbody tr:nth-child(even) { background: rgba(0,0,0,.02); }
         /* code block */
         .bot-body pre {
             background: var(--code-bg);
             border: 1px solid var(--border);
-            border-radius: 10px;
+            border-radius: 12px;
             overflow: hidden;
-            margin: 14px 0;
+            margin: 16px 0;
             font-size: 13.5px;
+            box-shadow: 0 2px 8px rgba(0,0,0,.06);
         }
         .code-hdr {
             display: flex; align-items: center;
             justify-content: space-between;
-            padding: 7px 14px;
+            padding: 8px 16px;
             background: var(--code-hdr-bg);
             border-bottom: 1px solid var(--border);
             font-size: 12px; color: var(--text3);
+            letter-spacing: .02em;
+        }
+        .code-hdr span {
+            display: flex; align-items: center; gap: 6px;
+            font-weight: 500; text-transform: lowercase;
+        }
+        .code-hdr span::before {
+            content: '';
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: var(--accent);
+            opacity: .5;
         }
         .code-copy {
             display: flex; align-items: center; gap: 4px;
             background: none; border: none;
             color: var(--text3); cursor: pointer;
             font-size: 12px; font-family: inherit;
-            padding: 2px 6px; border-radius: 5px;
+            padding: 3px 8px; border-radius: 6px;
             transition: color .12s, background .12s;
         }
         .code-copy:hover { color: var(--text2); background: var(--surface2); }
         .code-copy svg { width: 12px; height: 12px; }
         .bot-body pre code {
-            display: block; padding: 14px 16px;
-            line-height: 1.6; overflow-x: auto;
-            font-family: "Fira Code", "SF Mono", Consolas, monospace;
+            display: block; padding: 16px 18px;
+            line-height: 1.65; overflow-x: auto;
+            font-family: "Fira Code", "SF Mono", "Cascadia Code", Consolas, monospace;
             color: var(--code-text);
+            font-size: 13px;
+            tab-size: 4;
         }
         .bot-body code:not(pre code) {
             background: var(--code-inline-bg);
-            padding: 1px 6px; border-radius: 5px;
+            padding: 2px 7px; border-radius: 6px;
             font-size: 13px;
             font-family: "Fira Code", Consolas, monospace;
             color: var(--code-inline);
+            border: 1px solid rgba(125,211,252,.1);
         }
         /* Generated images */
         .bot-body img {
             max-width: 100%; max-height: 500px;
-            border-radius: 12px; margin: 12px 0;
+            border-radius: 12px; margin: 14px 0;
             display: block; cursor: zoom-in;
             box-shadow: var(--shadow-img);
-            transition: transform .2s, box-shadow .2s;
+            transition: transform .25s ease, box-shadow .25s ease;
         }
         .bot-body img:hover {
-            transform: scale(1.01);
-            box-shadow: var(--shadow-img);
+            transform: scale(1.015);
+            box-shadow: 0 8px 32px rgba(0,0,0,.3);
         }
 
         /* =================================================================
@@ -545,7 +663,10 @@
         .input-box.has-preview {
             border-radius: 0 0 16px 16px;
         }
-        .input-box:focus-within { border-color: var(--accent); box-shadow: var(--shadow-input), 0 0 0 3px var(--accent-soft); }
+        .input-box:focus-within {
+            border-color: var(--accent);
+            box-shadow: var(--shadow-input), 0 0 0 3px var(--accent-soft), 0 0 20px rgba(16,163,127,.08);
+        }
 
         .input-box textarea {
             background: none; border: none; outline: none;
@@ -573,6 +694,48 @@
         .in-tool-btn.on { color: var(--accent); }
         .in-tool-btn svg { width: 17px; height: 17px; }
 
+        /* 角色选择器样式 */
+        .role-selector { position: relative; }
+        .role-btn {
+            width: auto !important;
+            padding: 0 8px;
+            gap: 4px;
+            font-size: 12px;
+        }
+        .role-btn svg { width: 14px; height: 14px; }
+        .role-btn.active {
+            background: var(--accent-soft) !important;
+            color: var(--accent) !important;
+        }
+        .role-menu {
+            display: none;
+            position: absolute;
+            bottom: 100%;
+            left: 0;
+            margin-bottom: 8px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 8px;
+            min-width: 180px;
+            box-shadow: 0 4px 20px rgba(0,0,0,.3);
+            z-index: 100;
+        }
+        .role-menu.show { display: block; }
+        .role-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background .12s;
+        }
+        .role-item:hover { background: var(--surface2); }
+        .role-item.active { background: var(--accent-soft); color: var(--accent); }
+        .role-icon { font-size: 16px; }
+        .role-name { font-size: 13px; }
+
         /* Send button — circle, green when active */
         .send-btn {
             width: 32px; height: 32px; border-radius: 50%;
@@ -581,9 +744,17 @@
             cursor: not-allowed; flex-shrink: 0;
             transition: background .15s, transform .15s, color .15s;
         }
-        .send-btn.ready { background: var(--accent); color: #fff; cursor: pointer; }
-        .send-btn.ready:hover { background: var(--accent-h); transform: scale(1.06); }
+        .send-btn.ready {
+            background: var(--accent); color: #fff; cursor: pointer;
+            box-shadow: 0 2px 8px rgba(16,163,127,.3);
+        }
+        .send-btn.ready:hover {
+            background: var(--accent-h); transform: scale(1.08);
+            box-shadow: 0 4px 14px rgba(16,163,127,.4);
+        }
         .send-btn:disabled { opacity: .55; cursor: not-allowed; }
+        .send-btn.streaming-mode { background: #f59e0b; color: #fff; cursor: pointer; opacity: 1; }
+        .send-btn.streaming-mode:hover { background: #d97706; transform: scale(1.08); }
         .send-btn svg { width: 14px; height: 14px; }
 
         .input-disclaimer {
@@ -611,13 +782,15 @@
         }
         .lb-close {
             position: absolute; top: 18px; right: 18px;
-            width: 38px; height: 38px;
+            width: 40px; height: 40px;
             display: flex; align-items: center; justify-content: center;
-            border-radius: 50%; background: rgba(255,255,255,.1);
-            border: none; color: #fff; font-size: 18px;
-            cursor: pointer; transition: background .15s;
+            border-radius: 50%; background: rgba(255,255,255,.12);
+            border: 1px solid rgba(255,255,255,.15);
+            backdrop-filter: blur(8px);
+            color: #fff; font-size: 18px;
+            cursor: pointer; transition: all .2s;
         }
-        .lb-close:hover { background: rgba(255,255,255,.2); }
+        .lb-close:hover { background: rgba(255,255,255,.25); transform: scale(1.05); }
 
         /* =================================================================
            DRAG OVERLAY
@@ -663,71 +836,119 @@
         /* =================================================================
            UTILS
            ================================================================= */
-        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar { width: 7px; }
         ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb {
+            background: var(--scrollbar);
+            border-radius: 4px;
+            border: 1px solid transparent;
+            background-clip: content-box;
+        }
+        ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-h); background-clip: content-box; }
 
         /* Tool progress hint */
         .progress-hint {
             font-size: 12.5px;
             color: var(--text3);
-            margin-top: 8px;
-            padding: 4px 0;
+            margin-top: 10px;
+            padding: 6px 10px;
+            background: var(--accent-soft);
+            border-radius: 8px;
+            display: inline-flex; align-items: center; gap: 6px;
             animation: fadeIn .3s ease;
+        }
+        .progress-hint::before {
+            content: '⏳'; font-size: 12px;
         }
         @keyframes fadeIn { from{opacity:0} to{opacity:1} }
 
         /* 思考 / 活动面板：实时展示模型思考与工具规划，让等待变可见 */
         .think-panel {
-            border-left: 2px solid var(--border, #e3e3e3);
-            padding: 4px 0 4px 12px;
-            margin-bottom: 10px;
+            background: var(--surface);
+            border-radius: 12px;
+            padding: 10px 14px;
+            margin-bottom: 14px;
             font-size: 12.5px;
-            line-height: 1.6;
+            line-height: 1.65;
             color: var(--text3);
-            animation: fadeIn .3s ease;
+            animation: thinkFadeIn .35s ease;
         }
+        @keyframes thinkFadeIn { from{opacity:0;transform:translateY(-4px)} to{opacity:1;transform:translateY(0)} }
         .think-panel .think-head {
-            display: flex; align-items: center; gap: 6px;
+            display: flex; align-items: center; gap: 8px;
             font-weight: 600; cursor: pointer; user-select: none;
-            color: var(--text2, #6b6b6b);
+            color: var(--text2);
+            padding: 2px 0;
         }
-        .think-panel .think-head .think-caret { transition: transform .2s ease; font-size: 10px; }
+        .think-panel .think-head::before {
+            content: '';
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: var(--accent);
+            animation: thinkPulse 1.5s ease-in-out infinite;
+        }
+        .think-panel.done .think-head::before {
+            animation: none;
+            opacity: .4;
+        }
+        @keyframes thinkPulse { 0%,100%{opacity:.4;transform:scale(.8)} 50%{opacity:1;transform:scale(1.2)} }
+        .think-panel .think-head .think-caret {
+            transition: transform .25s ease; font-size: 9px;
+            color: var(--text3);
+        }
         .think-panel.collapsed .think-caret { transform: rotate(-90deg); }
         .think-panel.collapsed .think-body { display: none; }
-        .think-panel.done { opacity: .65; }
+        .think-panel.done { opacity: .55; }
         .think-panel .think-body {
-            margin-top: 4px;
+            margin-top: 8px;
+            padding-top: 8px;
             white-space: pre-wrap;
             word-break: break-word;
-            max-height: 260px;
+            max-height: 280px;
             overflow-y: auto;
+            font-size: 12px;
+            color: var(--text3);
         }
-        .think-panel .think-act { color: var(--text3); margin-top: 4px; }
+        .think-panel .think-act {
+            color: var(--accent); margin-top: 6px;
+            font-size: 12px; font-weight: 500;
+            display: flex; align-items: center; gap: 4px;
+        }
+        .think-panel .think-act::before {
+            content: '⚡'; font-size: 11px;
+        }
 
         /* sub-goal 进度条：框架维护的当前子目标，展示任务推进 */
         .subgoal-bar {
-            margin-bottom: 10px;
+            margin-bottom: 14px;
             font-size: 12.5px;
             animation: fadeIn .3s ease;
+            background: var(--surface);
+            border-radius: 10px;
+            padding: 10px 14px;
         }
         .subgoal-bar .subgoal-label {
-            color: var(--text2, #6b6b6b);
+            color: var(--text2);
             font-weight: 600;
-            margin-bottom: 5px;
+            margin-bottom: 8px;
+            display: flex; align-items: center; gap: 6px;
+        }
+        .subgoal-bar .subgoal-label::before {
+            content: '📋'; font-size: 12px;
         }
         .subgoal-bar .subgoal-track {
-            height: 4px;
-            border-radius: 3px;
-            background: var(--border, #e3e3e3);
+            height: 6px;
+            border-radius: 4px;
+            background: var(--border);
             overflow: hidden;
         }
         .subgoal-bar .subgoal-fill {
             height: 100%;
             width: 0;
-            border-radius: 3px;
-            background: linear-gradient(90deg, #7c9cff, #5b7cfa);
-            transition: width .35s ease;
+            border-radius: 4px;
+            background: linear-gradient(90deg, var(--accent), #2dd4a8);
+            transition: width .4s ease;
+            box-shadow: 0 0 8px rgba(16,163,127,.3);
         }
 
         @media (max-width: 700px) {
@@ -884,6 +1105,60 @@
                                 <path d="M21 15l-5-5L5 21"/>
                             </svg>
                         </button>
+                        <!-- 角色选择器 -->
+                        <div class="role-selector" id="roleSelector">
+                            <button class="in-tool-btn role-btn" id="roleBtn" title="选择角色" onclick="toggleRoleMenu()">
+                                <svg fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
+                                    <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+                                    <circle cx="9" cy="7" r="4"/>
+                                    <path d="M22 21v-2a4 4 0 0 0-3-3.87"/>
+                                    <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                                </svg>
+                                <span id="roleLabel">角色</span>
+                            </button>
+                            <div class="role-menu" id="roleMenu">
+                                <div class="role-item" data-role="" onclick="selectRole('')">
+                                    <span class="role-icon">🤖</span>
+                                    <span class="role-name">通用模式</span>
+                                </div>
+                                <div class="role-item" data-role="tester" onclick="selectRole('tester')">
+                                    <span class="role-icon">🧪</span>
+                                    <span class="role-name">测试工程师</span>
+                                </div>
+                                <div class="role-item" data-role="developer" onclick="selectRole('developer')">
+                                    <span class="role-icon">💻</span>
+                                    <span class="role-name">开发工程师</span>
+                                </div>
+                                <div class="role-item" data-role="pm" onclick="selectRole('pm')">
+                                    <span class="role-icon">📋</span>
+                                    <span class="role-name">产品经理</span>
+                                </div>
+                                <div class="role-item" data-role="designer" onclick="selectRole('designer')">
+                                    <span class="role-icon">🎨</span>
+                                    <span class="role-name">UI设计师</span>
+                                </div>
+                                <div class="role-item" data-role="security" onclick="selectRole('security')">
+                                    <span class="role-icon">🔒</span>
+                                    <span class="role-name">安全工程师</span>
+                                </div>
+                                <div class="role-item" data-role="ops" onclick="selectRole('ops')">
+                                    <span class="role-icon">⚙️</span>
+                                    <span class="role-name">运维工程师</span>
+                                </div>
+                                <div class="role-item" data-role="dba" onclick="selectRole('dba')">
+                                    <span class="role-icon">🗄️</span>
+                                    <span class="role-name">数据库管理员</span>
+                                </div>
+                                <div class="role-item" data-role="architect" onclick="selectRole('architect')">
+                                    <span class="role-icon">🏗️</span>
+                                    <span class="role-name">架构师</span>
+                                </div>
+                                <div class="role-item" data-role="tech_writer" onclick="selectRole('tech_writer')">
+                                    <span class="role-icon">📝</span>
+                                    <span class="role-name">技术文档工程师</span>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                     <button class="send-btn" id="sendBtn" onclick="send()" title="发送 (Enter)">
                         <svg viewBox="0 0 24 24" fill="currentColor">
@@ -929,6 +1204,8 @@ let uploadedFileRefs = [];
 let uploadingCount = 0;  // 正在上传的文件数
 let previewSrcs   = [];
 let sidebarOpen  = true;
+let selectedRole = '';  // 当前选择的角色
+let isStreaming  = false;
 
 const $msg  = document.getElementById('messages');
 const $inp  = document.getElementById('msgInput');
@@ -977,7 +1254,9 @@ $inp.addEventListener('paste', e => {
 
 function onInputChange() {
     const hasText = $inp.value.trim().length > 0;
-    $send.classList.toggle('ready', hasText || selectedFiles.length > 0);
+    const hasContent = hasText || selectedFiles.length > 0;
+    $send.classList.toggle('ready', hasContent && !isStreaming);
+    $send.classList.toggle('streaming-mode', isStreaming && hasText);
 }
 
 function handleKey(e) {
@@ -1191,6 +1470,68 @@ $msg.addEventListener('scroll', () => {
         loadMoreMessages(currentId, true);
     }
 });
+
+// ---- 角色选择器 ----
+function toggleRoleMenu() {
+    const menu = document.getElementById('roleMenu');
+    menu.classList.toggle('show');
+    // 点击外部关闭
+    if (menu.classList.contains('show')) {
+        setTimeout(() => {
+            document.addEventListener('click', closeRoleMenu, { once: true });
+        }, 0);
+    }
+}
+
+function closeRoleMenu() {
+    document.getElementById('roleMenu').classList.remove('show');
+}
+
+function selectRole(role) {
+    selectedRole = role;
+    const btn = document.getElementById('roleBtn');
+    const label = document.getElementById('roleLabel');
+    const menu = document.getElementById('roleMenu');
+
+    // 更新按钮状态
+    if (role) {
+        btn.classList.add('active');
+        const roleNames = {
+            'tester': '测试工程师',
+            'developer': '开发工程师',
+            'pm': '产品经理',
+            'designer': 'UI设计师',
+            'security': '安全工程师',
+            'ops': '运维工程师',
+            'dba': '数据库管理员',
+            'architect': '架构师',
+            'tech_writer': '技术文档工程师'
+        };
+        label.textContent = roleNames[role] || role;
+    } else {
+        btn.classList.remove('active');
+        label.textContent = '角色';
+    }
+
+    // 更新菜单项状态
+    menu.querySelectorAll('.role-item').forEach(item => {
+        item.classList.toggle('active', item.dataset.role === role);
+    });
+
+    // 关闭菜单
+    menu.classList.remove('show');
+
+    // 保存到本地存储
+    localStorage.setItem('mini_agent_role', role);
+}
+
+// 页面加载时恢复角色选择
+(function() {
+    const saved = localStorage.getItem('mini_agent_role');
+    if (saved) {
+        selectRole(saved);
+    }
+})();
 
 function scrollToBottom(smooth = false) {
     $msg.scrollTo({ top: $msg.scrollHeight, behavior: smooth ? 'smooth' : 'instant' });
@@ -1407,7 +1748,7 @@ function buildBotRow(text) {
     const row = document.createElement('div');
     row.className = 'msg-row bot-row';
     const bid = 'bb_' + Date.now() + '_' + Math.random().toString(36).slice(2,5);
-    row.innerHTML = '<div class="msg-inner"><div class="bot-avatar">M</div><div class="bot-content"><div class="bot-body" id="' + bid + '">' + renderMD(text) + '</div></div></div>';
+    row.innerHTML = '<div class="msg-inner"><div class="bot-avatar">🤖</div><div class="bot-content"><div class="bot-body" id="' + bid + '">' + renderMD(text) + '</div><div class="bot-actions"><button class="ba-btn" onclick="copyBotMsg(this)" title="复制"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>复制</button></div></div></div>';
     return row;
 }
 
@@ -1429,17 +1770,49 @@ function renderConvMessages(id) {
 }
 
 /* =========================================================================
+   STREAMING STATE & MESSAGE INJECTION
+   ========================================================================= */
+function setStreaming(on) {
+    isStreaming = on;
+    $send.title = on ? '追加说明 (Enter)' : '发送 (Enter)';
+    onInputChange();
+}
+
+async function injectMessage(text, sessionId) {
+    renderUserMsg(text, null, 0, [], true);
+    $inp.value = '';
+    $inp.style.height = 'auto';
+    onInputChange();
+    scrollToBottom();
+    try {
+        const resp = await fetch('/api/chat/inject', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId, message: text })
+        });
+        const data = await resp.json();
+        if (!data.success) {
+            console.warn('inject failed:', data);
+        }
+    } catch (e) {
+        console.warn('inject error:', e);
+    }
+}
+
+/* =========================================================================
    SEND MESSAGE
    ========================================================================= */
 function send() {
     const text = $inp.value.trim();
     if (!text && selectedFiles.length === 0) return;
     if (uploadingCount > 0) { alert('文件上传中，请等待'); return; }
-    // Check if all non-image files are uploaded
-    const nonImageCount = selectedFiles.filter(f => !f.type.startsWith('image/')).length;
-    const uploadedCount = uploadedFileRefs.filter(r => r).length;
-    if (nonImageCount > 0 && uploadedCount < nonImageCount) { alert('部分文件未上传成功'); return; }
-    if ($send.disabled) return;
+
+    // 执行中追加模式：agent 正在运行时，发送追加消息
+    if (isStreaming && currentId && text) {
+        injectMessage(text, currentId);
+        return;
+    }
+    if (isStreaming) return;
 
     // Hide welcome
     document.getElementById('welcomeScreen')?.remove();
@@ -1465,7 +1838,7 @@ function send() {
 
     // Bot placeholder
     const botBody = renderBotMsg('<div class="typing-dots"><span></span><span></span><span></span></div>', true);
-    $send.disabled = true;
+    setStreaming(true);
 
     // POST JSON 交互 — 替代 SSE 流式
     sendChatPost(text, currentId, filesCopy, refsCopy, botBody);
@@ -1487,7 +1860,7 @@ async function sendChatPost(text, sessionId, files, refs, botBody) {
             }
         }
 
-        const body = { message: text || '', sessionId: sessionId, images: images, files: fileAttachments, fileRefs: fileRefs };
+        const body = { message: text || '', sessionId: sessionId, images: images, files: fileAttachments, fileRefs: fileRefs, role: selectedRole };
         const resp = await fetch('/chat/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1497,7 +1870,7 @@ async function sendChatPost(text, sessionId, files, refs, botBody) {
         if (!resp.ok || !resp.body) {
             botBody.innerHTML = renderMD('❌ HTTP ' + resp.status);
             botBody.classList.remove('streaming');
-            $send.disabled = false; onInputChange(); scrollToBottom();
+            setStreaming(false); onInputChange(); scrollToBottom();
             return;
         }
 
@@ -1506,7 +1879,7 @@ async function sendChatPost(text, sessionId, files, refs, botBody) {
     } catch (err) {
         botBody.innerHTML = renderMD('❌ ' + err.message);
         botBody.classList.remove('streaming');
-        $send.disabled = false; onInputChange(); scrollToBottom();
+        setStreaming(false); onInputChange(); scrollToBottom();
     }
 }
 
@@ -1532,7 +1905,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             botBody.innerHTML = html;
             bindLightbox(botBody.closest('.bot-row'));
             addMsgToConv('assistant', answer, html, null);
-            $send.disabled = false; onInputChange(); scrollToBottom();
+            setStreaming(false); onInputChange(); scrollToBottom();
             // 停止该会话的轮询（如果有）
             stopPolling(sessionId);
             removeTaskRunningHint();
@@ -1688,7 +2061,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 // 缓冲已驱逐（任务早已结束）→ 回退：从数据库重载该会话
                 done = true;
                 if (sessionId === currentId) { switchConv(sessionId); }
-            } else if (name === 'session') { /* 忽略 */ }
+            } else if (name === 'session') { /* 忽略 */
+            } else if (name === 'inject_ack') { /* 前端已在 injectMessage() 中处理 */ }
         }
 
         /**
@@ -1758,7 +2132,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
     } catch (err) {
         botBody.innerHTML = renderMD('❌ ' + err.message);
         botBody.classList.remove('streaming');
-        $send.disabled = false; onInputChange(); scrollToBottom();
+        setStreaming(false); onInputChange(); scrollToBottom();
     }
 }
 
@@ -1791,17 +2165,18 @@ function addMsgToConv(role, text, html, imgSrc) {
 /* =========================================================================
    MESSAGE DOM BUILDERS
    ========================================================================= */
-function renderUserMsg(text, imgSrc, imgCount = imgSrc ? 1 : 0, fileNames = []) {
+function renderUserMsg(text, imgSrc, imgCount = imgSrc ? 1 : 0, fileNames = [], isInject = false) {
     const row = document.createElement('div');
     row.className = 'msg-row user-row';
     const moreCount = imgCount > 1 ? `<div style="font-size:11px;color:var(--text2);margin-top:4px">附 ${imgCount} 张图片</div>` : '';
     const fileList = fileNames.length > 0 ? `<div style="font-size:11px;color:var(--text2);margin-top:4px">附文件: ${fileNames.map(esc).join(', ')}</div>` : '';
+    const injectBadge = isInject ? `<span style="font-size:10px;background:var(--accent);color:#fff;padding:1px 6px;border-radius:8px;margin-right:6px;vertical-align:middle">补充</span>` : '';
     row.innerHTML = `
         <div class="msg-inner">
             <div class="user-bubble">
                 ${imgSrc ? `<img src="${escA(imgSrc)}" alt="上传图片">${moreCount}` : ''}
                 ${fileList}
-                ${text ? esc(text).replace(/\n/g, '<br>') : ''}
+                ${injectBadge}${text ? esc(text).replace(/\n/g, '<br>') : ''}
             </div>
         </div>`;
     $msg.appendChild(row);
@@ -1936,6 +2311,37 @@ function renderMD(t) {
     t = t.replace(/^## (.+)$/gm, '<h2>$1</h2>');
     t = t.replace(/^# (.+)$/gm, '<h1>$1</h1>');
     t = t.replace(/^---$/gm, '<hr>');
+
+    // 引用块：> text（支持多行连续引用）
+    t = t.replace(/(^> .+$\n?)+/gm, m => {
+        const inner = m.replace(/^> /gm, '').trim();
+        return `<blockquote>${inner}</blockquote>`;
+    });
+
+    // 表格：| header | header |\n|---|---|\n| cell | cell |
+    t = t.replace(/(^(\|.+\|)\n(\|[-:| ]+\|)\n((\|.+\|)\n?)*)/gm, m => {
+        const rows = m.trim().split('\n').filter(r => r.trim());
+        if (rows.length < 2) return m;
+        // 检测分隔行
+        const sepIdx = rows.findIndex(r => /^\|[-:| ]+\|$/.test(r.trim()));
+        if (sepIdx < 0) return m;
+        const headerRows = rows.slice(0, sepIdx);
+        const bodyRows = rows.slice(sepIdx + 1);
+        function parseCells(line) {
+            return line.split('|').slice(1, -1).map(c => c.trim());
+        }
+        let html = '<table><thead>';
+        headerRows.forEach(r => {
+            html += '<tr>' + parseCells(r).map(c => `<th>${c}</th>`).join('') + '</tr>';
+        });
+        html += '</thead><tbody>';
+        bodyRows.forEach(r => {
+            html += '<tr>' + parseCells(r).map(c => `<td>${c}</td>`).join('') + '</tr>';
+        });
+        html += '</tbody></table>';
+        return html;
+    });
+
     t = parseImgBang(t);
     t = parseBracketImg(t, '图片');
     t = parseLinks(t);
@@ -1944,6 +2350,9 @@ function renderMD(t) {
     t = t.replace(/(<li>[\s\S]*?<\/li>\n?)+/g, m => `<ul>${m}</ul>`);
     t = t.replace(/\n\n+/g, '</p><p>');
     t = t.replace(/\n/g, '<br>');
+    // 清理多余的 <br> 紧跟块元素
+    t = t.replace(/<br>(<\/?(h[1-3]|ul|ol|li|blockquote|table|thead|tbody|tr|th|td|pre|hr)[^>]*>)/gi, '$1');
+    t = t.replace(/(<\/?(h[1-3]|ul|ol|li|blockquote|table|thead|tbody|tr|th|td|pre|hr)[^>]*>)<br>/gi, '$1');
     if (!t.startsWith('<')) t = '<p>' + t + '</p>';
     return t;
 }
@@ -2004,7 +2413,7 @@ async function reconnectStream(sid) {
             startPolling(sid);
             return;
         }
-        $send.disabled = true;
+        setStreaming(true);
         const botBody = renderBotMsg('<div class="typing-dots"><span></span><span></span><span></span></div>', true);
         await consumeStream(resp.body.getReader(), botBody, sid);
     } catch (e) {
@@ -2040,7 +2449,7 @@ function showTaskRunningHint(sid) {
         <div class="bot-content">
             <div class="bot-body">
                 <div class="typing-dots"><span></span><span></span><span></span></div>
-                <div class="progress-hint">任务仍在运行中，请稍候...</div>
+                <span class="progress-hint">任务仍在运行中，请稍候...</span>
             </div>
         </div>
     </div>`;

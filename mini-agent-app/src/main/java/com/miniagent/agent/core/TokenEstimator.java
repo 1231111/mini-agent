@@ -4,9 +4,13 @@ import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.Content;
 import dev.langchain4j.data.message.ImageContent;
 import dev.langchain4j.data.message.TextContent;
+import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.data.message.SystemMessage;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Token 估算器：基于字符分类近似估算 token 数。
@@ -30,17 +34,36 @@ public class TokenEstimator {
     /** 单张图片的近似 token 开销（多模态，按中等分辨率保守估） */
     private static final int IMAGE_TOKENS = 700;
 
+    /** 文本估算缓存上限 */
+    private static final int CACHE_MAX_SIZE = 1000;
+
+    /** 文本 → token 数缓存（避免重复遍历长文本） */
+    private final Map<String, Integer> estimateCache = new ConcurrentHashMap<>();
+
     /**
-     * 估算文本的 token 数：按 CJK / 非 CJK 分别加权。
+     * 估算文本的 token 数：按 CJK / 非 CJK 分别加权。带缓存。
      */
     public int estimate(String text) {
+        if (text == null || text.isBlank()) return 0;
+        // 短文本不走缓存（缓存查找开销 > 重算）
+        if (text.length() < 200) return estimateDirect(text);
+        return estimateCache.computeIfAbsent(text, this::estimateDirect);
+    }
+
+    /** 实际估算逻辑（无缓存） */
+    private int estimateDirect(String text) {
         if (text == null || text.isBlank()) return 0;
         int cjk = 0, other = 0;
         for (int i = 0; i < text.length(); i++) {
             if (isCjk(text.charAt(i))) cjk++;
             else other++;
         }
-        return (int) Math.ceil(cjk * CJK_TOKENS_PER_CHAR + other * LATIN_TOKENS_PER_CHAR);
+        int result = (int) Math.ceil(cjk * CJK_TOKENS_PER_CHAR + other * LATIN_TOKENS_PER_CHAR);
+        // 缓存淘汰：超过上限时清空（简单策略，避免 LRU 开销）
+        if (estimateCache.size() > CACHE_MAX_SIZE) {
+            estimateCache.clear();
+        }
+        return result;
     }
 
     /** 判断是否为 CJK 表意文字 / 假名 / 韩文等高密度字符 */
@@ -83,7 +106,11 @@ public class TokenEstimator {
      */
     public int estimateMessages(List<ChatMessage> messages) {
         if (messages == null || messages.isEmpty()) return 0;
-        return messages.stream().mapToInt(this::estimate).sum();
+        int total = 0;
+        for (ChatMessage msg : messages) {
+            total += estimate(msg);
+        }
+        return total;
     }
 
     /**
@@ -98,21 +125,28 @@ public class TokenEstimator {
     }
 
     /**
-     * 提取 Content 的 token 估算
+     * 提取 Content 的 token 估算（直接类型检查，避免反射开销）
      */
     private int estimateContent(ChatMessage message) {
         int tokens = 0;
         try {
-            // 通过反射获取 singleContent 或 contents
-            var singleContentMethod = message.getClass().getMethod("singleContent");
-            Content content = (Content) singleContentMethod.invoke(message);
-            if (content instanceof TextContent tc) {
-                tokens += estimate(tc.text());
-            } else if (content instanceof ImageContent) {
-                tokens += IMAGE_TOKENS; // 图片固定开销（多模态）
+            List<Content> contents = null;
+            if (message instanceof UserMessage um) {
+                contents = um.contents();
+            } else if (message instanceof SystemMessage sm) {
+                // SystemMessage 只有纯文本
+                return estimate(sm.text());
+            }
+            if (contents != null) {
+                for (Content c : contents) {
+                    if (c instanceof TextContent tc) {
+                        tokens += estimate(tc.text());
+                    } else if (c instanceof ImageContent) {
+                        tokens += IMAGE_TOKENS;
+                    }
+                }
             }
         } catch (Exception e) {
-            // fallback: 尝试 toString
             tokens += estimate(message.toString());
         }
         return tokens;

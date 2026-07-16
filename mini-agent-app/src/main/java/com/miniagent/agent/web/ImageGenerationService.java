@@ -119,11 +119,11 @@ public class ImageGenerationService {
                     default            -> null;
                 };
                 if (imageUrl != null && !imageUrl.isBlank()) {
-                    ObjectNode result = MAPPER.createObjectNode();
-                    result.put("success", true);
-                    result.put("image", imageUrl);
-                    result.put("backend", backend);
-                    return MAPPER.writeValueAsString(result);
+                    // 统一返回 markdown 图片链接（前端可直接渲染，AgentLoop 可识别为媒体交付）
+                    if (imageUrl.startsWith("![")) return imageUrl;  // 已是 markdown
+                    if (imageUrl.startsWith("http")) return "![生成的图片](" + imageUrl + ")";  // URL → markdown
+                    // 本地路径（如 /static/images/xxx.png）→ markdown
+                    return "![生成的图片](" + imageUrl + ")";
                 }
                 lastError = "后端 " + backend + " 未返回图片URL";
                 log.warn("后端 {} 未返回图片，尝试下一个", backend);
@@ -200,12 +200,16 @@ public class ImageGenerationService {
         payload.put("model", chatAnywhereModel);
         payload.put("size", mapToOpenAiImageSize(imageSize));
 
+        // 图片保存目录（声明在 try 外，catch 中也需要访问）
+        Path projectRoot = Paths.get(System.getProperty("user.dir"));
+        Path imageDir = projectRoot.resolve(GENERATED_IMAGES_DIR);
+
         try {
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(base + "/images/generations"))
                     .header("Authorization", "Bearer " + key)
                     .header("Content-Type", "application/json")
-                    .timeout(Duration.ofSeconds(3000))
+                    .timeout(Duration.ofSeconds(500))
                     .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload), StandardCharsets.UTF_8))
                     .build();
 
@@ -238,10 +242,6 @@ public class ImageGenerationService {
             // 解码 Base64
             byte[] imageBytes = Base64.getDecoder().decode(b64Json);
 
-            // 获取项目根目录下的 generated-images 路径
-            Path projectRoot = Paths.get(System.getProperty("user.dir"));
-            Path imageDir = projectRoot.resolve(GENERATED_IMAGES_DIR);
-
             // 确保目录存在
             if (!Files.exists(imageDir)) {
                 Files.createDirectories(imageDir);
@@ -259,11 +259,17 @@ public class ImageGenerationService {
 
             log.info("图片已保存到: {}", outputPath.toAbsolutePath());
 
-            // 返回静态资源路径（前端可直接渲染）
-            return "/static/images/" + fileName;
+            // 返回 markdown 图片链接（前端可直接渲染，AgentLoop 可识别为媒体交付）
+            return "![生成的图片](/static/images/" + fileName + ")";
 
         } catch (Exception e) {
             log.error("ChatAnywhere 2CA 图像生成失败: {}", e.getMessage(), e);
+            // 安全网：HTTP 失败但图片可能已保存到磁盘（竞态条件），检查最近 60 秒内生成的图片
+            String recentImage = findRecentGeneratedImage(imageDir, 60);
+            if (recentImage != null) {
+                log.info("HTTP 失败但发现最近生成的图片: {}", recentImage);
+                return "![生成的图片](/static/images/" + recentImage + ")";
+            }
             return null;
         }
     }
@@ -621,6 +627,31 @@ public class ImageGenerationService {
             case "square_4K" -> "3840x2160";
             default -> "1024x1024";
         };
+    }
+
+    /**
+     * 安全网：在 generated-images 目录中查找最近 N 秒内生成的图片。
+     * 用于处理 HTTP 超时但图片已保存到磁盘的竞态条件。
+     */
+    private String findRecentGeneratedImage(Path imageDir, int withinSeconds) {
+        if (!Files.exists(imageDir)) return null;
+        long cutoff = System.currentTimeMillis() - withinSeconds * 1000L;
+        try (var stream = Files.list(imageDir)) {
+            return stream
+                    .filter(p -> p.toString().endsWith(".png") || p.toString().endsWith(".jpg"))
+                    .filter(p -> {
+                        try { return Files.getLastModifiedTime(p).toMillis() > cutoff; }
+                        catch (Exception e) { return false; }
+                    })
+                    .max(java.util.Comparator.comparingLong(p -> {
+                        try { return Files.getLastModifiedTime(p).toMillis(); }
+                        catch (Exception e) { return 0; }
+                    }))
+                    .map(p -> p.getFileName().toString())
+                    .orElse(null);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private static String errorJson(String message) {

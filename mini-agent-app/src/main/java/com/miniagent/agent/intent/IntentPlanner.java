@@ -36,6 +36,7 @@ public class IntentPlanner {
             "browser_screenshot", "browser_evaluate", "browser_close",
             "memory", "skill_list", "skill_view", "skill_manage",
             "todo", "delegate_task",
+            "image_generate",
             "comfyui_status", "comfyui_workflows", "comfyui_models", "comfyui_execute",
             "comfyui_txt2img", "comfyui_img2img", "comfyui_check_quality", "comfyui_img2video", "comfyui_tts"
     );

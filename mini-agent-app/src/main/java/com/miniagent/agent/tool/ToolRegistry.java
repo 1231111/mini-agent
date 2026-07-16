@@ -19,6 +19,8 @@ import java.util.stream.Collectors;
 public class ToolRegistry {
 
     private final Map<String, Tool> tools = new ConcurrentHashMap<>();
+    /** ToolSpecification 缓存：避免每次 getSpecifications 重建 schema */
+    private final Map<String, ToolSpecification> specCache = new ConcurrentHashMap<>();
 
     /**
      * 注册一个工具
@@ -28,6 +30,8 @@ public class ToolRegistry {
             throw new IllegalArgumentException("工具名称不能为空");
         }
         tools.put(tool.getName(), tool);
+        // 注册时预构建并缓存 ToolSpecification
+        specCache.put(tool.getName(), toSpecification(tool));
         log.debug("注册工具: {} - {}", tool.getName(), tool.getDescription());
     }
 
@@ -56,10 +60,13 @@ public class ToolRegistry {
         if (tool == null) {
             return "未知工具: " + toolName + "。可用工具: " + availableToolNames();
         }
-        String safeArgs = redactSensitive(argumentsJson);
-        log.info("执行工具: {} 参数: {}", toolName,
-                safeArgs != null && safeArgs.length() > 200
-                        ? safeArgs.substring(0, 200) + "..." : safeArgs);
+        // 延迟脱敏：只在 INFO 日志启用时执行正则替换
+        if (log.isInfoEnabled()) {
+            String safeArgs = redactSensitive(argumentsJson);
+            log.info("执行工具: {} 参数: {}", toolName,
+                    safeArgs != null && safeArgs.length() > 200
+                            ? safeArgs.substring(0, 200) + "..." : safeArgs);
+        }
         return tool.execute(argumentsJson);
     }
 
@@ -78,9 +85,7 @@ public class ToolRegistry {
      * 获取所有已注册工具的 ToolSpecification 列表（供 LangChain4j 使用）
      */
     public List<ToolSpecification> getSpecifications() {
-        return tools.values().stream()
-                .map(this::toSpecification)
-                .collect(Collectors.toList());
+        return new ArrayList<>(specCache.values());
     }
 
     public List<ToolSpecification> getSpecifications(Set<String> allowedToolNames) {
@@ -90,10 +95,12 @@ public class ToolRegistry {
         if (allowedToolNames.isEmpty()) {
             return List.of();
         }
-        return tools.values().stream()
-                .filter(t -> allowedToolNames.contains(t.getName()))
-                .map(this::toSpecification)
-                .collect(Collectors.toList());
+        List<ToolSpecification> result = new ArrayList<>();
+        for (String name : allowedToolNames) {
+            ToolSpecification spec = specCache.get(name);
+            if (spec != null) result.add(spec);
+        }
+        return result;
     }
 
     /**

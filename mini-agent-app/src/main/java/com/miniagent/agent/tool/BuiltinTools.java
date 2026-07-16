@@ -7,6 +7,7 @@ import com.miniagent.agent.comfyui.ImageQualityChecker;
 import com.miniagent.agent.memory.MemoryStore;
 import com.miniagent.agent.skill.SkillStore;
 import com.miniagent.agent.web.WebSearchService;
+import com.miniagent.agent.web.ImageGenerationService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -50,6 +51,8 @@ public class BuiltinTools {
     private  ComfyUIService comfyuiService;
     @Autowired
     private  ImageQualityChecker qualityChecker;
+    @Autowired
+    private  ImageGenerationService imageGenerationService;
 
     /**
      * 工具结果缓存：同一用户消息内，对 read_file / list_files 的重复调用直接返回缓存。
@@ -94,6 +97,7 @@ public class BuiltinTools {
         registerBrowserTools();
         registerMemoryTool();
         registerSkillTools();
+        registerImageGenerateTool();
         registerComfyUITools();
     }
 
@@ -617,6 +621,24 @@ public class BuiltinTools {
     }
 
 
+    // ==================== 云端图像生成（多后端自动降级） ====================
+
+    private void registerImageGenerateTool() {
+        registry.register("image_generate",
+                "生成图片（云端多后端自动降级：ChatAnywhere/MiMo/FAL/SiliconFlow/智谱CogView）。" +
+                "不需要 ComfyUI 服务，适合快速生成概念图、插画等。英文 prompt 效果最好。",
+                Map.of(
+                        "prompt", Map.of("type", "string", "description", "图片描述（英文效果最好，尽量详细描述画面内容、风格、光影）", "required", true),
+                        "aspect_ratio", Map.of("type", "string", "description", "比例: landscape(横版) / square(方形) / portrait(竖版)，默认 landscape")
+                ),
+                args -> {
+                    Map<String, Object> p = parseJson(args);
+                    String prompt = (String) p.get("prompt");
+                    String ratio = (String) p.getOrDefault("aspect_ratio", "landscape");
+                    return imageGenerationService.generate(prompt, ratio);
+                });
+    }
+
     // ==================== ComfyUI 工具（集成自 ClawHub skills） ====================
 
     private void registerComfyUITools() {
@@ -830,14 +852,14 @@ public class BuiltinTools {
     private static final Path WORKSPACE = Path.of(System.getProperty("user.dir")).toAbsolutePath().resolve("workspace");
 
     /**
-     * 当前任务名（静态，用于路由写文件到任务子目录）
+     * 当前任务名（线程隔离，用于路由写文件到任务子目录）
      * AgentChatApplicationService 在每次用户消息时更新该值。
      */
-    private static volatile String currentTaskName = "default";
+    private static final ThreadLocal<String> currentTaskName = ThreadLocal.withInitial(() -> "default");
 
     public static void setCurrentTaskName(String name) {
         if (name == null || name.isBlank()) {
-            currentTaskName = "default";
+            currentTaskName.set("default");
             return;
         }
         // 1. 只取首行
@@ -850,7 +872,11 @@ public class BuiltinTools {
         slug = slug.replaceAll("_{2,}", "_").replaceAll("^_|_$", "");
         // 4. 截断到 40 字符
         if (slug.length() > 40) slug = slug.substring(0, 40);
-        currentTaskName = slug.isBlank() ? "task_" + Integer.toHexString(name.hashCode()) : slug;
+        currentTaskName.set(slug.isBlank() ? "task_" + Integer.toHexString(name.hashCode()) : slug);
+    }
+
+    public static void clearCurrentTaskName() {
+        currentTaskName.remove();
     }
 
     private String readFile(String path, int offset, int limit) {
@@ -996,7 +1022,7 @@ public class BuiltinTools {
      */
     private Path resolveWorkspacePath(String path) {
         if (path == null || path.isBlank()) {
-            return WORKSPACE.resolve(currentTaskName).normalize();
+            return WORKSPACE.resolve(currentTaskName.get()).normalize();
         }
         // 统一分隔符 + 去掉 "./" 前缀
         String normalized = path.replace('\\', '/').trim();
@@ -1010,7 +1036,7 @@ public class BuiltinTools {
         }
         // 纯文件名 → 放到当前任务子目录
         if (p.getParent() == null) {
-            return WORKSPACE.resolve(currentTaskName).resolve(p).normalize();
+            return WORKSPACE.resolve(currentTaskName.get()).resolve(p).normalize();
         }
         // 其它相对路径 → 落到 workspace 下
         return WORKSPACE.resolve(p).normalize();

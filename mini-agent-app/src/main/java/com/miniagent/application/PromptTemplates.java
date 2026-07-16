@@ -129,19 +129,20 @@ public final class PromptTemplates {
 
 
     public static final String COMFYUI_GUIDANCE = """
-            ComfyUI 工具使用流程：
-            1. comfyui_status 检查是否在线
-            2. comfyui_models 查看可用模型（每个模型带风格标签）
-            3. 根据用户要求的画风选择合适的 checkpoint 模型
-            4. comfyui_txt2img(prompt=..., checkpoint="选中的模型名") 生图
-            5. 生成后调 comfyui_check_quality 检查图片质量（7分以上合格）
-            6. 不合格时根据建议调整提示词重新生成（最多重试2次）
-            7. 结果中的 markdown_images 字段包含可直接渲染的图片链接，必须原样复制到回复中
+            图片生成工具使用流程：
+            1. comfyui_status 检查 ComfyUI 是否在线
+            2. 如果 ComfyUI 不在线，立即改用 image_generate 工具（云端多后端自动降级，无需本地服务）
+            3. comfyui_models 查看可用模型（每个模型带风格标签）
+            4. 根据用户要求的画风选择合适的 checkpoint 模型
+            5. comfyui_txt2img(prompt=..., checkpoint="选中的模型名") 生图
+            6. 生成后调 comfyui_check_quality 检查图片质量（7分以上合格）
+            7. 不合格时根据建议调整提示词重新生成（最多重试2次）
 
             重要：
             - 不要跳过 comfyui_models，必须根据画风选模型，不要用默认模型。
-            - 图片生成成功后，必须把 markdown_images 中的链接原样输出给用户，前端才能显示图片。
-            - 不要用 "图片已生成" 这种空话，要带上实际的图片链接。
+            - 图片生成工具会直接返回可渲染的图片链接（markdown格式），你只需原样输出给用户即可。
+            - 不要添加额外解释，不要说"图片已生成"，直接输出图片链接。
+            - 如果 ComfyUI 未启动或连接失败，必须立即改用 image_generate 工具，不要要求用户手动启动 ComfyUI。
 
             当用户上传了图片时：
             - 图片路径会在消息中以 [用户上传了 N 张图片] 格式提供
@@ -154,11 +155,25 @@ public final class PromptTemplates {
             图生视频用 comfyui_img2video，TTS 用 comfyui_tts。
             """;
 
+    public static final String IMAGE_GENERATE_GUIDANCE = """
+            image_generate 工具说明（云端图片生成，无需本地服务）：
+            - 直接调用 image_generate(prompt="描述", aspect_ratio="landscape/square/portrait")
+            - 自动选择可用后端（ChatAnywhere/MiMo/FAL/SiliconFlow/智谱CogView），无需关心后端细节
+            - 英文 prompt 效果最好，中文也可以用
+            - 工具会直接返回可渲染的图片链接（markdown格式），你只需原样输出给用户即可
+            - 不要添加额外解释，不要说"图片已生成"，直接输出图片链接
+            """;
+
     public static final String PLANNING_GUIDANCE = """
             复杂任务（>=3步）开始前用 todo 工具写出子任务列表，每完成一步标记 completed。
             如果系统已经预填了任务计划（上下文里出现「当前子目标」或已有 todo 列表），不要再 todo set 整体重建——
             在它基础上推进：完成当前子目标就 todo update 标 completed，计划有偏差就 update 个别项，只有计划完全不适用时才重写。
             每轮专注「当前子目标」那一步，不要把整个任务从头重想一遍。
+
+            # 效率原则（节省迭代次数）
+            - 同一文件连续编辑时：第一次 read 后记住结构，后续章节直接 edit_file，不要每次都 search_code + read_file 重复探索。
+            - todo update 可以和其他工具调用合并在同一轮（一次回合可以调多个工具）。
+            - edit_file 的 old_string 只需包含足够定位的上下文（几行即可），不需要把整段旧内容都放进去。
 
             # 并行派发（重要，直接影响速度）
             可独立完成的子任务优先用 delegate_task 派发，避免主上下文被工具结果撑爆。
@@ -179,6 +194,29 @@ public final class PromptTemplates {
               - 生成了脚本（.sh/.py/.sql 等）→ 做语法检查或 dry-run（如 python -m py_compile、sql 语法校验）。
               - 无法在当前环境编译（缺依赖/缺数据库）→ 明确告诉用户「未编译验证，原因是 X」，不要假装验证过。
             不要在没验证的情况下说「已完成、可直接使用」。验证失败但已尽力时，如实说明卡在哪、还差什么。
+            """;
+
+    public static final String ROLE_DELEGATION_GUIDANCE = """
+
+            # 角色化子Agent（多角色协作）
+            delegate_task 支持通过 role 参数指定子Agent角色，每个角色有专业的系统提示词和工具集：
+            - tester（测试工程师）：擅长功能验证、Bug发现、自动化测试。工具：浏览器操作、文件读写。
+            - developer（开发工程师）：擅长代码编写、Bug修复、功能实现。工具：文件读写、代码搜索、命令执行。
+            - pm（产品经理）：擅长需求分析、文档撰写、方案设计。工具：文件读写、网页搜索。
+            - designer（UI设计师）：擅长界面审查、视觉验证、交互优化。工具：浏览器操作、截图。
+            - security（安全工程师）：擅长安全测试、漏洞扫描、权限验证。工具：浏览器操作、代码搜索。
+
+            使用场景：
+            - 测试场景：派 tester 角色执行功能测试，输出测试报告
+            - 开发场景：派 developer 角色修复Bug或实现功能
+            - 评审场景：派 designer 角色审查UI，派 pm 角色评审需求
+            - 安全场景：派 security 角色进行安全扫描
+            - 协作场景：多个角色并行工作，如 tester 测试 + developer 修复
+
+            示例：
+            - delegate_task(role="tester", goal="测试登录功能是否正常")
+            - delegate_task(role="developer", goal="修复密码验证失败的Bug")
+            - delegate_task(role="designer", goal="审查首页的UI布局是否规范")
             """;
 
 

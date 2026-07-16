@@ -12,9 +12,9 @@ spring:
     async:
       request-timeout: 30000000
   datasource:
-    url: jdbc:mysql://192.168.1.102:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
+    url: jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
     username: root
-    password: rootroot
+    password: mysql_root_pass
     driver-class-name: com.mysql.cj.jdbc.Driver
   jpa:
     hibernate:
@@ -38,16 +38,16 @@ server:
 langchain4j:
   open-ai:
     chat-model:
-      api-key:
+      api-key: tp-c9w1dsoho0uhtzdzmndf2a89pmzos44uut4za8rt2wkatxuc
       base-url: https://token-plan-cn.xiaomimimo.com/v1
-      model-name: mimo-v2.5-pro
+      model-name: mimo-v2.5
       timeout: 1200s
       returnThinking: true
       sendThinking: false   # 不把历史思考链回传给模型：UI 仍展示思考，但每轮输入大幅缩短，循环越往后省得越多
     streaming-chat-model:
-      api-key:
-      base-url:
-      model-name: mimo-v2.5-pro
+      api-key: tp-c9w1dsoho0uhtzdzmndf2a89pmzos44uut4za8rt2wkatxuc
+      base-url: https://token-plan-cn.xiaomimimo.com/v1
+      model-name: mimo-v2.5
       timeout: 1200s
       returnThinking: true
       sendThinking: false
@@ -77,7 +77,7 @@ agent:
     # 代码库语义检索（codebase_search 工具）。用 siliconflow 的 OpenAI 兼容 embedding 接口。
     # enabled=false 时该工具直接返回提示，不做索引，避免无 key 时报错。
     embedding-enabled: true
-    embedding-api-key:
+    embedding-api-key: sk-S5B6jjx0B3yMvxLAojE3Y94yxOzQUj7FmZFO8UTaFWcsDyby
     embedding-base-url: https://api.chatanywhere.tech/v1
     embedding-model: BAAI/bge-m3
     # 向量索引持久化文件（相对项目根）。增量索引按文件修改时间判断是否需要重嵌入。
@@ -98,9 +98,12 @@ web:
 # 图像生成配置
 image:
   gen:
-    mimo-api-key:
+    mimo-api-key: tp-c9w1dsoho0uhtzdzmndf2a89pmzos44uut4za8rt2wkatxuc
     mimo-base-url: https://token-plan-cn.xiaomimimo.com/v1
-    mimo-model: mimo-v2-image
+    mimo-model: MiMo-V2.5
+    chatanywhere-key: sk-S5B6jjx0B3yMvxLAojE3Y94yxOzQUj7FmZFO8UTaFWcsDyby
+    chatanywhere-base-url: https://api.chatanywhere.tech/v1
+    chatanywhere-model: gpt-image-2-ca
     siliconflow-api-key: cdfe3b37-673d-4830-9b27-621fd84193e1:d7706f80a383dad428e6f948b9b57e26
     fal-key:
     zhipu-api-key:

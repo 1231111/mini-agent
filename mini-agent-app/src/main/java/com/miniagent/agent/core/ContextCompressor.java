@@ -135,22 +135,9 @@ public class ContextCompressor {
         };
     }
 
+    /** 委托给 AgentLoop 的同名方法，避免重复实现 */
     private static String extractJsonField(String json, String field) {
-        String key = "\"" + field + "\"";
-        int ki = json.indexOf(key);
-        if (ki < 0) return "";
-        int colon = json.indexOf(':', ki + key.length());
-        if (colon < 0) return "";
-        int vs = colon + 1;
-        while (vs < json.length() && Character.isWhitespace(json.charAt(vs))) vs++;
-        if (vs >= json.length()) return "";
-        if (json.charAt(vs) == '"') {
-            int end = json.indexOf('"', vs + 1);
-            return end < 0 ? "" : json.substring(vs + 1, end);
-        }
-        int end = vs;
-        while (end < json.length() && json.charAt(end) != ',' && json.charAt(end) != '}') end++;
-        return json.substring(vs, end).trim();
+        return AgentLoop.extractJsonField(json, field);
     }
 
     private static String truncateStr(String s, int max) {
@@ -171,6 +158,40 @@ public class ContextCompressor {
         }
         // 确保尾部包含完整的用户消息
         cutIdx = ensureLastUserInTail(messages, cutIdx, headEnd);
+        // 确保不拆分 tool_call / tool_result 配对
+        cutIdx = ensureToolPairIntegrity(messages, cutIdx, headEnd);
+        return cutIdx;
+    }
+
+    /**
+     * 确保切割点不落在 AiMessage(tool_calls) 与其对应 ToolExecutionResultMessages 之间。
+     * 如果 cutIdx 处是 ToolExecutionResultMessage 且其配对的 AiMessage 在 cutIdx 之前（会被摘要掉），
+     * 则前移切割点到那个 AiMessage 的位置，把整组保留在 tail 中。
+     */
+    private int ensureToolPairIntegrity(List<ChatMessage> messages, int cutIdx, int headEnd) {
+        if (cutIdx >= messages.size()) return cutIdx;
+
+        // 向前查找：如果 cutIdx 处是 ToolExecutionResultMessage，找到它配对的 AiMessage
+        if (messages.get(cutIdx) instanceof ToolExecutionResultMessage tr) {
+            String resultId = tr.id();
+            for (int i = cutIdx - 1; i >= headEnd; i--) {
+                if (messages.get(i) instanceof AiMessage am && am.hasToolExecutionRequests()) {
+                    boolean matches = am.toolExecutionRequests().stream()
+                            .anyMatch(req -> req.id().equals(resultId));
+                    if (matches) {
+                        return i; // 把 AiMessage 也包含在 tail 中
+                    }
+                }
+            }
+        }
+
+        // 反向检查：如果 cutIdx-1 处是 AiMessage(tool_calls)，其 results 在 tail 中，
+        // 则把 AiMessage 也放入 tail
+        if (cutIdx > headEnd && messages.get(cutIdx - 1) instanceof AiMessage am
+                && am.hasToolExecutionRequests()) {
+            return cutIdx - 1;
+        }
+
         return cutIdx;
     }
 
@@ -204,77 +225,77 @@ public class ContextCompressor {
         return sb.toString();
     }
 
-    // ─── 摘要生成 ───
+    // ─── 摘要 + 记忆提取（合并为单次 LLM 调用）───
     private static final String SUMMARY_PREAMBLE = "你是一个上下文压缩专家。你的任务是生成简洁的交接摘要。\n" +
             "保留：关键决策、待办事项、重要数据、用户明确要求记住的内容。\n" +
             "删除：闲聊、重复信息、已完成的工具调用细节。";
 
     private static final String SUMMARY_TEMPLATE = "输出 %d 字以内的摘要，使用简洁的要点列表格式。";
 
-    private String generateSummary(List<ChatMessage> toSummarize, int summaryBudget, SessionState state) {
-        String content = serializeForSummary(toSummarize);
-        String prompt;
+    private static final String MEMORY_SEPARATOR = "---MEMORY---";
 
+    /**
+     * 合并摘要生成 + 记忆提取为单次 LLM 调用，节省一半压缩延迟。
+     * 输出格式：摘要部分 + "---MEMORY---" 分隔符 + 记忆提取部分。
+     */
+    private String generateSummaryAndExtractMemory(List<ChatMessage> toSummarize, int summaryBudget, SessionState state) {
+        String content = serializeForSummary(toSummarize);
+        String memoryPrompt = "\n\n在摘要之后，另起一行输出 " + MEMORY_SEPARATOR + "，然后提取关键信息到长期记忆（只提取将来仍有用的）：\n" +
+                "提取类别：1)用户偏好 2)重要决策 3)技术上下文 4)行动项\n" +
+                "格式：每条一行 \"类别: 内容\"。如果没有值得记忆的内容，在分隔符后输出 \"无\"。";
+
+        String prompt;
         if (state.previousSummary != null) {
             prompt = SUMMARY_PREAMBLE + "\n" +
                 "你正在更新一个上下文压缩摘要。以下是上一次的摘要和新的对话轮次。\n\n" +
                 "上一次摘要：\n" + state.previousSummary + "\n\n" +
                 "新的对话轮次：\n" + content + "\n\n" +
                 "更新摘要，保留仍然相关的信息，添加新的操作和状态变化。\n" +
-                String.format(SUMMARY_TEMPLATE, summaryBudget);
+                String.format(SUMMARY_TEMPLATE, summaryBudget) + memoryPrompt;
         } else {
             prompt = SUMMARY_PREAMBLE + "\n" +
                 "为以下对话生成结构化交接摘要：\n\n" + content + "\n\n" +
-                String.format(SUMMARY_TEMPLATE, summaryBudget);
+                String.format(SUMMARY_TEMPLATE, summaryBudget) + memoryPrompt;
         }
 
         try {
             List<ChatMessage> req = List.of(new UserMessage(prompt));
             ChatResponse resp = chatModel.chat(ChatRequest.builder().messages(req).build());
-            String summary = resp.aiMessage().text();
+            String fullResponse = resp.aiMessage().text();
+            if (fullResponse == null) return null;
+
+            // 按分隔符拆分：摘要 + 记忆
+            String summary;
+            String memoryPart = null;
+            int sepIdx = fullResponse.indexOf(MEMORY_SEPARATOR);
+            if (sepIdx >= 0) {
+                summary = fullResponse.substring(0, sepIdx).strip();
+                memoryPart = fullResponse.substring(sepIdx + MEMORY_SEPARATOR.length()).strip();
+            } else {
+                summary = fullResponse.strip();
+            }
+
             if (summary != null) state.previousSummary = summary;
+
+            // 异步保存记忆提取结果
+            if (memoryPart != null && !memoryPart.isBlank() && !memoryPart.contains("无")) {
+                try {
+                    String existing = memoryStore.getRawMidtermMemory();
+                    String newMemory = existing.isEmpty() ? memoryPart : existing + "\n" + memoryPart;
+                    if (newMemory.length() > 3000) {
+                        newMemory = newMemory.substring(newMemory.length() - 3000);
+                    }
+                    memoryStore.updateMidtermMemory(newMemory);
+                    log.info("压缩时提取记忆成功，提取 {} 字", memoryPart.length());
+                } catch (Exception e) {
+                    log.warn("压缩时保存记忆失败（不影响压缩）: {}", e.getMessage());
+                }
+            }
+
             return summary;
         } catch (Exception e) {
             log.error("摘要生成失败: {}", e.getMessage());
             return null;
-        }
-    }
-
-    /**
-     * 压缩前提取关键信息到中期记忆，防止信息丢失。
-     */
-    private void extractToMemory(List<ChatMessage> toSummarize) {
-        try {
-            String content = serializeForSummary(toSummarize);
-            if (content.length() < 100) return;
-
-            String prompt = "从以下对话中提取关键信息，写入长期记忆。只提取将来仍然有用的信息。\n\n" +
-                    "提取类别：\n" +
-                    "1. 用户偏好（沟通风格、技术栈偏好、工作习惯）\n" +
-                    "2. 重要决策（架构选择、技术选型、方案确认）\n" +
-                    "3. 技术上下文（项目结构、API地址、配置信息）\n" +
-                    "4. 行动项（待完成任务、承诺的后续步骤）\n\n" +
-                    "输出格式：每条一行，格式为 \"类别: 内容\"\n" +
-                    "如果没有值得记忆的内容，输出 \"无\"\n\n" +
-                    "对话内容：\n" +
-                    content.substring(0, Math.min(content.length(), 5000));
-
-            List<ChatMessage> req = List.of(new UserMessage(prompt));
-            var resp = chatModel.chat(
-                    dev.langchain4j.model.chat.request.ChatRequest.builder().messages(req).build());
-            String extracted = resp.aiMessage().text();
-
-            if (extracted != null && !extracted.isBlank() && !extracted.contains("无")) {
-                String existing = memoryStore.getRawMidtermMemory();
-                String newMemory = existing.isEmpty() ? extracted : existing + "\n" + extracted;
-                if (newMemory.length() > 3000) {
-                    newMemory = newMemory.substring(newMemory.length() - 3000);
-                }
-                memoryStore.updateMidtermMemory(newMemory);
-                log.info("压缩前提取记忆成功，提取 {} 字", extracted.length());
-            }
-        } catch (Exception e) {
-            log.warn("压缩前提取记忆失败（不影响压缩）: {}", e.getMessage());
         }
     }
 
@@ -353,12 +374,9 @@ public class ContextCompressor {
 
         log.info("压缩边界: 头部 {} + 中间 {} + 尾部 {}", headEnd, toSummarize.size(), tail.size());
 
-        // 阶段 2.5: 压缩前提取关键信息到记忆
-        extractToMemory(toSummarize);
-
-        // 阶段 3
+        // 阶段 3: 合并摘要生成 + 记忆提取（单次 LLM 调用）
         int summaryBudget = Math.min(MAX_SUMMARY_TOKENS, (int)(maxTokens * 0.05));
-        String summary = generateSummary(toSummarize, summaryBudget, state);
+        String summary = generateSummaryAndExtractMemory(toSummarize, summaryBudget, state);
 
         if (summary == null || summary.isBlank()) {
             summary = String.format("【上下文压缩】%d 条对话轮次已移除。请基于最近对话继续。", toSummarize.size());
