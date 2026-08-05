@@ -33,6 +33,7 @@ public class SecurityConfig {
                         .requestMatchers(
                                 "/",
                                 "/login",
+                                "/error",
                                 "/api/login",
                                 "/api/register",
                                 "/api/auth-status",

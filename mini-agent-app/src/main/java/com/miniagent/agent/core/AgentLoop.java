@@ -383,12 +383,12 @@ public class AgentLoop {
         }
 
         if (taskPlan != null) {
-            log.info("Agent计划: intent={}, taskGoal='{}', requiresPlan={}, allowedTools={}",
-                    taskPlan.intent(), taskPlan.taskGoal(), taskPlan.requiresStructuredPlan(),
-                    taskPlan.allowedTools());
+            log.info("Agent计划: intent={}, taskGoal='{}', requiresPlan={}, allowedToolCount={}",
+                    taskPlan.intent(), taskGoal, taskPlan.requiresStructuredPlan(),
+                    taskPlan.allowedTools() == null ? 0 : taskPlan.allowedTools().size());
         }
-        log.info("Agent任务开始: taskGoal='{}', maxIterations={}, toolsEnabled={}, explicitFileDelivery={}, requiresPlan={}",
-                taskGoal, iterations, hasTools, explicitlyNeedsFile, state.requiresStructuredPlan);
+        log.info("Agent任务开始: taskGoal='{}', maxIterations={}, toolsAvailable={}, explicitFileDelivery={}, requiresPlan={}",
+                taskGoal, iterations, toolSpecs.size(), explicitlyNeedsFile, state.requiresStructuredPlan);
 
         for (int turn = 0; turn < iterations; turn++) {
             // 检查用户执行中追加的消息
@@ -418,20 +418,25 @@ public class AgentLoop {
             refreshSubGoal(messages, state, sessionId, streamSink);
 
             String subGoalLog = state.lastSubGoalText != null ? state.lastSubGoalText : taskGoal;
-            log.info("Agent循环第 {}/{} 轮: {}, messages={}, tools={}",
-                    turn + 1, iterations, subGoalLog, messages.size(), state.toolsInvoked);
             state.currentTurn = turn;
             if (traceRecorder != null) traceRecorder.recordTurnStart(sessionId, turn, state.lastSubGoalText);
 
             // 1) 构建请求（按需过滤工具：复杂任务未 set 计划时仅放行 todo）
             var specsForTurn = buildToolSpecsForTurn(toolSpecs, hasTools, state.mediaDelivered, state, sessionId);
-            // 记录 LLM 请求上下文
+            log.info("Agent循环第 {}/{} 轮: {}, messages={}, availableTools={}, alreadyInvoked={}",
+                    turn + 1, iterations, truncate(subGoalLog, 80), messages.size(),
+                    specsForTurn.size(), state.toolsInvoked);
+            // 记录 LLM 请求上下文（超长 prompt 截断，避免轨迹写入拖死线程）
             if (traceRecorder != null) {
-                String promptCtx = formatMessagesForTrace(messages);
-                traceRecorder.recordThinking(sessionId, turn, "【LLM 请求】消息数: " + messages.size() + ", 工具数: " + specsForTurn.size() + "\n\n" + promptCtx);
+                String promptCtx = truncate(formatMessagesForTrace(messages), 8000);
+                traceRecorder.recordThinking(sessionId, turn,
+                        "【LLM 请求】消息数: " + messages.size() + ", 工具数: " + specsForTurn.size() + "\n\n" + promptCtx);
             }
+            log.info("开始调用 LLM（流式={}，工具数={}）…", streamSink != null, specsForTurn.size());
             long llmStartMs = System.currentTimeMillis();
             ChatResponse response = callLlm(chatModel, messages, specsForTurn, hasTools, streamSink);
+            log.info("LLM 调用结束，耗时 {}ms，response={}",
+                    System.currentTimeMillis() - llmStartMs, response == null ? "null" : "ok");
             long llmEndMs = System.currentTimeMillis();
 
             // 记录 LLM 响应
@@ -881,6 +886,10 @@ public class AgentLoop {
         AtomicReference<Throwable> errorRef = new AtomicReference<>();
         java.util.concurrent.atomic.AtomicBoolean receivedAny = new java.util.concurrent.atomic.AtomicBoolean(false);
 
+        // 超长库表/建表类 prompt + 思考链，首包常超过 90s；按输入规模自适应
+        long firstTokenTimeoutSec = estimateFirstTokenTimeoutSec(request);
+        log.info("流式 LLM 等待首包超时={}s（大上下文会自动加长）", firstTokenTimeoutSec);
+
         streamingChatModel.chat(request, new StreamingChatResponseHandler() {
             @Override
             public void onPartialThinking(PartialThinking partialThinking) {
@@ -913,17 +922,26 @@ public class AgentLoop {
             }
         });
 
-        // 首次等待 90s；如果已收到部分数据则延长到 300s（大输出正常情况）
-        long timeoutSec = 90;
-        if (!latch.await(timeoutSec, TimeUnit.SECONDS)) {
+        // 分段等待：每 15s 打日志，避免看起来像卡死；首包超时后再判失败
+        long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(firstTokenTimeoutSec);
+        while (!latch.await(15, TimeUnit.SECONDS)) {
             if (receivedAny.get()) {
-                // 已有数据流入，给更多时间完成
-                if (!latch.await(210, TimeUnit.SECONDS)) {
-                    throw new java.util.concurrent.TimeoutException("流式 LLM 调用超时");
+                // 已有思考/答案流入，再给最多 10 分钟收尾（大 SQL 生成）
+                if (!latch.await(600, TimeUnit.SECONDS)) {
+                    throw new java.util.concurrent.TimeoutException(
+                            "流式 LLM 调用超时（已收到部分输出但未完成）");
                 }
-            } else {
-                throw new java.util.concurrent.TimeoutException("流式 LLM 调用超时");
+                break;
             }
+            long remainSec = TimeUnit.NANOSECONDS.toSeconds(deadlineNs - System.nanoTime());
+            if (remainSec <= 0) {
+                throw new java.util.concurrent.TimeoutException(
+                        "流式 LLM 首包超时（" + firstTokenTimeoutSec + "s 内无任何增量）");
+            }
+            log.info("仍在等待 LLM 首包响应… 约剩余 {}s", remainSec);
+            try {
+                streamSink.onThinking("\n（模型处理中，长文档/建表任务首包可能较慢，请稍候…）\n");
+            } catch (Exception ignored) {}
         }
         Throwable err = errorRef.get();
         if (err != null) {
@@ -931,6 +949,25 @@ public class AgentLoop {
             throw new RuntimeException(err);
         }
         return responseRef.get();
+    }
+
+    /** 按请求体大小估计首包等待：思考模型 + 超长 schema 需要更久 */
+    private static long estimateFirstTokenTimeoutSec(ChatRequest request) {
+        long chars = 0;
+        if (request != null && request.messages() != null) {
+            for (ChatMessage m : request.messages()) {
+                if (m == null) continue;
+                String s = m.toString();
+                chars += s == null ? 0 : s.length();
+            }
+        }
+        int toolCount = request != null && request.toolSpecifications() != null
+                ? request.toolSpecifications().size() : 0;
+        chars += (long) toolCount * 400L;
+        if (chars >= 80_000) return 420; // ~7 min
+        if (chars >= 40_000) return 300; // 5 min
+        if (chars >= 15_000) return 180; // 3 min
+        return 120; // 默认 2 min（原 90s 对思考模型偏紧）
     }
 
     // ==================== 工具执行 ====================

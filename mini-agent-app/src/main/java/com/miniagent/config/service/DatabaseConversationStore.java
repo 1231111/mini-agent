@@ -31,18 +31,28 @@ public class DatabaseConversationStore {
         this.messageRepo = messageRepo;
     }
 
+    private static final int TITLE_MAX = 200;
+
     /** Create a new conversation for a user */
     @Transactional
     public Conversation create(Long userId, String id, String title) {
         ChatConversation entity = new ChatConversation();
         entity.setId(id);
         entity.setUserId(userId);
-        entity.setTitle(title == null || title.isBlank() ? "New Chat" : title.trim());
+        entity.setTitle(truncateTitle(title));
         long now = Instant.now().toEpochMilli();
         entity.setCreatedAt(now);
         entity.setUpdatedAt(now);
         conversationRepo.save(entity);
         return toModel(entity);
+    }
+
+    /** DB title 列 length=255；超长用户消息（整库 schema）必须截断 */
+    static String truncateTitle(String title) {
+        if (title == null || title.isBlank()) return "New Chat";
+        String oneLine = title.replaceAll("[\\r\\n]+", " ").trim();
+        if (oneLine.length() <= TITLE_MAX) return oneLine;
+        return oneLine.substring(0, TITLE_MAX - 3) + "...";
     }
 
     /** Get conversation by id */
@@ -106,8 +116,7 @@ public class DatabaseConversationStore {
                 long userMsgCount = messageRepo.findByConversationIdOrderByTimestampAsc(id)
                         .stream().filter(m -> "user".equals(m.getRole())).count();
                 if (userMsgCount == 1) {
-                    String autoTitle = content.length() > 40 ? content.substring(0, 40) + "..." : content;
-                    conv.setTitle(autoTitle.replaceAll("[\r\n]", " ").trim());
+                    conv.setTitle(truncateTitle(content.length() > 40 ? content.substring(0, 40) + "..." : content));
                 }
             }
             conversationRepo.save(conv);
@@ -138,8 +147,7 @@ public class DatabaseConversationStore {
                 long userMsgCount = messageRepo.findByConversationIdOrderByTimestampAsc(id)
                         .stream().filter(m -> "user".equals(m.getRole())).count();
                 if (userMsgCount == 1) {
-                    String autoTitle = content.length() > 40 ? content.substring(0, 40) + "..." : content;
-                    conv.setTitle(autoTitle.replaceAll("[\r\n]", " ").trim());
+                    conv.setTitle(truncateTitle(content.length() > 40 ? content.substring(0, 40) + "..." : content));
                 }
             }
             conversationRepo.save(conv);
@@ -150,7 +158,7 @@ public class DatabaseConversationStore {
     @Transactional
     public boolean rename(String id, String newTitle) {
         return conversationRepo.findById(id).map(conv -> {
-            conv.setTitle(newTitle.trim());
+            conv.setTitle(truncateTitle(newTitle));
             conv.setUpdatedAt(Instant.now().toEpochMilli());
             conversationRepo.save(conv);
             return true;

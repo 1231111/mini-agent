@@ -19,6 +19,8 @@ public final class ComplexTaskDetector {
                     + "|至少\\s*\\d+|不少于\\s*\\d+|\\d+\\s*个(文件|模块|接口|页面|服务)"
                     + "|generate\\s+(a\\s+)?(full|complete|entire)|scaffold|multi[- ]?step|end[- ]to[- ]end"
                     + "|然后.*(再|接着|最后)|先.*再.*最后"
+                    + "|建库|建表|建库和表|CREATE\\s+TABLE|CREATE\\s+DATABASE"
+                    + "|多张表|涉及的数据表|表结构和字段|字段含义如下"
                     + ")"
     );
 
@@ -35,11 +37,16 @@ public final class ComplexTaskDetector {
         if (userMessage == null || userMessage.isBlank()) return false;
         String text = userMessage.trim();
         if (COMPLEX_SIGNAL.matcher(text).find()) return true;
+        // 超长需求（如整库字段说明书）直接视为复杂任务
+        if (text.length() >= 3000) return true;
         // 长需求且含多个动作动词
         if (text.length() >= 100) {
             int verbs = countMatches(text, "(生成|实现|编写|设计|搭建|开发|创建|改造|重构|调研|验证)");
             if (verbs >= 3) return true;
         }
+        // 多表 schema 文档：出现多张表名即复杂
+        int tableMentions = countMatches(text, "(?i)\\b\\w+_super\\b|表名[：:]|CREATE\\s+TABLE");
+        if (tableMentions >= 2 && text.length() >= 500) return true;
         // 同时点名多种交付物
         int artifacts = 0;
         if (text.contains(".md") || text.contains("文档") || text.contains("方案")) artifacts++;
