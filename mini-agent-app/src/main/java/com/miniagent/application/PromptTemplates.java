@@ -76,16 +76,21 @@ public final class PromptTemplates {
             推理策略（按任务复杂度自行选择，简单任务跳过）：
 
             直接执行：简单问答、单步操作、明确指令。不要多余步骤。
-            思维链(CoT)：复杂分析、多步规划、需要判断的任务。推理要收敛——给出结论性的步骤，不要把每个犹豫、每个被否决的候选都写进来。
-            思维树(ToT)：创意类任务、有多个可行方案、需要对比选优。
-                用 delegate_task 并行派出 2-3 个子Agent，每个用不同思路，
-                收回结果后选最优方案继续执行。
+            思维链(CoT)+工具循环(ReAct)：复杂分析、多步规划。先收敛成结论性步骤（写入 todo），再逐步调工具执行与验收；
+                思考要短、要可行动，不要穷举被否决的候选。
+            思维树(ToT)：创意类/多方案对比时，用 delegate_task 并行派 2-3 个子Agent 走不同思路，
+                收回结果后选优继续；这是可选增强，不是默认路径。
             """;
 
     public static final String COMPLETION = """
 
             任务完成 → 交付产出物，结束。不要等用户确认"是否满意"。
             用户能否直接拿去用？如果需要用户再做大量工作，说明你还没做完。
+
+            # 硬性收尾条件
+            - 若上下文存在未完成的 todo（pending/in_progress），禁止最终收尾；先完成并 todo update。
+            - 标 completed 必须提供 evidence，对照该步的 done_when（如文件路径真实存在）。
+            - 没有客观产出（文件/图片/可验证结果）不要声称「已完成」。
             """;
 
     public static final String BEHAVIOR = """
@@ -165,24 +170,27 @@ public final class PromptTemplates {
             """;
 
     public static final String PLANNING_GUIDANCE = """
-            复杂任务（>=3步）开始前用 todo 工具写出子任务列表，每完成一步标记 completed。
-            如果系统已经预填了任务计划（上下文里出现「当前子目标」或已有 todo 列表），不要再 todo set 整体重建——
-            在它基础上推进：完成当前子目标就 todo update 标 completed，计划有偏差就 update 个别项，只有计划完全不适用时才重写。
-            每轮专注「当前子目标」那一步，不要把整个任务从头重想一遍。
+            # 结构化计划（强制）
+            复杂任务第一轮必须 todo(action=set)，每步包含：
+              - content：可执行的具体目标（禁止「理解需求」这类空步骤）
+              - done_when：验收标准，推荐 file_exists:workspace/任务/xxx.md | media_delivered | note_required
+            框架在未 set 计划前可能只允许调用 todo；未完成全部 todo 前禁止最终回复。
 
-            # 效率原则（节省迭代次数）
-            - 同一文件连续编辑时：第一次 read 后记住结构，后续章节直接 edit_file，不要每次都 search_code + read_file 重复探索。
-            - todo update 可以和其他工具调用合并在同一轮（一次回合可以调多个工具）。
-            - edit_file 的 old_string 只需包含足够定位的上下文（几行即可），不需要把整段旧内容都放进去。
+            如果系统已预填计划或上下文已有 todo 列表，不要整体 set 重建——
+            完成当前子目标就 update 标 completed（带 evidence），计划有偏差就改个别项。
 
-            # 并行派发（重要，直接影响速度）
-            可独立完成的子任务优先用 delegate_task 派发，避免主上下文被工具结果撑爆。
-            批量产出是天然并行任务，必须用 delegate_task 分包，不要在主循环里一个文件一个回合地串行写：
-              - 生成一整套代码模块（多个 .java/.sql/.md 文件）→ 按模块拆分，每个模块派一个子 Agent 并行生成。
-                例：「租户模块」「计费模块」「权限模块」各派一个 delegate_task，而不是主循环逐文件 write_file。
-              - 批量生成图片/关键帧、批量调研多个独立信息源 → 同理并行派发。
-            一次回合可以同时发起多个 delegate_task，它们会并行执行——主循环串行写 30 个文件要 30 个回合，
-            分 3 个子 Agent 并行只要 1 个回合的等待。子任务之间无依赖时，永远优先并行。
+            每轮只做「当前子目标」那一步；工具调用必须服务该步，不要跳去做无关探索。
+
+            # 效率原则
+            - 同一文件连续编辑：第一次 read 后记住结构，后续直接 edit_file。
+            - todo update 可与其他工具同一轮合并调用。
+            - edit_file 的 old_string 只需足够定位的几行上下文。
+
+            # 并行派发（硬性）
+            可独立完成的子任务必须用 delegate_task 派发，禁止主循环串行写大量文件：
+              - 多模块代码 / 多文档 / 多图 / 多信息源调研 → 一次回合发起多个 delegate_task。
+              - 子 Agent 的 context 写清路径、约束与验收；收回摘要后主 Agent 做整合与 todo 勾选。
+            子任务无依赖时永远优先并行。
             """;
 
     public static final String VERIFICATION_GUIDANCE = """

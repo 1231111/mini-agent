@@ -2,12 +2,13 @@ package com.miniagent.web;
 
 import com.miniagent.application.AgentChatApplicationService;
 import com.miniagent.agent.core.TokenUsageTracker;
+import com.miniagent.config.security.SessionCookieService;
 import com.miniagent.config.service.AuthService;
+import com.miniagent.config.service.DatabaseConversationStore;
 import com.miniagent.config.service.FileStorageService;
 import com.miniagent.web.dto.ChatRequest;
 import com.miniagent.web.dto.FileAttachment;
 import com.miniagent.web.dto.FileRef;
-import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.Data;
@@ -62,6 +63,10 @@ public class MiniAgentChatPageController {
     private  AgentTraceStepRepository agentTraceStepRepository;
     @Autowired
     private  com.miniagent.agent.core.SessionStreamHub streamHub;
+    @Autowired
+    private  SessionCookieService sessionCookieService;
+    @Autowired
+    private  DatabaseConversationStore conversationStore;
 
     @GetMapping("/")
     public String showChatPage(HttpServletRequest request) {
@@ -79,15 +84,7 @@ public class MiniAgentChatPageController {
     public Map<String, Object> login(@RequestBody LoginRequest req, HttpServletResponse response) {
         return authService.login(req.getUsername(), req.getPassword())
                 .map(user -> {
-                    Cookie cookie = new Cookie("uid", String.valueOf(user.getId()));
-                    cookie.setPath("/");
-                    cookie.setMaxAge(7 * 24 * 3600);
-                    cookie.setHttpOnly(true);
-                    response.addCookie(cookie);
-                    Cookie nameCookie = new Cookie("uname", user.getUsername());
-                    nameCookie.setPath("/");
-                    nameCookie.setMaxAge(7 * 24 * 3600);
-                    response.addCookie(nameCookie);
+                    sessionCookieService.issueSession(response, user.getId(), user.getUsername());
                     return Map.<String, Object>of("success", true, "userId", user.getId(), "username", user.getUsername(), "displayName", user.getDisplayName());
                 })
                 .orElse(Map.of("success", false, "message", "Invalid credentials"));
@@ -98,30 +95,15 @@ public class MiniAgentChatPageController {
     public Map<String, Object> register(@RequestBody RegisterRequest req, HttpServletResponse response) {
         return authService.register(req.getUsername(), req.getPassword(), req.getDisplayName())
                 .map(user -> {
-                    Cookie cookie = new Cookie("uid", String.valueOf(user.getId()));
-                    cookie.setPath("/");
-                    cookie.setMaxAge(7 * 24 * 3600);
-                    cookie.setHttpOnly(true);
-                    response.addCookie(cookie);
-                    Cookie nameCookie = new Cookie("uname", user.getUsername());
-                    nameCookie.setPath("/");
-                    nameCookie.setMaxAge(7 * 24 * 3600);
-                    response.addCookie(nameCookie);
+                    sessionCookieService.issueSession(response, user.getId(), user.getUsername());
                     return Map.<String, Object>of("success", true, "userId", user.getId(), "username", user.getUsername());
                 })
-                .orElse(Map.of("success", false, "message", "Username already exists"));
+                .orElse(Map.of("success", false, "message", "Username already exists or password too short"));
     }
 
     @GetMapping("/api/logout")
     public String logout(HttpServletResponse response) {
-        Cookie uidCookie = new Cookie("uid", "");
-        uidCookie.setPath("/");
-        uidCookie.setMaxAge(0);
-        response.addCookie(uidCookie);
-        Cookie unameCookie = new Cookie("uname", "");
-        unameCookie.setPath("/");
-        unameCookie.setMaxAge(0);
-        response.addCookie(unameCookie);
+        sessionCookieService.clearSession(response);
         return "redirect:/";
     }
 
@@ -159,18 +141,16 @@ public class MiniAgentChatPageController {
     }
 
     private Long getUserIdFromCookie(HttpServletRequest request) {
-        if (request.getCookies() != null) {
-            for (Cookie cookie : request.getCookies()) {
-                if ("uid".equals(cookie.getName())) {
-                    try {
-                        return Long.parseLong(cookie.getValue());
-                    } catch (NumberFormatException e) {
-                        return null;
-                    }
-                }
-            }
-        }
-        return null;
+        Long fromAttr = SessionCookieService.userIdFromRequest(request);
+        if (fromAttr != null) return fromAttr;
+        return sessionCookieService.resolveUserId(request);
+    }
+
+    /** Ensure session belongs to user (via conversation or prior tasks). */
+    private boolean ownsSession(Long userId, String sessionId) {
+        if (userId == null || sessionId == null || sessionId.isBlank()) return false;
+        if (conversationStore.ownedBy(userId, sessionId)) return true;
+        return chatTaskRepository.existsByUserIdAndSessionId(userId, sessionId);
     }
 
     // ========== 执行中追加消息 ==========
@@ -186,6 +166,9 @@ public class MiniAgentChatPageController {
         String message = body.get("message");
         if (sessionId == null || sessionId.isBlank() || message == null || message.isBlank()) {
             return java.util.Map.of("success", false, "error", "sessionId and message required");
+        }
+        if (!ownsSession(userId, sessionId) && !agentService.isTaskRunning(sessionId)) {
+            return java.util.Map.of("success", false, "error", "Forbidden");
         }
         boolean ok = streamHub.injectMessage(sessionId, message);
         if (!ok) {
@@ -301,7 +284,13 @@ public class MiniAgentChatPageController {
 
     @GetMapping(value = "/api/task-status", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, Object> taskStatus(@RequestParam("sessionId") String sessionId) {
+    public Map<String, Object> taskStatus(@RequestParam("sessionId") String sessionId,
+                                          HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) return Map.of("error", "Not authenticated");
+        if (!ownsSession(userId, sessionId) && !agentService.isTaskRunning(sessionId)) {
+            return Map.of("sessionId", sessionId, "running", false);
+        }
         boolean running = agentService.isTaskRunning(sessionId);
         return Map.of("sessionId", sessionId, "running", running);
     }
@@ -318,6 +307,16 @@ public class MiniAgentChatPageController {
             SseEmitter emitter = new SseEmitter(0L);
             try {
                 emitter.send(SseEmitter.event().name("error").data("Not authenticated"));
+                emitter.complete();
+            } catch (Exception e) {
+                emitter.completeWithError(e);
+            }
+            return emitter;
+        }
+        if (!ownsSession(userId, sessionId) && !agentService.isTaskRunning(sessionId)) {
+            SseEmitter emitter = new SseEmitter(0L);
+            try {
+                emitter.send(SseEmitter.event().name("error").data("Forbidden"));
                 emitter.complete();
             } catch (Exception e) {
                 emitter.completeWithError(e);
@@ -343,8 +342,11 @@ public class MiniAgentChatPageController {
 
     @GetMapping(value = "/api/conversation", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Object getConversation(@RequestParam("sessionId") String sessionId) {
-        var conv = agentService.getConversation(sessionId);
+    public Object getConversation(@RequestParam("sessionId") String sessionId,
+                                  HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) return Map.of("error", "Not authenticated");
+        var conv = agentService.getConversationForUser(userId, sessionId);
         if (conv == null) {
             return Map.of("exists", false, "sessionId", sessionId);
         }
@@ -382,20 +384,30 @@ public class MiniAgentChatPageController {
             @RequestParam("sessionId") String sessionId) {
         Long userId = getUserIdFromCookie(request);
         if (userId == null) return java.util.Map.of("error", "Not authenticated");
-        chatTaskRepository.deleteBySessionId(sessionId);
+        if (!ownsSession(userId, sessionId)) {
+            return java.util.Map.of("success", false, "error", "Forbidden");
+        }
+        chatTaskRepository.deleteByUserIdAndSessionId(userId, sessionId);
+        agentService.deleteConversationForUser(userId, sessionId);
         return java.util.Map.of("success", true);
     }
 
     @GetMapping(value = "/api/token-usage", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public TokenUsageTracker.UsageStats tokenUsage(@RequestParam("sessionId") String sessionId) {
+    public Object tokenUsage(@RequestParam("sessionId") String sessionId, HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) return Map.of("error", "Not authenticated");
+        if (!ownsSession(userId, sessionId)) return Map.of("error", "Forbidden");
         return TokenUsageTracker.get(sessionId);
     }
 
     @GetMapping(value = "/api/token-usage/all", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, TokenUsageTracker.UsageStats> allTokenUsage() {
-        return TokenUsageTracker.getAll();
+    public Object allTokenUsage(HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) return Map.of("error", "Not authenticated");
+        // Per-user aggregate not tracked; return empty to avoid cross-tenant leak
+        return Map.of();
     }
 
     // ========== 轨迹监控 ==========
@@ -411,9 +423,15 @@ public class MiniAgentChatPageController {
 
     @GetMapping(value = "/api/traces", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public java.util.List<AgentTraceStep> getTraces(
+    public Object getTraces(
+            HttpServletRequest request,
             @RequestParam(value = "sessionId", required = false) String sessionId,
             @RequestParam(value = "executionId", required = false) String executionId) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) return java.util.List.of();
+        if (sessionId != null && !sessionId.isBlank() && !ownsSession(userId, sessionId)) {
+            return java.util.List.of();
+        }
         if (executionId != null && !executionId.isEmpty()) {
             return agentTraceStepRepository.findByExecutionIdOrderByTurnIndexAscIdAsc(executionId);
         }
@@ -423,7 +441,11 @@ public class MiniAgentChatPageController {
     /** 获取某 session 下所有执行任务的列表（按 executionId 分组） */
     @GetMapping(value = "/api/traces/executions", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public java.util.List<java.util.Map<String, Object>> getExecutions(@RequestParam("sessionId") String sessionId) {
+    public java.util.List<java.util.Map<String, Object>> getExecutions(
+            @RequestParam("sessionId") String sessionId,
+            HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null || !ownsSession(userId, sessionId)) return java.util.List.of();
         java.util.List<AgentTraceStep> all = agentTraceStepRepository.findBySessionIdOrderByTurnIndexAscIdAsc(sessionId);
         // 按 executionId 分组，返回每个执行的摘要
         java.util.Map<String, java.util.List<AgentTraceStep>> grouped = new java.util.LinkedHashMap<>();
@@ -459,8 +481,14 @@ public class MiniAgentChatPageController {
     @GetMapping(value = "/api/traces/summary", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public java.util.Map<String, Object> getTraceSummary(
+            HttpServletRequest request,
             @RequestParam(value = "sessionId", required = false) String sessionId,
             @RequestParam(value = "executionId", required = false) String executionId) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) return java.util.Map.of("error", "Not authenticated");
+        if (sessionId != null && !sessionId.isBlank() && !ownsSession(userId, sessionId)) {
+            return java.util.Map.of("error", "Forbidden");
+        }
         long totalSteps, totalTurns;
         Long totalDuration;
         java.util.List<Object[]> toolStats;

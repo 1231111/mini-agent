@@ -3,7 +3,7 @@ services:
     image: mysql:8.0
     container_name: miniagent-mysql
     environment:
-      MYSQL_ROOT_PASSWORD: mysql_root_pass
+      MYSQL_ROOT_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-mysql_root_pass}
       MYSQL_DATABASE: mini_agent
       MYSQL_CHARACTER_SET_SERVER: utf8mb4
       MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
@@ -11,6 +11,53 @@ services:
       - "3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${SPRING_DATASOURCE_PASSWORD:-mysql_root_pass}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    container_name: miniagent-app
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-mysql_root_pass}
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      AGENT_AUTH_COOKIE_SECRET: ${AGENT_AUTH_COOKIE_SECRET:-change-me-to-a-long-random-string-at-least-32}
+      LANGCHAIN4J_OPENAI_API_KEY: ${LANGCHAIN4J_OPENAI_API_KEY:-}
+      LANGCHAIN4J_OPENAI_BASE_URL: ${LANGCHAIN4J_OPENAI_BASE_URL:-https://token-plan-cn.xiaomimimo.com/v1}
+      LANGCHAIN4J_OPENAI_MODEL: ${LANGCHAIN4J_OPENAI_MODEL:-mimo-v2.5}
+      AGENT_CODEBASE_EMBEDDING_API_KEY: ${AGENT_CODEBASE_EMBEDDING_API_KEY:-}
+      WEB_SEARCH_TAVILY_API_KEY: ${WEB_SEARCH_TAVILY_API_KEY:-}
+      WEB_SEARCH_BING_API_KEY: ${WEB_SEARCH_BING_API_KEY:-}
+      IMAGE_GEN_CHATANYWHERE_KEY: ${IMAGE_GEN_CHATANYWHERE_KEY:-}
+      IMAGE_GEN_SILICONFLOW_API_KEY: ${IMAGE_GEN_SILICONFLOW_API_KEY:-}
+      IMAGE_GEN_MIMO_API_KEY: ${IMAGE_GEN_MIMO_API_KEY:-}
+      AGENT_TOOLS_EXEC_ENABLED: "false"
+      AGENT_TOOLS_ALLOW_ABSOLUTE_WRITE: "false"
+    volumes:
+      - app-workspace:/app/workspace
+      - app-images:/app/generated-images
+      - app-uploads:/app/user-uploads
+      - app-memory:/app/memory
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
 
 volumes:
   mysql-data:
+  app-workspace:
+  app-images:
+  app-uploads:
+  app-memory:

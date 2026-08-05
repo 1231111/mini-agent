@@ -4,8 +4,10 @@ import com.microsoft.playwright.*;
 import com.microsoft.playwright.Locator.AriaSnapshotOptions;
 import com.microsoft.playwright.options.AriaRole;
 import com.microsoft.playwright.options.WaitUntilState;
+import com.miniagent.agent.security.NetworkGuard;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
@@ -36,6 +38,9 @@ public class BrowserService {
     private Playwright playwright;
     private Browser browser;
     private final Map<String, Page> pages = new ConcurrentHashMap<>();
+
+    @Autowired
+    private NetworkGuard networkGuard;
 
     /**
      * 确保浏览器实例已启动（懒初始化）
@@ -367,6 +372,8 @@ public class BrowserService {
      */
     public String navigate(String sessionId, String url) {
         try {
+            String blocked = networkGuard.validateUrl(url);
+            if (blocked != null) return blocked;
             Page page = getPage(sessionId);
             page.navigate(url, new Page.NavigateOptions()
                     .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)

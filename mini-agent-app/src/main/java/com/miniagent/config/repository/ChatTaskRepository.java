@@ -13,4 +13,8 @@ public interface ChatTaskRepository extends JpaRepository<ChatTask, Long> {
     @Query("SELECT t FROM ChatTask t WHERE t.userId = :userId AND t.id IN (SELECT MAX(t2.id) FROM ChatTask t2 WHERE t2.userId = :userId GROUP BY t2.sessionId) ORDER BY t.createdAt DESC")
     List<ChatTask> findLatestTaskPerSession(Long userId);
     void deleteBySessionId(String sessionId);
+
+    void deleteByUserIdAndSessionId(Long userId, String sessionId);
+
+    boolean existsByUserIdAndSessionId(Long userId, String sessionId);
 }

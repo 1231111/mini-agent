@@ -13,10 +13,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 任务规划工具：模型自己拆任务、自己改状态。
- * 对标 hermes-agent 的 todo_tool。
- *
- * 当前会话由 {@link TaskTodoContext#currentSessionId} 提供（每轮 Agent 入口设置）。
+ * 任务规划工具：模型自己拆任务、自己改状态，completed 需对照 done_when 提供 evidence。
  */
 @Slf4j
 @Component
@@ -33,8 +30,9 @@ public class TodoTool {
                 .name("todo")
                 .description("""
                         管理当前任务的执行计划（子任务列表）。
-                        - 复杂任务（>= 3 步）必须先用 action=set 写出完整计划，再开始执行。
-                        - 每完成一个子任务，立刻 action=update 把对应 id 标为 completed。
+                        - 复杂任务必须先 action=set 写出完整计划（每步含 done_when 验收标准），再开始执行。
+                        - 每完成一步立刻 action=update 标 completed，并提供 evidence（文件路径/图片链接/验证结果）。
+                        - done_when 推荐：file_exists:workspace/xxx.md | media_delivered | note_required
                         - 简单一句话问答不需要使用此工具。
                         """)
                 .parameters(buildSchema())
@@ -51,7 +49,7 @@ public class TodoTool {
         ));
         params.put("items", Map.of(
                 "type", "string",
-                "description", "set 时使用，JSON 数组字符串：[{\"id\":1,\"content\":\"步骤说明\",\"status\":\"pending\"}]"
+                "description", "set 时使用，JSON 数组：[{\"id\":1,\"content\":\"步骤\",\"status\":\"pending\",\"done_when\":\"file_exists:workspace/a.md\"}]"
         ));
         params.put("id", Map.of(
                 "type", "integer",
@@ -59,11 +57,15 @@ public class TodoTool {
         ));
         params.put("status", Map.of(
                 "type", "string",
-                "description", "update 时使用，新状态：pending / in_progress / completed / cancelled"
+                "description", "update 时使用：pending / in_progress / completed / cancelled"
         ));
         params.put("note", Map.of(
                 "type", "string",
-                "description", "update 时使用，可选的备注，例如失败原因或简短结果"
+                "description", "update 时可选备注；若未传 evidence 可用 note 充当证据"
+        ));
+        params.put("evidence", Map.of(
+                "type", "string",
+                "description", "update 标 completed 时必填：完成证据（文件路径、图片 markdown/URL、命令结果摘要）"
         ));
         return params;
     }
@@ -78,6 +80,9 @@ public class TodoTool {
                 case "set" -> {
                     Object rawItems = args.get("items");
                     List<Map<String, Object>> items = parseItems(rawItems);
+                    if (items.isEmpty()) {
+                        return error("set 需要非空 items，每项含 content，建议含 done_when");
+                    }
                     var updated = todoStore.set(sid, items);
                     return MAPPER.writeValueAsString(Map.of(
                             "success", true,
@@ -92,7 +97,12 @@ public class TodoTool {
                     if (id <= 0) return error("update 缺少有效 id");
                     String status = (String) args.get("status");
                     String note = (String) args.get("note");
-                    var updated = todoStore.update(sid, id, status, note);
+                    String evidence = (String) args.get("evidence");
+                    String[] err = new String[1];
+                    var updated = todoStore.update(sid, id, status, note, evidence, err);
+                    if (updated == null) {
+                        return error(err[0] != null ? err[0] : "update 失败");
+                    }
                     return MAPPER.writeValueAsString(Map.of(
                             "success", true,
                             "action", "update",

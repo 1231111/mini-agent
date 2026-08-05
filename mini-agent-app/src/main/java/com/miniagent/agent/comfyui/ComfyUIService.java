@@ -712,7 +712,10 @@ public class ComfyUIService {
 
     // ==================== 自动质检 + 重试 ====================
 
-    private static final int MAX_QUALITY_RETRIES = 2;
+    private static final int MAX_QUALITY_RETRIES = 1;
+
+    @Value("${comfyui.quality-check.enabled:true}")
+    private boolean qualityCheckEnabled;
 
     /**
      * 自动质检：生成成功后调用 ImageQualityChecker 检查图片质量，
@@ -722,6 +725,9 @@ public class ComfyUIService {
                                      String checkpoint, String mode,
                                      int width, int height, double denoise, int steps, double cfg,
                                      String referenceImagePath) {
+        if (!qualityCheckEnabled) {
+            return result;
+        }
         // 只对成功的结果做质检
         if (result == null || result.contains("\"error\"") || !result.contains("\"status\":\"success\"")) {
             return result;

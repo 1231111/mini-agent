@@ -2,7 +2,10 @@ package com.miniagent.config.service;
 
 import com.miniagent.config.entity.User;
 import com.miniagent.config.repository.UserRepository;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -13,53 +16,60 @@ import java.util.Optional;
 public class AuthService {
 
     private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
 
-    public AuthService(UserRepository userRepository) {
+    public AuthService(UserRepository userRepository, PasswordEncoder passwordEncoder) {
         this.userRepository = userRepository;
+        this.passwordEncoder = passwordEncoder;
     }
 
-    /**
-     * Register a new user.
-     * @return the created User, or empty if username already exists
-     */
     public Optional<User> register(String username, String password, String displayName) {
+        if (username == null || username.isBlank() || password == null || password.length() < 6) {
+            return Optional.empty();
+        }
         if (userRepository.existsByUsername(username)) {
             return Optional.empty();
         }
         User user = new User();
-        user.setUsername(username);
-        user.setPasswordHash(hashPassword(password));
-        user.setDisplayName(displayName != null ? displayName : username);
+        user.setUsername(username.trim());
+        user.setPasswordHash(passwordEncoder.encode(password));
+        user.setDisplayName(displayName != null && !displayName.isBlank() ? displayName : username.trim());
         return Optional.of(userRepository.save(user));
     }
 
-    /**
-     * Authenticate user by username and password.
-     * @return the User if credentials are valid, empty otherwise
-     */
+    @Transactional
     public Optional<User> login(String username, String password) {
         return userRepository.findByUsername(username)
-                .filter(user -> user.getPasswordHash().equals(hashPassword(password)));
+                .filter(user -> matchesAndUpgrade(user, password));
     }
 
-    /**
-     * Get user by ID
-     */
     public Optional<User> getUserById(Long id) {
         return userRepository.findById(id);
     }
 
-    /**
-     * Get user by username
-     */
     public Optional<User> getUserByUsername(String username) {
         return userRepository.findByUsername(username);
     }
 
     /**
-     * Hash password using SHA-256
+     * Accept BCrypt (new) and legacy unsalted SHA-256; upgrade SHA-256 hashes on successful login.
      */
-    private String hashPassword(String password) {
+    private boolean matchesAndUpgrade(User user, String password) {
+        String stored = user.getPasswordHash();
+        if (stored == null) return false;
+        if (stored.startsWith("$2a$") || stored.startsWith("$2b$") || stored.startsWith("$2y$")) {
+            return passwordEncoder.matches(password, stored);
+        }
+        // Legacy SHA-256
+        if (stored.equals(sha256(password))) {
+            user.setPasswordHash(passwordEncoder.encode(password));
+            userRepository.save(user);
+            return true;
+        }
+        return false;
+    }
+
+    private static String sha256(String password) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] hash = digest.digest(password.getBytes(StandardCharsets.UTF_8));

@@ -168,6 +168,28 @@ public class DatabaseConversationStore {
         return false;
     }
 
+    /** Delete only if owned by userId (IDOR protection). */
+    @Transactional
+    public boolean deleteForUser(Long userId, String id) {
+        if (userId == null || id == null) return false;
+        if (!conversationRepo.existsByIdAndUserId(id, userId)) return false;
+        messageRepo.deleteByConversationId(id);
+        conversationRepo.deleteById(id);
+        return true;
+    }
+
+    @Transactional(readOnly = true)
+    public Conversation getForUser(Long userId, String id) {
+        if (userId == null || id == null) return null;
+        return conversationRepo.findByIdAndUserId(id, userId)
+                .map(this::toModel)
+                .orElse(null);
+    }
+
+    public boolean ownedBy(Long userId, String id) {
+        return userId != null && id != null && conversationRepo.existsByIdAndUserId(id, userId);
+    }
+
     /** Exists */
     public boolean exists(String id) {
         return conversationRepo.existsById(id);

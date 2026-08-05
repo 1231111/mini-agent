@@ -9,6 +9,10 @@ public interface ChatConversationRepository extends JpaRepository<ChatConversati
     List<ChatConversation> findByUserIdOrderByUpdatedAtDesc(Long userId);
     long countByUserId(Long userId);
 
+    java.util.Optional<ChatConversation> findByIdAndUserId(String id, Long userId);
+
+    boolean existsByIdAndUserId(String id, Long userId);
+
     /** 所有去重的用户 ID（供每日分析按用户遍历）。 */
     @Query("select distinct c.userId from ChatConversation c")
     List<Long> findDistinctUserIds();

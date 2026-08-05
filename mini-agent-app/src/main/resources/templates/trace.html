@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent 轨迹监控</title>
+    <script>
+        (function(){try{var t=localStorage.getItem('mini_agent_theme');if(!t)t=window.matchMedia&&window.matchMedia('(prefers-color-scheme:light)').matches?'light':'dark';document.documentElement.setAttribute('data-theme',t)}catch(e){document.documentElement.setAttribute('data-theme','dark')}})();
+    </script>
+    <style>
+        :root {
+            --bg: #0e0f12; --sidebar-bg: #16181d; --surface: #1e2127; --surface2: #2a2e36;
+            --border: rgba(255,255,255,.09); --border-strong: rgba(255,255,255,.16);
+            --text: #f3f4f6; --text2: #a8adba; --text3: #6b7180; --heading: #ffffff;
+            --accent: #10a37f; --accent-soft: rgba(16,163,127,.14);
+            --success: #22c55e; --failure: #ef4444; --warning: #f59e0b; --running: #3b82f6;
+            --code-bg: #0a0b0d; --code-text: #c9d1d9;
+        }
+        [data-theme="light"] {
+            --bg: #ffffff; --sidebar-bg: #f7f7f8; --surface: #f4f4f5; --surface2: #e8e8ea;
+            --border: rgba(0,0,0,.1); --border-strong: rgba(0,0,0,.18);
+            --text: #1f2024; --text2: #5d6068; --text3: #9296a0; --heading: #0d0d10;
+            --code-bg: #f6f8fa; --code-text: #24292f;
+        }
+        *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+        html, body { height:100%; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg); color: var(--text);
+            display: flex; overflow: hidden;
+            -webkit-font-smoothing: antialiased;
+        }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.13); border-radius: 3px; }
+
+        /* SIDEBAR */
+        .sidebar {
+            width: 280px; background: var(--sidebar-bg);
+            display: flex; flex-direction: column;
+            flex-shrink: 0; height: 100vh;
+            border-right: 1px solid var(--border);
+        }
+        .sb-header {
+            padding: 16px; border-bottom: 1px solid var(--border);
+            display: flex; align-items: center; justify-content: space-between;
+        }
+        .sb-header h2 { font-size: 16px; font-weight: 600; color: var(--heading); }
+        .sb-header button {
+            width: 32px; height: 32px; border-radius: 8px;
+            border: none; background: none; color: var(--text2);
+            cursor: pointer; display: flex; align-items: center; justify-content: center;
+            transition: background .15s;
+        }
+        .sb-header button:hover { background: var(--surface); }
+        .sb-list { flex: 1; overflow-y: auto; padding: 8px; }
+        .sb-item {
+            padding: 10px 12px; border-radius: 8px;
+            cursor: pointer; margin-bottom: 2px;
+            transition: background .12s;
+            border: 1px solid transparent;
+        }
+        .sb-item:hover { background: var(--surface); }
+        .sb-item.active { background: var(--surface); border-color: var(--accent); }
+        .sb-item-title { font-size: 13px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .sb-item-time { font-size: 11px; color: var(--text3); margin-top: 2px; }
+        .sb-item-badge {
+            display: inline-block; font-size: 10px; padding: 1px 6px;
+            border-radius: 10px; margin-top: 4px;
+            background: var(--accent-soft); color: var(--accent);
+        }
+        .exec-card {
+            padding: 10px 12px; border-radius: 8px;
+            cursor: pointer; margin-bottom: 4px;
+            border: 1px solid transparent;
+            transition: all .15s;
+        }
+        .exec-card:hover { background: var(--surface); }
+        .exec-card.active { background: var(--surface); border-color: var(--accent); }
+
+        /* MAIN */
+        .main { flex: 1; display: flex; flex-direction: column; min-width: 0; height: 100vh; }
+        .topbar {
+            padding: 12px 20px; border-bottom: 1px solid var(--border);
+            display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+        }
+        .topbar h1 { font-size: 15px; font-weight: 600; color: var(--heading); }
+        .topbar .session-id { font-size: 12px; color: var(--text3); font-family: monospace; }
+        .topbar .actions { margin-left: auto; display: flex; gap: 8px; }
+        .topbar .actions button {
+            padding: 6px 14px; border-radius: 8px; border: 1px solid var(--border);
+            background: none; color: var(--text2); font-size: 12px; cursor: pointer;
+            transition: all .15s; font-family: inherit;
+        }
+        .topbar .actions button:hover { background: var(--surface); color: var(--text); }
+        .topbar .actions button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+        /* SUMMARY BAR */
+        .summary-bar {
+            padding: 12px 20px; border-bottom: 1px solid var(--border);
+            display: flex; gap: 24px; flex-shrink: 0;
+        }
+        .stat { display: flex; flex-direction: column; }
+        .stat-value { font-size: 20px; font-weight: 700; color: var(--heading); }
+        .stat-label { font-size: 11px; color: var(--text3); margin-top: 2px; }
+
+        /* TIMELINE */
+        .timeline-wrap { flex: 1; overflow-y: auto; padding: 20px; }
+        .timeline { max-width: 900px; margin: 0 auto; }
+        .turn-block { margin-bottom: 20px; }
+        .turn-header {
+            display: flex; align-items: center; gap: 10px;
+            padding: 8px 12px; border-radius: 10px;
+            background: var(--surface); margin-bottom: 8px;
+            cursor: pointer; user-select: none;
+        }
+        .turn-header:hover { background: var(--surface2); }
+        .turn-badge {
+            width: 28px; height: 28px; border-radius: 50%;
+            background: var(--accent-soft); color: var(--accent);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 12px; font-weight: 700; flex-shrink: 0;
+        }
+        .turn-title { font-size: 13px; font-weight: 600; color: var(--text); flex: 1; }
+        .turn-toggle { font-size: 10px; color: var(--text3); transition: transform .2s; }
+        .turn-block.collapsed .turn-toggle { transform: rotate(-90deg); }
+        .turn-block.collapsed .turn-steps { display: none; }
+
+        /* STEP ROWS */
+        .step { display: flex; gap: 12px; padding: 6px 0; }
+        .step-line {
+            width: 20px; display: flex; flex-direction: column; align-items: center; flex-shrink: 0;
+        }
+        .step-dot {
+            width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+            border: 2px solid var(--border-strong); background: var(--bg);
+        }
+        .step-dot.success { background: var(--success); border-color: var(--success); }
+        .step-dot.failure { background: var(--failure); border-color: var(--failure); }
+        .step-dot.running { background: var(--running); border-color: var(--running); animation: pulse 1.5s infinite; }
+        .step-dot.warning { background: var(--warning); border-color: var(--warning); }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+        .step-connector { width: 2px; flex: 1; background: var(--border); min-height: 8px; }
+        .step-content { flex: 1; min-width: 0; padding-bottom: 8px; }
+        .step-header { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+        .step-icon { font-size: 14px; }
+        .step-type {
+            font-size: 11px; font-weight: 600; text-transform: uppercase;
+            padding: 1px 6px; border-radius: 4px;
+            letter-spacing: .03em;
+        }
+        .step-type.PLAN { background: rgba(59,130,246,.15); color: #60a5fa; }
+        .step-type.TOOL_CALL { background: rgba(245,158,11,.15); color: #fbbf24; }
+        .step-type.TOOL_RESULT { background: rgba(34,197,94,.15); color: #4ade80; }
+        .step-type.THINKING { background: rgba(168,85,247,.15); color: #c084fc; }
+        .step-type.ANSWER { background: var(--accent-soft); color: var(--accent); }
+        .step-type.SUB_GOAL { background: rgba(59,130,246,.15); color: #60a5fa; }
+        .step-type.ERROR { background: rgba(239,68,68,.15); color: #f87171; }
+        .step-type.LOOP_END { background: rgba(107,114,128,.15); color: var(--text2); }
+        .step-type.LLM_REQUEST { background: rgba(99,102,241,.15); color: #818cf8; }
+        .step-type.LLM_RESPONSE { background: rgba(16,163,127,.15); color: var(--accent); }
+        .step-type.DECISION { background: rgba(236,72,153,.15); color: #f472b6; }
+        .step-type.LLM_CALL { background: rgba(99,102,241,.15); color: #818cf8; }
+        .step-type.COMPRESSION { background: rgba(107,114,128,.15); color: #9ca3af; }
+        .exec-block.latest { background: var(--accent-soft); border-radius: 12px; padding: 12px 16px 12px 16px !important; margin-left: -16px; }
+        .step-tool-name { font-size: 13px; font-weight: 600; color: var(--text); font-family: monospace; }
+        .step-time { font-size: 11px; color: var(--text3); margin-left: auto; }
+        .step-duration { font-size: 11px; color: var(--text3); }
+        .step-summary { font-size: 12px; color: var(--text2); margin-top: 4px; line-height: 1.5; }
+        .step-detail {
+            margin-top: 8px; display: none;
+            background: var(--code-bg); border: 1px solid var(--border);
+            border-radius: 8px; overflow: hidden;
+        }
+        .step.open .step-detail { display: block; }
+        .step-detail-header {
+            padding: 6px 12px; background: var(--surface2);
+            font-size: 11px; color: var(--text3); font-weight: 600;
+            border-bottom: 1px solid var(--border);
+        }
+        .step-detail-body {
+            padding: 12px; font-size: 12px; line-height: 1.6;
+            color: var(--code-text); font-family: "Fira Code", Consolas, monospace;
+            white-space: pre-wrap; word-break: break-word;
+            max-height: 400px; overflow-y: auto;
+        }
+
+        /* SUBGOAL ROW */
+        .subgoal-row {
+            display: flex; align-items: center; gap: 8px;
+            padding: 6px 12px; margin: 4px 0;
+            background: rgba(59,130,246,.08); border-radius: 8px;
+            border-left: 3px solid #3b82f6;
+        }
+        .subgoal-text { font-size: 12px; color: var(--text); }
+        .subgoal-progress { font-size: 11px; color: var(--text3); margin-left: auto; }
+
+        /* EMPTY STATE */
+        .empty-state {
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            height: 100%; color: var(--text3);
+        }
+        .empty-state .icon { font-size: 48px; margin-bottom: 16px; opacity: .5; }
+        .empty-state p { font-size: 14px; }
+
+        /* THEME TOGGLE */
+        .theme-btn {
+            width: 32px; height: 32px; border-radius: 8px;
+            border: none; background: none; color: var(--text2);
+            cursor: pointer; display: flex; align-items: center; justify-content: center;
+        }
+        .theme-btn:hover { background: var(--surface); }
+        .theme-btn svg { width: 16px; height: 16px; }
+        [data-theme="light"] .icon-sun { display: block; }
+        [data-theme="light"] .icon-moon { display: none; }
+        .icon-sun { display: none; }
+        .icon-moon { display: block; }
+    </style>
+</head>
+<body>
+
+<div class="sidebar">
+    <div class="sb-header">
+        <h2>🔍 轨迹监控</h2>
+        <button onclick="loadSessions()" title="刷新">
+            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" width="16" height="16">
+                <path d="M1 4v6h6M23 20v-6h-6"/>
+                <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/>
+            </svg>
+        </button>
+    </div>
+    <div class="sb-list" id="sessionList"></div>
+</div>
+
+<!-- 任务执行列表 -->
+<div class="sidebar" id="execPanel" style="width:260px;border-right:1px solid var(--border)">
+    <div class="sb-header">
+        <h2>📋 任务列表</h2>
+    </div>
+    <div class="sb-list" id="execList"></div>
+</div>
+
+<div class="main">
+    <div class="topbar">
+        <h1>执行轨迹</h1>
+        <span class="session-id" id="currentSessionId"></span>
+        <div class="actions">
+            <button id="autoRefreshBtn" onclick="toggleAutoRefresh()">自动刷新</button>
+            <button onclick="loadTraces()">刷新</button>
+            <button class="theme-btn" onclick="toggleTheme()">
+                <svg class="icon-sun" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+                <svg class="icon-moon" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+            </button>
+        </div>
+    </div>
+    <div class="summary-bar" id="summaryBar" style="display:none">
+        <div class="stat"><span class="stat-value" id="statTurns">0</span><span class="stat-label">迭代轮次</span></div>
+        <div class="stat"><span class="stat-value" id="statSteps">0</span><span class="stat-label">总步骤</span></div>
+        <div class="stat"><span class="stat-value" id="statDuration">0ms</span><span class="stat-label">工具总耗时</span></div>
+        <div class="stat"><span class="stat-value" id="statTools">0</span><span class="stat-label">工具调用</span></div>
+    </div>
+    <div class="timeline-wrap" id="timelineWrap">
+        <div class="empty-state">
+            <div class="icon">🤖</div>
+            <p>选择一个会话查看执行轨迹</p>
+        </div>
+    </div>
+</div>
+
+<script>
+const $list = document.getElementById('sessionList');
+const $timeline = document.getElementById('timelineWrap');
+const $summary = document.getElementById('summaryBar');
+const $sessionId = document.getElementById('currentSessionId');
+let currentSid = null;
+let currentExecId = null; // 当前选中的执行ID
+let autoRefreshTimer = null;
+let autoRefreshOn = true; // 默认开启自动刷新
+let knownSessions = new Set(); // 已知会话ID，用于检测新任务
+
+function toggleTheme() {
+    const cur = document.documentElement.getAttribute('data-theme');
+    const next = cur === 'light' ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('mini_agent_theme', next);
+}
+
+async function loadSessions() {
+    try {
+        const resp = await fetch('/api/conversations');
+        if (!resp.ok) { $list.innerHTML = '<div style="padding:12px;color:var(--text3)">加载失败</div>'; return; }
+        const list = await resp.json();
+        $list.innerHTML = '';
+        if (!list.length) { $list.innerHTML = '<div style="padding:12px;color:var(--text3)">暂无会话</div>'; return; }
+
+        // 检测新会话
+        let newSessionFound = null;
+        list.forEach(c => {
+            if (!knownSessions.has(c.sessionId)) {
+                knownSessions.add(c.sessionId);
+                if (!newSessionFound) newSessionFound = c;
+            }
+        });
+
+        // 如果有新会话且当前未选中任何会话，自动选中最新的
+        if (newSessionFound && !currentSid) {
+            selectSession(newSessionFound.sessionId, newSessionFound.title);
+        }
+
+        list.forEach(c => {
+            const d = document.createElement('div');
+            d.className = 'sb-item' + (c.sessionId === currentSid ? ' active' : '');
+            let time = '';
+            if (c.updatedAt) {
+                const d = typeof c.updatedAt === 'string' && /^\d+$/.test(c.updatedAt) ? new Date(Number(c.updatedAt)) : new Date(c.updatedAt);
+                time = isNaN(d.getTime()) ? '' : d.toLocaleString('zh-CN');
+            }
+            const isNew = newSessionFound && c.sessionId === newSessionFound.sessionId && !currentSid;
+            d.innerHTML = `<div class="sb-item-title">${esc(c.title || '新对话')}</div><div class="sb-item-time">${time}</div><div class="sb-item-badge">${c.sessionId}${isNew ? ' 🆕' : ''}</div>`;
+            d.onclick = () => selectSession(c.sessionId, c.title);
+            $list.appendChild(d);
+        });
+    } catch (e) { console.warn(e); }
+}
+
+async function selectSession(sid, title) {
+    currentSid = sid;
+    currentExecId = null;
+    $sessionId.textContent = sid;
+    document.querySelectorAll('.sb-item').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.sb-item').forEach(el => { if (el.querySelector('.sb-item-badge')?.textContent === sid) el.classList.add('active'); });
+    await loadExecutions();
+}
+
+async function loadExecutions() {
+    if (!currentSid) return;
+    try {
+        const resp = await fetch('/api/traces/executions?sessionId=' + encodeURIComponent(currentSid));
+        if (!resp.ok) return;
+        const execs = await resp.json();
+        renderExecutions(execs);
+        // 自动选中最新的执行
+        if (execs.length > 0 && !currentExecId) {
+            await selectExecution(execs[execs.length - 1].executionId);
+        }
+    } catch (e) { console.warn(e); }
+}
+
+async function selectExecution(execId) {
+    currentExecId = execId;
+    // 高亮选中的执行卡片
+    document.querySelectorAll('.exec-card').forEach(el => el.classList.toggle('active', el.dataset.execId === execId));
+    await loadTraces();
+}
+
+async function loadTraces() {
+    if (!currentExecId) return;
+    try {
+        const [tracesResp, summaryResp] = await Promise.all([
+            fetch('/api/traces?executionId=' + encodeURIComponent(currentExecId)),
+            fetch('/api/traces/summary?executionId=' + encodeURIComponent(currentExecId))
+        ]);
+        if (!tracesResp.ok) return;
+        const traces = await tracesResp.json();
+        // 按创建时间排序（确保时间顺序正确）
+        traces.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+        const summary = summaryResp.ok ? await summaryResp.json() : null;
+        renderSummary(summary);
+        renderTimeline(traces);
+    } catch (e) { console.warn(e); }
+}
+
+function renderExecutions(execs) {
+    const $execList = document.getElementById('execList');
+    if (!execs || execs.length === 0) {
+        $execList.innerHTML = '<div style="padding:12px;color:var(--text3)">暂无任务执行记录</div>';
+        return;
+    }
+    $execList.innerHTML = '';
+    execs.forEach((exec, idx) => {
+        const d = document.createElement('div');
+        d.className = 'exec-card' + (exec.executionId === currentExecId ? ' active' : '');
+        d.dataset.execId = exec.executionId;
+        const startTime = exec.startTime ? new Date(exec.startTime).toLocaleTimeString('zh-CN') : '';
+        const question = exec.userQuestion || '未知问题';
+        const questionShort = question.length > 50 ? question.substring(0, 50) + '...' : question;
+        const isLatest = idx === execs.length - 1;
+        d.innerHTML = `
+            <div style="display:flex;align-items:center;gap:6px">
+                <span style="font-size:12px">${isLatest ? '🟢' : '⚪'}</span>
+                <span style="font-size:13px;font-weight:600;color:var(--heading);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(questionShort)}</span>
+            </div>
+            <div style="font-size:11px;color:var(--text3);margin-top:4px">
+                ${startTime} · ${exec.stepCount} 步骤
+            </div>
+        `;
+        d.onclick = () => selectExecution(exec.executionId);
+        $execList.appendChild(d);
+    });
+}
+
+function renderSummary(s) {
+    if (!s || s.totalSteps === 0) { $summary.style.display = 'none'; return; }
+    $summary.style.display = 'flex';
+    document.getElementById('statTurns').textContent = s.totalTurns;
+    document.getElementById('statSteps').textContent = s.totalSteps;
+    document.getElementById('statDuration').textContent = s.totalDurationMs > 1000 ? (s.totalDurationMs / 1000).toFixed(1) + 's' : s.totalDurationMs + 'ms';
+    document.getElementById('statTools').textContent = s.tools ? s.tools.reduce((a, t) => a + (t.count || 0), 0) : 0;
+    // 渲染耗时 top5 瓶颈
+    let bottleneckHtml = '';
+    if (s.slowestSteps && s.slowestSteps.length > 0) {
+        bottleneckHtml = '<div class="stat" style="border-left:1px solid var(--border);padding-left:16px"><span class="stat-label">耗时瓶颈 TOP</span>';
+        s.slowestSteps.slice(0, 3).forEach(st => {
+            const name = st.toolName || st.stepType;
+            const dur = st.durationMs > 1000 ? (st.durationMs/1000).toFixed(1)+'s' : st.durationMs+'ms';
+            bottleneckHtml += `<span style="font-size:11px;color:var(--text2)">${esc(name)} ${dur}</span>`;
+        });
+        bottleneckHtml += '</div>';
+    }
+    // 移除旧的瓶颈区域再插入
+    const existing = document.getElementById('bottleneckStat');
+    if (existing) existing.remove();
+    if (bottleneckHtml) {
+        const div = document.createElement('div');
+        div.id = 'bottleneckStat';
+        div.innerHTML = bottleneckHtml;
+        div.style.display = 'contents';
+        $summary.appendChild(div);
+    }
+}
+
+function renderTimeline(traces) {
+    if (!traces || traces.length === 0) {
+        $timeline.innerHTML = '<div class="empty-state"><div class="icon">📭</div><p>暂无轨迹数据</p></div>';
+        return;
+    }
+    // 按 turnIndex 分组
+    const turns = {};
+    traces.forEach(t => {
+        if (!turns[t.turnIndex]) turns[t.turnIndex] = [];
+        turns[t.turnIndex].push(t);
+    });
+
+    let html = '<div class="timeline">';
+    Object.keys(turns).sort((a, b) => a - b).forEach(turn => {
+        const steps = turns[turn];
+        const subGoal = steps.find(s => s.stepType === 'SUB_GOAL');
+        const turnLabel = subGoal ? subGoal.subGoalText : '迭代 #' + (Number(turn) + 1);
+        html += `<div class="turn-block"><div class="turn-header" onclick="this.parentElement.classList.toggle('collapsed')"><div class="turn-badge">${Number(turn) + 1}</div><div class="turn-title">${esc(turnLabel)}</div><div class="turn-toggle">▼</div></div><div class="turn-steps">`;
+        steps.forEach((step, i) => {
+            const isLast = i === steps.length - 1;
+            html += renderStep(step, isLast);
+        });
+        html += '</div></div>';
+    });
+    html += '</div>';
+    $timeline.innerHTML = html;
+}
+
+function renderStep(step, isLast) {
+    // 检测 LLM 请求/响应（通过内容前缀）
+    const isLlmRequest = step.stepType === 'THINKING' && step.content && step.content.startsWith('【LLM 请求】');
+    const isLlmResponse = step.stepType === 'THINKING' && step.content && step.content.startsWith('【LLM 响应】');
+    let icon, typeLabel, typeClass;
+    if (isLlmRequest) { icon = '📤'; typeLabel = 'LLM_REQUEST'; typeClass = 'LLM_REQUEST'; }
+    else if (isLlmResponse) { icon = '📥'; typeLabel = 'LLM_RESPONSE'; typeClass = 'LLM_RESPONSE'; }
+    else {
+        icon = { PLAN: '🎯', TOOL_CALL: '🔧', TOOL_RESULT: '✅', THINKING: '💭', ANSWER: '📝', SUB_GOAL: '📋', ERROR: '❌', LOOP_END: '🏁', DECISION: '🧠', LLM_CALL: '⏱️', COMPRESSION: '🗜️' }[step.stepType] || '•';
+        typeLabel = step.stepType;
+        typeClass = step.stepType;
+    }
+    const statusClass = { SUCCESS: 'success', FAILURE: 'failure', RUNNING: 'running', TIMEOUT: 'warning' }[step.status] || '';
+    const duration = step.durationMs > 0 ? `<span class="step-duration">${step.durationMs > 1000 ? (step.durationMs/1000).toFixed(1)+'s' : step.durationMs+'ms'}</span>` : '';
+    const time = step.createdAt ? new Date(step.createdAt).toLocaleTimeString('zh-CN') : '';
+    // LLM 请求/响应默认展开，其他折叠
+    const autoOpen = isLlmRequest || isLlmResponse;
+    let summaryText = '';
+    if (step.content) {
+        if (isLlmRequest) {
+            // 提取消息数和工具数
+            const m = step.content.match(/消息数:\s*(\d+).*?工具数:\s*(\d+)/);
+            summaryText = m ? `发送 ${m[1]} 条消息, ${m[2]} 个工具` : '查看完整请求上下文';
+        } else if (isLlmResponse) {
+            // 提取关键信息
+            const lines = step.content.split('\n').filter(l => l.trim());
+            summaryText = lines.slice(0, 3).join(' | ').substring(0, 200);
+        } else {
+            summaryText = step.content.length > 150 ? step.content.substring(0, 150) + '...' : step.content;
+        }
+    }
+    let detailContent = '';
+    if (step.toolArgs) detailContent += `<div class="step-detail-header">工具参数</div><div class="step-detail-body">${esc(step.toolArgs)}</div>`;
+    if (step.content) {
+        const header = isLlmRequest ? 'LLM 请求上下文' : isLlmResponse ? 'LLM 响应详情' : '完整内容';
+        detailContent += `<div class="step-detail-header">${header}</div><div class="step-detail-body">${esc(step.content)}</div>`;
+    }
+    const hasDetail = detailContent.length > 0;
+    return `<div class="step${hasDetail ? ' has-detail' : ''}${autoOpen ? ' open' : ''}" ${hasDetail ? 'onclick="this.classList.toggle(\'open\')"' : ''}>
+        <div class="step-line"><div class="step-dot ${statusClass}"></div>${isLast ? '' : '<div class="step-connector"></div>'}</div>
+        <div class="step-content">
+            <div class="step-header">
+                <span class="step-icon">${icon}</span>
+                <span class="step-type ${typeClass}">${typeLabel}</span>
+                ${step.toolName ? '<span class="step-tool-name">' + esc(step.toolName) + '</span>' : ''}
+                ${duration}
+                <span class="step-time">${time}</span>
+            </div>
+            ${summaryText ? '<div class="step-summary">' + esc(summaryText) + '</div>' : ''}
+            ${hasDetail ? '<div class="step-detail">' + detailContent + '</div>' : ''}
+        </div>
+    </div>`;
+}
+
+function toggleAutoRefresh() {
+    autoRefreshOn = !autoRefreshOn;
+    document.getElementById('autoRefreshBtn').classList.toggle('active', autoRefreshOn);
+    startAutoRefresh();
+}
+
+function startAutoRefresh() {
+    if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+    if (autoRefreshOn) {
+        // 同时刷新会话列表、任务列表和轨迹数据
+        autoRefreshTimer = setInterval(async () => {
+            await loadSessions();
+            if (currentSid) await loadExecutions();
+            if (currentExecId) await loadTraces();
+        }, 5000);
+    }
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// Init
+loadSessions();
+// 默认开启自动刷新
+document.getElementById('autoRefreshBtn').classList.add('active');
+startAutoRefresh();
+</script>
+</body>
+</html>

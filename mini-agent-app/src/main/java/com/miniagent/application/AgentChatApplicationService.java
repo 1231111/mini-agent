@@ -36,6 +36,7 @@ import com.miniagent.agent.web.FileContentExtractor;
 import com.miniagent.web.MiniAgentChatPageController;
 import com.miniagent.config.repository.ChatTaskRepository;
 import com.miniagent.config.entity.ChatTask;
+import com.miniagent.config.service.TaskRunService;
 import com.miniagent.agent.delegate.RoleContext;
 
 import java.io.File;
@@ -87,10 +88,11 @@ public class AgentChatApplicationService {
     private final ChatTaskRepository chatTaskRepository;
     private final com.miniagent.agent.core.SessionStreamHub streamHub;
     private final BuiltinTools builtinTools;
+    private final TaskRunService taskRunService;
 
     private static final int MAX_ITERATIONS = 90;
 
-    /** 正在运行的任务：sessionId -> true。用于前端查询任务状态。 */
+    /** 正在运行的任务：sessionId -> true。用于前端查询任务状态（内存快路径）。 */
     private final java.util.concurrent.ConcurrentHashMap<String, Boolean> runningTasks = new java.util.concurrent.ConcurrentHashMap<>();
 
     @jakarta.annotation.PostConstruct
@@ -101,7 +103,7 @@ public class AgentChatApplicationService {
 
     /** 查询会话是否有正在运行的任务 */
     public boolean isTaskRunning(String sessionId) {
-        return runningTasks.containsKey(sessionId);
+        return runningTasks.containsKey(sessionId) || taskRunService.isRunning(sessionId);
     }
 
     /**
@@ -292,14 +294,20 @@ public class AgentChatApplicationService {
 
     private String executeAgentWithProgress(Long userId, String sessionId, String userMessage,
                                             org.springframework.web.servlet.mvc.method.annotation.SseEmitter progressEmitter) {
-        // 标记任务开始
+        String acquireErr = taskRunService.tryAcquire(userId, sessionId);
+        if (acquireErr != null) {
+            throw new IllegalStateException(acquireErr);
+        }
         runningTasks.put(sessionId, Boolean.TRUE);
-        // 设置当前用户上下文（供 MemoryStore 按 userId 隔离记忆）
         MemoryStore.setCurrentUser(userId);
         try {
-            return doExecuteAgent(userId, sessionId, userMessage, progressEmitter);
+            String answer = doExecuteAgent(userId, sessionId, userMessage, progressEmitter);
+            taskRunService.markCompleted(userId, sessionId);
+            return answer;
+        } catch (Exception e) {
+            taskRunService.markFailed(userId, sessionId, e.getMessage());
+            throw e;
         } finally {
-            // 标记任务结束
             runningTasks.remove(sessionId);
             MemoryStore.clearCurrentUser();
         }
@@ -683,8 +691,16 @@ public class AgentChatApplicationService {
         return conversationStore.get(sessionId);
     }
 
+    public Conversation getConversationForUser(Long userId, String sessionId) {
+        return conversationStore.getForUser(userId, sessionId);
+    }
+
     public boolean deleteConversation(String sessionId) {
         return conversationStore.delete(sessionId);
+    }
+
+    public boolean deleteConversationForUser(Long userId, String sessionId) {
+        return conversationStore.deleteForUser(userId, sessionId);
     }
 
     public boolean renameConversation(String sessionId, String newTitle) {

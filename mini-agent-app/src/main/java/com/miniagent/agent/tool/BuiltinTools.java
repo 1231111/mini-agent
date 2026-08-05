@@ -6,9 +6,9 @@ import com.miniagent.agent.comfyui.ComfyUIService;
 import com.miniagent.agent.comfyui.ImageQualityChecker;
 import com.miniagent.agent.memory.MemoryStore;
 import com.miniagent.agent.skill.SkillStore;
+import com.miniagent.agent.security.NetworkGuard;
 import com.miniagent.agent.web.WebSearchService;
 import com.miniagent.agent.web.ImageGenerationService;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -53,6 +53,14 @@ public class BuiltinTools {
     private  ImageQualityChecker qualityChecker;
     @Autowired
     private  ImageGenerationService imageGenerationService;
+    @Autowired
+    private  NetworkGuard networkGuard;
+
+    @Value("${agent.tools.exec-enabled:false}")
+    private boolean execEnabled;
+
+    @Value("${agent.tools.allow-absolute-write:false}")
+    private boolean allowAbsoluteWrite;
 
     /**
      * 工具结果缓存：同一用户消息内，对 read_file / list_files 的重复调用直接返回缓存。
@@ -61,6 +69,12 @@ public class BuiltinTools {
      */
     private final ConcurrentHashMap<String, String> toolResultCache =
             new ConcurrentHashMap<>();
+
+    /** 复用连接池，避免每次 httpGet 新建客户端 */
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
 
     /** 清空工具结果缓存（每条新用户消息开始时调用） */
     public void clearToolCache() {
@@ -457,7 +471,11 @@ public class BuiltinTools {
     }
 
     private void registerExecTool() {
-        registry.register("exec_command", "执行命令（有安全检查）。工作目录为用户主目录，可直接访问桌面、下载等位置。当前运行环境是 Windows，优先使用 cmd / PowerShell 语法；不要使用 Linux 的 ls/head/mkdir -p/heredoc。启动程序可用 start 命令。注意：搜索代码内容请用 search_code 工具，不要用命令行 grep/findstr。",
+        if (!execEnabled) {
+            log.info("exec_command 未注册（agent.tools.exec-enabled=false）");
+            return;
+        }
+        registry.register("exec_command", "执行命令（有安全检查，默认关闭）。工作目录为 workspace。当前运行环境是 Windows，优先使用 cmd / PowerShell 语法。搜索代码请用 search_code。",
                 Map.of(
                         "command", Map.of("type", "string", "description", "要执行的命令", "required", true)
                 ),
@@ -478,6 +496,8 @@ public class BuiltinTools {
                 args -> {
                     Map<String, Object> p = parseJson(args);
                     String url = (String) p.get("url");
+                    String blocked = networkGuard.validateUrl(url);
+                    if (blocked != null) return "{\"error\":\"" + blocked.replace("\"", "'") + "\"}";
                     String sid = (String) p.getOrDefault("sessionId", "default");
                     return browserService.navigate(sid, url);
                 });
@@ -1015,31 +1035,33 @@ public class BuiltinTools {
     }
 
     /**
-     * 解析路径：
-     *   - 绝对路径 → 直接用
-     *   - 纯文件名 → workspace/{当前任务}/文件名
-     *   - 相对路径 → 智能拼接，避免出现 workspace/workspace/...、./workspace/... 等重复前缀
+     * 解析路径（写入）：默认强制落在 workspace/ 下；绝对路径仅当 allow-absolute-write=true。
      */
     private Path resolveWorkspacePath(String path) {
+        Path workspaceRoot = WORKSPACE.toAbsolutePath().normalize();
         if (path == null || path.isBlank()) {
-            return WORKSPACE.resolve(currentTaskName.get()).normalize();
+            return workspaceRoot.resolve(currentTaskName.get()).normalize();
         }
-        // 统一分隔符 + 去掉 "./" 前缀
         String normalized = path.replace('\\', '/').trim();
         while (normalized.startsWith("./")) normalized = normalized.substring(2);
         Path p = Path.of(normalized);
-        if (p.isAbsolute()) return p.normalize();
-
-        // 已经以 workspace/ 开头 → 直接相对项目根
-        if (normalized.startsWith("workspace/") || normalized.equals("workspace")) {
-            return Path.of(".").resolve(normalized).normalize();
+        Path resolved;
+        if (p.isAbsolute()) {
+            if (!allowAbsoluteWrite) {
+                throw new SecurityException("禁止绝对路径写入（agent.tools.allow-absolute-write=false）: " + path);
+            }
+            resolved = p.normalize();
+        } else if (normalized.startsWith("workspace/") || normalized.equals("workspace")) {
+            resolved = Path.of(".").toAbsolutePath().resolve(normalized).normalize();
+        } else if (p.getParent() == null) {
+            resolved = workspaceRoot.resolve(currentTaskName.get()).resolve(p).normalize();
+        } else {
+            resolved = workspaceRoot.resolve(p).normalize();
         }
-        // 纯文件名 → 放到当前任务子目录
-        if (p.getParent() == null) {
-            return WORKSPACE.resolve(currentTaskName.get()).resolve(p).normalize();
+        if (!resolved.startsWith(workspaceRoot) && !allowAbsoluteWrite) {
+            throw new SecurityException("写入路径必须位于 workspace/ 内: " + resolved);
         }
-        // 其它相对路径 → 落到 workspace 下
-        return WORKSPACE.resolve(p).normalize();
+        return resolved;
     }
 
     /**
@@ -1076,19 +1098,16 @@ public class BuiltinTools {
 
     private String httpGet(String url) {
         try {
-            HttpClient client = HttpClient.newBuilder()
-                    .connectTimeout(Duration.ofSeconds(10))
-                    .followRedirects(HttpClient.Redirect.NORMAL)
-                    .build();
+            String blocked = networkGuard.validateUrl(url);
+            if (blocked != null) return "{\"error\":\"" + blocked.replace("\"", "'") + "\"}";
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .timeout(Duration.ofSeconds(20))
                     .header("User-Agent", "MiniAgent/1.0")
                     .GET()
                     .build();
-            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             String body = resp.body();
-            // 截断超长响应
             if (body.length() > 8000) body = body.substring(0, 8000) + "\n…（已截断）";
             return body;
         } catch (Exception e) {
@@ -1152,6 +1171,9 @@ public class BuiltinTools {
     );
 
     private String execCommand(String command) {
+        if (!execEnabled) {
+            return "{\"error\":\"exec_command 已禁用（agent.tools.exec-enabled=false）\"}";
+        }
         // 安全加固：多层防护
 
         // 第1层：危险命令黑名单检查
@@ -1190,13 +1212,11 @@ public class BuiltinTools {
                     ? new ProcessBuilder("cmd.exe", "/c", command)
                     : new ProcessBuilder("bash", "-c", command);
 
-            // 第4层：工作目录设为用户主目录（允许访问桌面、下载等常见位置）
-            // 写文件仍通过 write_file 工具限制在 workspace 内，这里只影响命令执行环境
-            String userHome = System.getProperty("user.home");
-            File workDirFile = new java.io.File(userHome);
+            // 第4层：工作目录限制在 workspace（避免扫用户主目录）
+            File workDirFile = WORKSPACE.toAbsolutePath().normalize().toFile();
             if (!workDirFile.exists()) workDirFile.mkdirs();
             pb.directory(workDirFile);
-            log.info("命令执行目录: {}", userHome);
+            log.info("命令执行目录: {}", workDirFile.getAbsolutePath());
 
             pb.environment().put("PYTHONUTF8", "1");
             pb.environment().put("PYTHONIOENCODING", "UTF-8");

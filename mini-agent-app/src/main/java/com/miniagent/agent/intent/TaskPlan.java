@@ -12,8 +12,18 @@ public record TaskPlan(
         boolean needsTools,
         List<String> allowedTools,
         List<TaskStep> steps,
-        String reason
+        String reason,
+        /** 复杂任务：进入 AgentLoop 后必须先 todo.set，否则框架只放行 todo 工具 */
+        boolean requiresStructuredPlan
 ) {
+    /** 兼容旧 8 参构造：默认不强制结构化计划 */
+    public TaskPlan(IntentType intent, String taskGoal, boolean directExecutable,
+                    boolean shouldUseHistory, boolean needsTools,
+                    List<String> allowedTools, List<TaskStep> steps, String reason) {
+        this(intent, taskGoal, directExecutable, shouldUseHistory, needsTools,
+                allowedTools, steps, reason, false);
+    }
+
     public Set<String> allowedToolSet() {
         return allowedTools == null ? Set.of() : new LinkedHashSet<>(allowedTools);
     }
@@ -26,6 +36,7 @@ public record TaskPlan(
         sb.append("- directExecutable: ").append(directExecutable).append('\n');
         sb.append("- shouldUseHistory: ").append(shouldUseHistory).append('\n');
         sb.append("- needsTools: ").append(needsTools).append('\n');
+        sb.append("- requiresStructuredPlan: ").append(requiresStructuredPlan).append('\n');
         sb.append("- allowedTools: ").append(allowedTools == null ? List.of() : allowedTools).append('\n');
         if (reason != null && !reason.isBlank()) {
             sb.append("- reason: ").append(reason).append('\n');
@@ -40,8 +51,14 @@ public record TaskPlan(
                         .append('\n');
             }
         }
-        sb.append("\n复杂任务（>=3步）自己用 todo 工具拆解并逐项推进，每完成一项标记 completed，全部完成再收尾。")
-          .append("如果对话历史里有未完成的任务、且用户本轮在要求继续，就接着上次的进度做，不要从头重来；")
+        if (requiresStructuredPlan) {
+            sb.append("\n【强制】这是复杂任务：你的第一轮工具调用必须是 todo(action=set)，")
+              .append("为每一步写清 content 与 done_when（验收标准，如 file_exists:workspace/xxx.md）。")
+              .append("未完成全部 todo 前禁止最终收尾。批量独立产出必须用 delegate_task 并行派发。");
+        } else {
+            sb.append("\n复杂任务（>=3步）自己用 todo 工具拆解并逐项推进，每完成一项标记 completed，全部完成再收尾。");
+        }
+        sb.append("如果对话历史里有未完成的任务、且用户本轮在要求继续，就接着上次的进度做，不要从头重来；")
           .append("否则按当前用户消息执行，不要把已完成的历史任务当成当前任务重做。");
         return sb.toString();
     }

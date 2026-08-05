@@ -107,7 +107,7 @@ public class AgentLoop {
      * 快工具（read_file/list_files）设短超时避免拖慢整体。
      */
     private static final Map<String, Long> TOOL_TIMEOUT_SECONDS = Map.ofEntries(
-            Map.entry("image_generate",     600L),
+            Map.entry("image_generate",     150L),
             Map.entry("web_search",          30L),
             Map.entry("web_extract",         30L),
             Map.entry("http_get",            30L),
@@ -321,6 +321,12 @@ public class AgentLoop {
         int lengthTruncationCount = 0; // 连续输出被长度上限截断计数（用于分块续写引导/兜底终止）
         boolean injectAppendHintAfterTools = false; // tool_call 被长度截断：工具执行后需注入续写引导
         boolean lengthTruncatedToolCalls = false; // 当前轮 tool_call 参数可能被截断
+        boolean requiresStructuredPlan = false; // 复杂任务：未 set 计划前只放行 todo
+        int planReminderCount = 0;              // 催促先写 todo 的次数
+        int incompleteTodoReminders = 0;        // 未完成 todo 却试图收尾的次数
+        int driftReminders = 0;                 // 偏离当前子目标的纠偏次数
+        boolean batchDelegateHintSent = false;  // 是否已提示用 delegate_task 并行
+        boolean goalAnchorInjected = false;     // 是否已注入任务目标锚定
 
         /** 死循环检测：本轮全部工具是否已重复 >= 3 次 */
         boolean allCallsRepeated(List<?> toolCalls) {
@@ -361,6 +367,7 @@ public class AgentLoop {
                 userTextForFilePattern == null ? "" : userTextForFilePattern).find();
         String taskGoal = summarizeTaskGoal(
                 taskPlan != null ? taskPlan.taskGoal() : userTextForFilePattern);
+        state.requiresStructuredPlan = taskPlan != null && taskPlan.requiresStructuredPlan();
 
         // sub-goal 栈播种：用意图规划的 steps 预填 todo（仅当该 session 还没有计划时）
         String sessionId = currentSessionId.get();
@@ -376,11 +383,12 @@ public class AgentLoop {
         }
 
         if (taskPlan != null) {
-            log.info("Agent计划: intent={}, taskGoal='{}', allowedTools={}",
-                    taskPlan.intent(), taskPlan.taskGoal(), taskPlan.allowedTools());
+            log.info("Agent计划: intent={}, taskGoal='{}', requiresPlan={}, allowedTools={}",
+                    taskPlan.intent(), taskPlan.taskGoal(), taskPlan.requiresStructuredPlan(),
+                    taskPlan.allowedTools());
         }
-        log.info("Agent任务开始: taskGoal='{}', maxIterations={}, toolsEnabled={}, explicitFileDelivery={}",
-                taskGoal, iterations, hasTools, explicitlyNeedsFile);
+        log.info("Agent任务开始: taskGoal='{}', maxIterations={}, toolsEnabled={}, explicitFileDelivery={}, requiresPlan={}",
+                taskGoal, iterations, hasTools, explicitlyNeedsFile, state.requiresStructuredPlan);
 
         for (int turn = 0; turn < iterations; turn++) {
             // 检查用户执行中追加的消息
@@ -397,6 +405,15 @@ public class AgentLoop {
                 }
             }
 
+            // 任务目标锚定（复杂任务注入一次，压缩后仍靠头部 user + 此提醒保持方向）
+            if (state.requiresStructuredPlan && !state.goalAnchorInjected) {
+                messages.add(new SystemMessage(
+                        "【任务目标锚定】本轮 taskGoal：" + taskGoal
+                                + "\n所有工具调用与计划步骤必须服务该目标；禁止跑去处理无关需求。"
+                                + "若需修订目标，等用户明确追加指令后再改 todo。"));
+                state.goalAnchorInjected = true;
+            }
+
             // 刷新「当前子目标」可刷新指针：移除上一条，按栈顶活动项注入新的一条到末尾
             refreshSubGoal(messages, state, sessionId, streamSink);
 
@@ -406,8 +423,8 @@ public class AgentLoop {
             state.currentTurn = turn;
             if (traceRecorder != null) traceRecorder.recordTurnStart(sessionId, turn, state.lastSubGoalText);
 
-            // 1) 构建请求（按需过滤工具）
-            var specsForTurn = buildToolSpecsForTurn(toolSpecs, hasTools, state.mediaDelivered, state);
+            // 1) 构建请求（按需过滤工具：复杂任务未 set 计划时仅放行 todo）
+            var specsForTurn = buildToolSpecsForTurn(toolSpecs, hasTools, state.mediaDelivered, state, sessionId);
             // 记录 LLM 请求上下文
             if (traceRecorder != null) {
                 String promptCtx = formatMessagesForTrace(messages);
@@ -544,6 +561,10 @@ public class AgentLoop {
                             + "把上次没写完的剩余内容分多次追加到同一文件，每次片段不要太长，直到整份文件写完。"));
                 }
 
+                // 子目标漂移纠偏 + 批量并行派发提示
+                injectDriftCorrectionIfNeeded(messages, toolCalls, state, sessionId);
+                injectBatchDelegateHintIfNeeded(messages, state, sessionId);
+
                 // 媒体已交付后，如果 LLM 还在调非输出工具，强制提醒或终止
                 if (state.mediaDelivered) {
                     boolean hasNonOutputTool = toolCalls.stream()
@@ -557,7 +578,7 @@ public class AgentLoop {
                         state.mediaReminderSent = true;
                         state.mediaIgnoreCount++;
                         log.info("媒体已交付但 LLM 还在调其他工具，第 {} 次忽略提醒", state.mediaIgnoreCount);
-                        if (state.mediaIgnoreCount >= 2) {
+                        if (state.mediaIgnoreCount >= 1) {
                             log.warn("LLM 连续忽略 {} 次提醒，强制结束循环", state.mediaIgnoreCount);
                             return state.lastMediaResult != null ? state.lastMediaResult : "图片已生成。";
                         }
@@ -575,7 +596,8 @@ public class AgentLoop {
             }
 
             // 3) 模型返回文本（无工具调用）→ 模型主动收尾，作为最终回复
-            String result = tryReturnFinalText(aiMessage, messages, state, explicitlyNeedsFile, turn, iterations);
+            String result = tryReturnFinalText(aiMessage, messages, state, explicitlyNeedsFile,
+                    turn, iterations, sessionId);
             if (result != null) {
                 if (traceRecorder != null) {
                     traceRecorder.recordAnswer(sessionId, turn, result);
@@ -646,9 +668,21 @@ public class AgentLoop {
 
     /** 根据当前状态过滤本轮可用工具 */
     private List<?> buildToolSpecsForTurn(List<?> toolSpecs, boolean hasTools,
-                                           boolean mediaDelivered, LoopState state) {
+                                           boolean mediaDelivered, LoopState state, String sessionId) {
         if (!hasTools) return List.of();  // mediaDelivered不再清空工具，让模型自己决定是否继续生成
         var specs = toolSpecs;
+
+        // 复杂任务：尚未 todo.set 时只允许 todo，强制先写计划
+        if (state.requiresStructuredPlan && sessionId != null && !taskTodoStore.hasPlan(sessionId)) {
+            specs = specs.stream()
+                    .filter(s -> "todo".equals(((dev.langchain4j.agent.tool.ToolSpecification) s).name()))
+                    .toList();
+            if (!specs.isEmpty()) {
+                log.info("复杂任务未建立计划，本轮仅放行 todo 工具");
+                return specs;
+            }
+        }
+
         if (state.imageGenerateUnavailable) {
             specs = specs.stream().filter(s -> !"image_generate".equals(((dev.langchain4j.agent.tool.ToolSpecification)s).name())).toList();
         }
@@ -664,6 +698,79 @@ public class AgentLoop {
             }
         }
         return specs;
+    }
+
+    /** 工具调用明显偏离当前子目标时注入纠偏（最多 2 次，避免刷屏） */
+    private void injectDriftCorrectionIfNeeded(List<ChatMessage> messages, List<?> toolCalls,
+                                               LoopState state, String sessionId) {
+        if (sessionId == null || state.driftReminders >= 2) return;
+        TaskTodoStore.SubGoal sg = taskTodoStore.currentSubGoalDetail(sessionId);
+        if (sg == null || sg.text() == null || sg.text().isBlank()) return;
+        if (!looksLikeSubGoalDrift(sg.text(), toolCalls)) return;
+        state.driftReminders++;
+        log.info("检测到子目标漂移，注入纠偏 #{}/2: {}", state.driftReminders, sg.text());
+        messages.add(new SystemMessage(
+                "【方向纠偏】当前子目标是：#" + sg.position() + "/" + sg.total() + " " + sg.text()
+                        + (sg.doneWhen() == null || sg.doneWhen().isBlank() ? "" : "（done_when=" + sg.doneWhen() + "）")
+                        + "\n你刚才的工具调用看起来与该步无关。请立刻回到当前子目标："
+                        + "用相关工具完成它，再 todo update 标 completed（附 evidence），不要继续无关操作。"));
+    }
+
+    /** 粗粒度相关性：元工具放行；否则要求参数/工具类型与子目标语义沾边 */
+    private boolean looksLikeSubGoalDrift(String subGoal, List<?> toolCalls) {
+        Set<String> meta = Set.of("todo", "memory", "delegate_task");
+        boolean hasNonMeta = false;
+        String sg = subGoal.toLowerCase();
+        for (Object tc : toolCalls) {
+            String name = toolNameOf(tc);
+            if (meta.contains(name)) continue;
+            hasNonMeta = true;
+            String args = argumentsOf(tc) == null ? "" : argumentsOf(tc).toLowerCase();
+            if (sharesSignificantToken(sg, args)) return false;
+            if (("write_file".equals(name) || "edit_file".equals(name) || "read_file".equals(name))
+                    && (sg.contains("写") || sg.contains("生成") || sg.contains("文件")
+                    || sg.contains("实现") || sg.contains("文档") || sg.contains("代码"))) return false;
+            if (("image_generate".equals(name) || name.startsWith("comfyui"))
+                    && (sg.contains("图") || sg.contains("画") || sg.contains("image") || sg.contains("视觉"))) return false;
+            if (("web_search".equals(name) || "web_extract".equals(name) || "http_get".equals(name))
+                    && (sg.contains("搜索") || sg.contains("调研") || sg.contains("查") || sg.contains("资料"))) return false;
+            if (name.startsWith("browser")
+                    && (sg.contains("浏览器") || sg.contains("网页") || sg.contains("打开") || sg.contains("验证"))) return false;
+            if ("exec_command".equals(name)
+                    && (sg.contains("编译") || sg.contains("测试") || sg.contains("验证") || sg.contains("运行"))) return false;
+            if (("search_code".equals(name) || "codebase_search".equals(name) || "ast_search".equals(name)
+                    || "read_package".equals(name))
+                    && (sg.contains("代码") || sg.contains("定位") || sg.contains("搜索") || sg.contains("分析"))) return false;
+        }
+        return hasNonMeta;
+    }
+
+    private static boolean sharesSignificantToken(String subGoal, String args) {
+        if (subGoal.isBlank() || args.isBlank()) return false;
+        // 中文 2+ 字片段 / 英文 4+ 字母词
+        java.util.regex.Matcher zh = java.util.regex.Pattern.compile("[\\u4e00-\\u9fff]{2,}").matcher(subGoal);
+        while (zh.find()) {
+            if (args.contains(zh.group())) return true;
+        }
+        java.util.regex.Matcher en = java.util.regex.Pattern.compile("[a-zA-Z0-9_./-]{4,}").matcher(subGoal);
+        while (en.find()) {
+            if (args.contains(en.group().toLowerCase())) return true;
+        }
+        return false;
+    }
+
+    /** 计划里有大量可并行产出步时，提示用 delegate_task（只提示一次） */
+    private void injectBatchDelegateHintIfNeeded(List<ChatMessage> messages, LoopState state, String sessionId) {
+        if (state.batchDelegateHintSent || sessionId == null) return;
+        int batchable = taskTodoStore.countBatchablePending(sessionId);
+        if (batchable < 3) return;
+        state.batchDelegateHintSent = true;
+        log.info("批量产出提示：{} 个可并行步骤，建议 delegate_task", batchable);
+        messages.add(new SystemMessage(
+                "【并行加速】当前计划仍有 " + batchable + " 个可独立的产出步骤。"
+                        + "请在本回合用多个 delegate_task 并行派发（每个子任务写清 goal/context/产出路径），"
+                        + "不要在主循环里一个文件一个回合串行 write_file。"
+                        + "子任务完成后根据摘要勾选对应 todo（附 evidence）。"));
     }
 
     // ==================== LLM 调用 ====================
@@ -1115,13 +1222,57 @@ public class AgentLoop {
     // ==================== 完成判断 ====================
 
     /**
-     * 尝试返回最终回复。返回 null 表示需要继续循环（注入了文件提醒）。
+     * 尝试返回最终回复。返回 null 表示需要继续循环（注入了文件/计划/todo 提醒）。
      */
     private String tryReturnFinalText(AiMessage aiMessage, List<ChatMessage> messages,
                                        LoopState state, boolean explicitlyNeedsFile,
-                                       int turn, int iterations) {
+                                       int turn, int iterations, String sessionId) {
         String finalText = aiMessage.text();
         log.info("Agent收尾 {}/{}: 生成最终回复", turn + 1, iterations);
+
+        if (finalText == null || finalText.isBlank()) {
+            if (state.mediaDelivered) return ensureMarkdownImage(state.lastMediaResult);
+            if (state.writeFileSucceeded && !hasBlockingTodos(sessionId)) {
+                return "（文件已生成，见 workspace/）";
+            }
+            if (hasBlockingTodos(sessionId) || (state.requiresStructuredPlan && !taskTodoStore.hasPlan(sessionId))) {
+                // 走下面的拦截逻辑
+                finalText = "";
+            } else {
+                return "（模型未返回内容）";
+            }
+        }
+
+        // 复杂任务尚未建立计划 → 拦截收尾，强制 todo.set
+        if (state.requiresStructuredPlan && sessionId != null && !taskTodoStore.hasPlan(sessionId)) {
+            if (state.planReminderCount < 2) {
+                state.planReminderCount++;
+                log.info("复杂任务未建立 todo，拦截收尾 #{}/2", state.planReminderCount);
+                messages.add(new SystemMessage(
+                        "【收尾被拦截】这是复杂任务，你还没有用 todo(action=set) 写出带 done_when 的计划。"
+                                + "下一轮必须先调用 todo set，再逐步执行。不要直接给最终结论。"));
+                return null;
+            }
+        }
+
+        // 存在未完成 todo → 拦截收尾（提醒 2 次后附清单放行，避免死锁）
+        if (sessionId != null && taskTodoStore.hasPlan(sessionId) && taskTodoStore.hasIncomplete(sessionId)) {
+            if (state.incompleteTodoReminders < 2) {
+                state.incompleteTodoReminders++;
+                log.info("todo 未完成，拦截收尾 #{}/2", state.incompleteTodoReminders);
+                messages.add(new SystemMessage(
+                        "【收尾被拦截】仍有未完成的子任务。请继续执行「当前子目标」，"
+                                + "完成后 todo update 标 completed 并提供 evidence。"
+                                + "全部完成后才能最终回复。\n"
+                                + taskTodoStore.render(sessionId)));
+                return null;
+            }
+            log.warn("todo 未完成但已提醒多次，附带未完成清单后放行。轮次 {}", turn + 1);
+            if (finalText == null) finalText = "";
+            finalText = finalText.stripTrailing()
+                    + "\n\n⚠️ 以下子任务尚未完成（可发送「继续」接着做）：\n"
+                    + taskTodoStore.render(sessionId);
+        }
 
         if (finalText == null || finalText.isBlank()) {
             if (state.mediaDelivered) return ensureMarkdownImage(state.lastMediaResult);
@@ -1160,13 +1311,21 @@ public class AgentLoop {
         return null;
     }
 
+    private boolean hasBlockingTodos(String sessionId) {
+        return sessionId != null && taskTodoStore.hasPlan(sessionId) && taskTodoStore.hasIncomplete(sessionId);
+    }
+
     /** 构建达到最大迭代次数时的兜底回复 */
     private String buildMaxIterationFallback(LoopState state, int iterations) {
         StringBuilder sb = new StringBuilder();
-        if (state.writeFileSucceeded || state.mediaDelivered) {
+        String sid = currentSessionId.get();
+        if (state.writeFileSucceeded || state.mediaDelivered || (sid != null && taskTodoStore.hasPlan(sid))) {
             sb.append("任务轮次已达上限（").append(iterations).append("轮），但已有部分成果：");
             if (state.writeFileSucceeded) sb.append("\n- 文件已写入 workspace/");
             if (state.mediaDelivered) sb.append("\n- 图片已生成");
+            if (sid != null && taskTodoStore.hasIncomplete(sid)) {
+                sb.append("\n- 未完成子任务：\n").append(taskTodoStore.render(sid));
+            }
             sb.append("\n\n剩余未完成的子任务可以通过发送「继续」来让我接着完成。");
             return sb.toString();
         }

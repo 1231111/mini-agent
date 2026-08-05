@@ -2,7 +2,7 @@
 §
 用户要求生成“中邪”风格的中国中年女性照片，需要苍白肤色、眼神呆滞、头发散乱、嘴角口水痕迹、破旧棉袄、昏暗室内背景。SILICONFLOW服务曾多次失败，但这次重试成功生成。
 §
-当前环境工具限制：image_generate和write_file工具在当前环境中不可用。当用户请求生成图片时，应提供优化后的完整提示词方案，建议用户使用即梦AI等外部平台。用户偏好写实摄影风格、电影质感、高分辨率（8K/4K），拒绝绘画或虚假感。
+image_generate工具已可用（云端多后端自动降级：ChatAnywhere/MiMo/FAL/SiliconFlow/智谱CogView），无需ComfyUI即可生成图片。ComfyUI工具（comfyui_txt2img等）需要本地ComfyUI服务运行。用户偏好写实摄影风格、电影质感、高分辨率（8K/4K），拒绝绘画或虚假感。
 §
 用户正在深入探索 mini-agent-springboot 项目的意图识别机制，这是优化项目架构（减少LLM调用）的关键切入点。
 

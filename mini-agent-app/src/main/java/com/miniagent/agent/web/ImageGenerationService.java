@@ -20,7 +20,14 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 图像生成服务 — 对标 hermes-agent image_generate
@@ -50,6 +57,28 @@ public class ImageGenerationService {
             .connectTimeout(Duration.ofSeconds(10))
             .followRedirects(HttpClient.Redirect.NORMAL)
             .build();
+    /** 后端竞速 / 熔断专用虚拟线程池 */
+    private static final ExecutorService BACKEND_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
+
+    /** 各后端 HTTP 超时（秒） */
+    private static final Map<String, Long> BACKEND_TIMEOUT_SECONDS = Map.of(
+            "chatanywhere", 120L,
+            "mimo", 90L,
+            "xiaomi", 90L,
+            "fal", 120L,
+            "siliconflow", 45L,
+            "zhipu", 45L
+    );
+
+    /** 熔断：5 分钟内失败达到阈值则跳过该后端 */
+    private static final int CIRCUIT_FAILURE_THRESHOLD = 3;
+    private static final long CIRCUIT_WINDOW_MS = 5 * 60 * 1000L;
+    private final ConcurrentHashMap<String, CircuitState> circuitStates = new ConcurrentHashMap<>();
+
+    private static final class CircuitState {
+        final AtomicInteger failures = new AtomicInteger(0);
+        final AtomicLong windowStartMs = new AtomicLong(System.currentTimeMillis());
+    }
 
     // ========== 环境变量配置 ==========
 
@@ -103,38 +132,157 @@ public class ImageGenerationService {
         log.info("图像生成: backend={} aspect={} prompt='{}'", primaryBackend, aspectRatio,
                 prompt.substring(0, Math.min(80, prompt.length())));
 
-        // 按优先级构建 fallback 链（跳过未配置 key 的 provider）
-        List<String> chain = buildFallbackChain(primaryBackend);
+        // 按优先级构建 fallback 链（跳过未配置 key / 熔断中的 provider）
+        List<String> chain = buildFallbackChain(primaryBackend).stream()
+                .filter(b -> !isCircuitOpen(b))
+                .toList();
+        if (chain.isEmpty()) {
+            chain = buildFallbackChain(primaryBackend); // 全部熔断时仍尝试原链
+        }
+
         String lastError = "无可用后端";
 
-        for (String backend : chain) {
-            try {
-                log.info("尝试后端: {}", backend);
-                String imageUrl = switch (backend) {
-                    case "chatanywhere" -> generateViaChatAnywhere(prompt, imageSize);
-                    case "mimo", "xiaomi" -> generateViaMimo(prompt, imageSize);
-                    case "fal"         -> generateViaFal(prompt, imageSize);
-                    case "siliconflow" -> generateViaSiliconFlow(prompt, imageSize);
-                    case "zhipu"       -> generateViaCogView(prompt, imageSize);
-                    default            -> null;
-                };
-                if (imageUrl != null && !imageUrl.isBlank()) {
-                    // 统一返回 markdown 图片链接（前端可直接渲染，AgentLoop 可识别为媒体交付）
-                    if (imageUrl.startsWith("![")) return imageUrl;  // 已是 markdown
-                    if (imageUrl.startsWith("http")) return "![生成的图片](" + imageUrl + ")";  // URL → markdown
-                    // 本地路径（如 /static/images/xxx.png）→ markdown
-                    return "![生成的图片](" + imageUrl + ")";
-                }
-                lastError = "后端 " + backend + " 未返回图片URL";
-                log.warn("后端 {} 未返回图片，尝试下一个", backend);
-            } catch (Exception e) {
-                lastError = "后端 " + backend + " 失败: " + e.getMessage();
-                log.warn("后端 {} 异常，尝试下一个: {}", backend, e.getMessage());
+        // 前两个后端并行竞速，谁先成功用谁；都失败再串行尝试剩余
+        if (chain.size() >= 2) {
+            String raced = raceBackends(chain.subList(0, 2), prompt, imageSize);
+            if (raced != null) return toMarkdownImage(raced);
+            lastError = "并行竞速后端均失败: " + chain.get(0) + ", " + chain.get(1);
+            for (int i = 2; i < chain.size(); i++) {
+                String result = tryBackend(chain.get(i), prompt, imageSize);
+                if (result != null) return toMarkdownImage(result);
+                lastError = "后端 " + chain.get(i) + " 失败";
+            }
+        } else {
+            for (String backend : chain) {
+                String result = tryBackend(backend, prompt, imageSize);
+                if (result != null) return toMarkdownImage(result);
+                lastError = "后端 " + backend + " 失败";
             }
         }
 
         log.error("所有图像生成后端均失败: {}", lastError);
         return errorJson("所有后端均失败: " + lastError);
+    }
+
+    /** 并行竞速：任一成功即返回，并取消其余；全部失败返回 null */
+    private String raceBackends(List<String> backends, String prompt, String imageSize) {
+        log.info("并行竞速后端: {}", backends);
+        List<CompletableFuture<String>> futures = new ArrayList<>();
+        for (String backend : backends) {
+            futures.add(CompletableFuture.supplyAsync(
+                    () -> tryBackend(backend, prompt, imageSize), BACKEND_EXECUTOR));
+        }
+        long maxWait = backends.stream()
+                .mapToLong(b -> BACKEND_TIMEOUT_SECONDS.getOrDefault(b, 120L))
+                .max().orElse(120L) + 10;
+
+        long deadline = System.currentTimeMillis() + maxWait * 1000L;
+        while (System.currentTimeMillis() < deadline) {
+            boolean allDone = true;
+            for (CompletableFuture<String> f : futures) {
+                if (!f.isDone()) {
+                    allDone = false;
+                    continue;
+                }
+                try {
+                    String r = f.getNow(null);
+                    if (r != null && !r.isBlank()) {
+                        for (CompletableFuture<String> other : futures) {
+                            if (other != f) other.cancel(true);
+                        }
+                        return r;
+                    }
+                } catch (Exception ignored) { /* 单个失败继续等 */ }
+            }
+            if (allDone) break;
+            try { Thread.sleep(200); } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        for (CompletableFuture<String> f : futures) f.cancel(true);
+        return null;
+    }
+
+    /** 尝试单个后端；成功返回图片 URL/markdown，失败记录熔断并返回 null */
+    private String tryBackend(String backend, String prompt, String imageSize) {
+        try {
+            log.info("尝试后端: {}", backend);
+            long timeoutSec = BACKEND_TIMEOUT_SECONDS.getOrDefault(backend, 120L);
+            CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return invokeBackend(backend, prompt, imageSize);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }, BACKEND_EXECUTOR);
+            String imageUrl = future.get(timeoutSec, TimeUnit.SECONDS);
+            if (imageUrl != null && !imageUrl.isBlank()) {
+                recordSuccess(backend);
+                return imageUrl;
+            }
+            log.warn("后端 {} 未返回图片，尝试下一个", backend);
+            recordFailure(backend);
+            return null;
+        } catch (java.util.concurrent.CancellationException e) {
+            log.info("后端 {} 竞速取消（另一后端已先返回）", backend);
+            return null;
+        } catch (Exception e) {
+            log.warn("后端 {} 异常，尝试下一个: {}", backend, e.getMessage());
+            recordFailure(backend);
+            return null;
+        }
+    }
+
+    private String invokeBackend(String backend, String prompt, String imageSize) throws Exception {
+        return switch (backend) {
+            case "chatanywhere" -> generateViaChatAnywhere(prompt, imageSize);
+            case "mimo", "xiaomi" -> generateViaMimo(prompt, imageSize);
+            case "fal" -> generateViaFal(prompt, imageSize);
+            case "siliconflow" -> generateViaSiliconFlow(prompt, imageSize);
+            case "zhipu" -> generateViaCogView(prompt, imageSize);
+            default -> null;
+        };
+    }
+
+    private static String toMarkdownImage(String imageUrl) {
+        if (imageUrl.startsWith("![")) return imageUrl;
+        return "![生成的图片](" + imageUrl + ")";
+    }
+
+    private boolean isCircuitOpen(String backend) {
+        CircuitState state = circuitStates.get(backend);
+        if (state == null) return false;
+        long now = System.currentTimeMillis();
+        if (now - state.windowStartMs.get() > CIRCUIT_WINDOW_MS) {
+            state.failures.set(0);
+            state.windowStartMs.set(now);
+            return false;
+        }
+        if (state.failures.get() >= CIRCUIT_FAILURE_THRESHOLD) {
+            log.info("后端 {} 熔断中（{} 次失败/5min），跳过", backend, state.failures.get());
+            return true;
+        }
+        return false;
+    }
+
+    private void recordFailure(String backend) {
+        CircuitState state = circuitStates.computeIfAbsent(backend, k -> new CircuitState());
+        long now = System.currentTimeMillis();
+        if (now - state.windowStartMs.get() > CIRCUIT_WINDOW_MS) {
+            state.failures.set(1);
+            state.windowStartMs.set(now);
+        } else {
+            state.failures.incrementAndGet();
+        }
+    }
+
+    private void recordSuccess(String backend) {
+        CircuitState state = circuitStates.get(backend);
+        if (state != null) {
+            state.failures.set(0);
+            state.windowStartMs.set(System.currentTimeMillis());
+        }
     }
 
     // ========== ChatAnywhere 图片后端（OpenAI Images 兼容） ==========
@@ -209,7 +357,7 @@ public class ImageGenerationService {
                     .uri(URI.create(base + "/images/generations"))
                     .header("Authorization", "Bearer " + key)
                     .header("Content-Type", "application/json")
-                    .timeout(Duration.ofSeconds(500))
+                    .timeout(Duration.ofSeconds(120))
                     .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload), StandardCharsets.UTF_8))
                     .build();
 
@@ -300,7 +448,7 @@ public class ImageGenerationService {
                 .uri(URI.create(base + "/images/generations"))
                 .header("Authorization", "Bearer " + key)
                 .header("Content-Type", "application/json")
-                .timeout(Duration.ofSeconds(120))
+                .timeout(Duration.ofSeconds(90))
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload), StandardCharsets.UTF_8))
                 .build();
 
@@ -431,7 +579,7 @@ public class ImageGenerationService {
                 .uri(URI.create("https://api.siliconflow.cn/v1/images/generations"))
                 .header("Authorization", "Bearer " + key)
                 .header("Content-Type", "application/json")
-                .timeout(Duration.ofSeconds(60))
+                .timeout(Duration.ofSeconds(45))
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload)))
                 .build();
 
@@ -470,7 +618,7 @@ public class ImageGenerationService {
                 .uri(URI.create("https://open.bigmodel.cn/api/paas/v4/images/generations"))
                 .header("Authorization", "Bearer " + key)
                 .header("Content-Type", "application/json")
-                .timeout(Duration.ofSeconds(60))
+                .timeout(Duration.ofSeconds(45))
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload)))
                 .build();
 
