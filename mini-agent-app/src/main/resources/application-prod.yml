@@ -1,17 +1,14 @@
+# Docker / 生产覆盖：数据源指向 compose 内的 mysql 服务名
 spring:
   thymeleaf:
     cache: true
+  datasource:
+    url: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
+    username: root
+    password: mysql_root_pass
   jpa:
     hibernate:
-      # Prefer validate + Flyway in mature deploys; update keeps first-land simple.
-      ddl-auto: ${SPRING_JPA_HIBERNATE_DDL_AUTO:update}
-  mvc:
-    async:
-      request-timeout: 1800000
-
-server:
-  tomcat:
-    connection-timeout: 1800000
+      ddl-auto: update
 
 logging:
   level:
@@ -27,8 +24,6 @@ agent:
     per-minute: 30
   concurrency:
     max-tasks-per-user: 2
-  sse:
-    timeout-ms: 1800000
 
 management:
   endpoint:
