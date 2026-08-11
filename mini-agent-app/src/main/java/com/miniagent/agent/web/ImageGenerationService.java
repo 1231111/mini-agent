@@ -3,7 +3,9 @@ package com.miniagent.agent.web;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.miniagent.config.storage.MediaStorage;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -60,9 +62,9 @@ public class ImageGenerationService {
     /** 后端竞速 / 熔断专用虚拟线程池 */
     private static final ExecutorService BACKEND_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
-    /** 各后端 HTTP 超时（秒） */
+    /** 各后端默认外层等待（秒）；chatanywhere 慢模型（gpt-image-2-ca）走配置项覆盖 */
     private static final Map<String, Long> BACKEND_TIMEOUT_SECONDS = Map.of(
-            "chatanywhere", 120L,
+            "chatanywhere", 500L,
             "mimo", 90L,
             "xiaomi", 90L,
             "fal", 120L,
@@ -80,6 +82,9 @@ public class ImageGenerationService {
         final AtomicLong windowStartMs = new AtomicLong(System.currentTimeMillis());
     }
 
+    @Autowired
+    private MediaStorage mediaStorage;
+
     // ========== 环境变量配置 ==========
 
     @Value("${image.gen.fal-key:#{null}}")
@@ -93,6 +98,10 @@ public class ImageGenerationService {
 
     @Value("${image.gen.chatanywhere-model:dall-e-3}")
     private String chatAnywhereModel;
+
+    /** gpt-image-2-ca 常需 3–8 分钟；默认 500s，勿再压到 120s */
+    @Value("${image.gen.chatanywhere-timeout-seconds:500}")
+    private long chatAnywhereTimeoutSeconds;
 
     @Value("${image.gen.siliconflow-api-key:#{null}}")
     private String siliconflowKey;
@@ -204,11 +213,22 @@ public class ImageGenerationService {
         return null;
     }
 
+    /** ChatAnywhere 实际等待秒数（2CA 慢模型用加长超时） */
+    private long chatAnywhereWaitSeconds() {
+        long configured = chatAnywhereTimeoutSeconds > 0 ? chatAnywhereTimeoutSeconds : 500L;
+        if (chatAnywhereModel != null && chatAnywhereModel.toLowerCase().contains("gpt-image")) {
+            return Math.max(configured, 500L);
+        }
+        return Math.max(configured, 120L);
+    }
+
     /** 尝试单个后端；成功返回图片 URL/markdown，失败记录熔断并返回 null */
     private String tryBackend(String backend, String prompt, String imageSize) {
         try {
             log.info("尝试后端: {}", backend);
-            long timeoutSec = BACKEND_TIMEOUT_SECONDS.getOrDefault(backend, 120L);
+            long timeoutSec = "chatanywhere".equals(backend)
+                    ? chatAnywhereWaitSeconds()
+                    : BACKEND_TIMEOUT_SECONDS.getOrDefault(backend, 120L);
             CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
                 try {
                     return invokeBackend(backend, prompt, imageSize);
@@ -228,10 +248,51 @@ public class ImageGenerationService {
             log.info("后端 {} 竞速取消（另一后端已先返回）", backend);
             return null;
         } catch (Exception e) {
-            log.warn("后端 {} 异常，尝试下一个: {}", backend, e.getMessage());
+            Throwable root = e;
+            while (root.getCause() != null && root.getCause() != root) root = root.getCause();
+            String detail = root.getMessage() != null ? root.getMessage() : e.getMessage();
+            log.warn("后端 {} 异常，尝试下一个: {}", backend, detail);
             recordFailure(backend);
             return null;
         }
+    }
+
+    /**
+     * 安全解析生图 API 响应：先校验 HTTP/Content-Type/正文形态，再解析 JSON。
+     * 对方返回 HTML 错误页时给出可读错误，而不是 Jackson JsonParseException。
+     */
+    private static JsonNode parseApiJson(String backend, HttpResponse<String> response) {
+        int status = response.statusCode();
+        String body = response.body() == null ? "" : response.body();
+        String contentType = response.headers().firstValue("content-type").orElse("");
+        String preview = bodyPreview(body, 180);
+
+        if (status < 200 || status >= 300) {
+            throw new RuntimeException(backend + " HTTP " + status
+                    + (contentType.isBlank() ? "" : " content-type=" + contentType)
+                    + " body=" + preview);
+        }
+        String trimmed = body.stripLeading();
+        boolean looksJson = trimmed.startsWith("{") || trimmed.startsWith("[");
+        boolean claimsJson = contentType.toLowerCase().contains("json");
+        if (!looksJson) {
+            throw new RuntimeException(backend + " 返回非 JSON（HTTP " + status
+                    + (contentType.isBlank() ? "" : ", content-type=" + contentType)
+                    + "）。常见原因：鉴权失败/网关错误页/端点不存在。body=" + preview);
+        }
+        try {
+            return MAPPER.readTree(body);
+        } catch (Exception e) {
+            throw new RuntimeException(backend + " JSON 解析失败"
+                    + (claimsJson ? "" : "（Content-Type 也非 json）")
+                    + ": " + e.getMessage() + "; body=" + preview, e);
+        }
+    }
+
+    private static String bodyPreview(String body, int max) {
+        if (body == null || body.isBlank()) return "(empty)";
+        String oneLine = body.replace('\r', ' ').replace('\n', ' ').strip();
+        return oneLine.length() <= max ? oneLine : oneLine.substring(0, max) + "…";
     }
 
     private String invokeBackend(String backend, String prompt, String imageSize) throws Exception {
@@ -312,30 +373,28 @@ public class ImageGenerationService {
                 ? "https://api.chatanywhere.tech/v1"
                 : chatAnywhereBaseUrl.replaceAll("/+$", "");
 
+        long httpTimeout = chatAnywhereWaitSeconds();
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(base + "/images/generations"))
                 .header("Authorization", "Bearer " + key)
                 .header("Content-Type", "application/json")
-                .timeout(Duration.ofSeconds(120))
+                .timeout(Duration.ofSeconds(httpTimeout))
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload), StandardCharsets.UTF_8))
                 .build();
 
         HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        JsonNode root = MAPPER.readTree(response.body());
+        JsonNode root = parseApiJson("ChatAnywhere", response);
         JsonNode data = root.path("data");
-        if (response.statusCode() >= 200 && response.statusCode() < 300 && data.isArray() && !data.isEmpty()) {
+        if (data.isArray() && !data.isEmpty()) {
             String url = data.get(0).path("url").asText("");
             if (!url.isBlank()) return url;
         }
 
         String msg = root.path("error").path("message")
-                .asText(root.path("message").asText(response.body()));
+                .asText(root.path("message").asText(bodyPreview(response.body(), 200)));
         log.error("ChatAnywhere 图像生成响应异常: HTTP {} {}", response.statusCode(), msg);
         throw new RuntimeException("ChatAnywhere: " + msg);
     }
-    // 在类中定义常量，指向项目根目录下的 generated-images
-    private static final String GENERATED_IMAGES_DIR = "generated-images";
-
     private String generateImageBy2ca(String prompt, String imageSize) {
         String key = resolveKey(chatAnywhereKey, "CHATANYWHERE_API_KEY");
         String base = (chatAnywhereBaseUrl == null || chatAnywhereBaseUrl.isBlank())
@@ -348,27 +407,29 @@ public class ImageGenerationService {
         payload.put("model", chatAnywhereModel);
         payload.put("size", mapToOpenAiImageSize(imageSize));
 
-        // 图片保存目录（声明在 try 外，catch 中也需要访问）
-        Path projectRoot = Paths.get(System.getProperty("user.dir"));
-        Path imageDir = projectRoot.resolve(GENERATED_IMAGES_DIR);
+        Path imageDir = mediaStorage.generatedDir();
 
         try {
+            long httpTimeout = chatAnywhereWaitSeconds();
+            log.info("ChatAnywhere 2CA 开始生成: model={} timeout={}s size={}",
+                    chatAnywhereModel, httpTimeout, mapToOpenAiImageSize(imageSize));
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(base + "/images/generations"))
                     .header("Authorization", "Bearer " + key)
                     .header("Content-Type", "application/json")
-                    .timeout(Duration.ofSeconds(120))
+                    .timeout(Duration.ofSeconds(httpTimeout))
                     .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload), StandardCharsets.UTF_8))
                     .build();
 
             HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
 
-            if (response.statusCode() != 200) {
-                log.error("API 请求失败，状态码: {}, 响应: {}", response.statusCode(), response.body());
+            JsonNode root;
+            try {
+                root = parseApiJson("ChatAnywhere-2CA", response);
+            } catch (RuntimeException bad) {
+                log.error("API 请求失败: {}", bad.getMessage());
                 return null;
             }
-
-            JsonNode root = MAPPER.readTree(response.body());
 
             if (root.has("error")) {
                 log.error("API 返回错误: {}", root.path("error").path("message").asText());
@@ -410,10 +471,19 @@ public class ImageGenerationService {
             // 返回 markdown 图片链接（前端可直接渲染，AgentLoop 可识别为媒体交付）
             return "![生成的图片](/static/images/" + fileName + ")";
 
+        } catch (java.net.http.HttpTimeoutException e) {
+            log.error("ChatAnywhere 2CA 超时（{}s）: {}", chatAnywhereWaitSeconds(), e.getMessage());
+            // 超时后放宽到 10 分钟窗口找落盘图片（服务端可能已生成完但客户端先断）
+            String recentImage = findRecentGeneratedImage(imageDir, 600);
+            if (recentImage != null) {
+                log.info("HTTP 超时但发现最近生成的图片: {}", recentImage);
+                return "![生成的图片](/static/images/" + recentImage + ")";
+            }
+            return null;
         } catch (Exception e) {
             log.error("ChatAnywhere 2CA 图像生成失败: {}", e.getMessage(), e);
-            // 安全网：HTTP 失败但图片可能已保存到磁盘（竞态条件），检查最近 60 秒内生成的图片
-            String recentImage = findRecentGeneratedImage(imageDir, 60);
+            // 安全网：HTTP 失败但图片可能已保存到磁盘（竞态条件），检查最近生成的图片
+            String recentImage = findRecentGeneratedImage(imageDir, 600);
             if (recentImage != null) {
                 log.info("HTTP 失败但发现最近生成的图片: {}", recentImage);
                 return "![生成的图片](/static/images/" + recentImage + ")";
@@ -453,9 +523,9 @@ public class ImageGenerationService {
                 .build();
 
         HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        JsonNode root = MAPPER.readTree(response.body());
+        JsonNode root = parseApiJson("MiMo", response);
         JsonNode data = root.path("data");
-        if (response.statusCode() >= 200 && response.statusCode() < 300 && data.isArray() && !data.isEmpty()) {
+        if (data.isArray() && !data.isEmpty()) {
             JsonNode first = data.get(0);
             String url = first.path("url").asText("");
             if (!url.isBlank()) return url;
@@ -464,8 +534,8 @@ public class ImageGenerationService {
         }
 
         String msg = root.path("error").path("message")
-                .asText(root.path("message").asText(response.body()));
-        log.error("MiMo 图像生成响应异常: HTTP {} {}", response.statusCode(), msg);
+                .asText(root.path("message").asText(bodyPreview(response.body(), 200)));
+        log.error("MiMo 图像生成业务响应异常: HTTP {} {}", response.statusCode(), msg);
         throw new RuntimeException("MiMo: " + msg);
     }
 
@@ -503,7 +573,7 @@ public class ImageGenerationService {
                 .build();
 
         HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
-        JsonNode root = MAPPER.readTree(response.body());
+        JsonNode root = parseApiJson("FAL", response);
 
         // 同步模式直接返回 images
         JsonNode images = root.path("images");
@@ -517,7 +587,7 @@ public class ImageGenerationService {
             return pollFalResult(key, requestId);
         }
 
-        log.error("FAL.ai 响应异常: {}", response.body());
+        log.error("FAL.ai 响应异常: {}", bodyPreview(response.body(), 300));
         return null;
     }
 
@@ -536,7 +606,13 @@ public class ImageGenerationService {
                     .build();
 
             HttpResponse<String> pollResp = HTTP.send(pollReq, HttpResponse.BodyHandlers.ofString());
-            JsonNode pollRoot = MAPPER.readTree(pollResp.body());
+            JsonNode pollRoot;
+            try {
+                pollRoot = parseApiJson("FAL-poll", pollResp);
+            } catch (RuntimeException bad) {
+                log.warn("FAL 轮询非 JSON: {}", bad.getMessage());
+                continue;
+            }
             String status = pollRoot.path("status").asText("");
 
             if ("COMPLETED".equals(status)) {
@@ -584,17 +660,14 @@ public class ImageGenerationService {
                 .build();
 
         HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
-        JsonNode root = MAPPER.readTree(response.body());
+        JsonNode root = parseApiJson("SiliconFlow", response);
         JsonNode images = root.path("images");
 
         if (images.isArray() && !images.isEmpty()) {
             return images.get(0).path("url").asText(null);
         }
 
-        // 解析具体错误原因抛出，让上层 fallback 链记录并继续或终止
-        String errBody = response.body();
-        log.error("SiliconFlow 响应异常: {}", errBody);
-        // 提取 message 字段（SiliconFlow 错误格式：{"message":"Api key is invalid"}）
+        log.error("SiliconFlow 业务响应异常: {}", bodyPreview(response.body(), 300));
         String apiMsg = root.path("message").asText(root.path("error").asText("未知错误"));
         throw new RuntimeException("SiliconFlow: " + apiMsg);
     }
@@ -623,15 +696,14 @@ public class ImageGenerationService {
                 .build();
 
         HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
-        JsonNode root = MAPPER.readTree(response.body());
+        JsonNode root = parseApiJson("CogView", response);
         JsonNode data = root.path("data");
 
         if (data.isArray() && !data.isEmpty()) {
             return data.get(0).path("url").asText(null);
         }
 
-        String errBody = response.body();
-        log.error("CogView 响应异常: {}", errBody);
+        log.error("CogView 业务响应异常: {}", bodyPreview(response.body(), 300));
         String apiMsg = root.path("error").path("message").asText(root.path("message").asText("未知错误"));
         throw new RuntimeException("CogView: " + apiMsg);
     }

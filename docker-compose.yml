@@ -27,11 +27,9 @@ services:
       - "8080:8080"
     environment:
       SPRING_PROFILES_ACTIVE: prod
+      MINI_AGENT_HOME: /app/data
     volumes:
-      - app-workspace:/app/workspace
-      - app-images:/app/generated-images
-      - app-uploads:/app/user-uploads
-      - app-memory:/app/memory
+      - app-data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/actuator/health"]
       interval: 30s
@@ -41,7 +39,4 @@ services:
 
 volumes:
   mysql-data:
-  app-workspace:
-  app-images:
-  app-uploads:
-  app-memory:
+  app-data:

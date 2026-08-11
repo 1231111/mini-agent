@@ -40,14 +40,19 @@ public class DelegateTaskTool {
     private RoleLoader roleLoader;
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** 子 Agent 默认可用的工具集合（读 + 调研 + 产出）。 */
+    /** 子 Agent 默认可用的工具集合（读 + 调研 + 产出 + 生图）。 */
     private static final List<String> DEFAULT_SUBAGENT_TOOLS = List.of(
             "read_file", "list_files", "read_package", "write_file", "exec_command",
             "search_code", "edit_file", "ast_search", "codebase_search",
             "web_search", "web_extract", "http_get",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_press", "browser_scroll",
-            "browser_screenshot", "browser_evaluate", "browser_close"
+            "browser_screenshot", "browser_evaluate", "browser_close",
+            "image_generate"
+    );
+
+    private static final List<String> IMAGE_TOOLS_FOR_SUB = List.of(
+            "image_generate", "comfyui_txt2img", "comfyui_img2img", "comfyui_check_quality"
     );
 
     private static final int SUBAGENT_MAX_ITERATIONS = 25;
@@ -134,11 +139,17 @@ public class DelegateTaskTool {
             // 确定工具集（自定义 > 角色配置 > 默认）
             List<String> tools;
             if (!customTools.isEmpty()) {
-                tools = customTools;
+                tools = new java.util.ArrayList<>(customTools);
             } else if (roleConfig != null && roleConfig.getAllowedTools() != null && !roleConfig.getAllowedTools().isEmpty()) {
-                tools = roleConfig.getAllowedTools();
+                tools = new java.util.ArrayList<>(roleConfig.getAllowedTools());
             } else {
-                tools = DEFAULT_SUBAGENT_TOOLS;
+                tools = new java.util.ArrayList<>(DEFAULT_SUBAGENT_TOOLS);
+            }
+            // 任务要求生图时自动补齐 image 工具（避免 developer 角色无 image_generate）
+            if (needsImageTools(goal, ctx)) {
+                for (String t : IMAGE_TOOLS_FOR_SUB) {
+                    if (!tools.contains(t)) tools.add(t);
+                }
             }
 
             String userMessage = """
@@ -149,14 +160,25 @@ public class DelegateTaskTool {
                     %s
                     """.formatted(goal, ctx.isEmpty() ? "（无）" : ctx);
 
+            // 强隔离：禁止嵌套派发，避免子 Agent 再开子 Agent 污染控制面
+            tools.remove("delegate_task");
+
             String roleLabel = roleConfig != null ? roleConfig.getName() : "通用";
             log.info("delegate_task 启动: role='{}', goal='{}', allowedTools={}", roleLabel, truncate(goal, 80), tools);
 
-            // 子 Agent：fresh context、受限工具
+            // 子 Agent：派生 sessionId + SubagentScope 完整沙箱（消息栈仍为 fresh List.of）
+            String parentSid = AgentLoop.getCurrentSession();
+            String subSid = (parentSid != null && !parentSid.isBlank())
+                    ? parentSid + ":sub:" + Long.toHexString(System.nanoTime())
+                    : "sub_" + Long.toHexString(System.nanoTime());
+
+            ChatModel modelForSub = AgentLoop.getCurrentChatModel() != null
+                    ? AgentLoop.getCurrentChatModel() : chatModel;
+
             String answer;
-            try {
-                answer = agentLoop.run(chatModel, systemPrompt, userMessage,
-                        java.util.List.of(), SUBAGENT_MAX_ITERATIONS, null,
+            try (SubagentScope scope = SubagentScope.enter(subSid, roleId, false)) {
+                answer = agentLoop.run(modelForSub, systemPrompt, userMessage,
+                        java.util.List.of(), /* 不继承父对话脏历史 */ SUBAGENT_MAX_ITERATIONS, null,
                         new com.miniagent.agent.intent.TaskPlan(
                                 com.miniagent.agent.intent.IntentType.NEW_TASK,
                                 goal, true, false, !tools.isEmpty(), tools,
@@ -211,6 +233,22 @@ public class DelegateTaskTool {
             - 不要重复执行同样的工具调用。不要做不可逆的对外操作（发布、发送外部请求）。
             - 没把握时直接说"信息不足"，不要编造。
             """;
+
+    private static boolean needsImageTools(String goal, String ctx) {
+        String blob = ((goal == null ? "" : goal) + " " + (ctx == null ? "" : ctx)).toLowerCase();
+        return blob.contains("image_generate")
+                || blob.contains("生图")
+                || blob.contains("生成图片")
+                || blob.contains("生成图")
+                || blob.contains("结构图")
+                || blob.contains("架构图")
+                || blob.contains("流程图")
+                || blob.contains("文生图")
+                || blob.contains("txt2img")
+                || blob.contains("img2img")
+                || blob.contains("diagram")
+                || (blob.contains("水平布局") && blob.contains("图"));
+    }
 
     @SuppressWarnings("unchecked")
     private List<String> parseTools(Object raw) {

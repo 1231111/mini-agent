@@ -233,14 +233,74 @@
         }
         .topbar-toggle:hover { background: var(--surface); color: var(--text); }
         .topbar-toggle svg { width: 16px; height: 16px; }
+        .model-badge-wrap { position: relative; }
         .model-badge {
             display: inline-flex; align-items: center; gap: 5px;
             font-size: 14px; font-weight: 600; color: var(--text);
-            padding: 4px 10px; border-radius: 8px; cursor: default;
-            user-select: none;
+            padding: 4px 10px; border-radius: 8px; cursor: pointer;
+            user-select: none; border: none; background: transparent;
         }
         .model-badge svg { width: 14px; height: 14px; color: var(--text2); }
         .model-badge:hover { background: var(--surface); }
+        .model-menu {
+            display: none;
+            position: absolute;
+            top: 100%;
+            left: 0;
+            margin-top: 8px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px;
+            min-width: 320px;
+            max-width: 380px;
+            box-shadow: 0 8px 28px rgba(0,0,0,.28);
+            z-index: 200;
+        }
+        .model-menu.show { display: block; }
+        .model-menu-title {
+            font-size: 12px; font-weight: 600; color: var(--text2);
+            margin-bottom: 8px; text-transform: uppercase; letter-spacing: .04em;
+        }
+        .model-preset-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+        .model-preset-item {
+            display: flex; flex-direction: column; gap: 2px;
+            padding: 8px 10px; border-radius: 8px; cursor: pointer;
+            border: 1px solid transparent;
+        }
+        .model-preset-item:hover { background: var(--surface2); }
+        .model-preset-item.active {
+            background: var(--accent-soft);
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+        .model-preset-item .mp-label { font-size: 13px; font-weight: 600; }
+        .model-preset-item .mp-meta { font-size: 11px; color: var(--text3); }
+        .model-custom-fields { display: flex; flex-direction: column; gap: 8px; }
+        .model-custom-fields label {
+            display: flex; flex-direction: column; gap: 4px;
+            font-size: 12px; color: var(--text2);
+        }
+        .model-custom-fields input {
+            border: 1px solid var(--border);
+            background: var(--bg);
+            color: var(--text);
+            border-radius: 8px;
+            padding: 8px 10px;
+            font-size: 13px;
+            outline: none;
+        }
+        .model-custom-fields input:focus { border-color: var(--accent); }
+        .model-menu-actions {
+            display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end;
+        }
+        .model-menu-actions button {
+            border: none; border-radius: 8px; padding: 7px 12px;
+            font-size: 12px; font-weight: 600; cursor: pointer;
+        }
+        .model-btn-secondary { background: var(--surface2); color: var(--text); }
+        .model-btn-primary { background: var(--accent); color: #fff; }
+        .model-menu-hint { font-size: 11px; color: var(--text3); margin-top: 8px; line-height: 1.4; }
         .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
         .theme-toggle {
             width: 34px; height: 34px;
@@ -736,6 +796,65 @@
         .role-icon { font-size: 16px; }
         .role-name { font-size: 13px; }
 
+        .perm-selector { position: relative; }
+        .perm-btn.active {
+            background: var(--accent-soft) !important;
+            color: var(--accent) !important;
+        }
+        .perm-menu {
+            display: none;
+            position: absolute;
+            bottom: 100%;
+            left: 0;
+            margin-bottom: 8px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 8px;
+            min-width: 200px;
+            box-shadow: 0 4px 20px rgba(0,0,0,.3);
+            z-index: 100;
+        }
+        .perm-menu.show { display: block; }
+        .perm-item {
+            padding: 8px 12px; border-radius: 8px; cursor: pointer;
+            font-size: 13px;
+        }
+        .perm-item:hover { background: var(--surface2); }
+        .perm-item.active { background: var(--accent-soft); color: var(--accent); }
+        .perm-item small { display: block; color: var(--text3); font-size: 11px; margin-top: 2px; }
+        .plan-banner {
+            display: none;
+            align-items: center; gap: 10px; justify-content: space-between;
+            margin: 0 16px 8px; padding: 10px 14px;
+            background: var(--accent-soft); border: 1px solid var(--accent);
+            border-radius: 10px; font-size: 13px; color: var(--text);
+        }
+        .plan-banner.show { display: flex; }
+        .plan-banner button {
+            border: none; border-radius: 8px; padding: 6px 12px;
+            background: var(--accent); color: #fff; font-weight: 600; cursor: pointer;
+            white-space: nowrap;
+        }
+        .ask-modal-backdrop {
+            display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45);
+            z-index: 1000; align-items: center; justify-content: center;
+        }
+        .ask-modal-backdrop.show { display: flex; }
+        .ask-modal {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 14px; padding: 20px; min-width: 320px; max-width: 420px;
+            box-shadow: 0 12px 40px rgba(0,0,0,.35);
+        }
+        .ask-modal h3 { margin: 0 0 8px; font-size: 16px; }
+        .ask-modal p { margin: 0 0 16px; font-size: 13px; color: var(--text2); }
+        .ask-modal .ask-actions { display: flex; gap: 8px; justify-content: flex-end; }
+        .ask-modal button {
+            border: none; border-radius: 8px; padding: 8px 14px; font-weight: 600; cursor: pointer;
+        }
+        .ask-deny { background: var(--surface2); color: var(--text); }
+        .ask-allow { background: var(--accent); color: #fff; }
+
         /* Send button — circle, green when active */
         .send-btn {
             width: 32px; height: 32px; border-radius: 50%;
@@ -1049,12 +1168,35 @@
                 <line x1="3" y1="18" x2="21" y2="18"/>
             </svg>
         </button>
-        <button class="model-badge" onclick="toggleSidebar()">
-            Mini Agent
-            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                <path d="M6 9l6 6 6-6"/>
-            </svg>
-        </button>
+        <div class="model-badge-wrap">
+            <button class="model-badge" id="modelBadgeBtn" onclick="toggleModelMenu(event)" title="模型配置">
+                <span id="modelBadgeLabel">模型</span>
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <path d="M6 9l6 6 6-6"/>
+                </svg>
+            </button>
+            <div class="model-menu" id="modelMenu" onclick="event.stopPropagation()">
+                <div class="model-menu-title">选择预设</div>
+                <div class="model-preset-list" id="modelPresetList"></div>
+                <div class="model-menu-title">自定义覆盖</div>
+                <div class="model-custom-fields">
+                    <label>Base URL
+                        <input type="text" id="modelBaseUrl" placeholder="留空则用预设/全局默认">
+                    </label>
+                    <label>Model Name
+                        <input type="text" id="modelNameInput" placeholder="如 gpt-4o-mini">
+                    </label>
+                    <label>API Key
+                        <input type="password" id="modelApiKey" placeholder="已配置则留空不改" autocomplete="off">
+                    </label>
+                </div>
+                <div class="model-menu-actions">
+                    <button type="button" class="model-btn-secondary" onclick="resetModelConfig()">恢复默认</button>
+                    <button type="button" class="model-btn-primary" onclick="saveModelConfig()">保存</button>
+                </div>
+                <div class="model-menu-hint" id="modelMenuHint">配置按登录用户保存；API Key 不会回显明文。</div>
+            </div>
+        </div>
         <div class="topbar-right">
             <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="切换主题">
                 <svg class="icon-sun" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -1086,6 +1228,10 @@
 
     <!-- Input area -->
     <div class="input-wrap">
+        <div class="plan-banner" id="planBanner">
+            <span id="planBannerText">Plan 模式：仅探索与规划，写操作已锁定</span>
+            <button type="button" onclick="approvePlan()">批准计划并执行</button>
+        </div>
         <div class="input-container">
             <!-- Image preview (multi-image, rendered by JS) -->
             <div class="img-preview" id="imgPreview"></div>
@@ -1095,9 +1241,9 @@
                           onkeydown="handleKey(event)" oninput="onInputChange()"></textarea>
                 <div class="input-toolbar">
                     <div class="input-left">
-                        <input type="file" id="fileInput" accept="image/*,.pdf,.docx,.doc,.pptx,.xlsx,.xls,.txt,.csv,.json,.md,.xml,.html,.js,.py,.java" multiple style="display:none"
+                        <input type="file" id="fileInput" accept="image/*,.pdf,.docx,.pptx,.xlsx,.txt,.csv,.json,.md,.markdown,.xml,.html,.js,.py,.java" multiple style="display:none"
                                onchange="onFileSelected(event)">
-                        <button class="in-tool-btn" id="imgBtn" title="上传图片"
+                        <button class="in-tool-btn" id="imgBtn" title="上传图片或文档（pdf/docx/pptx/xlsx/md…）"
                                 onclick="document.getElementById('fileInput').click()">
                             <svg fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24">
                                 <rect x="3" y="3" width="18" height="18" rx="3"/>
@@ -1105,6 +1251,29 @@
                                 <path d="M21 15l-5-5L5 21"/>
                             </svg>
                         </button>
+                        <!-- 权限模式 -->
+                        <div class="perm-selector" id="permSelector">
+                            <button class="in-tool-btn perm-btn" id="permBtn" title="权限模式" onclick="togglePermMenu()">
+                                <svg fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" width="16" height="16">
+                                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                                </svg>
+                                <span id="permLabel">默认</span>
+                            </button>
+                            <div class="perm-menu" id="permMenu">
+                                <div class="perm-item active" data-mode="default" onclick="selectPermissionMode('default')">
+                                    默认<small>正常工具面，现有 todo 门禁</small>
+                                </div>
+                                <div class="perm-item" data-mode="plan" onclick="selectPermissionMode('plan')">
+                                    Plan 模式<small>只读探索 + 写计划，批准后执行</small>
+                                </div>
+                                <div class="perm-item" data-mode="accept_edits" onclick="selectPermissionMode('accept_edits')">
+                                    自动编辑<small>少打断，仍受 todo 硬闸门约束</small>
+                                </div>
+                                <div class="perm-item" data-mode="ask" onclick="selectPermissionMode('ask')">
+                                    危险操作询问<small>写文件/终端等须确认</small>
+                                </div>
+                            </div>
+                        </div>
                         <!-- 角色选择器 -->
                         <div class="role-selector" id="roleSelector">
                             <button class="in-tool-btn role-btn" id="roleBtn" title="选择角色" onclick="toggleRoleMenu()">
@@ -1184,6 +1353,16 @@
     <span>上传文件到此处（图片/文档/文本）</span>
 </div>
 
+<div class="ask-modal-backdrop" id="askModal">
+    <div class="ask-modal">
+        <h3>需要确认危险操作</h3>
+        <p id="askModalText">工具待确认</p>
+        <div class="ask-actions">
+            <button type="button" class="ask-deny" onclick="denyAskTool()">拒绝</button>
+            <button type="button" class="ask-allow" onclick="grantAskTool()">批准并继续</button>
+        </div>
+    </div>
+</div>
 
 <script th:inline="none">
 /* =========================================================================
@@ -1205,6 +1384,8 @@ let uploadingCount = 0;  // 正在上传的文件数
 let previewSrcs   = [];
 let sidebarOpen  = true;
 let selectedRole = '';  // 当前选择的角色
+let permissionMode = localStorage.getItem('mini_agent_perm_mode') || 'default';
+let pendingAskTool = null;
 let isStreaming  = false;
 
 const $msg  = document.getElementById('messages');
@@ -1328,16 +1509,21 @@ function addFile(file) {
         };
         xhr.onload = () => {
             uploadingCount--;
-            if (xhr.status === 200) {
-                const data = JSON.parse(xhr.responseText);
-                if (data.success) {
-                    uploadedFileRefs[idx] = { filePath: data.filePath, filename: data.filename, mimeType: data.mimeType, fileSize: data.fileSize };
-                    updateFileProgress(idx, 100, 'done');
-                } else {
-                    updateFileProgress(idx, 0, 'error', data.message);
-                }
+            let data = null;
+            try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
+            if (xhr.status === 200 && data && data.success) {
+                uploadedFileRefs[idx] = {
+                    filePath: data.filePath,
+                    filename: data.filename,
+                    mimeType: data.mimeType,
+                    fileSize: data.fileSize,
+                    extractedTextPath: data.extractedTextPath || null
+                };
+                updateFileProgress(idx, 100, 'done', data.extractedTextPath ? '已解析' : null);
             } else {
-                updateFileProgress(idx, 0, 'error', 'HTTP ' + xhr.status);
+                const msg = (data && data.message)
+                    || (xhr.status === 413 ? '文件过大（上限 50MB）' : ('上传失败 HTTP ' + xhr.status));
+                updateFileProgress(idx, 0, 'error', msg);
             }
             updateSendButton();
         };
@@ -1368,7 +1554,7 @@ function updateFileProgress(idx, pct, status, errMsg) {
         pBar.style.width = '100%';
         pBar.classList.remove('uploading');
         pBar.classList.add('done');
-        sEl.textContent = '已上传';
+        sEl.textContent = errMsg || '已上传';
         sEl.className = 'upload-status done';
     } else if (status === 'error') {
         el.querySelector('.upload-status').textContent = '失败: ' + (errMsg || '');
@@ -1533,6 +1719,244 @@ function selectRole(role) {
     }
 })();
 
+/* =========================================================================
+   MODEL CONFIG（预设 + 自定义，服务端按用户持久化）
+   ========================================================================= */
+let modelConfigState = {
+    presetId: 'default',
+    presets: [],
+    customBaseUrl: '',
+    customModelName: '',
+    hasCustomApiKey: false
+};
+
+function toggleModelMenu(e) {
+    if (e) e.stopPropagation();
+    const menu = document.getElementById('modelMenu');
+    const opening = !menu.classList.contains('show');
+    menu.classList.toggle('show');
+    document.getElementById('roleMenu')?.classList.remove('show');
+    if (opening) {
+        setTimeout(() => {
+            document.addEventListener('click', closeModelMenuOnOutside, { once: true });
+        }, 0);
+    }
+}
+
+function closeModelMenuOnOutside(ev) {
+    const wrap = document.querySelector('.model-badge-wrap');
+    if (wrap && wrap.contains(ev.target)) return;
+    document.getElementById('modelMenu')?.classList.remove('show');
+}
+
+function selectModelPreset(presetId) {
+    modelConfigState.presetId = presetId || 'default';
+    const preset = (modelConfigState.presets || []).find(p => p.id === presetId);
+    document.querySelectorAll('.model-preset-item').forEach(el => {
+        el.classList.toggle('active', el.dataset.id === modelConfigState.presetId);
+    });
+    if (preset) {
+        // 仅当自定义框为空时用预设值预填展示（不强制覆盖用户已填）
+        const baseEl = document.getElementById('modelBaseUrl');
+        const nameEl = document.getElementById('modelNameInput');
+        if (!baseEl.value) baseEl.placeholder = preset.baseUrl || '留空则用预设/全局默认';
+        if (!nameEl.value) nameEl.placeholder = preset.modelName || '如 gpt-4o-mini';
+    }
+}
+
+function applyModelConfigView(data) {
+    if (!data || !data.success) return;
+    const cur = data.current || {};
+    modelConfigState.presetId = cur.presetId || data.defaultPreset || 'default';
+    modelConfigState.presets = data.presets || [];
+    modelConfigState.customBaseUrl = cur.customBaseUrl || '';
+    modelConfigState.customModelName = cur.customModelName || '';
+    modelConfigState.hasCustomApiKey = !!cur.hasCustomApiKey;
+
+    const label = cur.label || cur.modelName || '模型';
+    document.getElementById('modelBadgeLabel').textContent = label;
+    try { localStorage.setItem('mini_agent_model_label', label); } catch (_) {}
+
+    const list = document.getElementById('modelPresetList');
+    list.innerHTML = '';
+    (modelConfigState.presets || []).forEach(p => {
+        const div = document.createElement('div');
+        div.className = 'model-preset-item' + (p.id === modelConfigState.presetId ? ' active' : '');
+        div.dataset.id = p.id;
+        div.onclick = () => selectModelPreset(p.id);
+        div.innerHTML = '<span class="mp-label"></span><span class="mp-meta"></span>';
+        div.querySelector('.mp-label').textContent = p.label || p.id;
+        div.querySelector('.mp-meta').textContent = (p.modelName || '') + (p.baseUrl ? ' · ' + p.baseUrl : '');
+        list.appendChild(div);
+    });
+
+    document.getElementById('modelBaseUrl').value = modelConfigState.customBaseUrl;
+    document.getElementById('modelNameInput').value = modelConfigState.customModelName;
+    document.getElementById('modelApiKey').value = '';
+    document.getElementById('modelApiKey').placeholder = modelConfigState.hasCustomApiKey
+        ? '已配置自定义 Key，留空不改'
+        : (cur.apiKeyMasked ? ('全局/预设 ' + cur.apiKeyMasked + '，填新值可覆盖') : '已配置则留空不改');
+    document.getElementById('modelMenuHint').textContent =
+        '当前生效：' + (cur.modelName || '-') + ' @ ' + (cur.baseUrl || '-')
+        + (cur.apiKeyMasked ? ' · key ' + cur.apiKeyMasked : '');
+}
+
+async function loadModelConfig() {
+    try {
+        const resp = await fetch('/api/model-config');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        applyModelConfigView(data);
+    } catch (e) {
+        console.warn('loadModelConfig failed', e);
+        const cached = localStorage.getItem('mini_agent_model_label');
+        if (cached) document.getElementById('modelBadgeLabel').textContent = cached;
+    }
+}
+
+async function saveModelConfig() {
+    const body = {
+        presetId: modelConfigState.presetId,
+        baseUrl: document.getElementById('modelBaseUrl').value.trim(),
+        modelName: document.getElementById('modelNameInput').value.trim(),
+        apiKey: document.getElementById('modelApiKey').value
+    };
+    try {
+        const resp = await fetch('/api/model-config', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        const data = await resp.json();
+        if (!data.success) {
+            document.getElementById('modelMenuHint').textContent = data.message || '保存失败';
+            return;
+        }
+        applyModelConfigView(data);
+        document.getElementById('modelMenu').classList.remove('show');
+    } catch (e) {
+        document.getElementById('modelMenuHint').textContent = '保存失败: ' + e.message;
+    }
+}
+
+async function resetModelConfig() {
+    try {
+        const resp = await fetch('/api/model-config', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reset: true })
+        });
+        const data = await resp.json();
+        applyModelConfigView(data);
+        document.getElementById('modelMenu').classList.remove('show');
+    } catch (e) {
+        document.getElementById('modelMenuHint').textContent = '恢复失败: ' + e.message;
+    }
+}
+
+loadModelConfig();
+
+/* =========================================================================
+   PERMISSION MODE（Plan / Ask / Accept edits）
+   ========================================================================= */
+const PERM_LABELS = {
+    default: '默认',
+    plan: 'Plan',
+    accept_edits: '自动编辑',
+    ask: '询问'
+};
+
+function togglePermMenu() {
+    const menu = document.getElementById('permMenu');
+    menu.classList.toggle('show');
+    document.getElementById('roleMenu')?.classList.remove('show');
+    document.getElementById('modelMenu')?.classList.remove('show');
+    if (menu.classList.contains('show')) {
+        setTimeout(() => document.addEventListener('click', closePermMenuOutside, { once: true }), 0);
+    }
+}
+function closePermMenuOutside(ev) {
+    const wrap = document.getElementById('permSelector');
+    if (wrap && wrap.contains(ev.target)) return;
+    document.getElementById('permMenu')?.classList.remove('show');
+}
+async function selectPermissionMode(mode) {
+    permissionMode = mode || 'default';
+    localStorage.setItem('mini_agent_perm_mode', permissionMode);
+    document.getElementById('permLabel').textContent = PERM_LABELS[permissionMode] || permissionMode;
+    document.getElementById('permBtn').classList.toggle('active', permissionMode !== 'default');
+    document.querySelectorAll('.perm-item').forEach(el => {
+        el.classList.toggle('active', el.dataset.mode === permissionMode);
+    });
+    document.getElementById('permMenu')?.classList.remove('show');
+    refreshPlanBanner();
+    if (currentId) {
+        try {
+            await fetch('/api/permission-mode', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sessionId: currentId, mode: permissionMode })
+            });
+        } catch (e) { console.warn('set permission mode failed', e); }
+    }
+}
+function refreshPlanBanner() {
+    const banner = document.getElementById('planBanner');
+    if (!banner) return;
+    const show = permissionMode === 'plan';
+    banner.classList.toggle('show', show);
+}
+async function approvePlan() {
+    if (!currentId) { alert('请先开始对话'); return; }
+    try {
+        const resp = await fetch('/api/permission-mode', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: currentId, action: 'approve_plan' })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            document.getElementById('planBannerText').textContent =
+                data.planApproved ? 'Plan 已批准，写工具已解锁' : 'Plan 模式';
+        }
+    } catch (e) {
+        alert('批准失败: ' + e.message);
+    }
+}
+function showAskModal(tool) {
+    pendingAskTool = tool;
+    document.getElementById('askModalText').textContent =
+        'Agent 请求执行危险工具「' + tool + '」。批准后本会话可再次使用该工具。';
+    document.getElementById('askModal').classList.add('show');
+}
+function denyAskTool() {
+    pendingAskTool = null;
+    document.getElementById('askModal').classList.remove('show');
+}
+async function grantAskTool() {
+    const tool = pendingAskTool;
+    document.getElementById('askModal').classList.remove('show');
+    if (!tool || !currentId) return;
+    try {
+        await fetch('/api/permission-mode', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: currentId, action: 'grant_ask', tool })
+        });
+    } catch (e) { console.warn(e); }
+    pendingAskTool = null;
+}
+
+(function initPermUi() {
+    // 仅同步本地 UI，避免首屏无 session 时误打 API
+    document.getElementById('permLabel').textContent = PERM_LABELS[permissionMode] || permissionMode;
+    document.getElementById('permBtn')?.classList.toggle('active', permissionMode !== 'default');
+    document.querySelectorAll('.perm-item').forEach(el => {
+        el.classList.toggle('active', el.dataset.mode === permissionMode);
+    });
+    refreshPlanBanner();
+})();
+
 function scrollToBottom(smooth = false) {
     $msg.scrollTo({ top: $msg.scrollHeight, behavior: smooth ? 'smooth' : 'instant' });
 }
@@ -1679,6 +2103,17 @@ async function switchConv(id) {
     await loadMoreMessages(id, false);
     checkAndPollTask(id);
     renderSidebar();
+    // 将会话权限模式与本地选择对齐（并刷新 Plan banner）
+    if (permissionMode) {
+        try {
+            await fetch('/api/permission-mode', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sessionId: currentId, mode: permissionMode })
+            });
+        } catch (_) { /* ignore */ }
+    }
+    refreshPlanBanner();
 }
 async function loadMoreMessages(sessionId, prepend) {
     if (window._msgLoading || !window._msgHasMore) return;
@@ -1860,7 +2295,15 @@ async function sendChatPost(text, sessionId, files, refs, botBody) {
             }
         }
 
-        const body = { message: text || '', sessionId: sessionId, images: images, files: fileAttachments, fileRefs: fileRefs, role: selectedRole };
+        const body = {
+            message: text || '',
+            sessionId: sessionId,
+            images: images,
+            files: fileAttachments,
+            fileRefs: fileRefs,
+            role: selectedRole,
+            permissionMode: permissionMode || 'default'
+        };
         const resp = await fetch('/chat/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -2061,6 +2504,14 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 // 缓冲已驱逐（任务早已结束）→ 回退：从数据库重载该会话
                 done = true;
                 if (sessionId === currentId) { switchConv(sessionId); }
+            } else if (name === 'permission_ask') {
+                try {
+                    const payload = typeof data === 'string' ? JSON.parse(data) : data;
+                    const tool = payload && (payload.tool || payload.name);
+                    if (tool) showAskModal(tool);
+                } catch (_) {
+                    if (data) showAskModal(String(data));
+                }
             } else if (name === 'session') { /* 忽略 */
             } else if (name === 'inject_ack') { /* 前端已在 injectMessage() 中处理 */ }
         }

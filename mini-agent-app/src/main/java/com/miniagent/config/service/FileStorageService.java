@@ -1,10 +1,12 @@
 package com.miniagent.config.service;
 
+import com.miniagent.agent.web.UploadedDocumentService;
 import com.miniagent.config.entity.FileUpload;
 import com.miniagent.config.repository.FileUploadRepository;
+import com.miniagent.config.storage.MediaStorage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -12,7 +14,6 @@ import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
@@ -23,13 +24,16 @@ public class FileStorageService {
     private static final Logger log = LoggerFactory.getLogger(FileStorageService.class);
 
     private final FileUploadRepository fileUploadRepository;
+    private final UploadedDocumentService uploadedDocumentService;
     private final Path baseDir;
 
     public FileStorageService(
             FileUploadRepository fileUploadRepository,
-            @Value("${file.upload.base-dir:./user-uploads}") String baseDir) {
+            @Lazy UploadedDocumentService uploadedDocumentService,
+            MediaStorage mediaStorage) {
         this.fileUploadRepository = fileUploadRepository;
-        this.baseDir = Paths.get(baseDir).toAbsolutePath().normalize();
+        this.uploadedDocumentService = uploadedDocumentService;
+        this.baseDir = mediaStorage.uploadsDir();
         try {
             Files.createDirectories(this.baseDir);
         } catch (IOException e) {
@@ -44,20 +48,18 @@ public class FileStorageService {
             Files.createDirectories(userDir);
 
             String ext = "";
-            int dotIdx = originalFilename.lastIndexOf('.');
+            int dotIdx = originalFilename == null ? -1 : originalFilename.lastIndexOf('.');
             if (dotIdx > 0) {
                 ext = originalFilename.substring(dotIdx);
             }
-            String storedFilename = UUID.randomUUID().toString().substring(0, 8) + "_" + System.currentTimeMillis() + ext;
+            String storedFilename = UUID.randomUUID().toString().substring(0, 8)
+                    + "_" + System.currentTimeMillis() + ext;
 
             byte[] data = Base64.getDecoder().decode(base64Content);
 
-            // For text files, detect encoding and convert to UTF-8
+            // 文本类只做编码归一到 UTF-8，保留原扩展名（不再强行改成 .txt）
             if (isTextFile(originalFilename, mimeType)) {
                 data = toUtf8(data);
-                if (!storedFilename.endsWith(".txt")) {
-                    storedFilename = storedFilename.substring(0, storedFilename.lastIndexOf('.')) + ".txt";
-                }
             }
 
             Path filePath = userDir.resolve(storedFilename);
@@ -69,8 +71,17 @@ public class FileStorageService {
             fileUpload.setStoredFilename(storedFilename);
             fileUpload.setMimeType(mimeType);
             fileUpload.setFileSize((long) data.length);
-            fileUpload.setFilePath(filePath.toString());
+            fileUpload.setFilePath(filePath.toAbsolutePath().toString());
             fileUpload.setSessionId(sessionId);
+
+            // 上传即提取：Office/PDF/大文本写侧车，后续对话与 Agent 复用
+            try {
+                String sidecar = uploadedDocumentService.extractAndWriteSidecar(
+                        userId, filePath, originalFilename, mimeType);
+                fileUpload.setExtractedTextPath(sidecar);
+            } catch (Exception e) {
+                log.warn("上传后文本提取失败（文件已保存）: {}", originalFilename, e);
+            }
 
             return fileUploadRepository.save(fileUpload);
         } catch (Exception e) {
@@ -93,12 +104,13 @@ public class FileStorageService {
 
     private boolean isTextFile(String filename, String mimeType) {
         if (mimeType != null && (mimeType.startsWith("text/") || mimeType.contains("json")
-                || mimeType.contains("xml") || mimeType.contains("javascript"))) {
+                || mimeType.contains("xml") || mimeType.contains("javascript")
+                || mimeType.contains("markdown"))) {
             return true;
         }
         if (filename == null) return false;
         String lower = filename.toLowerCase();
-        String[] exts = {".txt", ".csv", ".json", ".md", ".xml", ".html", ".htm",
+        String[] exts = {".txt", ".csv", ".json", ".md", ".markdown", ".xml", ".html", ".htm",
                 ".css", ".js", ".ts", ".py", ".java", ".sql", ".sh", ".bat",
                 ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".log",
                 ".c", ".cpp", ".h", ".hpp", ".go", ".rs", ".rb", ".php"};

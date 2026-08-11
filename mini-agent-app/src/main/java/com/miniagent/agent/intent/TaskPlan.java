@@ -24,8 +24,11 @@ public record TaskPlan(
                 allowedTools, steps, reason, false);
     }
 
+    /**
+     * null = 不限制（注册表全量工具）；空集合 = 无工具。
+     */
     public Set<String> allowedToolSet() {
-        return allowedTools == null ? Set.of() : new LinkedHashSet<>(allowedTools);
+        return allowedTools == null ? null : new LinkedHashSet<>(allowedTools);
     }
 
     public String toPromptBlock() {
@@ -50,6 +53,12 @@ public record TaskPlan(
                         .append(step.allowedTools() == null ? List.of() : step.allowedTools())
                         .append('\n');
             }
+        }
+        if (intent == IntentType.QUESTION) {
+            sb.append("\n【轻问答模式】直接用中文简洁回答用户。")
+              .append("优先依据系统提示中的能力说明；仅当需要核对已安装技能时才调 skill_list/skill_view。")
+              .append("禁止调用文件/终端/浏览器/生图等执行类工具；不要建 todo；不要开多轮探索。");
+            return sb.toString();
         }
         if (requiresStructuredPlan) {
             sb.append("\n【强制】这是复杂任务：你的第一轮工具调用必须是 todo(action=set)，")

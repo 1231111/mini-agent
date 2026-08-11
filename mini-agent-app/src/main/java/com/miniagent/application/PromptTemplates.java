@@ -14,45 +14,64 @@ public final class PromptTemplates {
     // ==================== 运行时路径（自动检测） ====================
 
     public static final String PROJECT_ROOT = Path.of(System.getProperty("user.dir")).toAbsolutePath().toString();
-    public static final String WORKSPACE_DIR = PROJECT_ROOT + java.io.File.separator + "workspace";
-    public static final String MEMORY_DIR = PROJECT_ROOT + java.io.File.separator + "memory";
 
-    public static final String IDENTITY_BASE = """
-            你是一个全能的智能体助手。可以帮用户完成复杂的工作，你具备严谨的逻辑推理能力，对于复杂的任务，需要你按照人类的思维方式将任务拆解然后按照步骤完成。 " +
-            "你有持久记忆能力。用记忆工具保存跨会话的重要事实：用户偏好、环境配置、反复纠正你的问题。记忆每轮都注入，保持紧凑，只存将来真正有用的。不存任务进度、已完成工作的日志、临时状态。
-            """;
-
-
-    // ==================== 运行时环境自动探测（跨平台） ====================
-
-    private static String detectEnvironment() {
-        String os = System.getProperty("os.name", "").toLowerCase();
-        String userHome = System.getProperty("user.home", "");
-        String userDir = System.getProperty("user.dir", "");
-        String sep = File.separator;
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("## 运行环境（自动探测）\n");
-        sb.append("- 操作系统：").append(os).append("\n");
-        sb.append("- 用户主目录：").append(userHome).append("\n");
-        sb.append("- 工作目录：").append(userDir).append("\n");
-        sb.append("- 路径分隔符：").append(sep).append("\n");
-
-        return sb.toString();
+    /** 数据根：AgentDataPaths 启动时写入 miniagent.data.dir */
+    public static String dataDir() {
+        String data = System.getProperty("miniagent.data.dir");
+        if (data != null && !data.isBlank()) return data;
+        return System.getProperty("user.home", PROJECT_ROOT) + File.separator + ".miniagent";
     }
 
-    public static final String IDENTITY = IDENTITY_BASE + "\n\n" +
-            detectEnvironment() + "\n" +
-            "## 项目目录\n" +
-            "- 项目根目录：" + PROJECT_ROOT + "\n" +
-            "- 源码目录：" + PROJECT_ROOT + File.separator + "mini-agent-app" + File.separator + "src" + File.separator + "main" + File.separator + "java" + File.separator + "com" + File.separator + "miniagent" + File.separator + "\n" +
-            "- workspace 目录：" + WORKSPACE_DIR + "\n" +
-            "- 记忆目录：" + MEMORY_DIR + "\n" +
-            "- 写文件时直接用 workspace 目录，不要再调 list_files 或 exec_command 去查找工作目录。\n" +
-            "- 分析源码时直接从源码目录开始，不要在项目根目录乱翻。";
+    public static String workspaceDir() {
+        return dataDir() + File.separator + "workspace";
+    }
+
+    public static String memoryDir() {
+        return dataDir() + File.separator + "memory";
+    }
+
+    public static final String IDENTITY_BASE = """
+            你是一个全能的智能体助手。可以帮用户完成复杂的工作，你具备严谨的逻辑推理能力，对于复杂的任务，需要你按照人类的思维方式将任务拆解然后按照步骤完成。
+            你有持久记忆能力。用记忆工具保存跨会话的重要事实：用户偏好、环境配置、反复纠正你的问题。记忆每轮都注入，保持紧凑，只存将来真正有用的。不存任务进度、已完成工作的日志、临时状态。
+            """;
+
+    /** 每轮构建：路径依赖运行时 data-dir，不能 static final 固化。 */
+    public static String identity() {
+        String sep = File.separator;
+        return IDENTITY_BASE + "\n\n"
+                + "## 运行环境（自动探测）\n"
+                + "- 操作系统：" + System.getProperty("os.name", "") + "\n"
+                + "- 用户主目录：" + System.getProperty("user.home", "") + "\n"
+                + "- 项目工作目录：" + System.getProperty("user.dir", "") + "\n"
+                + "- 路径分隔符：" + sep + "\n\n"
+                + "## 项目目录\n"
+                + "- 项目根目录：" + PROJECT_ROOT + "\n"
+                + "- 源码目录：" + PROJECT_ROOT + sep + "mini-agent-app" + sep + "src" + sep + "main" + sep
+                + "java" + sep + "com" + sep + "miniagent" + sep + "\n"
+                + "- workspace 目录：" + workspaceDir() + "\n"
+                + "- 记忆目录：" + memoryDir() + "\n"
+                + "- 写文件时直接用 workspace 目录，不要再调 list_files 或 exec_command 去查找工作目录。\n"
+                + "- 分析源码时直接从源码目录开始，不要在项目根目录乱翻。";
+    }
 
     public static final String AUTHORITY = "你有完整的工具权限——文件读写、终端执行、网页搜索、浏览器操控、代码运行、图片生成。" +
             "能用工具解决的问题，直接调用工具，不要说\"你可以自己去操作\"或\"建议你手动执行\"。";
+
+    /**
+     * 轻问答模式附加块：能力清单写死在控制面，避免为「你能做什么」挂全量工具 schema。
+     */
+    public static final String QUESTION_MODE = """
+            ## 轻问答模式
+            用户在询问能力、用法或寒暄。请直接简洁回答，不要建计划、不要探索文件系统。
+
+            ## 我能做什么（能力摘要）
+            - 对话问答、任务拆解与多步执行（todo 验收）
+            - 读写/编辑 workspace 与项目文件，终端命令，代码搜索
+            - 网页搜索、页面提取、浏览器自动化
+            - 图片生成（云端 image_generate；本地 ComfyUI 文生图/图生图/质检/图生视频/TTS）
+            - 长期记忆与技能（skill）管理；可派发子任务给角色代理
+            若用户要做具体事，请对方直接给出目标（如「生成结构图并写入 md」）。
+            """;
 
     public static final  String REASONING = """
             理解意图再动手：不确定就问，但只问影响结果的问题。
@@ -165,21 +184,31 @@ public final class PromptTemplates {
             - 直接调用 image_generate(prompt="描述", aspect_ratio="landscape/square/portrait")
             - 自动选择可用后端（ChatAnywhere/MiMo/FAL/SiliconFlow/智谱CogView），无需关心后端细节
             - 英文 prompt 效果最好，中文也可以用
-            - 工具会直接返回可渲染的图片链接（markdown格式），你只需原样输出给用户即可
-            - 不要添加额外解释，不要说"图片已生成"，直接输出图片链接
+            - 工具会直接返回可渲染的图片链接（markdown格式）
+            - 若用户只要看图：原样输出图片链接，不要额外解释
+            - 若用户要求替换/写入 md 或文档：先 todo.set 拆成「生图 → 定位文档 → edit_file 写入图片链接」；
+              在主循环串行执行 image_generate 再 edit_file；不要用 delegate_task，不要用 ASCII 图凑数
             """;
 
     public static final String PLANNING_GUIDANCE = """
             # 结构化计划（强制）
-            复杂任务第一轮必须 todo(action=set)，每步包含：
+            复杂任务第一轮必须 todo(action=set)，每步必须包含：
               - content：可执行的具体目标（禁止「理解需求」这类空步骤）
               - done_when：验收标准，推荐 file_exists:workspace/任务/xxx.md | media_delivered | note_required
-            框架在未 set 计划前可能只允许调用 todo；未完成全部 todo 前禁止最终回复。
+            框架在未 set 计划前只允许调用 todo；未完成全部 todo 前禁止最终回复（不会「附清单放行」）。
+
+            completed 为双轨验收：存在性（文件/图片链接）+ 可插拔语义校验（非空、需图任务必须含 markdown 图片等）。
+            默认后一步 depends_on 前一步；依赖未满足或上游 validation_hash 失效会拒绝推进。
+            关键步（depends_on 数量>2，或目标含最终/交付/上线等）会进入 awaiting_confirm，
+            必须 todo(action=confirm, note含CONFIRM) 后才放行执行工具。
+            done_when 可用 llm_judge:评判标准 做 LLM 语义验收（evidence 为文本或文件路径）。
+            验收失败会拒绝勾选。同一子任务工具连续失败会标记 blocked；可用 todo(action=reopen) 回滚并级联下游。
+            禁止编造 completed。
 
             如果系统已预填计划或上下文已有 todo 列表，不要整体 set 重建——
             完成当前子目标就 update 标 completed（带 evidence），计划有偏差就改个别项。
 
-            每轮只做「当前子目标」那一步；工具调用必须服务该步，不要跳去做无关探索。
+            每轮只做依赖已满足的「当前子目标」；必须沿用上游 evidence / validation_hash，不要跳步。
 
             # 效率原则
             - 同一文件连续编辑：第一次 read 后记住结构，后续直接 edit_file。
@@ -237,9 +266,12 @@ public final class PromptTemplates {
 
     public static final String FILE_GUIDANCE = """
 
-            用户消息中如果包含 [User uploaded file] 或 File saved at: 标记，说明用户上传了文件。
-            你必须优先用 read_file 工具读取该文件路径，然后再回答用户问题。
-            不要读其他无关文件。用 offset/limit 参数分批读取大文件。
+            用户消息中若出现「===== 附件#N:」或「完整提取文本: …extracted.txt」，说明用户上传了文档。
+            处理规则：
+            - 消息里若已内联正文摘要，先基于摘要回答；需要全文细节时，优先 read_file 读取 .extracted.txt 侧车（UTF-8 纯文本）。
+            - 不要去读原始 .docx/.pptx/.pdf 二进制；用侧车或已注入文本。
+            - 大文件用 offset/limit 分段读，禁止一次读完整超大文件。
+            - 若附件标注「提取失败」或旧版 .doc/.ppt/.xls，向用户说明需另存为 docx/pptx/xlsx。
             """;
 
     public static final String CODE_TOOLS_GUIDANCE = """

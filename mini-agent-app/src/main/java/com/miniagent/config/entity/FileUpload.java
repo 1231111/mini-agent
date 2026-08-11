@@ -27,6 +27,10 @@ public class FileUpload {
     
     @Column(name = "file_path", nullable = false)
     private String filePath;
+
+    /** 提取后的纯文本侧车路径（Office/PDF/大文本），可供 Agent read_file */
+    @Column(name = "extracted_text_path", length = 1024)
+    private String extractedTextPath;
     
     @Column(name = "session_id")
     private String sessionId;
@@ -54,6 +58,8 @@ public class FileUpload {
     public void setFileSize(Long fileSize) { this.fileSize = fileSize; }
     public String getFilePath() { return filePath; }
     public void setFilePath(String filePath) { this.filePath = filePath; }
+    public String getExtractedTextPath() { return extractedTextPath; }
+    public void setExtractedTextPath(String extractedTextPath) { this.extractedTextPath = extractedTextPath; }
     public String getSessionId() { return sessionId; }
     public void setSessionId(String sessionId) { this.sessionId = sessionId; }
     public LocalDateTime getCreatedAt() { return createdAt; }

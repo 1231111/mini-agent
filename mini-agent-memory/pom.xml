@@ -12,7 +12,7 @@
 
     <artifactId>mini-agent-memory</artifactId>
     <name>mini-agent-memory</name>
-    <description>记忆子模块：短期 / 中期 / 长期 Markdown 持久化</description>
+    <description>记忆子模块：MemoryStore、数据根 AgentDataPaths、向量索引端口</description>
     <packaging>jar</packaging>
 
     <dependencies>

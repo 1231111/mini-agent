@@ -18,5 +18,7 @@ public class ChatRequest {
     private List<FileAttachment> files;
     private List<FileRef> fileRefs;
     private String role;  // 角色选择：tester/developer/pm/designer/security/ops/dba/architect/tech_writer
+    /** 权限模式：default | plan | accept_edits | ask */
+    private String permissionMode;
 
 }

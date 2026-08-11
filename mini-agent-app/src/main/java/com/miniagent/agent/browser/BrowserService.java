@@ -415,78 +415,92 @@ public class BrowserService {
     }
 
     /**
-     * 点击元素（通过 accessibility ref）
-     * ref 格式: "1", "2" 对应快照中的数字编号，也支持文本匹配
+     * 点击。by：auto|ref|text|role|css|aria。数字 ref 只走快照，失败立即返回（不把编号当 aria-label）。
      */
     public String click(String sessionId, String ref) {
+        return click(sessionId, ref, "auto");
+    }
+
+    public String click(String sessionId, String ref, String by) {
+        if (ref == null || ref.isBlank()) return "点击失败: ref 为空";
+        String mode = by == null || by.isBlank() ? "auto" : by.trim().toLowerCase(Locale.ROOT);
         try {
             Page page = getPage(sessionId);
-
-            // 策略1: ref 是数字 → 从快照中找到对应元素，提取文本/链接后点击
-            try {
-                int refNum = Integer.parseInt(ref);
-                String elementInfo = findElementByRef(page, refNum);
-                if (elementInfo != null) {
-                    log.info("click ref={} 对应元素: {}", ref, elementInfo);
-
-                    // 提取引号中的文本
-                    java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"([^\"]+)\"").matcher(elementInfo);
-                    if (m.find()) {
-                        String linkText = m.group(1);
-                        // 尝试用 getByRole(LINK)
-                        try {
-                            page.getByRole(AriaRole.LINK, new Page.GetByRoleOptions().setName(linkText))
-                                    .click(new Locator.ClickOptions().setTimeout(5000));
-                            page.waitForTimeout(1500);
-                            return "点击成功: " + linkText + "\n\n"
-                                    + formatSnapshot(page.locator("body").ariaSnapshot());
-                        } catch (Exception ignored) {}
-                        // 尝试用 getByText
-                        try {
-                            page.getByText(linkText, new Page.GetByTextOptions().setExact(true))
-                                    .click(new Locator.ClickOptions().setTimeout(5000));
-                            page.waitForTimeout(1500);
-                            return "点击成功: " + linkText + "\n\n"
-                                    + formatSnapshot(page.locator("body").ariaSnapshot());
-                        } catch (Exception ignored) {}
-                    }
-                }
-            } catch (NumberFormatException ignored) {}
-
-            // 策略2: ref 是文本 → getByRole(LINK)
-            try {
-                page.getByRole(AriaRole.LINK, new Page.GetByRoleOptions().setName(ref))
-                        .click(new Locator.ClickOptions().setTimeout(5000));
-                page.waitForTimeout(1500);
-                return "点击成功: " + ref + "\n\n"
-                        + formatSnapshot(page.locator("body").ariaSnapshot());
-            } catch (Exception ignored) {}
-
-            // 策略3: 文本匹配
-            try {
-                page.getByText(ref, new Page.GetByTextOptions().setExact(true))
-                        .click(new Locator.ClickOptions().setTimeout(5000));
-                page.waitForTimeout(1500);
-                return "点击成功 (文本): " + ref + "\n\n"
-                        + formatSnapshot(page.locator("body").ariaSnapshot());
-            } catch (Exception ignored) {}
-
-            // 策略4: CSS selector fallback
-            try {
-                page.locator("[aria-label*='" + ref + "'], [placeholder*='" + ref + "']")
-                        .first()
-                        .click(new Locator.ClickOptions().setTimeout(5000));
-                page.waitForTimeout(1500);
-                return "点击成功 (aria): ref=" + ref + "\n\n"
-                        + formatSnapshot(page.locator("body").ariaSnapshot());
-            } catch (Exception e) {
-                log.error("点击失败: ref={}", ref, e);
-                return "点击失败: 未找到元素 ref=" + ref + "。请用 browser_snapshot 查看页面。";
+            boolean numeric = ref.chars().allMatch(Character::isDigit);
+            if ("ref".equals(mode) || ("auto".equals(mode) && numeric)) {
+                return clickBySnapshotRef(page, ref);
             }
-
+            Locator loc = switch (mode) {
+                case "text" -> page.getByText(ref, new Page.GetByTextOptions().setExact(true));
+                case "role" -> roleLocator(page, ref);
+                case "css" -> page.locator(ref).first();
+                case "aria" -> page.locator("[aria-label*='" + ref + "'], [placeholder*='" + ref + "']").first();
+                case "auto" -> page.getByText(ref, new Page.GetByTextOptions().setExact(true));
+                default -> null;
+            };
+            if (loc == null) {
+                return "点击失败: 未知 by=" + mode + "，可用 ref|text|role|css|aria";
+            }
+            return clickAndSnap(page, loc, mode, ref);
         } catch (Exception e) {
-            log.error("点击失败: ref={}", ref, e);
-            return "点击失败: " + e.getMessage();
+            log.error("点击失败: ref={} by={}", ref, mode, e);
+            return "点击失败: ref=" + ref + " by=" + mode + " — " + e.getMessage()
+                    + "。请 browser_snapshot 后改 by。";
+        }
+    }
+
+    private String clickBySnapshotRef(Page page, String ref) {
+        final int refNum;
+        try {
+            refNum = Integer.parseInt(ref);
+        } catch (NumberFormatException e) {
+            return "点击失败: by=ref 需要数字编号，收到: " + ref;
+        }
+        String elementInfo = findElementByRef(page, refNum);
+        if (elementInfo == null) return "点击失败: 快照中无 ref=" + ref + "。请先 browser_snapshot。";
+        log.info("click ref={} 对应元素: {}", ref, elementInfo);
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"([^\"]+)\"").matcher(elementInfo);
+        String name = m.find() ? m.group(1) : null;
+        if (name == null || name.isBlank()) {
+            return "点击失败: ref=" + ref + " 无可用名称 [" + elementInfo + "]。改用 by=css。";
+        }
+        // 按快照角色选唯一策略；失败直接报错，不静默串联
+        Locator loc = elementInfo.contains("button")
+                ? page.getByRole(AriaRole.BUTTON, new Page.GetByRoleOptions().setName(name))
+                : elementInfo.contains("link")
+                ? page.getByRole(AriaRole.LINK, new Page.GetByRoleOptions().setName(name))
+                : page.getByText(name);
+        try {
+            return clickAndSnap(page, loc, "ref", name);
+        } catch (Exception e) {
+            return "点击失败: ref=" + ref + " name=\"" + name + "\" — " + e.getMessage()
+                    + "。可改 by=role（button=" + name + "）或 by=text。";
+        }
+    }
+
+    private Locator roleLocator(Page page, String ref) {
+        AriaRole role = AriaRole.BUTTON;
+        String roleName = ref;
+        int eq = ref.indexOf('=');
+        if (eq > 0) {
+            role = parseAriaRole(ref.substring(0, eq).trim());
+            roleName = ref.substring(eq + 1).trim();
+        }
+        return page.getByRole(role, new Page.GetByRoleOptions().setName(roleName));
+    }
+
+    private String clickAndSnap(Page page, Locator locator, String strategy, String label) {
+        locator.click(new Locator.ClickOptions().setTimeout(5000));
+        page.waitForTimeout(1500);
+        return "点击成功 (" + strategy + "): " + label + "\n\n"
+                + formatSnapshot(page.locator("body").ariaSnapshot());
+    }
+
+    private static AriaRole parseAriaRole(String raw) {
+        try {
+            return AriaRole.valueOf(raw.trim().toUpperCase(Locale.ROOT).replace('-', '_'));
+        } catch (Exception e) {
+            return AriaRole.BUTTON;
         }
     }
 
@@ -530,15 +544,7 @@ public class BrowserService {
                         + formatSnapshot(page.locator("body").ariaSnapshot());
             } catch (Exception ignored) {}
 
-            // 策略4: 找搜索框（bilibili 特殊处理）
-            try {
-                Locator searchInput = page.locator("input[type=search], input[name*=search], input[placeholder*=搜索], input.keyword").first();
-                searchInput.fill(text, new Locator.FillOptions().setTimeout(shortTimeout));
-                return "输入成功 (搜索框): text=\"" + text + "\"\n\n"
-                        + formatSnapshot(page.locator("body").ariaSnapshot());
-            } catch (Exception ignored) {}
-
-            return "输入失败: 未找到匹配 ref=" + ref + " 的输入框。请用 browser_snapshot 查看页面元素，然后用正确的 ref 编号重试。";
+            return "输入失败: 未找到匹配 ref=" + ref + " 的输入框。请用 browser_snapshot 后用编号或 placeholder 重试。";
 
         } catch (Exception e) {
             log.error("输入失败: ref={}", ref, e);

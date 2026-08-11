@@ -1,7 +1,10 @@
 package com.miniagent.agent.memory;
 
+import com.miniagent.memory.AgentDataPaths;
+import com.miniagent.memory.MemoryVectorIndex;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.http.client.jdk.JdkHttpClientBuilder;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
@@ -13,6 +16,7 @@ import org.springframework.stereotype.Component;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -32,7 +36,7 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 @Slf4j
 @Component
-public class VectorMemoryStore {
+public class VectorMemoryStore implements MemoryVectorIndex {
 
     @Value("${agent.memory.vector.enabled:true}")
     private boolean enabled;
@@ -54,18 +58,8 @@ public class VectorMemoryStore {
     private final Map<Long, InMemoryEmbeddingStore<TextSegment>> stores = new ConcurrentHashMap<>();
     private static final Long DEFAULT_USER = -1L;
 
-    public VectorMemoryStore(
-            @Value("${agent.memory.dir:}") String memoryDirOverride) {
-        Path root;
-        String env = System.getenv("MINI_AGENT_HOME");
-        if (memoryDirOverride != null && !memoryDirOverride.isBlank()) {
-            root = Path.of(memoryDirOverride);
-        } else if (env != null && !env.isBlank()) {
-            root = Path.of(env).resolve("memory");
-        } else {
-            root = Path.of(System.getProperty("user.dir")).toAbsolutePath().resolve("memory");
-        }
-        this.memoryDir = root;
+    public VectorMemoryStore(AgentDataPaths dataPaths) {
+        this.memoryDir = dataPaths.memory();
     }
 
     /** 向量检索是否可用（受配置开关与 embedding key 共同控制）。 */
@@ -90,7 +84,12 @@ public class VectorMemoryStore {
 
     private EmbeddingModel embeddingModel() {
         if (embeddingModel == null) {
+            // 显式 JDK 客户端，避免与 SpringRestClient 在 classpath 冲突
+            JdkHttpClientBuilder http = new JdkHttpClientBuilder()
+                    .connectTimeout(Duration.ofSeconds(15))
+                    .readTimeout(Duration.ofSeconds(60));
             embeddingModel = OpenAiEmbeddingModel.builder()
+                    .httpClientBuilder(http)
                     .apiKey(apiKey)
                     .baseUrl(baseUrl)
                     .modelName(embeddingModelName)

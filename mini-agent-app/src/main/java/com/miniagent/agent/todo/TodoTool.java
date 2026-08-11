@@ -13,7 +13,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 任务规划工具：模型自己拆任务、自己改状态，completed 需对照 done_when 提供 evidence。
+ * 任务规划工具：depends_on / 双轨验收 / reopen 回滚。
  */
 @Slf4j
 @Component
@@ -30,10 +30,13 @@ public class TodoTool {
                 .name("todo")
                 .description("""
                         管理当前任务的执行计划（子任务列表）。
-                        - 复杂任务必须先 action=set 写出完整计划（每步含 done_when 验收标准），再开始执行。
-                        - 每完成一步立刻 action=update 标 completed，并提供 evidence（文件路径/图片链接/验证结果）。
-                        - done_when 推荐：file_exists:workspace/xxx.md | media_delivered | note_required
-                        - 简单一句话问答不需要使用此工具。
+                        - 复杂任务必须先 action=set；每步必须含 done_when。
+                        - 默认后一步 depends_on 前一步；可显式设 depends_on:[1,2] 或 depends_on:[]（无依赖/可并行）。
+                        - completed 会做存在性 + 可插拔语义校验；依赖未满足或上游 hash 失效会拒绝。
+                        - 关键步（依赖数>2 或交付/上线类）会进入 awaiting_confirm，必须 action=confirm 后才能执行。
+                        - action=reopen 回滚 completed/blocked，并级联重置下游为 pending。
+                        - 工具连败会 blocked；不要编造 completed。
+                        - done_when：file_exists:… | media_delivered | note_required | llm_judge:评判标准
                         """)
                 .parameters(buildSchema())
                 .handler(this::handle)
@@ -44,28 +47,30 @@ public class TodoTool {
         Map<String, Object> params = new LinkedHashMap<>();
         params.put("action", Map.of(
                 "type", "string",
-                "description", "操作：set / update / list / clear",
+                "description", "操作：set / update / list / clear / reopen / confirm",
                 "required", true
         ));
         params.put("items", Map.of(
                 "type", "string",
-                "description", "set 时使用，JSON 数组：[{\"id\":1,\"content\":\"步骤\",\"status\":\"pending\",\"done_when\":\"file_exists:workspace/a.md\"}]"
+                "description", "set：JSON 数组，项可含 id,content,done_when,depends_on。例："
+                        + "[{\"id\":1,\"content\":\"生图\",\"done_when\":\"media_delivered\"},"
+                        + "{\"id\":2,\"content\":\"写入md\",\"done_when\":\"file_exists:workspace/a.md\",\"depends_on\":[1]}]"
         ));
         params.put("id", Map.of(
                 "type", "integer",
-                "description", "update 时使用，要更新的子任务 id"
+                "description", "update/reopen 时的子任务 id"
         ));
         params.put("status", Map.of(
                 "type", "string",
-                "description", "update 时使用：pending / in_progress / completed / cancelled"
+                "description", "update：pending / in_progress / completed / cancelled / blocked"
         ));
         params.put("note", Map.of(
                 "type", "string",
-                "description", "update 时可选备注；若未传 evidence 可用 note 充当证据"
+                "description", "备注；reopen 时可写回滚原因；update 未传 evidence 时可用 note 充当证据"
         ));
         params.put("evidence", Map.of(
                 "type", "string",
-                "description", "update 标 completed 时必填：完成证据（文件路径、图片 markdown/URL、命令结果摘要）"
+                "description", "completed 时必填：文件路径 / 图片 markdown / 验证摘要"
         ));
         return params;
     }
@@ -81,8 +86,10 @@ public class TodoTool {
                     Object rawItems = args.get("items");
                     List<Map<String, Object>> items = parseItems(rawItems);
                     if (items.isEmpty()) {
-                        return error("set 需要非空 items，每项含 content，建议含 done_when");
+                        return error("set 需要非空 items，每项含 content 与 done_when");
                     }
+                    String missing = validateDoneWhen(items);
+                    if (missing != null) return error(missing);
                     var updated = todoStore.set(sid, items);
                     return MAPPER.writeValueAsString(Map.of(
                             "success", true,
@@ -93,7 +100,7 @@ public class TodoTool {
                     ));
                 }
                 case "update" -> {
-                    int id = args.get("id") instanceof Number n ? n.intValue() : -1;
+                    int id = coercePositiveInt(args.get("id"));
                     if (id <= 0) return error("update 缺少有效 id");
                     String status = (String) args.get("status");
                     String note = (String) args.get("note");
@@ -106,6 +113,40 @@ public class TodoTool {
                     return MAPPER.writeValueAsString(Map.of(
                             "success", true,
                             "action", "update",
+                            "todo", todoStore.render(sid),
+                            "stats", todoStore.stats(sid),
+                            "items", updated
+                    ));
+                }
+                case "reopen" -> {
+                    int id = coercePositiveInt(args.get("id"));
+                    if (id <= 0) return error("reopen 缺少有效 id");
+                    String note = (String) args.get("note");
+                    String[] err = new String[1];
+                    var updated = todoStore.reopen(sid, id, note, err);
+                    if (updated == null) {
+                        return error(err[0] != null ? err[0] : "reopen 失败");
+                    }
+                    return MAPPER.writeValueAsString(Map.of(
+                            "success", true,
+                            "action", "reopen",
+                            "todo", todoStore.render(sid),
+                            "stats", todoStore.stats(sid),
+                            "items", updated
+                    ));
+                }
+                case "confirm" -> {
+                    int id = coercePositiveInt(args.get("id"));
+                    if (id <= 0) return error("confirm 缺少有效 id");
+                    String note = (String) args.get("note");
+                    String[] err = new String[1];
+                    var updated = todoStore.confirm(sid, id, note == null ? "CONFIRM" : note, err);
+                    if (updated == null) {
+                        return error(err[0] != null ? err[0] : "confirm 失败");
+                    }
+                    return MAPPER.writeValueAsString(Map.of(
+                            "success", true,
+                            "action", "confirm",
                             "todo", todoStore.render(sid),
                             "stats", todoStore.stats(sid),
                             "items", updated
@@ -125,13 +166,26 @@ public class TodoTool {
                     return MAPPER.writeValueAsString(Map.of("success", true, "action", "clear"));
                 }
                 default -> {
-                    return error("未知 action: " + action + "（支持 set/update/list/clear）");
+                    return error("未知 action: " + action + "（支持 set/update/list/clear/reopen/confirm）");
                 }
             }
         } catch (Exception e) {
             log.error("todo 工具执行失败", e);
             return error("todo 工具执行失败: " + e.getMessage());
         }
+    }
+
+    private static String validateDoneWhen(List<Map<String, Object>> items) {
+        for (Map<String, Object> raw : items) {
+            if (raw == null) continue;
+            String content = String.valueOf(raw.getOrDefault("content", "")).trim();
+            if (content.isEmpty()) continue;
+            Object dw = raw.getOrDefault("done_when", raw.get("doneWhen"));
+            if (dw == null || String.valueOf(dw).isBlank()) {
+                return "每项必须含 done_when（如 file_exists:workspace/xxx.md 或 media_delivered）。缺省项 content=" + content;
+            }
+        }
+        return null;
     }
 
     @SuppressWarnings("unchecked")
@@ -144,6 +198,18 @@ public class TodoTool {
             return MAPPER.readValue(trimmed, List.class);
         }
         return List.of();
+    }
+
+    private static int coercePositiveInt(Object raw) {
+        if (raw instanceof Number n) return n.intValue();
+        if (raw instanceof String s) {
+            try {
+                return Integer.parseInt(s.trim());
+            } catch (NumberFormatException ignored) {
+                return -1;
+            }
+        }
+        return -1;
     }
 
     private String error(String msg) {

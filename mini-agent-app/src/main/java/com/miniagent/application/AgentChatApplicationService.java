@@ -6,7 +6,8 @@ import com.miniagent.agent.core.TokenUsageTracker;
 import com.miniagent.agent.intent.IntentPlanner;
 import com.miniagent.agent.intent.IntentType;
 import com.miniagent.agent.intent.TaskPlan;
-import com.miniagent.agent.memory.MemoryStore;
+import com.miniagent.memory.MemoryStore;
+import com.miniagent.config.storage.MediaStorage;
 import com.miniagent.agent.todo.TaskTodoContext;
 import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.agent.skill.SkillStore;
@@ -38,6 +39,8 @@ import com.miniagent.config.repository.ChatTaskRepository;
 import com.miniagent.config.entity.ChatTask;
 import com.miniagent.config.service.TaskRunService;
 import com.miniagent.agent.delegate.RoleContext;
+import com.miniagent.agent.permission.PermissionContext;
+import com.miniagent.agent.permission.SessionPermissionStore;
 
 import java.io.File;
 import java.io.IOException;
@@ -89,6 +92,8 @@ public class AgentChatApplicationService {
     private final com.miniagent.agent.core.SessionStreamHub streamHub;
     private final BuiltinTools builtinTools;
     private final TaskRunService taskRunService;
+    private final MediaStorage mediaStorage;
+    private final SessionPermissionStore permissionStore;
 
     private static final int MAX_ITERATIONS = 90;
 
@@ -136,7 +141,7 @@ public class AgentChatApplicationService {
         Set<String> toolNames = getAvailableToolNames();
 
         // 身份 + 能力
-        parts.add(PromptTemplates.IDENTITY);
+        parts.add(PromptTemplates.identity());
         parts.add(PromptTemplates.AUTHORITY);
 
         // 记忆快照：长期记忆按当前对话语义召回（向量可用时），否则全量注入
@@ -377,12 +382,13 @@ public class AgentChatApplicationService {
 
         // hermes-agent 风格：不猜意图，全部进 AgentLoop，模型自己决定用什么工具
 
-        // 执行 Agent 循环
         AgentLoop.setCurrentSession(sessionId);
+        PermissionContext.set(sessionId, permissionStore.getMode(sessionId), permissionStore.isPlanApproved(sessionId));
         String answer;
         try {
             answer = agentLoop.run(chatModel, systemPrompt, userMessage, history, MAX_ITERATIONS, progress, taskPlan, streamSink);
         } finally {
+            PermissionContext.clear();
             AgentLoop.clearCurrentSession();
         }
 
@@ -492,8 +498,16 @@ public class AgentChatApplicationService {
 
         TaskTodoContext.set(sid);
         String systemPrompt = buildSystemPrompt(sid, userMessage);
-        String answer = agentLoop.runWithMultimodal(chatModel, systemPrompt, multimodalMsg, history,
-                MAX_ITERATIONS, null, taskPlan);
+        AgentLoop.setCurrentSession(sid);
+        PermissionContext.set(sid, permissionStore.getMode(sid), permissionStore.isPlanApproved(sid));
+        String answer;
+        try {
+            answer = agentLoop.runWithMultimodal(chatModel, systemPrompt, multimodalMsg, history,
+                    MAX_ITERATIONS, null, taskPlan);
+        } finally {
+            PermissionContext.clear();
+            AgentLoop.clearCurrentSession();
+        }
 
         // 持久化
         String displayMsg = (userMessage != null && !userMessage.isBlank() ? userMessage : "[图片]")
@@ -517,44 +531,9 @@ public class AgentChatApplicationService {
         }
     }
 
-    /**
-     * 将 base64 data URL 图片保存到磁盘，返回相对路径列表。
-     * 存储位置：{project_root}/conversation-images/{sessionId}/{timestamp}_{idx}.png
-     */
+    /** 对话附图 → MediaStorage（data-dir/media/conversations） */
     private List<String> saveImagesToDisk(String sessionId, List<String> imageDataUrls) {
-        List<String> paths = new ArrayList<>();
-        if (imageDataUrls == null || imageDataUrls.isEmpty()) return paths;
-        try {
-            java.nio.file.Path imgDir = java.nio.file.Path.of(
-                    System.getProperty("user.dir"), "conversation-images", sessionId);
-            java.nio.file.Files.createDirectories(imgDir);
-            long ts = System.currentTimeMillis();
-            for (int i = 0; i < imageDataUrls.size(); i++) {
-                String dataUrl = imageDataUrls.get(i);
-                // 解析 data:image/png;base64,xxxx
-                String base64 = dataUrl;
-                String ext = "png";
-                if (dataUrl.startsWith("data:")) {
-                    int commaIdx = dataUrl.indexOf(',');
-                    if (commaIdx > 0) {
-                        String header = dataUrl.substring(0, commaIdx);
-                        base64 = dataUrl.substring(commaIdx + 1);
-                        // 从 header 提取扩展名
-                        if (header.contains("jpeg") || header.contains("jpg")) ext = "jpg";
-                        else if (header.contains("webp")) ext = "webp";
-                        else if (header.contains("gif")) ext = "gif";
-                    }
-                }
-                String filename = ts + "_" + i + "." + ext;
-                java.nio.file.Path filePath = imgDir.resolve(filename);
-                java.nio.file.Files.write(filePath, java.util.Base64.getDecoder().decode(base64));
-                // 存相对路径
-                paths.add("conversation-images/" + sessionId + "/" + filename);
-            }
-        } catch (Exception e) {
-            log.warn("保存用户图片失败: {}", e.getMessage());
-        }
-        return paths;
+        return mediaStorage.saveConversationImages(sessionId, imageDataUrls);
     }
 
     private String answerReviewWithImages(String userMessage, List<String> images, List<ChatMessage> history) {

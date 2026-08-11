@@ -2,6 +2,7 @@ package com.miniagent.agent.comfyui;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.miniagent.config.storage.MediaStorage;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Lazy;
@@ -39,9 +40,11 @@ public class ComfyUIService {
             .connectTimeout(Duration.ofSeconds(10))
             .build();
     private final ImageQualityChecker qualityChecker;
+    private final MediaStorage mediaStorage;
 
-    public ComfyUIService(@Lazy ImageQualityChecker qualityChecker) {
+    public ComfyUIService(@Lazy ImageQualityChecker qualityChecker, MediaStorage mediaStorage) {
         this.qualityChecker = qualityChecker;
+        this.mediaStorage = mediaStorage;
     }
 
     /** 默认反向提示词 — 覆盖常见质量问题 */
@@ -279,8 +282,7 @@ public class ComfyUIService {
 
     /** 从 ComfyUI outputs 构建最终结果（下载图片到本地 + markdown 链接） */
     private String buildImageResult(String promptId, JsonNode outputs) {
-        // 确保 generated-images 目录存在
-        Path imageDir = Path.of(System.getProperty("user.dir")).toAbsolutePath().resolve("generated-images");
+        Path imageDir = mediaStorage.generatedDir();
         imageDir.toFile().mkdirs();
 
         List<String> images = new ArrayList<>();

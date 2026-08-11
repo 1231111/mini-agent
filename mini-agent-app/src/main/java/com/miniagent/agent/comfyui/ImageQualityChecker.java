@@ -7,9 +7,9 @@ import dev.langchain4j.data.message.Content;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
+import com.miniagent.config.storage.MediaStorage;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 
 import java.nio.file.Files;
@@ -27,7 +27,9 @@ import java.util.List;
 public class ImageQualityChecker {
 
     @Autowired
-    private  ChatModel chatModel;
+    private ChatModel chatModel;
+    @Autowired
+    private MediaStorage mediaStorage;
 
     private static final String QUALITY_PROMPT = """
             你是一个图片质量审核员。请仔细检查这张 AI 生成的图片，判断质量是否合格。
@@ -110,10 +112,6 @@ public class ImageQualityChecker {
         }
     }
 
-    public ImageQualityChecker(@Qualifier("chatModel") ChatModel chatModel) {
-        this.chatModel = chatModel;
-    }
-
     /**
      * 检查图片质量。
      * @param imagePath 图片路径（支持绝对路径、相对路径、URL路径如 /generated-images/xxx.png）
@@ -173,31 +171,17 @@ public class ImageQualityChecker {
         }
     }
 
-    /**
-     * 解析图片路径：支持绝对路径、相对路径、URL路径（/generated-images/xxx.png）。
-     */
+    /** 解析图片路径：绝对路径或 data-dir 下媒体相对路径。 */
     private Path resolvePath(String imagePath) {
-        // 1. 绝对路径直接用
         Path path = Path.of(imagePath);
         if (Files.exists(path)) return path;
-
-        // 2. URL路径（/generated-images/xxx.png）→ 拼项目根目录
-        if (imagePath.startsWith("/generated-images/") || imagePath.startsWith("generated-images/")) {
-            String relative = imagePath.startsWith("/") ? imagePath.substring(1) : imagePath;
-            path = Path.of(System.getProperty("user.dir")).resolve(relative);
+        try {
+            path = mediaStorage.resolve(imagePath);
             if (Files.exists(path)) return path;
+        } catch (Exception ignored) {
+            // fall through
         }
-
-        // 3. 其他相对路径
-        path = Path.of(System.getProperty("user.dir")).resolve(imagePath);
-        if (Files.exists(path)) return path;
-
-        // 4. 尝试去掉前导 /
-        if (imagePath.startsWith("/")) {
-            path = Path.of(System.getProperty("user.dir")).resolve(imagePath.substring(1));
-            if (Files.exists(path)) return path;
-        }
-
         return null;
     }
 }
+

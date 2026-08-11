@@ -6,14 +6,18 @@ import com.miniagent.config.security.SessionCookieService;
 import com.miniagent.config.service.AuthService;
 import com.miniagent.config.service.DatabaseConversationStore;
 import com.miniagent.config.service.FileStorageService;
+import com.miniagent.config.service.UserModelConfigService;
+import com.miniagent.config.storage.MediaStorage;
+import com.miniagent.agent.permission.PermissionMode;
+import com.miniagent.agent.permission.SessionPermissionStore;
 import com.miniagent.web.dto.ChatRequest;
 import com.miniagent.web.dto.FileAttachment;
 import com.miniagent.web.dto.FileRef;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.Data;
-import org.apache.commons.collections4.CollectionUtils;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.UrlResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -24,9 +28,10 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.ResponseBody;
 import org.springframework.web.multipart.MultipartFile;
-import com.miniagent.agent.web.FileContentExtractor;
+import com.miniagent.agent.web.UploadedDocumentService;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.nio.charset.StandardCharsets;
@@ -54,7 +59,7 @@ public class MiniAgentChatPageController {
     @Autowired
     private  FileStorageService fileStorageService;
     @Autowired
-    private  FileContentExtractor fileContentExtractor;
+    private  UploadedDocumentService uploadedDocumentService;
     @Autowired
     private  ChatMessageRepository chatMessageRepository;
     @Autowired
@@ -67,6 +72,19 @@ public class MiniAgentChatPageController {
     private  SessionCookieService sessionCookieService;
     @Autowired
     private  DatabaseConversationStore conversationStore;
+    @Autowired
+    private  UserModelConfigService userModelConfigService;
+    @Autowired
+    private MediaStorage mediaStorage;
+
+    @Value("${file.upload.max-size:52428800}")
+    private long maxUploadSizeBytes;
+    @Autowired
+    private SessionPermissionStore permissionStore;
+    @Autowired(required = false)
+    private com.miniagent.agent.mcp.McpToolBridge mcpToolBridge;
+    @Autowired(required = false)
+    private com.miniagent.agent.mcp.McpProperties mcpProperties;
 
     @GetMapping("/")
     public String showChatPage(HttpServletRequest request) {
@@ -115,14 +133,27 @@ public class MiniAgentChatPageController {
                                            HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
         if (userId == null) return Map.of("success", false, "message", "Not authenticated");
+        if (file == null || file.isEmpty()) {
+            return Map.of("success", false, "message", "文件为空");
+        }
+        if (file.getSize() > maxUploadSizeBytes) {
+            return Map.of("success", false, "message",
+                    "文件过大: " + (file.getSize() / 1024 / 1024) + "MB，上限 "
+                            + (maxUploadSizeBytes / 1024 / 1024) + "MB");
+        }
         try {
             String base64 = java.util.Base64.getEncoder().encodeToString(file.getBytes());
             var saved = fileStorageService.saveFile(userId, sessionId, file.getOriginalFilename(), file.getContentType(), base64);
-            return Map.of("success", true,
-                          "filePath", saved.getFilePath(),
-                          "filename", saved.getOriginalFilename(),
-                          "mimeType", saved.getMimeType() != null ? saved.getMimeType() : "application/octet-stream",
-                          "fileSize", saved.getFileSize());
+            Map<String, Object> resp = new LinkedHashMap<>();
+            resp.put("success", true);
+            resp.put("filePath", saved.getFilePath());
+            resp.put("filename", saved.getOriginalFilename());
+            resp.put("mimeType", saved.getMimeType() != null ? saved.getMimeType() : "application/octet-stream");
+            resp.put("fileSize", saved.getFileSize());
+            if (saved.getExtractedTextPath() != null) {
+                resp.put("extractedTextPath", saved.getExtractedTextPath());
+            }
+            return resp;
         } catch (Exception e) {
             return Map.of("success", false, "message", e.getMessage());
         }
@@ -198,45 +229,15 @@ public class MiniAgentChatPageController {
         List<String> images = req.getImages() == null ? List.of() : req.getImages();
         List<FileAttachment> files = req.getFiles() == null ? List.of() : req.getFiles();
         StringBuilder queryTask = new StringBuilder(message != null ? message : "");
-        // Handle fileRefs (pre-uploaded files)
+        // 预上传附件：统一走安全提取 + 侧车 + 上下文预算（docx/pptx/pdf/md 等）
         if (req.getFileRefs() != null && !req.getFileRefs().isEmpty()) {
-            queryTask.append(getFileMessageContext(req.getFileRefs()));
+            String fileCtx = uploadedDocumentService.buildMessageContext(userId, req.getFileRefs());
+            if (fileCtx != null && !fileCtx.isBlank()) {
+                queryTask.append(fileCtx);
+            }
         }
         return agentService.chatStreamMultimodal(userId, sessionId, queryTask.toString(), images, files, role);
     }
-
-    private String getFileMessageContext(List<FileRef> refs) {
-        if (CollectionUtils.isEmpty(refs)) {
-            return null;
-        }
-        StringBuilder fileMessage = new StringBuilder();
-        for (var ref : refs) {
-            long fsize = ref.getFileSize();
-            if (fsize < 5000) {
-                // Small file: read and embed
-                try {
-                    byte[] bytes = Files.readAllBytes(Path.of(ref.getFilePath()));
-                    String text = new String(bytes, StandardCharsets.UTF_8);
-                    fileMessage.append("\n\n--- File: ").append(ref.getFilename()).append(" ---\n");
-                    fileMessage.append(text);
-                    fileMessage.append("\n--- End File ---");
-                } catch (Exception e) {
-                    fileMessage.append("\n\n[File: ").append(ref.getFilename()).append(" at ").append(ref.getFilePath()).append("]");
-                }
-            } else {
-                // Large file: just give path, let agent use read_file
-                fileMessage.append("\n\n[User uploaded file: ").append(ref.getFilename()).append(" (").append(fsize).append(" bytes)]");
-                fileMessage.append("\nFile saved at: ").append(ref.getFilePath());
-                fileMessage.append("\nUse read_file tool to read specific sections. Do NOT read the entire file at once.");
-            }
-        }
-        return fileMessage.toString();
-    }
-
-    /** Generate image static resources */
-    private static final Path IMAGE_DIR = Paths.get(".", "generated-images");
-
-
 
     @Data
     public static class LoginRequest {
@@ -255,7 +256,7 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public ResponseEntity<?> serveImage(@PathVariable("filename") String filename) {
         try {
-            Path baseDir = IMAGE_DIR.toAbsolutePath().normalize();
+            Path baseDir = mediaStorage.generatedDir().toAbsolutePath().normalize();
             Path imagePath = baseDir.resolve(filename).normalize();
 
             if (!imagePath.startsWith(baseDir)) {
@@ -531,5 +532,115 @@ public class MiniAgentChatPageController {
         result.put("tools", tools);
         result.put("slowestSteps", slowest);
         return result;
+    }
+
+    // ========== 权限模式（按会话） ==========
+
+    @GetMapping(value = "/api/permission-mode", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public Map<String, Object> getPermissionMode(@RequestParam("sessionId") String sessionId,
+                                                 HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) return Map.of("success", false, "message", "Not authenticated");
+        if (sessionId == null || sessionId.isBlank()) {
+            return Map.of("success", false, "message", "sessionId required");
+        }
+        return permissionStore.toView(sessionId);
+    }
+
+    @PutMapping(value = "/api/permission-mode", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public Map<String, Object> putPermissionMode(@RequestBody Map<String, Object> body, HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) return Map.of("success", false, "message", "Not authenticated");
+        String sessionId = body == null ? null : String.valueOf(body.getOrDefault("sessionId", ""));
+        if (sessionId == null || sessionId.isBlank() || "null".equals(sessionId)) {
+            return Map.of("success", false, "message", "sessionId required");
+        }
+        String action = body.get("action") == null ? "set" : String.valueOf(body.get("action"));
+        if ("approve_plan".equalsIgnoreCase(action)) {
+            permissionStore.approvePlan(sessionId);
+            // 可选：注入一句提示，让运行中的 agent 感知（若无运行中任务则仅更新状态）
+            streamHub.injectMessage(sessionId, "【系统】用户已批准 Plan，请按 todo 开始执行写操作与交付。");
+            return permissionStore.toView(sessionId);
+        }
+        if ("grant_ask".equalsIgnoreCase(action)) {
+            String tool = body.get("tool") == null ? "" : String.valueOf(body.get("tool"));
+            permissionStore.grantAskTool(sessionId, tool);
+            streamHub.injectMessage(sessionId, "【系统】用户已批准工具 " + tool + "，请继续。");
+            return permissionStore.toView(sessionId);
+        }
+        String mode = body.get("mode") == null ? "default" : String.valueOf(body.get("mode"));
+        permissionStore.setMode(sessionId, PermissionMode.from(mode));
+        return permissionStore.toView(sessionId);
+    }
+
+    // ========== MCP 状态 ==========
+
+    @GetMapping(value = "/api/mcp/status", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public Map<String, Object> mcpStatus(HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) return Map.of("success", false, "message", "Not authenticated");
+        boolean enabled = mcpProperties != null && mcpProperties.isEnabled();
+        List<String> tools = mcpToolBridge == null ? List.of() : mcpToolBridge.registeredToolNames();
+        int serverCount = mcpProperties == null || mcpProperties.getServers() == null
+                ? 0 : mcpProperties.getServers().size();
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("success", true);
+        m.put("enabled", enabled);
+        m.put("serverCount", serverCount);
+        m.put("registeredTools", tools);
+        m.put("toolCount", tools.size());
+        return m;
+    }
+
+    @PostMapping(value = "/api/mcp/refresh", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public Map<String, Object> mcpRefresh(@RequestBody(required = false) Map<String, Object> body,
+                                          HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) return Map.of("success", false, "message", "Not authenticated");
+        if (mcpToolBridge == null) return Map.of("success", false, "message", "MCP bridge unavailable");
+        try {
+            String serverId = body == null || body.get("serverId") == null
+                    ? null : String.valueOf(body.get("serverId"));
+            if (serverId != null && !serverId.isBlank() && !"null".equals(serverId)) {
+                return mcpToolBridge.refreshServer(serverId);
+            }
+            return mcpToolBridge.refreshAll();
+        } catch (Exception e) {
+            return Map.of("success", false, "message", e.getMessage() == null ? "refresh failed" : e.getMessage());
+        }
+    }
+
+    // ========== 模型配置（按用户） ==========
+
+    @GetMapping(value = "/api/model-config", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public Map<String, Object> getModelConfig(HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) return Map.of("success", false, "message", "Not authenticated");
+        return userModelConfigService.getView(userId);
+    }
+
+    @PutMapping(value = "/api/model-config", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public Map<String, Object> putModelConfig(@RequestBody Map<String, Object> body, HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (userId == null) return Map.of("success", false, "message", "Not authenticated");
+        if (body != null && Boolean.TRUE.equals(body.get("reset"))) {
+            return userModelConfigService.resetToDefault(userId);
+        }
+        String presetId = body == null ? null : strOrNull(body.get("presetId"));
+        String baseUrl = body == null ? null : strOrNull(body.get("baseUrl"));
+        String modelName = body == null ? null : strOrNull(body.get("modelName"));
+        String apiKey = body == null ? null : strOrNull(body.get("apiKey"));
+        return userModelConfigService.save(userId, presetId, baseUrl, modelName, apiKey);
+    }
+
+    private static String strOrNull(Object v) {
+        if (v == null) return null;
+        return String.valueOf(v);
     }
 }

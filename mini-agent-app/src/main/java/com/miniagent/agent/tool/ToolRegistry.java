@@ -35,6 +35,20 @@ public class ToolRegistry {
         log.debug("注册工具: {} - {}", tool.getName(), tool.getDescription());
     }
 
+    /** 注销工具（MCP 热插拔 / 关闭时清理） */
+    public void unregister(String name) {
+        if (name == null || name.isBlank()) return;
+        tools.remove(name);
+        specCache.remove(name);
+        log.debug("注销工具: {}", name);
+    }
+
+    public void unregisterByPrefix(String prefix) {
+        if (prefix == null || prefix.isBlank()) return;
+        List<String> names = tools.keySet().stream().filter(n -> n.startsWith(prefix)).toList();
+        names.forEach(this::unregister);
+    }
+
     /**
      * 便捷注册
      */
@@ -95,8 +109,15 @@ public class ToolRegistry {
         if (allowedToolNames.isEmpty()) {
             return List.of();
         }
+        LinkedHashSet<String> names = new LinkedHashSet<>(allowedToolNames);
+        // 全工具面（含写文件+网页）时附带已注册 MCP，避免静态白名单漏掉 mcp__*
+        if (names.contains("write_file") && names.contains("web_extract")) {
+            for (String n : specCache.keySet()) {
+                if (n != null && n.startsWith("mcp__")) names.add(n);
+            }
+        }
         List<ToolSpecification> result = new ArrayList<>();
-        for (String name : allowedToolNames) {
+        for (String name : names) {
             ToolSpecification spec = specCache.get(name);
             if (spec != null) result.add(spec);
         }

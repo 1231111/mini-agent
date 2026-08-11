@@ -1,6 +1,17 @@
 package com.miniagent.agent.core;
 
+import com.miniagent.agent.delegate.SubagentContext;
+import com.miniagent.agent.hook.StopContext;
+import com.miniagent.agent.hook.StopDecision;
+import com.miniagent.agent.hook.StopHookChain;
+import com.miniagent.agent.hook.ToolHookChain;
+import com.miniagent.agent.hook.ToolHookContext;
+import com.miniagent.agent.hook.ToolPreDecision;
 import com.miniagent.agent.intent.TaskPlan;
+import com.miniagent.agent.permission.PermissionContext;
+import com.miniagent.agent.permission.PermissionMode;
+import com.miniagent.agent.permission.PermissionPolicy;
+import com.miniagent.agent.permission.SessionPermissionStore;
 import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.agent.tool.ToolRegistry;
 import dev.langchain4j.data.message.AiMessage;
@@ -59,13 +70,16 @@ public class AgentLoop {
     private final ToolRegistry toolRegistry;
     private final ContextCompressor contextCompressor;
     private final StreamingChatModel streamingChatModel;
+    private final TaskTodoStore taskTodoStore;
+    private final ToolHookChain toolHookChain;
+    private final StopHookChain stopHookChain;
+    private final SessionPermissionStore permissionStore;
     /** 轨迹记录器（可选，注入后自动记录每步执行） */
     private TraceRecorder traceRecorder;
     public void setTraceRecorder(TraceRecorder traceRecorder) { this.traceRecorder = traceRecorder; }
     /** 流式事件中枢（用于运行中消息注入） */
     private SessionStreamHub streamHub;
     public void setStreamHub(SessionStreamHub streamHub) { this.streamHub = streamHub; }
-    private final TaskTodoStore taskTodoStore;
 
     private static final int MAX_ITERATIONS = 90;
     /** 虚拟线程池：工具并行执行专用，IO 密集型任务零开销 */
@@ -76,6 +90,24 @@ public class AgentLoop {
     private static final ThreadLocal<String> currentSessionId = new ThreadLocal<>();
     public static void setCurrentSession(String sessionId) { currentSessionId.set(sessionId); }
     public static void clearCurrentSession() { currentSessionId.remove(); }
+    public static String getCurrentSession() { return currentSessionId.get(); }
+
+    /** 本轮请求绑定的模型（子 Agent / 并行工具线程可读取） */
+    private static final ThreadLocal<ChatModel> currentChatModel = new ThreadLocal<>();
+    private static final ThreadLocal<StreamingChatModel> currentStreamingModel = new ThreadLocal<>();
+
+    public static void setCurrentModels(ChatModel chat, StreamingChatModel streaming) {
+        if (chat != null) currentChatModel.set(chat); else currentChatModel.remove();
+        if (streaming != null) currentStreamingModel.set(streaming); else currentStreamingModel.remove();
+    }
+
+    public static void clearCurrentModels() {
+        currentChatModel.remove();
+        currentStreamingModel.remove();
+    }
+
+    public static ChatModel getCurrentChatModel() { return currentChatModel.get(); }
+    public static StreamingChatModel getCurrentStreamingModel() { return currentStreamingModel.get(); }
     private static final int MAX_EXPLORATION_CALLS = 40;  // read_file + list_files + exec_command 总上限（放开：复杂任务定位文件常需多次读取）
 
     /** 上下文窗口上限（token）。与 ContextCompressor 共用，统一从配置读取，默认 256K。 */
@@ -383,9 +415,9 @@ public class AgentLoop {
         }
 
         if (taskPlan != null) {
-            log.info("Agent计划: intent={}, taskGoal='{}', requiresPlan={}, allowedToolCount={}",
+            log.info("Agent计划: intent={}, taskGoal='{}', requiresPlan={}, allowedTools={}",
                     taskPlan.intent(), taskGoal, taskPlan.requiresStructuredPlan(),
-                    taskPlan.allowedTools() == null ? 0 : taskPlan.allowedTools().size());
+                    taskPlan.allowedTools() == null ? "ALL" : taskPlan.allowedTools().size());
         }
         log.info("Agent任务开始: taskGoal='{}', maxIterations={}, toolsAvailable={}, explicitFileDelivery={}, requiresPlan={}",
                 taskGoal, iterations, toolSpecs.size(), explicitlyNeedsFile, state.requiresStructuredPlan);
@@ -702,7 +734,34 @@ public class AgentLoop {
                 specs = toolSpecs.stream().filter(s -> "memory".equals(((dev.langchain4j.agent.tool.ToolSpecification)s).name())).toList();
             }
         }
-        return specs;
+        PermissionMode mode = PermissionContext.mode();
+        boolean planOk = PermissionContext.planApproved();
+        return specs.stream()
+                .filter(s -> PermissionPolicy.allowInSpecs(
+                        mode, planOk, ((dev.langchain4j.agent.tool.ToolSpecification) s).name()))
+                .toList();
+    }
+
+    /** 工具执行统一入口：权限闸门 + ToolHook */
+    private String executeToolWithHooks(String name, String args, int turn) {
+        String sid = currentSessionId.get();
+        PermissionMode mode = PermissionContext.mode();
+        boolean planOk = PermissionContext.planApproved();
+        if (mode == PermissionMode.PLAN && !planOk && !PermissionPolicy.isPlanSafe(name)) {
+            return "{\"error\":\"Plan 模式未批准，禁止执行: " + name + "\"}";
+        }
+        if (mode == PermissionMode.ASK && PermissionPolicy.isAskDangerous(name)
+                && sid != null && !permissionStore.isAskGranted(sid, name)) {
+            return "{\"error\":\"Ask 模式：工具 " + name + " 需用户确认后才能执行\"}";
+        }
+        boolean sub = SubagentContext.isActive();
+        ToolPreDecision pre = toolHookChain.before(new ToolHookContext(sid, name, args, turn, sub));
+        if (pre != null && pre.deny()) {
+            return pre.denyMessage() != null ? pre.denyMessage() : "{\"error\":\"工具被 Hook 拒绝\"}";
+        }
+        String effective = pre != null && pre.argumentsJson() != null ? pre.argumentsJson() : args;
+        String result = toolRegistry.execute(name, effective);
+        return toolHookChain.after(new ToolHookContext(sid, name, effective, turn, sub), result);
     }
 
     /** 工具调用明显偏离当前子目标时注入纠偏（最多 2 次，避免刷屏） */
@@ -999,7 +1058,10 @@ public class AgentLoop {
         // 主线程上下文快照：虚拟线程不继承 ThreadLocal，必须显式传递，
         // 否则并行批次里的 todo/memory 工具会拿到 "default" 会话 / null 用户，写错状态。
         final String ctxSessionId = currentSessionId.get();
-        final Long ctxUserId = com.miniagent.agent.memory.MemoryStore.getCurrentUser();
+        final Long ctxUserId = com.miniagent.memory.MemoryStore.getCurrentUser();
+        final PermissionMode ctxMode = PermissionContext.mode();
+        final boolean ctxPlanOk = PermissionContext.planApproved();
+        final int turn = state.currentTurn;
 
         for (var tc : toolCalls) {
             String name = toolNameOf(tc);
@@ -1019,19 +1081,20 @@ public class AgentLoop {
 
             long timeout = TOOL_TIMEOUT_SECONDS.getOrDefault(name, DEFAULT_TOOL_TIMEOUT_SECONDS);
             CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                // 子线程内重建上下文，使 todo/memory 等依赖 ThreadLocal 的工具拿到正确会话/用户
                 if (ctxSessionId != null) {
                     currentSessionId.set(ctxSessionId);
                     com.miniagent.agent.todo.TaskTodoContext.set(ctxSessionId);
                 }
-                if (ctxUserId != null) com.miniagent.agent.memory.MemoryStore.setCurrentUser(ctxUserId);
+                PermissionContext.set(ctxSessionId, ctxMode, ctxPlanOk);
+                if (ctxUserId != null) com.miniagent.memory.MemoryStore.setCurrentUser(ctxUserId);
                 try {
-                    String r = toolRegistry.execute(name, args);
+                    String r = executeToolWithHooks(name, args, turn);
                     results.put(toolIdOf(tc) + "|" + name, r == null ? "" : r);
                 } finally {
                     currentSessionId.remove();
                     com.miniagent.agent.todo.TaskTodoContext.clear();
-                    com.miniagent.agent.memory.MemoryStore.clearCurrentUser();
+                    com.miniagent.memory.MemoryStore.clearCurrentUser();
+                    PermissionContext.clear();
                 }
             }, VIRTUAL_EXECUTOR).orTimeout(timeout, java.util.concurrent.TimeUnit.SECONDS);
             futures.add(future);
@@ -1108,8 +1171,18 @@ public class AgentLoop {
             // 与并行路径共用 TOOL_TIMEOUT_SECONDS 预算；给读流/清理留 10s 余量。
             long timeout = TOOL_TIMEOUT_SECONDS.getOrDefault(name, DEFAULT_TOOL_TIMEOUT_SECONDS);
             final String fName = name, fArgs = args;
-            CompletableFuture<String> future = CompletableFuture.supplyAsync(
-                    () -> toolRegistry.execute(fName, fArgs), VIRTUAL_EXECUTOR);
+            final int turn = state.currentTurn;
+            final String ctxSessionId = currentSessionId.get();
+            final PermissionMode ctxMode = PermissionContext.mode();
+            final boolean ctxPlanOk = PermissionContext.planApproved();
+            CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
+                PermissionContext.set(ctxSessionId, ctxMode, ctxPlanOk);
+                try {
+                    return executeToolWithHooks(fName, fArgs, turn);
+                } finally {
+                    PermissionContext.clear();
+                }
+            }, VIRTUAL_EXECUTOR);
             try {
                 result = future.get(timeout + 10, TimeUnit.SECONDS);
             } catch (java.util.concurrent.TimeoutException te) {
@@ -1266,6 +1339,29 @@ public class AgentLoop {
                                        int turn, int iterations, String sessionId) {
         String finalText = aiMessage.text();
         log.info("Agent收尾 {}/{}: 生成最终回复", turn + 1, iterations);
+
+        StopDecision stop = stopHookChain.evaluate(new StopContext(
+                sessionId,
+                finalText == null ? "" : finalText,
+                turn,
+                iterations,
+                Set.copyOf(state.toolsInvoked),
+                state.writeFileSucceeded,
+                state.mediaDelivered,
+                state.requiresStructuredPlan,
+                SubagentContext.isActive(),
+                PermissionContext.mode(),
+                PermissionContext.planApproved()));
+        if (stop != null && !stop.isProceed()) {
+            if (stop.action() == StopDecision.Action.BLOCK_RETRY) {
+                messages.add(new SystemMessage(stop.message() != null ? stop.message()
+                        : "【StopHook】收尾被拦截，请继续执行。"));
+                return null;
+            }
+            if (stop.action() == StopDecision.Action.PREVENT_CONTINUATION) {
+                return stop.message() != null ? stop.message() : (finalText == null ? "" : finalText);
+            }
+        }
 
         if (finalText == null || finalText.isBlank()) {
             if (state.mediaDelivered) return ensureMarkdownImage(state.lastMediaResult);

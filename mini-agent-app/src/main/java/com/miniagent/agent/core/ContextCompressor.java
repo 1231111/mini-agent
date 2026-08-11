@@ -34,7 +34,7 @@ public class ContextCompressor {
     @Autowired
     private TokenEstimator tokenEstimator;
     @Autowired
-    private com.miniagent.agent.memory.MemoryStore memoryStore;
+    private com.miniagent.memory.MemoryStore memoryStore;
 
     // ─── 阈值配置 ───
     /** 压缩触发阈值：上下文占比达到该比例即压缩，留出输出余量。可配置，默认 0.75。 */

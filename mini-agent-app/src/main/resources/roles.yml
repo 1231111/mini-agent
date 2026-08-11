@@ -111,6 +111,7 @@ roles:
       - exec_command
       - list_files
       - read_package
+      - image_generate
 
   # ==========================================
   # 产品经理角色

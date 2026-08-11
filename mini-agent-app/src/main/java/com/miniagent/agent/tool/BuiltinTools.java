@@ -4,7 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.browser.BrowserService;
 import com.miniagent.agent.comfyui.ComfyUIService;
 import com.miniagent.agent.comfyui.ImageQualityChecker;
-import com.miniagent.agent.memory.MemoryStore;
+import com.miniagent.memory.MemoryStore;
 import com.miniagent.agent.skill.SkillStore;
 import com.miniagent.agent.security.NetworkGuard;
 import com.miniagent.agent.web.WebSearchService;
@@ -514,16 +514,23 @@ public class BuiltinTools {
                     return browserService.snapshot(sid, full);
                 });
 
-        registry.register("browser_click", "点击页面元素（通过快照中的ref编号）",
+        registry.register("browser_click",
+                "点击页面元素。默认用快照编号 ref（如 \"10\"）。解析失败时不要盲重试同参，改 by 切换策略："
+                        + "ref=仅编号；text=精确文本；role=button=名称 或 link=名称；css=CSS选择器；aria=aria-label/placeholder。",
                 Map.of(
-                        "ref", Map.of("type", "string", "description", "元素编号或文本", "required", true),
+                        "ref", Map.of("type", "string",
+                                "description", "快照编号（推荐）或文本/选择器，含义由 by 决定", "required", true),
+                        "by", Map.of("type", "string",
+                                "description", "解析策略: auto|ref|text|role|css|aria，默认 auto"),
                         "sessionId", Map.of("type", "string", "description", "浏览器会话ID")
                 ),
                 args -> {
                     Map<String, Object> p = parseJson(args);
-                    String ref = (String) p.get("ref");
+                    String ref = strArg(p, "ref");
+                    String by = strArg(p, "by");
+                    if (by == null || by.isBlank()) by = "auto";
                     String sid = (String) p.getOrDefault("sessionId", "default");
-                    return browserService.click(sid, ref);
+                    return browserService.click(sid, ref, by);
                 });
 
         registry.register("browser_type", "在输入框中输入文字",
@@ -867,9 +874,33 @@ public class BuiltinTools {
 
     // ==================== 文件操作实现 ====================
 
-    /** workspace 根目录，所有写操作都限定在此目录下 */
-    // workspace 根目录：跟项目根目录走
-    private static final Path WORKSPACE = Path.of(System.getProperty("user.dir")).toAbsolutePath().resolve("workspace");
+    /** 默认 workspace：与 AgentDataPaths 对齐（miniagent.data.dir/workspace） */
+    public static Path defaultWorkspaceRoot() {
+        String data = System.getProperty("miniagent.data.dir");
+        Path base = (data != null && !data.isBlank())
+                ? Path.of(data)
+                : Path.of(System.getProperty("user.dir")).toAbsolutePath();
+        return base.resolve("workspace").toAbsolutePath().normalize();
+    }
+
+    /** 有效 workspace 根：子 Agent 可覆盖为独立目录 */
+    public static Path effectiveWorkspaceRoot() {
+        Path override = com.miniagent.agent.core.WorkspaceContext.getRootOverride();
+        return override != null ? override.toAbsolutePath().normalize() : defaultWorkspaceRoot();
+    }
+
+    /** 为子 Agent 准备独立写出目录：workspace/_sub/{safeId}/ */
+    public static Path prepareSubagentWorkspace(String subSessionId) {
+        String safe = subSessionId == null ? "sub" : subSessionId.replaceAll("[^a-zA-Z0-9._-]", "_");
+        if (safe.length() > 80) safe = safe.substring(0, 80);
+        Path root = defaultWorkspaceRoot().resolve("_sub").resolve(safe).toAbsolutePath().normalize();
+        try {
+            java.nio.file.Files.createDirectories(root);
+        } catch (Exception e) {
+            throw new IllegalStateException("无法创建子 Agent workspace: " + root, e);
+        }
+        return root;
+    }
 
     /**
      * 当前任务名（线程隔离，用于路由写文件到任务子目录）
@@ -1038,9 +1069,11 @@ public class BuiltinTools {
      * 解析路径（写入）：默认强制落在 workspace/ 下；绝对路径仅当 allow-absolute-write=true。
      */
     private Path resolveWorkspacePath(String path) {
-        Path workspaceRoot = WORKSPACE.toAbsolutePath().normalize();
+        Path workspaceRoot = effectiveWorkspaceRoot();
+        String task = com.miniagent.agent.core.WorkspaceContext.getTaskOverride();
+        if (task == null || task.isBlank()) task = currentTaskName.get();
         if (path == null || path.isBlank()) {
-            return workspaceRoot.resolve(currentTaskName.get()).normalize();
+            return workspaceRoot.resolve(task).normalize();
         }
         String normalized = path.replace('\\', '/').trim();
         while (normalized.startsWith("./")) normalized = normalized.substring(2);
@@ -1054,7 +1087,7 @@ public class BuiltinTools {
         } else if (normalized.startsWith("workspace/") || normalized.equals("workspace")) {
             resolved = Path.of(".").toAbsolutePath().resolve(normalized).normalize();
         } else if (p.getParent() == null) {
-            resolved = workspaceRoot.resolve(currentTaskName.get()).resolve(p).normalize();
+            resolved = workspaceRoot.resolve(task).resolve(p).normalize();
         } else {
             resolved = workspaceRoot.resolve(p).normalize();
         }
@@ -1213,7 +1246,7 @@ public class BuiltinTools {
                     : new ProcessBuilder("bash", "-c", command);
 
             // 第4层：工作目录限制在 workspace（避免扫用户主目录）
-            File workDirFile = WORKSPACE.toAbsolutePath().normalize().toFile();
+            File workDirFile = defaultWorkspaceRoot().toFile();
             if (!workDirFile.exists()) workDirFile.mkdirs();
             pb.directory(workDirFile);
             log.info("命令执行目录: {}", workDirFile.getAbsolutePath());
@@ -1345,5 +1378,21 @@ public class BuiltinTools {
     private static String truncate(String s, int max) {
         if (s == null) return "";
         return s.length() <= max ? s : s.substring(0, max) + "…";
+    }
+
+    static String strArg(Map<String, Object> p, String key) {
+        Object v = p.get(key);
+        return v == null ? "" : String.valueOf(v).trim();
+    }
+
+    static int intArg(Map<String, Object> p, String key, int defaultValue) {
+        Object v = p.get(key);
+        if (v == null) return defaultValue;
+        if (v instanceof Number n) return n.intValue();
+        try {
+            return Integer.parseInt(String.valueOf(v).trim());
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
     }
 }

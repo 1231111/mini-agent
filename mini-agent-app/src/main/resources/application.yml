@@ -3,8 +3,8 @@ spring:
     cache: false   # 开发期关闭模板缓存：改完 .html 刷新页面即可生效，无需重启
   servlet:
     multipart:
-      max-file-size: 20MB
-      max-request-size: 20MB
+      max-file-size: 50MB
+      max-request-size: 55MB
       enabled: true
   application:
     name: mini-agent-springboot
@@ -31,7 +31,7 @@ server:
   tomcat:
     connection-timeout: 1800000
     max-http-request-header-size: 64KB
-    max-swallow-size: 64MB
+    max-swallow-size: 100MB
 
 management:
   endpoints:
@@ -62,9 +62,93 @@ langchain4j:
 
 # Agent 配置
 agent:
+  # 统一数据根（记忆/媒体/skills/workspace）。可用环境变量 MINI_AGENT_HOME 覆盖。
+  # 默认：{user.home}/.miniagent ，不再写入项目仓库旁路目录。
+  data-dir: ${MINI_AGENT_HOME:${user.home}/.miniagent}
   auth:
     cookie-secret: miniagent-dev-cookie-secret-change-if-needed!!
     cookie-max-age-seconds: 604800
+  # 意图识别漏斗：L0 配置规则 → L1 小模型 → L2 启发式（场景词只写在这里）
+  intent:
+    llm-enabled: true
+    min-confidence: 0.65
+    history-max-messages: 8
+    history-max-chars: 4000
+    timeout-seconds: 60
+    model-name: "qwen2.5:1.5b"
+    base-url: "http://127.0.0.1:11434/v1"
+    api-key: "ollama"
+    # classifier-system-prompt: |   # 可选覆盖；默认用代码内通用模板
+    rules:
+      force-full-on-web-and-file: true
+      force-full-on-image-into-doc: true
+      pure-image-max-len: 40
+      question-max-len: 80
+      review-max-len: 10
+      web-signals:
+        - "(?i)https?://"
+        - "(?i)飞书|feishu|lark|wiki"
+        - "(?i)抓取|爬取|打开网页|访问(该|这个)?(链接|地址|网址)"
+        - "(?i)获取.{0,12}(资料|内容|页面)|web_extract|browser"
+      file-signals:
+        - "(?i)\\.md\\b|markdown|md\\s*文件"
+        - "(?i)写(到|入)?桌面|桌面上|文档|write_file|保存到"
+      image-into-doc-signals:
+        - "(?i)(替换|写入|插入|写进|写到|放到|更新到|贴到).{0,40}(md|markdown|文档|\\.md)"
+        - "(?i)(md|markdown|文档|\\.md).{0,40}(替换|写入|插入)"
+        - "(?i)替换到你生成的|要有图片|包含图片|带上?图片|配上?图"
+      pure-image-signals:
+        - "(?i)画一?[张幅]|画个|画一张"
+        - "(?i)文生图|图生图|txt2img|img2img"
+        - "(?i)生成一?[张幅].{0,24}(图|图片|插画|海报|封面|壁纸|结构图|架构图|流程图)"
+        - "(?i)draw\\s+(a|an|me)|generate\\s+(an?\\s+)?image|create\\s+(an?\\s+)?image"
+        - "(?i)make\\s+(an?\\s+)?(image|picture|illustration)"
+      question-signals:
+        - "(?i)^\\s*(你(可以|能)做(什么|哪些)(事情|事)?|你有什么(能力|功能|本事)|你会什么|能做什么|有什么(能力|功能)|怎么用你|如何使用你|你会哪些|你都支持哪些|有哪些工具|支持什么功能|你是谁|介绍一下你(自己)?|自我介绍|help|what can you do|who are you|what are you|what do you support|你好|您好|hello|hi+|hey)\\s*[?？！!。.~…]*\\s*$"
+      task-action-signals:
+        - "(?i)生成|画|写|创建|修改|编辑|替换|删除|执行|运行|部署|搜索|打开|爬|下载|实现|开发|搭建|设计文档|建表|refactor|implement|deploy|generate"
+      continue-signals:
+        - "(?i)^(继续|接着(做|干|写|改)?|然后(把|再|继续)|按刚才的|在上次基础上|接着上次)"
+      complex-signals:
+        - "(?i)一整套|完整(的)?(项目|系统|方案|架构|平台)|多模块|多个文件|分别(实现|生成|写)|并且.*并且"
+        - "(?i)拆成|分步|步骤|阶段|里程碑|脚手架|骨架|monorepo|微服务|架构设计|技术方案|系统设计|从零(开始|搭建)|端到端"
+        - "(?i)至少\\s*\\d+|不少于\\s*\\d+|\\d+\\s*个(文件|模块|接口|页面|服务)"
+        - "(?i)generate\\s+(a\\s+)?(full|complete|entire)|scaffold|multi[- ]?step|end[- ]to[- ]end"
+        - "(?i)然后.*(再|接着|最后)|先.*再.*最后|建库|建表|CREATE\\s+TABLE|CREATE\\s+DATABASE"
+      image-and-doc-signals:
+        - "(?i)(生成|画).{0,40}(图|图片|结构图|架构图|流程图|插画).{0,60}(替换|写入|插入|写进|写到|放到).{0,40}(md|markdown|文档|\\.md)"
+        - "(?i)(替换|写入|插入|写进|写到|放到).{0,40}(md|markdown|文档|\\.md).{0,40}(图|图片|结构图)"
+        - "(?i)替换到你生成的|(生成|画).{0,40}(图|结构图|架构图).{0,40}替换"
+    tool-profiles:
+      # full 留空 = 使用 ToolRegistry 全量（含 MCP），不写死工具名
+      full: []
+      image:
+        - image_generate
+        - comfyui_status
+        - comfyui_workflows
+        - comfyui_models
+        - comfyui_execute
+        - comfyui_txt2img
+        - comfyui_img2img
+        - comfyui_check_quality
+        - comfyui_img2video
+        - todo
+        - memory
+      question:
+        - skill_list
+        - skill_view
+        - memory
+  # 聊天模型预设（前端可选；空字段回退 langchain4j.open-ai.chat-model.*）
+  models:
+    default-preset: default
+    presets:
+      - id: default
+        label: MiMo v2.5
+      - id: chatanywhere
+        label: ChatAnywhere
+        base-url: https://api.chatanywhere.tech/v1
+        model-name: gpt-4o-mini
+        api-key: sk-S5B6jjx0B3yMvxLAojE3Y94yxOzQUj7FmZFO8UTaFWcsDyby
   chat-memory:
     max-messages: 24
   context:
@@ -93,6 +177,23 @@ agent:
     max-tasks-per-user: 2
   todo:
     persist-dir: ./workspace/.todos
+  # 流式中途预执行只读工具（onCompleteToolCall）
+  streaming:
+    prefetch-readonly: true
+  # 会话累计 token 软预算（0=关闭）；超限后注入一次提醒，不硬杀
+  token-budget:
+    max-total: 0
+  # MCP：启用后启动时连接 servers 并把 tools 注册为 mcp__{id}__{tool}
+  # POST /api/mcp/refresh 可热更新 tools/list
+  mcp:
+    enabled: false
+    servers: []
+    # 示例：
+    # servers:
+    #   - id: filesystem
+    #     transport: stdio
+    #     command: npx
+    #     args: ["-y", "@modelcontextprotocol/server-filesystem", "./workspace"]
 
 logging:
   level:
@@ -117,14 +218,22 @@ image:
     chatanywhere-key: sk-S5B6jjx0B3yMvxLAojE3Y94yxOzQUj7FmZFO8UTaFWcsDyby
     chatanywhere-base-url: https://api.chatanywhere.tech/v1
     chatanywhere-model: gpt-image-2-ca
+    # gpt-image-2-ca 慢，120s 必超时；500s≈8 分钟
+    chatanywhere-timeout-seconds: 500
     siliconflow-api-key: cdfe3b37-673d-4830-9b27-621fd84193e1:d7706f80a383dad428e6f948b9b57e26
     fal-key:
     zhipu-api-key:
 
 file:
   upload:
-    base-dir: ./user-uploads
-    max-size: 10485760
+    # 已弃用：实际上传到 agent.data-dir/media/uploads（MediaStorage）
+    base-dir: unused
+    max-size: 52428800           # 50MB，与 spring.servlet.multipart.max-file-size 对齐
+  extract:
+    max-bytes: 52428800          # 单文件原始大小上限 50MB
+    max-inline-chars: 80000      # 单文件提取后内联截断
+    max-context-chars: 120000    # 多附件合计注入上下文预算
+    sidecar-threshold-chars: 20000  # 超过则写 .extracted.txt 侧车
 
 comfyui:
   host: 127.0.0.1
