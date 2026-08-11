@@ -18,6 +18,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.Objects;
+import org.apache.commons.lang3.StringUtils;
 
 @Configuration
 public class ChatMemoryConfig {
@@ -50,7 +52,7 @@ public class ChatMemoryConfig {
         return sid -> {
             MessageWindowChatMemory memory = MessageWindowChatMemory.withMaxMessages(maxMessages);
             DatabaseConversationStore.Conversation conv = conversationStore.get(sid);
-            if (conv != null && conv.messages != null && !conv.messages.isEmpty()) {
+            if (Objects.nonNull(conv) && Objects.nonNull(conv.messages) && !conv.messages.isEmpty()) {
                 List<DatabaseConversationStore.Message> all = conv.messages;
                 int from = Math.max(0, all.size() - maxMessages);
                 while (from < all.size() && !"user".equals(all.get(from).role)) {
@@ -59,9 +61,9 @@ public class ChatMemoryConfig {
                 if (from >= all.size()) from = Math.max(0, all.size() - maxMessages);
                 for (int i = from; i < all.size(); i++) {
                     DatabaseConversationStore.Message msg = all.get(i);
-                    if (msg == null || msg.content == null) continue;
+                    if (Objects.isNull(msg) || Objects.isNull(msg.content)) continue;
                     if ("user".equals(msg.role)) {
-                        if (msg.images != null && !msg.images.isEmpty()) {
+                        if (Objects.nonNull(msg.images) && !msg.images.isEmpty()) {
                             memory.add(rebuildMultimodalMessage(msg.content, msg.images, mediaStorage));
                         } else {
                             memory.add(UserMessage.from(msg.content));
@@ -79,7 +81,7 @@ public class ChatMemoryConfig {
     private UserMessage rebuildMultimodalMessage(String textContent, List<String> imagePaths,
                                                  MediaStorage mediaStorage) {
         List<dev.langchain4j.data.message.Content> contents = new ArrayList<>();
-        if (textContent != null && !textContent.isBlank()) {
+        if (StringUtils.isNotBlank(textContent)) {
             contents.add(dev.langchain4j.data.message.TextContent.from(textContent));
         }
         for (String imgPath : imagePaths) {

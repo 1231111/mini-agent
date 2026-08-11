@@ -17,6 +17,8 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 网络搜索服务 — 对标 hermes-agent 的 web_search / web_extract
@@ -72,7 +74,7 @@ public class WebSearchService {
      * @return 标准化 JSON 结果
      */
     public String search(String query, Integer limit) {
-        if (limit == null || limit <= 0) limit = DEFAULT_LIMIT;
+        if (Objects.isNull(limit) || limit <= 0) limit = DEFAULT_LIMIT;
         String backend = resolveBackend();
         log.info("Web搜索: query='{}' limit={} backend={}", query, limit, backend);
 
@@ -110,7 +112,7 @@ public class WebSearchService {
             // SSRF 防护：拦截内网地址
             URI uri = URI.create(url);
             String host = uri.getHost();
-            if (host == null || isPrivateHost(host)) {
+            if (Objects.isNull(host) || isPrivateHost(host)) {
                 return buildErrorResponse("安全拦截: URL 目标是内网地址 (" + host + ")");
             }
 
@@ -179,7 +181,7 @@ public class WebSearchService {
             if (results.isArray() && !results.isEmpty()) {
                 JsonNode first = results.get(0);
                 String content = first.path("raw_content").asText("");
-                if (content.isBlank()) content = first.path("content").asText("");
+                if (StringUtils.isBlank(content)) content = first.path("content").asText("");
                 String title = first.path("title").asText("");
 
                 if (content.length() > MAX_CONTENT_LENGTH) {
@@ -344,7 +346,7 @@ public class WebSearchService {
         // AbstractText — 即时答案
         String abstractText = root.path("AbstractText").asText("");
         String abstractUrl = root.path("AbstractURL").asText("");
-        if (!abstractText.isBlank() && !abstractUrl.isBlank()) {
+        if (!StringUtils.isBlank(abstractText) && !StringUtils.isBlank(abstractUrl)) {
             results.add(new SearchResult(
                     root.path("Heading").asText(query),
                     abstractUrl,
@@ -359,7 +361,7 @@ public class WebSearchService {
             if (pos > limit) break;
             String text = topic.path("Text").asText("");
             String topicUrl = topic.path("FirstURL").asText("");
-            if (!text.isBlank() && !topicUrl.isBlank()) {
+            if (!StringUtils.isBlank(text) && !StringUtils.isBlank(topicUrl)) {
                 results.add(new SearchResult(
                         extractFirstSentence(text),
                         topicUrl,
@@ -388,26 +390,26 @@ public class WebSearchService {
 
     private String resolveBackend() {
         // 1. 环境变量显式指定
-        if (configuredBackend != null && !configuredBackend.isBlank()) {
+        if (StringUtils.isNotBlank(configuredBackend)) {
             return configuredBackend.toLowerCase().trim();
         }
         // 2. 自动检测（优先级：tavily > bing > google > duckduckgo）
-        if (tavilyApiKey != null && !tavilyApiKey.isBlank()) return "tavily";
-        if (bingApiKey != null && !bingApiKey.isBlank()) return "bing";
-        if (googleApiKey != null && !googleApiKey.isBlank() && googleCseId != null && !googleCseId.isBlank()) return "google";
+        if (StringUtils.isNotBlank(tavilyApiKey)) return "tavily";
+        if (StringUtils.isNotBlank(bingApiKey)) return "bing";
+        if (StringUtils.isNotBlank(googleApiKey) && StringUtils.isNotBlank(googleCseId)) return "google";
         return "duckduckgo"; // 免费 fallback
     }
 
     private String resolveKey(String value, String envName) {
         // 先查 @Value 注入的值，再查系统环境变量
-        if (value != null && !value.isBlank()) return value;
+        if (StringUtils.isNotBlank(value)) return value;
         String envVal = System.getenv(envName);
-        if (envVal != null && !envVal.isBlank()) return envVal;
+        if (StringUtils.isNotBlank(envVal)) return envVal;
         throw new IllegalStateException("未配置 " + envName + "，无法使用该搜索后端");
     }
 
     private static String redactSensitive(String s) {
-        if (s == null) return "";
+        if (Objects.isNull(s)) return "";
         return s
                 .replaceAll("(?i)(access_token=)[^&\\s\"'}]+", "$1***")
                 .replaceAll("(?i)(secret=)[^&\\s\"'}]+", "$1***")

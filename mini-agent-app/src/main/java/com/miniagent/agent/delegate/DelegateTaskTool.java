@@ -14,6 +14,9 @@ import org.springframework.stereotype.Component;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 子任务派发工具：给主 Agent 一个"分包"能力。
@@ -107,7 +110,7 @@ public class DelegateTaskTool {
     @SuppressWarnings("unchecked")
     private String handle(String json) {
         try {
-            Map<String, Object> args = MAPPER.readValue(json == null ? "{}" : json, Map.class);
+            Map<String, Object> args = MAPPER.readValue(Optional.ofNullable(json).orElse("{}"), Map.class);
             String goal = String.valueOf(args.getOrDefault("goal", "")).trim();
             if (goal.isEmpty()) return error("goal 不能为空");
 
@@ -123,14 +126,14 @@ public class DelegateTaskTool {
             RoleConfig roleConfig = null;
             if (!roleId.isEmpty()) {
                 roleConfig = roleLoader.getRole(roleId);
-                if (roleConfig == null) {
+                if (Objects.isNull(roleConfig)) {
                     return error("未知角色: " + roleId + "。可用角色: " + String.join(", ", roleLoader.getRoleIds()));
                 }
             }
 
             // 确定系统提示词
             String systemPrompt;
-            if (roleConfig != null) {
+            if (Objects.nonNull(roleConfig)) {
                 systemPrompt = buildRoleSystemPrompt(roleConfig, goal);
             } else {
                 systemPrompt = DEFAULT_SYSTEM_PROMPT;
@@ -140,7 +143,7 @@ public class DelegateTaskTool {
             List<String> tools;
             if (!customTools.isEmpty()) {
                 tools = new java.util.ArrayList<>(customTools);
-            } else if (roleConfig != null && roleConfig.getAllowedTools() != null && !roleConfig.getAllowedTools().isEmpty()) {
+            } else if (Objects.nonNull(roleConfig) && Objects.nonNull(roleConfig.getAllowedTools()) && !roleConfig.getAllowedTools().isEmpty()) {
                 tools = new java.util.ArrayList<>(roleConfig.getAllowedTools());
             } else {
                 tools = new java.util.ArrayList<>(DEFAULT_SUBAGENT_TOOLS);
@@ -163,17 +166,16 @@ public class DelegateTaskTool {
             // 强隔离：禁止嵌套派发，避免子 Agent 再开子 Agent 污染控制面
             tools.remove("delegate_task");
 
-            String roleLabel = roleConfig != null ? roleConfig.getName() : "通用";
+            String roleLabel = Objects.nonNull(roleConfig) ? roleConfig.getName() : "通用";
             log.info("delegate_task 启动: role='{}', goal='{}', allowedTools={}", roleLabel, truncate(goal, 80), tools);
 
             // 子 Agent：派生 sessionId + SubagentScope 完整沙箱（消息栈仍为 fresh List.of）
             String parentSid = AgentLoop.getCurrentSession();
-            String subSid = (parentSid != null && !parentSid.isBlank())
+            String subSid = (StringUtils.isNotBlank(parentSid))
                     ? parentSid + ":sub:" + Long.toHexString(System.nanoTime())
                     : "sub_" + Long.toHexString(System.nanoTime());
 
-            ChatModel modelForSub = AgentLoop.getCurrentChatModel() != null
-                    ? AgentLoop.getCurrentChatModel() : chatModel;
+            ChatModel modelForSub = Optional.ofNullable(AgentLoop.getCurrentChatModel()).orElse(chatModel);
 
             String answer;
             try (SubagentScope scope = SubagentScope.enter(subSid, roleId, false)) {
@@ -235,7 +237,7 @@ public class DelegateTaskTool {
             """;
 
     private static boolean needsImageTools(String goal, String ctx) {
-        String blob = ((goal == null ? "" : goal) + " " + (ctx == null ? "" : ctx)).toLowerCase();
+        String blob = ((Optional.ofNullable(goal).orElse("")) + " " + (Optional.ofNullable(ctx).orElse(""))).toLowerCase();
         return blob.contains("image_generate")
                 || blob.contains("生图")
                 || blob.contains("生成图片")
@@ -252,7 +254,7 @@ public class DelegateTaskTool {
 
     @SuppressWarnings("unchecked")
     private List<String> parseTools(Object raw) {
-        if (raw == null) return List.of();
+        if (Objects.isNull(raw)) return List.of();
         try {
             if (raw instanceof List<?> list) return ((List<String>) list);
             String s = String.valueOf(raw).trim();
@@ -264,12 +266,12 @@ public class DelegateTaskTool {
     }
 
     private static String clamp(String s, int max) {
-        if (s == null) return "";
+        if (Objects.isNull(s)) return "";
         return s.length() <= max ? s : s.substring(0, max) + "\n…(摘要已截断)";
     }
 
     private static String truncate(String s, int max) {
-        if (s == null) return "";
+        if (Objects.isNull(s)) return "";
         return s.length() <= max ? s : s.substring(0, max) + "...";
     }
 

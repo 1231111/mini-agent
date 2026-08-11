@@ -7,6 +7,9 @@ import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.Locale;
 import java.util.regex.Pattern;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 语义层验收（双轨制第二轨）：在 file_exists / media 等存在性检查通过后，
@@ -21,7 +24,7 @@ public final class TodoSemanticValidator {
     private TodoSemanticValidator() {}
 
     public record Result(boolean ok, String error, String contentHash) {
-        public static Result pass(String hash) { return new Result(true, null, hash == null ? "" : hash); }
+        public static Result pass(String hash) { return new Result(true, null, Optional.ofNullable(hash).orElse("")); }
         public static Result fail(String error) { return new Result(false, error, ""); }
     }
 
@@ -31,14 +34,14 @@ public final class TodoSemanticValidator {
      * @param evidence 模型提供的证据
      */
     public static Result validate(String content, String doneWhen, String evidence) {
-        String dw = doneWhen == null ? "" : doneWhen.trim();
-        String ev = evidence == null ? "" : evidence.trim();
-        String goal = content == null ? "" : content;
+        String dw = Objects.isNull(doneWhen) ? "" : doneWhen.trim();
+        String ev = Objects.isNull(evidence) ? "" : evidence.trim();
+        String goal = Optional.ofNullable(content).orElse("");
 
         if (dw.startsWith("file_exists:")) {
             String path = dw.substring("file_exists:".length()).trim();
             Path p = resolveExisting(path, ev);
-            if (p == null) {
+            if (Objects.isNull(p)) {
                 return Result.fail("语义验收失败：找不到可校验文件（done_when/evidence）");
             }
             return validateFile(p, goal);
@@ -52,9 +55,9 @@ public final class TodoSemanticValidator {
         }
 
         // note_required / 未知：至少禁止空证据；若 evidence 像路径则顺带做文件语义检查
-        if (!ev.isBlank()) {
+        if (!StringUtils.isBlank(ev)) {
             Path maybe = tryResolve(ev);
-            if (maybe != null && Files.isRegularFile(maybe)) {
+            if (Objects.nonNull(maybe) && Files.isRegularFile(maybe)) {
                 return validateFile(maybe, goal);
             }
             return Result.pass(sha256(ev.getBytes(StandardCharsets.UTF_8)));
@@ -76,7 +79,7 @@ public final class TodoSemanticValidator {
                     return Result.fail("语义验收失败：文档过短（<" + size + " bytes），疑似未写完 " + p);
                 }
                 String body = Files.readString(p, StandardCharsets.UTF_8);
-                if (body.isBlank()) {
+                if (StringUtils.isBlank(body)) {
                     return Result.fail("语义验收失败：文档无有效文本 " + p);
                 }
                 boolean needsImage = lowerGoal.contains("图") || lowerGoal.contains("image")
@@ -120,23 +123,23 @@ public final class TodoSemanticValidator {
 
     private static Path resolveExisting(String doneWhenPath, String evidence) {
         Path p = tryResolve(doneWhenPath);
-        if (p != null && Files.exists(p)) return p;
-        if (evidence != null && !evidence.isBlank()) {
+        if (Objects.nonNull(p) && Files.exists(p)) return p;
+        if (StringUtils.isNotBlank(evidence)) {
             // evidence 可能是路径，或 markdown 里夹路径
             Path e = tryResolve(evidence.trim());
-            if (e != null && Files.exists(e)) return e;
+            if (Objects.nonNull(e) && Files.exists(e)) return e;
             var m = Pattern.compile("(?:workspace|generated-images|static/images)[^\\s)'\"]+")
                     .matcher(evidence.replace('\\', '/'));
             if (m.find()) {
                 Path fromEv = tryResolve(m.group());
-                if (fromEv != null && Files.exists(fromEv)) return fromEv;
+                if (Objects.nonNull(fromEv) && Files.exists(fromEv)) return fromEv;
             }
         }
         return null;
     }
 
     private static Path tryResolve(String path) {
-        if (path == null || path.isBlank()) return null;
+        if (StringUtils.isBlank(path)) return null;
         String normalized = path.replace('\\', '/').trim();
         // 去掉 markdown 包装
         if (normalized.startsWith("![") && normalized.contains("](")) {

@@ -76,7 +76,7 @@ public class TaskTodoStore {
     }
 
     @Autowired
-    public TaskTodoStore(@Value("${agent.todo.persist-dir:./workspace/.todos}") String persistDir,
+    public TaskTodoStore(@Value("${agent.todo.persist-dir:${agent.data-dir:${user.home}/.miniagent}/workspace/.todos}") String persistDir,
                          @Autowired(required = false) List<TodoStepValidator> validators) {
         this.persistDir = Path.of(persistDir).toAbsolutePath().normalize();
         this.validators = validators == null || validators.isEmpty()

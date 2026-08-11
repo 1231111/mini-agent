@@ -1,5 +1,8 @@
 package com.miniagent.agent.core;
 
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+
 import com.miniagent.agent.delegate.SubagentContext;
 import com.miniagent.agent.hook.StopContext;
 import com.miniagent.agent.hook.StopDecision;
@@ -29,7 +32,6 @@ import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.chat.response.PartialThinking;
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import com.miniagent.agent.trace.TraceRecorder;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -48,6 +50,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * Agent 循环：解析 tool_calls → 执行 → 注入结果 → 重试，直到模型返回最终文本。
@@ -64,16 +69,22 @@ import java.util.regex.Pattern;
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class AgentLoop {
 
-    private final ToolRegistry toolRegistry;
-    private final ContextCompressor contextCompressor;
-    private final StreamingChatModel streamingChatModel;
-    private final TaskTodoStore taskTodoStore;
-    private final ToolHookChain toolHookChain;
-    private final StopHookChain stopHookChain;
-    private final SessionPermissionStore permissionStore;
+    @Autowired
+    private ToolRegistry toolRegistry;
+    @Autowired
+    private ContextCompressor contextCompressor;
+    @Autowired
+    private StreamingChatModel streamingChatModel;
+    @Autowired
+    private TaskTodoStore taskTodoStore;
+    @Autowired
+    private ToolHookChain toolHookChain;
+    @Autowired
+    private StopHookChain stopHookChain;
+    @Autowired
+    private SessionPermissionStore permissionStore;
     /** 轨迹记录器（可选，注入后自动记录每步执行） */
     private TraceRecorder traceRecorder;
     public void setTraceRecorder(TraceRecorder traceRecorder) { this.traceRecorder = traceRecorder; }
@@ -97,8 +108,8 @@ public class AgentLoop {
     private static final ThreadLocal<StreamingChatModel> currentStreamingModel = new ThreadLocal<>();
 
     public static void setCurrentModels(ChatModel chat, StreamingChatModel streaming) {
-        if (chat != null) currentChatModel.set(chat); else currentChatModel.remove();
-        if (streaming != null) currentStreamingModel.set(streaming); else currentStreamingModel.remove();
+        Optional.ofNullable(chat).ifPresentOrElse(currentChatModel::set, () -> currentChatModel.remove());
+        Optional.ofNullable(streaming).ifPresentOrElse(currentStreamingModel::set, () -> currentStreamingModel.remove());
     }
 
     public static void clearCurrentModels() {
@@ -111,7 +122,7 @@ public class AgentLoop {
     private static final int MAX_EXPLORATION_CALLS = 40;  // read_file + list_files + exec_command 总上限（放开：复杂任务定位文件常需多次读取）
 
     /** 上下文窗口上限（token）。与 ContextCompressor 共用，统一从配置读取，默认 256K。 */
-    @org.springframework.beans.factory.annotation.Value("${agent.context.max-tokens:256000}")
+    @Value("${agent.context.max-tokens:256000}")
     private int maxContextTokens;
 
     /**
@@ -263,17 +274,17 @@ public class AgentLoop {
                       TaskPlan taskPlan,
                       AgentStreamSink streamSink) {
         List<ChatMessage> messages = new ArrayList<>();
-        if (systemMessage != null && !systemMessage.isBlank()) {
+        if (StringUtils.isNotBlank(systemMessage)) {
             messages.add(new SystemMessage(systemMessage));
         }
-        if (taskPlan != null) {
+        if (Objects.nonNull(taskPlan)) {
             messages.add(new SystemMessage(taskPlan.toPromptBlock()));
         }
-        if (chatHistory != null) {
+        if (Objects.nonNull(chatHistory)) {
             messages.addAll(chatHistory);
         }
         messages.add(new UserMessage(userMessage));
-        return executeLoop(chatModel, messages, userMessage == null ? "" : userMessage, maxIterations, progressCallback, taskPlan, streamSink);
+        return executeLoop(chatModel, messages, Optional.ofNullable(userMessage).orElse(""), maxIterations, progressCallback, taskPlan, streamSink);
     }
 
     /**
@@ -310,18 +321,31 @@ public class AgentLoop {
                                     int maxIterations,
                                     Consumer<String> progressCallback,
                                     TaskPlan taskPlan) {
+        return runWithMultimodal(chatModel, systemMessage, userMessage, chatHistory,
+                maxIterations, progressCallback, taskPlan, null);
+    }
+
+    public String runWithMultimodal(ChatModel chatModel,
+                                    String systemMessage,
+                                    UserMessage userMessage,
+                                    List<ChatMessage> chatHistory,
+                                    int maxIterations,
+                                    Consumer<String> progressCallback,
+                                    TaskPlan taskPlan,
+                                    AgentStreamSink streamSink) {
         List<ChatMessage> messages = new ArrayList<>();
-        if (systemMessage != null && !systemMessage.isBlank()) {
+        if (StringUtils.isNotBlank(systemMessage)) {
             messages.add(new SystemMessage(systemMessage));
         }
-        if (taskPlan != null) {
+        if (Objects.nonNull(taskPlan)) {
             messages.add(new SystemMessage(taskPlan.toPromptBlock()));
         }
-        if (chatHistory != null) {
+        if (Objects.nonNull(chatHistory)) {
             messages.addAll(chatHistory);
         }
         messages.add(userMessage);
-        return executeLoop(chatModel, messages, firstUserTextForFileIntent(userMessage), maxIterations, progressCallback, taskPlan, null);
+        return executeLoop(chatModel, messages, firstUserTextForFileIntent(userMessage),
+                maxIterations, progressCallback, taskPlan, streamSink);
     }
 
     /**
@@ -366,7 +390,7 @@ public class AgentLoop {
             for (var tc : toolCalls) {
                 try {
                     String key = tc.getClass().getMethod("name").invoke(tc) + "|"
-                            + (tc.getClass().getMethod("arguments").invoke(tc) == null ? ""
+                            + (Objects.isNull(tc.getClass().getMethod("arguments").invoke(tc)) ? ""
                                : tc.getClass().getMethod("arguments").invoke(tc));
                     int count = dupCallCounter.getOrDefault(key, 0) + 1;
                     dupCallCounter.put(key, count);
@@ -388,7 +412,7 @@ public class AgentLoop {
                               Consumer<String> progressCallback,
                               TaskPlan taskPlan,
                               AgentStreamSink streamSink) {
-        var toolSpecs = taskPlan == null
+        var toolSpecs = Objects.isNull(taskPlan)
                 ? toolRegistry.getSpecifications()
                 : toolRegistry.getSpecifications(taskPlan.allowedToolSet());
         boolean hasTools = !toolSpecs.isEmpty();
@@ -396,43 +420,55 @@ public class AgentLoop {
 
         LoopState state = new LoopState();
         boolean explicitlyNeedsFile = EXPLICIT_FILE_REQ.matcher(
-                userTextForFilePattern == null ? "" : userTextForFilePattern).find();
+                Optional.ofNullable(userTextForFilePattern).orElse("")).find();
         String taskGoal = summarizeTaskGoal(
-                taskPlan != null ? taskPlan.taskGoal() : userTextForFilePattern);
-        state.requiresStructuredPlan = taskPlan != null && taskPlan.requiresStructuredPlan();
+                Objects.nonNull(taskPlan) ? taskPlan.taskGoal() : userTextForFilePattern);
+        state.requiresStructuredPlan = Objects.nonNull(taskPlan) && taskPlan.requiresStructuredPlan();
 
         // sub-goal 栈播种：用意图规划的 steps 预填 todo（仅当该 session 还没有计划时）
         String sessionId = currentSessionId.get();
-        // 开始轨迹记录
-        String executionId = "exec_" + System.currentTimeMillis() + "_" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        if (traceRecorder != null) {
-            traceRecorder.beginExecution(sessionId, executionId, userTextForFilePattern);
+        // 复用上游 executionId；仅当本循环自己创建时才在 finally end（避免子 Agent 清掉父上下文）
+        final boolean ownsExecution = Objects.nonNull(traceRecorder) && !traceRecorder.isActive();
+        if (Objects.nonNull(traceRecorder)) {
+            traceRecorder.ensureExecution(sessionId, userTextForFilePattern);
+            String loopType = SubagentContext.isActive() ? "SUBAGENT_LOOP_START" : "AGENT_LOOP_START";
+            traceRecorder.recordNode(sessionId, 0, loopType,
+                    "{\"intent\":\"" + (Objects.isNull(taskPlan) ? "null" : taskPlan.intent())
+                            + "\",\"requiresStructuredPlan\":"
+                            + (Objects.nonNull(taskPlan) && taskPlan.requiresStructuredPlan()) + "}",
+                    "RUNNING", 0);
         }
         try {
-        if (taskPlan != null && taskPlan.steps() != null && !taskPlan.steps().isEmpty()) {
+        if (Objects.nonNull(taskPlan) && Objects.nonNull(taskPlan.steps()) && !taskPlan.steps().isEmpty()) {
             boolean seeded = taskTodoStore.seedFromSteps(sessionId, taskPlan.steps());
-            if (seeded) log.info("sub-goal 栈已播种 {} 步: {}", taskPlan.steps().size(), taskGoal);
+            if (seeded) {
+                log.info("sub-goal 栈已播种 {} 步: {}", taskPlan.steps().size(), taskGoal);
+                if (Objects.nonNull(traceRecorder)) {
+                    traceRecorder.recordNode(sessionId, 0, "TODO_SEED",
+                            "{\"steps\":" + taskPlan.steps().size() + "}", "SUCCESS", 0);
+                }
+            }
         }
 
-        if (taskPlan != null) {
+        if (Objects.nonNull(taskPlan)) {
             log.info("Agent计划: intent={}, taskGoal='{}', requiresPlan={}, allowedTools={}",
                     taskPlan.intent(), taskGoal, taskPlan.requiresStructuredPlan(),
-                    taskPlan.allowedTools() == null ? "ALL" : taskPlan.allowedTools().size());
+                    Objects.isNull(taskPlan.allowedTools()) ? "ALL" : taskPlan.allowedTools().size());
         }
         log.info("Agent任务开始: taskGoal='{}', maxIterations={}, toolsAvailable={}, explicitFileDelivery={}, requiresPlan={}",
                 taskGoal, iterations, toolSpecs.size(), explicitlyNeedsFile, state.requiresStructuredPlan);
 
         for (int turn = 0; turn < iterations; turn++) {
             // 检查用户执行中追加的消息
-            if (streamHub != null) {
+            if (Objects.nonNull(streamHub)) {
                 java.util.List<String> injected = streamHub.drainMessages(sessionId);
                 if (!injected.isEmpty()) {
                     for (String msg : injected) {
                         messages.add(new UserMessage(msg));
                         log.info("用户追加指令注入: {}", msg.length() > 100 ? msg.substring(0, 100) + "..." : msg);
                     }
-                    if (streamSink != null) streamSink.onThinking("\n（已收到你的补充说明，正在融入当前任务...）\n");
-                    if (traceRecorder != null) traceRecorder.recordThinking(sessionId, turn,
+                    if (Objects.nonNull(streamSink)) streamSink.onThinking("\n（已收到你的补充说明，正在融入当前任务...）\n");
+                    if (Objects.nonNull(traceRecorder)) traceRecorder.recordThinking(sessionId, turn,
                             "【用户追加】" + injected.size() + " 条补充指令注入");
                 }
             }
@@ -449,9 +485,9 @@ public class AgentLoop {
             // 刷新「当前子目标」可刷新指针：移除上一条，按栈顶活动项注入新的一条到末尾
             refreshSubGoal(messages, state, sessionId, streamSink);
 
-            String subGoalLog = state.lastSubGoalText != null ? state.lastSubGoalText : taskGoal;
+            String subGoalLog = Optional.ofNullable(state.lastSubGoalText).orElse(taskGoal);
             state.currentTurn = turn;
-            if (traceRecorder != null) traceRecorder.recordTurnStart(sessionId, turn, state.lastSubGoalText);
+            if (Objects.nonNull(traceRecorder)) traceRecorder.recordTurnStart(sessionId, turn, state.lastSubGoalText);
 
             // 1) 构建请求（按需过滤工具：复杂任务未 set 计划时仅放行 todo）
             var specsForTurn = buildToolSpecsForTurn(toolSpecs, hasTools, state.mediaDelivered, state, sessionId);
@@ -459,56 +495,56 @@ public class AgentLoop {
                     turn + 1, iterations, truncate(subGoalLog, 80), messages.size(),
                     specsForTurn.size(), state.toolsInvoked);
             // 记录 LLM 请求上下文（超长 prompt 截断，避免轨迹写入拖死线程）
-            if (traceRecorder != null) {
+            if (Objects.nonNull(traceRecorder)) {
                 String promptCtx = truncate(formatMessagesForTrace(messages), 8000);
                 traceRecorder.recordThinking(sessionId, turn,
                         "【LLM 请求】消息数: " + messages.size() + ", 工具数: " + specsForTurn.size() + "\n\n" + promptCtx);
             }
-            log.info("开始调用 LLM（流式={}，工具数={}）…", streamSink != null, specsForTurn.size());
+            log.info("开始调用 LLM（流式={}，工具数={}）…", Objects.nonNull(streamSink), specsForTurn.size());
             long llmStartMs = System.currentTimeMillis();
             ChatResponse response = callLlm(chatModel, messages, specsForTurn, hasTools, streamSink);
             log.info("LLM 调用结束，耗时 {}ms，response={}",
-                    System.currentTimeMillis() - llmStartMs, response == null ? "null" : "ok");
+                    System.currentTimeMillis() - llmStartMs, Objects.isNull(response) ? "null" : "ok");
             long llmEndMs = System.currentTimeMillis();
 
             // 记录 LLM 响应
-            if (traceRecorder != null && response != null) {
+            if (Objects.nonNull(traceRecorder) && Objects.nonNull(response)) {
                 AiMessage ai = response.aiMessage();
                 // 记录 LLM 调用耗时
-                int inTokens = response.tokenUsage() != null ? response.tokenUsage().inputTokenCount() : 0;
-                int outTokens = response.tokenUsage() != null ? response.tokenUsage().outputTokenCount() : 0;
+                int inTokens = Objects.nonNull(response.tokenUsage()) ? response.tokenUsage().inputTokenCount() : 0;
+                int outTokens = Objects.nonNull(response.tokenUsage()) ? response.tokenUsage().outputTokenCount() : 0;
                 traceRecorder.recordLlmLatency(sessionId, turn, llmEndMs - llmStartMs, inTokens, outTokens);
                 // 记录决策推理（模型在调工具前的思考文字）
-                if (ai.hasToolExecutionRequests() && ai.text() != null && !ai.text().isBlank()) {
+                if (ai.hasToolExecutionRequests() && StringUtils.isNotBlank(ai.text())) {
                     traceRecorder.recordDecision(sessionId, turn, ai.text());
                 }
                 String respText = "【LLM 响应】";
-                if (ai.text() != null && !ai.text().isBlank()) respText += "\n文本: " + truncate(ai.text(), 2000);
+                if (StringUtils.isNotBlank(ai.text())) respText += "\n文本: " + truncate(ai.text(), 2000);
                 if (ai.hasToolExecutionRequests()) {
                     respText += "\n工具调用: " + ai.toolExecutionRequests().size() + " 个";
                     for (var tc : ai.toolExecutionRequests()) {
                         respText += "\n  - " + toolNameOf(tc) + "(" + truncate(argumentsOf(tc), 500) + ")";
                     }
                 }
-                if (response.tokenUsage() != null) {
+                if (Objects.nonNull(response.tokenUsage())) {
                     respText += "\nToken: input=" + response.tokenUsage().inputTokenCount() + ", output=" + response.tokenUsage().outputTokenCount();
                 }
                 traceRecorder.recordThinking(sessionId, turn, respText);
             }
 
-            if (response == null) {
+            if (Objects.isNull(response)) {
                 state.llmFailureCount++;
                 // 智能降级策略：不立即放弃，尝试恢复
                 if (state.llmFailureCount == 1) {
                     // 首次失败：通知前端、注入恢复提示，给模型一次重连机会
                     log.warn("LLM 调用失败（第 {} 次），注入恢复提示后继续", state.llmFailureCount);
-                    if (streamSink != null) streamSink.onThinking("\n（模型响应超时，正在重试...）\n");
+                    if (Objects.nonNull(streamSink)) streamSink.onThinking("\n（模型响应超时，正在重试...）\n");
                     messages.add(new SystemMessage("【系统通知】上次模型调用遇到临时网络问题，已自动重连。请继续刚才的任务。"));
                     continue;
                 } else if (state.llmFailureCount == 2 && messages.size() > 20) {
                     // 第二次失败 + 上下文过长：可能 token 过多超时，裁剪后做最后一次尝试
                     log.warn("LLM 连续失败 2 次且上下文过长（{} 条），裁剪至最近 10 条后做最终尝试", messages.size());
-                    if (streamSink != null) streamSink.onThinking("\n（第二次重试失败，正在精简上下文后做最后尝试...）\n");
+                    if (Objects.nonNull(streamSink)) streamSink.onThinking("\n（第二次重试失败，正在精简上下文后做最后尝试...）\n");
                     List<ChatMessage> trimmed = new ArrayList<>();
                     // 保留 system prompt（前几条 SystemMessage）
                     int sysEnd = 0;
@@ -526,7 +562,7 @@ public class AgentLoop {
                 } else {
                     // 连续失败 3 次或降级策略用尽：最终放弃
                     log.error("LLM 调用连续失败 {} 次（已尝试恢复与降级），任务终止", state.llmFailureCount);
-                    if (traceRecorder != null) traceRecorder.recordError(sessionId, turn, "LLM 连续失败 " + state.llmFailureCount + " 次");
+                    if (Objects.nonNull(traceRecorder)) traceRecorder.recordError(sessionId, turn, "LLM 连续失败 " + state.llmFailureCount + " 次");
                     return "（模型连接异常，已自动重试但仍失败，请稍后再试或联系管理员）";
                 }
             }
@@ -571,10 +607,10 @@ public class AgentLoop {
             // 2) 工具调用 → 执行工具，继续循环
             if (aiMessage.hasToolExecutionRequests()) {
                 // 本轮流出的文本只是中间思考，提示前端清空已渲染的答案增量
-                if (streamSink != null) streamSink.onAnswerReset();
+                if (Objects.nonNull(streamSink)) streamSink.onAnswerReset();
                 var toolCalls = aiMessage.toolExecutionRequests();
                 log.info("模型请求 {} 个工具调用,tools:{}", toolCalls.size(),toolCalls);
-                if (traceRecorder != null) {
+                if (Objects.nonNull(traceRecorder)) {
                     for (var tc : toolCalls) {
                         traceRecorder.recordToolCall(sessionId, turn, toolNameOf(tc), argumentsOf(tc));
                     }
@@ -617,7 +653,7 @@ public class AgentLoop {
                         log.info("媒体已交付但 LLM 还在调其他工具，第 {} 次忽略提醒", state.mediaIgnoreCount);
                         if (state.mediaIgnoreCount >= 1) {
                             log.warn("LLM 连续忽略 {} 次提醒，强制结束循环", state.mediaIgnoreCount);
-                            return state.lastMediaResult != null ? state.lastMediaResult : "图片已生成。";
+                            return Optional.ofNullable(state.lastMediaResult).orElse("图片已生成。");
                         }
                         messages.add(new SystemMessage(
                                 "图片已经生成完毕，不要再调用任何工具，直接输出 markdown 图片链接给用户。"));
@@ -626,7 +662,7 @@ public class AgentLoop {
 
                 int msgCountBefore = messages.size();
                 messages = contextCompressor.maybeCompress(messages, maxContextTokens, sessionId);
-                if (traceRecorder != null && messages.size() < msgCountBefore) {
+                if (Objects.nonNull(traceRecorder) && messages.size() < msgCountBefore) {
                     traceRecorder.recordCompression(sessionId, turn, msgCountBefore, messages.size(), 0, 0);
                 }
                 continue;
@@ -635,8 +671,8 @@ public class AgentLoop {
             // 3) 模型返回文本（无工具调用）→ 模型主动收尾，作为最终回复
             String result = tryReturnFinalText(aiMessage, messages, state, explicitlyNeedsFile,
                     turn, iterations, sessionId);
-            if (result != null) {
-                if (traceRecorder != null) {
+            if (Objects.nonNull(result)) {
+                if (Objects.nonNull(traceRecorder)) {
                     traceRecorder.recordAnswer(sessionId, turn, result);
                     traceRecorder.recordLoopEnd(sessionId, turn, "SUCCESS", null, null);
                 }
@@ -646,10 +682,15 @@ public class AgentLoop {
         }
 
         log.warn("Agent 循环达到最大迭代次数 {}", iterations);
-        if (traceRecorder != null) traceRecorder.recordLoopEnd(sessionId, iterations - 1, "MAX_ITERATIONS", null, null);
+        if (Objects.nonNull(traceRecorder)) traceRecorder.recordLoopEnd(sessionId, iterations - 1, "MAX_ITERATIONS", null, null);
         return buildMaxIterationFallback(state, iterations);
         } finally {
-            if (traceRecorder != null) traceRecorder.endExecution();
+            if (Objects.nonNull(traceRecorder) && SubagentContext.isActive()) {
+                traceRecorder.recordNode(sessionId, 0, "SUBAGENT_LOOP_END", "{}", "SUCCESS", 0);
+            }
+            if (ownsExecution && Objects.nonNull(traceRecorder)) {
+                traceRecorder.endExecution();
+            }
         }
     }
 
@@ -670,17 +711,17 @@ public class AgentLoop {
         }
 
         // 子目标未变且指针消息仍在 messages 中 → 跳过，避免每轮 remove+add 开销
-        if (sg != null && sg.text().equals(state.lastSubGoalText) && state.currentSubGoalMsg != null
+        if (Objects.nonNull(sg) && sg.text().equals(state.lastSubGoalText) && Objects.nonNull(state.currentSubGoalMsg)
                 && messages.contains(state.currentSubGoalMsg)) {
             return;
         }
 
         // 先移除上一条指针消息（如果还在 messages 里）
-        if (state.currentSubGoalMsg != null) {
+        if (Objects.nonNull(state.currentSubGoalMsg)) {
             messages.remove(state.currentSubGoalMsg);
             state.currentSubGoalMsg = null;
         }
-        if (sg == null) return; // 无可执行子目标：不注入
+        if (Objects.isNull(sg)) return; // 无可执行子目标：不注入
 
         String pointer = "当前子目标 (#" + sg.position() + "/" + sg.total() + ")：" + sg.text()
                 + "\n聚焦完成这一步即可，完成后用 todo 工具把它标记为 completed 再进入下一步。";
@@ -691,13 +732,13 @@ public class AgentLoop {
         // 子目标文字变化才推前端，避免重复事件
         if (!sg.text().equals(state.lastSubGoalText)) {
             state.lastSubGoalText = sg.text();
-            if (streamSink != null) {
+            if (Objects.nonNull(streamSink)) {
                 try { streamSink.onSubGoal(sg.text(), sg.done(), sg.total()); }
                 catch (Exception ignored) {}
             }
-            if (traceRecorder != null) {
+            if (Objects.nonNull(traceRecorder)) {
                 String sid = currentSessionId.get();
-                if (sid != null) traceRecorder.recordSubGoal(sid, 0, sg.text(), sg.done(), sg.total());
+                if (Objects.nonNull(sid)) traceRecorder.recordSubGoal(sid, 0, sg.text(), sg.done(), sg.total());
             }
         }
     }
@@ -710,7 +751,7 @@ public class AgentLoop {
         var specs = toolSpecs;
 
         // 复杂任务：尚未 todo.set 时只允许 todo，强制先写计划
-        if (state.requiresStructuredPlan && sessionId != null && !taskTodoStore.hasPlan(sessionId)) {
+        if (state.requiresStructuredPlan && Objects.nonNull(sessionId) && !taskTodoStore.hasPlan(sessionId)) {
             specs = specs.stream()
                     .filter(s -> "todo".equals(((dev.langchain4j.agent.tool.ToolSpecification) s).name()))
                     .toList();
@@ -748,18 +789,30 @@ public class AgentLoop {
         PermissionMode mode = PermissionContext.mode();
         boolean planOk = PermissionContext.planApproved();
         if (mode == PermissionMode.PLAN && !planOk && !PermissionPolicy.isPlanSafe(name)) {
+            if (Objects.nonNull(traceRecorder)) {
+                traceRecorder.recordNode(sid, turn, "PERM_DENY",
+                        "{\"tool\":\"" + name + "\",\"mode\":\"PLAN\"}", "FAILURE", 0);
+            }
             return "{\"error\":\"Plan 模式未批准，禁止执行: " + name + "\"}";
         }
         if (mode == PermissionMode.ASK && PermissionPolicy.isAskDangerous(name)
-                && sid != null && !permissionStore.isAskGranted(sid, name)) {
+                && Objects.nonNull(sid) && !permissionStore.isAskGranted(sid, name)) {
+            if (Objects.nonNull(traceRecorder)) {
+                traceRecorder.recordNode(sid, turn, "PERM_DENY",
+                        "{\"tool\":\"" + name + "\",\"mode\":\"ASK\"}", "FAILURE", 0);
+            }
             return "{\"error\":\"Ask 模式：工具 " + name + " 需用户确认后才能执行\"}";
         }
         boolean sub = SubagentContext.isActive();
         ToolPreDecision pre = toolHookChain.before(new ToolHookContext(sid, name, args, turn, sub));
-        if (pre != null && pre.deny()) {
-            return pre.denyMessage() != null ? pre.denyMessage() : "{\"error\":\"工具被 Hook 拒绝\"}";
+        if (Objects.nonNull(pre) && pre.deny()) {
+            if (Objects.nonNull(traceRecorder)) {
+                traceRecorder.recordNode(sid, turn, "HOOK_DENY",
+                        "{\"tool\":\"" + name + "\"}", "FAILURE", 0);
+            }
+            return Optional.ofNullable(pre.denyMessage()).orElse("{\"error\":\"工具被 Hook 拒绝\"}");
         }
-        String effective = pre != null && pre.argumentsJson() != null ? pre.argumentsJson() : args;
+        String effective = (Objects.nonNull(pre) && Objects.nonNull(pre.argumentsJson())) ? pre.argumentsJson() : args;
         String result = toolRegistry.execute(name, effective);
         return toolHookChain.after(new ToolHookContext(sid, name, effective, turn, sub), result);
     }
@@ -767,15 +820,15 @@ public class AgentLoop {
     /** 工具调用明显偏离当前子目标时注入纠偏（最多 2 次，避免刷屏） */
     private void injectDriftCorrectionIfNeeded(List<ChatMessage> messages, List<?> toolCalls,
                                                LoopState state, String sessionId) {
-        if (sessionId == null || state.driftReminders >= 2) return;
+        if (Objects.isNull(sessionId) || state.driftReminders >= 2) return;
         TaskTodoStore.SubGoal sg = taskTodoStore.currentSubGoalDetail(sessionId);
-        if (sg == null || sg.text() == null || sg.text().isBlank()) return;
+        if (Objects.isNull(sg) || StringUtils.isBlank(sg.text())) return;
         if (!looksLikeSubGoalDrift(sg.text(), toolCalls)) return;
         state.driftReminders++;
         log.info("检测到子目标漂移，注入纠偏 #{}/2: {}", state.driftReminders, sg.text());
         messages.add(new SystemMessage(
                 "【方向纠偏】当前子目标是：#" + sg.position() + "/" + sg.total() + " " + sg.text()
-                        + (sg.doneWhen() == null || sg.doneWhen().isBlank() ? "" : "（done_when=" + sg.doneWhen() + "）")
+                        + (StringUtils.isBlank(sg.doneWhen()) ? "" : "（done_when=" + sg.doneWhen() + "）")
                         + "\n你刚才的工具调用看起来与该步无关。请立刻回到当前子目标："
                         + "用相关工具完成它，再 todo update 标 completed（附 evidence），不要继续无关操作。"));
     }
@@ -789,7 +842,7 @@ public class AgentLoop {
             String name = toolNameOf(tc);
             if (meta.contains(name)) continue;
             hasNonMeta = true;
-            String args = argumentsOf(tc) == null ? "" : argumentsOf(tc).toLowerCase();
+            String args = Objects.isNull(argumentsOf(tc)) ? "" : argumentsOf(tc).toLowerCase();
             if (sharesSignificantToken(sg, args)) return false;
             if (("write_file".equals(name) || "edit_file".equals(name) || "read_file".equals(name))
                     && (sg.contains("写") || sg.contains("生成") || sg.contains("文件")
@@ -810,7 +863,7 @@ public class AgentLoop {
     }
 
     private static boolean sharesSignificantToken(String subGoal, String args) {
-        if (subGoal.isBlank() || args.isBlank()) return false;
+        if (StringUtils.isBlank(subGoal) || StringUtils.isBlank(args)) return false;
         // 中文 2+ 字片段 / 英文 4+ 字母词
         java.util.regex.Matcher zh = java.util.regex.Pattern.compile("[\\u4e00-\\u9fff]{2,}").matcher(subGoal);
         while (zh.find()) {
@@ -825,7 +878,7 @@ public class AgentLoop {
 
     /** 计划里有大量可并行产出步时，提示用 delegate_task（只提示一次） */
     private void injectBatchDelegateHintIfNeeded(List<ChatMessage> messages, LoopState state, String sessionId) {
-        if (state.batchDelegateHintSent || sessionId == null) return;
+        if (state.batchDelegateHintSent || Objects.isNull(sessionId)) return;
         int batchable = taskTodoStore.countBatchablePending(sessionId);
         if (batchable < 3) return;
         state.batchDelegateHintSent = true;
@@ -854,12 +907,12 @@ public class AgentLoop {
         int maxRetries = 1;
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
             try {
-                ChatResponse response = streamSink == null
+                ChatResponse response = Objects.isNull(streamSink)
                         ? chatModel.chat(request)
                         : callLlmStreaming(request, streamSink);
-                if (response != null && response.tokenUsage() != null) {
+                if (Objects.nonNull(response) && Objects.nonNull(response.tokenUsage())) {
                     String sid = currentSessionId.get();
-                    if (sid != null) {
+                    if (Objects.nonNull(sid)) {
                         TokenUsageTracker.add(sid,
                                 response.tokenUsage().inputTokenCount(),
                                 response.tokenUsage().outputTokenCount(), 0);
@@ -915,14 +968,14 @@ public class AgentLoop {
      * 故沿 cause 链同时检查异常类型与 message 关键词。
      */
     private static boolean isTransientNetworkError(Throwable t) {
-        for (Throwable cur = t; cur != null && cur != cur.getCause(); cur = cur.getCause()) {
+        for (Throwable cur = t; Objects.nonNull(cur) && cur != cur.getCause(); cur = cur.getCause()) {
             if (cur instanceof java.io.IOException
                     || cur instanceof java.util.concurrent.TimeoutException
                     || cur instanceof dev.langchain4j.exception.TimeoutException) {
                 return true;
             }
             String msg = cur.getMessage();
-            if (msg != null) {
+            if (Objects.nonNull(msg)) {
                 String m = msg.toLowerCase();
                 if (m.contains("closed") || m.contains("reset")
                         || m.contains("timeout") || m.contains("timed out")
@@ -949,20 +1002,21 @@ public class AgentLoop {
         long firstTokenTimeoutSec = estimateFirstTokenTimeoutSec(request);
         log.info("流式 LLM 等待首包超时={}s（大上下文会自动加长）", firstTokenTimeoutSec);
 
-        streamingChatModel.chat(request, new StreamingChatResponseHandler() {
+        StreamingChatModel model = Optional.ofNullable(getCurrentStreamingModel()).orElse(streamingChatModel);
+        model.chat(request, new StreamingChatResponseHandler() {
             @Override
             public void onPartialThinking(PartialThinking partialThinking) {
-                if (partialThinking == null) return;
+                if (Objects.isNull(partialThinking)) return;
                 receivedAny.set(true);
                 String t = partialThinking.text();
-                if (t != null && !t.isEmpty()) {
+                if (Objects.nonNull(t) && !t.isEmpty()) {
                     try { streamSink.onThinking(t); } catch (Exception ignored) {}
                 }
             }
 
             @Override
             public void onPartialResponse(String token) {
-                if (token != null && !token.isEmpty()) {
+                if (Objects.nonNull(token) && !token.isEmpty()) {
                     receivedAny.set(true);
                     try { streamSink.onAnswerToken(token); } catch (Exception ignored) {}
                 }
@@ -1003,7 +1057,7 @@ public class AgentLoop {
             } catch (Exception ignored) {}
         }
         Throwable err = errorRef.get();
-        if (err != null) {
+        if (Objects.nonNull(err)) {
             if (err instanceof Exception ex) throw ex;
             throw new RuntimeException(err);
         }
@@ -1013,14 +1067,14 @@ public class AgentLoop {
     /** 按请求体大小估计首包等待：思考模型 + 超长 schema 需要更久 */
     private static long estimateFirstTokenTimeoutSec(ChatRequest request) {
         long chars = 0;
-        if (request != null && request.messages() != null) {
+        if (Objects.nonNull(request) && Objects.nonNull(request.messages())) {
             for (ChatMessage m : request.messages()) {
-                if (m == null) continue;
+                if (Objects.isNull(m)) continue;
                 String s = m.toString();
-                chars += s == null ? 0 : s.length();
+                chars += Objects.isNull(s) ? 0 : s.length();
             }
         }
-        int toolCount = request != null && request.toolSpecifications() != null
+        int toolCount = Objects.nonNull(request) && Objects.nonNull(request.toolSpecifications())
                 ? request.toolSpecifications().size() : 0;
         chars += (long) toolCount * 400L;
         if (chars >= 80_000) return 420; // ~7 min
@@ -1035,7 +1089,7 @@ public class AgentLoop {
     private void executeToolCalls(List<?> toolCalls, List<ChatMessage> messages,
                                    Consumer<String> progressCallback, LoopState state) {
         // 推送进度
-        if (progressCallback != null) {
+        if (Objects.nonNull(progressCallback)) {
             String names = toolCalls.stream()
                     .map(tc -> formatProgressMsg(toolNameOf(tc), argumentsOf(tc)))
                     .reduce((a, b) -> a + " | " + b).orElse("");
@@ -1059,6 +1113,7 @@ public class AgentLoop {
         // 否则并行批次里的 todo/memory 工具会拿到 "default" 会话 / null 用户，写错状态。
         final String ctxSessionId = currentSessionId.get();
         final Long ctxUserId = com.miniagent.memory.MemoryStore.getCurrentUser();
+        final boolean ctxForced = PermissionContext.isForced();
         final PermissionMode ctxMode = PermissionContext.mode();
         final boolean ctxPlanOk = PermissionContext.planApproved();
         final int turn = state.currentTurn;
@@ -1077,19 +1132,20 @@ public class AgentLoop {
             }
 
             log.info("  [并行] {}({})", name, truncate(redactSensitive(args), 150));
-            if (progressCallback != null) progressCallback.accept(formatProgressMsg(name, args));
+            if (Objects.nonNull(progressCallback)) progressCallback.accept(formatProgressMsg(name, args));
 
             long timeout = TOOL_TIMEOUT_SECONDS.getOrDefault(name, DEFAULT_TOOL_TIMEOUT_SECONDS);
             CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                if (ctxSessionId != null) {
+                if (Objects.nonNull(ctxSessionId)) {
                     currentSessionId.set(ctxSessionId);
                     com.miniagent.agent.todo.TaskTodoContext.set(ctxSessionId);
                 }
-                PermissionContext.set(ctxSessionId, ctxMode, ctxPlanOk);
-                if (ctxUserId != null) com.miniagent.memory.MemoryStore.setCurrentUser(ctxUserId);
+                if (ctxForced) PermissionContext.force(ctxSessionId, ctxMode, ctxPlanOk);
+                else PermissionContext.setSession(ctxSessionId);
+                if (Objects.nonNull(ctxUserId)) com.miniagent.memory.MemoryStore.setCurrentUser(ctxUserId);
                 try {
                     String r = executeToolWithHooks(name, args, turn);
-                    results.put(toolIdOf(tc) + "|" + name, r == null ? "" : r);
+                    results.put(toolIdOf(tc) + "|" + name, Optional.ofNullable(r).orElse(""));
                 } finally {
                     currentSessionId.remove();
                     com.miniagent.agent.todo.TaskTodoContext.clear();
@@ -1123,7 +1179,7 @@ public class AgentLoop {
             // 反思机制（并行）：失败时把反思提示并入工具结果，不伪装成用户消息
             String parallelReflection = buildReflectionHint(name, argumentsOf(tc), result);
             String resultForContext = clampForContext(result, name);
-            if (parallelReflection != null) {
+            if (Objects.nonNull(parallelReflection)) {
                 state.consecutiveFailures++;
                 if (!state.reflectionInjected && state.consecutiveFailures >= 2) {
                     resultForContext = resultForContext + "\n\n" + parallelReflection;
@@ -1136,7 +1192,7 @@ public class AgentLoop {
             }
 
             log.info("  [并行] {}: {}", name, truncate(redactSensitive(result), 200));
-            if (traceRecorder != null) traceRecorder.recordToolResult(currentSessionId.get(), state.currentTurn, name, result, 0, result.contains("\"error\"") ? "FAILURE" : "SUCCESS");
+            if (Objects.nonNull(traceRecorder)) traceRecorder.recordToolResult(currentSessionId.get(), state.currentTurn, name, result, 0, result.contains("\"error\"") ? "FAILURE" : "SUCCESS");
             messages.add(ToolExecutionResultMessage.from(
                     toolIdOf(tc), name, resultForContext));
         }
@@ -1159,7 +1215,7 @@ public class AgentLoop {
         String cacheKey = name + ":" + args;
 
         log.info("  {}({})", name, truncate(redactSensitive(args), 150));
-        if (progressCallback != null) progressCallback.accept(formatProgressMsg(name, args));
+        if (Objects.nonNull(progressCallback)) progressCallback.accept(formatProgressMsg(name, args));
 
         String result;
         if (CACHEABLE_TOOLS.contains(name) && state.toolResultCache.containsKey(cacheKey)) {
@@ -1173,10 +1229,12 @@ public class AgentLoop {
             final String fName = name, fArgs = args;
             final int turn = state.currentTurn;
             final String ctxSessionId = currentSessionId.get();
+            final boolean ctxForced = PermissionContext.isForced();
             final PermissionMode ctxMode = PermissionContext.mode();
             final boolean ctxPlanOk = PermissionContext.planApproved();
             CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
-                PermissionContext.set(ctxSessionId, ctxMode, ctxPlanOk);
+                if (ctxForced) PermissionContext.force(ctxSessionId, ctxMode, ctxPlanOk);
+                else PermissionContext.setSession(ctxSessionId);
                 try {
                     return executeToolWithHooks(fName, fArgs, turn);
                 } finally {
@@ -1195,7 +1253,7 @@ public class AgentLoop {
                 log.warn("  工具 {} 执行异常: {}", name, e.getMessage());
                 result = "{\"error\":\"工具执行异常: " + e.getMessage() + "\"}";
             }
-            if (CACHEABLE_TOOLS.contains(name) && result != null) {
+            if (CACHEABLE_TOOLS.contains(name) && Objects.nonNull(result)) {
                 state.toolResultCache.put(cacheKey, result);
             }
         }
@@ -1205,7 +1263,7 @@ public class AgentLoop {
         // 反思机制：工具失败时把反思提示并入工具结果，不伪装成用户消息
         String reflectionHint = buildReflectionHint(name, args, result);
         String resultForContext = clampForContext(result, name);
-        if (reflectionHint != null) {
+        if (Objects.nonNull(reflectionHint)) {
             state.consecutiveFailures++;
             state.lastFailedTool = name;
             if (!state.reflectionInjected && state.consecutiveFailures >= 1) {
@@ -1220,7 +1278,7 @@ public class AgentLoop {
         }
 
         log.info("  {}: {}", name, truncate(redactSensitive(result), 300));
-        if (traceRecorder != null) traceRecorder.recordToolResult(currentSessionId.get(), state.currentTurn, name, result, 0, result.contains("\"error\"") ? "FAILURE" : "SUCCESS");
+        if (Objects.nonNull(traceRecorder)) traceRecorder.recordToolResult(currentSessionId.get(), state.currentTurn, name, result, 0, result.contains("\"error\"") ? "FAILURE" : "SUCCESS");
         messages.add(ToolExecutionResultMessage.from(
                 toolIdOf(tc), name, resultForContext));
     }
@@ -1236,12 +1294,12 @@ public class AgentLoop {
             if (msg instanceof SystemMessage sm) { role = "system"; text = sm.text(); }
             else if (msg instanceof UserMessage um) {
                 role = "user";
-                if (um.singleText() != null) text = um.singleText();
+                if (Objects.nonNull(um.singleText())) text = um.singleText();
                 else text = um.contents().stream().map(c -> c instanceof TextContent tc ? tc.text() : "[图片]").reduce("", (a, b) -> a + b);
             }
             else if (msg instanceof AiMessage am) {
                 role = "assistant";
-                if (am.text() != null) text = am.text();
+                if (Objects.nonNull(am.text())) text = am.text();
                 if (am.hasToolExecutionRequests()) text += " [tool_calls: " + am.toolExecutionRequests().size() + "]";
             }
             else if (msg instanceof ToolExecutionResultMessage tr) { role = "tool:" + tr.toolName(); text = tr.text(); }
@@ -1253,7 +1311,7 @@ public class AgentLoop {
 
     /** 工具失败时注入反思上下文，引导模型换策略 */
     private String buildReflectionHint(String toolName, String args, String result) {
-        if (result == null || result.isBlank()) return null;
+        if (StringUtils.isBlank(result)) return null;
         // 对于 read_file / search_code，只有明确的错误 JSON 才算失败，文件内容本身不算
         if ("read_file".equals(toolName) || "search_code".equals(toolName) || "read_package".equals(toolName)) {
             boolean isExplicitError = result.startsWith("{\"error\"");
@@ -1291,7 +1349,7 @@ public class AgentLoop {
 
     /** 从路径中猜测程序名 */
     private static String guessProgramName(String path) {
-        if (path == null) return "program";
+        if (Objects.isNull(path)) return "program";
         String name = path.replace("\\", "/").trim();
         int lastSlash = name.lastIndexOf('/');
         if (lastSlash >= 0) name = name.substring(lastSlash + 1);
@@ -1305,7 +1363,7 @@ public class AgentLoop {
         if ("read_file".equals(toolName) || "list_files".equals(toolName)
                 || "exec_command".equals(toolName)) state.explorationCount++;
         if ("read_package".equals(toolName)) state.explorationCount += 3;
-        if (WRITE_TOOLS.contains(toolName) && result != null
+        if (WRITE_TOOLS.contains(toolName) && Objects.nonNull(result)
                 && (result.contains("\"success\":true") || result.startsWith("写入成功"))) {
             state.writeFileSucceeded = true;
             // 写入成功后失效文件相关的缓存，避免后续读到过期内容
@@ -1313,7 +1371,7 @@ public class AgentLoop {
                     e.getKey().startsWith("read_file:") || e.getKey().startsWith("exec_command:")
                             || e.getKey().startsWith("list_files:") || e.getKey().startsWith("read_package:"));
         }
-        if ("exec_command".equals(toolName) && result != null
+        if ("exec_command".equals(toolName) && Objects.nonNull(result)
                 && !result.contains("\"error\"")) {
             // exec_command 可能修改文件系统，失效 read_file 缓存
             state.toolResultCache.entrySet().removeIf(e ->
@@ -1323,7 +1381,7 @@ public class AgentLoop {
         if ("image_generate".equals(toolName) && isImageGenerateUnavailable(result)) {
             state.imageGenerateUnavailable = true;
         }
-        if (MEDIA_TOOLS.contains(toolName) && result != null && looksLikeMediaSuccess(result)) {
+        if (MEDIA_TOOLS.contains(toolName) && Objects.nonNull(result) && looksLikeMediaSuccess(result)) {
             state.mediaDelivered = true;
             state.lastMediaResult = result;
         }
@@ -1342,7 +1400,7 @@ public class AgentLoop {
 
         StopDecision stop = stopHookChain.evaluate(new StopContext(
                 sessionId,
-                finalText == null ? "" : finalText,
+                Optional.ofNullable(finalText).orElse(""),
                 turn,
                 iterations,
                 Set.copyOf(state.toolsInvoked),
@@ -1352,18 +1410,17 @@ public class AgentLoop {
                 SubagentContext.isActive(),
                 PermissionContext.mode(),
                 PermissionContext.planApproved()));
-        if (stop != null && !stop.isProceed()) {
+        if (Objects.nonNull(stop) && !stop.isProceed()) {
             if (stop.action() == StopDecision.Action.BLOCK_RETRY) {
-                messages.add(new SystemMessage(stop.message() != null ? stop.message()
-                        : "【StopHook】收尾被拦截，请继续执行。"));
+                messages.add(new SystemMessage(Optional.ofNullable(stop.message()).orElse("【StopHook】收尾被拦截，请继续执行。")));
                 return null;
             }
             if (stop.action() == StopDecision.Action.PREVENT_CONTINUATION) {
-                return stop.message() != null ? stop.message() : (finalText == null ? "" : finalText);
+                return Optional.ofNullable(stop.message()).orElse((Optional.ofNullable(finalText).orElse("")));
             }
         }
 
-        if (finalText == null || finalText.isBlank()) {
+        if (StringUtils.isBlank(finalText)) {
             if (state.mediaDelivered) return ensureMarkdownImage(state.lastMediaResult);
             if (state.writeFileSucceeded && !hasBlockingTodos(sessionId)) {
                 return "（文件已生成，见 workspace/）";
@@ -1377,7 +1434,7 @@ public class AgentLoop {
         }
 
         // 复杂任务尚未建立计划 → 拦截收尾，强制 todo.set
-        if (state.requiresStructuredPlan && sessionId != null && !taskTodoStore.hasPlan(sessionId)) {
+        if (state.requiresStructuredPlan && Objects.nonNull(sessionId) && !taskTodoStore.hasPlan(sessionId)) {
             if (state.planReminderCount < 2) {
                 state.planReminderCount++;
                 log.info("复杂任务未建立 todo，拦截收尾 #{}/2", state.planReminderCount);
@@ -1389,7 +1446,7 @@ public class AgentLoop {
         }
 
         // 存在未完成 todo → 拦截收尾（提醒 2 次后附清单放行，避免死锁）
-        if (sessionId != null && taskTodoStore.hasPlan(sessionId) && taskTodoStore.hasIncomplete(sessionId)) {
+        if (Objects.nonNull(sessionId) && taskTodoStore.hasPlan(sessionId) && taskTodoStore.hasIncomplete(sessionId)) {
             if (state.incompleteTodoReminders < 2) {
                 state.incompleteTodoReminders++;
                 log.info("todo 未完成，拦截收尾 #{}/2", state.incompleteTodoReminders);
@@ -1401,13 +1458,13 @@ public class AgentLoop {
                 return null;
             }
             log.warn("todo 未完成但已提醒多次，附带未完成清单后放行。轮次 {}", turn + 1);
-            if (finalText == null) finalText = "";
+            if (Objects.isNull(finalText)) finalText = "";
             finalText = finalText.stripTrailing()
                     + "\n\n⚠️ 以下子任务尚未完成（可发送「继续」接着做）：\n"
                     + taskTodoStore.render(sessionId);
         }
 
-        if (finalText == null || finalText.isBlank()) {
+        if (StringUtils.isBlank(finalText)) {
             if (state.mediaDelivered) return ensureMarkdownImage(state.lastMediaResult);
             if (state.writeFileSucceeded) return "（文件已生成，见 workspace/）";
             return "（模型未返回内容）";
@@ -1415,7 +1472,7 @@ public class AgentLoop {
 
         // 媒体已交付 → 确保 markdown 图片在回复中
         if (state.mediaDelivered) {
-            if (state.lastMediaResult != null && !MARKDOWN_IMAGE.matcher(finalText).find()) {
+            if (Objects.nonNull(state.lastMediaResult) && !MARKDOWN_IMAGE.matcher(finalText).find()) {
                 finalText = finalText.stripTrailing() + "\n\n" + ensureMarkdownImage(state.lastMediaResult);
             }
             return finalText;
@@ -1445,18 +1502,18 @@ public class AgentLoop {
     }
 
     private boolean hasBlockingTodos(String sessionId) {
-        return sessionId != null && taskTodoStore.hasPlan(sessionId) && taskTodoStore.hasIncomplete(sessionId);
+        return Objects.nonNull(sessionId) && taskTodoStore.hasPlan(sessionId) && taskTodoStore.hasIncomplete(sessionId);
     }
 
     /** 构建达到最大迭代次数时的兜底回复 */
     private String buildMaxIterationFallback(LoopState state, int iterations) {
         StringBuilder sb = new StringBuilder();
         String sid = currentSessionId.get();
-        if (state.writeFileSucceeded || state.mediaDelivered || (sid != null && taskTodoStore.hasPlan(sid))) {
+        if (state.writeFileSucceeded || state.mediaDelivered || (Objects.nonNull(sid) && taskTodoStore.hasPlan(sid))) {
             sb.append("任务轮次已达上限（").append(iterations).append("轮），但已有部分成果：");
             if (state.writeFileSucceeded) sb.append("\n- 文件已写入 workspace/");
             if (state.mediaDelivered) sb.append("\n- 图片已生成");
-            if (sid != null && taskTodoStore.hasIncomplete(sid)) {
+            if (Objects.nonNull(sid) && taskTodoStore.hasIncomplete(sid)) {
                 sb.append("\n- 未完成子任务：\n").append(taskTodoStore.render(sid));
             }
             sb.append("\n\n剩余未完成的子任务可以通过发送「继续」来让我接着完成。");
@@ -1485,7 +1542,7 @@ public class AgentLoop {
 
     /** 多模态消息中取第一段文字，供「显式要文件」正则使用；无文字则视为非文件类意图。 */
     private static String firstUserTextForFileIntent(UserMessage um) {
-        if (um == null) {
+        if (Objects.isNull(um)) {
             return "";
         }
         if (um.hasSingleText()) {
@@ -1506,18 +1563,18 @@ public class AgentLoop {
      * 即使工具已统一返回 markdown，仍需兜底处理历史遗留的 JSON/纯文本格式。
      */
     private static String ensureMarkdownImage(String result) {
-        if (result == null || result.isBlank()) return result;
+        if (StringUtils.isBlank(result)) return result;
         // 已是 markdown
         if (result.startsWith("![") && result.contains("](")) return result;
         // JSON 中提取 markdown_images 字段（ComfyUI 旧格式兼容）
         if (result.contains("\"markdown_images\"")) {
             String extracted = extractJsonField(result, "markdown_images");
-            if (extracted != null && extracted.startsWith("![")) return extracted;
+            if (Objects.nonNull(extracted) && extracted.startsWith("![")) return extracted;
         }
         // JSON 中提取 image URL（image_generate 旧格式兼容）
         if (result.contains("\"image\"") && result.contains("\"success\"")) {
             String url = extractJsonField(result, "image");
-            if (url != null && !url.isBlank()) return "![生成的图片](" + url + ")";
+            if (StringUtils.isNotBlank(url)) return "![生成的图片](" + url + ")";
         }
         // 纯文本（如截图路径）— 无法转换，原样返回
         return result;
@@ -1525,7 +1582,7 @@ public class AgentLoop {
 
     /** 判断 image_generate / browser_screenshot 的返回值是否指示成功并附带了图片/文件。 */
     private boolean looksLikeMediaSuccess(String result) {
-        if (result == null || result.isBlank()) return false;
+        if (StringUtils.isBlank(result)) return false;
         // BuiltinTools.formatImageResult 会把成功结果包成 "![图片](url)"
         if (result.startsWith("![") && result.contains("](")) return true;
         // browser_screenshot 直接返回类似 "截图已保存: ..." 的字样
@@ -1542,7 +1599,7 @@ public class AgentLoop {
      * 退化成写脚本/找本地图片，最后撞 maxIterations。
      */
     private boolean isImageGenerateUnavailable(String result) {
-        if (result == null) return false;
+        if (Objects.isNull(result)) return false;
         return result.contains("图片生成失败")
                 || result.contains("API Key 无效")
                 || result.contains("Invalid token")
@@ -1551,7 +1608,7 @@ public class AgentLoop {
 
     /** 把工具结果压到可接受长度再塞进上下文（按工具类型取不同上限）。 */
     private String clampForContext(String result, String toolName) {
-        if (result == null || result.isBlank()) return "{\"success\":true,\"message\":\"工具执行完成\"}";
+        if (StringUtils.isBlank(result)) return "{\"success\":true,\"message\":\"工具执行完成\"}";
         int limit = TOOL_RESULT_LIMITS.getOrDefault(toolName, DEFAULT_TOOL_RESULT_MAX);
         if (result.length() <= limit) return result;
         return result.substring(0, limit)
@@ -1578,8 +1635,8 @@ public class AgentLoop {
     }
 
     /** 从 JSON 字符串里粗提取指定字段值（不引入 Jackson 依赖，轻量实现） */
-    static String extractJsonField(String json, String field) {
-        if (json == null || json.isBlank()) return "";
+    public static String extractJsonField(String json, String field) {
+        if (StringUtils.isBlank(json)) return "";
         String key = "\"" + field + "\"";
         int ki = json.indexOf(key);
         if (ki < 0) return "";
@@ -1599,20 +1656,20 @@ public class AgentLoop {
 
     /** 纯日志/匹配用的截断。 */
     private static String truncate(String s, int max) {
-        if (s == null) return "";
+        if (Objects.isNull(s)) return "";
         return s.length() <= max ? s : s.substring(0, max) + "...";
     }
 
     /** 提取一行可读任务目标用于日志，避免长 prompt/密钥污染日志。 */
     private static String summarizeTaskGoal(String userText) {
-        if (userText == null || userText.isBlank()) return "(empty)";
+        if (StringUtils.isBlank(userText)) return "(empty)";
         String oneLine = userText.replaceAll("[\\r\\n]+", " ").trim();
         return truncate(redactSensitive(oneLine), 120);
     }
 
     /** 日志脱敏：避免 access_token、secret、api-key 等敏感信息进入控制台。 */
     private static String redactSensitive(String s) {
-        if (s == null) return "";
+        if (Objects.isNull(s)) return "";
         return s
                 .replaceAll("(?i)(access_token=)[^&\\s\"'}]+", "$1***")
                 .replaceAll("(?i)(secret=)[^&\\s\"'}]+", "$1***")

@@ -1,8 +1,9 @@
 package com.miniagent.agent.web;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.miniagent.config.storage.MediaStorage;
 import com.miniagent.web.dto.FileRef;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -13,6 +14,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 用户上传文档 → 安全校验 → 文本提取 → 注入对话上下文。
@@ -24,11 +28,12 @@ import java.util.List;
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class UploadedDocumentService {
 
-    private final FileContentExtractor extractor;
-    private final MediaStorage mediaStorage;
+    @Autowired
+    private FileContentExtractor extractor;
+    @Autowired
+    private MediaStorage mediaStorage;
 
     @Value("${file.extract.max-context-chars:120000}")
     private int maxContextChars;
@@ -37,14 +42,14 @@ public class UploadedDocumentService {
     private int sidecarThresholdChars;
 
     public String buildMessageContext(Long userId, List<FileRef> refs) {
-        if (userId == null || refs == null || refs.isEmpty()) return "";
+        if (Objects.isNull(userId) || Objects.isNull(refs) || refs.isEmpty()) return "";
 
         StringBuilder out = new StringBuilder();
         int budgetLeft = maxContextChars;
         int index = 0;
 
         for (FileRef ref : refs) {
-            if (ref == null || ref.getFilePath() == null || ref.getFilePath().isBlank()) continue;
+            if (Objects.isNull(ref) || StringUtils.isBlank(ref.getFilePath())) continue;
             index++;
             Path path = Paths.get(ref.getFilePath()).toAbsolutePath().normalize();
             if (!isOwnedPath(userId, path)) {
@@ -58,7 +63,7 @@ public class UploadedDocumentService {
                 continue;
             }
 
-            String filename = ref.getFilename() != null ? ref.getFilename() : path.getFileName().toString();
+            String filename = Optional.ofNullable(ref.getFilename()).orElse(path.getFileName().toString());
             String mime = ref.getMimeType();
 
             ExtractResult full = extractFull(path, filename, mime);
@@ -73,7 +78,7 @@ public class UploadedDocumentService {
             }
 
             Path sidecar = maybeWriteSidecar(path, filename, mime, full);
-            if (sidecar != null) {
+            if (Objects.nonNull(sidecar)) {
                 out.append("完整提取文本: ").append(sidecar.toAbsolutePath()).append('\n');
                 out.append("请优先用 read_file 对该 .extracted.txt 分段阅读（offset/limit）。\n");
             }
@@ -103,7 +108,7 @@ public class UploadedDocumentService {
      * 上传完成后：为可提取文档写侧车，返回侧车绝对路径（失败返回 null）。
      */
     public String extractAndWriteSidecar(Long userId, Path originalPath, String filename, String mimeType) {
-        if (userId == null || originalPath == null) return null;
+        if (Objects.isNull(userId) || Objects.isNull(originalPath)) return null;
         Path path = originalPath.toAbsolutePath().normalize();
         if (!isOwnedPath(userId, path)) {
             log.warn("侧车提取拒绝越权路径 userId={}, path={}", userId, path);
@@ -116,13 +121,13 @@ public class UploadedDocumentService {
         }
         Path sidecar = maybeWriteSidecar(path, filename, mimeType, full);
         // 小文本也可选不写；上传阶段对 Office/PDF 强制写
-        if (sidecar == null && full.hasText()) {
+        if (Objects.isNull(sidecar) && full.hasText()) {
             FileContentExtractor.DocKind kind = extractor.resolveKind(filename, mimeType);
             if (kind != FileContentExtractor.DocKind.TEXT) {
                 sidecar = writeSidecar(path, full.text());
             }
         }
-        return sidecar == null ? null : sidecar.toAbsolutePath().toString();
+        return Objects.isNull(sidecar) ? null : sidecar.toAbsolutePath().toString();
     }
 
     public boolean isOwnedPath(Long userId, Path path) {
@@ -136,9 +141,9 @@ public class UploadedDocumentService {
 
     public List<String> validateRefs(Long userId, List<FileRef> refs) {
         List<String> errors = new ArrayList<>();
-        if (refs == null) return errors;
+        if (Objects.isNull(refs)) return errors;
         for (FileRef ref : refs) {
-            if (ref == null || ref.getFilePath() == null) {
+            if (Objects.isNull(ref) || Objects.isNull(ref.getFilePath())) {
                 errors.add("空文件引用");
                 continue;
             }

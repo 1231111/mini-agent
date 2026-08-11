@@ -69,6 +69,7 @@ agent:
     cookie-secret: miniagent-dev-cookie-secret-change-if-needed!!
     cookie-max-age-seconds: 604800
   # 意图识别漏斗：L0 配置规则 → L1 小模型 → L2 启发式（场景词只写在这里）
+  # L0 规则运行时：启动时若 MySQL 无 ACTIVE rule_set 则从下方 YAML bootstrap；之后以 DB 为准，支持反馈学习热发布
   intent:
     llm-enabled: true
     min-confidence: 0.65
@@ -166,7 +167,7 @@ agent:
     embedding-api-key: sk-S5B6jjx0B3yMvxLAojE3Y94yxOzQUj7FmZFO8UTaFWcsDyby
     embedding-base-url: https://api.chatanywhere.tech/v1
     embedding-model: BAAI/bge-m3
-    index-file: ./workspace/.codebase-index.json
+    index-file: ${agent.data-dir}/workspace/.codebase-index.json
   tools:
     exec-enabled: false
     allow-absolute-write: false
@@ -176,7 +177,7 @@ agent:
   concurrency:
     max-tasks-per-user: 2
   todo:
-    persist-dir: ./workspace/.todos
+    persist-dir: ${agent.data-dir}/workspace/.todos
   # 流式中途预执行只读工具（onCompleteToolCall）
   streaming:
     prefetch-readonly: true

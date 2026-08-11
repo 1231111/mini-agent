@@ -1,27 +1,35 @@
 package com.miniagent.agent.todo;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.miniagent.agent.trace.TraceRecorder;
 import com.miniagent.agent.tool.Tool;
 import com.miniagent.agent.tool.ToolRegistry;
 import jakarta.annotation.PostConstruct;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 任务规划工具：depends_on / 双轨验收 / reopen 回滚。
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class TodoTool {
 
-    private final ToolRegistry toolRegistry;
-    private final TaskTodoStore todoStore;
+    @Autowired
+    private ToolRegistry toolRegistry;
+    @Autowired
+    private TaskTodoStore todoStore;
+    @Autowired(required = false)
+    private TraceRecorder traceRecorder;
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @PostConstruct
@@ -79,7 +87,7 @@ public class TodoTool {
     private String handle(String json) {
         try {
             String sid = TaskTodoContext.currentSessionId();
-            Map<String, Object> args = MAPPER.readValue(json == null ? "{}" : json, Map.class);
+            Map<String, Object> args = MAPPER.readValue(Optional.ofNullable(json).orElse("{}"), Map.class);
             String action = String.valueOf(args.getOrDefault("action", "list")).trim().toLowerCase();
             switch (action) {
                 case "set" -> {
@@ -89,15 +97,17 @@ public class TodoTool {
                         return error("set 需要非空 items，每项含 content 与 done_when");
                     }
                     String missing = validateDoneWhen(items);
-                    if (missing != null) return error(missing);
+                    if (Objects.nonNull(missing)) return error(missing);
                     var updated = todoStore.set(sid, items);
-                    return MAPPER.writeValueAsString(Map.of(
+                    String out = MAPPER.writeValueAsString(Map.of(
                             "success", true,
                             "action", "set",
                             "todo", todoStore.render(sid),
                             "stats", todoStore.stats(sid),
                             "items", updated
                     ));
+                    traceTodo("TODO_SET", sid, "set", updated, null);
+                    return out;
                 }
                 case "update" -> {
                     int id = coercePositiveInt(args.get("id"));
@@ -107,16 +117,21 @@ public class TodoTool {
                     String evidence = (String) args.get("evidence");
                     String[] err = new String[1];
                     var updated = todoStore.update(sid, id, status, note, evidence, err);
-                    if (updated == null) {
-                        return error(err[0] != null ? err[0] : "update 失败");
+                    if (Objects.isNull(updated)) {
+                        return error(Objects.nonNull(err[0]) ? err[0] : "update 失败");
                     }
-                    return MAPPER.writeValueAsString(Map.of(
+                    String out = MAPPER.writeValueAsString(Map.of(
                             "success", true,
                             "action", "update",
                             "todo", todoStore.render(sid),
                             "stats", todoStore.stats(sid),
                             "items", updated
                     ));
+                    traceTodo("TODO_UPDATE", sid, "update", updated,
+                            Map.of("id", id, "status", Optional.ofNullable(status).orElse(""),
+                                    "note", Optional.ofNullable(note).orElse(""),
+                                    "evidence", Optional.ofNullable(evidence).orElse("")));
+                    return out;
                 }
                 case "reopen" -> {
                     int id = coercePositiveInt(args.get("id"));
@@ -124,45 +139,53 @@ public class TodoTool {
                     String note = (String) args.get("note");
                     String[] err = new String[1];
                     var updated = todoStore.reopen(sid, id, note, err);
-                    if (updated == null) {
-                        return error(err[0] != null ? err[0] : "reopen 失败");
+                    if (Objects.isNull(updated)) {
+                        return error(Objects.nonNull(err[0]) ? err[0] : "reopen 失败");
                     }
-                    return MAPPER.writeValueAsString(Map.of(
+                    String out = MAPPER.writeValueAsString(Map.of(
                             "success", true,
                             "action", "reopen",
                             "todo", todoStore.render(sid),
                             "stats", todoStore.stats(sid),
                             "items", updated
                     ));
+                    traceTodo("TODO_REOPEN", sid, "reopen", updated, Map.of("id", id));
+                    return out;
                 }
                 case "confirm" -> {
                     int id = coercePositiveInt(args.get("id"));
                     if (id <= 0) return error("confirm 缺少有效 id");
                     String note = (String) args.get("note");
                     String[] err = new String[1];
-                    var updated = todoStore.confirm(sid, id, note == null ? "CONFIRM" : note, err);
-                    if (updated == null) {
-                        return error(err[0] != null ? err[0] : "confirm 失败");
+                    var updated = todoStore.confirm(sid, id, Optional.ofNullable(note).orElse("CONFIRM"), err);
+                    if (Objects.isNull(updated)) {
+                        return error(Objects.nonNull(err[0]) ? err[0] : "confirm 失败");
                     }
-                    return MAPPER.writeValueAsString(Map.of(
+                    String out = MAPPER.writeValueAsString(Map.of(
                             "success", true,
                             "action", "confirm",
                             "todo", todoStore.render(sid),
                             "stats", todoStore.stats(sid),
                             "items", updated
                     ));
+                    traceTodo("TODO_CONFIRM", sid, "confirm", updated, Map.of("id", id));
+                    return out;
                 }
                 case "list" -> {
-                    return MAPPER.writeValueAsString(Map.of(
+                    var items = todoStore.get(sid);
+                    String out = MAPPER.writeValueAsString(Map.of(
                             "success", true,
                             "action", "list",
                             "todo", todoStore.render(sid),
                             "stats", todoStore.stats(sid),
-                            "items", todoStore.get(sid)
+                            "items", items
                     ));
+                    traceTodo("TODO_LIST", sid, "list", items, null);
+                    return out;
                 }
                 case "clear" -> {
                     todoStore.clear(sid);
+                    traceTodo("TODO_CLEAR", sid, "clear", List.of(), null);
                     return MAPPER.writeValueAsString(Map.of("success", true, "action", "clear"));
                 }
                 default -> {
@@ -177,11 +200,11 @@ public class TodoTool {
 
     private static String validateDoneWhen(List<Map<String, Object>> items) {
         for (Map<String, Object> raw : items) {
-            if (raw == null) continue;
+            if (Objects.isNull(raw)) continue;
             String content = String.valueOf(raw.getOrDefault("content", "")).trim();
             if (content.isEmpty()) continue;
             Object dw = raw.getOrDefault("done_when", raw.get("doneWhen"));
-            if (dw == null || String.valueOf(dw).isBlank()) {
+            if (Objects.isNull(dw) || StringUtils.isBlank(String.valueOf(dw))) {
                 return "每项必须含 done_when（如 file_exists:workspace/xxx.md 或 media_delivered）。缺省项 content=" + content;
             }
         }
@@ -190,7 +213,7 @@ public class TodoTool {
 
     @SuppressWarnings("unchecked")
     private List<Map<String, Object>> parseItems(Object raw) throws Exception {
-        if (raw == null) return List.of();
+        if (Objects.isNull(raw)) return List.of();
         if (raw instanceof List<?> list) return (List<Map<String, Object>>) list;
         if (raw instanceof String s) {
             String trimmed = s.trim();
@@ -210,6 +233,25 @@ public class TodoTool {
             }
         }
         return -1;
+    }
+
+    private void traceTodo(String stepType, String sid, String action, Object items, Map<String, Object> extra) {
+        if (Objects.isNull(traceRecorder) || !traceRecorder.isActive()) return;
+        try {
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("action", action);
+            payload.put("sessionId", sid);
+            if (Objects.nonNull(extra)) payload.putAll(extra);
+            payload.put("items", items);
+            if (Objects.nonNull(items) && items instanceof List<?> list) {
+                payload.put("itemCount", list.size());
+            }
+            payload.put("render", todoStore.render(sid));
+            payload.put("stats", todoStore.stats(sid));
+            traceRecorder.recordNode(stepType, MAPPER.writeValueAsString(payload), "SUCCESS", 0);
+        } catch (Exception e) {
+            log.debug("todo trace 写入跳过: {}", e.getMessage());
+        }
     }
 
     private String error(String msg) {

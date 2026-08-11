@@ -11,6 +11,7 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import java.util.Objects;
 
 @Configuration
 @EnableWebSecurity
@@ -52,7 +53,7 @@ public class SecurityConfig {
                 .exceptionHandling(ex -> ex
                         .authenticationEntryPoint((req, res, e) -> {
                             String accept = req.getHeader("Accept");
-                            boolean wantsHtml = accept != null && accept.contains("text/html");
+                            boolean wantsHtml = Objects.nonNull(accept) && accept.contains("text/html");
                             if (wantsHtml && !req.getRequestURI().startsWith("/api")
                                     && !req.getRequestURI().startsWith("/chat")) {
                                 res.sendRedirect("/");

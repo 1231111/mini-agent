@@ -3,6 +3,7 @@ package com.miniagent.config.security;
 import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -25,17 +26,18 @@ public class SessionCookieService {
     public static final String COOKIE_UNAME = "uname";
     public static final String ATTR_USER_ID = "authUserId";
 
-    private final byte[] secret;
-    private final int maxAgeSeconds;
+    @Value("${agent.auth.cookie-secret}")
+    private String cookieSecret;
+    @Value("${agent.auth.cookie-max-age-seconds:604800}")
+    private int maxAgeSeconds;
+    private byte[] secret;
 
-    public SessionCookieService(
-            @Value("${agent.auth.cookie-secret}") String cookieSecret,
-            @Value("${agent.auth.cookie-max-age-seconds:604800}") int maxAgeSeconds) {
+    @PostConstruct
+    private void initSecret() {
         if (cookieSecret == null || cookieSecret.isBlank()) {
             throw new IllegalStateException("agent.auth.cookie-secret must be set");
         }
         this.secret = cookieSecret.getBytes(StandardCharsets.UTF_8);
-        this.maxAgeSeconds = maxAgeSeconds;
     }
 
     public void issueSession(HttpServletResponse response, Long userId, String username) {

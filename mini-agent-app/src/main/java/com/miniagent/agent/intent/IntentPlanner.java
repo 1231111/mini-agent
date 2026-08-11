@@ -8,39 +8,28 @@ import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 /**
- * 意图控制面 — L0 配置规则 → L1 可配小模型 → L2 启发式。
- * 场景词与工具白名单不进代码，见 {@link IntentProperties}。
+ * 意图控制面：L0 配置/MySQL 规则 → L1 可配小模型 → L2 启发式。
+ * 场景词与工具白名单不进代码，见 {@link IntentProperties} / {@link IntentRuleRuntime}。
  */
 @Slf4j
 @Component
 public class IntentPlanner {
 
-    private final LlmIntentClassifier classifier;
-    private final IntentProperties props;
-    private final IntentRuleGate ruleGate;
-    private final IntentSignalMatcher signals;
-
     @Autowired
-    public IntentPlanner(LlmIntentClassifier classifier,
-                         IntentProperties props,
-                         IntentRuleGate ruleGate,
-                         IntentSignalMatcher signals) {
-        this.classifier = classifier;
-        this.props = props;
-        this.ruleGate = ruleGate;
-        this.signals = signals;
-    }
+    private LlmIntentClassifier classifier;
+    @Autowired
+    private IntentProperties props;
+    @Autowired
+    private IntentRuleGate ruleGate;
+    @Autowired
+    private IntentSignalMatcher signals;
+    @Autowired(required = false)
+    private IntentHitLogService hitLogService;
 
-    /** 同包测试用 */
-    IntentPlanner(LlmIntentClassifier classifier, IntentProperties props) {
-        IntentSignalMatcher matcher = new IntentSignalMatcher(props);
-        this.classifier = classifier;
-        this.props = props;
-        this.signals = matcher;
-        this.ruleGate = new IntentRuleGate(props, matcher);
-    }
+    public IntentPlanner() {}
 
     public TaskPlan plan(ChatModel chatModel, String userMessage, boolean hasImage) {
         return plan(chatModel, userMessage, hasImage, List.of());
@@ -48,39 +37,54 @@ public class IntentPlanner {
 
     public TaskPlan plan(ChatModel chatModel, String userMessage, boolean hasImage,
                          List<ChatMessage> recentHistory) {
+        long t0 = System.currentTimeMillis();
         String text = userMessage == null ? "" : userMessage.trim();
         double minConfidence = clamp(props.getMinConfidence());
 
         if (hasImage && text.length() <= props.getRules().getReviewMaxLen()) {
-            return logAndReturn("L0", new TaskPlan(IntentType.REVIEW,
+            return finish("L0", text, new TaskPlan(IntentType.REVIEW,
                     text.isBlank() ? "分析用户截图反馈" : text,
                     true, true, false, List.of(), List.of(), "rule:image-review", false),
-                    null);
+                    null, t0);
         }
 
         TaskPlan gated = ruleGate.tryShortCircuit(text, hasImage);
         if (gated != null) {
-            return logAndReturn("L0", gated, null);
+            return finish("L0", text, gated, null, t0);
         }
+        noteSkip("L0", "规则未命中，继续下层");
 
         if (classifier != null && classifier.isEnabled()) {
             LlmIntentClassifier.Classification c =
                     classifier.classify(text, hasImage, recentHistory);
             if (c != null && c.confidence() >= minConfidence) {
-                return logAndReturn("L1", fromClassification(text, hasImage, c, minConfidence), c);
+                return finish("L1", text, fromClassification(text, hasImage, c, minConfidence), c, t0);
             }
             if (c != null) {
                 log.info("意图漏斗: layer=L1 低置信 conf={} < {}，回退 L2，reason={}",
                         String.format("%.2f", c.confidence()),
                         String.format("%.2f", minConfidence),
                         c.reason());
+                noteSkip("L1", "小模型低置信 conf=" + String.format("%.2f", c.confidence())
+                        + " < " + String.format("%.2f", minConfidence) + "，回退 L2");
+            } else {
+                noteSkip("L1", classifier.hasDedicatedModel()
+                        ? "小模型无有效分类结果，回退 L2"
+                        : "意图小模型未配置，跳过 L1");
             }
+        } else {
+            noteSkip("L1", "意图小模型未启用，跳过 L1");
         }
 
-        return logAndReturn("L2", planByHeuristic(text, hasImage, recentHistory), null);
+        return finish("L2", text, planByHeuristic(text, hasImage, recentHistory), null, t0);
     }
 
-    private TaskPlan logAndReturn(String layer, TaskPlan plan, LlmIntentClassifier.Classification c) {
+    private void noteSkip(String layer, String why) {
+        if (Objects.nonNull(hitLogService)) hitLogService.recordSkip(layer, why);
+    }
+
+    private TaskPlan finish(String layer, String userText, TaskPlan plan,
+                            LlmIntentClassifier.Classification c, long t0) {
         int toolCount = plan.allowedTools() == null ? -1 : plan.allowedTools().size();
         if (c != null) {
             log.info("意图漏斗: layer={} intent={} profile={} structured={} tools={} conf={} reason={}",
@@ -89,6 +93,9 @@ public class IntentPlanner {
         } else {
             log.info("意图漏斗: layer={} intent={} structured={} tools={} reason={}",
                     layer, plan.intent(), plan.requiresStructuredPlan(), toolCount, plan.reason());
+        }
+        if (Objects.nonNull(hitLogService)) {
+            hitLogService.record(layer, userText, plan, c, System.currentTimeMillis() - t0);
         }
         return plan;
     }

@@ -10,6 +10,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 持久化记忆存储 — 参考 hermes-agent 的 MemoryStore 设计，按 userId 隔离。
@@ -72,7 +73,7 @@ public class MemoryStore {
 
     /** 触发当前用户长期记忆（MEMORY + USER 全部条目）的向量索引重建。 */
     private void reindexVector(Long userId, UserMemory um) {
-        if (vectorStore == null || !vectorStore.isEnabled()) return;
+        if (Objects.isNull(vectorStore) || !vectorStore.isEnabled()) return;
         List<String> all = new ArrayList<>(um.memoryEntries);
         all.addAll(um.userEntries);
         try {
@@ -88,7 +89,7 @@ public class MemoryStore {
 
     private Long effectiveUserId() {
         Long uid = currentUserId.get();
-        return uid != null ? uid : DEFAULT_USER;
+        return Optional.ofNullable(uid).orElse(DEFAULT_USER);
     }
 
     /** 当前用户的记忆根目录：memory/users/{userId}/ （_default 用于匿名/系统）。 */
@@ -152,7 +153,8 @@ public class MemoryStore {
         um.midtermSnapshot = renderTextBlock("MIDTERM", um.midtermMemory, MIDTERM_CHAR_LIMIT);
         um.loaded = true;
         // 首次加载时若向量索引尚不存在，用现有条目建一次（覆盖历史遗留数据）。
-        if (vectorStore != null && vectorStore.isEnabled() && !vectorStore.hasIndex(userId)
+        // first-load vector reindex
+        if (Objects.nonNull(vectorStore) && vectorStore.isEnabled() && !vectorStore.hasIndex(userId)
                 && !(um.memoryEntries.isEmpty() && um.userEntries.isEmpty())) {
             reindexVector(userId, um);
         }
@@ -178,7 +180,7 @@ public class MemoryStore {
         if (!Files.exists(path)) return new ArrayList<>();
         try {
             String raw = Files.readString(path, StandardCharsets.UTF_8);
-            if (raw.isBlank()) return new ArrayList<>();
+            if (StringUtils.isBlank(raw)) return new ArrayList<>();
             return Arrays.stream(raw.split(Pattern.quote(ENTRY_DELIMITER)))
                     .map(String::trim).filter(s -> !s.isEmpty())
                     .collect(Collectors.toList());
@@ -215,14 +217,14 @@ public class MemoryStore {
      * 向量不可用时回退为 {@link #getCombinedSnapshot()} 全量注入。
      */
     public String getSnapshotForQuery(String query) {
-        if (vectorStore == null || !vectorStore.isEnabled()) {
+        if (Objects.isNull(vectorStore) || !vectorStore.isEnabled()) {
             return getCombinedSnapshot();
         }
         Long uid = effectiveUserId();
         UserMemory um = current();
         List<String> recalled = vectorStore.recall(uid, query);
         List<String> blocks = new ArrayList<>();
-        if (recalled != null && !recalled.isEmpty()) {
+        if(Objects.nonNull(recalled) && !recalled.isEmpty()) {
             String content = String.join(ENTRY_DELIMITER, recalled);
             String sep = "═".repeat(46);
             blocks.add(sep + "\n相关记忆（按当前对话召回 " + recalled.size() + " 条）\n" + sep + "\n" + content);
@@ -240,14 +242,14 @@ public class MemoryStore {
      * 每次对话结束后由上层模型把旧摘要 + 本轮对话压缩成新的统一摘要。
      */
     public void updateMidtermMemory(String summary) {
-        if (summary == null) return;
+        if (Objects.isNull(summary)) return;
         summary = summary.trim();
         if (summary.isEmpty()) return;
         if (summary.length() > MIDTERM_CHAR_LIMIT) {
             summary = summary.substring(0, MIDTERM_CHAR_LIMIT);
         }
         String scanErr = SecurityScanner.scan(summary);
-        if (scanErr != null) {
+        if(Objects.nonNull(scanErr)) {
             // 中期记忆来自模型归纳，若安全扫描失败则不写入，避免污染系统提示。
             return;
         }
@@ -265,7 +267,7 @@ public class MemoryStore {
 
     public String getRawMidtermMemory() {
         String m = current().midtermMemory;
-        return m == null ? "" : m;
+        return Optional.ofNullable(m).orElse("");
     }
 
     // =========================================================================
@@ -278,7 +280,8 @@ public class MemoryStore {
         if (content.isEmpty()) return result(false, "内容不能为空。", target, null, 0);
 
         String scanErr = SecurityScanner.scan(content);
-        if (scanErr != null) return result(false, scanErr, target, null, 0);
+        if (Objects.nonNull(scanErr)) return result(false, scanErr, target, null, 0);
+
 
         Long uid = effectiveUserId();
         UserMemory um = current();
@@ -312,7 +315,8 @@ public class MemoryStore {
         if (newContent.isEmpty()) return result(false, "new_content 不能为空。使用 remove 删除条目。", target, null, 0);
 
         String scanErr = SecurityScanner.scan(newContent);
-        if (scanErr != null) return result(false, scanErr, target, null, 0);
+        if (Objects.nonNull(scanErr)) return result(false, scanErr, target, null, 0);
+
 
         Long uid = effectiveUserId();
         UserMemory um = current();
@@ -461,7 +465,7 @@ public class MemoryStore {
     }
 
     private static String renderTextBlock(String label, String content, int limit) {
-        if (content == null || content.isBlank()) return "";
+        if (StringUtils.isBlank(content)) return "";
         content = content.trim();
         int pct = Math.min(100, (content.length() * 100) / limit);
         String sep = "═".repeat(46);
@@ -474,7 +478,7 @@ public class MemoryStore {
         m.put("success", success);
         m.put("target", target);
         m.put("message", msg);
-        if (entries != null) {
+        if (Objects.nonNull(entries)) {
             int current = charCount(entries);
             int pct = limit > 0 ? Math.min(100, (current * 100) / limit) : 0;
             m.put("usage", String.format("%d%% — %d/%d 字符", pct, current, limit));

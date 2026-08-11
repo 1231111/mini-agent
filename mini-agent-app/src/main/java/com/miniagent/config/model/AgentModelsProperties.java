@@ -5,6 +5,9 @@ import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * agent.models.* — 前端可选的聊天模型预设。
@@ -30,13 +33,13 @@ public class AgentModelsProperties {
     }
 
     public void setPresets(List<Preset> presets) {
-        this.presets = presets != null ? presets : new ArrayList<>();
+        this.presets = Optional.ofNullable(presets).orElse(new ArrayList<>());
     }
 
     public Preset findPreset(String id) {
-        if (id == null || id.isBlank()) return null;
+        if (StringUtils.isBlank(id)) return null;
         for (Preset p : presets) {
-            if (p != null && id.equals(p.getId())) return p;
+            if (Objects.nonNull(p) && id.equals(p.getId())) return p;
         }
         return null;
     }

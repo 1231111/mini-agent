@@ -62,7 +62,7 @@ public class SkillStore {
         for (Map<String, String> skill : skills) {
             sb.append("- ").append(skill.get("name"));
             String desc = skill.get("description");
-            if (desc != null && !desc.isEmpty()) {
+            if (Objects.nonNull(desc) && !desc.isEmpty()) {
                 sb.append(": ").append(desc);
             }
             sb.append("\n");
@@ -72,7 +72,7 @@ public class SkillStore {
 
     public String viewSkill(String name) {
         Path skillMd = findSkillMd(name);
-        if (skillMd == null) {
+        if (Objects.isNull(skillMd)) {
             return null;
         }
         try {
@@ -85,7 +85,7 @@ public class SkillStore {
 
     public String viewSkillFile(String name, String relativePath) {
         Path skillDir = findSkillDir(name);
-        if (skillDir == null) {
+        if (Objects.isNull(skillDir)) {
             return null;
         }
         Path target = skillDir.resolve(relativePath).normalize();
@@ -116,7 +116,7 @@ public class SkillStore {
         }
 
         Path skillDir;
-        if (category != null && !category.isEmpty()) {
+        if (Objects.nonNull(category) && !category.isEmpty()) {
             skillDir = skillsDir.resolve(category).resolve(cleanName);
         } else {
             skillDir = skillsDir.resolve(cleanName);
@@ -133,9 +133,9 @@ public class SkillStore {
             StringBuilder md = new StringBuilder();
             md.append("---\n");
             md.append("name: ").append(cleanName).append("\n");
-            md.append("description: ").append(description != null ? description : "").append("\n");
+            md.append("description: ").append(Optional.ofNullable(description).orElse("")).append("\n");
             md.append("---\n\n");
-            if (content != null && !content.isEmpty()) {
+            if (Objects.nonNull(content) && !content.isEmpty()) {
                 md.append(content);
             } else {
                 md.append("# ").append(cleanName).append("\n\nAdd instructions here...\n");
@@ -155,7 +155,7 @@ public class SkillStore {
     public Map<String, Object> editSkill(String name, String newContent) {
         Map<String, Object> result = new LinkedHashMap<>();
         Path skillMd = findSkillMd(name);
-        if (skillMd == null) {
+        if (Objects.isNull(skillMd)) {
             result.put("success", false);
             result.put("error", "skill not found: " + name);
             return result;
@@ -178,7 +178,7 @@ public class SkillStore {
     public Map<String, Object> patchSkill(String name, String oldText, String newText) {
         Map<String, Object> result = new LinkedHashMap<>();
         Path skillMd = findSkillMd(name);
-        if (skillMd == null) {
+        if (Objects.isNull(skillMd)) {
             result.put("success", false);
             result.put("error", "skill not found: " + name);
             return result;
@@ -203,7 +203,7 @@ public class SkillStore {
     public Map<String, Object> deleteSkill(String name) {
         Map<String, Object> result = new LinkedHashMap<>();
         Path skillDir = findSkillDir(name);
-        if (skillDir == null) {
+        if (Objects.isNull(skillDir)) {
             result.put("success", false);
             result.put("error", "skill not found: " + name);
             return result;
@@ -232,11 +232,11 @@ public class SkillStore {
             stream.filter(p -> p.getFileName().toString().equals("SKILL.md"))
                   .forEach(skillMd -> {
                       Map<String, String> meta = parseMetadata(skillMd);
-                      if (meta != null) {
+                      if (Objects.nonNull(meta)) {
                           Path skillDir2 = skillMd.getParent();
                           Path parentDir = skillDir2.getParent();
                           String category = "";
-                          if (parentDir != null && !parentDir.equals(skillsDir)) {
+                          if (Objects.nonNull(parentDir) && !parentDir.equals(skillsDir)) {
                               category = parentDir.getFileName().toString();
                           }
                           meta.put("category", category);
@@ -262,7 +262,7 @@ public class SkillStore {
             String yamlStr = content.substring(3, end).trim();
             Yaml yaml = new Yaml();
             Map<String, Object> frontmatter = yaml.load(yamlStr);
-            if (frontmatter == null) return null;
+            if (Objects.isNull(frontmatter)) return null;
 
             String skillName = String.valueOf(frontmatter.getOrDefault("name", ""));
             if (skillName.isEmpty() || "null".equals(skillName)) {
@@ -290,7 +290,7 @@ public class SkillStore {
             return stream.filter(p -> p.getFileName().toString().equals("SKILL.md"))
                          .filter(p -> {
                              Map<String, String> meta = parseMetadata(p);
-                             return meta != null && name.equals(meta.get("name"));
+                             return Objects.nonNull(meta) && name.equals(meta.get("name"));
                          })
                          .findFirst().orElse(null);
         } catch (IOException e) {
@@ -300,11 +300,11 @@ public class SkillStore {
 
     private Path findSkillDir(String name) {
         Path skillMd = findSkillMd(name);
-        return skillMd != null ? skillMd.getParent() : null;
+        return Objects.nonNull(skillMd) ? skillMd.getParent() : null;
     }
 
     private static String sanitizeName(String name) {
-        if (name == null) return "";
+        if (Objects.isNull(name)) return "";
         return name.toLowerCase()
                    .replaceAll("[^a-z0-9-]", "-")
                    .replaceAll("-{2,}", "-")

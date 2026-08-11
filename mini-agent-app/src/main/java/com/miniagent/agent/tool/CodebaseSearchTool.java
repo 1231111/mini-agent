@@ -1,5 +1,7 @@
 package com.miniagent.agent.tool;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
@@ -26,6 +28,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * codebase_search：基于 embedding 的语义代码检索（Cursor 风格的「补充手段」）。
@@ -42,7 +47,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @Component
 public class CodebaseSearchTool {
 
-    private final ToolRegistry toolRegistry;
+    @Autowired
+
+    private ToolRegistry toolRegistry;
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @Value("${agent.codebase.embedding-enabled:false}")
@@ -53,7 +60,7 @@ public class CodebaseSearchTool {
     private String baseUrl;
     @Value("${agent.codebase.embedding-model:BAAI/bge-m3}")
     private String embeddingModelName;
-    @Value("${agent.codebase.index-file:./workspace/.codebase-index.json}")
+    @Value("${agent.codebase.index-file:${agent.data-dir:${user.home}/.miniagent}/workspace/.codebase-index.json}")
     private String indexFile;
 
     private EmbeddingModel embeddingModel;
@@ -62,9 +69,7 @@ public class CodebaseSearchTool {
     /** 已索引文件 mtime 记录，用于增量判断。 */
     private final Map<String, Long> indexedMtime = new LinkedHashMap<>();
 
-    public CodebaseSearchTool(ToolRegistry toolRegistry) {
-        this.toolRegistry = toolRegistry;
-    }
+    
 
     @PostConstruct
     public void register() {
@@ -94,23 +99,23 @@ public class CodebaseSearchTool {
 
     @SuppressWarnings("unchecked")
     private String handle(String json) {
-        if (!enabled || apiKey == null || apiKey.isBlank()) {
+        if (!enabled || StringUtils.isBlank(apiKey)) {
             return "{\"error\":\"codebase_search 未启用（缺少 embedding key）。请改用 search_code 或 ast_search。\"}";
         }
         try {
-            Map<String, Object> args = MAPPER.readValue(json == null ? "{}" : json, Map.class);
+            Map<String, Object> args = MAPPER.readValue(Optional.ofNullable(json).orElse("{}"), Map.class);
             String query = String.valueOf(args.getOrDefault("query", "")).trim();
             if (query.isEmpty()) return err("query 不能为空");
-            String pathArg = args.get("path") == null ? null : String.valueOf(args.get("path")).trim();
+            String pathArg = Objects.isNull(args.get("path")) ? null : String.valueOf(args.get("path")).trim();
             int topK = args.containsKey("top_k") ? ((Number) args.get("top_k")).intValue() : 5;
 
-            Path root = (pathArg == null || pathArg.isBlank())
+            Path root = (StringUtils.isBlank(pathArg))
                     ? Path.of(System.getProperty("user.dir")).toAbsolutePath()
                     : resolvePath(pathArg);
             if (!Files.exists(root)) return err("路径不存在: " + pathArg);
 
             ensureIndexed(root);
-            if (store == null) return err("索引尚未就绪");
+            if (Objects.isNull(store)) return err("索引尚未就绪");
 
             Embedding queryEmbedding = embeddingModel().embed(query).content();
             EmbeddingSearchRequest req = EmbeddingSearchRequest.builder()
@@ -125,7 +130,7 @@ public class CodebaseSearchTool {
             for (EmbeddingMatch<TextSegment> m : matches) {
                 TextSegment seg = m.embedded();
                 String loc = seg.metadata().getString("location");
-                sb.append("─── ").append(loc != null ? loc : "?")
+                sb.append("─── ").append(Optional.ofNullable(loc).orElse("?"))
                   .append("  (score=").append(String.format("%.3f", m.score())).append(")\n");
                 sb.append(truncate(seg.text(), 800)).append("\n\n");
             }
@@ -155,13 +160,13 @@ public class CodebaseSearchTool {
             }
 
             // 已索引且无变更 → 直接用
-            if (indexed.get() && store != null && currentMtime.equals(indexedMtime)) {
+            if (indexed.get() && Objects.nonNull(store) && currentMtime.equals(indexedMtime)) {
                 return;
             }
 
             // 尝试从磁盘加载已有索引（仅首次进程启动后）
             Path idx = resolvePath(indexFile);
-            if (!indexed.get() && store == null && Files.exists(idx)) {
+            if (!indexed.get() && Objects.isNull(store) && Files.exists(idx)) {
                 try {
                     store = InMemoryEmbeddingStore.fromFile(idx);
                     log.info("已加载代码库索引: {}", idx);
@@ -172,7 +177,7 @@ public class CodebaseSearchTool {
             }
 
             // 变更检测：文件集或 mtime 不同就全量重建（实现简单可靠；量大时可优化为单文件增量）
-            boolean needRebuild = (store == null) || !currentMtime.equals(indexedMtime);
+            boolean needRebuild = (Objects.isNull(store)) || !currentMtime.equals(indexedMtime);
             if (!needRebuild) { indexed.set(true); return; }
 
             log.info("开始索引代码库（{} 个 Java 文件）...", files.size());
@@ -242,7 +247,7 @@ public class CodebaseSearchTool {
     }
 
     private EmbeddingModel embeddingModel() {
-        if (embeddingModel == null) {
+        if (Objects.isNull(embeddingModel)) {
             JdkHttpClientBuilder http = new JdkHttpClientBuilder()
                     .connectTimeout(java.time.Duration.ofSeconds(15))
                     .readTimeout(java.time.Duration.ofSeconds(60));
@@ -263,7 +268,7 @@ public class CodebaseSearchTool {
     }
 
     private static String truncate(String s, int max) {
-        if (s == null) return "";
+        if (Objects.isNull(s)) return "";
         return s.length() <= max ? s : s.substring(0, max) + "…";
     }
 

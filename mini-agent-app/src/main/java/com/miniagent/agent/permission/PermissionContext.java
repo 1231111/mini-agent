@@ -1,20 +1,40 @@
 package com.miniagent.agent.permission;
 
+import java.util.Objects;
+import java.util.Optional;
+
 /**
- * 本轮请求的权限上下文（ThreadLocal，随工具虚拟线程显式传递）。
+ * 权限上下文：主会话实时读 {@link SessionPermissionStore}；子 Agent 可用 {@link #force} 覆盖。
  */
 public final class PermissionContext {
 
+    private static volatile SessionPermissionStore STORE;
+
     private static final ThreadLocal<String> SESSION = new ThreadLocal<>();
-    private static final ThreadLocal<PermissionMode> MODE = new ThreadLocal<>();
-    private static final ThreadLocal<Boolean> PLAN_APPROVED = new ThreadLocal<>();
+    private static final ThreadLocal<PermissionMode> FORCE_MODE = new ThreadLocal<>();
+    private static final ThreadLocal<Boolean> FORCE_PLAN_OK = new ThreadLocal<>();
 
     private PermissionContext() {}
 
-    public static void set(String sessionId, PermissionMode mode, boolean planApproved) {
+    public static void bindStore(SessionPermissionStore store) {
+        STORE = store;
+    }
+
+    public static void setSession(String sessionId) {
         SESSION.set(sessionId);
-        MODE.set(mode == null ? PermissionMode.DEFAULT : mode);
-        PLAN_APPROVED.set(planApproved);
+        FORCE_MODE.remove();
+        FORCE_PLAN_OK.remove();
+    }
+
+    public static void force(String sessionId, PermissionMode mode, boolean planApproved) {
+        SESSION.set(sessionId);
+        FORCE_MODE.set(Optional.ofNullable(mode).orElse(PermissionMode.DEFAULT));
+        FORCE_PLAN_OK.set(planApproved);
+    }
+
+    /** 兼容旧调用：force 语义。主路径请用 {@link #setSession}。 */
+    public static void set(String sessionId, PermissionMode mode, boolean planApproved) {
+        force(sessionId, mode, planApproved);
     }
 
     public static String sessionId() {
@@ -22,18 +42,28 @@ public final class PermissionContext {
     }
 
     public static PermissionMode mode() {
-        PermissionMode m = MODE.get();
-        return m == null ? PermissionMode.DEFAULT : m;
+        return Optional.ofNullable(FORCE_MODE.get()).orElseGet(() ->
+                Optional.ofNullable(SESSION.get())
+                        .filter(sid -> Objects.nonNull(STORE))
+                        .map(STORE::getMode)
+                        .orElse(PermissionMode.DEFAULT));
     }
 
     public static boolean planApproved() {
-        Boolean b = PLAN_APPROVED.get();
-        return b == null || b;
+        return Optional.ofNullable(FORCE_PLAN_OK.get()).orElseGet(() ->
+                Optional.ofNullable(SESSION.get())
+                        .filter(sid -> Objects.nonNull(STORE))
+                        .map(STORE::isPlanApproved)
+                        .orElse(true));
+    }
+
+    public static boolean isForced() {
+        return Objects.nonNull(FORCE_MODE.get());
     }
 
     public static void clear() {
         SESSION.remove();
-        MODE.remove();
-        PLAN_APPROVED.remove();
+        FORCE_MODE.remove();
+        FORCE_PLAN_OK.remove();
     }
 }

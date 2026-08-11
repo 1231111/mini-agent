@@ -14,11 +14,8 @@ import java.util.Locale;
 @Component
 public class NetworkGuard {
 
-    private final boolean blockPrivate;
-
-    public NetworkGuard(@Value("${agent.tools.block-private-network:true}") boolean blockPrivate) {
-        this.blockPrivate = blockPrivate;
-    }
+    @Value("${agent.tools.block-private-network:true}")
+    private boolean blockPrivate;
 
     /** @return null if OK, else error message */
     public String validateUrl(String url) {

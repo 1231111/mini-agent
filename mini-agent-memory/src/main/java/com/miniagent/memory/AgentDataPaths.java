@@ -9,6 +9,7 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 统一数据根：媒体 / 记忆 / skills 都相对此目录，禁止再绑 user.dir。
@@ -52,7 +53,7 @@ public class AgentDataPaths {
 
     /** 解析相对路径；兼容旧前缀 conversation-images/、generated-images/、user-uploads/ */
     public Path resolveMedia(String relativeOrUrl) {
-        if (relativeOrUrl == null || relativeOrUrl.isBlank()) {
+        if (StringUtils.isBlank(relativeOrUrl)) {
             throw new IllegalArgumentException("path blank");
         }
         String p = relativeOrUrl.trim().replace('\\', '/');
@@ -76,11 +77,11 @@ public class AgentDataPaths {
     }
 
     static Path resolveRoot(String dataDir) {
-        if (dataDir != null && !dataDir.isBlank()) {
+        if (StringUtils.isNotBlank(dataDir)) {
             return Path.of(dataDir.trim());
         }
         String env = System.getenv("MINI_AGENT_HOME");
-        if (env != null && !env.isBlank()) {
+        if (StringUtils.isNotBlank(env)) {
             return Path.of(env.trim());
         }
         return Path.of(System.getProperty("user.home"), ".miniagent");

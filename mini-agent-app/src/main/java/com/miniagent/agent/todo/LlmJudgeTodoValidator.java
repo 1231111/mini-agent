@@ -1,9 +1,10 @@
 package com.miniagent.agent.todo;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
@@ -11,6 +12,8 @@ import org.springframework.stereotype.Component;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Objects;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 可选语义裁判：done_when = llm_judge:&lt;评判标准&gt;
@@ -20,10 +23,10 @@ import java.nio.file.Path;
 @Slf4j
 @Component
 @Order(200)
-@RequiredArgsConstructor
 public class LlmJudgeTodoValidator implements TodoStepValidator {
 
-    private final ChatModel chatModel;
+    @Autowired
+    private ChatModel chatModel;
 
     @Override
     public String name() {
@@ -32,8 +35,8 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
 
     @Override
     public String validate(TaskTodoStore.TodoItem item, String evidence) {
-        if (item == null) return "校验项为空";
-        String dw = item.doneWhen() == null ? "" : item.doneWhen().trim();
+        if (Objects.isNull(item)) return "校验项为空";
+        String dw = Objects.isNull(item.doneWhen()) ? "" : item.doneWhen().trim();
         if (!dw.regionMatches(true, 0, "llm_judge:", 0, "llm_judge:".length())) {
             return null; // 非本校验器职责
         }
@@ -42,7 +45,7 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
             return "llm_judge 缺少评判标准，例：llm_judge:文档是否描述了四层电池结构";
         }
         String payload = loadEvidencePayload(evidence);
-        if (payload == null || payload.isBlank()) {
+        if (StringUtils.isBlank(payload)) {
             return "llm_judge 无法读取 evidence 内容";
         }
         if (payload.length() > 12000) {
@@ -63,11 +66,11 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
 
                 【待验收内容】
                 %s
-                """.formatted(criteria, item.content() == null ? "" : item.content(), payload);
+                """.formatted(criteria, Objects.isNull(item.content()) ? "" : item.content(), payload);
 
         try {
             ChatResponse resp = chatModel.chat(UserMessage.from(prompt));
-            String text = resp == null || resp.aiMessage() == null || resp.aiMessage().text() == null
+            String text = Objects.isNull(resp) || Objects.isNull(resp.aiMessage()) || Objects.isNull(resp.aiMessage().text())
                     ? "" : resp.aiMessage().text().trim();
             log.info("llm_judge 原始回复: {}", text.length() > 200 ? text.substring(0, 200) + "…" : text);
             String first = text.lines().findFirst().orElse("").trim().toUpperCase();
@@ -75,7 +78,7 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
                 return null;
             }
             String reason = text.lines().skip(1).findFirst().orElse(text).trim();
-            if (reason.isBlank()) reason = "未通过语义评判";
+            if (StringUtils.isBlank(reason)) reason = "未通过语义评判";
             return "LLM 语义验收 FAIL：" + reason;
         } catch (Exception e) {
             log.warn("llm_judge 调用失败: {}", e.getMessage());
@@ -84,7 +87,7 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
     }
 
     private static String loadEvidencePayload(String evidence) {
-        if (evidence == null || evidence.isBlank()) return null;
+        if (StringUtils.isBlank(evidence)) return null;
         String ev = evidence.trim();
         try {
             Path p = Path.of(ev.replace('\\', '/'));

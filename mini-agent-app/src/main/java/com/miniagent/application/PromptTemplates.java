@@ -2,6 +2,7 @@ package com.miniagent.application;
 
 import java.io.File;
 import java.nio.file.Path;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 系统提示词统一管理 — 所有 Agent 行为规范、工具指导、模式提示。
@@ -18,7 +19,7 @@ public final class PromptTemplates {
     /** 数据根：AgentDataPaths 启动时写入 miniagent.data.dir */
     public static String dataDir() {
         String data = System.getProperty("miniagent.data.dir");
-        if (data != null && !data.isBlank()) return data;
+        if (StringUtils.isNotBlank(data)) return data;
         return System.getProperty("user.home", PROJECT_ROOT) + File.separator + ".miniagent";
     }
 

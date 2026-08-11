@@ -11,6 +11,8 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.Objects;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * Token 估算器：基于字符分类近似估算 token 数。
@@ -44,7 +46,7 @@ public class TokenEstimator {
      * 估算文本的 token 数：按 CJK / 非 CJK 分别加权。带缓存。
      */
     public int estimate(String text) {
-        if (text == null || text.isBlank()) return 0;
+        if (StringUtils.isBlank(text)) return 0;
         // 短文本不走缓存（缓存查找开销 > 重算）
         if (text.length() < 200) return estimateDirect(text);
         return estimateCache.computeIfAbsent(text, this::estimateDirect);
@@ -52,7 +54,7 @@ public class TokenEstimator {
 
     /** 实际估算逻辑（无缓存） */
     private int estimateDirect(String text) {
-        if (text == null || text.isBlank()) return 0;
+        if (StringUtils.isBlank(text)) return 0;
         int cjk = 0, other = 0;
         for (int i = 0; i < text.length(); i++) {
             if (isCjk(text.charAt(i))) cjk++;
@@ -88,7 +90,7 @@ public class TokenEstimator {
         } else if (message instanceof dev.langchain4j.data.message.UserMessage um) {
             tokens += estimateContent(um);
         } else if (message instanceof dev.langchain4j.data.message.AiMessage am) {
-            if (am.text() != null) {
+            if (Objects.nonNull(am.text())) {
                 tokens += estimate(am.text());
             }
             if (am.hasToolExecutionRequests()) {
@@ -105,7 +107,7 @@ public class TokenEstimator {
      * 估算消息列表的总 token 数
      */
     public int estimateMessages(List<ChatMessage> messages) {
-        if (messages == null || messages.isEmpty()) return 0;
+        if (Objects.isNull(messages) || messages.isEmpty()) return 0;
         int total = 0;
         for (ChatMessage msg : messages) {
             total += estimate(msg);
@@ -137,7 +139,7 @@ public class TokenEstimator {
                 // SystemMessage 只有纯文本
                 return estimate(sm.text());
             }
-            if (contents != null) {
+            if (Objects.nonNull(contents)) {
                 for (Content c : contents) {
                     if (c instanceof TextContent tc) {
                         tokens += estimate(tc.text());

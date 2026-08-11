@@ -1,8 +1,9 @@
 package com.miniagent.eval;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.application.AgentChatApplicationService;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.core.annotation.Order;
@@ -17,6 +18,8 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.Objects;
+import java.util.Optional;
 
 /**
  * 评估 Runner（对标 LLM-agent 工程常见的 eval harness）。
@@ -37,10 +40,10 @@ import java.util.concurrent.TimeUnit;
 @Slf4j
 @Component
 @Order(100)
-@RequiredArgsConstructor
 public class EvalRunner implements CommandLineRunner {
 
-    private final AgentChatApplicationService chatService;
+    @Autowired
+    private AgentChatApplicationService chatService;
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final long DEFAULT_TIMEOUT_MS = 180_000;
     private static final Long EVAL_USER_ID = 0L; // 评估专用用户
@@ -55,7 +58,7 @@ public class EvalRunner implements CommandLineRunner {
         String onlyCategory = argValue(argList, "--eval.category", null);
         Path caseDir = projectRoot.resolve(dir);
 
-        log.info("===== 评估开始 dir={} category={} =====", caseDir, onlyCategory == null ? "全部" : onlyCategory);
+        log.info("===== 评估开始 dir={} category={} =====", caseDir, Optional.ofNullable(onlyCategory).orElse("全部"));
 
         List<EvalCase> cases = loadCases(caseDir, onlyCategory);
         if (cases.isEmpty()) {
@@ -94,13 +97,13 @@ public class EvalRunner implements CommandLineRunner {
 
         CaseResult cr = new CaseResult();
         cr.id = ec.id;
-        cr.category = ec.category == null ? "uncategorized" : ec.category;
+        cr.category = Optional.ofNullable(ec.category).orElse("uncategorized");
         cr.elapsedMs = elapsed;
         cr.runtimeError = runtimeError;
         cr.checkResults = new ArrayList<>();
 
-        boolean allPass = runtimeError == null;
-        if (ec.checks != null) {
+        boolean allPass = Objects.isNull(runtimeError);
+        if (Objects.nonNull(ec.checks)) {
             for (EvalCheck check : ec.checks) {
                 CheckResult r = checker.check(check, response);
                 cr.checkResults.add(r);
@@ -109,7 +112,7 @@ public class EvalRunner implements CommandLineRunner {
         }
         cr.pass = allPass;
         log.info("[{}] {} ({}ms){}", cr.pass ? "PASS" : "FAIL", ec.id, elapsed,
-                runtimeError != null ? " 运行错误: " + runtimeError : "");
+                Objects.nonNull(runtimeError) ? " 运行错误: " + runtimeError : "");
         return cr;
     }
 
@@ -121,11 +124,11 @@ public class EvalRunner implements CommandLineRunner {
             for (Path f : files) {
                 try {
                     EvalCase ec = MAPPER.readValue(Files.readString(f), EvalCase.class);
-                    if (ec.id == null || ec.prompt == null) {
+                    if (Objects.isNull(ec.id) || Objects.isNull(ec.prompt)) {
                         log.warn("跳过无效用例（缺 id/prompt）: {}", f.getFileName());
                         continue;
                     }
-                    if (onlyCategory == null || onlyCategory.equalsIgnoreCase(ec.category)) {
+                    if (Objects.isNull(onlyCategory) || onlyCategory.equalsIgnoreCase(ec.category)) {
                         cases.add(ec);
                     }
                 } catch (Exception e) {
@@ -164,7 +167,7 @@ public class EvalRunner implements CommandLineRunner {
             if (cr.pass) continue;
             anyFail = true;
             sb.append("  ✗ ").append(cr.id);
-            if (cr.runtimeError != null) sb.append("  运行错误: ").append(cr.runtimeError);
+            if (Objects.nonNull(cr.runtimeError)) sb.append("  运行错误: ").append(cr.runtimeError);
             sb.append('\n');
             for (CheckResult c : cr.checkResults) {
                 if (!c.pass) sb.append("      - ").append(c.description)

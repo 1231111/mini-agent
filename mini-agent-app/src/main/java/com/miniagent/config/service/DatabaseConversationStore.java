@@ -1,5 +1,7 @@
 package com.miniagent.config.service;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.config.entity.ChatConversation;
@@ -14,6 +16,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Instant;
 import java.util.*;
 import java.util.stream.Collectors;
+import org.apache.commons.lang3.StringUtils;
 
 @Service
 public class DatabaseConversationStore {
@@ -21,15 +24,14 @@ public class DatabaseConversationStore {
     private static final Logger log = LoggerFactory.getLogger(DatabaseConversationStore.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private final ChatConversationRepository conversationRepo;
-    private final ChatMessageRepository messageRepo;
+    @Autowired
 
-    public DatabaseConversationStore(
-            ChatConversationRepository conversationRepo,
-            ChatMessageRepository messageRepo) {
-        this.conversationRepo = conversationRepo;
-        this.messageRepo = messageRepo;
-    }
+    private ChatConversationRepository conversationRepo;
+    @Autowired
+
+    private ChatMessageRepository messageRepo;
+
+    
 
     private static final int TITLE_MAX = 200;
 
@@ -49,7 +51,7 @@ public class DatabaseConversationStore {
 
     /** DB title 列 length=255；超长用户消息（整库 schema）必须截断 */
     static String truncateTitle(String title) {
-        if (title == null || title.isBlank()) return "New Chat";
+        if (StringUtils.isBlank(title)) return "New Chat";
         String oneLine = title.replaceAll("[\\r\\n]+", " ").trim();
         if (oneLine.length() <= TITLE_MAX) return oneLine;
         return oneLine.substring(0, TITLE_MAX - 3) + "...";
@@ -132,7 +134,7 @@ public class DatabaseConversationStore {
             msg.setRole(role);
             msg.setContent(content);
             msg.setTimestamp(Instant.now().toEpochMilli());
-            if (imagePaths != null && !imagePaths.isEmpty()) {
+            if (Objects.nonNull(imagePaths) && !imagePaths.isEmpty()) {
                 try {
                     msg.setImages(MAPPER.writeValueAsString(imagePaths));
                 } catch (Exception e) {
@@ -179,7 +181,7 @@ public class DatabaseConversationStore {
     /** Delete only if owned by userId (IDOR protection). */
     @Transactional
     public boolean deleteForUser(Long userId, String id) {
-        if (userId == null || id == null) return false;
+        if (Objects.isNull(userId) || Objects.isNull(id)) return false;
         if (!conversationRepo.existsByIdAndUserId(id, userId)) return false;
         messageRepo.deleteByConversationId(id);
         conversationRepo.deleteById(id);
@@ -188,14 +190,14 @@ public class DatabaseConversationStore {
 
     @Transactional(readOnly = true)
     public Conversation getForUser(Long userId, String id) {
-        if (userId == null || id == null) return null;
+        if (Objects.isNull(userId) || Objects.isNull(id)) return null;
         return conversationRepo.findByIdAndUserId(id, userId)
                 .map(this::toModel)
                 .orElse(null);
     }
 
     public boolean ownedBy(Long userId, String id) {
-        return userId != null && id != null && conversationRepo.existsByIdAndUserId(id, userId);
+        return Objects.nonNull(userId) && Objects.nonNull(id) && conversationRepo.existsByIdAndUserId(id, userId);
     }
 
     /** Exists */
@@ -216,7 +218,7 @@ public class DatabaseConversationStore {
             msg.role = m.getRole();
             msg.content = m.getContent();
             msg.timestamp = m.getTimestamp();
-            if (m.getImages() != null) {
+            if (Objects.nonNull(m.getImages())) {
                 try {
                     msg.images = MAPPER.readValue(m.getImages(), new TypeReference<List<String>>() {});
                 } catch (Exception e) {

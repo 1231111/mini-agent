@@ -2,6 +2,7 @@ package com.miniagent.agent.todo;
 
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
+import java.util.Objects;
 
 /**
  * 默认语义验收：非空文件、需图任务含 markdown 图片、SQL 含 DDL 等。
@@ -17,8 +18,8 @@ public class BuiltinSemanticTodoValidator implements TodoStepValidator {
 
     @Override
     public String validate(TaskTodoStore.TodoItem item, String evidence) {
-        if (item == null) return "校验项为空";
-        String dw = item.doneWhen() == null ? "" : item.doneWhen().trim();
+        if (Objects.isNull(item)) return "校验项为空";
+        String dw = Objects.isNull(item.doneWhen()) ? "" : item.doneWhen().trim();
         // llm_judge 交给专用校验器
         if (dw.regionMatches(true, 0, "llm_judge:", 0, "llm_judge:".length())) {
             return null;

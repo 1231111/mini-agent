@@ -1,9 +1,10 @@
 package com.miniagent.agent.mcp;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.miniagent.agent.tool.Tool;
 import com.miniagent.agent.tool.ToolRegistry;
 import jakarta.annotation.PreDestroy;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -15,6 +16,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.Objects;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 将 MCP 服务器 tools/list 动态注册进 {@link ToolRegistry}，命名 mcp__{serverId}__{tool}。
@@ -22,12 +25,13 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 @EnableConfigurationProperties(McpProperties.class)
 public class McpToolBridge {
 
-    private final McpProperties properties;
-    private final ToolRegistry toolRegistry;
+    @Autowired
+    private McpProperties properties;
+    @Autowired
+    private ToolRegistry toolRegistry;
     private final ConcurrentHashMap<String, McpStdioClient> clients = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, List<String>> namesByServer = new ConcurrentHashMap<>();
     private final List<String> registeredNames = new ArrayList<>();
@@ -38,7 +42,7 @@ public class McpToolBridge {
             log.info("MCP 未启用（agent.mcp.enabled=false）");
             return;
         }
-        if (properties.getServers() == null || properties.getServers().isEmpty()) {
+        if (Objects.isNull(properties.getServers()) || properties.getServers().isEmpty()) {
             log.info("MCP 已启用但未配置 servers");
             return;
         }
@@ -80,7 +84,7 @@ public class McpToolBridge {
 
     /** 刷新单个服务器：优先复用进程 listTools；失败则重启连接 */
     public synchronized Map<String, Object> refreshServer(String serverId) throws Exception {
-        if (serverId == null || serverId.isBlank()) {
+        if (StringUtils.isBlank(serverId)) {
             throw new IllegalArgumentException("serverId required");
         }
         McpProperties.Server cfg = properties.getServers().stream()
@@ -91,14 +95,14 @@ public class McpToolBridge {
         unregisterServerTools(serverId);
         McpStdioClient existing = clients.get(serverId);
         try {
-            if (existing != null) {
+            if (Objects.nonNull(existing)) {
                 registerToolsFromClient(serverId, existing);
             } else {
                 connectServer(cfg, false);
             }
         } catch (Exception e) {
             log.warn("MCP[{}] list 刷新失败，尝试重启进程: {}", serverId, e.getMessage());
-            if (existing != null) {
+            if (Objects.nonNull(existing)) {
                 try { existing.close(); } catch (Exception ignored) {}
                 clients.remove(serverId);
             }
@@ -112,10 +116,10 @@ public class McpToolBridge {
     }
 
     private void connectServer(McpProperties.Server server, boolean force) throws Exception {
-        if (server.getId() == null || server.getId().isBlank()) {
+        if (StringUtils.isBlank(server.getId())) {
             throw new IllegalArgumentException("server.id 必填");
         }
-        String transport = server.getTransport() == null ? "stdio" : server.getTransport().toLowerCase();
+        String transport = Objects.isNull(server.getTransport()) ? "stdio" : server.getTransport().toLowerCase();
         if (!"stdio".equals(transport)) {
             log.warn("MCP[{}] transport={} 暂未实现，跳过（当前仅 stdio）", server.getId(), transport);
             return;
@@ -134,8 +138,8 @@ public class McpToolBridge {
         List<String> names = new ArrayList<>();
         for (McpStdioClient.McpToolDef t : tools) {
             String regName = "mcp__" + sanitize(serverId) + "__" + sanitize(t.name());
-            String desc = "[MCP:" + serverId + "] " + (t.description() == null ? t.name() : t.description());
-            Map<String, Object> params = t.parameters() == null ? Map.of() : t.parameters();
+            String desc = "[MCP:" + serverId + "] " + (Objects.isNull(t.description()) ? t.name() : t.description());
+            Map<String, Object> params = Objects.isNull(t.parameters()) ? Map.of() : t.parameters();
             final String toolName = t.name();
             toolRegistry.register(Tool.builder()
                     .name(regName)
@@ -152,7 +156,7 @@ public class McpToolBridge {
 
     private void unregisterServerTools(String serverId) {
         List<String> names = namesByServer.remove(serverId);
-        if (names != null) {
+        if (Objects.nonNull(names)) {
             for (String n : names) {
                 toolRegistry.unregister(n);
                 registeredNames.remove(n);
@@ -166,7 +170,7 @@ public class McpToolBridge {
 
     private String invoke(String serverId, String toolName, String argsJson) {
         McpStdioClient client = clients.get(serverId);
-        if (client == null) {
+        if (Objects.isNull(client)) {
             return "{\"error\":\"MCP 服务器未连接: " + serverId + "\"}";
         }
         try {
@@ -178,7 +182,7 @@ public class McpToolBridge {
     }
 
     private static String sanitize(String s) {
-        return s == null ? "x" : s.replaceAll("[^a-zA-Z0-9_-]", "_");
+        return Objects.isNull(s) ? "x" : s.replaceAll("[^a-zA-Z0-9_-]", "_");
     }
 
     @PreDestroy

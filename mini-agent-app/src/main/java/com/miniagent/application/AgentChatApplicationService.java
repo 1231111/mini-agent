@@ -1,7 +1,11 @@
 package com.miniagent.application;
 
-import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.core.ContextCompressor;
+import jakarta.annotation.PostConstruct;
+
+import java.util.concurrent.ConcurrentHashMap;
+
+import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.core.TokenUsageTracker;
 import com.miniagent.agent.intent.IntentPlanner;
 import com.miniagent.agent.intent.IntentType;
@@ -27,8 +31,9 @@ import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.memory.ChatMemory;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -40,7 +45,9 @@ import com.miniagent.config.entity.ChatTask;
 import com.miniagent.config.service.TaskRunService;
 import com.miniagent.agent.delegate.RoleContext;
 import com.miniagent.agent.permission.PermissionContext;
-import com.miniagent.agent.permission.SessionPermissionStore;
+import com.miniagent.config.model.ModelClientFactory;
+import java.util.Objects;
+import java.util.Optional;
 
 import java.io.File;
 import java.io.IOException;
@@ -51,6 +58,7 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import com.miniagent.application.PromptTemplates;
+import org.apache.commons.lang3.StringUtils;
 
 
 /**
@@ -67,40 +75,57 @@ import com.miniagent.application.PromptTemplates;
  * - 侧边栏显示历史会话列表，支持切换/删除/重命名
  */
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class AgentChatApplicationService {
 
     /** SSE 流式连接超时（毫秒）。可配置，默认 30 分钟，避免长任务被 10 分钟硬上限掐断。0 表示永不超时（不建议，有连接泄漏风险）。 */
-    @org.springframework.beans.factory.annotation.Value("${agent.sse.timeout-ms:1800000}")
+    @Value("${agent.sse.timeout-ms:1800000}")
     private long sseTimeoutMs;
 
-    private final AgentLoop agentLoop;
-    private final ChatModel chatModel;
-    private final com.miniagent.agent.trace.TraceRecorder traceRecorder;
+    @Autowired
+    private AgentLoop agentLoop;
+    @Autowired
+    private ChatModel chatModel;
+    @Autowired
+    private com.miniagent.agent.trace.TraceRecorder traceRecorder;
 
-    private final ChatMemoryConfig.ChatMemoryProvider chatMemoryProvider;
-    private final MemoryStore memoryStore;
-    private final ToolRegistry toolRegistry;
-    private final DatabaseConversationStore conversationStore;
-    private final SkillStore skillStore;
-    private final IntentPlanner intentPlanner;
-    private final TaskTodoStore taskTodoStore;
-    private final ContextCompressor contextCompressor;
-    private final FileContentExtractor fileContentExtractor;
-    private final ChatTaskRepository chatTaskRepository;
-    private final com.miniagent.agent.core.SessionStreamHub streamHub;
-    private final BuiltinTools builtinTools;
-    private final TaskRunService taskRunService;
-    private final MediaStorage mediaStorage;
-    private final SessionPermissionStore permissionStore;
+    @Autowired
+    private ChatMemoryConfig.ChatMemoryProvider chatMemoryProvider;
+    @Autowired
+    private MemoryStore memoryStore;
+    @Autowired
+    private ToolRegistry toolRegistry;
+    @Autowired
+    private DatabaseConversationStore conversationStore;
+    @Autowired
+    private SkillStore skillStore;
+    @Autowired
+    private IntentPlanner intentPlanner;
+    @Autowired
+    private TaskTodoStore taskTodoStore;
+    @Autowired
+    private ContextCompressor contextCompressor;
+    @Autowired
+    private FileContentExtractor fileContentExtractor;
+    @Autowired
+    private ChatTaskRepository chatTaskRepository;
+    @Autowired
+    private com.miniagent.agent.core.SessionStreamHub streamHub;
+    @Autowired
+    private BuiltinTools builtinTools;
+    @Autowired
+    private TaskRunService taskRunService;
+    @Autowired
+    private MediaStorage mediaStorage;
+    @Autowired
+    private ModelClientFactory modelClientFactory;
 
     private static final int MAX_ITERATIONS = 90;
 
     /** 正在运行的任务：sessionId -> true。用于前端查询任务状态（内存快路径）。 */
-    private final java.util.concurrent.ConcurrentHashMap<String, Boolean> runningTasks = new java.util.concurrent.ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Boolean> runningTasks = new ConcurrentHashMap<>();
 
-    @jakarta.annotation.PostConstruct
+    @PostConstruct
     private void init() {
         agentLoop.setTraceRecorder(traceRecorder);
         agentLoop.setStreamHub(streamHub);
@@ -215,9 +240,9 @@ public class AgentChatApplicationService {
         }
 
         // 当前 todo 状态（每轮新鲜注入，不依赖工具调用）
-        if (sessionId != null) {
+        if (Objects.nonNull(sessionId)) {
             String todoBlock = taskTodoStore.render(sessionId);
-            if (!todoBlock.isBlank()) {
+            if (!StringUtils.isBlank(todoBlock)) {
                 parts.add(todoBlock);
             }
         }
@@ -246,10 +271,10 @@ public class AgentChatApplicationService {
     // =========================================================================
 
     public String chat(Long userId, String sessionId, String userMessage) {
-        if (userMessage == null || userMessage.isBlank()) {
+        if (StringUtils.isBlank(userMessage)) {
             return "请输入有效内容。";
         }
-        String sid = (sessionId == null || sessionId.isBlank())
+        String sid = (StringUtils.isBlank(sessionId))
                 ? UUID.randomUUID().toString().substring(0, 8)
                 : sessionId.trim();
         return executeAgent(userId, sid, userMessage.trim());
@@ -260,7 +285,7 @@ public class AgentChatApplicationService {
      * 避免以半截 AiMessage/工具消息开头而切散 tool_call/result 配对。
      */
     private List<ChatMessage> recentHistoryByTurn(List<ChatMessage> all, int maxKeep) {
-        if (all == null || all.isEmpty()) return List.of();
+        if (Objects.isNull(all) || all.isEmpty()) return List.of();
         int keep = Math.min(maxKeep, all.size());
         int start = all.size() - keep;
         // 向后推进到第一条 UserMessage，对齐轮次边界
@@ -286,7 +311,7 @@ public class AgentChatApplicationService {
             if (!conversationStore.exists(sessionId)) {
                 conversationStore.create(userId, sessionId, userMessage);
             }
-            if (userImagePaths != null && !userImagePaths.isEmpty()) {
+            if (Objects.nonNull(userImagePaths) && !userImagePaths.isEmpty()) {
                 conversationStore.addMessageWithImages(sessionId, "user", userMessage, userImagePaths);
             } else {
                 conversationStore.addMessage(sessionId, "user", userMessage);
@@ -299,14 +324,21 @@ public class AgentChatApplicationService {
 
     private String executeAgentWithProgress(Long userId, String sessionId, String userMessage,
                                             org.springframework.web.servlet.mvc.method.annotation.SseEmitter progressEmitter) {
+        return executeAgentWithProgress(userId, sessionId, userMessage, progressEmitter, List.of());
+    }
+
+    /** 文本 / 多模态统一入口：并发闸门 +（可选）SSE sink */
+    private String executeAgentWithProgress(Long userId, String sessionId, String userMessage,
+                                            org.springframework.web.servlet.mvc.method.annotation.SseEmitter progressEmitter,
+                                            List<String> imageDataUrls) {
         String acquireErr = taskRunService.tryAcquire(userId, sessionId);
-        if (acquireErr != null) {
+        if (Objects.nonNull(acquireErr)) {
             throw new IllegalStateException(acquireErr);
         }
         runningTasks.put(sessionId, Boolean.TRUE);
         MemoryStore.setCurrentUser(userId);
         try {
-            String answer = doExecuteAgent(userId, sessionId, userMessage, progressEmitter);
+            String answer = doExecuteAgent(userId, sessionId, userMessage, progressEmitter, imageDataUrls);
             taskRunService.markCompleted(userId, sessionId);
             return answer;
         } catch (Exception e) {
@@ -315,55 +347,85 @@ public class AgentChatApplicationService {
         } finally {
             runningTasks.remove(sessionId);
             MemoryStore.clearCurrentUser();
+            TaskTodoContext.clear();
         }
     }
 
     private String doExecuteAgent(Long userId, String sessionId, String userMessage,
-                                  org.springframework.web.servlet.mvc.method.annotation.SseEmitter progressEmitter) {
-        // 设置当前会话上下文（供 ContextCompressor 使用）
+                                  org.springframework.web.servlet.mvc.method.annotation.SseEmitter progressEmitter,
+                                  List<String> imageDataUrls) {
+        List<String> images = Optional.ofNullable(imageDataUrls).orElseGet(List::of).stream()
+                .filter(StringUtils::isNotBlank).toList();
+        boolean hasImage = !images.isEmpty();
+        String runStatus = "SUCCESS";
+
         contextCompressor.setCurrentSession(sessionId);
-        // 新一轮用户消息：清空 read_file/list_files 结果缓存，避免读到上一轮的旧内容
         builtinTools.clearToolCache();
 
-        // 确保会话存在于 ConversationStore
-        ChatMemory memory = chatMemoryProvider.get(sessionId);
-        TaskPlan taskPlan = intentPlanner.plan(chatModel, userMessage, false);
-        // 即使 shouldUseHistory=false，也保留最近2轮对话
-        List<ChatMessage> history;
-        if (taskPlan.shouldUseHistory()) {
-            history = memory.messages();
-        } else {
-            history = recentHistoryByTurn(memory.messages(), 4);
+        // 意图漏斗与 AgentLoop 共用同一 executionId
+        if (Objects.nonNull(traceRecorder)) {
+            traceRecorder.ensureExecution(sessionId, userMessage);
         }
+        try {
+        ModelClientFactory.ResolvedModels models = modelClientFactory.resolve(userId);
+        ChatModel effectiveChat = models.chat();
+        log.info("本轮模型: userId={}, preset={}, model={}",
+                userId, models.settings().presetId(), models.settings().modelName());
+
+        ChatMemory memory = chatMemoryProvider.get(sessionId);
+        List<ChatMessage> memMsgs = memory.messages();
+        TaskPlan taskPlan = intentPlanner.plan(effectiveChat, userMessage, hasImage, memMsgs);
+        List<ChatMessage> history = taskPlan.shouldUseHistory()
+                ? memMsgs : recentHistoryByTurn(memMsgs, 4);
+
+        List<String> savedImagePaths = hasImage ? saveImagesToDisk(sessionId, images) : List.of();
+        UserMessage multimodalMsg = hasImage ? buildMultimodalUserMessage(userMessage, images, savedImagePaths) : null;
+        String displayQuestion = hasImage
+                ? (StringUtils.isNotBlank(userMessage) ? userMessage : "[图片]") + " 📷x" + images.size()
+                : userMessage;
 
         if (taskPlan.intent() == IntentType.REVIEW) {
-            String answer = answerReviewQuestion(userMessage, null, history);
-            memory.add(UserMessage.from(userMessage));
-            memory.add(AiMessage.from(answer));
-            ChatTask task = new ChatTask();
-            task.setUserId(userId);
-            task.setSessionId(sessionId);
-            task.setQuestion(userMessage);
-            task.setAnswer(answer);
-            chatTaskRepository.save(task);
-            persistTurn(userId, sessionId, userMessage, answer, null);
-            updateMidtermMemoryAsync(userId, userMessage, answer);
-            return answer;
+            AgentLoop.setCurrentModels(effectiveChat, models.streaming());
+            try {
+                if (Objects.nonNull(traceRecorder)) {
+                    traceRecorder.recordNode("REVIEW_PATH", "{\"hasImage\":" + hasImage + "}", "RUNNING", 0);
+                }
+                String answer = hasImage
+                        ? answerReviewWithImages(userMessage, images, history)
+                        : answerReviewQuestion(userMessage, null, history);
+                if (hasImage) memory.add(multimodalMsg);
+                else memory.add(UserMessage.from(userMessage));
+                memory.add(AiMessage.from(answer));
+                ChatTask task = new ChatTask();
+                task.setUserId(userId);
+                task.setSessionId(sessionId);
+                task.setQuestion(displayQuestion);
+                task.setAnswer(answer);
+                if (hasImage) task.setImages(String.join(",", savedImagePaths));
+                chatTaskRepository.save(task);
+                persistTurn(userId, sessionId, displayQuestion, answer, hasImage ? savedImagePaths : null);
+                updateMidtermMemoryAsync(userId, displayQuestion, answer);
+                if (Objects.nonNull(traceRecorder)) {
+                    traceRecorder.recordAnswer(sessionId, 0, answer);
+                }
+                return answer;
+            } finally {
+                AgentLoop.clearCurrentModels();
+            }
         }
 
-        // 任务名
-        String firstLine = userMessage.split("[\r\n]", 2)[0];
+        String firstLine = StringUtils.isNotBlank(userMessage)
+                ? userMessage.split("[\r\n]", 2)[0]
+                : (hasImage ? "分析图片" : "default");
         BuiltinTools.setCurrentTaskName(firstLine);
-
         TaskTodoContext.set(sessionId);
         String systemPrompt = buildSystemPrompt(sessionId, userMessage);
 
-        // 进度回调：工具调用时把 progress 事件 publish 到会话中枢（与 HTTP 连接解耦，支持刷新重连）
-        final boolean streaming = (progressEmitter != null);
-        Consumer<String> progress = !streaming ? null : msg ->
-                streamHub.publish(sessionId, "progress", msg == null ? "" : msg);
-
-        // 实时流式回调：思考 / 答案增量 publish 到中枢，由中枢缓冲并扇出给所有订阅者
+        final boolean streaming = Objects.nonNull(progressEmitter);
+        Consumer<String> progress = Optional.ofNullable(progressEmitter)
+                .<Consumer<String>>map(em -> msg ->
+                        streamHub.publish(sessionId, "progress", Optional.ofNullable(msg).orElse("")))
+                .orElse(null);
         com.miniagent.agent.core.AgentStreamSink streamSink = !streaming ? null
                 : new com.miniagent.agent.core.AgentStreamSink() {
             @Override public void onThinking(String delta) {
@@ -380,158 +442,87 @@ public class AgentChatApplicationService {
             }
         };
 
-        // hermes-agent 风格：不猜意图，全部进 AgentLoop，模型自己决定用什么工具
-
         AgentLoop.setCurrentSession(sessionId);
-        PermissionContext.set(sessionId, permissionStore.getMode(sessionId), permissionStore.isPlanApproved(sessionId));
+        AgentLoop.setCurrentModels(effectiveChat, models.streaming());
+        PermissionContext.setSession(sessionId);
         String answer;
         try {
-            answer = agentLoop.run(chatModel, systemPrompt, userMessage, history, MAX_ITERATIONS, progress, taskPlan, streamSink);
+            if (hasImage) {
+                answer = agentLoop.runWithMultimodal(effectiveChat, systemPrompt, multimodalMsg, history,
+                        MAX_ITERATIONS, progress, taskPlan, streamSink);
+            } else {
+                answer = agentLoop.run(effectiveChat, systemPrompt, userMessage, history,
+                        MAX_ITERATIONS, progress, taskPlan, streamSink);
+            }
         } finally {
             PermissionContext.clear();
+            AgentLoop.clearCurrentModels();
             AgentLoop.clearCurrentSession();
         }
 
-        // 保存到 LangChain4j 会话记忆
-        memory.add(UserMessage.from(userMessage));
+        if (hasImage) memory.add(multimodalMsg);
+        else memory.add(UserMessage.from(userMessage));
         memory.add(AiMessage.from(answer));
 
-        // 持久化到 ChatTask
         ChatTask task = new ChatTask();
         task.setUserId(userId);
         task.setSessionId(sessionId);
-        task.setQuestion(userMessage);
+        task.setQuestion(displayQuestion);
         task.setAnswer(answer);
+        if (hasImage) task.setImages(String.join(",", savedImagePaths));
         chatTaskRepository.save(task);
-
-        persistTurn(userId, sessionId, userMessage, answer, null);
-
-        updateMidtermMemoryAsync(userId, userMessage, answer);
-
+        persistTurn(userId, sessionId, displayQuestion, answer, hasImage ? savedImagePaths : null);
+        updateMidtermMemoryAsync(userId, displayQuestion, answer);
         return answer;
+        } catch (Exception e) {
+            runStatus = "FAILURE";
+            if (Objects.nonNull(traceRecorder)) {
+                traceRecorder.recordError(sessionId, 0, e.getMessage());
+            }
+            throw e;
+        } finally {
+            // AgentLoop 正常路径会 end；REVIEW / 异常路径若仍 active 则在此收尾
+            if (Objects.nonNull(traceRecorder) && traceRecorder.isActive()) {
+                traceRecorder.endExecution(runStatus);
+            }
+        }
     }
 
+    private UserMessage buildMultimodalUserMessage(String userMessage, List<String> images,
+                                                   List<String> savedImagePaths) {
+        List<dev.langchain4j.data.message.Content> contents = new ArrayList<>();
+        StringBuilder text = new StringBuilder();
+        if (StringUtils.isNotBlank(userMessage)) text.append(userMessage);
+        Optional.ofNullable(savedImagePaths).filter(paths -> !paths.isEmpty()).ifPresent(paths -> {
+            text.append("\n\n[用户上传了 ").append(paths.size()).append(" 张图片]\n");
+            for (int i = 0; i < paths.size(); i++) {
+                text.append("图片").append(i + 1).append(" 本地路径: ").append(paths.get(i)).append('\n');
+            }
+        });
+        contents.add(TextContent.from(text.toString()));
+        images.forEach(img -> contents.add(ImageContent.from(img)));
+        return UserMessage.from(contents);
+    }
 
     /** 单图入口（兼容旧调用） */
     public String chatWithImage(Long userId, String sessionId, String userMessage, String imageDataUrl) {
         return chatWithImages(userId, sessionId, userMessage,
-                (imageDataUrl == null || imageDataUrl.isBlank()) ? List.of() : List.of(imageDataUrl));
+                (StringUtils.isBlank(imageDataUrl)) ? List.of() : List.of(imageDataUrl));
     }
 
     /**
      * 多图入口：文字 + 任意张图片。所有图片走同一个 UserMessage 多模态。
      */
     public String chatWithImages(Long userId, String sessionId, String userMessage, List<String> imageDataUrls) {
-        List<String> images = imageDataUrls == null ? List.of() : imageDataUrls.stream()
-                .filter(s -> s != null && !s.isBlank()).toList();
+        List<String> images = Optional.ofNullable(imageDataUrls).orElseGet(List::of).stream()
+                .filter(StringUtils::isNotBlank).toList();
         if (images.isEmpty()) {
             return chat(userId, sessionId, userMessage);
         }
-        // 设置当前用户上下文（供 MemoryStore 按 userId 隔离记忆）
-        MemoryStore.setCurrentUser(userId);
-        try {
-        // 新一轮用户消息：清空工具结果缓存，避免读到上一轮的旧内容
-        builtinTools.clearToolCache();
-        String sid = (sessionId == null || sessionId.isBlank()) ? "default" : sessionId.trim();
-        log.info("多模态请求: sessionId={}, imageCount={}, totalImageDataLength={}, message='{}'",
-                sid, images.size(),
-                images.stream().mapToInt(String::length).sum(),
-                userMessage == null ? "" : userMessage.replaceAll("[\\r\\n]+", " "));
-
-
-        // 先保存图片到磁盘，获取本地路径
-        List<String> savedImagePaths = saveImagesToDisk(sid, images);
-
-        // 构建多模态消息：文本 + 图片路径 + N 张图片
-        List<dev.langchain4j.data.message.Content> contents = new ArrayList<>();
-        StringBuilder textWithPaths = new StringBuilder();
-        if (userMessage != null && !userMessage.isBlank()) {
-            textWithPaths.append(userMessage);
-        }
-        // 注入图片路径信息（不指定工具，让 LLM 根据用户意图自行判断）
-        if (!savedImagePaths.isEmpty()) {
-            textWithPaths.append("\n\n[用户上传了 ").append(savedImagePaths.size()).append(" 张图片]\n");
-            for (int i = 0; i < savedImagePaths.size(); i++) {
-                textWithPaths.append("图片").append(i + 1).append(" 本地路径: ").append(savedImagePaths.get(i)).append("\n");
-            }
-        }
-        contents.add(TextContent.from(textWithPaths.toString()));
-        for (String img : images) {
-            contents.add(ImageContent.from(img));
-        }
-        UserMessage multimodalMsg = UserMessage.from(contents);
-
-        ChatMemory memory = chatMemoryProvider.get(sid);
-        TaskPlan taskPlan = intentPlanner.plan(chatModel, userMessage, true);
-        // 即使 shouldUseHistory=false，也保留最近2轮对话
-        List<ChatMessage> history;
-        if (taskPlan.shouldUseHistory()) {
-            history = memory.messages();
-        } else {
-            history = recentHistoryByTurn(memory.messages(), 4);
-        }
-
-        if (taskPlan.intent() == IntentType.REVIEW) {
-            String displayMsg = (userMessage != null && !userMessage.isBlank() ? userMessage : "[图片反馈]")
-                    + " 📷x" + images.size();
-            String answer = answerReviewWithImages(userMessage, images, history);
-            // 持久化：用户消息带图片路径，助手消息正常存
-            ChatTask imgReviewTask = new ChatTask();
-            imgReviewTask.setUserId(userId);
-            imgReviewTask.setSessionId(sid);
-            imgReviewTask.setQuestion(displayMsg);
-            imgReviewTask.setAnswer(answer);
-            imgReviewTask.setImages(String.join(",", savedImagePaths));
-            chatTaskRepository.save(imgReviewTask);
-            // ChatMemory：用多模态消息，模型能真正看到图
-            memory.add(multimodalMsg);
-            memory.add(AiMessage.from(answer));
-            persistTurn(userId, sid, displayMsg, answer, savedImagePaths);
-            updateMidtermMemoryAsync(userId, displayMsg, answer);
-            return answer;
-        }
-
-        String taskName = (userMessage != null && !userMessage.isBlank())
-                ? userMessage.split("[\r\n]", 2)[0]
-                : "分析图片";
-        BuiltinTools.setCurrentTaskName(taskName);
-
-        TaskTodoContext.set(sid);
-        String systemPrompt = buildSystemPrompt(sid, userMessage);
-        AgentLoop.setCurrentSession(sid);
-        PermissionContext.set(sid, permissionStore.getMode(sid), permissionStore.isPlanApproved(sid));
-        String answer;
-        try {
-            answer = agentLoop.runWithMultimodal(chatModel, systemPrompt, multimodalMsg, history,
-                    MAX_ITERATIONS, null, taskPlan);
-        } finally {
-            PermissionContext.clear();
-            AgentLoop.clearCurrentSession();
-        }
-
-        // 持久化
-        String displayMsg = (userMessage != null && !userMessage.isBlank() ? userMessage : "[图片]")
-                + " 📷x" + images.size();
-        ChatTask imgTask = new ChatTask();
-        imgTask.setUserId(userId);
-        imgTask.setSessionId(sid);
-        imgTask.setQuestion(displayMsg);
-        imgTask.setAnswer(answer);
-        chatTaskRepository.save(imgTask);
-        // ChatMemory：多模态
-        memory.add(multimodalMsg);
-        memory.add(AiMessage.from(answer));
-
-        persistTurn(userId, sid, displayMsg, answer, savedImagePaths);
-
-        updateMidtermMemoryAsync(userId, displayMsg, answer);
-        return answer;
-        } finally {
-            MemoryStore.clearCurrentUser();
-        }
+        String sid = StringUtils.isBlank(sessionId) ? "default" : sessionId.trim();
+        return executeAgentWithProgress(userId, sid, userMessage, null, images);
     }
 
-    /** 对话附图 → MediaStorage（data-dir/media/conversations） */
     private List<String> saveImagesToDisk(String sessionId, List<String> imageDataUrls) {
         return mediaStorage.saveConversationImages(sessionId, imageDataUrls);
     }
@@ -543,13 +534,13 @@ public class AgentChatApplicationService {
             log.info("评审模式: imageCount={}, totalImageDataLength={}, userMessage='{}'",
                     images.size(),
                     images.stream().mapToInt(String::length).sum(),
-                    userMessage == null ? "" : userMessage.replaceAll("[\\r\\n]+", " "));
+                    Objects.isNull(userMessage) ? "" : userMessage.replaceAll("[\\r\\n]+", " "));
 
-            if (history != null && !history.isEmpty()) {
+            if (Objects.nonNull(history) && !history.isEmpty()) {
                 int from = Math.max(0, history.size() - 4);
                 messages.addAll(history.subList(from, history.size()));
             }
-            String text = userMessage == null || userMessage.isBlank()
+            String text = StringUtils.isBlank(userMessage)
                     ? "请分析这些截图反映的问题。"
                     : userMessage;
             List<dev.langchain4j.data.message.Content> contents = new ArrayList<>();
@@ -558,9 +549,10 @@ public class AgentChatApplicationService {
                 contents.add(ImageContent.from(img));
             }
             messages.add(UserMessage.from(contents));
-            var response = chatModel.chat(ChatRequest.builder().messages(messages).build());
+            ChatModel model = Optional.ofNullable(AgentLoop.getCurrentChatModel()).orElse(chatModel);
+            var response = model.chat(ChatRequest.builder().messages(messages).build());
             String answer = response.aiMessage().text();
-            return answer == null || answer.isBlank()
+            return StringUtils.isBlank(answer)
                     ? "这是结果质量反馈，不应该继续执行旧任务。问题通常来自上下文被旧任务牵引、工具循环未及时停止或最终兜底回复过短。"
                     : answer;
         } catch (Exception e) {
@@ -584,7 +576,7 @@ public class AgentChatApplicationService {
                         【最新助手回答】
                         %s
                         """.formatted(
-                        oldMemory.isBlank() ? "（空）" : oldMemory,
+                        StringUtils.isBlank(oldMemory) ? "（空）" : oldMemory,
                         sanitizeForMemory(userMessage, 2500),
                         sanitizeForMemory(answer, 3500)
                 );
@@ -595,7 +587,7 @@ public class AgentChatApplicationService {
                         ))
                         .build());
                 String summary = response.aiMessage().text();
-                if (summary != null && !summary.isBlank()) {
+                if (StringUtils.isNotBlank(summary)) {
                     memoryStore.updateMidtermMemory(summary);
                 }
             } catch (Exception ignored) {
@@ -611,26 +603,27 @@ public class AgentChatApplicationService {
             List<ChatMessage> messages = new ArrayList<>();
             messages.add(new SystemMessage(PromptTemplates.REVIEW_MODE_PROMPT));
             log.info("评审模式: hasImage={}, imageDataLength={}, userMessage='{}'",
-                    imageDataUrl != null && !imageDataUrl.isBlank(),
-                    imageDataUrl == null ? 0 : imageDataUrl.length(),
-                    userMessage == null ? "" : userMessage.replaceAll("[\\r\\n]+", " "));
+                    StringUtils.isNotBlank(imageDataUrl),
+                    Objects.isNull(imageDataUrl) ? 0 : imageDataUrl.length(),
+                    Objects.isNull(userMessage) ? "" : userMessage.replaceAll("[\\r\\n]+", " "));
 
             // 只给少量近期上下文，避免旧任务把模型重新拉回执行链路。
-            if (history != null && !history.isEmpty()) {
+            if (Objects.nonNull(history) && !history.isEmpty()) {
                 int from = Math.max(0, history.size() - 4);
                 messages.addAll(history.subList(from, history.size()));
             }
 
-            String text = userMessage == null || userMessage.isBlank() ? "请分析这张截图反映的问题。" : userMessage;
-            if (imageDataUrl != null && !imageDataUrl.isBlank()) {
+            String text = StringUtils.isBlank(userMessage) ? "请分析这张截图反映的问题。" : userMessage;
+            if (StringUtils.isNotBlank(imageDataUrl)) {
                 messages.add(UserMessage.from(TextContent.from(text), ImageContent.from(imageDataUrl)));
             } else {
                 messages.add(UserMessage.from(text));
             }
 
-            var response = chatModel.chat(ChatRequest.builder().messages(messages).build());
+            ChatModel model = Optional.ofNullable(AgentLoop.getCurrentChatModel()).orElse(chatModel);
+            var response = model.chat(ChatRequest.builder().messages(messages).build());
             String answer = response.aiMessage().text();
-            return answer == null || answer.isBlank()
+            return StringUtils.isBlank(answer)
                     ? "这是结果质量反馈，不应该继续执行旧任务。问题通常来自上下文被旧任务牵引、工具循环未及时停止或最终兜底回复过短。"
                     : answer;
         } catch (Exception e) {
@@ -640,7 +633,7 @@ public class AgentChatApplicationService {
 
     /** 判断是否是简单问答：短消息 + 不涉及文件/工具操作 */
     private static String sanitizeForMemory(String text, int maxChars) {
-        if (text == null) return "";
+        if (Objects.isNull(text)) return "";
         String sanitized = text
                 .replaceAll("(?i)(access_token=)[^&\\s\"'}]+", "$1***")
                 .replaceAll("(?i)(secret=)[^&\\s\"'}]+", "$1***")
@@ -657,7 +650,7 @@ public class AgentChatApplicationService {
 
     /** 删除会话 */
     public void resetConversation(Long userId, String sessionId) {
-        if (sessionId != null && !sessionId.isBlank()) {
+        if (StringUtils.isNotBlank(sessionId)) {
             conversationStore.delete(sessionId.trim());
         }
     }
@@ -691,7 +684,7 @@ public class AgentChatApplicationService {
     // =========================================================================
 
     public SseEmitter chatStream(Long userId, String sessionId, String userMessage) {
-        if (userMessage == null || userMessage.isBlank()) {
+        if (StringUtils.isBlank(userMessage)) {
             SseEmitter emitter = new SseEmitter();
             try {
                 emitter.send(SseEmitter.event().name("error").data("请输入有效内容。"));
@@ -702,7 +695,7 @@ public class AgentChatApplicationService {
             return emitter;
         }
 
-        String sid = (sessionId == null || sessionId.isBlank())
+        String sid = (StringUtils.isBlank(sessionId))
                 ? UUID.randomUUID().toString().substring(0, 8)
                 : sessionId.trim();
         SseEmitter emitter = new SseEmitter(sseTimeoutMs); // 可配置超时（agent.sse.timeout-ms，默认30分钟）
@@ -717,7 +710,7 @@ public class AgentChatApplicationService {
         CompletableFuture.runAsync(() -> {
             try {
                 String answer = executeAgentWithProgress(userId, finalSid, finalMsg, emitter);
-                streamHub.complete(finalSid, answer == null ? "" : answer);
+                streamHub.complete(finalSid, Optional.ofNullable(answer).orElse(""));
             } catch (Exception e) {
                 streamHub.error(finalSid, "处理出错: " + e.getMessage());
             }
@@ -728,28 +721,20 @@ public class AgentChatApplicationService {
 
     public SseEmitter chatStreamWithImage(Long userId, String sessionId, String userMessage, String imageDataUrl) {
         return chatStreamMultimodal(userId, sessionId, userMessage,
-                (imageDataUrl == null || imageDataUrl.isBlank()) ? List.of() : List.of(imageDataUrl), null, null);
+                (StringUtils.isBlank(imageDataUrl)) ? List.of() : List.of(imageDataUrl), null, null);
     }
 
     /**
      * 统一多模态 SSE 入口：支持文字 + 任意张图片。
      */
     public SseEmitter chatStreamMultimodal(Long userId, String sessionId, String userMessage, List<String> imageDataUrls, List<FileAttachment> files, String role) {
-        // 设置角色上下文
-        if (role != null && !role.isEmpty()) {
-            RoleContext.setRole(role);
-        }
-
-        // 提取上传文件的文本内容
         List<FileAttachment> fileAttachments =
-            files == null ? List.of() : files.stream()
-                .filter(f -> f != null && f.getBase64() != null && !f.getBase64().isBlank())
+            Optional.ofNullable(files).orElseGet(List::of).stream()
+                .filter(f -> Objects.nonNull(f) && StringUtils.isNotBlank(f.getBase64()))
                 .toList();
         if (!fileAttachments.isEmpty()) {
             StringBuilder sb = new StringBuilder();
-            if (userMessage != null && !userMessage.isBlank()) {
-                sb.append(userMessage);
-            }
+            if (StringUtils.isNotBlank(userMessage)) sb.append(userMessage);
             for (var file : fileAttachments) {
                 String extracted = fileContentExtractor.extract(file.getFilename(), file.getMimeType(), file.getBase64());
                 sb.append("\n\n--- 文件: ").append(file.getFilename()).append(" ---\n");
@@ -759,9 +744,9 @@ public class AgentChatApplicationService {
             userMessage = sb.toString();
         }
 
-        List<String> images = imageDataUrls == null ? List.of() : imageDataUrls.stream()
-                .filter(s -> s != null && !s.isBlank()).toList();
-        if ((userMessage == null || userMessage.isBlank()) && images.isEmpty()) {
+        List<String> images = Optional.ofNullable(imageDataUrls).orElseGet(List::of).stream()
+                .filter(StringUtils::isNotBlank).toList();
+        if (StringUtils.isBlank(userMessage) && images.isEmpty()) {
             SseEmitter emitter = new SseEmitter(0L);
             try {
                 emitter.send(SseEmitter.event().name("error").data("请输入文字或上传图片。"));
@@ -771,32 +756,33 @@ public class AgentChatApplicationService {
             }
             return emitter;
         }
-        if (images.isEmpty()) {
-            return chatStream(userId, sessionId, userMessage);
-        }
 
-        String sid = (sessionId == null || sessionId.isBlank())
+        String sid = StringUtils.isBlank(sessionId)
                 ? UUID.randomUUID().toString().substring(0, 8)
                 : sessionId.trim();
-        SseEmitter emitter = new SseEmitter(3600_000L);
-        String finalSid = sid;
-        String finalUserMessage = userMessage;
+        SseEmitter emitter = new SseEmitter(sseTimeoutMs);
+        final String finalSid = sid;
+        final String finalUserMessage = userMessage;
+        final String finalRole = role;
+        final List<String> finalImages = images;
 
-        streamHub.start(finalSid, finalUserMessage == null ? "" : finalUserMessage);
+        streamHub.start(finalSid, Optional.ofNullable(finalUserMessage).orElse(""));
         streamHub.attach(finalSid, emitter);
 
         CompletableFuture.runAsync(() -> {
             try {
-                String answer = chatWithImages(userId, finalSid, finalUserMessage, images);
-                streamHub.complete(finalSid, answer == null ? "" : answer);
+                if (StringUtils.isNotBlank(finalRole)) RoleContext.setRole(finalRole);
+                String answer = executeAgentWithProgress(userId, finalSid, finalUserMessage, emitter, finalImages);
+                streamHub.complete(finalSid, Optional.ofNullable(answer).orElse(""));
             } catch (Exception e) {
                 streamHub.error(finalSid, "处理出错: " + e.getMessage());
+            } finally {
+                RoleContext.clear();
             }
         });
 
         return emitter;
     }
-
     /**
      * 将 Agent 最终回复以 SSE 推出。
      *
@@ -806,7 +792,7 @@ public class AgentChatApplicationService {
      *   3. 过长的纯文字行再按中文句末标点细分，避免一次发太多。
      */
     private void streamAnswer(SseEmitter emitter, String answer) throws Exception {
-        if (answer == null || answer.isEmpty()) {
+        if (StringUtils.isEmpty(answer)) {
             emitter.send(SseEmitter.event().name("end").data(""));
             emitter.complete();
             return;

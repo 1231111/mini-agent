@@ -30,6 +30,9 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 图像生成服务 — 对标 hermes-agent image_generate
@@ -129,10 +132,10 @@ public class ImageGenerationService {
      * @return 标准化 JSON: {"success": true, "image": "url"}
      */
     public String generate(String prompt, String aspectRatio) {
-        if (prompt == null || prompt.isBlank()) {
+        if (StringUtils.isBlank(prompt)) {
             return errorJson("prompt 不能为空");
         }
-        if (aspectRatio == null || aspectRatio.isBlank()) {
+        if (StringUtils.isBlank(aspectRatio)) {
             aspectRatio = "landscape";
         }
 
@@ -154,17 +157,17 @@ public class ImageGenerationService {
         // 前两个后端并行竞速，谁先成功用谁；都失败再串行尝试剩余
         if (chain.size() >= 2) {
             String raced = raceBackends(chain.subList(0, 2), prompt, imageSize);
-            if (raced != null) return toMarkdownImage(raced);
+            if (Objects.nonNull(raced)) return toMarkdownImage(raced);
             lastError = "并行竞速后端均失败: " + chain.get(0) + ", " + chain.get(1);
             for (int i = 2; i < chain.size(); i++) {
                 String result = tryBackend(chain.get(i), prompt, imageSize);
-                if (result != null) return toMarkdownImage(result);
+                if (Objects.nonNull(result)) return toMarkdownImage(result);
                 lastError = "后端 " + chain.get(i) + " 失败";
             }
         } else {
             for (String backend : chain) {
                 String result = tryBackend(backend, prompt, imageSize);
-                if (result != null) return toMarkdownImage(result);
+                if (Objects.nonNull(result)) return toMarkdownImage(result);
                 lastError = "后端 " + backend + " 失败";
             }
         }
@@ -195,7 +198,7 @@ public class ImageGenerationService {
                 }
                 try {
                     String r = f.getNow(null);
-                    if (r != null && !r.isBlank()) {
+                    if (StringUtils.isNotBlank(r)) {
                         for (CompletableFuture<String> other : futures) {
                             if (other != f) other.cancel(true);
                         }
@@ -216,7 +219,7 @@ public class ImageGenerationService {
     /** ChatAnywhere 实际等待秒数（2CA 慢模型用加长超时） */
     private long chatAnywhereWaitSeconds() {
         long configured = chatAnywhereTimeoutSeconds > 0 ? chatAnywhereTimeoutSeconds : 500L;
-        if (chatAnywhereModel != null && chatAnywhereModel.toLowerCase().contains("gpt-image")) {
+        if (Objects.nonNull(chatAnywhereModel) && chatAnywhereModel.toLowerCase().contains("gpt-image")) {
             return Math.max(configured, 500L);
         }
         return Math.max(configured, 120L);
@@ -237,7 +240,7 @@ public class ImageGenerationService {
                 }
             }, BACKEND_EXECUTOR);
             String imageUrl = future.get(timeoutSec, TimeUnit.SECONDS);
-            if (imageUrl != null && !imageUrl.isBlank()) {
+            if (StringUtils.isNotBlank(imageUrl)) {
                 recordSuccess(backend);
                 return imageUrl;
             }
@@ -249,8 +252,8 @@ public class ImageGenerationService {
             return null;
         } catch (Exception e) {
             Throwable root = e;
-            while (root.getCause() != null && root.getCause() != root) root = root.getCause();
-            String detail = root.getMessage() != null ? root.getMessage() : e.getMessage();
+            while (Objects.nonNull(root.getCause()) && root.getCause() != root) root = root.getCause();
+            String detail = Optional.ofNullable(root.getMessage()).orElse(e.getMessage());
             log.warn("后端 {} 异常，尝试下一个: {}", backend, detail);
             recordFailure(backend);
             return null;
@@ -263,13 +266,13 @@ public class ImageGenerationService {
      */
     private static JsonNode parseApiJson(String backend, HttpResponse<String> response) {
         int status = response.statusCode();
-        String body = response.body() == null ? "" : response.body();
+        String body = Objects.isNull(response.body()) ? "" : response.body();
         String contentType = response.headers().firstValue("content-type").orElse("");
         String preview = bodyPreview(body, 180);
 
         if (status < 200 || status >= 300) {
             throw new RuntimeException(backend + " HTTP " + status
-                    + (contentType.isBlank() ? "" : " content-type=" + contentType)
+                    + (StringUtils.isBlank(contentType) ? "" : " content-type=" + contentType)
                     + " body=" + preview);
         }
         String trimmed = body.stripLeading();
@@ -277,7 +280,7 @@ public class ImageGenerationService {
         boolean claimsJson = contentType.toLowerCase().contains("json");
         if (!looksJson) {
             throw new RuntimeException(backend + " 返回非 JSON（HTTP " + status
-                    + (contentType.isBlank() ? "" : ", content-type=" + contentType)
+                    + (StringUtils.isBlank(contentType) ? "" : ", content-type=" + contentType)
                     + "）。常见原因：鉴权失败/网关错误页/端点不存在。body=" + preview);
         }
         try {
@@ -290,7 +293,7 @@ public class ImageGenerationService {
     }
 
     private static String bodyPreview(String body, int max) {
-        if (body == null || body.isBlank()) return "(empty)";
+        if (StringUtils.isBlank(body)) return "(empty)";
         String oneLine = body.replace('\r', ' ').replace('\n', ' ').strip();
         return oneLine.length() <= max ? oneLine : oneLine.substring(0, max) + "…";
     }
@@ -313,7 +316,7 @@ public class ImageGenerationService {
 
     private boolean isCircuitOpen(String backend) {
         CircuitState state = circuitStates.get(backend);
-        if (state == null) return false;
+        if (Objects.isNull(state)) return false;
         long now = System.currentTimeMillis();
         if (now - state.windowStartMs.get() > CIRCUIT_WINDOW_MS) {
             state.failures.set(0);
@@ -340,7 +343,7 @@ public class ImageGenerationService {
 
     private void recordSuccess(String backend) {
         CircuitState state = circuitStates.get(backend);
-        if (state != null) {
+        if (Objects.nonNull(state)) {
             state.failures.set(0);
             state.windowStartMs.set(System.currentTimeMillis());
         }
@@ -369,7 +372,7 @@ public class ImageGenerationService {
            return generateImageBy2ca(prompt, imageSize);
         }
 
-        String base = (chatAnywhereBaseUrl == null || chatAnywhereBaseUrl.isBlank())
+        String base = (StringUtils.isBlank(chatAnywhereBaseUrl))
                 ? "https://api.chatanywhere.tech/v1"
                 : chatAnywhereBaseUrl.replaceAll("/+$", "");
 
@@ -387,7 +390,7 @@ public class ImageGenerationService {
         JsonNode data = root.path("data");
         if (data.isArray() && !data.isEmpty()) {
             String url = data.get(0).path("url").asText("");
-            if (!url.isBlank()) return url;
+            if (!StringUtils.isBlank(url)) return url;
         }
 
         String msg = root.path("error").path("message")
@@ -397,7 +400,7 @@ public class ImageGenerationService {
     }
     private String generateImageBy2ca(String prompt, String imageSize) {
         String key = resolveKey(chatAnywhereKey, "CHATANYWHERE_API_KEY");
-        String base = (chatAnywhereBaseUrl == null || chatAnywhereBaseUrl.isBlank())
+        String base = (StringUtils.isBlank(chatAnywhereBaseUrl))
                 ? "https://api.chatanywhere.tech/v1"
                 : chatAnywhereBaseUrl.replaceAll("/+$", "");
 
@@ -443,7 +446,7 @@ public class ImageGenerationService {
             }
 
             String b64Json = data.get(0).path("b64_json").asText();
-            if (b64Json == null || b64Json.isBlank()) {
+            if (StringUtils.isBlank(b64Json)) {
                 log.error("未找到 b64_json 字段");
                 return null;
             }
@@ -475,7 +478,7 @@ public class ImageGenerationService {
             log.error("ChatAnywhere 2CA 超时（{}s）: {}", chatAnywhereWaitSeconds(), e.getMessage());
             // 超时后放宽到 10 分钟窗口找落盘图片（服务端可能已生成完但客户端先断）
             String recentImage = findRecentGeneratedImage(imageDir, 600);
-            if (recentImage != null) {
+            if (Objects.nonNull(recentImage)) {
                 log.info("HTTP 超时但发现最近生成的图片: {}", recentImage);
                 return "![生成的图片](/static/images/" + recentImage + ")";
             }
@@ -484,7 +487,7 @@ public class ImageGenerationService {
             log.error("ChatAnywhere 2CA 图像生成失败: {}", e.getMessage(), e);
             // 安全网：HTTP 失败但图片可能已保存到磁盘（竞态条件），检查最近生成的图片
             String recentImage = findRecentGeneratedImage(imageDir, 600);
-            if (recentImage != null) {
+            if (Objects.nonNull(recentImage)) {
                 log.info("HTTP 失败但发现最近生成的图片: {}", recentImage);
                 return "![生成的图片](/static/images/" + recentImage + ")";
             }
@@ -510,7 +513,7 @@ public class ImageGenerationService {
         payload.put("size", size.get("width") + "x" + size.get("height"));
         payload.put("response_format", "url");
 
-        String base = (mimoBaseUrl == null || mimoBaseUrl.isBlank())
+        String base = (StringUtils.isBlank(mimoBaseUrl))
                 ? "https://token-plan-cn.xiaomimimo.com/v1"
                 : mimoBaseUrl.replaceAll("/+$", "");
 
@@ -528,9 +531,9 @@ public class ImageGenerationService {
         if (data.isArray() && !data.isEmpty()) {
             JsonNode first = data.get(0);
             String url = first.path("url").asText("");
-            if (!url.isBlank()) return url;
+            if (!StringUtils.isBlank(url)) return url;
             String b64 = first.path("b64_json").asText("");
-            if (!b64.isBlank()) return "data:image/png;base64," + b64;
+            if (!StringUtils.isBlank(b64)) return "data:image/png;base64," + b64;
         }
 
         String msg = root.path("error").path("message")
@@ -583,7 +586,7 @@ public class ImageGenerationService {
 
         // 异步模式：需要轮询
         String requestId = root.path("request_id").asText("");
-        if (!requestId.isBlank()) {
+        if (!StringUtils.isBlank(requestId)) {
             return pollFalResult(key, requestId);
         }
 
@@ -711,15 +714,15 @@ public class ImageGenerationService {
     // ========== 后端选择 ==========
 
     private String resolveBackend() {
-        if (configuredBackend != null && !configuredBackend.isBlank()) {
+        if (StringUtils.isNotBlank(configuredBackend)) {
             return configuredBackend.toLowerCase().trim();
         }
         // 自动检测优先级: ChatAnywhere > MiMo > FAL > SiliconFlow > 智谱
-        if (chatAnywhereKey != null && !chatAnywhereKey.isBlank()) return "chatanywhere";
-        if (mimoKey != null && !mimoKey.isBlank()) return "mimo";
-        if (falKey != null && !falKey.isBlank()) return "fal";
-        if (siliconflowKey != null && !siliconflowKey.isBlank()) return "siliconflow";
-        if (zhipuKey != null && !zhipuKey.isBlank()) return "zhipu";
+        if (StringUtils.isNotBlank(chatAnywhereKey)) return "chatanywhere";
+        if (StringUtils.isNotBlank(mimoKey)) return "mimo";
+        if (StringUtils.isNotBlank(falKey)) return "fal";
+        if (StringUtils.isNotBlank(siliconflowKey)) return "siliconflow";
+        if (StringUtils.isNotBlank(zhipuKey)) return "zhipu";
         return "mimo"; // 默认使用项目主模型网关
     }
 
@@ -731,16 +734,16 @@ public class ImageGenerationService {
         List<String> chain = new ArrayList<>();
         // 哪些后端有 key 就加入
         Map<String, String> keyMap = Map.of(
-                "chatanywhere", chatAnywhereKey != null ? chatAnywhereKey : "",
-                "mimo",        mimoKey         != null ? mimoKey        : "",
-                "fal",         falKey          != null ? falKey         : "",
-                "siliconflow", siliconflowKey  != null ? siliconflowKey : "",
-                "zhipu",       zhipuKey        != null ? zhipuKey       : ""
-        );
+                "chatanywhere", Optional.ofNullable(chatAnywhereKey).orElse(""),
+                "mimo",        Objects.nonNull(mimoKey) ? mimoKey : "",
+                "fal",         Optional.ofNullable(falKey).orElse(""),
+                "siliconflow", Objects.nonNull(siliconflowKey) ? siliconflowKey : "",
+                "zhipu",       Optional.ofNullable(zhipuKey).orElse(""
+        ));
         List<String> allBackends = List.of("chatanywhere", "mimo", "fal", "siliconflow", "zhipu");
 
         // 先放 primary
-        if (keyMap.getOrDefault(primaryBackend, "").isBlank()) {
+        if (StringUtils.isBlank(keyMap.getOrDefault(primaryBackend, ""))) {
             // primary 没 key，尝试从环境变量检测
             String envKey = switch (primaryBackend) {
                 case "chatanywhere" -> System.getenv("CHATANYWHERE_API_KEY");
@@ -750,7 +753,7 @@ public class ImageGenerationService {
                 case "zhipu"       -> System.getenv("ZHIPU_API_KEY");
                 default -> null;
             };
-            if (envKey != null && !envKey.isBlank()) chain.add(primaryBackend);
+            if (StringUtils.isNotBlank(envKey)) chain.add(primaryBackend);
         } else {
             chain.add(primaryBackend);
         }
@@ -759,7 +762,7 @@ public class ImageGenerationService {
         for (String b : allBackends) {
             if (!b.equals(primaryBackend)) {
                 String k = keyMap.getOrDefault(b, "");
-                if (!k.isBlank()) chain.add(b);
+                if (!StringUtils.isBlank(k)) chain.add(b);
                 else {
                     String envKey = switch (b) {
                         case "chatanywhere" -> System.getenv("CHATANYWHERE_API_KEY");
@@ -769,7 +772,7 @@ public class ImageGenerationService {
                         case "zhipu"       -> System.getenv("ZHIPU_API_KEY");
                         default -> null;
                     };
-                    if (envKey != null && !envKey.isBlank()) chain.add(b);
+                    if (StringUtils.isNotBlank(envKey)) chain.add(b);
                 }
             }
         }
@@ -782,9 +785,9 @@ public class ImageGenerationService {
     }
 
     private String resolveKey(String value, String envName) {
-        if (value != null && !value.isBlank()) return value;
+        if (StringUtils.isNotBlank(value)) return value;
         String envVal = System.getenv(envName);
-        if (envVal != null && !envVal.isBlank()) return envVal;
+        if (StringUtils.isNotBlank(envVal)) return envVal;
         throw new IllegalStateException("未配置 " + envName + "，无法使用该图像生成后端");
     }
 

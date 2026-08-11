@@ -1,11 +1,12 @@
 package com.miniagent.agent.memory;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.miniagent.memory.MemoryStore;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -13,6 +14,7 @@ import org.springframework.stereotype.Service;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 每天 00:00 自动分析用户对话，提取偏好写入 USER.md / MEMORY.md
@@ -26,12 +28,14 @@ import java.util.*;
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class MemoryDailyAnalysisService {
 
-    private final ChatModel chatModel;
-    private final MemoryStore memoryStore;
-    private final com.miniagent.config.service.DatabaseConversationStore conversationStore;
+    @Autowired
+    private ChatModel chatModel;
+    @Autowired
+    private MemoryStore memoryStore;
+    @Autowired
+    private com.miniagent.config.service.DatabaseConversationStore conversationStore;
 
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
@@ -49,7 +53,7 @@ public class MemoryDailyAnalysisService {
             long since = System.currentTimeMillis() - 24L * 60 * 60 * 1000;
             int analyzed = 0;
             for (Long userId : userIds) {
-                if (userId == null) continue;
+                if (Objects.isNull(userId)) continue;
                 try {
                     analyzed += analyzeUser(userId, since);
                 } catch (Exception e) {
@@ -76,7 +80,7 @@ public class MemoryDailyAnalysisService {
         MemoryStore.setCurrentUser(userId);
         try {
             String analysis = analyzeWithLLM(transcript);
-            if (analysis == null || analysis.isBlank()) return 0;
+            if (StringUtils.isBlank(analysis)) return 0;
             writeAnalysisResults(analysis);
             memoryStore.loadFromDisk(); // 重新加载该用户快照
             return 1;
@@ -90,9 +94,9 @@ public class MemoryDailyAnalysisService {
         List<String> allMessages = new ArrayList<>();
         var conversations = conversationStore.activeConversationsSince(userId, since);
         for (var conv : conversations) {
-            if (conv.messages == null) continue;
+            if (Objects.isNull(conv.messages)) continue;
             for (var msg : conv.messages) {
-                if (msg == null || msg.content == null || msg.content.isBlank()) continue;
+                if (Objects.isNull(msg) || StringUtils.isBlank(msg.content)) continue;
                 String role = "user".equals(msg.role) ? "用户"
                         : "assistant".equals(msg.role) ? "助手" : "其它";
                 allMessages.add(role + ": " + msg.content);

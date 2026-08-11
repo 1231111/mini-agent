@@ -3,6 +3,7 @@ package com.miniagent.agent.core;
 import org.springframework.stereotype.Component;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.Objects;
 
 /**
  * Token 用量追踪器：按会话统计输入/输出 token 和工具调用次数。
@@ -40,7 +41,7 @@ public class TokenUsageTracker {
     private static final Map<String, UsageStats> stats = new ConcurrentHashMap<>();
 
     public static void add(String sessionId, long inputTokens, long outputTokens, int toolCalls) {
-        if (sessionId == null) return;
+        if (Objects.isNull(sessionId)) return;
         UsageStats s = stats.computeIfAbsent(sessionId, k -> new UsageStats());
         if (inputTokens > 0) s.addInput(inputTokens);
         if (outputTokens > 0) s.addOutput(outputTokens);
@@ -49,7 +50,7 @@ public class TokenUsageTracker {
     }
 
     public static void addToolCall(String sessionId) {
-        if (sessionId == null) return;
+        if (Objects.isNull(sessionId)) return;
         stats.computeIfAbsent(sessionId, k -> new UsageStats()).addToolCall();
     }
 

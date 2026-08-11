@@ -3,6 +3,7 @@ package com.miniagent.config.service;
 import com.miniagent.config.entity.AgentTaskRun;
 import com.miniagent.config.repository.AgentTaskRunRepository;
 import jakarta.annotation.PostConstruct;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -19,15 +20,16 @@ public class TaskRunService {
 
     private static final Logger log = LoggerFactory.getLogger(TaskRunService.class);
 
-    private final AgentTaskRunRepository repository;
-    private final int maxPerUser;
+    @Autowired
+    private AgentTaskRunRepository repository;
+    @Value("${agent.concurrency.max-tasks-per-user:2}")
+    private int maxPerUserConfig;
+    private int maxPerUser = 2;
     private final ConcurrentHashMap<Long, AtomicInteger> inFlight = new ConcurrentHashMap<>();
 
-    public TaskRunService(
-            AgentTaskRunRepository repository,
-            @Value("${agent.concurrency.max-tasks-per-user:2}") int maxPerUser) {
-        this.repository = repository;
-        this.maxPerUser = Math.max(1, maxPerUser);
+    @PostConstruct
+    private void initMaxPerUser() {
+        this.maxPerUser = Math.max(1, maxPerUserConfig);
     }
 
     @PostConstruct

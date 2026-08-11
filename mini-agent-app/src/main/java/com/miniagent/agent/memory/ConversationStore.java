@@ -13,6 +13,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 会话持久化存储 — 每个会话一个 JSON 文件，保存在 ~/.hermes/conversations/ 下
@@ -73,7 +74,7 @@ public class ConversationStore {
     public Conversation create(String id, String title) {
         Conversation conv = new Conversation();
         conv.id = id;
-        conv.title = (title == null || title.isBlank()) ? "新对话" : title.trim();
+        conv.title = (StringUtils.isBlank(title)) ? "新对话" : title.trim();
         conv.createdAt = Instant.now().toEpochMilli();
         conv.updatedAt = conv.createdAt;
         conv.messages = new ArrayList<>();
@@ -92,15 +93,15 @@ public class ConversationStore {
         return cache.values().stream()
                 .sorted((a, b) -> Long.compare(b.updatedAt, a.updatedAt))
                 .map(c -> new ConversationSummary(c.id, c.title, c.createdAt, c.updatedAt,
-                        c.messages == null ? 0 : c.messages.size()))
+                        Objects.isNull(c.messages) ? 0 : c.messages.size()))
                 .collect(Collectors.toList());
     }
 
     /** 追加消息 */
     public void addMessage(String id, String role, String content) {
         Conversation conv = cache.get(id);
-        if (conv == null) return;
-        if (conv.messages == null) conv.messages = new ArrayList<>();
+        if (Objects.isNull(conv)) return;
+        if (Objects.isNull(conv.messages)) conv.messages = new ArrayList<>();
         Message msg = new Message();
         msg.role = role;
         msg.content = content;
@@ -118,13 +119,13 @@ public class ConversationStore {
     /** 追加消息（带图片） */
     public void addMessageWithImages(String id, String role, String content, List<String> imagePaths) {
         Conversation conv = cache.get(id);
-        if (conv == null) return;
-        if (conv.messages == null) conv.messages = new ArrayList<>();
+        if (Objects.isNull(conv)) return;
+        if (Objects.isNull(conv.messages)) conv.messages = new ArrayList<>();
         Message msg = new Message();
         msg.role = role;
         msg.content = content;
         msg.timestamp = Instant.now().toEpochMilli();
-        msg.images = (imagePaths == null || imagePaths.isEmpty()) ? null : new ArrayList<>(imagePaths);
+        msg.images = (Objects.isNull(imagePaths) || imagePaths.isEmpty()) ? null : new ArrayList<>(imagePaths);
         conv.messages.add(msg);
         conv.updatedAt = Instant.now().toEpochMilli();
         if ("user".equals(role) && conv.messages.stream().filter(m -> "user".equals(m.role)).count() == 1) {
@@ -137,7 +138,7 @@ public class ConversationStore {
     /** 重命名 */
     public boolean rename(String id, String newTitle) {
         Conversation conv = cache.get(id);
-        if (conv == null) return false;
+        if (Objects.isNull(conv)) return false;
         conv.title = newTitle.trim();
         conv.updatedAt = Instant.now().toEpochMilli();
         saveToDisk(conv);
@@ -147,7 +148,7 @@ public class ConversationStore {
     /** 删除 */
     public boolean delete(String id) {
         Conversation removed = cache.remove(id);
-        if (removed == null) return false;
+        if (Objects.isNull(removed)) return false;
         try {
             Files.deleteIfExists(conversationsDir.resolve(id + ".json"));
         } catch (IOException ignored) {}

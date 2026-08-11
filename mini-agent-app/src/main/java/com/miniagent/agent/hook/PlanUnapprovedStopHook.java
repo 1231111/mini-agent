@@ -2,6 +2,7 @@ package com.miniagent.agent.hook;
 
 import com.miniagent.agent.permission.PermissionMode;
 import org.springframework.stereotype.Component;
+import java.util.Objects;
 
 /**
  * Plan 未批准时：若本轮已调用过写/执行类工具痕迹（toolsInvoked），禁止「已完成」式收尾。
@@ -30,7 +31,7 @@ public class PlanUnapprovedStopHook implements StopHook {
         if (context.permissionMode() != PermissionMode.PLAN || context.planApproved()) {
             return StopDecision.proceed();
         }
-        boolean claimedExec = context.toolsInvoked() != null
+        boolean claimedExec = Objects.nonNull(context.toolsInvoked())
                 && context.toolsInvoked().stream().anyMatch(EXEC_HINTS::contains);
         if (!claimedExec && !context.writeFileSucceeded() && !context.mediaDelivered()) {
             return StopDecision.proceed();

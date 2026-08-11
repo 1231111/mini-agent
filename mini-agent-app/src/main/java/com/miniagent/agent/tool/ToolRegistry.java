@@ -9,6 +9,7 @@ import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 工具注册表：统一注册、发现、调度所有可用工具。
@@ -26,7 +27,7 @@ public class ToolRegistry {
      * 注册一个工具
      */
     public void register(Tool tool) {
-        if (tool.getName() == null || tool.getName().isBlank()) {
+        if (StringUtils.isBlank(tool.getName())) {
             throw new IllegalArgumentException("工具名称不能为空");
         }
         tools.put(tool.getName(), tool);
@@ -37,14 +38,14 @@ public class ToolRegistry {
 
     /** 注销工具（MCP 热插拔 / 关闭时清理） */
     public void unregister(String name) {
-        if (name == null || name.isBlank()) return;
+        if (StringUtils.isBlank(name)) return;
         tools.remove(name);
         specCache.remove(name);
         log.debug("注销工具: {}", name);
     }
 
     public void unregisterByPrefix(String prefix) {
-        if (prefix == null || prefix.isBlank()) return;
+        if (StringUtils.isBlank(prefix)) return;
         List<String> names = tools.keySet().stream().filter(n -> n.startsWith(prefix)).toList();
         names.forEach(this::unregister);
     }
@@ -71,21 +72,21 @@ public class ToolRegistry {
      */
     public String execute(String toolName, String argumentsJson) {
         Tool tool = tools.get(toolName);
-        if (tool == null) {
+        if (Objects.isNull(tool)) {
             return "未知工具: " + toolName + "。可用工具: " + availableToolNames();
         }
         // 延迟脱敏：只在 INFO 日志启用时执行正则替换
         if (log.isInfoEnabled()) {
             String safeArgs = redactSensitive(argumentsJson);
             log.info("执行工具: {} 参数: {}", toolName,
-                    safeArgs != null && safeArgs.length() > 200
+                    Objects.nonNull(safeArgs) && safeArgs.length() > 200
                             ? safeArgs.substring(0, 200) + "..." : safeArgs);
         }
         return tool.execute(argumentsJson);
     }
 
     private static String redactSensitive(String s) {
-        if (s == null) return null;
+        if (Objects.isNull(s)) return null;
         return s
                 .replaceAll("(?i)(access_token=)[^&\\s\"'}]+", "$1***")
                 .replaceAll("(?i)(secret=)[^&\\s\"'}]+", "$1***")
@@ -103,7 +104,7 @@ public class ToolRegistry {
     }
 
     public List<ToolSpecification> getSpecifications(Set<String> allowedToolNames) {
-        if (allowedToolNames == null) {
+        if (Objects.isNull(allowedToolNames)) {
             return getSpecifications();
         }
         if (allowedToolNames.isEmpty()) {
@@ -113,13 +114,13 @@ public class ToolRegistry {
         // 全工具面（含写文件+网页）时附带已注册 MCP，避免静态白名单漏掉 mcp__*
         if (names.contains("write_file") && names.contains("web_extract")) {
             for (String n : specCache.keySet()) {
-                if (n != null && n.startsWith("mcp__")) names.add(n);
+                if (Objects.nonNull(n) && n.startsWith("mcp__")) names.add(n);
             }
         }
         List<ToolSpecification> result = new ArrayList<>();
         for (String name : names) {
             ToolSpecification spec = specCache.get(name);
-            if (spec != null) result.add(spec);
+            if (Objects.nonNull(spec)) result.add(spec);
         }
         return result;
     }
@@ -163,7 +164,7 @@ public class ToolRegistry {
                 .description(tool.getDescription());
 
         Map<String, Object> params = tool.getParameters();
-        if (params != null && !params.isEmpty()) {
+        if (Objects.nonNull(params) && !params.isEmpty()) {
             JsonObjectSchema.Builder schema = JsonObjectSchema.builder();
             List<String> required = new ArrayList<>();
 
@@ -179,28 +180,28 @@ public class ToolRegistry {
 
                     switch (type) {
                         case "integer" -> {
-                            if (desc.isBlank()) {
+                            if (StringUtils.isBlank(desc)) {
                                 schema.addIntegerProperty(paramName);
                             } else {
                                 schema.addIntegerProperty(paramName, desc);
                             }
                         }
                         case "number" -> {
-                            if (desc.isBlank()) {
+                            if (StringUtils.isBlank(desc)) {
                                 schema.addNumberProperty(paramName);
                             } else {
                                 schema.addNumberProperty(paramName, desc);
                             }
                         }
                         case "boolean" -> {
-                            if (desc.isBlank()) {
+                            if (StringUtils.isBlank(desc)) {
                                 schema.addBooleanProperty(paramName);
                             } else {
                                 schema.addBooleanProperty(paramName, desc);
                             }
                         }
                         default -> {
-                            if (desc.isBlank()) {
+                            if (StringUtils.isBlank(desc)) {
                                 schema.addStringProperty(paramName);
                             } else {
                                 schema.addStringProperty(paramName, desc);

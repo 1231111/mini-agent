@@ -19,6 +19,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.Objects;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 浏览器服务：用 Playwright 驱动无头 Chromium，提供页面快照和交互能力。
@@ -47,12 +49,12 @@ public class BrowserService {
      * 首次启动时自动下载 Chromium（约 150MB）
      */
     private synchronized void ensureBrowser() {
-        if (playwright == null) {
+        if (Objects.isNull(playwright)) {
             // 检测 Chromium 是否已下载，没有就自动安装
             ensureChromiumInstalled();
             playwright = Playwright.create();
         }
-        if (browser == null) {
+        if (Objects.isNull(browser)) {
             browser = playwright.chromium().launch(
                     new BrowserType.LaunchOptions()
                             .setHeadless(false)    // 改为有头模式，可见浏览器窗口
@@ -123,13 +125,13 @@ public class BrowserService {
      */
     private static Path resolveBrowsersRoot() {
         String override = System.getProperty("playwright.browsers.path");
-        if (override != null && !override.isBlank()) {
+        if (StringUtils.isNotBlank(override)) {
             return Paths.get(override);
         }
         String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
         if (os.contains("win")) {
             String local = System.getenv("LOCALAPPDATA");
-            if (local != null && !local.isBlank()) {
+            if (StringUtils.isNotBlank(local)) {
                 return Paths.get(local, "ms-playwright");
             }
         }
@@ -189,7 +191,7 @@ public class BrowserService {
     private boolean tryInstallViaClasspathCli() {
         try {
             String playwrightJar = resolvePlaywrightJarPath();
-            if (playwrightJar == null) {
+            if (Objects.isNull(playwrightJar)) {
                 log.debug("未解析到 playwright jar 路径");
                 return false;
             }
@@ -209,7 +211,7 @@ public class BrowserService {
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
             Map<String, String> env = pb.environment();
-            if (env.get("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT") == null) {
+            if (Objects.isNull(env.get("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT"))) {
                 env.put("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT", "600000");
             }
 
@@ -222,7 +224,7 @@ public class BrowserService {
                     String chunk = new String(buf, 0, len, StandardCharsets.UTF_8);
                     for (String line : chunk.split("\\R")) {
                         line = line.trim();
-                        if (!line.isBlank()) {
+                        if (!StringUtils.isBlank(line)) {
                             log.info("  playwright: {}", line);
                         }
                     }
@@ -253,7 +255,7 @@ public class BrowserService {
 
     private static String resolvePlaywrightJarPath() {
         String classpath = System.getProperty("java.class.path");
-        if (classpath != null) {
+        if (Objects.nonNull(classpath)) {
             for (String entry : classpath.split(File.pathSeparator)) {
                 if (entry.contains("playwright") && entry.endsWith(".jar") && Files.isRegularFile(Paths.get(entry))) {
                     return entry;
@@ -265,7 +267,7 @@ public class BrowserService {
         String jarName = "playwright-" + ver + ".jar";
         List<String> fallbacks = new ArrayList<>();
         String m2Local = System.getProperty("maven.repo.local");
-        if (m2Local != null && !m2Local.isBlank()) {
+        if (StringUtils.isNotBlank(m2Local)) {
             fallbacks.add(Paths.get(m2Local, "com", "microsoft", "playwright", "playwright", ver, jarName).toString());
         }
         fallbacks.add(Paths.get(System.getProperty("user.home"), ".m2", "repository", "com", "microsoft", "playwright", "playwright", ver, jarName).toString());
@@ -287,7 +289,7 @@ public class BrowserService {
             Process p = pb.start();
 
             Map<String, String> env = pb.environment();
-            if (env.get("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT") == null) {
+            if (Objects.isNull(env.get("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT"))) {
                 env.put("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT", "600000");
             }
 
@@ -298,7 +300,7 @@ public class BrowserService {
                     String chunk = new String(buf, 0, len, StandardCharsets.UTF_8);
                     if (chunk.contains("%") || chunk.contains("Downloading") || chunk.contains("installed")) {
                         for (String line : chunk.split("\\R")) {
-                            if (!line.isBlank()) {
+                            if (!StringUtils.isBlank(line)) {
                                 log.info("  {}", line.trim());
                             }
                         }
@@ -328,7 +330,7 @@ public class BrowserService {
             pb.redirectErrorStream(true);
             pb.directory(new java.io.File(System.getProperty("user.dir")));
             Map<String, String> env = pb.environment();
-            if (env.get("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT") == null) {
+            if (Objects.isNull(env.get("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT"))) {
                 env.put("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT", "600000");
             }
             Process p = pb.start();
@@ -354,7 +356,7 @@ public class BrowserService {
      */
     private Page getPage(String sessionId) {
         // 空字符串/null → 用 "default" session
-        if (sessionId == null || sessionId.isBlank()) {
+        if (StringUtils.isBlank(sessionId)) {
             sessionId = "default";
         }
         return pages.computeIfAbsent(sessionId, id -> {
@@ -373,7 +375,7 @@ public class BrowserService {
     public String navigate(String sessionId, String url) {
         try {
             String blocked = networkGuard.validateUrl(url);
-            if (blocked != null) return blocked;
+            if (Objects.nonNull(blocked)) return blocked;
             Page page = getPage(sessionId);
             page.navigate(url, new Page.NavigateOptions()
                     .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
@@ -422,8 +424,8 @@ public class BrowserService {
     }
 
     public String click(String sessionId, String ref, String by) {
-        if (ref == null || ref.isBlank()) return "点击失败: ref 为空";
-        String mode = by == null || by.isBlank() ? "auto" : by.trim().toLowerCase(Locale.ROOT);
+        if (StringUtils.isBlank(ref)) return "点击失败: ref 为空";
+        String mode = StringUtils.isBlank(by) ? "auto" : by.trim().toLowerCase(Locale.ROOT);
         try {
             Page page = getPage(sessionId);
             boolean numeric = ref.chars().allMatch(Character::isDigit);
@@ -438,7 +440,7 @@ public class BrowserService {
                 case "auto" -> page.getByText(ref, new Page.GetByTextOptions().setExact(true));
                 default -> null;
             };
-            if (loc == null) {
+            if (Objects.isNull(loc)) {
                 return "点击失败: 未知 by=" + mode + "，可用 ref|text|role|css|aria";
             }
             return clickAndSnap(page, loc, mode, ref);
@@ -457,11 +459,11 @@ public class BrowserService {
             return "点击失败: by=ref 需要数字编号，收到: " + ref;
         }
         String elementInfo = findElementByRef(page, refNum);
-        if (elementInfo == null) return "点击失败: 快照中无 ref=" + ref + "。请先 browser_snapshot。";
+        if (Objects.isNull(elementInfo)) return "点击失败: 快照中无 ref=" + ref + "。请先 browser_snapshot。";
         log.info("click ref={} 对应元素: {}", ref, elementInfo);
         java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"([^\"]+)\"").matcher(elementInfo);
         String name = m.find() ? m.group(1) : null;
-        if (name == null || name.isBlank()) {
+        if (StringUtils.isBlank(name)) {
             return "点击失败: ref=" + ref + " 无可用名称 [" + elementInfo + "]。改用 by=css。";
         }
         // 按快照角色选唯一策略；失败直接报错，不静默串联
@@ -518,11 +520,11 @@ public class BrowserService {
             try {
                 int refNum = Integer.parseInt(ref);
                 String elementInfo = findElementByRef(page, refNum);
-                if (elementInfo != null) {
+                if (Objects.nonNull(elementInfo)) {
                     log.info("ref={} 对应元素: {}", ref, elementInfo);
                     // 尝试用 placeholder / label 找输入框
                     Locator input = findInputByInfo(page, elementInfo);
-                    if (input != null) {
+                    if (Objects.nonNull(input)) {
                         input.fill(text, new Locator.FillOptions().setTimeout(shortTimeout));
                         return "输入成功: ref=" + ref + " text=\"" + text + "\"\n\n"
                                 + formatSnapshot(page.locator("body").ariaSnapshot());
@@ -584,13 +586,13 @@ public class BrowserService {
         String label = m.find() ? m.group(1) : null;
 
         if (elementInfo.contains("searchbox") || elementInfo.contains("textbox")
-                || (label != null && (label.contains("搜索") || label.contains("search")))) {
+                || (Objects.nonNull(label) && (label.contains("搜索") || label.contains("search")))) {
             // 搜索框 / 输入框
             Locator byPlaceholder = page.locator("input[placeholder]").first();
             if (byPlaceholder.count() > 0) return byPlaceholder;
         }
 
-        if (label != null) {
+        if (Objects.nonNull(label)) {
             try {
                 return page.getByPlaceholder(label);
             } catch (Exception ignored) {}
@@ -656,7 +658,7 @@ public class BrowserService {
      */
     public String close(String sessionId) {
         Page page = pages.remove(sessionId);
-        if (page != null) {
+        if (Objects.nonNull(page)) {
             page.close();
             return "浏览器页面已关闭: " + sessionId;
         }
@@ -670,7 +672,7 @@ public class BrowserService {
         try {
             Page page = getPage(sessionId);
             Object result = page.evaluate(expression);
-            return "执行结果: " + (result != null ? result.toString() : "null");
+            return "执行结果: " + (Objects.nonNull(result) ? result.toString() : "null");
         } catch (Exception e) {
             return "执行失败: " + e.getMessage();
         }
@@ -684,7 +686,7 @@ public class BrowserService {
      * 处理后: [1] - link "搜索"
      */
     private String formatSnapshot(String snapshot) {
-        if (snapshot == null || snapshot.isBlank()) {
+        if (StringUtils.isBlank(snapshot)) {
             return "（页面为空）";
         }
 
@@ -715,7 +717,7 @@ public class BrowserService {
         log.info("关闭所有浏览器会话...");
         pages.values().forEach(Page::close);
         pages.clear();
-        if (browser != null) browser.close();
-        if (playwright != null) playwright.close();
+        if (Objects.nonNull(browser)) browser.close();
+        if (Objects.nonNull(playwright)) playwright.close();
     }
 }

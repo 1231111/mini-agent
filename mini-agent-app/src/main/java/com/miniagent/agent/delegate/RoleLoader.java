@@ -36,7 +36,7 @@ public class RoleLoader {
                 Map<String, Map<String, Object>> rolesMap =
                         (Map<String, Map<String, Object>>) root.get("roles");
 
-                if (rolesMap == null) {
+                if (Objects.isNull(rolesMap)) {
                     log.warn("roles.yml 中未找到 roles 配置");
                     return;
                 }
@@ -99,7 +99,7 @@ public class RoleLoader {
     }
 
     private List<String> toStringList(Object obj) {
-        if (obj == null) return List.of();
+        if (Objects.isNull(obj)) return List.of();
         if (obj instanceof List<?> list) {
             return list.stream()
                     .map(String::valueOf)

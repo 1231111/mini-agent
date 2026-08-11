@@ -1,5 +1,7 @@
 package com.miniagent.agent.tool;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
@@ -8,7 +10,6 @@ import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import jakarta.annotation.PostConstruct;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -19,6 +20,9 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * ast_search：基于 JavaParser 的结构化代码检索。
@@ -29,10 +33,10 @@ import java.util.Map;
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class AstSearchTool {
 
-    private final ToolRegistry toolRegistry;
+    @Autowired
+    private ToolRegistry toolRegistry;
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final int MAX_RESULTS = 100;
 
@@ -69,13 +73,13 @@ public class AstSearchTool {
 
     private String handle(String json) {
         try {
-            Map<String, Object> args = MAPPER.readValue(json == null ? "{}" : json, Map.class);
+            Map<String, Object> args = MAPPER.readValue(Optional.ofNullable(json).orElse("{}"), Map.class);
             String queryType = String.valueOf(args.getOrDefault("query_type", "")).trim();
             if (queryType.isEmpty()) return err("query_type 不能为空");
-            String name = args.get("name") == null ? null : String.valueOf(args.get("name")).trim();
-            String pathArg = args.get("path") == null ? null : String.valueOf(args.get("path")).trim();
+            String name = Objects.isNull(args.get("name")) ? null : String.valueOf(args.get("name")).trim();
+            String pathArg = Objects.isNull(args.get("path")) ? null : String.valueOf(args.get("path")).trim();
 
-            Path root = (pathArg == null || pathArg.isBlank())
+            Path root = (StringUtils.isBlank(pathArg))
                     ? Path.of(System.getProperty("user.dir")).toAbsolutePath()
                     : resolvePath(pathArg);
             if (!Files.exists(root)) return err("路径不存在: " + pathArg);
@@ -95,7 +99,7 @@ public class AstSearchTool {
                 scanFile(f, root, queryType, name, hits);
             }
 
-            if (hits.isEmpty()) return "（无匹配）query_type=" + queryType + (name != null ? ", name=" + name : "");
+            if (hits.isEmpty()) return "（无匹配）query_type=" + queryType + (Objects.nonNull(name) ? ", name=" + name : "");
             StringBuilder sb = new StringBuilder("匹配 " + hits.size() + " 处"
                     + (hits.size() >= MAX_RESULTS ? "（已达上限）" : "") + ":\n");
             hits.forEach(h -> sb.append(h).append('\n'));
@@ -155,11 +159,11 @@ public class AstSearchTool {
     }
 
     private static boolean matches(String actual, String wanted) {
-        return wanted == null || wanted.isBlank() || actual.equals(wanted);
+        return StringUtils.isBlank(wanted) || actual.equals(wanted);
     }
 
     private static boolean hasAnnotation(com.github.javaparser.ast.NodeList<com.github.javaparser.ast.expr.AnnotationExpr> anns, String name) {
-        if (name == null) return !anns.isEmpty();
+        if (Objects.isNull(name)) return !anns.isEmpty();
         return anns.stream().anyMatch(a -> a.getNameAsString().equals(name));
     }
 

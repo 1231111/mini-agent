@@ -1,5 +1,7 @@
 package com.miniagent.agent.intent;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import org.springframework.stereotype.Component;
 
 /**
@@ -8,11 +10,11 @@ import org.springframework.stereotype.Component;
 @Component
 public class ComplexTaskDetector {
 
-    private final IntentSignalMatcher signals;
+    @Autowired
 
-    public ComplexTaskDetector(IntentSignalMatcher signals) {
-        this.signals = signals;
-    }
+    private IntentSignalMatcher signals;
+
+    
 
     public boolean isComplex(String userMessage) {
         return signals.complex(userMessage);

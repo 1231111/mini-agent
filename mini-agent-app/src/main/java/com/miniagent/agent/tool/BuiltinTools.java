@@ -27,6 +27,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 内置工具集合：文件操作、HTTP 请求、命令执行、浏览器操控
@@ -87,7 +88,7 @@ public class BuiltinTools {
      * （read_file 缓存 key 形如 "read_file|{...\"path\":\"xxx\"...}"，按文件名子串匹配失效）。
      */
     private void invalidateReadCache(String path) {
-        if (path == null || path.isBlank()) {
+        if (StringUtils.isBlank(path)) {
             toolResultCache.clear();
             return;
         }
@@ -96,7 +97,7 @@ public class BuiltinTools {
         String fileName = norm.contains("/") ? norm.substring(norm.lastIndexOf('/') + 1) : norm;
         toolResultCache.keySet().removeIf(k -> {
             String kn = k.replace('\\', '/');
-            return kn.contains(norm) || (!fileName.isBlank() && kn.contains(fileName));
+            return kn.contains(norm) || (!StringUtils.isBlank(fileName) && kn.contains(fileName));
         });
     }
 
@@ -129,7 +130,7 @@ public class BuiltinTools {
                     // 缓存命中检查
                     String cacheKey = "read_file|" + args;
                     String cached = toolResultCache.get(cacheKey);
-                    if (cached != null) {
+                    if (Objects.nonNull(cached)) {
                         log.debug("read_file 缓存命中: {}", cacheKey);
                         return cached;
                     }
@@ -156,7 +157,7 @@ public class BuiltinTools {
                         return "{\"error\":\"参数 JSON 不完整，疑似本次输出被长度上限截断。请改用分块写入：先 mode=overwrite 写前半部分，再多次 mode=append 续写剩余内容，每次内容不要太长。\"}";
                     }
                     String content = (String) p.get("content");
-                    if (content == null) {
+                    if (Objects.isNull(content)) {
                         return "{\"error\":\"缺少 content 参数（或参数被截断）。大文件请分块写入：首次 mode=overwrite，后续 mode=append。\"}";
                     }
                     boolean append = "append".equalsIgnoreCase(String.valueOf(p.get("mode")));
@@ -242,7 +243,7 @@ public class BuiltinTools {
                 args -> {
                     Map<String, Object> p = parseJson(args);
                     String pattern = (String) p.get("pattern");
-                    if (pattern == null || pattern.isBlank()) return "{\"error\":\"pattern 不能为空\"}";
+                    if (StringUtils.isBlank(pattern)) return "{\"error\":\"pattern 不能为空\"}";
                     String path = (String) p.get("path");
                     String glob = (String) p.get("glob");
                     int max = p.containsKey("max_results") ? ((Number) p.get("max_results")).intValue() : 100;
@@ -263,7 +264,7 @@ public class BuiltinTools {
                     Map<String, Object> p = parseJson(args);
                     String path = (String) p.get("path");
                     String oldStr = (String) p.get("old_string");
-                    String newStr = p.get("new_string") == null ? "" : (String) p.get("new_string");
+                    String newStr = Objects.isNull(p.get("new_string")) ? "" : (String) p.get("new_string");
                     boolean replaceAll = Boolean.TRUE.equals(p.get("replace_all"));
                     return editFile(path, oldStr, newStr, replaceAll);
                 });
@@ -271,15 +272,15 @@ public class BuiltinTools {
 
     /** search_code 实现：优先 ripgrep，失败回退 Java 正则扫描。 */
     private String searchCode(String pattern, String path, String glob, int maxResults) {
-        Path root = (path == null || path.isBlank())
+        Path root = (StringUtils.isBlank(path))
                 ? Path.of(System.getProperty("user.dir")).toAbsolutePath()
                 : resolveSearchPath(path);
         if (!Files.exists(root)) return "{\"error\":\"路径不存在: " + path + "\"}";
 
         String rg = ripgrepPath();
-        if (rg != null) {
+        if (Objects.nonNull(rg)) {
             String r = searchViaRipgrep(rg, pattern, root, glob, maxResults);
-            if (r != null) return r;  // null 表示 rg 执行异常，回退
+            if (Objects.nonNull(r)) return r;  // null 表示 rg 执行异常，回退
         }
         return searchViaJava(pattern, root, glob, maxResults);
     }
@@ -287,9 +288,9 @@ public class BuiltinTools {
     /** 探测 ripgrep 是否可用，返回可执行路径或 null。结果缓存避免每次 where 调用。 */
     private static volatile String cachedRgPath;   // null=未探测; ""=不可用; 其它=路径
     private String ripgrepPath() {
-        if (cachedRgPath != null) return cachedRgPath.isEmpty() ? null : cachedRgPath;
+        if (Objects.nonNull(cachedRgPath)) return cachedRgPath.isEmpty() ? null : cachedRgPath;
         synchronized (BuiltinTools.class) {
-            if (cachedRgPath != null) return cachedRgPath.isEmpty() ? null : cachedRgPath;
+            if (Objects.nonNull(cachedRgPath)) return cachedRgPath.isEmpty() ? null : cachedRgPath;
             try {
                 boolean win = System.getProperty("os.name", "").toLowerCase().contains("win");
                 ProcessBuilder pb = win ? new ProcessBuilder("where", "rg")
@@ -298,7 +299,7 @@ public class BuiltinTools {
                 Process proc = pb.start();
                 String out = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
                 boolean ok = proc.waitFor(5, java.util.concurrent.TimeUnit.SECONDS) && proc.exitValue() == 0;
-                cachedRgPath = (ok && !out.isBlank()) ? out.lines().findFirst().orElse("rg").trim() : "";
+                cachedRgPath = (ok && !StringUtils.isBlank(out)) ? out.lines().findFirst().orElse("rg").trim() : "";
             } catch (Exception e) {
                 cachedRgPath = "";
             }
@@ -311,7 +312,7 @@ public class BuiltinTools {
             List<String> cmd = new ArrayList<>(List.of(
                     rg, "--line-number", "--no-heading", "--color", "never",
                     "--max-count", String.valueOf(Math.max(1, maxResults))));
-            if (glob != null && !glob.isBlank()) { cmd.add("--glob"); cmd.add(glob); }
+            if (StringUtils.isNotBlank(glob)) { cmd.add("--glob"); cmd.add(glob); }
             cmd.add(pattern);
             cmd.add(root.toString());
             ProcessBuilder pb = new ProcessBuilder(cmd);
@@ -341,7 +342,7 @@ public class BuiltinTools {
         try (var stream = Files.walk(root)) {
             var it = stream.filter(Files::isRegularFile)
                     .filter(f -> !isBinaryOrIgnored(f))
-                    .filter(f -> globRe == null || globRe.matcher(f.getFileName().toString()).matches())
+                    .filter(f -> Objects.isNull(globRe) || globRe.matcher(f.getFileName().toString()).matches())
                     .iterator();
             while (it.hasNext() && count[0] < maxResults) {
                 Path f = it.next();
@@ -365,12 +366,12 @@ public class BuiltinTools {
     }
 
     private String formatSearchOutput(String raw, Path root, int maxResults, String engine) {
-        if (raw == null || raw.isBlank()) return "（无匹配）";
+        if (StringUtils.isBlank(raw)) return "（无匹配）";
         String[] lines = raw.split("\n");
         StringBuilder sb = new StringBuilder();
         int n = 0;
         for (String line : lines) {
-            if (line.isBlank()) continue;
+            if (StringUtils.isBlank(line)) continue;
             if (n >= maxResults) break;
             // rg 输出绝对路径，转相对路径更紧凑
             String rel = line;
@@ -388,8 +389,8 @@ public class BuiltinTools {
 
     /** edit_file 实现：校验唯一匹配后替换。 */
     private String editFile(String path, String oldStr, String newStr, boolean replaceAll) {
-        if (path == null || path.isBlank()) return "{\"error\":\"path 不能为空\"}";
-        if (oldStr == null || oldStr.isEmpty()) return "{\"error\":\"old_string 不能为空（新建文件请用 write_file）\"}";
+        if (StringUtils.isBlank(path)) return "{\"error\":\"path 不能为空\"}";
+        if (Objects.isNull(oldStr) || oldStr.isEmpty()) return "{\"error\":\"old_string 不能为空（新建文件请用 write_file）\"}";
         if (oldStr.equals(newStr)) return "{\"error\":\"old_string 与 new_string 相同，无需编辑\"}";
         try {
             Path target = resolveSearchPath(path);
@@ -439,7 +440,7 @@ public class BuiltinTools {
 
     /** 把 glob（*.java、*.{ts,tsx}）转成文件名正则；null/空返回 null（不过滤）。 */
     private static java.util.regex.Pattern globToRegex(String glob) {
-        if (glob == null || glob.isBlank()) return null;
+        if (StringUtils.isBlank(glob)) return null;
         StringBuilder re = new StringBuilder();
         for (int i = 0; i < glob.length(); i++) {
             char c = glob.charAt(i);
@@ -497,7 +498,7 @@ public class BuiltinTools {
                     Map<String, Object> p = parseJson(args);
                     String url = (String) p.get("url");
                     String blocked = networkGuard.validateUrl(url);
-                    if (blocked != null) return "{\"error\":\"" + blocked.replace("\"", "'") + "\"}";
+                    if (Objects.nonNull(blocked)) return "{\"error\":\"" + blocked.replace("\"", "'") + "\"}";
                     String sid = (String) p.getOrDefault("sessionId", "default");
                     return browserService.navigate(sid, url);
                 });
@@ -528,7 +529,7 @@ public class BuiltinTools {
                     Map<String, Object> p = parseJson(args);
                     String ref = strArg(p, "ref");
                     String by = strArg(p, "by");
-                    if (by == null || by.isBlank()) by = "auto";
+                    if (StringUtils.isBlank(by)) by = "auto";
                     String sid = (String) p.getOrDefault("sessionId", "default");
                     return browserService.click(sid, ref, by);
                 });
@@ -816,13 +817,13 @@ public class BuiltinTools {
                     Map<String, Object> p = parseJson(args);
                     String name = (String) p.get("name");
                     String filePath = (String) p.getOrDefault("file_path", "");
-                    if (name == null) return "{\"error\":\"name is required\"}";
+                    if (Objects.isNull(name)) return "{\"error\":\"name is required\"}";
                     if (!filePath.isEmpty()) {
                         String content = skillStore.viewSkillFile(name, filePath);
-                        return content != null ? content : "File not found: " + name + "/" + filePath;
+                        return Optional.ofNullable(content).orElse("File not found: " + name + "/" + filePath);
                     }
                     String content = skillStore.viewSkill(name);
-                    return content != null ? content : "Skill not found: " + name;
+                    return Optional.ofNullable(content).orElse("Skill not found: " + name);
                 });
 
         // skill_manage - 创建/编辑/删除 skill
@@ -841,7 +842,7 @@ public class BuiltinTools {
                     Map<String, Object> p = parseJson(args);
                     String action = (String) p.get("action");
                     String name = (String) p.get("name");
-                    if (action == null || name == null) return "{\"error\":\"action and name are required\"}";
+                    if (Objects.isNull(action) || Objects.isNull(name)) return "{\"error\":\"action and name are required\"}";
                     try {
                         Map<String, Object> result;
                         switch (action) {
@@ -877,7 +878,7 @@ public class BuiltinTools {
     /** 默认 workspace：与 AgentDataPaths 对齐（miniagent.data.dir/workspace） */
     public static Path defaultWorkspaceRoot() {
         String data = System.getProperty("miniagent.data.dir");
-        Path base = (data != null && !data.isBlank())
+        Path base = (StringUtils.isNotBlank(data))
                 ? Path.of(data)
                 : Path.of(System.getProperty("user.dir")).toAbsolutePath();
         return base.resolve("workspace").toAbsolutePath().normalize();
@@ -886,12 +887,12 @@ public class BuiltinTools {
     /** 有效 workspace 根：子 Agent 可覆盖为独立目录 */
     public static Path effectiveWorkspaceRoot() {
         Path override = com.miniagent.agent.core.WorkspaceContext.getRootOverride();
-        return override != null ? override.toAbsolutePath().normalize() : defaultWorkspaceRoot();
+        return Objects.nonNull(override) ? override.toAbsolutePath().normalize() : defaultWorkspaceRoot();
     }
 
     /** 为子 Agent 准备独立写出目录：workspace/_sub/{safeId}/ */
     public static Path prepareSubagentWorkspace(String subSessionId) {
-        String safe = subSessionId == null ? "sub" : subSessionId.replaceAll("[^a-zA-Z0-9._-]", "_");
+        String safe = Objects.isNull(subSessionId) ? "sub" : subSessionId.replaceAll("[^a-zA-Z0-9._-]", "_");
         if (safe.length() > 80) safe = safe.substring(0, 80);
         Path root = defaultWorkspaceRoot().resolve("_sub").resolve(safe).toAbsolutePath().normalize();
         try {
@@ -909,7 +910,7 @@ public class BuiltinTools {
     private static final ThreadLocal<String> currentTaskName = ThreadLocal.withInitial(() -> "default");
 
     public static void setCurrentTaskName(String name) {
-        if (name == null || name.isBlank()) {
+        if (StringUtils.isBlank(name)) {
             currentTaskName.set("default");
             return;
         }
@@ -923,7 +924,7 @@ public class BuiltinTools {
         slug = slug.replaceAll("_{2,}", "_").replaceAll("^_|_$", "");
         // 4. 截断到 40 字符
         if (slug.length() > 40) slug = slug.substring(0, 40);
-        currentTaskName.set(slug.isBlank() ? "task_" + Integer.toHexString(name.hashCode()) : slug);
+        currentTaskName.set(StringUtils.isBlank(slug) ? "task_" + Integer.toHexString(name.hashCode()) : slug);
     }
 
     public static void clearCurrentTaskName() {
@@ -1020,7 +1021,7 @@ public class BuiltinTools {
             Files.createDirectories(target.getParent());
             // 如果是 markdown 文件，统一图片路径为 /static/images/ 前缀
             String finalContent = content;
-            if (path != null && path.toLowerCase().endsWith(".md")) {
+            if (Objects.nonNull(path) && path.toLowerCase().endsWith(".md")) {
                 finalContent = finalContent.replaceAll(
                     "!\\[([^\\]]*)\\]\\(generated-images/([^)]+)\\)",
                     "![$1](/static/images/$2)"
@@ -1071,8 +1072,8 @@ public class BuiltinTools {
     private Path resolveWorkspacePath(String path) {
         Path workspaceRoot = effectiveWorkspaceRoot();
         String task = com.miniagent.agent.core.WorkspaceContext.getTaskOverride();
-        if (task == null || task.isBlank()) task = currentTaskName.get();
-        if (path == null || path.isBlank()) {
+        if (StringUtils.isBlank(task)) task = currentTaskName.get();
+        if (StringUtils.isBlank(path)) {
             return workspaceRoot.resolve(task).normalize();
         }
         String normalized = path.replace('\\', '/').trim();
@@ -1086,7 +1087,7 @@ public class BuiltinTools {
             resolved = p.normalize();
         } else if (normalized.startsWith("workspace/") || normalized.equals("workspace")) {
             resolved = Path.of(".").toAbsolutePath().resolve(normalized).normalize();
-        } else if (p.getParent() == null) {
+        } else if (Objects.isNull(p.getParent())) {
             resolved = workspaceRoot.resolve(task).resolve(p).normalize();
         } else {
             resolved = workspaceRoot.resolve(p).normalize();
@@ -1111,7 +1112,7 @@ public class BuiltinTools {
      *   3. 都不存在 → 退回 {@link #resolveWorkspacePath}，保留读取自身产出物的原有语义。
      */
     private Path resolveReadPath(String path) {
-        if (path == null || path.isBlank()) {
+        if (StringUtils.isBlank(path)) {
             return resolveWorkspacePath(path);
         }
         String normalized = path.replace('\\', '/').trim();
@@ -1132,7 +1133,7 @@ public class BuiltinTools {
     private String httpGet(String url) {
         try {
             String blocked = networkGuard.validateUrl(url);
-            if (blocked != null) return "{\"error\":\"" + blocked.replace("\"", "'") + "\"}";
+            if (Objects.nonNull(blocked)) return "{\"error\":\"" + blocked.replace("\"", "'") + "\"}";
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .timeout(Duration.ofSeconds(20))
@@ -1151,7 +1152,7 @@ public class BuiltinTools {
     // ==================== 命令执行实现 ====================
 
     private static String redactSensitive(String s) {
-        if (s == null) return "";
+        if (Objects.isNull(s)) return "";
         return s
                 .replaceAll("(?i)(access_token=)[^&\\s\"'}\\]]+", "$1***")
                 .replaceAll("(?i)(secret=)[^&\\s\"'}\\]]+", "$1***")
@@ -1302,7 +1303,7 @@ public class BuiltinTools {
 
     /** 把字符串安全编码为 JSON 字符串字面量（含引号），用于拼装错误返回。 */
     private static String jsonString(String s) {
-        if (s == null) return "\"\"";
+        if (Objects.isNull(s)) return "\"\"";
         StringBuilder sb = new StringBuilder(s.length() + 16);
         sb.append('"');
         for (int i = 0; i < s.length(); i++) {
@@ -1358,7 +1359,7 @@ public class BuiltinTools {
     static final String PARSE_ERROR_KEY = "__parse_error__";
 
     private Map<String, Object> parseJson(String json) {
-        if (json == null || json.isBlank()) return new HashMap<>();
+        if (StringUtils.isBlank(json)) return new HashMap<>();
         try {
             com.fasterxml.jackson.databind.ObjectMapper om = new com.fasterxml.jackson.databind.ObjectMapper();
             @SuppressWarnings("unchecked")
@@ -1376,18 +1377,18 @@ public class BuiltinTools {
 
     /** 截断超长字符串，附省略标记。供搜索结果控 token。 */
     private static String truncate(String s, int max) {
-        if (s == null) return "";
+        if (Objects.isNull(s)) return "";
         return s.length() <= max ? s : s.substring(0, max) + "…";
     }
 
     static String strArg(Map<String, Object> p, String key) {
         Object v = p.get(key);
-        return v == null ? "" : String.valueOf(v).trim();
+        return Objects.isNull(v) ? "" : String.valueOf(v).trim();
     }
 
     static int intArg(Map<String, Object> p, String key, int defaultValue) {
         Object v = p.get(key);
-        if (v == null) return defaultValue;
+        if (Objects.isNull(v)) return defaultValue;
         if (v instanceof Number n) return n.intValue();
         try {
             return Integer.parseInt(String.valueOf(v).trim());

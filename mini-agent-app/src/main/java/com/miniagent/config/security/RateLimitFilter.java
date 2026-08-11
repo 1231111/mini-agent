@@ -4,6 +4,8 @@ import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import jakarta.annotation.PostConstruct;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
@@ -24,15 +26,16 @@ import java.util.concurrent.ConcurrentHashMap;
 @Order(Ordered.HIGHEST_PRECEDENCE + 20)
 public class RateLimitFilter extends OncePerRequestFilter {
 
-    private final int perMinute;
-    private final SessionCookieService sessionCookieService;
+    @Value("${agent.rate-limit.per-minute:60}")
+    private int perMinuteConfig;
+    private int perMinute = 60;
+    @Autowired
+    private SessionCookieService sessionCookieService;
     private final Map<String, Deque<Long>> windows = new ConcurrentHashMap<>();
 
-    public RateLimitFilter(
-            @Value("${agent.rate-limit.per-minute:60}") int perMinute,
-            SessionCookieService sessionCookieService) {
-        this.perMinute = Math.max(1, perMinute);
-        this.sessionCookieService = sessionCookieService;
+    @PostConstruct
+    private void initRate() {
+        this.perMinute = Math.max(1, perMinuteConfig);
     }
 
     @Override

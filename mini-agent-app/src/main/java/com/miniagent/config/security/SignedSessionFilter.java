@@ -1,5 +1,7 @@
 package com.miniagent.config.security;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -13,15 +15,16 @@ import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Objects;
 
 @Component
 public class SignedSessionFilter extends OncePerRequestFilter {
 
-    private final SessionCookieService sessionCookieService;
+    @Autowired
 
-    public SignedSessionFilter(SessionCookieService sessionCookieService) {
-        this.sessionCookieService = sessionCookieService;
-    }
+    private SessionCookieService sessionCookieService;
+
+    
 
     /** SSE/异步派发必须重新挂载认证，否则 async dispatch 会 Access Denied */
     @Override
@@ -38,7 +41,7 @@ public class SignedSessionFilter extends OncePerRequestFilter {
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
         Long userId = sessionCookieService.resolveUserId(request);
-        if (userId != null) {
+        if (Objects.nonNull(userId)) {
             request.setAttribute(SessionCookieService.ATTR_USER_ID, userId);
             SecurityContext context = SecurityContextHolder.createEmptyContext();
             context.setAuthentication(new UsernamePasswordAuthenticationToken(

@@ -1,5 +1,9 @@
 package com.miniagent.agent.memory;
 
+import jakarta.annotation.PostConstruct;
+
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.miniagent.memory.AgentDataPaths;
 import com.miniagent.memory.MemoryVectorIndex;
 import dev.langchain4j.data.embedding.Embedding;
@@ -21,6 +25,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 长期记忆向量检索（按 userId 隔离）。
@@ -38,6 +45,9 @@ import java.util.concurrent.ConcurrentHashMap;
 @Component
 public class VectorMemoryStore implements MemoryVectorIndex {
 
+    @Autowired
+    private AgentDataPaths dataPaths;
+
     @Value("${agent.memory.vector.enabled:true}")
     private boolean enabled;
     @Value("${agent.memory.vector.top-k:6}")
@@ -53,23 +63,24 @@ public class VectorMemoryStore implements MemoryVectorIndex {
     @Value("${agent.codebase.embedding-model:BAAI/bge-m3}")
     private String embeddingModelName;
 
-    private final Path memoryDir;
+    private Path memoryDir;
     private EmbeddingModel embeddingModel;
     private final Map<Long, InMemoryEmbeddingStore<TextSegment>> stores = new ConcurrentHashMap<>();
     private static final Long DEFAULT_USER = -1L;
 
-    public VectorMemoryStore(AgentDataPaths dataPaths) {
+    @PostConstruct
+    private void initAutowiredComputed() {
         this.memoryDir = dataPaths.memory();
     }
 
     /** 向量检索是否可用（受配置开关与 embedding key 共同控制）。 */
     public boolean isEnabled() {
-        return enabled && apiKey != null && !apiKey.isBlank();
+        return enabled && StringUtils.isNotBlank(apiKey);
     }
 
     /** 某用户是否已有向量索引（内存或磁盘）。用于判断是否需要首建。 */
     public boolean hasIndex(Long userId) {
-        Long uid = userId == null ? DEFAULT_USER : userId;
+        Long uid = Optional.ofNullable(userId).orElse(DEFAULT_USER);
         return stores.containsKey(uid) || Files.exists(vecPath(uid));
     }
 
@@ -83,7 +94,7 @@ public class VectorMemoryStore implements MemoryVectorIndex {
     }
 
     private EmbeddingModel embeddingModel() {
-        if (embeddingModel == null) {
+        if (Objects.isNull(embeddingModel)) {
             // 显式 JDK 客户端，避免与 SpringRestClient 在 classpath 冲突
             JdkHttpClientBuilder http = new JdkHttpClientBuilder()
                     .connectTimeout(Duration.ofSeconds(15))
@@ -104,11 +115,11 @@ public class VectorMemoryStore implements MemoryVectorIndex {
      */
     public synchronized void reindex(Long userId, List<String> entries) {
         if (!isEnabled()) return;
-        Long uid = userId == null ? DEFAULT_USER : userId;
+        Long uid = Optional.ofNullable(userId).orElse(DEFAULT_USER);
         try {
             InMemoryEmbeddingStore<TextSegment> fresh = new InMemoryEmbeddingStore<>();
             for (String entry : entries) {
-                if (entry == null || entry.isBlank()) continue;
+                if (StringUtils.isBlank(entry)) continue;
                 try {
                     TextSegment seg = TextSegment.from(entry);
                     Embedding emb = embeddingModel().embed(seg).content();
@@ -134,7 +145,7 @@ public class VectorMemoryStore implements MemoryVectorIndex {
     /** 取某用户的向量库，首次访问时尝试从磁盘加载。 */
     private InMemoryEmbeddingStore<TextSegment> storeOf(Long uid) {
         InMemoryEmbeddingStore<TextSegment> store = stores.get(uid);
-        if (store != null) return store;
+        if (Objects.nonNull(store)) return store;
         Path p = vecPath(uid);
         if (Files.exists(p)) {
             try {
@@ -153,11 +164,11 @@ public class VectorMemoryStore implements MemoryVectorIndex {
      * @return 召回的条目文本列表；不可用或无命中时返回空列表（调用方据此回退全量注入）。
      */
     public List<String> recall(Long userId, String query) {
-        if (!isEnabled() || query == null || query.isBlank()) return List.of();
-        Long uid = userId == null ? DEFAULT_USER : userId;
+        if (!isEnabled() || StringUtils.isBlank(query)) return List.of();
+        Long uid = Optional.ofNullable(userId).orElse(DEFAULT_USER);
         try {
             InMemoryEmbeddingStore<TextSegment> store = storeOf(uid);
-            if (store == null) return List.of();
+            if (Objects.isNull(store)) return List.of();
             Embedding q = embeddingModel().embed(query).content();
             EmbeddingSearchRequest req = EmbeddingSearchRequest.builder()
                     .queryEmbedding(q)

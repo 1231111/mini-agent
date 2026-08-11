@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Agent 轨迹监控</title>
-    <script>
+    <script th:inline="none">
         (function(){try{var t=localStorage.getItem('mini_agent_theme');if(!t)t=window.matchMedia&&window.matchMedia('(prefers-color-scheme:light)').matches?'light':'dark';document.documentElement.setAttribute('data-theme',t)}catch(e){document.documentElement.setAttribute('data-theme','dark')}})();
     </script>
     <style>
@@ -69,24 +69,16 @@
             border-radius: 10px; margin-top: 4px;
             background: var(--accent-soft); color: var(--accent);
         }
-        .exec-card {
-            padding: 10px 12px; border-radius: 8px;
-            cursor: pointer; margin-bottom: 4px;
-            border: 1px solid transparent;
-            transition: all .15s;
-        }
-        .exec-card:hover { background: var(--surface); }
-        .exec-card.active { background: var(--surface); border-color: var(--accent); }
-
         /* MAIN */
         .main { flex: 1; display: flex; flex-direction: column; min-width: 0; height: 100vh; }
         .topbar {
             padding: 12px 20px; border-bottom: 1px solid var(--border);
             display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+            flex-wrap: wrap;
         }
         .topbar h1 { font-size: 15px; font-weight: 600; color: var(--heading); }
         .topbar .session-id { font-size: 12px; color: var(--text3); font-family: monospace; }
-        .topbar .actions { margin-left: auto; display: flex; gap: 8px; }
+        .topbar .actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
         .topbar .actions button {
             padding: 6px 14px; border-radius: 8px; border: 1px solid var(--border);
             background: none; color: var(--text2); font-size: 12px; cursor: pointer;
@@ -94,6 +86,29 @@
         }
         .topbar .actions button:hover { background: var(--surface); color: var(--text); }
         .topbar .actions button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+        .exec-select {
+            min-width: 280px; max-width: 420px; flex: 1;
+            padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
+            background: var(--surface); color: var(--text); font-size: 12px; font-family: inherit;
+        }
+        .live-bar {
+            display: none; padding: 8px 20px; border-bottom: 1px solid var(--border);
+            background: rgba(59,130,246,.08); align-items: center; gap: 10px; flex-shrink: 0;
+            font-size: 12px;
+        }
+        .live-bar.on { display: flex; }
+        .live-dot {
+            width: 8px; height: 8px; border-radius: 50%; background: var(--running);
+            animation: pulse 1.2s infinite; flex-shrink: 0;
+        }
+        .live-label { color: var(--running); font-weight: 600; white-space: nowrap; }
+        .live-step { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .live-count { color: var(--text3); white-space: nowrap; }
+        tr.step-new td { animation: flashRow .8s ease; }
+        @keyframes flashRow {
+            from { background: rgba(16,163,127,.22); }
+            to { background: transparent; }
+        }
 
         /* SUMMARY BAR */
         .summary-bar {
@@ -106,7 +121,44 @@
 
         /* TIMELINE */
         .timeline-wrap { flex: 1; overflow-y: auto; padding: 20px; }
-        .timeline { max-width: 900px; margin: 0 auto; }
+        .timeline { max-width: 1100px; margin: 0 auto; }
+        .panel {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 12px; margin-bottom: 16px; overflow: hidden;
+        }
+        .panel-h {
+            padding: 10px 14px; font-size: 13px; font-weight: 600; color: var(--heading);
+            border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px;
+        }
+        .panel-h .hint { font-size: 11px; font-weight: 400; color: var(--text3); margin-left: auto; }
+        .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        .data-table th {
+            text-align: left; padding: 8px 12px; color: var(--text3); font-weight: 600;
+            background: var(--surface2); border-bottom: 1px solid var(--border); white-space: nowrap;
+        }
+        .data-table td {
+            padding: 10px 12px; border-bottom: 1px solid var(--border);
+            color: var(--text); vertical-align: top; line-height: 1.5;
+        }
+        .data-table tr:last-child td { border-bottom: none; }
+        .data-table tr:hover td { background: rgba(255,255,255,.02); }
+        .data-table .k { width: 140px; color: var(--text3); white-space: nowrap; }
+        .data-table .mono { font-family: "Fira Code", Consolas, monospace; font-size: 11px; }
+        .kv-mini { margin: 0; padding: 0; list-style: none; }
+        .kv-mini li { display: flex; gap: 8px; padding: 2px 0; }
+        .kv-mini .kk { color: var(--text3); flex: 0 0 90px; word-break: break-all; }
+        .kv-mini .vv { color: var(--text); flex: 1; word-break: break-word; white-space: pre-wrap; }
+        .badge-ok { color: var(--success); font-weight: 600; }
+        .badge-warn { color: var(--warning, #c9842f); font-weight: 600; }
+        .badge-fail { color: var(--failure); font-weight: 600; }
+        .badge-run { color: var(--running); font-weight: 600; }
+        .cell-clamp { max-height: 120px; overflow: auto; }
+        .raw-toggle {
+            cursor: pointer; user-select: none; padding: 10px 14px;
+            font-size: 12px; color: var(--text2); border-top: 1px solid var(--border);
+        }
+        .raw-toggle:hover { color: var(--text); }
+        .raw-body.hidden { display: none; }
         .turn-block { margin-bottom: 20px; }
         .turn-header {
             display: flex; align-items: center; gap: 10px;
@@ -233,26 +285,27 @@
     <div class="sb-list" id="sessionList"></div>
 </div>
 
-<!-- 任务执行列表 -->
-<div class="sidebar" id="execPanel" style="width:260px;border-right:1px solid var(--border)">
-    <div class="sb-header">
-        <h2>📋 任务列表</h2>
-    </div>
-    <div class="sb-list" id="execList"></div>
-</div>
-
 <div class="main">
     <div class="topbar">
         <h1>执行轨迹</h1>
         <span class="session-id" id="currentSessionId"></span>
+        <select class="exec-select" id="execSelect" onchange="onExecSelectChange()" title="本会话任务列表">
+            <option value="">选择任务…</option>
+        </select>
         <div class="actions">
             <button id="autoRefreshBtn" onclick="toggleAutoRefresh()">自动刷新</button>
-            <button onclick="loadTraces()">刷新</button>
+            <button onclick="loadTraces(true)">刷新</button>
             <button class="theme-btn" onclick="toggleTheme()">
                 <svg class="icon-sun" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
                 <svg class="icon-moon" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
             </button>
         </div>
+    </div>
+    <div class="live-bar" id="liveBar">
+        <div class="live-dot"></div>
+        <span class="live-label" id="liveLabel">运行中</span>
+        <span class="live-step" id="liveStep">等待节点…</span>
+        <span class="live-count" id="liveCount"></span>
     </div>
     <div class="summary-bar" id="summaryBar" style="display:none">
         <div class="stat"><span class="stat-value" id="statTurns">0</span><span class="stat-label">迭代轮次</span></div>
@@ -268,16 +321,27 @@
     </div>
 </div>
 
-<script>
+<script th:inline="none">
+/* 避免在源码里写连续方括号，防止 Thymeleaf 把其当成内联表达式 */
+const _LB = '[' , _RB = ']';
+const MD_IMG_RE = new RegExp('!' + '\\' + _LB + '[^' + '\\' + _RB + ']*' + '\\' + _RB + '\\(([^)]+)\\)');
+const MD_IMG_PREFIX_RE = new RegExp('!' + '\\' + _LB + '[^' + '\\' + _RB + ']*' + '\\' + _RB + '\\(');
+
 const $list = document.getElementById('sessionList');
 const $timeline = document.getElementById('timelineWrap');
 const $summary = document.getElementById('summaryBar');
 const $sessionId = document.getElementById('currentSessionId');
+const $execSelect = document.getElementById('execSelect');
+const $liveBar = document.getElementById('liveBar');
 let currentSid = null;
-let currentExecId = null; // 当前选中的执行ID
+let currentExecId = null;
 let autoRefreshTimer = null;
-let autoRefreshOn = true; // 默认开启自动刷新
-let knownSessions = new Set(); // 已知会话ID，用于检测新任务
+let autoRefreshOn = true;
+let knownSessions = new Set();
+let taskRunning = false;
+let lastTraceIds = new Set(); // 已渲染节点 id，用于高亮新增
+let lastStepCount = 0;
+let cachedExecs = [];
 
 function toggleTheme() {
     const cur = document.documentElement.getAttribute('data-theme');
@@ -339,65 +403,128 @@ async function loadExecutions() {
         const resp = await fetch('/api/traces/executions?sessionId=' + encodeURIComponent(currentSid));
         if (!resp.ok) return;
         const execs = await resp.json();
-        renderExecutions(execs);
-        // 自动选中最新的执行
-        if (execs.length > 0 && !currentExecId) {
-            await selectExecution(execs[execs.length - 1].executionId);
+        cachedExecs = execs || [];
+        renderExecutions(cachedExecs);
+        if (cachedExecs.length > 0 && !currentExecId) {
+            await selectExecution(cachedExecs[cachedExecs.length - 1].executionId);
+        } else if (currentExecId) {
+            $execSelect.value = currentExecId;
         }
     } catch (e) { console.warn(e); }
 }
 
-async function selectExecution(execId) {
-    currentExecId = execId;
-    // 高亮选中的执行卡片
-    document.querySelectorAll('.exec-card').forEach(el => el.classList.toggle('active', el.dataset.execId === execId));
-    await loadTraces();
+function onExecSelectChange() {
+    const v = $execSelect.value;
+    if (v) selectExecution(v);
 }
 
-async function loadTraces() {
+async function selectExecution(execId) {
+    if (!execId) return;
+    const switched = currentExecId !== execId;
+    currentExecId = execId;
+    if ($execSelect) $execSelect.value = execId;
+    if (switched) {
+        lastTraceIds = new Set();
+        lastStepCount = 0;
+    }
+    await loadTraces(true);
+}
+
+function sortTraces(traces) {
+    traces.sort((a, b) => {
+        const ida = Number(a.id) || 0, idb = Number(b.id) || 0;
+        if (ida && idb && ida !== idb) return ida - idb;
+        const ta = new Date(a.createdAt || 0).getTime();
+        const tb = new Date(b.createdAt || 0).getTime();
+        if (ta !== tb) return ta - tb;
+        return ida - idb;
+    });
+    return traces;
+}
+
+async function loadTraces(forceFull) {
     if (!currentExecId) return;
     try {
-        const [tracesResp, summaryResp] = await Promise.all([
+        const [tracesResp, summaryResp, statusResp] = await Promise.all([
             fetch('/api/traces?executionId=' + encodeURIComponent(currentExecId)),
-            fetch('/api/traces/summary?executionId=' + encodeURIComponent(currentExecId))
+            fetch('/api/traces/summary?executionId=' + encodeURIComponent(currentExecId)),
+            currentSid
+                ? fetch('/api/task-status?sessionId=' + encodeURIComponent(currentSid))
+                : Promise.resolve(null)
         ]);
         if (!tracesResp.ok) return;
-        const traces = await tracesResp.json();
-        // 按创建时间排序（确保时间顺序正确）
-        traces.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+        const traces = sortTraces(await tracesResp.json());
         const summary = summaryResp.ok ? await summaryResp.json() : null;
+        if (statusResp && statusResp.ok) {
+            const st = await statusResp.json();
+            taskRunning = !!st.running;
+        } else {
+            // 无 RUN_END 且最近一步在 30s 内 → 视为运行中
+            const last = traces[traces.length - 1];
+            const hasEnd = traces.some(t => t.stepType === 'RUN_END' || t.stepType === 'LOOP_END');
+            const fresh = last && (Date.now() - new Date(last.createdAt).getTime() < 30000);
+            taskRunning = !hasEnd && !!fresh;
+        }
+        updateLiveBar(traces);
         renderSummary(summary);
-        renderTimeline(traces);
+
+        const ids = new Set(traces.map(t => t.id).filter(Boolean));
+        const newIds = [...ids].filter(id => !lastTraceIds.has(id));
+        const grew = traces.length > lastStepCount;
+        // 运行中或步数增加：全量重绘并高亮新增；否则也全量（表格结构简单）
+        renderTimeline(traces, newIds);
+        if ((taskRunning || grew) && newIds.length) {
+            const wrap = document.getElementById('timelineWrap');
+            const lastRow = wrap && wrap.querySelector('tr.step-new');
+            if (lastRow) lastRow.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+        lastTraceIds = ids;
+        lastStepCount = traces.length;
+        scheduleRefreshInterval();
     } catch (e) { console.warn(e); }
 }
 
+function updateLiveBar(traces) {
+    if (!$liveBar) return;
+    if (taskRunning) {
+        $liveBar.classList.add('on');
+        const last = traces[traces.length - 1];
+        const meta = last ? stepMeta(resolveStepKind(last)) : null;
+        document.getElementById('liveLabel').textContent = '运行中 · 动态监控';
+        document.getElementById('liveStep').textContent = last
+            ? (meta.icon + ' ' + meta.label + ' · ' + stepSummary(last))
+            : '等待首个节点…';
+        document.getElementById('liveCount').textContent = traces.length + ' 步已落库';
+    } else {
+        $liveBar.classList.remove('on');
+    }
+}
+
 function renderExecutions(execs) {
-    const $execList = document.getElementById('execList');
+    if (!$execSelect) return;
+    const prev = currentExecId;
+    $execSelect.innerHTML = '';
     if (!execs || execs.length === 0) {
-        $execList.innerHTML = '<div style="padding:12px;color:var(--text3)">暂无任务执行记录</div>';
+        const o = document.createElement('option');
+        o.value = '';
+        o.textContent = '暂无任务';
+        $execSelect.appendChild(o);
         return;
     }
-    $execList.innerHTML = '';
-    execs.forEach((exec, idx) => {
-        const d = document.createElement('div');
-        d.className = 'exec-card' + (exec.executionId === currentExecId ? ' active' : '');
-        d.dataset.execId = exec.executionId;
+    // 新任务在上
+    const list = [...execs].reverse();
+    list.forEach((exec, idx) => {
+        const o = document.createElement('option');
+        o.value = exec.executionId;
         const startTime = exec.startTime ? new Date(exec.startTime).toLocaleTimeString('zh-CN') : '';
         const question = exec.userQuestion || '未知问题';
-        const questionShort = question.length > 50 ? question.substring(0, 50) + '...' : question;
-        const isLatest = idx === execs.length - 1;
-        d.innerHTML = `
-            <div style="display:flex;align-items:center;gap:6px">
-                <span style="font-size:12px">${isLatest ? '🟢' : '⚪'}</span>
-                <span style="font-size:13px;font-weight:600;color:var(--heading);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(questionShort)}</span>
-            </div>
-            <div style="font-size:11px;color:var(--text3);margin-top:4px">
-                ${startTime} · ${exec.stepCount} 步骤
-            </div>
-        `;
-        d.onclick = () => selectExecution(exec.executionId);
-        $execList.appendChild(d);
+        const short = question.length > 36 ? question.substring(0, 36) + '…' : question;
+        const latest = idx === 0 ? '● ' : '';
+        o.textContent = latest + startTime + ' · ' + short + '（' + (exec.stepCount || 0) + '步）';
+        $execSelect.appendChild(o);
     });
+    if (prev && list.some(e => e.executionId === prev)) $execSelect.value = prev;
+    else $execSelect.value = list[0].executionId;
 }
 
 function renderSummary(s) {
@@ -430,44 +557,924 @@ function renderSummary(s) {
     }
 }
 
-function renderTimeline(traces) {
+function tryParse(s) {
+    if (s == null || s === '') return null;
+    try { return JSON.parse(s); } catch (_) { return null; }
+}
+
+function fmtDur(ms) {
+    if (!ms || ms <= 0) return '—';
+    return ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
+}
+
+function fmtTime(t) {
+    return t ? new Date(t).toLocaleTimeString('zh-CN') : '—';
+}
+
+function statusLabel(st) {
+    const u = String(st || '').toUpperCase();
+    const zh = ({ SUCCESS: '成功', SKIPPED: '未命中', FAILURE: '失败', RUNNING: '进行中',
+        TIMEOUT: '超时', MAX_ITERATIONS: '达轮次上限' })[u] || (st || '—');
+    if (u === 'SUCCESS') return '<span class="badge-ok">' + zh + '</span>';
+    if (u === 'SKIPPED') return '<span class="badge-warn">' + zh + '</span>';
+    if (u === 'FAILURE' || u === 'TIMEOUT') return '<span class="badge-fail">' + zh + '</span>';
+    if (u === 'RUNNING') return '<span class="badge-run">' + zh + '</span>';
+    if (u === 'MAX_ITERATIONS') return '<span class="badge-warn">' + zh + '</span>';
+    return esc(zh);
+}
+
+function clip(s, n) {
+    s = String(s == null ? '' : s);
+    return s.length > n ? s.substring(0, n) + '…' : s;
+}
+
+/** 入参/结果：JSON 拆成键值行；过长截断，完整仍可滚动 */
+function renderPayload(raw, maxLen) {
+    if (raw == null || raw === '') return '<span style="color:var(--text3)">—</span>';
+    const obj = tryParse(raw);
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+        const keys = Object.keys(obj);
+        if (keys.length === 0) return '<span style="color:var(--text3)">（空对象）</span>';
+        let lis = '';
+        keys.forEach(k => {
+            let v = obj[k];
+            if (v != null && typeof v === 'object') v = JSON.stringify(v);
+            else v = String(v);
+            if (v.length > (maxLen || 280)) v = v.substring(0, maxLen || 280) + '…';
+            lis += `<li><span class="kk">${esc(k)}</span><span class="vv">${esc(v)}</span></li>`;
+        });
+        return `<ul class="kv-mini cell-clamp">${lis}</ul>`;
+    }
+    if (Array.isArray(obj)) {
+        const s = JSON.stringify(obj);
+        return `<div class="cell-clamp mono">${esc(clip(s, 400))}</div>`;
+    }
+    let t = String(raw);
+    const img = t.match(MD_IMG_RE);
+    if (img) return `<div class="cell-clamp">已生成图片：<span class="mono">${esc(img[1])}</span></div>`;
+    return `<div class="cell-clamp">${esc(clip(t, maxLen || 320))}</div>`;
+}
+
+function panelEmpty(title, hint, msg) {
+    return `<div class="panel"><div class="panel-h">${title}<span class="hint">${hint || ''}</span></div>
+        <div style="padding:14px;color:var(--text3);font-size:12px">${esc(msg)}</div></div>`;
+}
+
+function kvTable(rows) {
+    return `<table class="data-table"><tbody>${rows.map(([k, v]) =>
+        `<tr><td class="k">${esc(k)}</td><td>${typeof v === 'string' ? esc(v) : v}</td></tr>`).join('')}</tbody></table>`;
+}
+
+function resolveStepKind(step) {
+    if (step.stepType === 'THINKING' && step.content) {
+        if (step.content.startsWith('【LLM 请求】')) return 'LLM_REQUEST';
+        if (step.content.startsWith('【LLM 响应】')) return 'LLM_RESPONSE';
+    }
+    return step.stepType;
+}
+
+/** IntentType 英文码 → 中文（与 Java IntentType 一致；库内仍存英文） */
+const INTENT_META = {
+    QUESTION:            { label: '问答咨询', desc: '寒暄、能力询问或纯问答，通常不需要复杂工具链' },
+    REVIEW:              { label: '截图点评', desc: '用户附带截图/图片，走点评反馈快路径' },
+    NEW_TASK:            { label: '新任务', desc: '需要动手执行的新任务；分类不确定时的默认兜底' },
+    CONTINUE_TASK:       { label: '继续任务', desc: '延续上一轮未完成工作，应带上历史上下文' },
+    RESEARCH:            { label: '调研检索', desc: '偏信息搜集/调研类任务' },
+    FILE_DELIVERY:       { label: '文件交付', desc: '以产出或交付文件为主的任务' },
+    PUBLISHING:          { label: '发布上线', desc: '发布、上线、对外发布类任务' },
+    IMAGE_GENERATION:    { label: '图像生成', desc: '以文生图/改图为主的任务' },
+    MULTIMODAL_ANALYSIS: { label: '多模态分析', desc: '需要结合图文等多模态内容分析' },
+    HISTORY_REFERENCE:   { label: '引用历史', desc: '明确引用历史话题/会话内容' },
+    UNKNOWN:             { label: '未知意图', desc: '无法归类；流水线中通常会回落到新任务' }
+};
+const TOOL_PROFILE_ZH = { QUESTION: '问答工具面', IMAGE: '生图工具面', FULL: '全量工具面' };
+
+function intentLabel(code) {
+    if (!code) return '—';
+    const m = INTENT_META[String(code).toUpperCase()];
+    return m ? m.label : String(code);
+}
+function intentDesc(code) {
+    if (!code) return '';
+    const m = INTENT_META[String(code).toUpperCase()];
+    return m ? m.desc : '';
+}
+function toolProfileZh(code) {
+    if (!code) return '—';
+    const k = String(code).toUpperCase();
+    return TOOL_PROFILE_ZH[k] || String(code);
+}
+
+/**
+ * Trace 展示契约（给非开发看）：
+ * 1) 摘要一律【字段名】值，禁止无标签拼接
+ * 2) 枚举/状态必须中文；英文码只留在详情或 title
+ * 3) 「意图类型」≠ 任务全文；任务正文只出现在【任务目标】/【用户问题】
+ */
+function tagged(pairs) {
+    return pairs
+        .filter(p => p && p[1] != null && p[1] !== '')
+        .map(([k, v]) => '【' + k + '】' + v)
+        .join('  ');
+}
+const RUN_STATUS_ZH = {
+    SUCCESS: '成功', FAILURE: '失败', RUNNING: '进行中', SKIPPED: '未命中',
+    TIMEOUT: '超时', MAX_ITERATIONS: '达到最大轮次', UNKNOWN: '未知'
+};
+const TODO_ACTION_ZH = {
+    set: '建立计划', update: '更新状态', list: '查询列表',
+    reopen: '回滚重开', confirm: '人工确认', clear: '清空计划', seed: '播种待办'
+};
+const PERM_MODE_ZH = { PLAN: '计划模式', ASK: '询问模式', AUTO: '自动', ACCEPT_EDITS: '接受编辑' };
+
+function statusZh(st) {
+    if (!st) return '—';
+    const u = String(st).toUpperCase();
+    return RUN_STATUS_ZH[u] || st;
+}
+function todoActionZh(a) {
+    if (!a) return '—';
+    const k = String(a).toLowerCase();
+    return TODO_ACTION_ZH[k] || a;
+}
+function permModeZh(m) {
+    if (!m) return '';
+    const u = String(m).toUpperCase();
+    return PERM_MODE_ZH[u] || m;
+}
+
+function intentLayerExplain(kind) {
+    if (kind === 'INTENT_L0') return { code: 'L0', how: '规则（YAML/MySQL），未调小模型' };
+    if (kind === 'INTENT_L1') return { code: 'L1', how: '独立意图小模型分类' };
+    if (kind === 'INTENT_L2') return { code: 'L2', how: '代码启发式兜底' };
+    if (kind === 'TASK_PLAN') return { code: '定案', how: '本轮最终采用的执行计划' };
+    return { code: '?', how: '意图相关' };
+}
+function cleanReason(reason) {
+    if (!reason) return '';
+    return String(reason).replace(/^small-model:\s*/i, '').replace(/^small-model$/i, '')
+        .replace(/^rule:\s*/i, '规则：').trim();
+}
+function intentPlanSummary(kind, j) {
+    if (!j) return tagged([['说明', '无结构化内容']]);
+    const layer = intentLayerExplain(kind);
+    if (j.skipped) {
+        return tagged([
+            ['判定层', layer.code], ['判定方式', layer.how],
+            ['结果', '未命中/跳过'], ['说明', clip(j.reason || '继续下层', 100)]
+        ]);
+    }
+    return tagged([
+        ['判定层', layer.code],
+        ['判定方式', layer.how],
+        ['结果', kind === 'TASK_PLAN' ? '执行计划定案' : '命中定案'],
+        ['意图类型', intentLabel(j.intent) + '（类别，不是任务全文）'],
+        ['任务目标', j.taskGoal ? clip(j.taskGoal, 100) : null],
+        ['判定理由', cleanReason(j.reason) || cleanReason(j.classifierReason) || null],
+        ['置信度', j.confidence != null ? String(j.confidence) : null],
+        ['工具面', j.toolProfile ? toolProfileZh(j.toolProfile) : null],
+        ['强制拆计划', j.requiresStructuredPlan == null ? null : (j.requiresStructuredPlan ? '是' : '否')]
+    ]);
+}
+function parseLlmLatency(c) {
+    const m = String(c || '').match(/耗时\s*(\d+)\s*ms.*?输入\s*(\d+)\s*tokens.*?输出\s*(\d+)\s*tokens/i);
+    if (!m) return null;
+    return { ms: m[1], inTok: m[2], outTok: m[3] };
+}
+function parseCompression(c) {
+    const m = String(c || '').match(/(\d+)\s*→\s*(\d+)\s*条消息/);
+    if (!m) return null;
+    return { before: m[1], after: m[2] };
+}
+
+function stepSummary(step) {
+    const kind = resolveStepKind(step);
+    const c = step.content || '';
+    const j = tryParse(c);
+    switch (kind) {
+        case 'RUN_START': {
+            const q = (j && j.question) || step.userQuestion || '';
+            return tagged([
+                ['事件', '任务开始'],
+                ['用户问题', clip(q, 140)],
+                ['执行ID', j && j.executionId ? j.executionId : null]
+            ]);
+        }
+        case 'RUN_END':
+            return tagged([
+                ['事件', '任务结束'],
+                ['结束状态', statusZh((j && j.status) || step.status)]
+            ]);
+        case 'INTENT_L0': case 'INTENT_L1': case 'INTENT_L2': case 'TASK_PLAN':
+            return intentPlanSummary(kind, j);
+        case 'REVIEW_PATH':
+            return tagged([
+                ['路径', '截图点评快路径'],
+                ['说明', '不进入完整 Agent 主循环'],
+                ['含图', j && j.hasImage != null ? (j.hasImage ? '是' : '否') : null]
+            ]);
+        case 'AGENT_LOOP_START':
+            return tagged([
+                ['事件', '进入主 Agent 循环'],
+                ['意图类型', j ? intentLabel(j.intent) : null],
+                ['强制拆计划', j && j.requiresStructuredPlan != null ? (j.requiresStructuredPlan ? '是' : '否') : null]
+            ]);
+        case 'SUBAGENT_LOOP_START':
+            return tagged([
+                ['事件', '启动子代理循环'],
+                ['意图类型', j ? intentLabel(j.intent) : null],
+                ['强制拆计划', j && j.requiresStructuredPlan != null ? (j.requiresStructuredPlan ? '是' : '否') : null]
+            ]);
+        case 'SUBAGENT_LOOP_END':
+            return tagged([['事件', '子代理循环结束'], ['结果', '结果已回传父任务']]);
+        case 'PLAN': {
+            let goal = c || '';
+            if (goal.startsWith('子目标:')) goal = goal.slice(4).trim();
+            if (goal.startsWith('开始第')) {
+                return tagged([['事件', '本轮迭代开始'], ['说明', goal]]);
+            }
+            return tagged([['事件', '本轮迭代开始'], ['本轮目标', clip(goal || '（未写明）', 120)]]);
+        }
+        case 'SUB_GOAL':
+            return tagged([
+                ['当前子目标', clip(step.subGoalText || c || '—', 120)],
+                ['进度', step.subGoalTotal ? ((step.subGoalDone || 0) + '/' + step.subGoalTotal) : null]
+            ]);
+        case 'DECISION':
+            return tagged([['决策说明', clip(c, 160)], ['含义', '模型选工具前的理由']]);
+        case 'THINKING':
+            if (c.startsWith('【用户追加】')) return tagged([['事件', '注入用户补充指令'], ['说明', clip(c.replace(/^【用户追加】/, ''), 100)]]);
+            return tagged([['模型思考', clip(c, 140)]]);
+        case 'LLM_REQUEST': {
+            const m = c.match(/消息数:\s*(\d+).*?工具数:\s*(\d+)/);
+            return tagged([
+                ['事件', '向大模型发请求'],
+                ['消息条数', m ? m[1] : null],
+                ['可用工具数', m ? m[2] : null],
+                ['说明', '完整上下文见详情']
+            ]);
+        }
+        case 'LLM_RESPONSE': {
+            const tools = (c.match(/工具调用:\s*(\d+)/) || [])[1];
+            const hasText = c.includes('文本:');
+            return tagged([
+                ['事件', '大模型返回'],
+                ['工具调用数', tools || '0'],
+                ['含文本', hasText ? '是' : '否']
+            ]);
+        }
+        case 'LLM_CALL': {
+            const p = parseLlmLatency(c);
+            return tagged([
+                ['事件', '模型调用耗时'],
+                ['耗时', p ? (p.ms + 'ms') : (fmtDur(step.durationMs) || null)],
+                ['输入Token', p ? p.inTok : null],
+                ['输出Token', p ? p.outTok : null]
+            ]) || tagged([['事件', '模型调用耗时'], ['说明', clip(c, 80)]]);
+        }
+        case 'TOOL_CALL':
+            return tagged([
+                ['事件', '发起工具调用'],
+                ['工具名', step.toolName || '?'],
+                ['调用参数', step.toolArgs ? clip(step.toolArgs, 90) : null]
+            ]);
+        case 'TOOL_RESULT': {
+            if (MD_IMG_PREFIX_RE.test(c)) return tagged([['事件', '工具返回'], ['结果', '已生成图片']]);
+            const oj = tryParse(c);
+            if (oj && oj.online === false) return tagged([['事件', '工具返回'], ['结果', '服务未在线']]);
+            if (oj && oj.success === false) {
+                return tagged([
+                    ['事件', '工具返回'], ['结果', '失败'],
+                    ['原因', clip(oj.message || oj.error || '', 80)]
+                ]);
+            }
+            if (oj && oj.success === true && oj.action) {
+                return tagged([
+                    ['事件', '工具返回'], ['结果', '成功'],
+                    ['Todo动作', todoActionZh(oj.action)]
+                ]);
+            }
+            return tagged([
+                ['事件', '工具返回'],
+                ['工具名', step.toolName || null],
+                ['结果摘要', clip(c, 100)]
+            ]);
+        }
+        case 'TODO_SET': case 'TODO_UPDATE': case 'TODO_LIST': case 'TODO_REOPEN': case 'TODO_CONFIRM': case 'TODO_CLEAR': {
+            const n = j ? (j.itemCount != null ? j.itemCount : (Array.isArray(j.items) ? j.items.length : null)) : null;
+            return tagged([
+                ['Todo动作', todoActionZh((j && j.action) || kind.replace('TODO_', '').toLowerCase())],
+                ['条目数', n != null ? String(n) : null],
+                ['列表摘要', j && j.render ? clip(String(j.render).replace(/\n/g, '；'), 80) : null]
+            ]);
+        }
+        case 'TODO_SEED':
+            return tagged([
+                ['Todo动作', '播种待办'],
+                ['子目标步数', j && j.steps != null ? String(j.steps) : null],
+                ['说明', '用意图计划预填待办/子目标栈']
+            ]);
+        case 'PERM_DENY':
+            return tagged([
+                ['拦截类型', '权限拒绝'],
+                ['工具名', j && j.tool ? j.tool : null],
+                ['权限模式', j && j.mode ? permModeZh(j.mode) : null],
+                ['说明', 'Plan/Ask 闸门拦住，工具未执行']
+            ]);
+        case 'HOOK_DENY':
+            return tagged([
+                ['拦截类型', '钩子拒绝'],
+                ['工具名', j && j.tool ? j.tool : null],
+                ['说明', 'ToolHook 拒绝，工具未执行']
+            ]);
+        case 'COMPRESSION': {
+            const p = parseCompression(c);
+            return tagged([
+                ['事件', '上下文压缩'],
+                ['消息数', p ? (p.before + '→' + p.after) : null],
+                ['说明', p ? null : clip(c, 100)]
+            ]);
+        }
+        case 'ANSWER':
+            return tagged([['最终回答', clip(c, 140)], ['说明', '对用户可见的产出文本']]);
+        case 'LOOP_END': {
+            let st = step.status;
+            const m = String(c || '').match(/循环结束:\s*(\w+)/);
+            if (m) st = m[1];
+            return tagged([
+                ['事件', 'Agent 循环结束'],
+                ['结束原因', statusZh(st)],
+                ['说明', st === 'MAX_ITERATIONS' ? '已达最大迭代轮次' : null]
+            ]);
+        }
+        case 'ERROR':
+            return tagged([['事件', '执行错误'], ['错误信息', clip(c, 140)]]);
+        default:
+            return tagged([
+                ['节点', stepMeta(kind).label || kind || '未知'],
+                ['摘要', clip(c || step.toolName || '—', 120)]
+            ]);
+    }
+}
+
+function stepDetailHtml(step) {
+    const kind = resolveStepKind(step);
+    const j = tryParse(step.content);
+    const meta = stepMeta(kind);
+    const head = kvTable([
+        ['主题', meta.stage],
+        ['节点', meta.label],
+        ['说明', meta.desc],
+        ['内部码', kind || '—'],
+        ['状态', statusZh(step.status)],
+        ['轮次', String((step.turnIndex || 0) + 1)],
+        ['耗时', step.durationMs ? fmtDur(step.durationMs) : '—']
+    ].filter(r => r[1] && r[1] !== '—'));
+
+    if (kind === 'TASK_PLAN' || (kind && kind.startsWith('INTENT_') && j)) {
+        const layer = intentLayerExplain(kind);
+        if (j.skipped) {
+            return head + kvTable([
+                ['判定层', layer.code],
+                ['判定方式', layer.how],
+                ['结果', '未命中 / 跳过（本层未定案，继续下层）'],
+                ['说明', j.reason || '—']
+            ]);
+        }
+        const idesc = intentDesc(j.intent);
+        const rows = [
+            ['判定层', layer.code],
+            ['判定方式', layer.how],
+            ['结果', kind === 'TASK_PLAN' ? '执行计划定案' : '命中定案'],
+            ['意图类型', intentLabel(j.intent) + (idesc ? ' — ' + idesc : '')],
+            ['任务目标', j.taskGoal || '—'],
+            ['判定理由', cleanReason(j.reason) || cleanReason(j.classifierReason) || '—'],
+            ['强制拆计划', j.requiresStructuredPlan ? '是' : '否'],
+            ['使用历史', j.shouldUseHistory ? '是' : '否'],
+            ['置信度', j.confidence != null ? String(j.confidence) : '—'],
+            ['工具面', toolProfileZh(j.toolProfile)],
+            ['工具白名单', j.allowedTools == null ? '全量' : (j.allowedTools.join?.('、') || String(j.allowedTools))]
+        ].filter(r => r[1] != null && r[1] !== '');
+        return head + kvTable(rows.map(([k, v]) => [k, String(v)]));
+    }
+    if (kind && kind.startsWith('TODO_') && j && Array.isArray(j.items)) {
+        return head + kvTable([
+            ['Todo动作', todoActionZh(j.action)],
+            ['条目数', String(j.itemCount != null ? j.itemCount : j.items.length)]
+        ]) + renderTodoItemsTable(j.items)
+            + (j.render ? `<div class="step-summary" style="padding:8px 12px">${esc(j.render)}</div>` : '');
+    }
+    if (kind === 'TOOL_CALL') {
+        return head + kvTable([['工具名', step.toolName || '—'], ['含义', '发起调用，尚未拿到结果']])
+            + `<div class="panel-h" style="border-top:1px solid var(--border)">调用参数</div>`
+            + renderPayload(step.toolArgs, 400);
+    }
+    if (kind === 'TOOL_RESULT') {
+        return head + kvTable([['工具名', step.toolName || '—'], ['含义', '工具执行返回']])
+            + `<div class="panel-h" style="border-top:1px solid var(--border)">返回内容</div>`
+            + renderPayload(step.content, 500);
+    }
+    if (kind === 'PERM_DENY' || kind === 'HOOK_DENY') {
+        return head + kvTable([
+            ['拦截类型', kind === 'PERM_DENY' ? '权限拒绝' : '钩子拒绝'],
+            ['工具名', (j && j.tool) || '—'],
+            ['权限模式', (j && j.mode) ? permModeZh(j.mode) : '—'],
+            ['原始内容', clip(step.content || '', 500)]
+        ]);
+    }
+    if (kind === 'DECISION' || kind === 'ANSWER' || kind === 'THINKING' || kind === 'LLM_REQUEST' || kind === 'LLM_RESPONSE' || kind === 'PLAN' || kind === 'ERROR') {
+        return head + `<div class="cell-clamp" style="padding:8px 12px;white-space:pre-wrap">${esc(step.content || '—')}</div>`;
+    }
+    if (kind === 'LLM_CALL') {
+        const p = parseLlmLatency(step.content);
+        return head + kvTable([
+            ['耗时', p ? p.ms + 'ms' : fmtDur(step.durationMs)],
+            ['输入Token', p ? p.inTok : '—'],
+            ['输出Token', p ? p.outTok : '—'],
+            ['原始', step.content || '—']
+        ]);
+    }
+    if (kind === 'RUN_START' || kind === 'RUN_END' || kind === 'LOOP_END' || kind === 'REVIEW_PATH'
+        || kind === 'AGENT_LOOP_START' || kind === 'SUBAGENT_LOOP_START' || kind === 'SUBAGENT_LOOP_END'
+        || kind === 'COMPRESSION' || kind === 'SUB_GOAL' || kind === 'TODO_SEED') {
+        if (j && typeof j === 'object') return head + renderPayload(step.content, 400);
+        return head + `<div class="cell-clamp" style="padding:8px 12px;white-space:pre-wrap">${esc(step.content || step.subGoalText || '—')}</div>`;
+    }
+    if (step.toolArgs) return head + renderPayload(step.toolArgs, 300);
+    if (step.content) {
+        if (j && typeof j === 'object') return head + renderPayload(step.content, 400);
+        return head + `<div class="cell-clamp" style="padding:8px 12px;white-space:pre-wrap">${esc(clip(step.content, 2000))}</div>`;
+    }
+    return head;
+}
+
+function turnGoal(steps) {
+    const sg = steps.find(s => s.stepType === 'SUB_GOAL' && s.subGoalText);
+    if (sg) return sg.subGoalText;
+    const dec = steps.find(s => s.stepType === 'DECISION' && s.content);
+    if (dec) return dec.content;
+    const plan = steps.find(s => s.stepType === 'PLAN' && s.content);
+    if (plan && plan.content && !plan.content.startsWith('开始第')) return plan.content;
+    const tools = steps.filter(s => s.stepType === 'TOOL_CALL').map(s => s.toolName).filter(Boolean);
+    if (tools.length) return '调用：' + tools.join('、');
+    return '（本轮无显式子目标）';
+}
+
+function pairTools(traces) {
+    const calls = [];
+    const pending = {};
+    traces.forEach(s => {
+        if (s.stepType === 'TOOL_CALL') {
+            const name = s.toolName || '?';
+            if (!pending[name]) pending[name] = [];
+            pending[name].push(s);
+        } else if (s.stepType === 'TOOL_RESULT') {
+            const name = s.toolName || '?';
+            const q = pending[name];
+            const call = q && q.length ? q.shift() : null;
+            calls.push({
+                turn: s.turnIndex, tool: name, args: call ? call.toolArgs : null,
+                result: s.content, durationMs: s.durationMs, status: s.status, time: s.createdAt
+            });
+        }
+    });
+    Object.keys(pending).forEach(name => {
+        (pending[name] || []).forEach(call => {
+            calls.push({
+                turn: call.turnIndex, tool: name, args: call.toolArgs,
+                result: null, durationMs: 0, status: 'RUNNING', time: call.createdAt
+            });
+        });
+    });
+    // 不按时间重排：保持 traces 传入时的真实执行序（并行 CALL 先于 RESULT 会原样保留）
+    return calls;
+}
+
+function extractTodoItems(traces) {
+    // 优先最新 TODO_SET / TODO_UPDATE 快照；否则从 todo 工具结果里抠 items
+    const todoNodes = traces.filter(s => s.stepType && s.stepType.startsWith('TODO_'));
+    for (let i = todoNodes.length - 1; i >= 0; i--) {
+        const j = tryParse(todoNodes[i].content);
+        if (j && Array.isArray(j.items) && j.items.length) {
+            return { items: j.items, source: stepMeta(todoNodes[i].stepType).label, time: todoNodes[i].createdAt, render: j.render };
+        }
+    }
+    for (let i = traces.length - 1; i >= 0; i--) {
+        const s = traces[i];
+        if (s.stepType !== 'TOOL_RESULT' || s.toolName !== 'todo') continue;
+        const j = tryParse(s.content);
+        if (j && Array.isArray(j.items) && j.items.length) {
+            return { items: j.items, source: '工具 todo 结果', time: s.createdAt, render: j.todo || j.render };
+        }
+    }
+    return null;
+}
+
+function renderTodoItemsTable(items) {
+    if (!items || !items.length) return '<div style="padding:12px;color:var(--text3);font-size:12px">暂无拆分项</div>';
+    let body = '';
+    items.forEach((it, idx) => {
+        const id = it.id != null ? it.id : (idx + 1);
+        const content = it.content || it.text || it.goal || '—';
+        const st = it.status || 'pending';
+        const dw = it.done_when || it.doneWhen || '—';
+        const dep = Array.isArray(it.depends_on) ? it.depends_on.join(',') : (it.depends_on != null ? String(it.depends_on) : '—');
+        const ev = it.evidence || it.note || '';
+        body += `<tr>
+            <td>${esc(String(id))}</td>
+            <td>${esc(content)}</td>
+            <td>${esc(st)}</td>
+            <td class="mono">${esc(String(dw))}</td>
+            <td class="mono">${esc(dep)}</td>
+            <td>${esc(clip(ev, 80))}</td>
+        </tr>`;
+    });
+    return `<table class="data-table">
+        <thead><tr><th>ID</th><th>子任务</th><th>状态</th><th>验收 done_when</th><th>依赖</th><th>证据/备注</th></tr></thead>
+        <tbody>${body}</tbody></table>`;
+}
+
+function renderLifecyclePanel(traces, newIds) {
+    const newSet = new Set(newIds || []);
+    let body = '';
+    traces.forEach((step, i) => {
+        const kind = resolveStepKind(step);
+        const meta = stepMeta(kind);
+        const detailId = 'lc-detail-' + i;
+        const tid = step.id != null ? String(step.id) : '';
+        const isNew = step.id != null && newSet.has(step.id);
+        body += `<tr class="${isNew ? 'step-new' : ''}">
+            <td style="white-space:nowrap;color:var(--text3);font-size:11px" title="trace id=${esc(tid)}">${fmtTime(step.createdAt)}</td>
+            <td>${(step.turnIndex || 0) + 1}</td>
+            <td title="${esc(meta.desc)} [${esc(kind)}]">
+                <div style="font-size:11px;color:var(--accent);font-weight:600;margin-bottom:2px">${esc(meta.stage)}</div>
+                <span class="step-type ${esc(kind)}" style="text-transform:none">${esc(meta.icon + ' ' + meta.label)}</span>
+            </td>
+            <td>${step.toolName ? `<span class="mono">${esc(step.toolName)}</span>` : '—'}</td>
+            <td style="white-space:pre-wrap;line-height:1.45;max-width:520px;font-size:12px">${esc(stepSummary(step))}</td>
+            <td>${fmtDur(step.durationMs)}</td>
+            <td>${statusLabel(step.status)}</td>
+            <td><button type="button" class="raw-toggle" style="border:none;padding:2px 8px;background:var(--surface2);border-radius:6px"
+                onclick="const el=document.getElementById('${detailId}');el.style.display=el.style.display==='none'?'table-row':'none'">详情</button></td>
+        </tr>
+        <tr id="${detailId}" style="display:none"><td colspan="8" style="background:var(--code-bg)">${stepDetailHtml(step)}</td></tr>`;
+    });
+    const liveHint = taskRunning ? ' · 运行中自动刷新' : '';
+    return `<div class="panel"><div class="panel-h">🧬 全生命周期（真实执行序）<span class="hint">按写入顺序 · ${traces.length} 步${liveHint} · 摘要均为【字段】中文，勿把「意图类型」当成任务全文</span></div>
+        <table class="data-table" id="lifecycleTable">
+            <thead><tr><th>时间</th><th>轮次</th><th>阶段</th><th>工具</th><th>摘要</th><th>耗时</th><th>状态</th><th></th></tr></thead>
+            <tbody>${body}</tbody>
+        </table></div>`;
+}
+
+function themeSection(title, hint, innerHtml, open) {
+    const hid = open ? '' : ' hidden';
+    const arrow = open ? '▼' : '▶';
+    return `<div class="panel">
+        <div class="raw-toggle" onclick="(function(el){var b=el.nextElementSibling;b.classList.toggle('hidden');el.childNodes[0].textContent=b.classList.contains('hidden')?'▶ ':'▼ ';})(this)">${arrow} ${title}<span class="hint" style="margin-left:8px">${esc(hint)}</span></div>
+        <div class="raw-body${hid}">${innerHtml}</div>
+    </div>`;
+}
+
+/** 去掉各 panel 函数自带的外层壳，塞进 themeSection */
+function unwrapPanel(html) {
+    if (!html) return '';
+    return String(html)
+        .replace(/^<div class="panel">\s*/, '')
+        .replace(/<div class="panel-h">[\s\S]*?<\/div>\s*/, '')
+        .replace(/<\/div>\s*$/, '');
+}
+
+function renderPlanPanel(traces) {
+    const planStep = traces.find(s => s.stepType === 'TASK_PLAN');
+    const intentSteps = traces.filter(s => s.stepType && s.stepType.startsWith('INTENT_'));
+    const intentHit = [...intentSteps].reverse().find(s => {
+        const sk = tryParse(s.content);
+        return !(sk && sk.skipped);
+    }) || null;
+    const runStart = traces.find(s => s.stepType === 'RUN_START');
+    const plan = planStep ? tryParse(planStep.content) : null;
+    const intentMeta = intentHit ? stepMeta(intentHit.stepType) : null;
+    let q = '';
+    if (runStart) {
+        const rs = tryParse(runStart.content);
+        q = (rs && rs.question) || runStart.userQuestion || '';
+    } else q = (traces[0] && traces[0].userQuestion) || '';
+
+    const rows = [];
+    rows.push(['用户问题', q || '—']);
+    if (intentSteps.length) {
+        rows.push(['漏斗路径', intentSteps.map(s => {
+            const m = stepMeta(s.stepType);
+            const sk = tryParse(s.content);
+            const how = intentLayerExplain(s.stepType).how;
+            return m.label + '／' + how + (sk && sk.skipped ? ' →未命中' : ' →命中');
+        }).join(' ｜ ')]);
+    }
+    if (intentMeta) {
+        rows.push(['定案层', intentMeta.label]);
+        rows.push(['定案方式', intentLayerExplain(intentHit.stepType).how]);
+    }
+    if (plan) {
+        rows.push(['意图类型', intentLabel(plan.intent) + '（任务类别，不是任务全文）']);
+        const idesc = intentDesc(plan.intent);
+        if (idesc) rows.push(['意图说明', idesc]);
+        rows.push(['任务目标', plan.taskGoal || '—']);
+        rows.push(['判定理由', cleanReason(plan.reason) || '—']);
+        rows.push(['强制拆计划', plan.requiresStructuredPlan ? '是（首轮须 todo.set）' : '否']);
+        rows.push(['使用历史', plan.shouldUseHistory ? '是' : '否']);
+        rows.push(['需要工具', plan.needsTools === false ? '否' : '是']);
+        const tools = plan.allowedTools;
+        rows.push(['工具白名单', tools == null ? '不限制（全量）' : (tools.length ? tools.join('、') : '空→按全量')]);
+        if (plan.confidence != null) rows.push(['分类置信度', String(plan.confidence)]);
+        if (plan.toolProfile) rows.push(['工具面', toolProfileZh(plan.toolProfile)]);
+    } else rows.push(['执行计划', '未记录执行计划节点']);
+    return `<div class="panel"><div class="panel-h">🗺️ 执行计划<span class="hint">意图漏斗产出</span></div>${kvTable(rows)}</div>`;
+}
+
+function renderTodoPanel(traces) {
+    const snap = extractTodoItems(traces);
+    const changes = traces.filter(s => s.stepType && s.stepType.startsWith('TODO_'));
+    let changeRows = '';
+    changes.forEach((s, i) => {
+        const meta = stepMeta(s.stepType);
+        changeRows += `<tr>
+            <td>${i + 1}</td><td>${fmtTime(s.createdAt)}</td><td>${(s.turnIndex || 0) + 1}</td>
+            <td>${esc(meta.label)}</td><td>${esc(stepSummary(s))}</td>
+        </tr>`;
+    });
+    // 兼容旧轨迹：从 todo 工具调用推断变更
+    if (!changes.length) {
+        pairTools(traces).filter(p => p.tool === 'todo').forEach((p, i) => {
+            const args = tryParse(p.args) || {};
+            changeRows += `<tr>
+                <td>${i + 1}</td><td>${fmtTime(p.time)}</td><td>${(p.turn || 0) + 1}</td>
+                <td>todo.${esc(args.action || '?')}</td><td>${esc(clip(JSON.stringify(args), 100))}</td>
+            </tr>`;
+        });
+    }
+    let html = `<div class="panel"><div class="panel-h">📌 Todo 拆分列表<span class="hint">${snap ? ('来源：' + snap.source) : '尚未拆分'}</span></div>`;
+    if (snap) html += renderTodoItemsTable(snap.items);
+    else html += `<div style="padding:12px;color:var(--text3);font-size:12px">本任务尚未 todo.set（或旧轨迹无结构化记录）</div>`;
+    if (changeRows) {
+        html += `<div class="panel-h" style="border-top:1px solid var(--border);border-bottom:1px solid var(--border)">Todo 变更流水</div>
+            <table class="data-table"><thead><tr><th>#</th><th>时间</th><th>轮次</th><th>动作</th><th>摘要</th></tr></thead>
+            <tbody>${changeRows}</tbody></table>`;
+    }
+    html += '</div>';
+    return html;
+}
+
+function renderTurnsPanel(traces) {
+    const byTurn = {};
+    traces.forEach(t => {
+        if (!byTurn[t.turnIndex]) byTurn[t.turnIndex] = [];
+        byTurn[t.turnIndex].push(t);
+    });
+    const keys = Object.keys(byTurn).map(Number).sort((a, b) => a - b)
+        .filter(t => byTurn[t].some(s =>
+            ['PLAN', 'TOOL_CALL', 'LLM_CALL', 'SUB_GOAL', 'ANSWER', 'DECISION'].includes(s.stepType)));
+    if (!keys.length) return panelEmpty('🎯 各轮目标', '', '尚无迭代轮次');
+    let body = '';
+    keys.forEach(t => {
+        const steps = byTurn[t];
+        const goal = turnGoal(steps);
+        const tools = [...new Set(steps.filter(s => s.stepType === 'TOOL_CALL').map(s => s.toolName).filter(Boolean))];
+        const llm = steps.filter(s => s.stepType === 'LLM_CALL').reduce((a, s) => a + (s.durationMs || 0), 0);
+        const dec = steps.filter(s => s.stepType === 'DECISION').map(s => s.content).filter(Boolean);
+        // 轮次起始时间：该轮第一次 PLAN / LLM，不要用混进来的 RUN_START
+        const anchor = steps.find(s => s.stepType === 'PLAN')
+            || steps.find(s => s.stepType === 'LLM_CALL')
+            || steps.find(s => resolveStepKind(s) === 'LLM_REQUEST')
+            || steps[0];
+        body += `<tr>
+            <td>${t + 1}</td>
+            <td>${esc(goal)}</td>
+            <td>${dec.length ? esc(clip(dec.join('；'), 120)) : '—'}</td>
+            <td class="mono">${tools.length ? esc(tools.join(', ')) : '—'}</td>
+            <td>${fmtDur(llm)}</td>
+            <td style="color:var(--text3);white-space:nowrap">${fmtTime(anchor?.createdAt)}</td>
+        </tr>`;
+    });
+    return `<table class="data-table">
+            <thead><tr><th>轮次</th><th>本轮目标</th><th>决策/反思</th><th>工具</th><th>模型耗时</th><th>时间</th></tr></thead>
+            <tbody>${body}</tbody>
+        </table>`;
+}
+
+function renderDecisionPanel(traces) {
+    const rows = traces.filter(s => {
+        if (s.stepType === 'DECISION') return true;
+        if (s.stepType === 'THINKING' && s.content && !s.content.startsWith('【LLM')) return true;
+        return false;
+    });
+    if (!rows.length) return panelEmpty('🧠 模型决策 / 反思', '', '本任务无决策或反思文本');
+    let body = '';
+    rows.forEach((s, i) => {
+        const meta = stepMeta(s.stepType === 'DECISION' ? 'DECISION' : 'THINKING');
+        body += `<tr>
+            <td>${i + 1}</td><td>${fmtTime(s.createdAt)}</td><td>${(s.turnIndex || 0) + 1}</td>
+            <td>${esc(meta.label)}</td>
+            <td><div class="cell-clamp" style="white-space:pre-wrap">${esc(s.content || '')}</div></td>
+        </tr>`;
+    });
+    return `<div class="panel"><div class="panel-h">🧠 模型决策 / 反思<span class="hint">选工具前的理由与中间思考</span></div>
+        <table class="data-table">
+            <thead><tr><th>#</th><th>时间</th><th>轮次</th><th>类型</th><th>内容</th></tr></thead>
+            <tbody>${body}</tbody>
+        </table></div>`;
+}
+
+function renderLlmPanel(traces) {
+    const rows = traces.filter(s => s.stepType === 'LLM_CALL' || resolveStepKind(s) === 'LLM_REQUEST' || resolveStepKind(s) === 'LLM_RESPONSE');
+    if (!rows.length) return panelEmpty('📤 模型调用', '', '无 LLM 调用记录');
+    let body = '';
+    rows.forEach((s, i) => {
+        const kind = resolveStepKind(s);
+        const meta = stepMeta(kind);
+        body += `<tr>
+            <td>${i + 1}</td><td>${fmtTime(s.createdAt)}</td><td>${(s.turnIndex || 0) + 1}</td>
+            <td>${esc(meta.label)}</td>
+            <td>${esc(stepSummary(s))}</td>
+            <td>${fmtDur(s.durationMs)}</td>
+            <td><button type="button" class="raw-toggle" style="border:none;padding:2px 8px;background:var(--surface2);border-radius:6px"
+                onclick="this.parentElement.parentElement.nextElementSibling.style.display=this.parentElement.parentElement.nextElementSibling.style.display==='none'?'table-row':'none'">详情</button></td>
+        </tr>
+        <tr style="display:none"><td colspan="7" style="background:var(--code-bg)">${stepDetailHtml(s)}</td></tr>`;
+    });
+    return `<div class="panel"><div class="panel-h">📤 模型调用<span class="hint">请求 / 耗时 / 响应</span></div>
+        <table class="data-table">
+            <thead><tr><th>#</th><th>时间</th><th>轮次</th><th>类型</th><th>摘要</th><th>耗时</th><th></th></tr></thead>
+            <tbody>${body}</tbody>
+        </table></div>`;
+}
+
+function renderToolsPanel(traces) {
+    const pairs = pairTools(traces);
+    if (!pairs.length) return panelEmpty('🔧 工具调用明细', '', '本任务未调用工具');
+    let body = '';
+    pairs.forEach((p, i) => {
+        body += `<tr>
+            <td>${i + 1}</td><td>${(p.turn || 0) + 1}</td>
+            <td class="mono"><b>${esc(p.tool)}</b></td>
+            <td>${renderPayload(p.args, 240)}</td>
+            <td>${renderPayload(p.result, 320)}</td>
+            <td>${fmtDur(p.durationMs)}</td>
+            <td>${statusLabel(p.status)}</td>
+        </tr>`;
+    });
+    return `<div class="panel"><div class="panel-h">🔧 工具调用明细<span class="hint">工具 · 入参 · 结果</span></div>
+        <table class="data-table">
+            <thead><tr><th>#</th><th>轮次</th><th>工具</th><th>入参</th><th>结果</th><th>耗时</th><th>状态</th></tr></thead>
+            <tbody>${body}</tbody>
+        </table></div>`;
+}
+
+function renderGatesPanel(traces) {
+    const rows = traces.filter(s => ['PERM_DENY', 'HOOK_DENY', 'COMPRESSION', 'ERROR'].includes(s.stepType));
+    if (!rows.length) return '';
+    let body = '';
+    rows.forEach((s, i) => {
+        const meta = stepMeta(s.stepType);
+        body += `<tr>
+            <td>${i + 1}</td><td>${fmtTime(s.createdAt)}</td><td>${(s.turnIndex || 0) + 1}</td>
+            <td>${esc(meta.label)}</td><td>${esc(stepSummary(s))}</td><td>${statusLabel(s.status)}</td>
+        </tr>`;
+    });
+    return `<div class="panel"><div class="panel-h">🚫 拦截 / 压缩 / 错误<span class="hint">权限、钩子、异常</span></div>
+        <table class="data-table">
+            <thead><tr><th>#</th><th>时间</th><th>轮次</th><th>类型</th><th>摘要</th><th>状态</th></tr></thead>
+            <tbody>${body}</tbody>
+        </table></div>`;
+}
+
+function renderAnswerPanel(traces) {
+    const answers = traces.filter(s => s.stepType === 'ANSWER');
+    const ends = traces.filter(s => s.stepType === 'LOOP_END' || s.stepType === 'RUN_END');
+    if (!answers.length && !ends.length) return panelEmpty('📝 最终结果', '', '尚无最终回答');
+    let html = `<div class="panel"><div class="panel-h">📝 最终结果<span class="hint">回答与收尾</span></div>`;
+    answers.forEach((s, i) => {
+        html += `<div style="padding:12px;border-bottom:1px solid var(--border)">
+            <div style="font-size:11px;color:var(--text3);margin-bottom:6px">回答 #${i + 1} · 轮次 ${(s.turnIndex || 0) + 1} · ${fmtTime(s.createdAt)}</div>
+            <div style="white-space:pre-wrap;font-size:13px;line-height:1.6">${esc(s.content || '')}</div>
+        </div>`;
+    });
+    if (ends.length) {
+        html += `<table class="data-table"><thead><tr><th>收尾节点</th><th>摘要</th><th>时间</th></tr></thead><tbody>`;
+        ends.forEach(s => {
+            html += `<tr><td>${esc(stepMeta(s.stepType).label)}</td><td>${esc(stepSummary(s))}</td><td>${fmtTime(s.createdAt)}</td></tr>`;
+        });
+        html += `</tbody></table>`;
+    }
+    html += '</div>';
+    return html;
+}
+
+function renderTimeline(traces, newIds) {
     if (!traces || traces.length === 0) {
         $timeline.innerHTML = '<div class="empty-state"><div class="icon">📭</div><p>暂无轨迹数据</p></div>';
         return;
     }
-    // 按 turnIndex 分组
-    const turns = {};
-    traces.forEach(t => {
-        if (!turns[t.turnIndex]) turns[t.turnIndex] = [];
-        turns[t.turnIndex].push(t);
-    });
+    const gates = renderGatesPanel(traces);
+    // 主题区始终挂着（折叠）：与主表同一批节点，只是按主题过滤
+    $timeline.innerHTML = `<div class="timeline">
+        ${renderLifecyclePanel(traces, newIds)}
+        ${themeSection('🗺️ 执行计划', '同数据切片 · 主表阶段=「执行计划」的行', unwrapPanel(renderPlanPanel(traces)), false)}
+        ${themeSection('📌 Todo 拆分', '同数据切片 · 主表阶段=「Todo拆分」的行', unwrapPanel(renderTodoPanel(traces)), false)}
+        ${themeSection('🎯 各轮目标', '同数据切片 · 主表阶段=「各轮目标」的行', renderTurnsPanel(traces), false)}
+        ${themeSection('🧠 决策 / 反思', '同数据切片 · 主表阶段=「决策/反思」的行', unwrapPanel(renderDecisionPanel(traces)), false)}
+        ${themeSection('📤 模型调用', '同数据切片 · 主表阶段=「模型调用」的行', unwrapPanel(renderLlmPanel(traces)), false)}
+        ${themeSection('🔧 工具调用', '同数据切片 · 主表阶段=「工具调用」的行', unwrapPanel(renderToolsPanel(traces)), false)}
+        ${gates ? themeSection('🚫 拦截 / 错误', '同数据切片', unwrapPanel(gates), false) : ''}
+        ${themeSection('📝 最终结果', '同数据切片 · 主表阶段=「最终结果」的行', unwrapPanel(renderAnswerPanel(traces)), false)}
+    </div>`;
+}
 
-    let html = '<div class="timeline">';
-    Object.keys(turns).sort((a, b) => a - b).forEach(turn => {
-        const steps = turns[turn];
-        const subGoal = steps.find(s => s.stepType === 'SUB_GOAL');
-        const turnLabel = subGoal ? subGoal.subGoalText : '迭代 #' + (Number(turn) + 1);
-        html += `<div class="turn-block"><div class="turn-header" onclick="this.parentElement.classList.toggle('collapsed')"><div class="turn-badge">${Number(turn) + 1}</div><div class="turn-title">${esc(turnLabel)}</div><div class="turn-toggle">▼</div></div><div class="turn-steps">`;
-        steps.forEach((step, i) => {
-            const isLast = i === steps.length - 1;
-            html += renderStep(step, isLast);
+/** 兜底元数据；启动时由 /api/traces/node-catalog（TraceStepType）覆盖 stage/label/desc */
+const STEP_ICONS = {
+    RUN_START:'🚀', RUN_END:'🏁', INTENT_L0:'⚡', INTENT_L1:'🔎', INTENT_L2:'📐', TASK_PLAN:'🗺️', REVIEW_PATH:'🖼️',
+    AGENT_LOOP_START:'🔄', SUBAGENT_LOOP_START:'👶', SUBAGENT_LOOP_END:'👶', PLAN:'🎯',
+    LLM_REQUEST:'📤', LLM_RESPONSE:'📥', LLM_CALL:'⏱️', THINKING:'💭', DECISION:'🧠',
+    TOOL_CALL:'🔧', TOOL_RESULT:'✅', PERM_DENY:'🚫', HOOK_DENY:'🪝',
+    TODO_SEED:'📌', TODO_SET:'📋', TODO_UPDATE:'☑️', TODO_LIST:'📃', TODO_REOPEN:'↩️', TODO_CONFIRM:'🔏', TODO_CLEAR:'🧹',
+    SUB_GOAL:'📋', COMPRESSION:'🗜️', ANSWER:'📝', LOOP_END:'🏁', ERROR:'❌'
+};
+let NODE_CATALOG = [];
+const STEP_META = {
+    RUN_START:            { stage: '生命周期', icon: '🚀', label: '任务开始',     desc: '收到用户问题，创建本次执行（executionId）' },
+    RUN_END:              { stage: '最终结果', icon: '🏁', label: '任务结束',     desc: '本轮用户任务收尾（成功/失败）' },
+    INTENT_L0:            { stage: '执行计划', icon: '⚡', label: 'L0·规则命中',   desc: '判定方式=规则（YAML/MySQL），高置信短路，未调小模型' },
+    INTENT_L1:            { stage: '执行计划', icon: '🔎', label: 'L1·小模型分类', desc: '判定方式=独立意图小模型，输出意图/目标/理由' },
+    INTENT_L2:            { stage: '执行计划', icon: '📐', label: 'L2·启发式兜底', desc: '判定方式=代码启发式（L0未命中且L1未用/低置信）' },
+    TASK_PLAN:            { stage: '执行计划', icon: '🗺️', label: '执行计划定案', desc: '本轮最终采用的 TaskPlan（目标/白名单/是否强制 todo）' },
+    REVIEW_PATH:          { stage: '执行计划', icon: '🖼️', label: '截图点评路径', desc: '走 REVIEW 快路径，不进完整 Agent 循环' },
+    AGENT_LOOP_START:     { stage: '生命周期', icon: '🔄', label: '进入主循环',   desc: '开始 Agent 多轮：模型 → 工具 → 再决策' },
+    SUBAGENT_LOOP_START:  { stage: '生命周期', icon: '👶', label: '子代理启动',   desc: 'delegate_task 拉起子 Agent 循环' },
+    SUBAGENT_LOOP_END:    { stage: '生命周期', icon: '👶', label: '子代理结束',   desc: '子 Agent 循环结束，结果回父任务' },
+    PLAN:                 { stage: '各轮目标', icon: '🎯', label: '本轮目标',     desc: '进入第 N 轮迭代（准备发 LLM）' },
+    LLM_REQUEST:          { stage: '模型调用', icon: '📤', label: '请求发出',     desc: '发给大模型的完整上下文' },
+    LLM_RESPONSE:         { stage: '模型调用', icon: '📥', label: '响应返回',     desc: '大模型返回：文本和/或工具调用' },
+    LLM_CALL:             { stage: '模型调用', icon: '⏱️', label: '调用耗时',     desc: '本轮 LLM 时延与 token 用量' },
+    THINKING:             { stage: '决策/反思', icon: '💭', label: '模型思考',     desc: '模型中间思考/流式内容' },
+    DECISION:             { stage: '决策/反思', icon: '🧠', label: '决策说明',     desc: '模型在选工具前的简短理由' },
+    TOOL_CALL:            { stage: '工具调用', icon: '🔧', label: '调用发起',     desc: '发起某个工具调用（参数见详情）' },
+    TOOL_RESULT:          { stage: '工具调用', icon: '✅', label: '结果返回',     desc: '工具执行返回（成功/失败内容）' },
+    PERM_DENY:            { stage: '工具调用', icon: '🚫', label: '权限拒绝',     desc: 'Plan/Ask 权限闸门拦住了该工具' },
+    HOOK_DENY:            { stage: '工具调用', icon: '🪝', label: '钩子拒绝',     desc: 'ToolHook 拒绝了该工具调用' },
+    TODO_SEED:            { stage: 'Todo拆分', icon: '📌', label: '播种待办',     desc: '用意图计划预填 todo/子目标栈' },
+    TODO_SET:             { stage: 'Todo拆分', icon: '📋', label: '建立计划',     desc: 'todo.set：写入完整拆分列表' },
+    TODO_UPDATE:          { stage: 'Todo拆分', icon: '☑️', label: '更新状态',     desc: 'todo.update：推进/完成/阻塞某一步' },
+    TODO_LIST:            { stage: 'Todo拆分', icon: '📃', label: '查询列表',     desc: 'todo.list：读取当前计划' },
+    TODO_REOPEN:          { stage: 'Todo拆分', icon: '↩️', label: '回滚重开',     desc: 'todo.reopen：回滚某步并级联下游' },
+    TODO_CONFIRM:         { stage: 'Todo拆分', icon: '🔏', label: '人工确认',     desc: 'todo.confirm：关键步放行' },
+    TODO_CLEAR:           { stage: 'Todo拆分', icon: '🧹', label: '清空计划',     desc: 'todo.clear：清空计划' },
+    SUB_GOAL:             { stage: '各轮目标', icon: '📋', label: '当前子目标',   desc: '框架维护的当前子目标指针' },
+    COMPRESSION:          { stage: '生命周期', icon: '🗜️', label: '上下文压缩',   desc: '历史消息过长，压缩后继续' },
+    ANSWER:               { stage: '最终结果', icon: '📝', label: '最终回答',     desc: '本轮对用户的最终文本/产物' },
+    LOOP_END:             { stage: '最终结果', icon: '🏁', label: '循环结束',     desc: 'Agent 循环结束原因（成功/达上限等）' },
+    ERROR:                { stage: '最终结果', icon: '❌', label: '执行错误',     desc: '本轮执行出现异常' }
+};
+
+function stepMeta(stepType) {
+    const base = STEP_META[stepType];
+    if (base) return { ...base, icon: base.icon || STEP_ICONS[stepType] || '•' };
+    return { stage: '其他', icon: STEP_ICONS[stepType] || '•', label: stepType || '未知节点', desc: '未登记的内部节点码：' + stepType };
+}
+
+async function loadNodeCatalog() {
+    try {
+        const resp = await fetch('/api/traces/node-catalog');
+        if (!resp.ok) return;
+        NODE_CATALOG = await resp.json();
+        NODE_CATALOG.forEach(n => {
+            const prev = STEP_META[n.code] || {};
+            STEP_META[n.code] = {
+                stage: n.stage,
+                icon: prev.icon || STEP_ICONS[n.code] || '•',
+                label: n.label,
+                desc: n.description + (n.persisted === false ? '（展示别名，不单独落库）' : ''),
+                persisted: n.persisted !== false
+            };
         });
-        html += '</div></div>';
-    });
-    html += '</div>';
-    $timeline.innerHTML = html;
+    } catch (e) { /* 用本地 STEP_META 兜底 */ }
 }
 
 function renderStep(step, isLast) {
     // 检测 LLM 请求/响应（通过内容前缀）
     const isLlmRequest = step.stepType === 'THINKING' && step.content && step.content.startsWith('【LLM 请求】');
     const isLlmResponse = step.stepType === 'THINKING' && step.content && step.content.startsWith('【LLM 响应】');
-    let icon, typeLabel, typeClass;
-    if (isLlmRequest) { icon = '📤'; typeLabel = 'LLM_REQUEST'; typeClass = 'LLM_REQUEST'; }
-    else if (isLlmResponse) { icon = '📥'; typeLabel = 'LLM_RESPONSE'; typeClass = 'LLM_RESPONSE'; }
-    else {
-        icon = { PLAN: '🎯', TOOL_CALL: '🔧', TOOL_RESULT: '✅', THINKING: '💭', ANSWER: '📝', SUB_GOAL: '📋', ERROR: '❌', LOOP_END: '🏁', DECISION: '🧠', LLM_CALL: '⏱️', COMPRESSION: '🗜️' }[step.stepType] || '•';
-        typeLabel = step.stepType;
+    let icon, typeLabel, typeClass, typeDesc;
+    if (isLlmRequest) {
+        ({ icon, label: typeLabel, desc: typeDesc } = stepMeta('LLM_REQUEST'));
+        typeClass = 'LLM_REQUEST';
+    } else if (isLlmResponse) {
+        ({ icon, label: typeLabel, desc: typeDesc } = stepMeta('LLM_RESPONSE'));
+        typeClass = 'LLM_RESPONSE';
+    } else {
+        const meta = stepMeta(step.stepType);
+        icon = meta.icon;
+        typeLabel = meta.label;
+        typeDesc = meta.desc;
         typeClass = step.stepType;
     }
     const statusClass = { SUCCESS: 'success', FAILURE: 'failure', RUNNING: 'running', TIMEOUT: 'warning' }[step.status] || '';
@@ -501,7 +1508,7 @@ function renderStep(step, isLast) {
         <div class="step-content">
             <div class="step-header">
                 <span class="step-icon">${icon}</span>
-                <span class="step-type ${typeClass}">${typeLabel}</span>
+                <span class="step-type ${typeClass}" title="${esc(typeDesc)} [${esc(step.stepType || '')}]">${esc(typeLabel)}</span>
                 ${step.toolName ? '<span class="step-tool-name">' + esc(step.toolName) + '</span>' : ''}
                 ${duration}
                 <span class="step-time">${time}</span>
@@ -515,28 +1522,30 @@ function renderStep(step, isLast) {
 function toggleAutoRefresh() {
     autoRefreshOn = !autoRefreshOn;
     document.getElementById('autoRefreshBtn').classList.toggle('active', autoRefreshOn);
-    startAutoRefresh();
+    scheduleRefreshInterval();
 }
 
-function startAutoRefresh() {
+function scheduleRefreshInterval() {
     if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
-    if (autoRefreshOn) {
-        // 同时刷新会话列表、任务列表和轨迹数据
-        autoRefreshTimer = setInterval(async () => {
-            await loadSessions();
-            if (currentSid) await loadExecutions();
-            if (currentExecId) await loadTraces();
-        }, 5000);
-    }
+    if (!autoRefreshOn) return;
+    // 运行中 1.5s 拉一次节点；空闲 5s
+    const ms = taskRunning ? 1500 : 5000;
+    autoRefreshTimer = setInterval(async () => {
+        if (currentSid) await loadExecutions();
+        if (currentExecId) await loadTraces(false);
+        // 低频刷会话列表
+        if (!taskRunning) await loadSessions();
+    }, ms);
 }
+
+function startAutoRefresh() { scheduleRefreshInterval(); }
 
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 // Init
-loadSessions();
-// 默认开启自动刷新
+loadNodeCatalog().then(() => loadSessions());
 document.getElementById('autoRefreshBtn').classList.add('active');
-startAutoRefresh();
+scheduleRefreshInterval();
 </script>
 </body>
 </html>

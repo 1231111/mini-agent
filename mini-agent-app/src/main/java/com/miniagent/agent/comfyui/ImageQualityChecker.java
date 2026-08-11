@@ -17,6 +17,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Objects;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 图片质检工具 — 用 LLM 视觉能力分析生成图片的质量。
@@ -67,10 +69,10 @@ public class ImageQualityChecker {
         try {
             Path genPath = resolvePath(generatedImagePath);
             Path refPath = resolvePath(referenceImagePath);
-            if (genPath == null || !Files.exists(genPath)) {
+            if (Objects.isNull(genPath) || !Files.exists(genPath)) {
                 return "{\"pass\":false,\"error\":\"生成图不存在: " + generatedImagePath + "\"}";
             }
-            if (refPath == null || !Files.exists(refPath)) {
+            if (Objects.isNull(refPath) || !Files.exists(refPath)) {
                 // 参考图找不到就退化为普通质检
                 return check(generatedImagePath);
             }
@@ -95,7 +97,7 @@ public class ImageQualityChecker {
             UserMessage msg = UserMessage.from(contents);
 
             ChatResponse resp = chatModel.chat(ChatRequest.builder().messages(List.of(msg)).build());
-            if (resp == null || resp.aiMessage() == null) {
+            if (Objects.isNull(resp) || Objects.isNull(resp.aiMessage())) {
                 return "{\"pass\":true,\"score\":5,\"issues\":[\"质检模型调用失败\"],\"suggestion\":\"\"}";
             }
 
@@ -119,12 +121,12 @@ public class ImageQualityChecker {
      */
     public String check(String imagePath) {
         try {
-            if (imagePath == null || imagePath.isBlank()) {
+            if (StringUtils.isBlank(imagePath)) {
                 return "{\"pass\":false,\"error\":\"请提供图片路径\"}";
             }
 
             Path path = resolvePath(imagePath);
-            if (path == null || !Files.exists(path)) {
+            if (Objects.isNull(path) || !Files.exists(path)) {
                 return "{\"pass\":false,\"error\":\"图片文件不存在: " + imagePath + "\"}";
             }
 
@@ -152,7 +154,7 @@ public class ImageQualityChecker {
             UserMessage msg = UserMessage.from(contents);
 
             ChatResponse resp = chatModel.chat(ChatRequest.builder().messages(List.of(msg)).build());
-            if (resp == null || resp.aiMessage() == null) {
+            if (Objects.isNull(resp) || Objects.isNull(resp.aiMessage())) {
                 return "{\"pass\":true,\"score\":5,\"issues\":[\"质检模型调用失败，默认通过\"],\"suggestion\":\"\"}";
             }
 

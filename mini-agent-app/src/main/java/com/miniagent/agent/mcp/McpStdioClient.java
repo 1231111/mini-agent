@@ -19,6 +19,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 轻量 MCP stdio JSON-RPC 客户端（Content-Length 帧 + 兼容 NDJSON）。
@@ -42,14 +45,14 @@ public class McpStdioClient implements AutoCloseable {
     }
 
     public static McpStdioClient start(McpProperties.Server cfg) throws Exception {
-        if (cfg.getCommand() == null || cfg.getCommand().isBlank()) {
+        if (StringUtils.isBlank(cfg.getCommand())) {
             throw new IllegalArgumentException("MCP server " + cfg.getId() + " 缺少 command");
         }
         List<String> cmd = new ArrayList<>();
         cmd.add(cfg.getCommand());
-        if (cfg.getArgs() != null) cmd.addAll(cfg.getArgs());
+        if (Objects.nonNull(cfg.getArgs())) cmd.addAll(cfg.getArgs());
         ProcessBuilder pb = new ProcessBuilder(cmd);
-        if (cfg.getEnv() != null && !cfg.getEnv().isEmpty()) {
+        if (Objects.nonNull(cfg.getEnv()) && !cfg.getEnv().isEmpty()) {
             pb.environment().putAll(cfg.getEnv());
         }
         pb.redirectErrorStream(false);
@@ -74,14 +77,14 @@ public class McpStdioClient implements AutoCloseable {
     public List<McpToolDef> listTools() throws Exception {
         JsonNode result = request("tools/list", MAPPER.createObjectNode()).get(30, TimeUnit.SECONDS);
         List<McpToolDef> out = new ArrayList<>();
-        JsonNode tools = result == null ? null : result.get("tools");
-        if (tools == null || !tools.isArray()) return out;
+        JsonNode tools = Objects.isNull(result) ? null : result.get("tools");
+        if (Objects.isNull(tools) || !tools.isArray()) return out;
         for (JsonNode t : tools) {
             String name = text(t, "name");
-            if (name == null || name.isBlank()) continue;
+            if (StringUtils.isBlank(name)) continue;
             String desc = text(t, "description");
             Map<String, Object> params = schemaToParams(t.get("inputSchema"));
-            out.add(new McpToolDef(name, desc == null ? "" : desc, params));
+            out.add(new McpToolDef(name, Optional.ofNullable(desc).orElse(""), params));
         }
         return out;
     }
@@ -91,7 +94,7 @@ public class McpStdioClient implements AutoCloseable {
         params.put("name", name);
         JsonNode argsNode;
         try {
-            argsNode = argumentsJson == null || argumentsJson.isBlank()
+            argsNode = StringUtils.isBlank(argumentsJson)
                     ? MAPPER.createObjectNode()
                     : MAPPER.readTree(argumentsJson);
         } catch (Exception e) {
@@ -103,11 +106,11 @@ public class McpStdioClient implements AutoCloseable {
     }
 
     private String formatCallResult(JsonNode result) throws Exception {
-        if (result == null) return "{\"error\":\"MCP 空结果\"}";
+        if (Objects.isNull(result)) return "{\"error\":\"MCP 空结果\"}";
         boolean isError = result.path("isError").asBoolean(false);
         JsonNode content = result.get("content");
         StringBuilder sb = new StringBuilder();
-        if (content != null && content.isArray()) {
+        if (Objects.nonNull(content) && content.isArray()) {
             for (JsonNode c : content) {
                 String type = text(c, "type");
                 if ("text".equals(type)) {
@@ -136,7 +139,7 @@ public class McpStdioClient implements AutoCloseable {
         msg.put("jsonrpc", "2.0");
         msg.put("id", id);
         msg.put("method", method);
-        if (params != null) msg.set("params", params);
+        if (Objects.nonNull(params)) msg.set("params", params);
         writeFrame(msg);
         return fut;
     }
@@ -145,7 +148,7 @@ public class McpStdioClient implements AutoCloseable {
         ObjectNode msg = MAPPER.createObjectNode();
         msg.put("jsonrpc", "2.0");
         msg.put("method", method);
-        if (params != null) msg.set("params", params);
+        if (Objects.nonNull(params)) msg.set("params", params);
         writeFrame(msg);
     }
 
@@ -162,7 +165,7 @@ public class McpStdioClient implements AutoCloseable {
         try (InputStream raw = new BufferedInputStream(process.getInputStream())) {
             while (!closed) {
                 JsonNode msg = readOneMessage(raw);
-                if (msg == null) break;
+                if (Objects.isNull(msg)) break;
                 handleMessage(msg);
             }
         } catch (Exception e) {
@@ -206,11 +209,11 @@ public class McpStdioClient implements AutoCloseable {
     }
 
     private void handleMessage(JsonNode msg) {
-        if (msg == null) return;
+        if (Objects.isNull(msg)) return;
         if (msg.has("id") && (msg.has("result") || msg.has("error"))) {
             long id = msg.get("id").asLong();
             CompletableFuture<JsonNode> fut = pending.remove(id);
-            if (fut == null) return;
+            if (Objects.isNull(fut)) return;
             if (msg.has("error")) {
                 fut.completeExceptionally(new IllegalStateException(msg.get("error").toString()));
             } else {
@@ -229,14 +232,14 @@ public class McpStdioClient implements AutoCloseable {
 
     private Map<String, Object> schemaToParams(JsonNode schema) {
         Map<String, Object> params = new LinkedHashMap<>();
-        if (schema == null || !schema.isObject()) return params;
+        if (Objects.isNull(schema) || !schema.isObject()) return params;
         JsonNode props = schema.get("properties");
         JsonNode required = schema.get("required");
         java.util.Set<String> req = new java.util.HashSet<>();
         if (required instanceof ArrayNode arr) {
             arr.forEach(n -> req.add(n.asText()));
         }
-        if (props != null && props.isObject()) {
+        if (Objects.nonNull(props) && props.isObject()) {
             props.fields().forEachRemaining(e -> {
                 JsonNode def = e.getValue();
                 Map<String, Object> p = new LinkedHashMap<>();
@@ -250,8 +253,8 @@ public class McpStdioClient implements AutoCloseable {
     }
 
     private static String text(JsonNode n, String field) {
-        JsonNode v = n == null ? null : n.get(field);
-        return v == null || v.isNull() ? null : v.asText();
+        JsonNode v = Objects.isNull(n) ? null : n.get(field);
+        return Objects.isNull(v) || v.isNull() ? null : v.asText();
     }
 
     @Override

@@ -1,6 +1,7 @@
 package com.miniagent.agent.tool;
 
 import java.util.Set;
+import java.util.Objects;
 
 /**
  * 工具并发安全策略：只读/幂等工具可在流式中途预执行（对齐 Claude Code isConcurrencySafe）。
@@ -21,6 +22,6 @@ public final class ToolConcurrencyPolicy {
     );
 
     public static boolean isStreamPrefetchSafe(String toolName) {
-        return toolName != null && STREAM_PREFETCH_SAFE.contains(toolName);
+        return Objects.nonNull(toolName) && STREAM_PREFETCH_SAFE.contains(toolName);
     }
 }

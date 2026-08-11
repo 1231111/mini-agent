@@ -34,20 +34,16 @@ import org.springframework.web.multipart.MultipartFile;
 import com.miniagent.agent.web.UploadedDocumentService;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.*;
 
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.PageRequest;
-import com.miniagent.config.entity.ChatMessage;
 import com.miniagent.config.repository.ChatMessageRepository;
 import com.miniagent.config.repository.ChatTaskRepository;
 import com.miniagent.config.entity.ChatTask;
 import com.miniagent.config.repository.AgentTraceStepRepository;
 import com.miniagent.config.entity.AgentTraceStep;
+import org.apache.commons.lang3.StringUtils;
 
 @Controller
 public class MiniAgentChatPageController {
@@ -89,7 +85,7 @@ public class MiniAgentChatPageController {
     @GetMapping("/")
     public String showChatPage(HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) {
+        if (Objects.isNull(userId)) {
             return "login";
         }
         return "chat";
@@ -132,8 +128,8 @@ public class MiniAgentChatPageController {
                                            @RequestParam(value = "sessionId", defaultValue = "default") String sessionId,
                                            HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return Map.of("success", false, "message", "Not authenticated");
-        if (file == null || file.isEmpty()) {
+        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
+        if (Objects.isNull(file)) {
             return Map.of("success", false, "message", "文件为空");
         }
         if (file.getSize() > maxUploadSizeBytes) {
@@ -142,15 +138,15 @@ public class MiniAgentChatPageController {
                             + (maxUploadSizeBytes / 1024 / 1024) + "MB");
         }
         try {
-            String base64 = java.util.Base64.getEncoder().encodeToString(file.getBytes());
+            String base64 = Base64.getEncoder().encodeToString(file.getBytes());
             var saved = fileStorageService.saveFile(userId, sessionId, file.getOriginalFilename(), file.getContentType(), base64);
             Map<String, Object> resp = new LinkedHashMap<>();
             resp.put("success", true);
             resp.put("filePath", saved.getFilePath());
             resp.put("filename", saved.getOriginalFilename());
-            resp.put("mimeType", saved.getMimeType() != null ? saved.getMimeType() : "application/octet-stream");
+            resp.put("mimeType", Optional.ofNullable(saved.getMimeType()).orElse("application/octet-stream"));
             resp.put("fileSize", saved.getFileSize());
-            if (saved.getExtractedTextPath() != null) {
+            if (Objects.nonNull(saved.getExtractedTextPath())) {
                 resp.put("extractedTextPath", saved.getExtractedTextPath());
             }
             return resp;
@@ -163,7 +159,7 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public Map<String, Object> authStatus(HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) {
+        if (Objects.isNull(userId)) {
             return Map.of("authenticated", false);
         }
         return authService.getUserById(userId)
@@ -173,13 +169,13 @@ public class MiniAgentChatPageController {
 
     private Long getUserIdFromCookie(HttpServletRequest request) {
         Long fromAttr = SessionCookieService.userIdFromRequest(request);
-        if (fromAttr != null) return fromAttr;
+        if (Objects.nonNull(fromAttr)) return fromAttr;
         return sessionCookieService.resolveUserId(request);
     }
 
     /** Ensure session belongs to user (via conversation or prior tasks). */
     private boolean ownsSession(Long userId, String sessionId) {
-        if (userId == null || sessionId == null || sessionId.isBlank()) return false;
+        if (Objects.isNull(userId) || StringUtils.isBlank(sessionId)) return false;
         if (conversationStore.ownedBy(userId, sessionId)) return true;
         return chatTaskRepository.existsByUserIdAndSessionId(userId, sessionId);
     }
@@ -188,24 +184,24 @@ public class MiniAgentChatPageController {
 
     @PostMapping(value = "/api/chat/inject", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public java.util.Map<String, Object> injectMessage(@RequestBody java.util.Map<String, String> body, HttpServletRequest request) {
+    public Map<String, Object> injectMessage(@RequestBody Map<String, String> body, HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) {
-            return java.util.Map.of("success", false, "error", "Not authenticated");
+        if (Objects.isNull(userId)) {
+            return Map.of("success", false, "error", "Not authenticated");
         }
         String sessionId = body.get("sessionId");
         String message = body.get("message");
-        if (sessionId == null || sessionId.isBlank() || message == null || message.isBlank()) {
-            return java.util.Map.of("success", false, "error", "sessionId and message required");
+        if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(message)) {
+            return Map.of("success", false, "error", "sessionId and message required");
         }
         if (!ownsSession(userId, sessionId) && !agentService.isTaskRunning(sessionId)) {
-            return java.util.Map.of("success", false, "error", "Forbidden");
+            return Map.of("success", false, "error", "Forbidden");
         }
         boolean ok = streamHub.injectMessage(sessionId, message);
         if (!ok) {
-            return java.util.Map.of("success", false, "error", "No active task for this session");
+            return Map.of("success", false, "error", "No active task for this session");
         }
-        return java.util.Map.of("success", true);
+        return Map.of("success", true);
     }
 
     // ========== SSE streaming ==========
@@ -213,7 +209,7 @@ public class MiniAgentChatPageController {
     @PostMapping(value = "/chat/stream", consumes = MediaType.APPLICATION_JSON_VALUE)
     public SseEmitter chatStreamMultimodal(@RequestBody ChatRequest req, HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) {
+        if (Objects.isNull(userId)) {
             SseEmitter emitter = new SseEmitter(0L);
             try {
                 emitter.send(SseEmitter.event().name("error").data("Not authenticated"));
@@ -226,13 +222,13 @@ public class MiniAgentChatPageController {
         String message = req.getMessage();
         String sessionId = req.getSessionId();
         String role = req.getRole();  // 获取角色选择
-        List<String> images = req.getImages() == null ? List.of() : req.getImages();
-        List<FileAttachment> files = req.getFiles() == null ? List.of() : req.getFiles();
-        StringBuilder queryTask = new StringBuilder(message != null ? message : "");
+        List<String> images = Objects.isNull(req.getImages()) ? List.of() : req.getImages();
+        List<FileAttachment> files = Objects.isNull(req.getFiles()) ? List.of() : req.getFiles();
+        StringBuilder queryTask = new StringBuilder(Optional.ofNullable(message).orElse(""));
         // 预上传附件：统一走安全提取 + 侧车 + 上下文预算（docx/pptx/pdf/md 等）
-        if (req.getFileRefs() != null && !req.getFileRefs().isEmpty()) {
+        if (Objects.nonNull(req.getFileRefs()) && !req.getFileRefs().isEmpty()) {
             String fileCtx = uploadedDocumentService.buildMessageContext(userId, req.getFileRefs());
-            if (fileCtx != null && !fileCtx.isBlank()) {
+            if (StringUtils.isNotBlank(fileCtx)) {
                 queryTask.append(fileCtx);
             }
         }
@@ -267,10 +263,10 @@ public class MiniAgentChatPageController {
             }
 
             String contentType = Files.probeContentType(imagePath);
-            if (contentType == null) contentType = "application/octet-stream";
+            if (Objects.isNull(contentType)) contentType = "application/octet-stream";
 
             String uri = imagePath.toUri().toString();
-            UrlResource resource = new UrlResource(uri == null ? "file:///" : uri);
+            UrlResource resource = new UrlResource(Objects.isNull(uri) ? "file:///" : uri);
             return ResponseEntity.ok()
                     .contentType(MediaType.parseMediaType(contentType))
                     .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + filename + "\"")
@@ -288,7 +284,7 @@ public class MiniAgentChatPageController {
     public Map<String, Object> taskStatus(@RequestParam("sessionId") String sessionId,
                                           HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
         if (!ownsSession(userId, sessionId) && !agentService.isTaskRunning(sessionId)) {
             return Map.of("sessionId", sessionId, "running", false);
         }
@@ -304,7 +300,7 @@ public class MiniAgentChatPageController {
     public SseEmitter attachStream(@RequestParam("sessionId") String sessionId,
                                    HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) {
+        if (Objects.isNull(userId)) {
             SseEmitter emitter = new SseEmitter(0L);
             try {
                 emitter.send(SseEmitter.event().name("error").data("Not authenticated"));
@@ -332,12 +328,12 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public Object listConversations(HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return java.util.Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
         var tasks = chatTaskRepository.findLatestTaskPerSession(userId);
-        return tasks.stream().map(t -> java.util.Map.of(
+        return tasks.stream().map(t -> Map.of(
             "sessionId", t.getSessionId(),
             "title", t.getQuestion().length() > 40 ? t.getQuestion().substring(0, 40) : t.getQuestion(),
-            "updatedAt", t.getCreatedAt() != null ? t.getCreatedAt().toString() : ""
+            "updatedAt", Objects.nonNull(t.getCreatedAt()) ? t.getCreatedAt().toString() : ""
         )).toList();
     }
 
@@ -346,9 +342,9 @@ public class MiniAgentChatPageController {
     public Object getConversation(@RequestParam("sessionId") String sessionId,
                                   HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
         var conv = agentService.getConversationForUser(userId, sessionId);
-        if (conv == null) {
+        if (Objects.isNull(conv)) {
             return Map.of("exists", false, "sessionId", sessionId);
         }
         return conv;
@@ -362,17 +358,17 @@ public class MiniAgentChatPageController {
             @RequestParam(value = "page", defaultValue = "0") int page,
             @RequestParam(value = "size", defaultValue = "10") int size) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return java.util.Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
         var tasks = chatTaskRepository.findByUserIdAndSessionIdOrderByCreatedAtDesc(
                 userId, sessionId, org.springframework.data.domain.PageRequest.of(page, size));
-        var list = new java.util.ArrayList<>(tasks.getContent());
-        java.util.Collections.reverse(list);
-        return java.util.Map.of(
-            "tasks", list.stream().map(t -> java.util.Map.of(
+        var list = new ArrayList<>(tasks.getContent());
+        Collections.reverse(list);
+        return Map.of(
+            "tasks", list.stream().map(t -> Map.of(
                 "id", t.getId(),
                 "question", t.getQuestion(),
-                "answer", t.getAnswer() != null ? t.getAnswer() : "",
-                "createdAt", t.getCreatedAt() != null ? t.getCreatedAt().toString() : ""
+                "answer", Optional.ofNullable(t.getAnswer()).orElse(""),
+                "createdAt", Objects.nonNull(t.getCreatedAt()) ? t.getCreatedAt().toString() : ""
             )).toList(),
             "hasMore", tasks.hasNext()
         );
@@ -380,24 +376,24 @@ public class MiniAgentChatPageController {
 
     @GetMapping(value = "/api/conversation/delete", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public java.util.Map<String, Object> deleteConversationApi(
+    public Map<String, Object> deleteConversationApi(
             HttpServletRequest request,
             @RequestParam("sessionId") String sessionId) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return java.util.Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
         if (!ownsSession(userId, sessionId)) {
-            return java.util.Map.of("success", false, "error", "Forbidden");
+            return Map.of("success", false, "error", "Forbidden");
         }
         chatTaskRepository.deleteByUserIdAndSessionId(userId, sessionId);
         agentService.deleteConversationForUser(userId, sessionId);
-        return java.util.Map.of("success", true);
+        return Map.of("success", true);
     }
 
     @GetMapping(value = "/api/token-usage", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public Object tokenUsage(@RequestParam("sessionId") String sessionId, HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
         if (!ownsSession(userId, sessionId)) return Map.of("error", "Forbidden");
         return TokenUsageTracker.get(sessionId);
     }
@@ -406,7 +402,7 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public Object allTokenUsage(HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
         // Per-user aggregate not tracked; return empty to avoid cross-tenant leak
         return Map.of();
     }
@@ -416,10 +412,17 @@ public class MiniAgentChatPageController {
     @GetMapping("/trace")
     public String showTracePage(HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) {
+        if (Objects.isNull(userId)) {
             return "login";
         }
         return "trace";
+    }
+
+    /** Trace 节点全集目录（与 TraceStepType 同步，供页面中文展示/可控清单） */
+    @GetMapping(value = "/api/traces/node-catalog", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public Object getTraceNodeCatalog() {
+        return com.miniagent.agent.trace.TraceStepType.catalog();
     }
 
     @GetMapping(value = "/api/traces", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -429,11 +432,11 @@ public class MiniAgentChatPageController {
             @RequestParam(value = "sessionId", required = false) String sessionId,
             @RequestParam(value = "executionId", required = false) String executionId) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return java.util.List.of();
-        if (sessionId != null && !sessionId.isBlank() && !ownsSession(userId, sessionId)) {
-            return java.util.List.of();
+        if (Objects.isNull(userId)) return List.of();
+        if (StringUtils.isNotBlank(sessionId) && !ownsSession(userId, sessionId)) {
+            return List.of();
         }
-        if (executionId != null && !executionId.isEmpty()) {
+        if (Objects.nonNull(executionId) && !executionId.isEmpty()) {
             return agentTraceStepRepository.findByExecutionIdOrderByTurnIndexAscIdAsc(executionId);
         }
         return agentTraceStepRepository.findBySessionIdOrderByTurnIndexAscIdAsc(sessionId);
@@ -442,20 +445,20 @@ public class MiniAgentChatPageController {
     /** 获取某 session 下所有执行任务的列表（按 executionId 分组） */
     @GetMapping(value = "/api/traces/executions", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public java.util.List<java.util.Map<String, Object>> getExecutions(
+    public List<Map<String, Object>> getExecutions(
             @RequestParam("sessionId") String sessionId,
             HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null || !ownsSession(userId, sessionId)) return java.util.List.of();
-        java.util.List<AgentTraceStep> all = agentTraceStepRepository.findBySessionIdOrderByTurnIndexAscIdAsc(sessionId);
+        if (Objects.isNull(userId) || !ownsSession(userId, sessionId)) return List.of();
+        List<AgentTraceStep> all = agentTraceStepRepository.findBySessionIdOrderByTurnIndexAscIdAsc(sessionId);
         // 按 executionId 分组，返回每个执行的摘要
-        java.util.Map<String, java.util.List<AgentTraceStep>> grouped = new java.util.LinkedHashMap<>();
+        Map<String, List<AgentTraceStep>> grouped = new LinkedHashMap<>();
         for (AgentTraceStep s : all) {
-            grouped.computeIfAbsent(s.getExecutionId(), k -> new java.util.ArrayList<>()).add(s);
+            grouped.computeIfAbsent(s.getExecutionId(), k -> new ArrayList<>()).add(s);
         }
-        java.util.List<java.util.Map<String, Object>> result = new java.util.ArrayList<>();
+        List<Map<String, Object>> result = new ArrayList<>();
         for (var entry : grouped.entrySet()) {
-            java.util.List<AgentTraceStep> steps = entry.getValue();
+            List<AgentTraceStep> steps = entry.getValue();
             AgentTraceStep first = steps.get(0);
             AgentTraceStep last = steps.get(steps.size() - 1);
             String question = first.getUserQuestion();
@@ -465,10 +468,10 @@ public class MiniAgentChatPageController {
                     .map(s -> s.getContent())
                     .findFirst().orElse("");
             if (answerSummary.length() > 100) answerSummary = answerSummary.substring(0, 100) + "...";
-            java.util.Map<String, Object> exec = new java.util.HashMap<>();
+            Map<String, Object> exec = new HashMap<>();
             exec.put("executionId", entry.getKey());
             exec.put("sessionId", sessionId);
-            exec.put("userQuestion", question != null ? question : "");
+            exec.put("userQuestion", Optional.ofNullable(question).orElse(""));
             exec.put("answerSummary", answerSummary);
             exec.put("stepCount", steps.size());
             exec.put("startTime", first.getCreatedAt());
@@ -481,21 +484,21 @@ public class MiniAgentChatPageController {
 
     @GetMapping(value = "/api/traces/summary", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public java.util.Map<String, Object> getTraceSummary(
+    public Map<String, Object> getTraceSummary(
             HttpServletRequest request,
             @RequestParam(value = "sessionId", required = false) String sessionId,
             @RequestParam(value = "executionId", required = false) String executionId) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return java.util.Map.of("error", "Not authenticated");
-        if (sessionId != null && !sessionId.isBlank() && !ownsSession(userId, sessionId)) {
-            return java.util.Map.of("error", "Forbidden");
+        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
+        if (StringUtils.isNotBlank(sessionId) && !ownsSession(userId, sessionId)) {
+            return Map.of("error", "Forbidden");
         }
         long totalSteps, totalTurns;
         Long totalDuration;
-        java.util.List<Object[]> toolStats;
-        java.util.List<Object[]> slowestSteps = java.util.List.of();
+        List<Object[]> toolStats;
+        List<Object[]> slowestSteps = List.of();
 
-        if (executionId != null && !executionId.isEmpty()) {
+        if (Objects.nonNull(executionId) && !executionId.isEmpty()) {
             totalSteps = agentTraceStepRepository.countByExecutionId(executionId);
             totalTurns = agentTraceStepRepository.countDistinctTurnsByExecutionId(executionId);
             totalDuration = agentTraceStepRepository.sumDurationByExecutionId(executionId);
@@ -508,27 +511,27 @@ public class MiniAgentChatPageController {
             toolStats = agentTraceStepRepository.toolStatsBySessionId(sessionId);
         }
 
-        java.util.List<java.util.Map<String, Object>> tools = new java.util.ArrayList<>();
+        List<Map<String, Object>> tools = new ArrayList<>();
         for (Object[] row : toolStats) {
-            java.util.Map<String, Object> m = new java.util.HashMap<>();
+            Map<String, Object> m = new HashMap<>();
             m.put("name", row[0]);
             m.put("count", row[1]);
             m.put("avgDurationMs", Math.round(((Number) row[2]).doubleValue()));
             tools.add(m);
         }
-        java.util.List<java.util.Map<String, Object>> slowest = new java.util.ArrayList<>();
+        List<Map<String, Object>> slowest = new ArrayList<>();
         for (Object[] row : slowestSteps) {
             if (slowest.size() >= 5) break;
-            java.util.Map<String, Object> m = new java.util.HashMap<>();
+            Map<String, Object> m = new HashMap<>();
             m.put("stepType", row[0]);
             m.put("toolName", row[1]);
             m.put("durationMs", row[2]);
             slowest.add(m);
         }
-        java.util.Map<String, Object> result = new java.util.HashMap<>();
+        Map<String, Object> result = new HashMap<>();
         result.put("totalSteps", totalSteps);
         result.put("totalTurns", totalTurns);
-        result.put("totalDurationMs", totalDuration != null ? totalDuration : 0);
+        result.put("totalDurationMs", Optional.ofNullable(totalDuration).orElse(0L));
         result.put("tools", tools);
         result.put("slowestSteps", slowest);
         return result;
@@ -541,8 +544,8 @@ public class MiniAgentChatPageController {
     public Map<String, Object> getPermissionMode(@RequestParam("sessionId") String sessionId,
                                                  HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return Map.of("success", false, "message", "Not authenticated");
-        if (sessionId == null || sessionId.isBlank()) {
+        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
+        if (StringUtils.isBlank(sessionId)) {
             return Map.of("success", false, "message", "sessionId required");
         }
         return permissionStore.toView(sessionId);
@@ -552,12 +555,12 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public Map<String, Object> putPermissionMode(@RequestBody Map<String, Object> body, HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return Map.of("success", false, "message", "Not authenticated");
-        String sessionId = body == null ? null : String.valueOf(body.getOrDefault("sessionId", ""));
-        if (sessionId == null || sessionId.isBlank() || "null".equals(sessionId)) {
+        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
+        String sessionId = Objects.isNull(body) ? null : String.valueOf(body.getOrDefault("sessionId", ""));
+        if (StringUtils.isBlank(sessionId) || "null".equals(sessionId)) {
             return Map.of("success", false, "message", "sessionId required");
         }
-        String action = body.get("action") == null ? "set" : String.valueOf(body.get("action"));
+        String action = Objects.isNull(body.get("action")) ? "set" : String.valueOf(body.get("action"));
         if ("approve_plan".equalsIgnoreCase(action)) {
             permissionStore.approvePlan(sessionId);
             // 可选：注入一句提示，让运行中的 agent 感知（若无运行中任务则仅更新状态）
@@ -565,12 +568,12 @@ public class MiniAgentChatPageController {
             return permissionStore.toView(sessionId);
         }
         if ("grant_ask".equalsIgnoreCase(action)) {
-            String tool = body.get("tool") == null ? "" : String.valueOf(body.get("tool"));
+            String tool = Objects.isNull(body.get("tool")) ? "" : String.valueOf(body.get("tool"));
             permissionStore.grantAskTool(sessionId, tool);
             streamHub.injectMessage(sessionId, "【系统】用户已批准工具 " + tool + "，请继续。");
             return permissionStore.toView(sessionId);
         }
-        String mode = body.get("mode") == null ? "default" : String.valueOf(body.get("mode"));
+        String mode = Objects.isNull(body.get("mode")) ? "default" : String.valueOf(body.get("mode"));
         permissionStore.setMode(sessionId, PermissionMode.from(mode));
         return permissionStore.toView(sessionId);
     }
@@ -581,10 +584,10 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public Map<String, Object> mcpStatus(HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return Map.of("success", false, "message", "Not authenticated");
-        boolean enabled = mcpProperties != null && mcpProperties.isEnabled();
-        List<String> tools = mcpToolBridge == null ? List.of() : mcpToolBridge.registeredToolNames();
-        int serverCount = mcpProperties == null || mcpProperties.getServers() == null
+        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
+        boolean enabled = Objects.nonNull(mcpProperties) && mcpProperties.isEnabled();
+        List<String> tools = Objects.isNull(mcpToolBridge) ? List.of() : mcpToolBridge.registeredToolNames();
+        int serverCount = Objects.isNull(mcpProperties) || Objects.isNull(mcpProperties.getServers())
                 ? 0 : mcpProperties.getServers().size();
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("success", true);
@@ -600,17 +603,17 @@ public class MiniAgentChatPageController {
     public Map<String, Object> mcpRefresh(@RequestBody(required = false) Map<String, Object> body,
                                           HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return Map.of("success", false, "message", "Not authenticated");
-        if (mcpToolBridge == null) return Map.of("success", false, "message", "MCP bridge unavailable");
+        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
+        if (Objects.isNull(mcpToolBridge)) return Map.of("success", false, "message", "MCP bridge unavailable");
         try {
-            String serverId = body == null || body.get("serverId") == null
+            String serverId = Objects.isNull(body) || Objects.isNull(body.get("serverId"))
                     ? null : String.valueOf(body.get("serverId"));
-            if (serverId != null && !serverId.isBlank() && !"null".equals(serverId)) {
+            if (StringUtils.isNotBlank(serverId) && !"null".equals(serverId)) {
                 return mcpToolBridge.refreshServer(serverId);
             }
             return mcpToolBridge.refreshAll();
         } catch (Exception e) {
-            return Map.of("success", false, "message", e.getMessage() == null ? "refresh failed" : e.getMessage());
+            return Map.of("success", false, "message", Objects.nonNull(e.getMessage()) ? e.getMessage() : "refresh failed");
         }
     }
 
@@ -620,7 +623,7 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public Map<String, Object> getModelConfig(HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return Map.of("success", false, "message", "Not authenticated");
+        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
         return userModelConfigService.getView(userId);
     }
 
@@ -628,19 +631,19 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public Map<String, Object> putModelConfig(@RequestBody Map<String, Object> body, HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (userId == null) return Map.of("success", false, "message", "Not authenticated");
-        if (body != null && Boolean.TRUE.equals(body.get("reset"))) {
+        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
+        if (Objects.nonNull(body) && Boolean.TRUE.equals(body.get("reset"))) {
             return userModelConfigService.resetToDefault(userId);
         }
-        String presetId = body == null ? null : strOrNull(body.get("presetId"));
-        String baseUrl = body == null ? null : strOrNull(body.get("baseUrl"));
-        String modelName = body == null ? null : strOrNull(body.get("modelName"));
-        String apiKey = body == null ? null : strOrNull(body.get("apiKey"));
+        String presetId = Objects.isNull(body) ? null : strOrNull(body.get("presetId"));
+        String baseUrl = Objects.isNull(body) ? null : strOrNull(body.get("baseUrl"));
+        String modelName = Objects.isNull(body) ? null : strOrNull(body.get("modelName"));
+        String apiKey = Objects.isNull(body) ? null : strOrNull(body.get("apiKey"));
         return userModelConfigService.save(userId, presetId, baseUrl, modelName, apiKey);
     }
 
     private static String strOrNull(Object v) {
-        if (v == null) return null;
+        if (Objects.isNull(v)) return null;
         return String.valueOf(v);
     }
 }

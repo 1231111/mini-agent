@@ -3,6 +3,9 @@ package com.miniagent.agent.intent;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 public record TaskPlan(
         IntentType intent,
@@ -28,7 +31,7 @@ public record TaskPlan(
      * null = 不限制（注册表全量工具）；空集合 = 无工具。
      */
     public Set<String> allowedToolSet() {
-        return allowedTools == null ? null : new LinkedHashSet<>(allowedTools);
+        return Objects.isNull(allowedTools) ? null : new LinkedHashSet<>(allowedTools);
     }
 
     public String toPromptBlock() {
@@ -40,17 +43,17 @@ public record TaskPlan(
         sb.append("- shouldUseHistory: ").append(shouldUseHistory).append('\n');
         sb.append("- needsTools: ").append(needsTools).append('\n');
         sb.append("- requiresStructuredPlan: ").append(requiresStructuredPlan).append('\n');
-        sb.append("- allowedTools: ").append(allowedTools == null ? List.of() : allowedTools).append('\n');
-        if (reason != null && !reason.isBlank()) {
+        sb.append("- allowedTools: ").append(Optional.ofNullable(allowedTools).orElse(List.of())).append('\n');
+        if (StringUtils.isNotBlank(reason)) {
             sb.append("- reason: ").append(reason).append('\n');
         }
-        if (steps != null && !steps.isEmpty()) {
+        if (Objects.nonNull(steps) && !steps.isEmpty()) {
             sb.append("## 计划步骤\n");
             for (TaskStep step : steps) {
                 sb.append(step.id()).append(". ")
                         .append(step.goal())
                         .append(" | tools=")
-                        .append(step.allowedTools() == null ? List.of() : step.allowedTools())
+                        .append(Objects.isNull(step.allowedTools()) ? List.of() : step.allowedTools())
                         .append('\n');
             }
         }

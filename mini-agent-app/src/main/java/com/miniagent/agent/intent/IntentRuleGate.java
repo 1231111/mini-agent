@@ -1,9 +1,12 @@
 package com.miniagent.agent.intent;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * L0 高置信规则短路。匹配逻辑固定，信号词/工具面全部来自配置。
@@ -11,19 +14,24 @@ import java.util.List;
 @Component
 public class IntentRuleGate {
 
-    private final IntentProperties props;
-    private final IntentSignalMatcher signals;
+    @Autowired
+    private IntentProperties props;
+    @Autowired
+    private IntentSignalMatcher signals;
 
-    public IntentRuleGate(IntentProperties props, IntentSignalMatcher signals) {
+    /** 同包测试：绕过 Spring 注入 */
+    IntentRuleGate(IntentProperties props, IntentSignalMatcher signals) {
         this.props = props;
         this.signals = signals;
     }
+
+    public IntentRuleGate() {}
 
     /**
      * @return 高置信 TaskPlan；未命中返回 null
      */
     public TaskPlan tryShortCircuit(String text, boolean hasImage) {
-        if (text == null) text = "";
+        if (Objects.isNull(text)) text = "";
         String t = text.trim();
         IntentProperties.Rules rules = props.getRules();
 
@@ -59,11 +67,11 @@ public class IntentRuleGate {
         // full=null → 注册表全量（含 MCP）；不写死工具名列表
         List<String> tools = props.getToolProfiles().getFull();
         return new TaskPlan(IntentType.NEW_TASK, goal, true, true, true,
-                tools == null || tools.isEmpty() ? null : List.copyOf(tools),
+                Objects.isNull(tools) || tools.isEmpty() ? null : List.copyOf(tools),
                 List.of(), reason, structured);
     }
 
     private static List<String> copyTools(List<String> tools) {
-        return tools == null ? List.of() : new ArrayList<>(tools);
+        return Objects.isNull(tools) ? List.of() : new ArrayList<>(tools);
     }
 }

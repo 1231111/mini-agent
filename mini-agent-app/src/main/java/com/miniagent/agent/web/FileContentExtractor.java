@@ -30,6 +30,9 @@ import java.nio.file.Path;
 import java.util.Base64;
 import java.util.Locale;
 import java.util.Set;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 统一文件文本提取：MIME + 扩展名双通道识别，支持磁盘路径与 base64。
@@ -69,7 +72,7 @@ public class FileContentExtractor {
     }
 
     public ExtractResult extractDetailed(String filename, String mimeType, String base64Content) {
-        if (base64Content == null || base64Content.isEmpty()) {
+        if (StringUtils.isEmpty(base64Content)) {
             return ExtractResult.fail(null, "文件内容为空");
         }
         byte[] data;
@@ -82,7 +85,7 @@ public class FileContentExtractor {
     }
 
     public ExtractResult extractFromPath(Path path, String filename, String mimeType) {
-        if (path == null || !Files.isRegularFile(path)) {
+        if (Objects.isNull(path) || !Files.isRegularFile(path)) {
             return ExtractResult.fail(null, "文件不存在: " + path);
         }
         try {
@@ -92,7 +95,7 @@ public class FileContentExtractor {
                         "文件过大: " + (size / 1024) + "KB，最大允许 " + (maxFileBytes / 1024) + "KB");
             }
             byte[] data = Files.readAllBytes(path);
-            String name = filename != null ? filename : path.getFileName().toString();
+            String name = Optional.ofNullable(filename).orElse(path.getFileName().toString());
             return extractFromBytes(name, mimeType, data);
         } catch (IOException e) {
             log.warn("读取文件失败: {}", path, e);
@@ -110,7 +113,7 @@ public class FileContentExtractor {
     }
 
     private ExtractResult extractFromBytes(String filename, String mimeType, byte[] data, boolean applyInlineLimit) {
-        if (data == null || data.length == 0) {
+        if (Objects.isNull(data) || data.length == 0) {
             return ExtractResult.fail(null, "文件内容为空");
         }
         if (data.length > maxFileBytes) {
@@ -142,7 +145,7 @@ public class FileContentExtractor {
                         "不支持的文件类型: mime=" + mimeType + ", file=" + filename
                                 + "。支持: pdf/docx/pptx/xlsx/md/txt/csv/json 等文本");
             }
-            if (raw == null || raw.isBlank()) {
+            if (StringUtils.isBlank(raw)) {
                 return ExtractResult.fail(format, "无可提取的文本内容（可能是扫描件或空文档）");
             }
             int original = raw.length();
@@ -160,8 +163,8 @@ public class FileContentExtractor {
 
     /** MIME 优先，扩展名兜底（浏览器常把 docx 报成 octet-stream） */
     public DocKind resolveKind(String filename, String mimeType) {
-        String mime = mimeType == null ? "" : mimeType.toLowerCase(Locale.ROOT).trim();
-        String lower = filename == null ? "" : filename.toLowerCase(Locale.ROOT);
+        String mime = Objects.isNull(mimeType) ? "" : mimeType.toLowerCase(Locale.ROOT).trim();
+        String lower = Objects.isNull(filename) ? "" : filename.toLowerCase(Locale.ROOT);
 
         if (lower.endsWith(".doc") && !lower.endsWith(".docx")) return DocKind.LEGACY_OLE;
         if (lower.endsWith(".ppt") && !lower.endsWith(".pptx")) return DocKind.LEGACY_OLE;
@@ -173,7 +176,7 @@ public class FileContentExtractor {
         if (mime.contains("spreadsheetml") || lower.endsWith(".xlsx")) return DocKind.XLSX;
 
         if (isTextType(mime) || isTextByExtension(lower)) return DocKind.TEXT;
-        if (mime.isBlank() || "application/octet-stream".equals(mime)) {
+        if (StringUtils.isBlank(mime) || "application/octet-stream".equals(mime)) {
             // 未知 MIME：仅信任明确文本扩展名，其余 unsupported
             if (isTextByExtension(lower)) return DocKind.TEXT;
         }
@@ -196,13 +199,13 @@ public class FileContentExtractor {
     }
 
     private boolean isTextType(String mimeType) {
-        if (mimeType == null || mimeType.isBlank()) return false;
+        if (StringUtils.isBlank(mimeType)) return false;
         if (TEXT_MIME_TYPES.contains(mimeType)) return true;
         return mimeType.startsWith("text/");
     }
 
     private boolean isTextByExtension(String lowerFilename) {
-        if (lowerFilename == null) return false;
+        if (Objects.isNull(lowerFilename)) return false;
         String[] textExts = {".txt", ".csv", ".json", ".md", ".markdown", ".xml", ".html", ".htm",
                 ".css", ".js", ".ts", ".py", ".java", ".sql", ".sh", ".bat",
                 ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".log",
@@ -225,13 +228,13 @@ public class FileContentExtractor {
             StringBuilder sb = new StringBuilder();
             for (XWPFParagraph para : doc.getParagraphs()) {
                 String text = para.getText();
-                if (text != null && !text.isBlank()) sb.append(text).append('\n');
+                if (StringUtils.isNotBlank(text)) sb.append(text).append('\n');
             }
             for (XWPFTable table : doc.getTables()) {
                 for (XWPFTableRow row : table.getRows()) {
                     for (XWPFTableCell cell : row.getTableCells()) {
                         String text = cell.getText();
-                        if (text != null && !text.isBlank()) sb.append(text).append('\t');
+                        if (StringUtils.isNotBlank(text)) sb.append(text).append('\t');
                     }
                     sb.append('\n');
                 }
@@ -250,7 +253,7 @@ public class FileContentExtractor {
                 for (XSLFShape shape : slide.getShapes()) {
                     if (shape instanceof XSLFTextShape textShape) {
                         String text = textShape.getText();
-                        if (text != null && !text.isBlank()) sb.append(text).append('\n');
+                        if (StringUtils.isNotBlank(text)) sb.append(text).append('\n');
                     }
                 }
                 sb.append('\n');
@@ -267,14 +270,14 @@ public class FileContentExtractor {
                 sb.append("--- ").append(sheet.getSheetName()).append(" ---\n");
                 for (int rowIdx = sheet.getFirstRowNum(); rowIdx <= sheet.getLastRowNum(); rowIdx++) {
                     XSSFRow row = sheet.getRow(rowIdx);
-                    if (row == null) continue;
+                    if (Objects.isNull(row)) continue;
                     StringBuilder rowStr = new StringBuilder();
                     short first = row.getFirstCellNum();
                     if (first < 0) continue;
                     for (int cellIdx = first; cellIdx < row.getLastCellNum(); cellIdx++) {
                         if (cellIdx > first) rowStr.append('\t');
                         XSSFCell cell = row.getCell(cellIdx);
-                        if (cell != null) rowStr.append(cell.toString());
+                        if (Objects.nonNull(cell)) rowStr.append(cell.toString());
                     }
                     if (!rowStr.isEmpty()) sb.append(rowStr).append('\n');
                 }

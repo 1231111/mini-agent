@@ -1,5 +1,7 @@
 package com.miniagent.config.service;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.miniagent.config.entity.User;
 import com.miniagent.config.repository.UserRepository;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -11,20 +13,23 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.Optional;
+import java.util.Objects;
+import org.apache.commons.lang3.StringUtils;
 
 @Service
 public class AuthService {
 
-    private final UserRepository userRepository;
-    private final PasswordEncoder passwordEncoder;
+    @Autowired
 
-    public AuthService(UserRepository userRepository, PasswordEncoder passwordEncoder) {
-        this.userRepository = userRepository;
-        this.passwordEncoder = passwordEncoder;
-    }
+    private UserRepository userRepository;
+    @Autowired
+
+    private PasswordEncoder passwordEncoder;
+
+    
 
     public Optional<User> register(String username, String password, String displayName) {
-        if (username == null || username.isBlank() || password == null || password.length() < 6) {
+        if (StringUtils.isBlank(username) || Objects.isNull(password) || password.length() < 6) {
             return Optional.empty();
         }
         if (userRepository.existsByUsername(username)) {
@@ -33,7 +38,7 @@ public class AuthService {
         User user = new User();
         user.setUsername(username.trim());
         user.setPasswordHash(passwordEncoder.encode(password));
-        user.setDisplayName(displayName != null && !displayName.isBlank() ? displayName : username.trim());
+        user.setDisplayName(StringUtils.isNotBlank(displayName) ? displayName : username.trim());
         return Optional.of(userRepository.save(user));
     }
 
@@ -56,7 +61,7 @@ public class AuthService {
      */
     private boolean matchesAndUpgrade(User user, String password) {
         String stored = user.getPasswordHash();
-        if (stored == null) return false;
+        if (Objects.isNull(stored)) return false;
         if (stored.startsWith("$2a$") || stored.startsWith("$2b$") || stored.startsWith("$2y$")) {
             return passwordEncoder.matches(password, stored);
         }

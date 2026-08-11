@@ -1,5 +1,9 @@
 package com.miniagent.agent.core;
 
+import com.miniagent.agent.core.AgentLoop;
+import com.miniagent.agent.core.TokenEstimator;
+import org.springframework.beans.factory.annotation.Value;
+
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
@@ -15,6 +19,7 @@ import org.springframework.stereotype.Component;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 上下文压缩器（对标 hermes-agent context_compressor.py 5 阶段流水线）。
@@ -38,7 +43,7 @@ public class ContextCompressor {
 
     // ─── 阈值配置 ───
     /** 压缩触发阈值：上下文占比达到该比例即压缩，留出输出余量。可配置，默认 0.75。 */
-    @org.springframework.beans.factory.annotation.Value("${agent.context.compress-threshold:0.75}")
+    @Value("${agent.context.compress-threshold:0.75}")
     private double compressionThreshold;
     private static final double TAIL_TOKEN_RATIO = 0.4;
     private static final int PROTECT_FIRST_N = 2;
@@ -123,7 +128,7 @@ public class ContextCompressor {
 
     /** 从工具调用参数中提取关键信息摘要（如文件路径、搜索关键词） */
     private static String summarizeToolCall(String toolName, String arguments) {
-        if (arguments == null || arguments.isBlank()) return toolName;
+        if (StringUtils.isBlank(arguments)) return toolName;
         return switch (toolName) {
             case "read_file", "write_file", "list_files" -> toolName + "(" + extractJsonField(arguments, "path") + ")";
             case "web_search" -> toolName + "(" + extractJsonField(arguments, "query") + ")";
@@ -141,7 +146,7 @@ public class ContextCompressor {
     }
 
     private static String truncateStr(String s, int max) {
-        if (s == null) return "";
+        if (Objects.isNull(s)) return "";
         return s.length() <= max ? s : s.substring(0, max) + "...";
     }
 
@@ -212,13 +217,13 @@ public class ContextCompressor {
             if (msg instanceof UserMessage um) {
                 sb.append("用户: ").append(extractText(um)).append("\n");
             } else if (msg instanceof AiMessage am) {
-                sb.append("助手: ").append(am.text() != null ? am.text() : "[工具调用]").append("\n");
+                sb.append("助手: ").append(Optional.ofNullable(am.text()).orElse("[工具调用]")).append("\n");
             } else if (msg instanceof ToolExecutionResultMessage tr) {
-                String t = tr.text() == null ? "" : tr.text();
+                String t = Objects.isNull(tr.text()) ? "" : tr.text();
                 sb.append("工具结果(").append(tr.toolName()).append("): ")
                   .append(t.substring(0, Math.min(t.length(), 200))).append("\n");
             } else if (msg instanceof SystemMessage sm) {
-                String t = sm.text() == null ? "" : sm.text();
+                String t = Objects.isNull(sm.text()) ? "" : sm.text();
                 sb.append("系统: ").append(t.substring(0, Math.min(t.length(), 200))).append("\n");
             }
         }
@@ -245,7 +250,7 @@ public class ContextCompressor {
                 "格式：每条一行 \"类别: 内容\"。如果没有值得记忆的内容，在分隔符后输出 \"无\"。";
 
         String prompt;
-        if (state.previousSummary != null) {
+        if (Objects.nonNull(state.previousSummary)) {
             prompt = SUMMARY_PREAMBLE + "\n" +
                 "你正在更新一个上下文压缩摘要。以下是上一次的摘要和新的对话轮次。\n\n" +
                 "上一次摘要：\n" + state.previousSummary + "\n\n" +
@@ -262,7 +267,7 @@ public class ContextCompressor {
             List<ChatMessage> req = List.of(new UserMessage(prompt));
             ChatResponse resp = chatModel.chat(ChatRequest.builder().messages(req).build());
             String fullResponse = resp.aiMessage().text();
-            if (fullResponse == null) return null;
+            if (Objects.isNull(fullResponse)) return null;
 
             // 按分隔符拆分：摘要 + 记忆
             String summary;
@@ -275,10 +280,10 @@ public class ContextCompressor {
                 summary = fullResponse.strip();
             }
 
-            if (summary != null) state.previousSummary = summary;
+            if (Objects.nonNull(summary)) state.previousSummary = summary;
 
             // 异步保存记忆提取结果
-            if (memoryPart != null && !memoryPart.isBlank() && !memoryPart.contains("无")) {
+            if (StringUtils.isNotBlank(memoryPart) && !memoryPart.contains("无")) {
                 try {
                     String existing = memoryStore.getRawMidtermMemory();
                     String newMemory = existing.isEmpty() ? memoryPart : existing + "\n" + memoryPart;
@@ -325,15 +330,15 @@ public class ContextCompressor {
     }
 
     public List<ChatMessage> maybeCompress(List<ChatMessage> messages, int maxContextTokens, String sessionId) {
-        if (messages == null || messages.size() < MIN_MESSAGES_TO_COMPRESS) return messages;
+        if (Objects.isNull(messages) || messages.size() < MIN_MESSAGES_TO_COMPRESS) return messages;
 
         int maxTokens = maxContextTokens > 0 ? maxContextTokens : DEFAULT_MAX_CONTEXT_TOKENS;
         double ratio = tokenEstimator.contextRatio(messages, maxTokens);
 
         if (ratio < compressionThreshold) return messages;
 
-        String effectiveSessionId = sessionId != null ? sessionId : currentSessionId.get();
-        SessionState state = effectiveSessionId != null ? getState(effectiveSessionId) : new SessionState();
+        String effectiveSessionId = Optional.ofNullable(sessionId).orElse(currentSessionId.get());
+        SessionState state = Objects.nonNull(effectiveSessionId) ? getState(effectiveSessionId) : new SessionState();
 
         if (state.cooldownRemaining > 0) {
             state.cooldownRemaining--;
@@ -378,7 +383,7 @@ public class ContextCompressor {
         int summaryBudget = Math.min(MAX_SUMMARY_TOKENS, (int)(maxTokens * 0.05));
         String summary = generateSummaryAndExtractMemory(toSummarize, summaryBudget, state);
 
-        if (summary == null || summary.isBlank()) {
+        if (StringUtils.isBlank(summary)) {
             summary = String.format("【上下文压缩】%d 条对话轮次已移除。请基于最近对话继续。", toSummarize.size());
         }
 
@@ -451,6 +456,6 @@ public class ContextCompressor {
     }
 
     private String truncate(String s, int maxLen) {
-        return s != null && s.length() > maxLen ? s.substring(0, maxLen) + "..." : s;
+        return Objects.nonNull(s) && s.length() > maxLen ? s.substring(0, maxLen) + "..." : s;
     }
 }

@@ -1,15 +1,17 @@
 package com.miniagent.agent.memory;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.tool.Tool;
 import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.memory.MemoryStore;
 import jakarta.annotation.PostConstruct;
-import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 记忆工具 — 单一入口 + action 参数（参考 hermes-agent 的 memory tool 设计）
@@ -17,11 +19,12 @@ import java.util.*;
  * 支持 action: add / replace / remove / read
  */
 @Component
-@RequiredArgsConstructor
 public class MemoryTool {
 
-    private final MemoryStore memoryStore;
-    private final ToolRegistry toolRegistry;
+    @Autowired
+    private MemoryStore memoryStore;
+    @Autowired
+    private ToolRegistry toolRegistry;
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @PostConstruct
@@ -87,19 +90,19 @@ public class MemoryTool {
 
                         return switch (action) {
                             case "add" -> {
-                                if (content == null || content.isBlank())
+                                if (StringUtils.isBlank(content))
                                     yield error("add 需要 content 参数。");
                                 yield MAPPER.writeValueAsString(memoryStore.add(target, content));
                             }
                             case "replace" -> {
-                                if (oldText == null || oldText.isBlank())
+                                if (StringUtils.isBlank(oldText))
                                     yield error("replace 需要 old_text 参数。");
-                                if (content == null || content.isBlank())
+                                if (StringUtils.isBlank(content))
                                     yield error("replace 需要 content 参数。");
                                 yield MAPPER.writeValueAsString(memoryStore.replace(target, oldText, content));
                             }
                             case "remove" -> {
-                                if (oldText == null || oldText.isBlank())
+                                if (StringUtils.isBlank(oldText))
                                     yield error("remove 需要 old_text 参数。");
                                 yield MAPPER.writeValueAsString(memoryStore.remove(target, oldText));
                             }
@@ -127,12 +130,12 @@ public class MemoryTool {
 
     private static String str(Map<String, Object> args, String key) {
         Object v = args.get(key);
-        return v == null ? null : v.toString();
+        return Objects.isNull(v) ? null : v.toString();
     }
 
     private static String str(Map<String, Object> args, String key, String defaultVal) {
         Object v = args.get(key);
-        return v == null ? defaultVal : v.toString();
+        return Objects.isNull(v) ? defaultVal : v.toString();
     }
 
     private static String error(String msg) {

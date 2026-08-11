@@ -7,6 +7,7 @@ import org.springframework.stereotype.Component;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * 聚合全部 {@link StopHook}；任一非 PROCEED 即短路。
@@ -18,7 +19,7 @@ public class StopHookChain {
     private final List<StopHook> hooks;
 
     public StopHookChain(@Autowired(required = false) List<StopHook> hooks) {
-        List<StopHook> list = hooks == null ? List.of() : new ArrayList<>(hooks);
+        List<StopHook> list = Objects.isNull(hooks) ? List.of() : new ArrayList<>(hooks);
         list.sort(Comparator.comparingInt(StopHook::order));
         this.hooks = List.copyOf(list);
         if (!this.hooks.isEmpty()) {
@@ -32,7 +33,7 @@ public class StopHookChain {
         for (StopHook hook : hooks) {
             try {
                 StopDecision d = hook.evaluate(context);
-                if (d == null || d.isProceed()) continue;
+                if (Objects.isNull(d) || d.isProceed()) continue;
                 log.info("StopHook [{}] 裁决 {}: {}", hook.name(), d.action(), d.reason());
                 return d;
             } catch (Exception e) {

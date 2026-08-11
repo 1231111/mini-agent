@@ -1,6 +1,7 @@
 package com.miniagent.agent.permission;
 
 import java.util.Locale;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 会话级权限模式（对齐 Claude Code 分层思想，适配 Web 多用户）。
@@ -19,7 +20,7 @@ public enum PermissionMode {
     ASK;
 
     public static PermissionMode from(String raw) {
-        if (raw == null || raw.isBlank()) return DEFAULT;
+        if (StringUtils.isBlank(raw)) return DEFAULT;
         String s = raw.trim().toLowerCase(Locale.ROOT).replace('-', '_');
         return switch (s) {
             case "plan" -> PLAN;

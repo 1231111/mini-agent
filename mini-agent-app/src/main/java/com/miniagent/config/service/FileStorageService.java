@@ -1,5 +1,9 @@
 package com.miniagent.config.service;
 
+import jakarta.annotation.PostConstruct;
+
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.miniagent.agent.web.UploadedDocumentService;
 import com.miniagent.config.entity.FileUpload;
 import com.miniagent.config.repository.FileUploadRepository;
@@ -17,28 +21,25 @@ import java.nio.file.Path;
 import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
+import java.util.Objects;
 
 @Service
 public class FileStorageService {
 
     private static final Logger log = LoggerFactory.getLogger(FileStorageService.class);
 
-    private final FileUploadRepository fileUploadRepository;
-    private final UploadedDocumentService uploadedDocumentService;
-    private final Path baseDir;
+    @Autowired
+    private FileUploadRepository fileUploadRepository;
+    @Lazy
+    @Autowired
+    private UploadedDocumentService uploadedDocumentService;
+    @Autowired
+    private MediaStorage mediaStorage;
+    private Path baseDir;
 
-    public FileStorageService(
-            FileUploadRepository fileUploadRepository,
-            @Lazy UploadedDocumentService uploadedDocumentService,
-            MediaStorage mediaStorage) {
-        this.fileUploadRepository = fileUploadRepository;
-        this.uploadedDocumentService = uploadedDocumentService;
+    @PostConstruct
+    private void initAutowiredComputed() {
         this.baseDir = mediaStorage.uploadsDir();
-        try {
-            Files.createDirectories(this.baseDir);
-        } catch (IOException e) {
-            log.error("Failed to create base upload directory: {}", this.baseDir, e);
-        }
     }
 
     public FileUpload saveFile(Long userId, String sessionId, String originalFilename,
@@ -48,7 +49,7 @@ public class FileStorageService {
             Files.createDirectories(userDir);
 
             String ext = "";
-            int dotIdx = originalFilename == null ? -1 : originalFilename.lastIndexOf('.');
+            int dotIdx = Objects.isNull(originalFilename) ? -1 : originalFilename.lastIndexOf('.');
             if (dotIdx > 0) {
                 ext = originalFilename.substring(dotIdx);
             }
@@ -103,12 +104,12 @@ public class FileStorageService {
     }
 
     private boolean isTextFile(String filename, String mimeType) {
-        if (mimeType != null && (mimeType.startsWith("text/") || mimeType.contains("json")
+        if (Objects.nonNull(mimeType) && (mimeType.startsWith("text/") || mimeType.contains("json")
                 || mimeType.contains("xml") || mimeType.contains("javascript")
                 || mimeType.contains("markdown"))) {
             return true;
         }
-        if (filename == null) return false;
+        if (Objects.isNull(filename)) return false;
         String lower = filename.toLowerCase();
         String[] exts = {".txt", ".csv", ".json", ".md", ".markdown", ".xml", ".html", ".htm",
                 ".css", ".js", ".ts", ".py", ".java", ".sql", ".sh", ".bat",

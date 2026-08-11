@@ -1,4 +1,5 @@
 package com.miniagent.agent.todo;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 把当前对话的 sessionId 在调用 Agent 循环时注入 ThreadLocal，
@@ -16,7 +17,7 @@ public final class TaskTodoContext {
 
     public static String currentSessionId() {
         String sid = CURRENT.get();
-        return sid == null || sid.isBlank() ? "default" : sid;
+        return StringUtils.isBlank(sid) ? "default" : sid;
     }
 
     public static void clear() {

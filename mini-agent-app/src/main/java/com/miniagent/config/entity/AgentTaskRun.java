@@ -2,6 +2,7 @@ package com.miniagent.config.entity;
 
 import jakarta.persistence.*;
 import java.time.LocalDateTime;
+import java.util.Objects;
 
 @Entity
 @Table(name = "agent_task_runs", indexes = {
@@ -37,7 +38,7 @@ public class AgentTaskRun {
 
     @PrePersist
     protected void onCreate() {
-        if (startedAt == null) startedAt = LocalDateTime.now();
+        if (Objects.isNull(startedAt)) startedAt = LocalDateTime.now();
     }
 
     public Long getId() { return id; }

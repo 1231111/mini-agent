@@ -5,6 +5,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.regex.Pattern;
+import java.util.Objects;
+import java.util.Optional;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * 断言执行器：对一条 {@link EvalCheck} 求值，返回是否通过 + 失败原因。
@@ -25,8 +28,8 @@ public class EvalChecker {
     }
 
     public CheckResult check(EvalCheck c, String response) {
-        String resp = response == null ? "" : response;
-        boolean raw = switch (c.type == null ? "" : c.type) {
+        String resp = Optional.ofNullable(response).orElse("");
+        boolean raw = switch (Optional.ofNullable(c.type).orElse("")) {
             case "response_contains" -> resp.toLowerCase().contains(safe(c.value).toLowerCase());
             case "response_regex" -> Pattern.compile(safe(c.value), Pattern.DOTALL).matcher(resp).find();
             case "response_min_length" -> resp.strip().length() >= c.number;
@@ -35,7 +38,7 @@ public class EvalChecker {
             case "file_contains" -> fileContains(c.path, c.value);
             default -> false;
         };
-        if (c.type == null || c.type.isBlank() || !KNOWN.contains(c.type)) {
+        if (StringUtils.isBlank(c.type) || !KNOWN.contains(c.type)) {
             return CheckResult.fail(c.type, "未知断言类型: " + c.type);
         }
         boolean pass = c.negate != raw; // negate 时取反
@@ -48,22 +51,22 @@ public class EvalChecker {
             "no_error", "file_exists", "file_contains");
 
     private boolean noError(String resp, String value) {
-        if (value != null && !value.isBlank()) return !resp.contains(value);
+        if (StringUtils.isNotBlank(value)) return !resp.contains(value);
         String low = resp.toLowerCase();
         return DEFAULT_ERROR_PHRASES.stream().noneMatch(p -> low.contains(p.toLowerCase()));
     }
 
     private boolean fileExists(String path) {
         Path p = resolve(path);
-        return p != null && Files.exists(p);
+        return Objects.nonNull(p) && Files.exists(p);
     }
 
     private boolean fileContains(String path, String value) {
         Path p = resolve(path);
-        if (p == null || !Files.exists(p)) return false;
+        if (Objects.isNull(p) || !Files.exists(p)) return false;
         try {
             String content = Files.readString(p, StandardCharsets.UTF_8);
-            return value == null || content.contains(value);
+            return Objects.isNull(value) || content.contains(value);
         } catch (Exception e) {
             return false;
         }
@@ -71,7 +74,7 @@ public class EvalChecker {
 
     /** 解析用例里的相对路径：相对项目根；绝对路径直接用。 */
     private Path resolve(String path) {
-        if (path == null || path.isBlank()) return null;
+        if (StringUtils.isBlank(path)) return null;
         String norm = path.replace('\\', '/').trim();
         Path p = Path.of(norm);
         return p.isAbsolute() ? p.normalize() : projectRoot.resolve(norm).normalize();
@@ -98,5 +101,5 @@ public class EvalChecker {
         };
     }
 
-    private static String safe(String s) { return s == null ? "" : s; }
+    private static String safe(String s) { return Optional.ofNullable(s).orElse(""); }
 }

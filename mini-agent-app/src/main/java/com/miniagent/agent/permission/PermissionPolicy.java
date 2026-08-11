@@ -1,6 +1,7 @@
 package com.miniagent.agent.permission;
 
 import java.util.Set;
+import java.util.Objects;
 
 /**
  * 权限策略：Plan 只读工具集、Ask 危险工具集。
@@ -29,11 +30,11 @@ public final class PermissionPolicy {
     );
 
     public static boolean isPlanSafe(String toolName) {
-        return toolName != null && PLAN_SAFE_TOOLS.contains(toolName);
+        return Objects.nonNull(toolName) && PLAN_SAFE_TOOLS.contains(toolName);
     }
 
     public static boolean isAskDangerous(String toolName) {
-        if (toolName == null) return false;
+        if (Objects.isNull(toolName)) return false;
         // MCP 外部工具默认视为危险（需 Ask 确认或 Plan 批准）
         if (toolName.startsWith("mcp__")) return true;
         return ASK_DANGEROUS_TOOLS.contains(toolName);
@@ -44,7 +45,7 @@ public final class PermissionPolicy {
      * Ask 的「未授权危险工具」仍会出现在 specs 中（让模型能发起），执行时再拦截并推前端确认。
      */
     public static boolean allowInSpecs(PermissionMode mode, boolean planApproved, String toolName) {
-        if (toolName == null) return false;
+        if (Objects.isNull(toolName)) return false;
         if (mode == PermissionMode.PLAN && !planApproved) {
             return isPlanSafe(toolName);
         }

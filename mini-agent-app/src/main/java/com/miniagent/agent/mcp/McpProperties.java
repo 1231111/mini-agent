@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * agent.mcp.* 配置。
@@ -29,7 +30,7 @@ public class McpProperties {
     }
 
     public void setServers(List<Server> servers) {
-        this.servers = servers == null ? new ArrayList<>() : servers;
+        this.servers = Optional.ofNullable(servers).orElse(new ArrayList<>());
     }
 
     public static class Server {
@@ -46,9 +47,9 @@ public class McpProperties {
         public String getCommand() { return command; }
         public void setCommand(String command) { this.command = command; }
         public List<String> getArgs() { return args; }
-        public void setArgs(List<String> args) { this.args = args == null ? new ArrayList<>() : args; }
+        public void setArgs(List<String> args) { this.args = Optional.ofNullable(args).orElse(new ArrayList<>()); }
         public Map<String, String> getEnv() { return env; }
-        public void setEnv(Map<String, String> env) { this.env = env == null ? new HashMap<>() : env; }
+        public void setEnv(Map<String, String> env) { this.env = Optional.ofNullable(env).orElse(new HashMap<>()); }
         public String getTransport() { return transport; }
         public void setTransport(String transport) { this.transport = transport; }
         public String getUrl() { return url; }

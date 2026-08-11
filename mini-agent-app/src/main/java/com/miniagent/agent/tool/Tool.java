@@ -8,6 +8,7 @@ import lombok.NoArgsConstructor;
 import java.util.Collections;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.Objects;
 
 /**
  * 工具抽象：一个可被 Agent 调用的外部能力。
@@ -32,7 +33,7 @@ public class Tool {
      * @return 执行结果
      */
     public String execute(String argumentsJson) {
-        if (handler == null) {
+        if (Objects.isNull(handler)) {
             return "错误：工具 " + name + " 未配置执行器";
         }
         try {

@@ -5,6 +5,7 @@ import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * agent.intent.* — 模型端点、置信度、L0 信号与工具面均配置化，避免场景写死在代码里。
@@ -47,10 +48,10 @@ public class IntentProperties {
         this.classifierSystemPrompt = classifierSystemPrompt;
     }
     public Rules getRules() { return rules; }
-    public void setRules(Rules rules) { this.rules = rules != null ? rules : new Rules(); }
+    public void setRules(Rules rules) { this.rules = Optional.ofNullable(rules).orElse(new Rules()); }
     public ToolProfiles getToolProfiles() { return toolProfiles; }
     public void setToolProfiles(ToolProfiles toolProfiles) {
-        this.toolProfiles = toolProfiles != null ? toolProfiles : new ToolProfiles();
+        this.toolProfiles = Optional.ofNullable(toolProfiles).orElse(new ToolProfiles());
     }
 
     /** L0/L2 信号：每项为正则；改场景只改配置 */
@@ -74,39 +75,39 @@ public class IntentProperties {
 
         public List<String> getWebSignals() { return webSignals; }
         public void setWebSignals(List<String> webSignals) {
-            this.webSignals = webSignals != null ? webSignals : new ArrayList<>();
+            this.webSignals = Optional.ofNullable(webSignals).orElse(new ArrayList<>());
         }
         public List<String> getFileSignals() { return fileSignals; }
         public void setFileSignals(List<String> fileSignals) {
-            this.fileSignals = fileSignals != null ? fileSignals : new ArrayList<>();
+            this.fileSignals = Optional.ofNullable(fileSignals).orElse(new ArrayList<>());
         }
         public List<String> getImageIntoDocSignals() { return imageIntoDocSignals; }
         public void setImageIntoDocSignals(List<String> imageIntoDocSignals) {
-            this.imageIntoDocSignals = imageIntoDocSignals != null ? imageIntoDocSignals : new ArrayList<>();
+            this.imageIntoDocSignals = Optional.ofNullable(imageIntoDocSignals).orElse(new ArrayList<>());
         }
         public List<String> getPureImageSignals() { return pureImageSignals; }
         public void setPureImageSignals(List<String> pureImageSignals) {
-            this.pureImageSignals = pureImageSignals != null ? pureImageSignals : new ArrayList<>();
+            this.pureImageSignals = Optional.ofNullable(pureImageSignals).orElse(new ArrayList<>());
         }
         public List<String> getQuestionSignals() { return questionSignals; }
         public void setQuestionSignals(List<String> questionSignals) {
-            this.questionSignals = questionSignals != null ? questionSignals : new ArrayList<>();
+            this.questionSignals = Optional.ofNullable(questionSignals).orElse(new ArrayList<>());
         }
         public List<String> getTaskActionSignals() { return taskActionSignals; }
         public void setTaskActionSignals(List<String> taskActionSignals) {
-            this.taskActionSignals = taskActionSignals != null ? taskActionSignals : new ArrayList<>();
+            this.taskActionSignals = Optional.ofNullable(taskActionSignals).orElse(new ArrayList<>());
         }
         public List<String> getContinueSignals() { return continueSignals; }
         public void setContinueSignals(List<String> continueSignals) {
-            this.continueSignals = continueSignals != null ? continueSignals : new ArrayList<>();
+            this.continueSignals = Optional.ofNullable(continueSignals).orElse(new ArrayList<>());
         }
         public List<String> getComplexSignals() { return complexSignals; }
         public void setComplexSignals(List<String> complexSignals) {
-            this.complexSignals = complexSignals != null ? complexSignals : new ArrayList<>();
+            this.complexSignals = Optional.ofNullable(complexSignals).orElse(new ArrayList<>());
         }
         public List<String> getImageAndDocSignals() { return imageAndDocSignals; }
         public void setImageAndDocSignals(List<String> imageAndDocSignals) {
-            this.imageAndDocSignals = imageAndDocSignals != null ? imageAndDocSignals : new ArrayList<>();
+            this.imageAndDocSignals = Optional.ofNullable(imageAndDocSignals).orElse(new ArrayList<>());
         }
         public int getPureImageMaxLen() { return pureImageMaxLen; }
         public void setPureImageMaxLen(int pureImageMaxLen) { this.pureImageMaxLen = pureImageMaxLen; }
@@ -136,11 +137,11 @@ public class IntentProperties {
         public void setFull(List<String> full) { this.full = full; }
         public List<String> getImage() { return image; }
         public void setImage(List<String> image) {
-            this.image = image != null ? image : new ArrayList<>();
+            this.image = Optional.ofNullable(image).orElse(new ArrayList<>());
         }
         public List<String> getQuestion() { return question; }
         public void setQuestion(List<String> question) {
-            this.question = question != null ? question : new ArrayList<>();
+            this.question = Optional.ofNullable(question).orElse(new ArrayList<>());
         }
     }
 }

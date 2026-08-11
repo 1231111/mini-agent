@@ -1,5 +1,7 @@
 package com.miniagent.agent.comfyui;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.config.storage.MediaStorage;
@@ -17,6 +19,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.*;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * ComfyUI API 服务 — 统一封装所有 ComfyUI 交互。
@@ -39,13 +42,15 @@ public class ComfyUIService {
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
-    private final ImageQualityChecker qualityChecker;
-    private final MediaStorage mediaStorage;
+    @Lazy
+    @Autowired
 
-    public ComfyUIService(@Lazy ImageQualityChecker qualityChecker, MediaStorage mediaStorage) {
-        this.qualityChecker = qualityChecker;
-        this.mediaStorage = mediaStorage;
-    }
+    private ImageQualityChecker qualityChecker;
+    @Autowired
+
+    private MediaStorage mediaStorage;
+
+    
 
     /** 默认反向提示词 — 覆盖常见质量问题 */
     private static final String DEFAULT_NEGATIVE_PROMPT =
@@ -74,7 +79,7 @@ public class ComfyUIService {
     public String getStatus() {
         try {
             String body = httpGet(baseUrl() + "/system_stats");
-            if (body == null) {
+            if (Objects.isNull(body)) {
                 return toJson(Map.of(
                         "online", false,
                         "message", "ComfyUI 未运行或无法连接 (" + baseUrl() + ")",
@@ -118,7 +123,7 @@ public class ComfyUIService {
     public String listWorkflows() {
         try {
             String body = httpGet(baseUrl() + "/object_info");
-            if (body == null) return error("无法获取工作流信息，ComfyUI 可能未启动");
+            if (Objects.isNull(body)) return error("无法获取工作流信息，ComfyUI 可能未启动");
 
             JsonNode nodes = mapper.readTree(body);
             List<String> nodeNames = new ArrayList<>();
@@ -148,9 +153,9 @@ public class ComfyUIService {
     public String getCheckpointModels() {
         try {
             String body = httpGet(baseUrl() + "/object_info/CheckpointLoaderSimple");
-            if (body == null) {
+            if (Objects.isNull(body)) {
                 body = httpGet(baseUrl() + "/object_info");
-                if (body == null) return error("无法获取模型信息，ComfyUI 可能未启动");
+                if (Objects.isNull(body)) return error("无法获取模型信息，ComfyUI 可能未启动");
             }
 
             JsonNode root = mapper.readTree(body);
@@ -207,7 +212,7 @@ public class ComfyUIService {
                     ? workflowJson
                     : "{\"prompt\":" + workflowJson + "}";
             String body = httpPost(baseUrl() + "/prompt", wrappedJson);
-            if (body == null) return error("提交工作流失败，ComfyUI 可能未启动");
+            if (Objects.isNull(body)) return error("提交工作流失败，ComfyUI 可能未启动");
 
             JsonNode result = mapper.readTree(body);
             String promptId = result.path("prompt_id").asText("");
@@ -245,7 +250,7 @@ public class ComfyUIService {
                 Thread.sleep(pollInterval);
 
                 String body = httpGet(baseUrl() + "/history/" + promptId);
-                if (body != null) {
+                if (Objects.nonNull(body)) {
                     JsonNode history = mapper.readTree(body);
                     if (history.has(promptId)) {
                         JsonNode entry = history.get(promptId);
@@ -296,7 +301,7 @@ public class ComfyUIService {
                     if (!filename.isEmpty()) {
                         // 1. 从 ComfyUI 下载图片到本地
                         String localFile = downloadFromComfyUI(filename, subfolder, type, imageDir);
-                        if (localFile != null) {
+                        if (Objects.nonNull(localFile)) {
                             // 2. 返回 Spring Boot 的 URL（前端可访问）
                             images.add("/generated-images/" + localFile);
                         }
@@ -309,7 +314,7 @@ public class ComfyUIService {
                     String filename = audio.path("filename").asText("");
                     if (!filename.isEmpty()) {
                         String localFile = downloadFromComfyUI(filename, "", "output", imageDir);
-                        if (localFile != null) {
+                        if (Objects.nonNull(localFile)) {
                             images.add("/generated-images/" + localFile);
                         }
                     }
@@ -333,8 +338,8 @@ public class ComfyUIService {
     private String downloadFromComfyUI(String filename, String subfolder, String type, Path saveDir) {
         try {
             String url = baseUrl() + "/view?filename=" + filename;
-            if (subfolder != null && !subfolder.isEmpty()) url += "&subfolder=" + subfolder;
-            if (type != null && !type.isEmpty()) url += "&type=" + type;
+            if (Objects.nonNull(subfolder) && !subfolder.isEmpty()) url += "&subfolder=" + subfolder;
+            if (Objects.nonNull(type) && !type.isEmpty()) url += "&type=" + type;
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
@@ -366,7 +371,7 @@ public class ComfyUIService {
     public String checkStatus(String promptId) {
         try {
             String body = httpGet(baseUrl() + "/history/" + promptId);
-            if (body == null) return error("查询状态失败");
+            if (Objects.isNull(body)) return error("查询状态失败");
 
             JsonNode history = mapper.readTree(body);
             if (history.has(promptId)) {
@@ -405,11 +410,11 @@ public class ComfyUIService {
     public String txt2img(String prompt, String negativePrompt, int width, int height,
                            String checkpoint, int steps, double cfg, Long seed) {
         try {
-            if (seed == null || seed < 0) seed = new Random().nextLong() & 0xFFFFFFFFL;
-            if (negativePrompt == null || negativePrompt.isBlank()) {
+            if (Objects.isNull(seed) || seed < 0) seed = new Random().nextLong() & 0xFFFFFFFFL;
+            if (StringUtils.isBlank(negativePrompt)) {
                 negativePrompt = DEFAULT_NEGATIVE_PROMPT;
             }
-            if (checkpoint == null || checkpoint.isBlank()) {
+            if (StringUtils.isBlank(checkpoint)) {
                 // 自动获取第一个可用模型
                 String modelsJson = getCheckpointModels();
                 try {
@@ -492,9 +497,9 @@ public class ComfyUIService {
     public String img2img(String imagePath, String prompt, String negativePrompt,
                           String checkpoint, double denoise, int steps, double cfg, Long seed) {
         try {
-            if (imagePath == null || imagePath.isBlank()) return error("请提供参考图片路径");
-            if (seed == null || seed < 0) seed = new Random().nextLong() & 0xFFFFFFFFL;
-            if (negativePrompt == null || negativePrompt.isBlank()) negativePrompt = DEFAULT_NEGATIVE_PROMPT;
+            if (StringUtils.isBlank(imagePath)) return error("请提供参考图片路径");
+            if (Objects.isNull(seed) || seed < 0) seed = new Random().nextLong() & 0xFFFFFFFFL;
+            if (StringUtils.isBlank(negativePrompt)) negativePrompt = DEFAULT_NEGATIVE_PROMPT;
             if (denoise < 0 || denoise > 1) denoise = 0.6;
 
             // 1. 上传图片到 ComfyUI
@@ -507,7 +512,7 @@ public class ComfyUIService {
             log.info("参考图已上传: {}", filename);
 
             // 2. 自动选模型
-            if (checkpoint == null || checkpoint.isBlank()) {
+            if (StringUtils.isBlank(checkpoint)) {
                 String modelsJson = getCheckpointModels();
                 try {
                     JsonNode modelsNode = mapper.readTree(modelsJson);
@@ -666,7 +671,7 @@ public class ComfyUIService {
                       }
                     }""",
                     escapeJson(filename),
-                    escapeJson(movementPrompt != null ? movementPrompt : "gentle movement"),
+                    escapeJson(Optional.ofNullable(movementPrompt).orElse("gentle movement")),
                     new Random().nextLong() & 0xFFFFFFFFL);
 
             return submitAndWait(workflow, 600);  // 视频生成 5-10 分钟
@@ -682,7 +687,7 @@ public class ComfyUIService {
      */
     public String tts(String text, String voice) {
         try {
-            if (voice == null || voice.isBlank()) voice = "default";
+            if (StringUtils.isBlank(voice)) voice = "default";
 
             String workflow = String.format("""
                     {
@@ -731,13 +736,13 @@ public class ComfyUIService {
             return result;
         }
         // 只对成功的结果做质检
-        if (result == null || result.contains("\"error\"") || !result.contains("\"status\":\"success\"")) {
+        if (Objects.isNull(result) || result.contains("\"error\"") || !result.contains("\"status\":\"success\"")) {
             return result;
         }
 
         // 提取图片路径
         String imagePath = extractFirstImagePath(result);
-        if (imagePath == null) {
+        if (Objects.isNull(imagePath)) {
             log.info("自动质检跳过：未找到图片路径");
             return result;
         }
@@ -749,7 +754,7 @@ public class ComfyUIService {
             log.info("自动质检第 {}/{} 次: {}", attempt, MAX_QUALITY_RETRIES, imagePath);
             // img2img 有参考图时用对比质检
             String checkResult;
-            if ("img2img".equals(mode) && referenceImagePath != null && !referenceImagePath.isBlank()) {
+            if ("img2img".equals(mode) && StringUtils.isNotBlank(referenceImagePath)) {
                 checkResult = qualityChecker.checkWithReference(imagePath, referenceImagePath);
             } else {
                 checkResult = qualityChecker.check(imagePath);
@@ -773,10 +778,10 @@ public class ComfyUIService {
 
             // 根据质检建议调整提示词重试
             String suggestion = extractSuggestion(checkResult);
-            if (suggestion != null && !suggestion.isBlank()) {
+            if (StringUtils.isNotBlank(suggestion)) {
                 // 把建议追加到反向提示词
-                currentNegative = (currentNegative != null ? currentNegative : DEFAULT_NEGATIVE_PROMPT)
-                        + ", " + suggestion;
+                currentNegative = (Optional.ofNullable(currentNegative).orElse(DEFAULT_NEGATIVE_PROMPT)
+                        + ", " + suggestion);
                 log.info("根据质检建议调整反向提示词: {}", suggestion);
             }
 
@@ -790,7 +795,7 @@ public class ComfyUIService {
                 return appendQualityInfo(result, checkResult, attempt);
             }
 
-            if (retryResult != null && retryResult.contains("\"status\":\"success\"")) {
+            if (Objects.nonNull(retryResult) && retryResult.contains("\"status\":\"success\"")) {
                 result = retryResult;
                 imagePath = extractFirstImagePath(result);
             } else {
@@ -846,7 +851,6 @@ public class ComfyUIService {
             return result;
         }
     }
-
 
     private String httpGet(String url) {
         try {
@@ -910,7 +914,7 @@ public class ComfyUIService {
     }
 
     private String escapeJson(String s) {
-        if (s == null) return "";
+        if (Objects.isNull(s)) return "";
         return s.replace("\\", "\\\\").replace("\"", "\\\"")
                 .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
     }

@@ -1,5 +1,7 @@
 package com.miniagent.config;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.miniagent.memory.AgentDataPaths;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.servlet.config.annotation.ResourceHandlerRegistry;
@@ -11,11 +13,11 @@ import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 @Configuration
 public class WebConfig implements WebMvcConfigurer {
 
-    private final AgentDataPaths dataPaths;
+    @Autowired
 
-    public WebConfig(AgentDataPaths dataPaths) {
-        this.dataPaths = dataPaths;
-    }
+    private AgentDataPaths dataPaths;
+
+    
 
     @Override
     public void addResourceHandlers(ResourceHandlerRegistry registry) {

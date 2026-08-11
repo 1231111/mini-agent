@@ -9,8 +9,11 @@ import com.miniagent.agent.tool.BuiltinTools;
 import com.miniagent.memory.MemoryStore;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
+import org.apache.commons.lang3.StringUtils;
 
 import java.nio.file.Path;
+import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Sub-agent context sandbox: switch session/role/permission/workspace on enter,
@@ -21,21 +24,18 @@ public final class SubagentScope implements AutoCloseable {
     private final String parentSession;
     private final String parentRole;
     private final PermissionMode parentMode;
-    private final boolean parentPlanOk;
     private final ChatModel parentChat;
     private final StreamingChatModel parentStreaming;
     private final Long parentUserId;
     private final Path parentWorkspaceRoot;
     private final String parentTaskOverride;
 
-    private SubagentScope(String parentSession, String parentRole,
-                          PermissionMode parentMode, boolean parentPlanOk,
+    private SubagentScope(String parentSession, String parentRole, PermissionMode parentMode,
                           ChatModel parentChat, StreamingChatModel parentStreaming,
                           Long parentUserId, Path parentWorkspaceRoot, String parentTaskOverride) {
         this.parentSession = parentSession;
         this.parentRole = parentRole;
         this.parentMode = parentMode;
-        this.parentPlanOk = parentPlanOk;
         this.parentChat = parentChat;
         this.parentStreaming = parentStreaming;
         this.parentUserId = parentUserId;
@@ -43,15 +43,10 @@ public final class SubagentScope implements AutoCloseable {
         this.parentTaskOverride = parentTaskOverride;
     }
 
-    /**
-     * Enter sub-agent sandbox.
-     * @param inheritAsk if true and parent is ASK, child stays ASK; otherwise DEFAULT (unattended).
-     */
     public static SubagentScope enter(String subSessionId, String roleId, boolean inheritAsk) {
         String parentSid = AgentLoop.getCurrentSession();
         String parentRole = RoleContext.getRole();
         PermissionMode parentMode = PermissionContext.mode();
-        boolean parentPlanOk = PermissionContext.planApproved();
         ChatModel parentChat = AgentLoop.getCurrentChatModel();
         StreamingChatModel parentStreaming = AgentLoop.getCurrentStreamingModel();
         Long parentUserId = MemoryStore.getCurrentUser();
@@ -59,18 +54,16 @@ public final class SubagentScope implements AutoCloseable {
         String parentTask = WorkspaceContext.getTaskOverride();
 
         SubagentScope scope = new SubagentScope(
-                parentSid, parentRole, parentMode, parentPlanOk,
+                parentSid, parentRole, parentMode,
                 parentChat, parentStreaming, parentUserId, parentWs, parentTask);
 
         AgentLoop.setCurrentSession(subSessionId);
         TaskTodoContext.set(subSessionId);
         SubagentContext.enter(parentSid, subSessionId);
 
-        if (roleId != null && !roleId.isBlank()) {
-            RoleContext.setRole(roleId);
-        } else {
-            RoleContext.clear();
-        }
+        Optional.ofNullable(roleId)
+                .filter(StringUtils::isNotBlank)
+                .ifPresentOrElse(RoleContext::setRole, RoleContext::clear);
 
         PermissionMode childMode = PermissionMode.DEFAULT;
         if (inheritAsk && parentMode == PermissionMode.ASK) {
@@ -78,50 +71,39 @@ public final class SubagentScope implements AutoCloseable {
         } else if (parentMode == PermissionMode.ACCEPT_EDITS) {
             childMode = PermissionMode.ACCEPT_EDITS;
         }
-        PermissionContext.set(subSessionId, childMode, true);
+        PermissionContext.force(subSessionId, childMode, true);
 
         Path subWs = BuiltinTools.prepareSubagentWorkspace(subSessionId);
         WorkspaceContext.setRootOverride(subWs);
         WorkspaceContext.setTaskOverride("out");
-
         return scope;
     }
 
     @Override
     public void close() {
         SubagentContext.exit();
-        if (parentSession != null) {
-            AgentLoop.setCurrentSession(parentSession);
-            TaskTodoContext.set(parentSession);
-        } else {
+        Optional.ofNullable(parentSession).ifPresentOrElse(sid -> {
+            AgentLoop.setCurrentSession(sid);
+            TaskTodoContext.set(sid);
+            PermissionContext.setSession(sid);
+        }, () -> {
             AgentLoop.clearCurrentSession();
             TaskTodoContext.clear();
-        }
-        if (parentRole != null && !parentRole.isBlank()) {
-            RoleContext.setRole(parentRole);
-        } else {
-            RoleContext.clear();
-        }
-        PermissionContext.set(parentSession, parentMode, parentPlanOk);
-        if (parentChat != null || parentStreaming != null) {
+            PermissionContext.clear();
+        });
+        Optional.ofNullable(parentRole)
+                .filter(StringUtils::isNotBlank)
+                .ifPresentOrElse(RoleContext::setRole, RoleContext::clear);
+        if (Objects.nonNull(parentChat) || Objects.nonNull(parentStreaming)) {
             AgentLoop.setCurrentModels(parentChat, parentStreaming);
         } else {
             AgentLoop.clearCurrentModels();
         }
-        if (parentUserId != null) {
-            MemoryStore.setCurrentUser(parentUserId);
-        } else {
-            MemoryStore.clearCurrentUser();
-        }
-        if (parentWorkspaceRoot != null) {
-            WorkspaceContext.setRootOverride(parentWorkspaceRoot);
-        } else {
-            WorkspaceContext.clearRootOverride();
-        }
-        if (parentTaskOverride != null) {
-            WorkspaceContext.setTaskOverride(parentTaskOverride);
-        } else {
-            WorkspaceContext.clearTaskOverride();
-        }
+        Optional.ofNullable(parentUserId)
+                .ifPresentOrElse(MemoryStore::setCurrentUser, MemoryStore::clearCurrentUser);
+        Optional.ofNullable(parentWorkspaceRoot)
+                .ifPresentOrElse(WorkspaceContext::setRootOverride, WorkspaceContext::clearRootOverride);
+        Optional.ofNullable(parentTaskOverride)
+                .ifPresentOrElse(WorkspaceContext::setTaskOverride, WorkspaceContext::clearTaskOverride);
     }
 }

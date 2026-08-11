@@ -1,4 +1,6 @@
 package com.miniagent.agent.delegate;
+import java.util.Objects;
+import java.util.Optional;
 
 /**
  * 角色上下文
@@ -22,7 +24,7 @@ public class RoleContext {
      */
     public static String getRole() {
         String role = CURRENT_ROLE.get();
-        return role != null ? role : "";
+        return Optional.ofNullable(role).orElse("");
     }
 
     /**
@@ -38,6 +40,6 @@ public class RoleContext {
      */
     public static boolean hasRole() {
         String role = CURRENT_ROLE.get();
-        return role != null && !role.isEmpty();
+        return Objects.nonNull(role) && !role.isEmpty();
     }
 }

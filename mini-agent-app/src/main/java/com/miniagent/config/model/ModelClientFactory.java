@@ -1,12 +1,13 @@
 package com.miniagent.config.model;
 
+import org.springframework.beans.factory.annotation.Autowired;
+
 import com.miniagent.config.service.UserModelConfigService;
 import dev.langchain4j.http.client.jdk.JdkHttpClientBuilder;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -14,18 +15,19 @@ import org.springframework.stereotype.Component;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * 按用户有效配置构建并缓存 Chat / Streaming 客户端（不改动全局 @Primary Bean）。
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class ModelClientFactory {
 
     private static final int MAX_CACHE = 16;
 
-    private final UserModelConfigService userModelConfigService;
+    @Autowired
+    private UserModelConfigService userModelConfigService;
 
     @Value("${langchain4j.open-ai.chat-model.timeout:1200s}")
     private Duration timeout;
@@ -47,7 +49,7 @@ public class ModelClientFactory {
         EffectiveModelSettings settings = userModelConfigService.getEffective(userId);
         String key = settings.cacheKey();
         ResolvedModels hit = cache.get(key);
-        if (hit != null) return hit;
+        if (Objects.nonNull(hit)) return hit;
 
         log.info("构建用户模型客户端: userId={}, preset={}, model={}, baseUrl={}",
                 userId, settings.presetId(), settings.modelName(), settings.baseUrl());
