@@ -220,8 +220,7 @@ public class PlanningLoop {
                         metrics.casConflict();
                         break;
                     }
-                    if (recoveryEngine.recover(sessionId, dx).isPresent()) metrics.recovery();
-                    snap = stateStore.get(sessionId).orElse(snap);
+                    snap = applyRecoveryOrCancel(sessionId, snap, node, dx, action.taskId());
                     g = snap.graph();
                     continue;
                 }
@@ -256,12 +255,7 @@ public class PlanningLoop {
                         log.warn("状态冲突，触发 replan: {}", e.getMessage());
                         break;
                     }
-                    if (recoveryEngine.recover(sessionId, dx).isEmpty()) {
-                        log.warn("Recovery 失败/达上限/熔断 task={}", action.taskId());
-                    } else {
-                        metrics.recovery();
-                    }
-                    snap = stateStore.get(sessionId).orElse(snap);
+                    snap = applyRecoveryOrCancel(sessionId, snap, node, dx, action.taskId());
                     g = snap.graph();
                 }
             }
@@ -286,6 +280,38 @@ public class PlanningLoop {
                     + stateStore.get(sessionId).map(StateSnapshot::version).orElse(0L)
                     + "，metrics=" + metrics.snapshot() + "）。";
         return lastAnswer;
+    }
+
+    /**
+     * Recovery 成功则升版；达总上限/分类熔断则 CANCELLED，避免 FAILED→READY 空转。
+     * CAS 冲突等瞬时失败不取消。
+     */
+    private StateSnapshot applyRecoveryOrCancel(String sessionId, StateSnapshot snap,
+                                                TaskNode node, FailureDiagnosis dx,
+                                                String taskId) {
+        boolean atLimit = snap.recoveryCount() >= properties.getMaxRecoveries()
+                || recoveryEngine.classCount(snap, dx.failureClass())
+                >= recoveryEngine.classLimit(dx.failureClass());
+        if (recoveryEngine.recover(sessionId, dx).isPresent()) {
+            metrics.recovery();
+            return stateStore.get(sessionId).orElse(snap);
+        }
+        if (!atLimit) {
+            log.warn("Recovery 失败 task={}", taskId);
+            return stateStore.get(sessionId).orElse(snap);
+        }
+        log.warn("Recovery 耗尽，取消节点 task={}", taskId);
+        TaskNode latest = snap.graph().byId(node.id());
+        if (latest == null) latest = node;
+        TaskGraph g = snap.graph().replace(
+                latest.withStatus(TaskNodeStatus.CANCELLED).withError("recovery_exhausted"));
+        try {
+            return stateStore.commit(sessionId, snap.version(), snap.withGraph(g));
+        } catch (PlannerStateStore.VersionConflictException e) {
+            metrics.casConflict();
+            log.warn("取消耗尽节点冲突 task={}: {}", taskId, e.getMessage());
+            return stateStore.get(sessionId).orElse(snap);
+        }
     }
 
     private StateSnapshot markRunning(String sessionId, StateSnapshot snap, ActionProposal proposal) {

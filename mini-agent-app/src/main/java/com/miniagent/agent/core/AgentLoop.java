@@ -899,6 +899,8 @@ public class AgentLoop {
                                                LoopState state, String sessionId) {
         com.miniagent.agent.planner.PlanningContext.Holder pc =
                 com.miniagent.agent.planner.PlanningContext.get();
+        // 硬闸门已锁工具面：允许工具上的调用不算漂移（避免「整理/动态」误杀 web_search）
+        if (pc != null && pc.hardGate()) return;
         if (pc != null) {
             String focus = StringUtils.isNotBlank(pc.focusTaskName())
                     ? pc.focusTaskName() : pc.focusTaskId();
@@ -942,7 +944,11 @@ public class AgentLoop {
             if (("image_generate".equals(name) || name.startsWith("comfyui"))
                     && (sg.contains("图") || sg.contains("画") || sg.contains("image") || sg.contains("视觉"))) return false;
             if (("web_search".equals(name) || "web_extract".equals(name) || "http_get".equals(name))
-                    && (sg.contains("搜索") || sg.contains("调研") || sg.contains("查") || sg.contains("资料"))) return false;
+                    && (sg.contains("搜索") || sg.contains("调研") || sg.contains("查")
+                    || sg.contains("资料") || sg.contains("整理") || sg.contains("动态")
+                    || sg.contains("新闻") || sg.contains("行业") || sg.contains("政策")
+                    || sg.contains("头条") || sg.contains("热点") || sg.contains("news")))
+                return false;
             if (name.startsWith("browser")
                     && (sg.contains("浏览器") || sg.contains("网页") || sg.contains("打开") || sg.contains("验证"))) return false;
             if ("exec_command".equals(name)

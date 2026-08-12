@@ -87,9 +87,10 @@ public class TodoTool {
     @SuppressWarnings("unchecked")
     private String handle(String json) {
         try {
+            String sid = TaskTodoContext.currentSessionId();
+            json = alignTodoIdWithFocus(sid, json);
             String gate = com.miniagent.agent.planner.ProposalGate.denyTodoArgsJson(json);
             if (gate != null) return gate;
-            String sid = TaskTodoContext.currentSessionId();
             Map<String, Object> args = MAPPER.readValue(Optional.ofNullable(json).orElse("{}"), Map.class);
             String action = String.valueOf(args.getOrDefault("action", "list")).trim().toLowerCase();
             switch (action) {
@@ -114,7 +115,7 @@ public class TodoTool {
                     return out;
                 }
                 case "update" -> {
-                    int id = coercePositiveInt(args.get("id"));
+                    int id = resolveTodoId(sid, coercePositiveInt(args.get("id")));
                     if (id <= 0) return error("update 缺少有效 id");
                     String status = (String) args.get("status");
                     String note = (String) args.get("note");
@@ -139,7 +140,7 @@ public class TodoTool {
                     return out;
                 }
                 case "reopen" -> {
-                    int id = coercePositiveInt(args.get("id"));
+                    int id = resolveTodoId(sid, coercePositiveInt(args.get("id")));
                     if (id <= 0) return error("reopen 缺少有效 id");
                     String note = (String) args.get("note");
                     String[] err = new String[1];
@@ -158,7 +159,7 @@ public class TodoTool {
                     return out;
                 }
                 case "confirm" -> {
-                    int id = coercePositiveInt(args.get("id"));
+                    int id = resolveTodoId(sid, coercePositiveInt(args.get("id")));
                     if (id <= 0) return error("confirm 缺少有效 id");
                     String note = (String) args.get("note");
                     String[] err = new String[1];
@@ -201,6 +202,58 @@ public class TodoTool {
             log.error("todo 工具执行失败", e);
             return error("todo 工具执行失败: " + e.getMessage());
         }
+    }
+
+    /**
+     * 硬闸门前：错误/过期 todo id 对齐到 focus（优先 store 中存在的 focus id）。
+     */
+    private String alignTodoIdWithFocus(String sid, String json) {
+        try {
+            var h = com.miniagent.agent.planner.PlanningContext.get();
+            if (h == null || !h.hardGate() || h.focusTodoIds().isEmpty()) return json;
+            var node = MAPPER.readTree(Optional.ofNullable(json).orElse("{}"));
+            String action = node.path("action").asText("").trim().toLowerCase();
+            if (!"update".equals(action) && !"reopen".equals(action) && !"confirm".equals(action))
+                return json;
+            int id = node.path("id").asInt(0);
+            int preferred = -1;
+            for (int f : h.focusTodoIds())
+                if (hasTodo(sid, f)) {
+                    preferred = f;
+                    break;
+                }
+            if (preferred < 0)
+                preferred = h.focusTodoIds().iterator().next();
+            if (id == preferred || (h.focusTodoIds().contains(id) && hasTodo(sid, id)))
+                return json;
+            if (!(node instanceof com.fasterxml.jackson.databind.node.ObjectNode obj))
+                return json;
+            obj.put("id", preferred);
+            return MAPPER.writeValueAsString(obj);
+        } catch (Exception e) {
+            return json;
+        }
+    }
+
+    /**
+     * 模型常用旧 id（图 rewrite 后重编号）；硬闸门 focus 与 store 不一致时落到现存 focus / 当前子目标。
+     */
+    private int resolveTodoId(String sid, int id) {
+        if (id > 0 && hasTodo(sid, id)) return id;
+        var h = com.miniagent.agent.planner.PlanningContext.get();
+        if (h != null) {
+            for (int f : h.focusTodoIds())
+                if (hasTodo(sid, f)) return f;
+        }
+        TaskTodoStore.SubGoal sg = todoStore.currentSubGoalDetail(sid);
+        if (sg != null && sg.id() > 0) return sg.id();
+        return id;
+    }
+
+    private boolean hasTodo(String sid, int id) {
+        for (TaskTodoStore.TodoItem it : todoStore.get(sid))
+            if (it.id() == id) return true;
+        return false;
     }
 
     private static String validateDoneWhen(List<Map<String, Object>> items) {
