@@ -61,6 +61,8 @@ public class MemoryStore {
 
     /** 可选：长期记忆向量索引。条目变更后同步重建该用户索引。为 null 时不启用向量召回。 */
     private MemoryVectorIndex vectorStore;
+    /** 可选：DB 等后端；非 null 时读写走 BlobStore（多副本），否则走本地文件。 */
+    private MemoryBlobStore blobStore;
 
     public MemoryStore(Path memoryDir) {
         this.memoryDir = memoryDir;
@@ -69,6 +71,14 @@ public class MemoryStore {
     /** 注入向量索引组件（由配置装配）。 */
     public void setVectorStore(MemoryVectorIndex vectorStore) {
         this.vectorStore = vectorStore;
+    }
+
+    public void setBlobStore(MemoryBlobStore blobStore) {
+        this.blobStore = blobStore;
+    }
+
+    public boolean usesBlobStore() {
+        return Objects.nonNull(blobStore);
     }
 
     /** 触发当前用户长期记忆（MEMORY + USER 全部条目）的向量索引重建。 */
@@ -121,12 +131,13 @@ public class MemoryStore {
     // 加载 / 保存
     // =========================================================================
 
-    /** 加载（或重新加载）当前用户的记忆并刷新冻结快照。每个 session 开始时调用一次。 */
+    /** 加载（或重新加载）当前用户的记忆并刷新冻结快照。每轮请求应调用，保证多副本读到最新 DB。 */
     public void loadFromDisk() {
         Long uid = effectiveUserId();
         UserMemory um = users.computeIfAbsent(uid, k -> new UserMemory());
         um.lock.lock();
         try {
+            um.loaded = false;
             loadUser(uid, um);
         } finally {
             um.lock.unlock();
@@ -135,29 +146,70 @@ public class MemoryStore {
 
     /** 实际加载逻辑，调用方须持有 um.lock。 */
     private void loadUser(Long userId, UserMemory um) {
-        Path dir = userDir(userId);
-        try {
-            Files.createDirectories(dir);
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to create memory dir: " + dir, e);
+        if (Objects.nonNull(blobStore)) {
+            MemoryBlobStore.Blob blob = blobStore.load(userId);
+            um.memoryEntries = deduplicate(splitRaw(blob.memoryRaw()));
+            um.userEntries = deduplicate(splitRaw(blob.userRaw()));
+            um.midtermMemory = Optional.ofNullable(blob.midtermRaw()).orElse("");
+            // 冷启动：DB 空则尝试从旧文件导入一次
+            if (um.memoryEntries.isEmpty() && um.userEntries.isEmpty() && um.midtermMemory.isBlank()) {
+                importFromFilesIfPresent(userId, um);
+            }
+        } else {
+            Path dir = userDir(userId);
+            try {
+                Files.createDirectories(dir);
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to create memory dir: " + dir, e);
+            }
+            ensureFileExists(memoryPath(userId));
+            ensureFileExists(userPath(userId));
+            ensureFileExists(midtermPath(userId));
+            um.memoryEntries = deduplicate(readFile(memoryPath(userId)));
+            um.userEntries = deduplicate(readFile(userPath(userId)));
+            um.midtermMemory = safeReadString(midtermPath(userId));
         }
-        ensureFileExists(memoryPath(userId));
-        ensureFileExists(userPath(userId));
-        ensureFileExists(midtermPath(userId));
-
-        um.memoryEntries = deduplicate(readFile(memoryPath(userId)));
-        um.userEntries = deduplicate(readFile(userPath(userId)));
-        um.midtermMemory = safeReadString(midtermPath(userId));
         um.memorySnapshot = renderBlock("MEMORY", um.memoryEntries, MEMORY_CHAR_LIMIT);
         um.userSnapshot = renderBlock("USER", um.userEntries, USER_CHAR_LIMIT);
         um.midtermSnapshot = renderTextBlock("MIDTERM", um.midtermMemory, MIDTERM_CHAR_LIMIT);
         um.loaded = true;
-        // 首次加载时若向量索引尚不存在，用现有条目建一次（覆盖历史遗留数据）。
-        // first-load vector reindex
         if (Objects.nonNull(vectorStore) && vectorStore.isEnabled() && !vectorStore.hasIndex(userId)
                 && !(um.memoryEntries.isEmpty() && um.userEntries.isEmpty())) {
             reindexVector(userId, um);
         }
+    }
+
+    private void importFromFilesIfPresent(Long userId, UserMemory um) {
+        List<String> mem = readFile(memoryPath(userId));
+        List<String> user = readFile(userPath(userId));
+        String mid = safeReadString(midtermPath(userId));
+        if (mem.isEmpty() && user.isEmpty() && StringUtils.isBlank(mid)) return;
+        um.memoryEntries = deduplicate(mem);
+        um.userEntries = deduplicate(user);
+        um.midtermMemory = mid;
+        persistEntries(userId, "memory", um.memoryEntries);
+        persistEntries(userId, "user", um.userEntries);
+        if (StringUtils.isNotBlank(mid)) {
+            blobStore.saveMidterm(userId, mid);
+        }
+    }
+
+    private List<String> splitRaw(String raw) {
+        if (StringUtils.isBlank(raw)) return new ArrayList<>();
+        return Arrays.stream(raw.split(Pattern.quote(ENTRY_DELIMITER)))
+                .map(String::trim).filter(s -> !s.isEmpty())
+                .collect(Collectors.toList());
+    }
+
+    /** 写入 MEMORY/USER 条目 */
+    private void persistEntries(Long uid, String target, List<String> entries) {
+        String content = String.join(ENTRY_DELIMITER, entries);
+        if (Objects.nonNull(blobStore)) {
+            if ("user".equals(target)) blobStore.saveUser(uid, content);
+            else blobStore.saveMemory(uid, content);
+            return;
+        }
+        saveToDisk(pathFor(uid, target), entries);
     }
 
     /** 原子写入磁盘 */
@@ -217,23 +269,48 @@ public class MemoryStore {
      * 向量不可用时回退为 {@link #getCombinedSnapshot()} 全量注入。
      */
     public String getSnapshotForQuery(String query) {
-        if (Objects.isNull(vectorStore) || !vectorStore.isEnabled()) {
-            return getCombinedSnapshot();
+        return getSnapshotForQuery(query, true, true, true, 0);
+    }
+
+    /**
+     * 按开关加载记忆块，供 ContextLoader 按意图裁剪。
+     *
+     * @param userMaxChars USER 截断；0=不截断
+     */
+    public String getSnapshotForQuery(String query, boolean includeMemory, boolean includeUser,
+                                      boolean includeMidterm, int userMaxChars) {
+        if (!includeMemory && !includeUser && !includeMidterm) {
+            return "";
         }
-        Long uid = effectiveUserId();
         UserMemory um = current();
-        List<String> recalled = vectorStore.recall(uid, query);
         List<String> blocks = new ArrayList<>();
-        if(Objects.nonNull(recalled) && !recalled.isEmpty()) {
-            String content = String.join(ENTRY_DELIMITER, recalled);
-            String sep = "═".repeat(46);
-            blocks.add(sep + "\n相关记忆（按当前对话召回 " + recalled.size() + " 条）\n" + sep + "\n" + content);
-        } else if (!um.memorySnapshot.isEmpty()) {
-            // 无命中时回退为全量 MEMORY，避免漏掉可能相关的笔记。
-            blocks.add(um.memorySnapshot);
+
+        if (includeMemory) {
+            if (Objects.nonNull(vectorStore) && vectorStore.isEnabled()) {
+                Long uid = effectiveUserId();
+                List<String> recalled = vectorStore.recall(uid, query);
+                if (Objects.nonNull(recalled) && !recalled.isEmpty()) {
+                    String content = String.join(ENTRY_DELIMITER, recalled);
+                    String sep = "═".repeat(46);
+                    blocks.add(sep + "\n相关记忆（按当前对话召回 " + recalled.size() + " 条）\n" + sep + "\n" + content);
+                } else if (!um.memorySnapshot.isEmpty()) {
+                    blocks.add(um.memorySnapshot);
+                }
+            } else if (!um.memorySnapshot.isEmpty()) {
+                blocks.add(um.memorySnapshot);
+            }
         }
-        if (!um.userSnapshot.isEmpty()) blocks.add(um.userSnapshot);
-        if (!um.midtermSnapshot.isEmpty()) blocks.add(um.midtermSnapshot);
+
+        if (includeUser && !um.userSnapshot.isEmpty()) {
+            String user = um.userSnapshot;
+            if (userMaxChars > 0 && user.length() > userMaxChars) {
+                user = user.substring(0, userMaxChars) + "…";
+            }
+            blocks.add(user);
+        }
+        if (includeMidterm && !um.midtermSnapshot.isEmpty()) {
+            blocks.add(um.midtermSnapshot);
+        }
         return String.join("\n\n", blocks);
     }
 
@@ -258,7 +335,11 @@ public class MemoryStore {
         um.lock.lock();
         try {
             um.midtermMemory = summary;
-            FilesWriteString(midtermPath(uid), summary);
+            if (Objects.nonNull(blobStore)) {
+                blobStore.saveMidterm(uid, summary);
+            } else {
+                FilesWriteString(midtermPath(uid), summary);
+            }
             um.midtermSnapshot = renderTextBlock("MIDTERM", um.midtermMemory, MIDTERM_CHAR_LIMIT);
         } finally {
             um.lock.unlock();
@@ -299,7 +380,7 @@ public class MemoryStore {
 
             entries.add(content);
             setEntries(um, target, entries);
-            saveToDisk(pathFor(uid, target), entries);
+            persistEntries(uid, target, entries);
             reindexVector(uid, um);
             return result(true, "条目已添加。", target, entries, limit);
         } finally {
@@ -337,7 +418,7 @@ public class MemoryStore {
                 return result(false, String.format("替换后将达 %d/%d 字符。请缩短内容。", total.length(), limit), target, entries, limit);
 
             setEntries(um, target, entries);
-            saveToDisk(pathFor(uid, target), entries);
+            persistEntries(uid, target, entries);
             reindexVector(uid, um);
             return result(true, "条目已替换。", target, entries, limit);
         } finally {
@@ -364,7 +445,7 @@ public class MemoryStore {
 
             entries.remove((int) matchIdx.get(0));
             setEntries(um, target, entries);
-            saveToDisk(pathFor(uid, target), entries);
+            persistEntries(uid, target, entries);
             reindexVector(uid, um);
             return result(true, "条目已删除。", target, entries, limit);
         } finally {

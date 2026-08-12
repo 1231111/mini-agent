@@ -40,6 +40,9 @@ public class IntentPlanner {
         long t0 = System.currentTimeMillis();
         String text = userMessage == null ? "" : userMessage.trim();
         double minConfidence = clamp(props.getMinConfidence());
+        if (Objects.nonNull(hitLogService)) {
+            hitLogService.begin(text, hasImage);
+        }
 
         if (hasImage && text.length() <= props.getRules().getReviewMaxLen()) {
             return finish("L0", text, new TaskPlan(IntentType.REVIEW,

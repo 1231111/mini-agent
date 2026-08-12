@@ -4,11 +4,11 @@ import jakarta.annotation.PostConstruct;
 
 import org.springframework.beans.factory.annotation.Autowired;
 
+import com.miniagent.common.embedding.SharedEmbeddingModel;
 import com.miniagent.memory.AgentDataPaths;
 import com.miniagent.memory.MemoryVectorIndex;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.http.client.jdk.JdkHttpClientBuilder;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
@@ -20,7 +20,6 @@ import org.springframework.stereotype.Component;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -43,6 +42,8 @@ import org.apache.commons.lang3.StringUtils;
  */
 @Slf4j
 @Component
+@org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(
+        name = "agent.memory.vector.backend", havingValue = "local")
 public class VectorMemoryStore implements MemoryVectorIndex {
 
     @Autowired
@@ -95,12 +96,8 @@ public class VectorMemoryStore implements MemoryVectorIndex {
 
     private EmbeddingModel embeddingModel() {
         if (Objects.isNull(embeddingModel)) {
-            // 显式 JDK 客户端，避免与 SpringRestClient 在 classpath 冲突
-            JdkHttpClientBuilder http = new JdkHttpClientBuilder()
-                    .connectTimeout(Duration.ofSeconds(15))
-                    .readTimeout(Duration.ofSeconds(60));
             embeddingModel = OpenAiEmbeddingModel.builder()
-                    .httpClientBuilder(http)
+                    .httpClientBuilder(SharedEmbeddingModel.http1ClientBuilder())
                     .apiKey(apiKey)
                     .baseUrl(baseUrl)
                     .modelName(embeddingModelName)

@@ -8,21 +8,20 @@ import org.springframework.web.servlet.config.annotation.ResourceHandlerRegistry
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
 /**
- * 静态资源：/generated-images/** → data-dir/media/generated
+ * 静态资源：生成图 + 会话附图。
  */
 @Configuration
 public class WebConfig implements WebMvcConfigurer {
 
     @Autowired
-
     private AgentDataPaths dataPaths;
-
-    
 
     @Override
     public void addResourceHandlers(ResourceHandlerRegistry registry) {
-        String location = dataPaths.mediaGenerated().toUri().toString();
         registry.addResourceHandler("/generated-images/**")
-                .addResourceLocations(location);
+                .addResourceLocations(dataPaths.mediaGenerated().toUri().toString());
+        // 与落盘键 conversation-images/{session}/{file} 对齐
+        registry.addResourceHandler("/conversation-images/**")
+                .addResourceLocations(dataPaths.mediaConversations().toUri().toString());
     }
 }

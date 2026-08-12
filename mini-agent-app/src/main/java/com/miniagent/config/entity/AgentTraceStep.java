@@ -6,7 +6,8 @@ import java.time.LocalDateTime;
 @Entity
 @Table(name = "agent_trace_steps", indexes = {
     @Index(name = "idx_trace_session_turn", columnList = "sessionId,turnIndex"),
-    @Index(name = "idx_trace_execution", columnList = "executionId")
+    @Index(name = "idx_trace_execution", columnList = "executionId"),
+    @Index(name = "idx_trace_parent_step", columnList = "parentStepId")
 })
 public class AgentTraceStep {
     @Id
@@ -17,12 +18,18 @@ public class AgentTraceStep {
     /** 每次 Agent 执行的唯一标识，用于区分同一 session 中的不同任务 */
     @Column(name = "execution_id", nullable = false, length = 60)
     private String executionId;
+    /** 父执行（子代理树）；同 execution 内嵌套时可空或等于自身 */
+    @Column(name = "parent_execution_id", length = 60)
+    private String parentExecutionId;
+    /** 父步骤 ID（如挂在 SUBAGENT_LOOP_START 下） */
+    @Column(name = "parent_step_id")
+    private Long parentStepId;
     /** 用户的问题/指令 */
     @Column(name = "user_question", columnDefinition = "TEXT")
     private String userQuestion;
     @Column(name = "turn_index", nullable = false)
     private int turnIndex;
-    /** 类型：PLAN / TOOL_CALL / TOOL_RESULT / THINKING / ANSWER / SUB_GOAL / ERROR / LOOP_END */
+    /** 类型：见 AgentStepNode（如 PLAN / TOOL_CALL / AGENT_LOOP_END / ANSWER / ERROR / CANCELED） */
     @Column(name = "step_type", nullable = false, length = 30)
     private String stepType;
     /** 工具名（仅 TOOL_CALL / TOOL_RESULT） */
@@ -62,6 +69,10 @@ public class AgentTraceStep {
     public void setSessionId(String sessionId) { this.sessionId = sessionId; }
     public String getExecutionId() { return executionId; }
     public void setExecutionId(String executionId) { this.executionId = executionId; }
+    public String getParentExecutionId() { return parentExecutionId; }
+    public void setParentExecutionId(String parentExecutionId) { this.parentExecutionId = parentExecutionId; }
+    public Long getParentStepId() { return parentStepId; }
+    public void setParentStepId(Long parentStepId) { this.parentStepId = parentStepId; }
     public String getUserQuestion() { return userQuestion; }
     public void setUserQuestion(String userQuestion) { this.userQuestion = userQuestion; }
     public int getTurnIndex() { return turnIndex; }

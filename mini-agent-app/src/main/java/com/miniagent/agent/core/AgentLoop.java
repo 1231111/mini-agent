@@ -1,5 +1,8 @@
 package com.miniagent.agent.core;
 
+import com.miniagent.common.ChatMessageTexts;
+import com.miniagent.common.MessageConstants;
+import com.miniagent.common.RunStatus;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 
@@ -10,6 +13,7 @@ import com.miniagent.agent.hook.StopHookChain;
 import com.miniagent.agent.hook.ToolHookChain;
 import com.miniagent.agent.hook.ToolHookContext;
 import com.miniagent.agent.hook.ToolPreDecision;
+import com.miniagent.agent.intent.IntentType;
 import com.miniagent.agent.intent.TaskPlan;
 import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.agent.permission.PermissionMode;
@@ -89,8 +93,8 @@ public class AgentLoop {
     private TraceRecorder traceRecorder;
     public void setTraceRecorder(TraceRecorder traceRecorder) { this.traceRecorder = traceRecorder; }
     /** 流式事件中枢（用于运行中消息注入） */
-    private SessionStreamHub streamHub;
-    public void setStreamHub(SessionStreamHub streamHub) { this.streamHub = streamHub; }
+    private SessionEventCenter eventCenter;
+    public void setEventCenter(SessionEventCenter eventCenter) { this.eventCenter = eventCenter; }
 
     private static final int MAX_ITERATIONS = 90;
     /** 虚拟线程池：工具并行执行专用，IO 密集型任务零开销 */
@@ -373,8 +377,12 @@ public class AgentLoop {
         boolean reflectionInjected = false; // 本轮是否已注入反思提示
         SystemMessage currentSubGoalMsg = null; // 框架注入的「当前子目标」可刷新指针消息
         String lastSubGoalText = null;          // 上次推送给前端的子目标文字（去重用）
+        int lastSubGoalDone = 0;
+        int lastSubGoalTotal = 0;
         int llmFailureCount = 0;  // 连续 LLM 调用失败计数（用于降级策略）
         int lengthTruncationCount = 0; // 连续输出被长度上限截断计数（用于分块续写引导/兜底终止）
+        /** 主循环结束原因，finally 打在 AGENT_LOOP_END（勿另写 LOOP_END） */
+        String loopEndReason = "DONE";
         boolean injectAppendHintAfterTools = false; // tool_call 被长度截断：工具执行后需注入续写引导
         boolean lengthTruncatedToolCalls = false; // 当前轮 tool_call 参数可能被截断
         boolean requiresStructuredPlan = false; // 复杂任务：未 set 计划前只放行 todo
@@ -383,6 +391,8 @@ public class AgentLoop {
         int driftReminders = 0;                 // 偏离当前子目标的纠偏次数
         boolean batchDelegateHintSent = false;  // 是否已提示用 delegate_task 并行
         boolean goalAnchorInjected = false;     // 是否已注入任务目标锚定
+        /** 寒暄/轻问答：不吃上一轮残留 todo，也不拦截收尾 */
+        boolean lightQa = false;
 
         /** 死循环检测：本轮全部工具是否已重复 >= 3 次 */
         boolean allCallsRepeated(List<?> toolCalls) {
@@ -424,6 +434,7 @@ public class AgentLoop {
         String taskGoal = summarizeTaskGoal(
                 Objects.nonNull(taskPlan) ? taskPlan.taskGoal() : userTextForFilePattern);
         state.requiresStructuredPlan = Objects.nonNull(taskPlan) && taskPlan.requiresStructuredPlan();
+        state.lightQa = Objects.nonNull(taskPlan) && taskPlan.intent() == IntentType.QUESTION;
 
         // sub-goal 栈播种：用意图规划的 steps 预填 todo（仅当该 session 还没有计划时）
         String sessionId = currentSessionId.get();
@@ -431,12 +442,17 @@ public class AgentLoop {
         final boolean ownsExecution = Objects.nonNull(traceRecorder) && !traceRecorder.isActive();
         if (Objects.nonNull(traceRecorder)) {
             traceRecorder.ensureExecution(sessionId, userTextForFilePattern);
-            String loopType = SubagentContext.isActive() ? "SUBAGENT_LOOP_START" : "AGENT_LOOP_START";
-            traceRecorder.recordNode(sessionId, 0, loopType,
+            boolean sub = SubagentContext.isActive();
+            String loopType = sub ? "SUBAGENT_LOOP_START" : "AGENT_LOOP_START";
+            var startStep = traceRecorder.recordNode(sessionId, 0, loopType,
                     "{\"intent\":\"" + (Objects.isNull(taskPlan) ? "null" : taskPlan.intent())
                             + "\",\"requiresStructuredPlan\":"
                             + (Objects.nonNull(taskPlan) && taskPlan.requiresStructuredPlan()) + "}",
-                    "RUNNING", 0);
+                    RunStatus.RUNNING.name(), 0);
+            if (sub && Objects.nonNull(startStep) && Objects.nonNull(startStep.getId())) {
+                // 后续子步骤挂到本 START 下（同 execution 树状嵌套）
+                traceRecorder.enterChildScope(startStep.getId());
+            }
         }
         try {
         if (Objects.nonNull(taskPlan) && Objects.nonNull(taskPlan.steps()) && !taskPlan.steps().isEmpty()) {
@@ -444,8 +460,8 @@ public class AgentLoop {
             if (seeded) {
                 log.info("sub-goal 栈已播种 {} 步: {}", taskPlan.steps().size(), taskGoal);
                 if (Objects.nonNull(traceRecorder)) {
-                    traceRecorder.recordNode(sessionId, 0, "TODO_SEED",
-                            "{\"steps\":" + taskPlan.steps().size() + "}", "SUCCESS", 0);
+                    traceRecorder.recordNode(sessionId, 0, "TASK_SEED",
+                            "{\"steps\":" + taskPlan.steps().size() + "}", RunStatus.SUCCESS.name(), 0);
                 }
             }
         }
@@ -460,14 +476,14 @@ public class AgentLoop {
 
         for (int turn = 0; turn < iterations; turn++) {
             // 检查用户执行中追加的消息
-            if (Objects.nonNull(streamHub)) {
-                java.util.List<String> injected = streamHub.drainMessages(sessionId);
+            if (Objects.nonNull(eventCenter)) {
+                java.util.List<String> injected = eventCenter.takePendingUserMessages(sessionId);
                 if (!injected.isEmpty()) {
                     for (String msg : injected) {
                         messages.add(new UserMessage(msg));
                         log.info("用户追加指令注入: {}", msg.length() > 100 ? msg.substring(0, 100) + "..." : msg);
                     }
-                    if (Objects.nonNull(streamSink)) streamSink.onThinking("\n（已收到你的补充说明，正在融入当前任务...）\n");
+                    if (Objects.nonNull(streamSink)) streamSink.onThinking(MessageConstants.AGENT_SUBTASK_PROMPT);
                     if (Objects.nonNull(traceRecorder)) traceRecorder.recordThinking(sessionId, turn,
                             "【用户追加】" + injected.size() + " 条补充指令注入");
                 }
@@ -482,12 +498,19 @@ public class AgentLoop {
                 state.goalAnchorInjected = true;
             }
 
-            // 刷新「当前子目标」可刷新指针：移除上一条，按栈顶活动项注入新的一条到末尾
-            refreshSubGoal(messages, state, sessionId, streamSink);
+            // 轻问答不挂上一轮残留子目标，避免「你好」被旧图任务劫持
+            if (!state.lightQa) {
+                refreshSubGoal(messages, state, sessionId, streamSink);
+            }
 
-            String subGoalLog = Optional.ofNullable(state.lastSubGoalText).orElse(taskGoal);
+            String subGoalLog = state.lightQa
+                    ? taskGoal
+                    : Optional.ofNullable(state.lastSubGoalText).orElse(taskGoal);
             state.currentTurn = turn;
-            if (Objects.nonNull(traceRecorder)) traceRecorder.recordTurnStart(sessionId, turn, state.lastSubGoalText);
+            if (Objects.nonNull(traceRecorder)) {
+                traceRecorder.recordTurnStart(sessionId, turn, state.lastSubGoalText,
+                        state.lastSubGoalDone, state.lastSubGoalTotal);
+            }
 
             // 1) 构建请求（按需过滤工具：复杂任务未 set 计划时仅放行 todo）
             var specsForTurn = buildToolSpecsForTurn(toolSpecs, hasTools, state.mediaDelivered, state, sessionId);
@@ -534,36 +557,41 @@ public class AgentLoop {
 
             if (Objects.isNull(response)) {
                 state.llmFailureCount++;
-                // 智能降级策略：不立即放弃，尝试恢复
+                if (Objects.nonNull(traceRecorder)) {
+                    traceRecorder.recordLlmCallError(sessionId, turn, MessageConstants.AGENT_LLM_NO_RESPONSE, state.llmFailureCount);
+                }
                 if (state.llmFailureCount == 1) {
-                    // 首次失败：通知前端、注入恢复提示，给模型一次重连机会
                     log.warn("LLM 调用失败（第 {} 次），注入恢复提示后继续", state.llmFailureCount);
+                    if (Objects.nonNull(traceRecorder)) {
+                        traceRecorder.recordLlmRetry(sessionId, turn, "reconnect_hint", state.llmFailureCount);
+                    }
                     if (Objects.nonNull(streamSink)) streamSink.onThinking("\n（模型响应超时，正在重试...）\n");
-                    messages.add(new SystemMessage("【系统通知】上次模型调用遇到临时网络问题，已自动重连。请继续刚才的任务。"));
+                    messages.add(new SystemMessage(MessageConstants.AGENT_LLM_NETWORK_RECONNECT));
                     continue;
                 } else if (state.llmFailureCount == 2 && messages.size() > 20) {
-                    // 第二次失败 + 上下文过长：可能 token 过多超时，裁剪后做最后一次尝试
                     log.warn("LLM 连续失败 2 次且上下文过长（{} 条），裁剪至最近 10 条后做最终尝试", messages.size());
+                    if (Objects.nonNull(traceRecorder)) {
+                        traceRecorder.recordLlmRetry(sessionId, turn, "trim_context", state.llmFailureCount);
+                    }
                     if (Objects.nonNull(streamSink)) streamSink.onThinking("\n（第二次重试失败，正在精简上下文后做最后尝试...）\n");
                     List<ChatMessage> trimmed = new ArrayList<>();
-                    // 保留 system prompt（前几条 SystemMessage）
                     int sysEnd = 0;
                     for (int i = 0; i < Math.min(5, messages.size()); i++) {
                         if (messages.get(i) instanceof SystemMessage) sysEnd = i + 1;
                         else break;
                     }
                     trimmed.addAll(messages.subList(0, sysEnd));
-                    // 加最近 10 条对话（更激进裁剪，减少 token 数）
                     int keep = Math.min(10, messages.size() - sysEnd);
                     trimmed.addAll(messages.subList(messages.size() - keep, messages.size()));
                     messages = trimmed;
                     state.currentSubGoalMsg = null;
                     continue;
                 } else {
-                    // 连续失败 3 次或降级策略用尽：最终放弃
                     log.error("LLM 调用连续失败 {} 次（已尝试恢复与降级），任务终止", state.llmFailureCount);
-                    if (Objects.nonNull(traceRecorder)) traceRecorder.recordError(sessionId, turn, "LLM 连续失败 " + state.llmFailureCount + " 次");
-                    return "（模型连接异常，已自动重试但仍失败，请稍后再试或联系管理员）";
+                    if (Objects.nonNull(traceRecorder)) {
+                        traceRecorder.recordError(sessionId, turn, "LLM 连续失败 " + state.llmFailureCount + " 次");
+                    }
+                    return MessageConstants.AGENT_LLM_NETWORK_FAILED;
                 }
             }
             // 成功后重置失败计数
@@ -606,7 +634,7 @@ public class AgentLoop {
 
             // 2) 工具调用 → 执行工具，继续循环
             if (aiMessage.hasToolExecutionRequests()) {
-                // 本轮流出的文本只是中间思考，提示前端清空已渲染的答案增量
+                // 封存本轮已流出正文为过程说明（前端进时间线，不清空历史）
                 if (Objects.nonNull(streamSink)) streamSink.onAnswerReset();
                 var toolCalls = aiMessage.toolExecutionRequests();
                 log.info("模型请求 {} 个工具调用,tools:{}", toolCalls.size(),toolCalls);
@@ -674,22 +702,31 @@ public class AgentLoop {
             if (Objects.nonNull(result)) {
                 if (Objects.nonNull(traceRecorder)) {
                     traceRecorder.recordAnswer(sessionId, turn, result);
-                    traceRecorder.recordLoopEnd(sessionId, turn, "SUCCESS", null, null);
                 }
+                state.loopEndReason = RunStatus.SUCCESS.name();
                 return result;
             }
             // tryReturnFinalText 注入了提醒，继续循环
         }
 
         log.warn("Agent 循环达到最大迭代次数 {}", iterations);
-        if (Objects.nonNull(traceRecorder)) traceRecorder.recordLoopEnd(sessionId, iterations - 1, "MAX_ITERATIONS", null, null);
+        state.loopEndReason = "MAX_ITERATIONS";
         return buildMaxIterationFallback(state, iterations);
         } finally {
-            if (Objects.nonNull(traceRecorder) && SubagentContext.isActive()) {
-                traceRecorder.recordNode(sessionId, 0, "SUBAGENT_LOOP_END", "{}", "SUCCESS", 0);
+            if (Objects.nonNull(traceRecorder)) {
+                if (SubagentContext.isActive()) {
+                    traceRecorder.exitChildScope();
+                    traceRecorder.recordNode(sessionId, 0, "SUBAGENT_LOOP_END", "{}", RunStatus.SUCCESS.name(), 0);
+                } else {
+                    String reason = state.loopEndReason == null ? "DONE" : state.loopEndReason;
+                    traceRecorder.recordAgentLoopEnd(sessionId, Math.max(0, state.currentTurn), reason);
+                    if ("MAX_ITERATIONS".equalsIgnoreCase(reason)) {
+                        traceRecorder.recordAborted(sessionId, Math.max(0, state.currentTurn), reason);
+                    }
+                }
             }
             if (ownsExecution && Objects.nonNull(traceRecorder)) {
-                traceRecorder.endExecution();
+                traceRecorder.endExecution(state.loopEndReason == null ? RunStatus.SUCCESS.name() : state.loopEndReason);
             }
         }
     }
@@ -730,16 +767,18 @@ public class AgentLoop {
         state.currentSubGoalMsg = msg;
 
         // 子目标文字变化才推前端，避免重复事件
+        // 子目标是状态指针：只更新 LoopState + 前端，不落独立 Trace 节点（并入 PLAN 元数据）
         if (!sg.text().equals(state.lastSubGoalText)) {
             state.lastSubGoalText = sg.text();
+            state.lastSubGoalDone = sg.done();
+            state.lastSubGoalTotal = sg.total();
             if (Objects.nonNull(streamSink)) {
                 try { streamSink.onSubGoal(sg.text(), sg.done(), sg.total()); }
                 catch (Exception ignored) {}
             }
-            if (Objects.nonNull(traceRecorder)) {
-                String sid = currentSessionId.get();
-                if (Objects.nonNull(sid)) traceRecorder.recordSubGoal(sid, 0, sg.text(), sg.done(), sg.total());
-            }
+        } else {
+            state.lastSubGoalDone = sg.done();
+            state.lastSubGoalTotal = sg.total();
         }
     }
 
@@ -749,6 +788,24 @@ public class AgentLoop {
                                            boolean mediaDelivered, LoopState state, String sessionId) {
         if (!hasTools) return List.of();  // mediaDelivered不再清空工具，让模型自己决定是否继续生成
         var specs = toolSpecs;
+
+        // Planner Proposal：只放行提案工具（+ todo/memory 已在 allowed 中）
+        com.miniagent.agent.planner.PlanningContext.Holder pc =
+                com.miniagent.agent.planner.PlanningContext.get();
+        if (pc != null && pc.forceProposalToolsOnly() && !pc.allowedTools().isEmpty()) {
+            specs = specs.stream()
+                    .filter(s -> pc.allowedTools().contains(
+                            ((dev.langchain4j.agent.tool.ToolSpecification) s).name()))
+                    .toList();
+            if (!specs.isEmpty()) {
+                log.info("Planner 提案工具面: {}", pc.allowedTools());
+                return specs.stream()
+                        .filter(s -> PermissionPolicy.allowInSpecs(
+                                PermissionContext.mode(), PermissionContext.planApproved(),
+                                ((dev.langchain4j.agent.tool.ToolSpecification) s).name()))
+                        .toList();
+            }
+        }
 
         // 复杂任务：尚未 todo.set 时只允许 todo，强制先写计划
         if (state.requiresStructuredPlan && Objects.nonNull(sessionId) && !taskTodoStore.hasPlan(sessionId)) {
@@ -786,12 +843,32 @@ public class AgentLoop {
     /** 工具执行统一入口：权限闸门 + ToolHook */
     private String executeToolWithHooks(String name, String args, int turn) {
         String sid = currentSessionId.get();
+        String proposalDeny = com.miniagent.agent.planner.ProposalGate.denyTool(name);
+        if (proposalDeny != null) {
+            if (Objects.nonNull(traceRecorder)) {
+                traceRecorder.recordNode(sid, turn, "HOOK_DENY",
+                        "{\"tool\":\"" + name + "\",\"reason\":\"planner_hard_gate\"}",
+                        RunStatus.FAILURE.name(), 0);
+            }
+            return proposalDeny;
+        }
+        if ("todo".equals(name)) {
+            String todoDeny = com.miniagent.agent.planner.ProposalGate.denyTodoArgsJson(args);
+            if (todoDeny != null) {
+                if (Objects.nonNull(traceRecorder)) {
+                    traceRecorder.recordNode(sid, turn, "HOOK_DENY",
+                            "{\"tool\":\"todo\",\"reason\":\"planner_todo_gate\"}",
+                            RunStatus.FAILURE.name(), 0);
+                }
+                return todoDeny;
+            }
+        }
         PermissionMode mode = PermissionContext.mode();
         boolean planOk = PermissionContext.planApproved();
         if (mode == PermissionMode.PLAN && !planOk && !PermissionPolicy.isPlanSafe(name)) {
             if (Objects.nonNull(traceRecorder)) {
                 traceRecorder.recordNode(sid, turn, "PERM_DENY",
-                        "{\"tool\":\"" + name + "\",\"mode\":\"PLAN\"}", "FAILURE", 0);
+                        "{\"tool\":\"" + name + "\",\"mode\":\"PLAN\"}", RunStatus.FAILURE.name(), 0);
             }
             return "{\"error\":\"Plan 模式未批准，禁止执行: " + name + "\"}";
         }
@@ -799,7 +876,7 @@ public class AgentLoop {
                 && Objects.nonNull(sid) && !permissionStore.isAskGranted(sid, name)) {
             if (Objects.nonNull(traceRecorder)) {
                 traceRecorder.recordNode(sid, turn, "PERM_DENY",
-                        "{\"tool\":\"" + name + "\",\"mode\":\"ASK\"}", "FAILURE", 0);
+                        "{\"tool\":\"" + name + "\",\"mode\":\"ASK\"}", RunStatus.FAILURE.name(), 0);
             }
             return "{\"error\":\"Ask 模式：工具 " + name + " 需用户确认后才能执行\"}";
         }
@@ -808,7 +885,7 @@ public class AgentLoop {
         if (Objects.nonNull(pre) && pre.deny()) {
             if (Objects.nonNull(traceRecorder)) {
                 traceRecorder.recordNode(sid, turn, "HOOK_DENY",
-                        "{\"tool\":\"" + name + "\"}", "FAILURE", 0);
+                        "{\"tool\":\"" + name + "\"}", RunStatus.FAILURE.name(), 0);
             }
             return Optional.ofNullable(pre.denyMessage()).orElse("{\"error\":\"工具被 Hook 拒绝\"}");
         }
@@ -820,6 +897,21 @@ public class AgentLoop {
     /** 工具调用明显偏离当前子目标时注入纠偏（最多 2 次，避免刷屏） */
     private void injectDriftCorrectionIfNeeded(List<ChatMessage> messages, List<?> toolCalls,
                                                LoopState state, String sessionId) {
+        com.miniagent.agent.planner.PlanningContext.Holder pc =
+                com.miniagent.agent.planner.PlanningContext.get();
+        if (pc != null) {
+            String focus = StringUtils.isNotBlank(pc.focusTaskName())
+                    ? pc.focusTaskName() : pc.focusTaskId();
+            if (StringUtils.isBlank(focus) || !looksLikeSubGoalDrift(focus, toolCalls)) return;
+            if (pc.driftHits() >= 2) return;
+            pc.markDrift();
+            log.info("Planner 检测到漂移，标记 Recovery focus={}", focus);
+            messages.add(new SystemMessage(
+                    "【Planner 方向纠偏】当前提案子目标：" + focus
+                            + "\n你刚才的工具调用偏离该步。请立刻用提案允许的工具完成它，"
+                            + "并用 todo update（id∈focusTodoIds）附 evidence 标 completed。"));
+            return;
+        }
         if (Objects.isNull(sessionId) || state.driftReminders >= 2) return;
         TaskTodoStore.SubGoal sg = taskTodoStore.currentSubGoalDetail(sessionId);
         if (Objects.isNull(sg) || StringUtils.isBlank(sg.text())) return;
@@ -1192,7 +1284,12 @@ public class AgentLoop {
             }
 
             log.info("  [并行] {}: {}", name, truncate(redactSensitive(result), 200));
-            if (Objects.nonNull(traceRecorder)) traceRecorder.recordToolResult(currentSessionId.get(), state.currentTurn, name, result, 0, result.contains("\"error\"") ? "FAILURE" : "SUCCESS");
+            if (Objects.nonNull(traceRecorder)) traceRecorder.recordToolResult(currentSessionId.get(), state.currentTurn, name, result, 0, result.contains("\"error\"") ? RunStatus.FAILURE.name() : RunStatus.SUCCESS.name());
+            if (Objects.nonNull(progressCallback)) {
+                boolean failed = result != null && result.contains("\"error\"");
+                progressCallback.accept((failed ? "✗ " : "✓ ") + name + ": "
+                        + truncate(redactSensitive(result), 120));
+            }
             messages.add(ToolExecutionResultMessage.from(
                     toolIdOf(tc), name, resultForContext));
         }
@@ -1278,7 +1375,12 @@ public class AgentLoop {
         }
 
         log.info("  {}: {}", name, truncate(redactSensitive(result), 300));
-        if (Objects.nonNull(traceRecorder)) traceRecorder.recordToolResult(currentSessionId.get(), state.currentTurn, name, result, 0, result.contains("\"error\"") ? "FAILURE" : "SUCCESS");
+        if (Objects.nonNull(traceRecorder)) traceRecorder.recordToolResult(currentSessionId.get(), state.currentTurn, name, result, 0, result.contains("\"error\"") ? RunStatus.FAILURE.name() : RunStatus.SUCCESS.name());
+        if (Objects.nonNull(progressCallback)) {
+            boolean failed = result != null && result.contains("\"error\"");
+            progressCallback.accept((failed ? "✗ " : "✓ ") + name + ": "
+                    + truncate(redactSensitive(result), 120));
+        }
         messages.add(ToolExecutionResultMessage.from(
                 toolIdOf(tc), name, resultForContext));
     }
@@ -1294,8 +1396,7 @@ public class AgentLoop {
             if (msg instanceof SystemMessage sm) { role = "system"; text = sm.text(); }
             else if (msg instanceof UserMessage um) {
                 role = "user";
-                if (Objects.nonNull(um.singleText())) text = um.singleText();
-                else text = um.contents().stream().map(c -> c instanceof TextContent tc ? tc.text() : "[图片]").reduce("", (a, b) -> a + b);
+                text = ChatMessageTexts.userForTrace(um);
             }
             else if (msg instanceof AiMessage am) {
                 role = "assistant";
@@ -1425,7 +1526,9 @@ public class AgentLoop {
             if (state.writeFileSucceeded && !hasBlockingTodos(sessionId)) {
                 return "（文件已生成，见 workspace/）";
             }
-            if (hasBlockingTodos(sessionId) || (state.requiresStructuredPlan && !taskTodoStore.hasPlan(sessionId))) {
+            if (!state.lightQa
+                    && (hasBlockingTodos(sessionId)
+                    || (state.requiresStructuredPlan && !taskTodoStore.hasPlan(sessionId)))) {
                 // 走下面的拦截逻辑
                 finalText = "";
             } else {
@@ -1434,7 +1537,8 @@ public class AgentLoop {
         }
 
         // 复杂任务尚未建立计划 → 拦截收尾，强制 todo.set
-        if (state.requiresStructuredPlan && Objects.nonNull(sessionId) && !taskTodoStore.hasPlan(sessionId)) {
+        if (!state.lightQa && state.requiresStructuredPlan
+                && Objects.nonNull(sessionId) && !taskTodoStore.hasPlan(sessionId)) {
             if (state.planReminderCount < 2) {
                 state.planReminderCount++;
                 log.info("复杂任务未建立 todo，拦截收尾 #{}/2", state.planReminderCount);
@@ -1446,7 +1550,11 @@ public class AgentLoop {
         }
 
         // 存在未完成 todo → 拦截收尾（提醒 2 次后附清单放行，避免死锁）
-        if (Objects.nonNull(sessionId) && taskTodoStore.hasPlan(sessionId) && taskTodoStore.hasIncomplete(sessionId)) {
+        // 轻问答（寒暄等）不看残留计划，否则同会话上一轮未完成 todo 会逼出多轮「模型思考」
+        if (!state.lightQa
+                && Objects.nonNull(sessionId)
+                && taskTodoStore.hasPlan(sessionId)
+                && taskTodoStore.hasIncomplete(sessionId)) {
             if (state.incompleteTodoReminders < 2) {
                 state.incompleteTodoReminders++;
                 log.info("todo 未完成，拦截收尾 #{}/2", state.incompleteTodoReminders);
@@ -1519,7 +1627,7 @@ public class AgentLoop {
             sb.append("\n\n剩余未完成的子任务可以通过发送「继续」来让我接着完成。");
             return sb.toString();
         }
-        return "（达到最大迭代次数 " + iterations + "，Agent 循环终止。发送「继续」可让我接着上次进度继续。）";
+        return "（" + MessageConstants.AGENT_MAX_ITERATIONS_REACHED + " 当前迭代: " + iterations + "。发送「继续」可让我接着上次进度继续。）";
     }
 
     // ==================== 反射工具方法 ====================
@@ -1540,20 +1648,9 @@ public class AgentLoop {
     }
 
 
-    /** 多模态消息中取第一段文字，供「显式要文件」正则使用；无文字则视为非文件类意图。 */
+    /** 多模态消息中取文字，供「显式要文件」正则使用；无文字则视为非文件类意图。 */
     private static String firstUserTextForFileIntent(UserMessage um) {
-        if (Objects.isNull(um)) {
-            return "";
-        }
-        if (um.hasSingleText()) {
-            return um.singleText();
-        }
-        for (Content c : um.contents()) {
-            if (c instanceof TextContent tc) {
-                return tc.text();
-            }
-        }
-        return "";
+        return ChatMessageTexts.userPlain(um);
     }
 
     // ==================== 工具方法 ====================

@@ -42,6 +42,11 @@ public class UserModelConfigService {
         return resolve(row);
     }
 
+    /** 仅按预设解析（多模态 vision 切换，不套用户自定义覆盖） */
+    public EffectiveModelSettings getEffectivePreset(String presetId) {
+        return resolvePresetOnly(presetId);
+    }
+
     /** GET /api/model-config 视图（无明文 key） */
     public Map<String, Object> getView(Long userId) {
         UserModelConfig row = Objects.isNull(userId) ? null : repository.findByUserId(userId).orElse(null);

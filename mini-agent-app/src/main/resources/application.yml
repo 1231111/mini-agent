@@ -16,6 +16,11 @@ spring:
     username: root
     password: mysql_root_pass
     driver-class-name: com.mysql.cj.jdbc.Driver
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      timeout: 3s
   jpa:
     hibernate:
       ddl-auto: update
@@ -41,6 +46,10 @@ management:
   endpoint:
     health:
       show-details: when_authorized
+  health:
+    # local 默认不依赖 Redis；prod/redis 模式再开
+    redis:
+      enabled: false
 
 # LangChain4j OpenAI 兼容客户端
 langchain4j:
@@ -155,18 +164,57 @@ agent:
   context:
     max-tokens: 256000
     compress-threshold: 0.75
+    # false=Loop 内硬截断不调 LLM；摘要改后台异步，避免 P99 翻倍
+    llm-summary-enabled: false
+    history:
+      question: 0
+      # QUESTION 指代：相关度精捞最多保留条数（非盲目最近 N）
+      question-with-ref: 6
+      # 指代精捞：从会话末尾向前扫描的候选池大小
+      ref-scan-max: 48
+      # 弱代词指代时保底附带的最近消息条数
+      ref-pronoun-anchor: 4
+      # 指代精捞：写入时持久化会话向量；检索优先向量库，失败回退扫描窗/词重叠
+      ref-vector-enabled: true
+      ref-min-score: 0.35
+      vector:
+        # Milvus 集合名（backend 与 agent.memory.vector.backend 一致）
+        collection: agent_session_history
+      review: 4
+      new-task: 6
+      continue: -1
+      image: -1
+      default: -1
+  # local=单机不启 Redis 热存储/跨实例事件；redis=写穿热存储+任务并发+发布订阅（生产/compose）
+  replica:
+    mode: local
+    todo-ttl-seconds: 86400
+    memory-ttl-seconds: 86400
+    planner-ttl-seconds: 86400
+    run-lock-ttl-seconds: 7200
   memory:
+    # db=多副本真相源（agent_user_memory）；file=仅本地目录
+    storage: db
     vector:
       enabled: true
+      # local=本机 InMemory+JSON；milvus=生产向量库（compose/prod）
+      backend: local
       top-k: 6
       min-score: 0.4
+      milvus:
+        uri: http://127.0.0.1:19530
+        token:
+        collection: agent_memory
+        # Yuan-embedding-2.0-zh=1792；改模型需重建 Milvus 集合
+        dimension: 1792
   sse:
     timeout-ms: 1800000
   codebase:
     embedding-enabled: true
-    embedding-api-key: sk-S5B6jjx0B3yMvxLAojE3Y94yxOzQUj7FmZFO8UTaFWcsDyby
-    embedding-base-url: https://api.chatanywhere.tech/v1
-    embedding-model: BAAI/bge-m3
+    # 本地 embedding-server（compose: embedding / 本机 :8008）
+    embedding-api-key: local
+    embedding-base-url: http://127.0.0.1:8008/v1
+    embedding-model: Yuan-embedding-2.0-zh
     index-file: ${agent.data-dir}/workspace/.codebase-index.json
   tools:
     exec-enabled: false
@@ -176,8 +224,42 @@ agent:
     per-minute: 60
   concurrency:
     max-tasks-per-user: 2
+  multimodal:
+    # MiMo Base64 串上限约 50MB → 源文件约 35MB
+    audio-max-bytes: 36700160
+    video-max-bytes: 36700160
+    # 有图/音视频时改用该预设（default=MiMo v2.5）；空=沿用用户当前模型
+    vision-preset: default
   todo:
+    # db=多副本真相源（agent_session_todos）；file=仅本地 JSON
+    storage: db
     persist-dir: ${agent.data-dir}/workspace/.todos
+  # 生产级 Planner：GoalCompiler + PlanningLoop + Recovery（Todo/Trace 为投影）
+  planner:
+    enabled: true
+    # db=多副本真相源（agent_session_planner）；file=本地 JSON；memory=仅进程内（勿用于扩容）
+    storage: db
+    persist-dir: ${agent.data-dir}/workspace/.planner
+    force-for-intents:
+      - NEW_TASK
+      - RESEARCH
+      - FILE_DELIVERY
+      - PUBLISHING
+      - CONTINUE_TASK
+    skip-intents:
+      - QUESTION
+      - REVIEW
+    max-recoveries: 3
+    proposal-batch-size: 1
+    proposal-max-iterations: 8
+    compiler-retry: 1
+    max-outer-rounds: 24
+    hard-proposal: true
+    strict-eval: true
+    max-local-repair: 3
+    max-replace-tool: 2
+    max-rewrite-graph: 2
+    max-revise-goal: 1
   # 流式中途预执行只读工具（onCompleteToolCall）
   streaming:
     prefetch-readonly: true

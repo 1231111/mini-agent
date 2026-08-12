@@ -1,15 +1,20 @@
 package com.miniagent.agent.memory;
 
 import com.miniagent.agent.skill.SkillStore;
+import com.miniagent.agent.web.MultimodalMedia;
+import com.miniagent.common.ChatRole;
 import com.miniagent.config.service.DatabaseConversationStore;
 import com.miniagent.config.storage.MediaStorage;
 import com.miniagent.memory.AgentDataPaths;
+import com.miniagent.memory.MemoryBlobStore;
 import com.miniagent.memory.MemoryStore;
+import com.miniagent.memory.MemoryVectorIndex;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.memory.ChatMemory;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -30,9 +35,16 @@ public class ChatMemoryConfig {
     private final Map<String, ChatMemory> memories = new ConcurrentHashMap<>();
 
     @Bean
-    public MemoryStore memoryStore(AgentDataPaths dataPaths, VectorMemoryStore vectorMemoryStore) {
+    public MemoryStore memoryStore(AgentDataPaths dataPaths,
+                                   @Autowired(required = false) MemoryVectorIndex vectorIndex,
+                                   @Autowired(required = false) MemoryBlobStore blobStore) {
         MemoryStore store = new MemoryStore(dataPaths.memory());
-        store.setVectorStore(vectorMemoryStore);
+        if (vectorIndex != null) {
+            store.setVectorStore(vectorIndex);
+        }
+        if (blobStore != null) {
+            store.setBlobStore(blobStore);
+        }
         store.loadFromDisk();
         return store;
     }
@@ -55,20 +67,20 @@ public class ChatMemoryConfig {
             if (Objects.nonNull(conv) && Objects.nonNull(conv.messages) && !conv.messages.isEmpty()) {
                 List<DatabaseConversationStore.Message> all = conv.messages;
                 int from = Math.max(0, all.size() - maxMessages);
-                while (from < all.size() && !"user".equals(all.get(from).role)) {
+                while (from < all.size() && !ChatRole.USER.getValue().equals(all.get(from).role)) {
                     from++;
                 }
                 if (from >= all.size()) from = Math.max(0, all.size() - maxMessages);
                 for (int i = from; i < all.size(); i++) {
                     DatabaseConversationStore.Message msg = all.get(i);
                     if (Objects.isNull(msg) || Objects.isNull(msg.content)) continue;
-                    if ("user".equals(msg.role)) {
+                    if (ChatRole.USER.getValue().equals(msg.role)) {
                         if (Objects.nonNull(msg.images) && !msg.images.isEmpty()) {
                             memory.add(rebuildMultimodalMessage(msg.content, msg.images, mediaStorage));
                         } else {
                             memory.add(UserMessage.from(msg.content));
                         }
-                    } else if ("assistant".equals(msg.role)) {
+                    } else if (ChatRole.ASSISTANT.getValue().equals(msg.role)) {
                         memory.add(AiMessage.from(msg.content));
                     }
                 }
@@ -84,24 +96,35 @@ public class ChatMemoryConfig {
         if (StringUtils.isNotBlank(textContent)) {
             contents.add(dev.langchain4j.data.message.TextContent.from(textContent));
         }
-        for (String imgPath : imagePaths) {
+        for (String mediaPath : imagePaths) {
             try {
-                java.nio.file.Path absPath = mediaStorage.resolve(imgPath);
-                if (java.nio.file.Files.exists(absPath)) {
-                    byte[] bytes = java.nio.file.Files.readAllBytes(absPath);
-                    String base64 = java.util.Base64.getEncoder().encodeToString(bytes);
+                java.nio.file.Path absPath = mediaStorage.resolve(mediaPath);
+                if (!java.nio.file.Files.exists(absPath)) {
+                    contents.add(dev.langchain4j.data.message.TextContent.from(
+                            "[媒体已丢失: " + mediaPath + "]"));
+                    continue;
+                }
+                byte[] bytes = java.nio.file.Files.readAllBytes(absPath);
+                String base64 = java.util.Base64.getEncoder().encodeToString(bytes);
+                String lower = mediaPath.toLowerCase();
+                String kind = MultimodalMedia.kindOf(mediaPath, null);
+                if (MultimodalMedia.KIND_AUDIO.equals(kind)) {
+                    String mime = MultimodalMedia.mimeOf(mediaPath, null, kind);
+                    contents.add(dev.langchain4j.data.message.AudioContent.from(base64, mime));
+                } else if (MultimodalMedia.KIND_VIDEO.equals(kind)) {
+                    String mime = MultimodalMedia.mimeOf(mediaPath, null, kind);
+                    contents.add(dev.langchain4j.data.message.VideoContent.from(base64, mime));
+                } else {
                     String mimeType = "image/png";
-                    String lower = imgPath.toLowerCase();
                     if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) mimeType = "image/jpeg";
                     else if (lower.endsWith(".webp")) mimeType = "image/webp";
                     else if (lower.endsWith(".gif")) mimeType = "image/gif";
                     contents.add(dev.langchain4j.data.message.ImageContent.from(
                             "data:" + mimeType + ";base64," + base64));
-                } else {
-                    contents.add(dev.langchain4j.data.message.TextContent.from("[图片已丢失: " + imgPath + "]"));
                 }
             } catch (Exception e) {
-                contents.add(dev.langchain4j.data.message.TextContent.from("[图片读取失败: " + imgPath + "]"));
+                contents.add(dev.langchain4j.data.message.TextContent.from(
+                        "[媒体读取失败: " + mediaPath + "]"));
             }
         }
         return UserMessage.from(contents);

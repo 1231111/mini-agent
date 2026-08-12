@@ -1,0 +1,98 @@
+---
+description: 全语言：可复用抽象、禁止魔法值、统一 API 响应与错误码
+alwaysApply: true
+---
+
+# 工程约定（全语言）
+
+适用于本仓库任意语言（Java / JS / TS / Python / Shell 等）。与 Ponytail 并用：确认「已有第二处真实调用」再抽公共能力；禁止为假想复用造 Util/Helper。
+
+## 1. 可复用能力抽成公共模块
+
+- 跨文件/跨模块重复的纯逻辑、校验、编解码、路径/时间/JSON/字符串辅助 → 抽到公共位置（如 `common/`、`util/`、共享包），不要复制粘贴。
+- 抽之前先搜仓库：已有同类能力则复用，禁止平行再写一份。
+- 公共代码保持无业务状态；有状态的流程留在 Service / 业务层。
+- 命名按中文含义直译，禁止黑话伪装业务名。
+
+```text
+❌ 两处复制同一段截断逻辑
+✅ 一处公共函数：limitText(text, maxChars)
+```
+
+## 2. 禁止魔法值，统一管理
+
+- 类/函数内禁止用裸字面量表达业务含义：超时、重试次数、缓存 key 前缀、配置缺省、协议事件名、模块前缀、错误码字符串等。
+- 落点优先级：
+  1. 配置文件 / 环境变量 / 配置类（可运维变更）
+  2. 模块常量文件 / 枚举（固定协议与领域常量）
+  3. 文件内私有常量（仅本文件使用、且无跨文件复用时）
+- 日志与面向用户的说明文案可字面量；**码、阈值、key、阈值阈值、协议名**必须走常量或配置。
+
+```text
+❌ set("run:session:" + id, "1", 7200)
+✅ sessionRunLockKey(id) + 配置项 runLockTtlSeconds
+```
+
+## 3. API：统一响应实体 + 按业务划分错误码
+
+所有对外 JSON API（REST/RPC 风格）必须：
+
+1. **统一回复实体**（成功/失败同一结构，含 success/code/message/data 或项目等价字段），禁止各接口自造 `Map`/`dict` 散装字段。
+2. **错误码按业务功能设计**，区分：
+   - **业务错误**：可预期、可提示用户（未登录、参数非法、并发超限…）
+   - **系统错误**：基础设施/不可预期（DB 挂、依赖超时、内部断言…）
+3. 新错误先在错误码表/枚举追加，再引用；禁止接口里手写散落错误码字符串。
+4. 业务失败抛业务异常（或语言等价），系统失败抛系统异常；由全局处理层转成统一响应。勿把系统故障伪装成业务码。
+5. 非 JSON 通道（SSE/WebSocket 等）可不套响应实体，但事件名/结束码仍走常量；失败原因尽量带上错误码。
+
+本仓库 Java 已有实现（其他语言新增 API 时对齐同一契约，勿另起炉灶）：
+
+| 用途 | 类型 |
+|------|------|
+| 统一 JSON | `com.miniagent.common.ApiResponse` |
+| 错误码 | `com.miniagent.common.ErrorCode`（`模块.功能区.序号`） |
+| 业务失败 | `BusinessException` |
+| 系统失败 | `SystemException` |
+
+```text
+❌ { "success": false, "error": "未登录" }
+✅ 统一实体 + ErrorCode.AUTH_NOT_AUTHENTICATED（或等价业务异常）
+```
+
+## 4. 代码排版（生成代码必须遵守）
+
+### 4.1 单行 if / else / for / while 不加 `{}`
+
+主体只有一条语句时，不加花括号；多条语句或嵌套块才加。
+
+```java
+// ✅
+if (userId == null) return "Not authenticated";
+if (ok) doWork();
+else skip();
+
+// ❌
+if (userId == null) {
+    return "Not authenticated";
+}
+```
+
+同理适用于 `else`、`for`、`while`、`do`（仅当体为单语句）。  
+例外：需要在体里放注释+语句、或语言强制要求括号的语法（如部分格式化/宏场景）再加 `{}`。
+
+### 4.2 行宽：一屏看全，禁止横向拖动
+
+- 软上限 **100 列**（含缩进）；尽量不超过，避免编辑器出现横向滚动条。
+- 超长时优先拆：链式调用换行、参数列表换行、长字符串拆变量/常量、长条件拆中间布尔变量。
+- 不要为「塞进一行」删空格挤成难读长行；宁可多行短行。
+- 生成/改代码时主动按此折行，不要留下需横向滚动才能读完的行。
+
+```java
+// ❌ 一行拖到屏幕外
+return conversationStore.findFirstBySessionIdAndStatusOrderByStartedAtDesc(sessionId, Status.RUNNING);
+
+// ✅
+return conversationStore
+        .findFirstBySessionIdAndStatusOrderByStartedAtDesc(
+                sessionId, Status.RUNNING);
+```

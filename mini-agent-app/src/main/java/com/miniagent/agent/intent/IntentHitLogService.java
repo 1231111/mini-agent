@@ -1,8 +1,9 @@
 package com.miniagent.agent.intent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.miniagent.common.RunStatus;
 import com.miniagent.agent.trace.TraceRecorder;
-import com.miniagent.agent.trace.TraceStepType;
+import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.config.entity.IntentRuleHitLog;
 import com.miniagent.config.repository.IntentRuleHitLogRepository;
 import lombok.extern.slf4j.Slf4j;
@@ -25,6 +26,21 @@ public class IntentHitLogService {
     @Autowired private IntentSignalMatcher signals;
     @Autowired private TraceRecorder traceRecorder;
 
+    /** 意图识别阶段开始（独立功能点，与执行计划分离） */
+    public void begin(String userText, boolean hasImage) {
+        try {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("phase", "INTENT");
+            m.put("hasImage", hasImage);
+            m.put("question", truncate(userText, 500));
+            m.put("pipeline", "L0规则→L1小模型→L2启发式");
+            traceRecorder.recordNode(AgentStepNode.INTENT_START.name(),
+                    JSON.writeValueAsString(m), RunStatus.RUNNING.name(), 0);
+        } catch (Exception e) {
+            log.warn("意图识别开始节点写入失败: {}", e.getMessage());
+        }
+    }
+
     public void record(String layer, String userText, TaskPlan plan,
                        LlmIntentClassifier.Classification c, long durationMs) {
         if (Objects.isNull(plan)) return;
@@ -44,11 +60,21 @@ public class IntentHitLogService {
             repo.save(row);
 
             String stepType = "INTENT_" + (layer == null ? "L2" : layer.trim().toUpperCase());
-            if (!TraceStepType.isKnownPersisted(stepType)) {
-                stepType = TraceStepType.INTENT_L2.name();
+            if (!AgentStepNode.isKnownPersisted(stepType)) {
+                stepType = AgentStepNode.INTENT_L2.name();
             }
-            traceRecorder.recordNode(stepType, planJson, "SUCCESS", durationMs);
-            traceRecorder.recordNode(TraceStepType.TASK_PLAN.name(), planJson, "SUCCESS", 0);
+            // 1) 漏斗定案层  2) 意图识别阶段结束  3) 下游执行计划快照
+            traceRecorder.recordNode(stepType, planJson, RunStatus.SUCCESS.name(), durationMs);
+            Map<String, Object> end = new LinkedHashMap<>();
+            end.put("phase", "INTENT");
+            end.put("decidedLayer", layer);
+            end.put("intent", plan.intent().name());
+            end.put("taskGoal", plan.taskGoal());
+            if (Objects.nonNull(c)) end.put("confidence", c.confidence());
+            if (plan.intent() == IntentType.REVIEW) end.put("route", "REVIEW_FAST_PATH");
+            traceRecorder.recordNode(AgentStepNode.INTENT_END.name(),
+                    JSON.writeValueAsString(end), RunStatus.SUCCESS.name(), durationMs);
+            traceRecorder.recordNode(AgentStepNode.TASK_PLAN.name(), planJson, RunStatus.SUCCESS.name(), 0);
         } catch (Exception e) {
             log.warn("意图命中日志写入失败: {}", e.getMessage());
         }
@@ -58,7 +84,7 @@ public class IntentHitLogService {
     public void recordSkip(String layer, String why) {
         try {
             String stepType = "INTENT_" + (layer == null ? "L2" : layer.trim().toUpperCase());
-            if (!TraceStepType.isKnownPersisted(stepType)) return;
+            if (!AgentStepNode.isKnownPersisted(stepType)) return;
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("skipped", true);
             m.put("reason", why == null ? "未命中" : why);
@@ -73,6 +99,9 @@ public class IntentHitLogService {
         try {
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("intent", plan.intent().name());
+            if (plan.intent() == IntentType.REVIEW) {
+                m.put("route", "REVIEW_FAST_PATH");
+            }
             m.put("taskGoal", plan.taskGoal());
             m.put("reason", plan.reason());
             m.put("requiresStructuredPlan", plan.requiresStructuredPlan());

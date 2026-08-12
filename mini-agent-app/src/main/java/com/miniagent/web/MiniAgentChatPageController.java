@@ -2,6 +2,9 @@ package com.miniagent.web;
 
 import com.miniagent.application.AgentChatApplicationService;
 import com.miniagent.agent.core.TokenUsageTracker;
+import com.miniagent.common.ApiResponse;
+import com.miniagent.common.ErrorCode;
+import com.miniagent.common.MessageConstants;
 import com.miniagent.config.security.SessionCookieService;
 import com.miniagent.config.service.AuthService;
 import com.miniagent.config.service.DatabaseConversationStore;
@@ -13,6 +16,8 @@ import com.miniagent.agent.permission.SessionPermissionStore;
 import com.miniagent.web.dto.ChatRequest;
 import com.miniagent.web.dto.FileAttachment;
 import com.miniagent.web.dto.FileRef;
+import com.miniagent.web.dto.MediaRef;
+import com.miniagent.agent.web.MultimodalMedia;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.Data;
@@ -63,7 +68,7 @@ public class MiniAgentChatPageController {
     @Autowired
     private  AgentTraceStepRepository agentTraceStepRepository;
     @Autowired
-    private  com.miniagent.agent.core.SessionStreamHub streamHub;
+    private  com.miniagent.agent.core.SessionEventCenter eventCenter;
     @Autowired
     private  SessionCookieService sessionCookieService;
     @Autowired
@@ -75,6 +80,10 @@ public class MiniAgentChatPageController {
 
     @Value("${file.upload.max-size:52428800}")
     private long maxUploadSizeBytes;
+    @Value("${agent.multimodal.audio-max-bytes:36700160}")
+    private long audioMaxBytes;
+    @Value("${agent.multimodal.video-max-bytes:36700160}")
+    private long videoMaxBytes;
     @Autowired
     private SessionPermissionStore permissionStore;
     @Autowired(required = false)
@@ -95,24 +104,24 @@ public class MiniAgentChatPageController {
 
     @PostMapping(value = "/api/login", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, Object> login(@RequestBody LoginRequest req, HttpServletResponse response) {
+    public ApiResponse<Map<String, Object>> login(@RequestBody LoginRequest req, HttpServletResponse response) {
         return authService.login(req.getUsername(), req.getPassword())
                 .map(user -> {
                     sessionCookieService.issueSession(response, user.getId(), user.getUsername());
-                    return Map.<String, Object>of("success", true, "userId", user.getId(), "username", user.getUsername(), "displayName", user.getDisplayName());
+                    return ApiResponse.ok(Map.<String, Object>of("userId", user.getId(), "username", user.getUsername(), "displayName", user.getDisplayName()));
                 })
-                .orElse(Map.of("success", false, "message", "Invalid credentials"));
+                .orElse(ApiResponse.fail(ErrorCode.AUTH_LOGIN_FAILED));
     }
 
     @PostMapping(value = "/api/register", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, Object> register(@RequestBody RegisterRequest req, HttpServletResponse response) {
+    public ApiResponse<Map<String, Object>> register(@RequestBody RegisterRequest req, HttpServletResponse response) {
         return authService.register(req.getUsername(), req.getPassword(), req.getDisplayName())
                 .map(user -> {
                     sessionCookieService.issueSession(response, user.getId(), user.getUsername());
-                    return Map.<String, Object>of("success", true, "userId", user.getId(), "username", user.getUsername());
+                    return ApiResponse.ok(Map.<String, Object>of("userId", user.getId(), "username", user.getUsername()));
                 })
-                .orElse(Map.of("success", false, "message", "Username already exists or password too short"));
+                .orElse(ApiResponse.fail(ErrorCode.AUTH_USER_EXISTS));
     }
 
     @GetMapping("/api/logout")
@@ -124,47 +133,57 @@ public class MiniAgentChatPageController {
 
     @PostMapping(value = "/api/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, Object> uploadFile(@RequestParam("file") MultipartFile file,
-                                           @RequestParam(value = "sessionId", defaultValue = "default") String sessionId,
-                                           HttpServletRequest request) {
+    public ApiResponse<Map<String, Object>> uploadFile(@RequestParam("file") MultipartFile file,
+                                                       @RequestParam(value = "sessionId", defaultValue = "default") String sessionId,
+                                                       HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         if (Objects.isNull(file)) {
-            return Map.of("success", false, "message", "文件为空");
+            return ApiResponse.fail(ErrorCode.FILE_EMPTY);
         }
-        if (file.getSize() > maxUploadSizeBytes) {
-            return Map.of("success", false, "message",
+        String originalName = file.getOriginalFilename();
+        String contentType = file.getContentType();
+        if (MultimodalMedia.looksLikeMediaButUnsupported(originalName, contentType)) {
+            return ApiResponse.fail(ErrorCode.FILE_MEDIA_UNSUPPORTED,
+                    "仅支持音频 mp3/wav/flac/m4a/ogg 与视频 mp4/mov/avi/wmv");
+        }
+        String mediaKind = MultimodalMedia.kindOf(originalName, contentType);
+        long sizeLimit = maxUploadSizeBytes;
+        if (MultimodalMedia.KIND_AUDIO.equals(mediaKind)) sizeLimit = Math.min(sizeLimit, audioMaxBytes);
+        else if (MultimodalMedia.KIND_VIDEO.equals(mediaKind)) sizeLimit = Math.min(sizeLimit, videoMaxBytes);
+        if (file.getSize() > sizeLimit) {
+            return ApiResponse.fail(ErrorCode.FILE_TOO_LARGE,
                     "文件过大: " + (file.getSize() / 1024 / 1024) + "MB，上限 "
-                            + (maxUploadSizeBytes / 1024 / 1024) + "MB");
+                            + (sizeLimit / 1024 / 1024) + "MB");
         }
         try {
             String base64 = Base64.getEncoder().encodeToString(file.getBytes());
-            var saved = fileStorageService.saveFile(userId, sessionId, file.getOriginalFilename(), file.getContentType(), base64);
-            Map<String, Object> resp = new LinkedHashMap<>();
-            resp.put("success", true);
-            resp.put("filePath", saved.getFilePath());
-            resp.put("filename", saved.getOriginalFilename());
-            resp.put("mimeType", Optional.ofNullable(saved.getMimeType()).orElse("application/octet-stream"));
-            resp.put("fileSize", saved.getFileSize());
+            var saved = fileStorageService.saveFile(userId, sessionId, originalName, contentType, base64);
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("filePath", saved.getFilePath());
+            data.put("filename", saved.getOriginalFilename());
+            data.put("mimeType", Optional.ofNullable(saved.getMimeType()).orElse("application/octet-stream"));
+            data.put("fileSize", saved.getFileSize());
+            if (Objects.nonNull(mediaKind)) data.put("kind", mediaKind);
             if (Objects.nonNull(saved.getExtractedTextPath())) {
-                resp.put("extractedTextPath", saved.getExtractedTextPath());
+                data.put("extractedTextPath", saved.getExtractedTextPath());
             }
-            return resp;
+            return ApiResponse.ok(data);
         } catch (Exception e) {
-            return Map.of("success", false, "message", e.getMessage());
+            return ApiResponse.fail(ErrorCode.FILE_UPLOAD_ERROR, e.getMessage());
         }
     }
 
     @GetMapping(value = "/api/auth-status", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, Object> authStatus(HttpServletRequest request) {
+    public ApiResponse<Map<String, Object>> authStatus(HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
         if (Objects.isNull(userId)) {
-            return Map.of("authenticated", false);
+            return ApiResponse.ok(Map.of("authenticated", false));
         }
         return authService.getUserById(userId)
-                .map(user -> Map.<String, Object>of("authenticated", true, "userId", user.getId(), "username", user.getUsername(), "displayName", user.getDisplayName()))
-                .orElse(Map.of("authenticated", false));
+                .map(user -> ApiResponse.ok(Map.<String, Object>of("authenticated", true, "userId", user.getId(), "username", user.getUsername(), "displayName", user.getDisplayName())))
+                .orElse(ApiResponse.ok(Map.of("authenticated", false)));
     }
 
     private Long getUserIdFromCookie(HttpServletRequest request) {
@@ -182,26 +201,26 @@ public class MiniAgentChatPageController {
 
     // ========== 执行中追加消息 ==========
 
-    @PostMapping(value = "/api/chat/inject", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    @PostMapping(value = "/api/chat/append-message", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, Object> injectMessage(@RequestBody Map<String, String> body, HttpServletRequest request) {
+    public ApiResponse<Void> appendUserMessage(@RequestBody Map<String, String> body, HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
         if (Objects.isNull(userId)) {
-            return Map.of("success", false, "error", "Not authenticated");
+            return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
         String sessionId = body.get("sessionId");
         String message = body.get("message");
         if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(message)) {
-            return Map.of("success", false, "error", "sessionId and message required");
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "sessionId and message required");
         }
         if (!ownsSession(userId, sessionId) && !agentService.isTaskRunning(sessionId)) {
-            return Map.of("success", false, "error", "Forbidden");
+            return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN);
         }
-        boolean ok = streamHub.injectMessage(sessionId, message);
+        boolean ok = eventCenter.appendUserMessage(sessionId, message);
         if (!ok) {
-            return Map.of("success", false, "error", "No active task for this session");
+            return ApiResponse.fail(ErrorCode.CHAT_SESSION_NOT_FOUND, "No active task for this session");
         }
-        return Map.of("success", true);
+        return ApiResponse.ok();
     }
 
     // ========== SSE streaming ==========
@@ -224,6 +243,7 @@ public class MiniAgentChatPageController {
         String role = req.getRole();  // 获取角色选择
         List<String> images = Objects.isNull(req.getImages()) ? List.of() : req.getImages();
         List<FileAttachment> files = Objects.isNull(req.getFiles()) ? List.of() : req.getFiles();
+        List<MediaRef> mediaRefs = Objects.isNull(req.getMediaRefs()) ? List.of() : req.getMediaRefs();
         StringBuilder queryTask = new StringBuilder(Optional.ofNullable(message).orElse(""));
         // 预上传附件：统一走安全提取 + 侧车 + 上下文预算（docx/pptx/pdf/md 等）
         if (Objects.nonNull(req.getFileRefs()) && !req.getFileRefs().isEmpty()) {
@@ -232,7 +252,8 @@ public class MiniAgentChatPageController {
                 queryTask.append(fileCtx);
             }
         }
-        return agentService.chatStreamMultimodal(userId, sessionId, queryTask.toString(), images, files, role);
+        return agentService.chatStreamMultimodal(
+                userId, sessionId, queryTask.toString(), images, files, mediaRefs, role);
     }
 
     @Data
@@ -281,15 +302,15 @@ public class MiniAgentChatPageController {
 
     @GetMapping(value = "/api/task-status", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, Object> taskStatus(@RequestParam("sessionId") String sessionId,
-                                          HttpServletRequest request) {
+    public ApiResponse<Map<String, Object>> taskStatus(@RequestParam("sessionId") String sessionId,
+                                                       HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         if (!ownsSession(userId, sessionId) && !agentService.isTaskRunning(sessionId)) {
-            return Map.of("sessionId", sessionId, "running", false);
+            return ApiResponse.ok(Map.of("sessionId", sessionId, "running", false));
         }
         boolean running = agentService.isTaskRunning(sessionId);
-        return Map.of("sessionId", sessionId, "running", running);
+        return ApiResponse.ok(Map.of("sessionId", sessionId, "running", running));
     }
 
     /**
@@ -326,85 +347,108 @@ public class MiniAgentChatPageController {
 
     @GetMapping(value = "/api/conversations", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Object listConversations(HttpServletRequest request) {
+    public ApiResponse<List<Map<String, Object>>> listConversations(HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         var tasks = chatTaskRepository.findLatestTaskPerSession(userId);
-        return tasks.stream().map(t -> Map.of(
+        return ApiResponse.ok(tasks.stream().map(t -> Map.<String, Object>of(
             "sessionId", t.getSessionId(),
             "title", t.getQuestion().length() > 40 ? t.getQuestion().substring(0, 40) : t.getQuestion(),
             "updatedAt", Objects.nonNull(t.getCreatedAt()) ? t.getCreatedAt().toString() : ""
-        )).toList();
+        )).toList());
     }
 
     @GetMapping(value = "/api/conversation", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Object getConversation(@RequestParam("sessionId") String sessionId,
-                                  HttpServletRequest request) {
+    public ApiResponse<Object> getConversation(@RequestParam("sessionId") String sessionId,
+                                               HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         var conv = agentService.getConversationForUser(userId, sessionId);
         if (Objects.isNull(conv)) {
-            return Map.of("exists", false, "sessionId", sessionId);
+            return ApiResponse.ok(Map.of("exists", false, "sessionId", sessionId));
         }
-        return conv;
+        return ApiResponse.ok(conv);
     }
 
     @GetMapping(value = "/api/conversation/messages", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Object getConversationMessages(
+    public ApiResponse<Map<String, Object>> getConversationMessages(
             HttpServletRequest request,
             @RequestParam("sessionId") String sessionId,
             @RequestParam(value = "page", defaultValue = "0") int page,
             @RequestParam(value = "size", defaultValue = "10") int size) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         var tasks = chatTaskRepository.findByUserIdAndSessionIdOrderByCreatedAtDesc(
                 userId, sessionId, org.springframework.data.domain.PageRequest.of(page, size));
         var list = new ArrayList<>(tasks.getContent());
         Collections.reverse(list);
-        return Map.of(
-            "tasks", list.stream().map(t -> Map.of(
-                "id", t.getId(),
-                "question", t.getQuestion(),
-                "answer", Optional.ofNullable(t.getAnswer()).orElse(""),
-                "createdAt", Objects.nonNull(t.getCreatedAt()) ? t.getCreatedAt().toString() : ""
-            )).toList(),
+        List<Map<String, Object>> mapped = new ArrayList<>();
+        for (var t : list) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("id", t.getId());
+            row.put("question", t.getQuestion());
+            row.put("answer", Optional.ofNullable(t.getAnswer()).orElse(""));
+            row.put("createdAt", Objects.nonNull(t.getCreatedAt()) ? t.getCreatedAt().toString() : "");
+            row.put("images", toConversationImageUrls(t.getImages()));
+            mapped.add(row);
+        }
+        return ApiResponse.ok(Map.of(
+            "tasks", mapped,
             "hasMore", tasks.hasNext()
-        );
+        ));
+    }
+
+    /** chat_tasks.images 逗号分隔相对键 → 可回显的 HTTP 路径 */
+    static List<String> toConversationImageUrls(String imagesCsv) {
+        if (StringUtils.isBlank(imagesCsv)) return List.of();
+        List<String> out = new ArrayList<>();
+        for (String part : imagesCsv.split(",")) {
+            String p = part == null ? "" : part.trim().replace('\\', '/');
+            if (p.isEmpty()) continue;
+            if (p.startsWith("http://") || p.startsWith("https://") || p.startsWith("/")) {
+                out.add(p);
+                continue;
+            }
+            if (!p.startsWith("conversation-images/"))
+                p = "conversation-images/" + p;
+            out.add("/" + p);
+        }
+        return out;
     }
 
     @GetMapping(value = "/api/conversation/delete", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, Object> deleteConversationApi(
+    public ApiResponse<Void> deleteConversationApi(
             HttpServletRequest request,
             @RequestParam("sessionId") String sessionId) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         if (!ownsSession(userId, sessionId)) {
-            return Map.of("success", false, "error", "Forbidden");
+            return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN);
         }
         chatTaskRepository.deleteByUserIdAndSessionId(userId, sessionId);
         agentService.deleteConversationForUser(userId, sessionId);
-        return Map.of("success", true);
+        return ApiResponse.ok();
     }
 
     @GetMapping(value = "/api/token-usage", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Object tokenUsage(@RequestParam("sessionId") String sessionId, HttpServletRequest request) {
+    public ApiResponse<Object> tokenUsage(@RequestParam("sessionId") String sessionId, HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
-        if (!ownsSession(userId, sessionId)) return Map.of("error", "Forbidden");
-        return TokenUsageTracker.get(sessionId);
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        if (!ownsSession(userId, sessionId)) return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN);
+        return ApiResponse.ok(TokenUsageTracker.get(sessionId));
     }
 
     @GetMapping(value = "/api/token-usage/all", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Object allTokenUsage(HttpServletRequest request) {
+    public ApiResponse<Object> allTokenUsage(HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         // Per-user aggregate not tracked; return empty to avoid cross-tenant leak
-        return Map.of();
+        return ApiResponse.ok(Map.of());
     }
 
     // ========== 轨迹监控 ==========
@@ -418,38 +462,60 @@ public class MiniAgentChatPageController {
         return "trace";
     }
 
-    /** Trace 节点全集目录（与 TraceStepType 同步，供页面中文展示/可控清单） */
+    /** Agent 节点全集目录（与 AgentStepNode 同步） */
     @GetMapping(value = "/api/traces/node-catalog", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public Object getTraceNodeCatalog() {
-        return com.miniagent.agent.trace.TraceStepType.catalog();
+        return com.miniagent.agent.trace.AgentStepNode.catalog();
     }
 
     @GetMapping(value = "/api/traces", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Object getTraces(
+    public ApiResponse<Object> getTraces(
             HttpServletRequest request,
             @RequestParam(value = "sessionId", required = false) String sessionId,
             @RequestParam(value = "executionId", required = false) String executionId) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return List.of();
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         if (StringUtils.isNotBlank(sessionId) && !ownsSession(userId, sessionId)) {
-            return List.of();
+            return ApiResponse.ok(List.of());
         }
         if (Objects.nonNull(executionId) && !executionId.isEmpty()) {
-            return agentTraceStepRepository.findByExecutionIdOrderByTurnIndexAscIdAsc(executionId);
+            return ApiResponse.ok(agentTraceStepRepository.findByExecutionIdOrderByTurnIndexAscIdAsc(executionId));
         }
-        return agentTraceStepRepository.findBySessionIdOrderByTurnIndexAscIdAsc(sessionId);
+        return ApiResponse.ok(agentTraceStepRepository.findBySessionIdOrderByTurnIndexAscIdAsc(sessionId));
+    }
+
+    /**
+     * 规划决策轨迹（按 executionId）：GOAL_COMPILED / PROPOSAL / STATE_COMMIT / RECOVERY_* 等。
+     */
+    @GetMapping(value = "/api/planner/decisions", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<Object> getPlannerDecisions(
+            HttpServletRequest request,
+            @RequestParam("executionId") String executionId) {
+        Long userId = getUserIdFromCookie(request);
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        if (StringUtils.isBlank(executionId))
+            return ApiResponse.fail(ErrorCode.CHAT_MESSAGE_EMPTY);
+        List<AgentTraceStep> all =
+                agentTraceStepRepository.findByExecutionIdOrderByTurnIndexAscIdAsc(executionId);
+        if (all.isEmpty()) return ApiResponse.ok(List.of());
+        String sessionId = all.get(0).getSessionId();
+        if (StringUtils.isNotBlank(sessionId) && !ownsSession(userId, sessionId))
+            return ApiResponse.ok(List.of());
+        return ApiResponse.ok(com.miniagent.agent.planner.PlannerDecisionNodes.filter(
+                all, AgentTraceStep::getStepType));
     }
 
     /** 获取某 session 下所有执行任务的列表（按 executionId 分组） */
     @GetMapping(value = "/api/traces/executions", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public List<Map<String, Object>> getExecutions(
+    public ApiResponse<List<Map<String, Object>>> getExecutions(
             @RequestParam("sessionId") String sessionId,
             HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId) || !ownsSession(userId, sessionId)) return List.of();
+        if (Objects.isNull(userId) || !ownsSession(userId, sessionId)) return ApiResponse.ok(List.of());
         List<AgentTraceStep> all = agentTraceStepRepository.findBySessionIdOrderByTurnIndexAscIdAsc(sessionId);
         // 按 executionId 分组，返回每个执行的摘要
         Map<String, List<AgentTraceStep>> grouped = new LinkedHashMap<>();
@@ -479,19 +545,19 @@ public class MiniAgentChatPageController {
             exec.put("status", last.getStatus());
             result.add(exec);
         }
-        return result;
+        return ApiResponse.ok(result);
     }
 
     @GetMapping(value = "/api/traces/summary", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, Object> getTraceSummary(
+    public ApiResponse<Map<String, Object>> getTraceSummary(
             HttpServletRequest request,
             @RequestParam(value = "sessionId", required = false) String sessionId,
             @RequestParam(value = "executionId", required = false) String executionId) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         if (StringUtils.isNotBlank(sessionId) && !ownsSession(userId, sessionId)) {
-            return Map.of("error", "Forbidden");
+            return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN);
         }
         long totalSteps, totalTurns;
         Long totalDuration;
@@ -534,86 +600,84 @@ public class MiniAgentChatPageController {
         result.put("totalDurationMs", Optional.ofNullable(totalDuration).orElse(0L));
         result.put("tools", tools);
         result.put("slowestSteps", slowest);
-        return result;
+        return ApiResponse.ok(result);
     }
 
     // ========== 权限模式（按会话） ==========
 
     @GetMapping(value = "/api/permission-mode", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, Object> getPermissionMode(@RequestParam("sessionId") String sessionId,
-                                                 HttpServletRequest request) {
+    public ApiResponse<Object> getPermissionMode(@RequestParam("sessionId") String sessionId,
+                                                  HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         if (StringUtils.isBlank(sessionId)) {
-            return Map.of("success", false, "message", "sessionId required");
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "sessionId required");
         }
-        return permissionStore.toView(sessionId);
+        return ApiResponse.ok(permissionStore.toView(sessionId));
     }
 
     @PutMapping(value = "/api/permission-mode", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, Object> putPermissionMode(@RequestBody Map<String, Object> body, HttpServletRequest request) {
+    public ApiResponse<Object> putPermissionMode(@RequestBody Map<String, Object> body, HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         String sessionId = Objects.isNull(body) ? null : String.valueOf(body.getOrDefault("sessionId", ""));
         if (StringUtils.isBlank(sessionId) || "null".equals(sessionId)) {
-            return Map.of("success", false, "message", "sessionId required");
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "sessionId required");
         }
         String action = Objects.isNull(body.get("action")) ? "set" : String.valueOf(body.get("action"));
         if ("approve_plan".equalsIgnoreCase(action)) {
             permissionStore.approvePlan(sessionId);
-            // 可选：注入一句提示，让运行中的 agent 感知（若无运行中任务则仅更新状态）
-            streamHub.injectMessage(sessionId, "【系统】用户已批准 Plan，请按 todo 开始执行写操作与交付。");
-            return permissionStore.toView(sessionId);
+            eventCenter.appendUserMessage(sessionId, "【系统】用户已批准 Plan，请按 todo 开始执行写操作与交付。");
+            return ApiResponse.ok(permissionStore.toView(sessionId));
         }
         if ("grant_ask".equalsIgnoreCase(action)) {
             String tool = Objects.isNull(body.get("tool")) ? "" : String.valueOf(body.get("tool"));
             permissionStore.grantAskTool(sessionId, tool);
-            streamHub.injectMessage(sessionId, "【系统】用户已批准工具 " + tool + "，请继续。");
-            return permissionStore.toView(sessionId);
+            eventCenter.appendUserMessage(sessionId, "【系统】用户已批准工具 " + tool + "，请继续。");
+            return ApiResponse.ok(permissionStore.toView(sessionId));
         }
         String mode = Objects.isNull(body.get("mode")) ? "default" : String.valueOf(body.get("mode"));
         permissionStore.setMode(sessionId, PermissionMode.from(mode));
-        return permissionStore.toView(sessionId);
+        return ApiResponse.ok(permissionStore.toView(sessionId));
     }
 
     // ========== MCP 状态 ==========
 
     @GetMapping(value = "/api/mcp/status", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, Object> mcpStatus(HttpServletRequest request) {
+    public ApiResponse<Map<String, Object>> mcpStatus(HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         boolean enabled = Objects.nonNull(mcpProperties) && mcpProperties.isEnabled();
         List<String> tools = Objects.isNull(mcpToolBridge) ? List.of() : mcpToolBridge.registeredToolNames();
         int serverCount = Objects.isNull(mcpProperties) || Objects.isNull(mcpProperties.getServers())
                 ? 0 : mcpProperties.getServers().size();
         Map<String, Object> m = new LinkedHashMap<>();
-        m.put("success", true);
         m.put("enabled", enabled);
         m.put("serverCount", serverCount);
         m.put("registeredTools", tools);
         m.put("toolCount", tools.size());
-        return m;
+        return ApiResponse.ok(m);
     }
 
     @PostMapping(value = "/api/mcp/refresh", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public Map<String, Object> mcpRefresh(@RequestBody(required = false) Map<String, Object> body,
-                                          HttpServletRequest request) {
+    public ApiResponse<Object> mcpRefresh(@RequestBody(required = false) Map<String, Object> body,
+                                           HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
-        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
-        if (Objects.isNull(mcpToolBridge)) return Map.of("success", false, "message", "MCP bridge unavailable");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        if (Objects.isNull(mcpToolBridge)) return ApiResponse.fail(ErrorCode.MCP_NOT_ENABLED);
         try {
             String serverId = Objects.isNull(body) || Objects.isNull(body.get("serverId"))
                     ? null : String.valueOf(body.get("serverId"));
             if (StringUtils.isNotBlank(serverId) && !"null".equals(serverId)) {
-                return mcpToolBridge.refreshServer(serverId);
+                return ApiResponse.ok(mcpToolBridge.refreshServer(serverId));
             }
-            return mcpToolBridge.refreshAll();
+            return ApiResponse.ok(mcpToolBridge.refreshAll());
         } catch (Exception e) {
-            return Map.of("success", false, "message", Objects.nonNull(e.getMessage()) ? e.getMessage() : "refresh failed");
+            return ApiResponse.fail(ErrorCode.MCP_CONNECTION_FAILED, Objects.nonNull(e.getMessage()) ? e.getMessage() : "refresh failed");
         }
     }
 

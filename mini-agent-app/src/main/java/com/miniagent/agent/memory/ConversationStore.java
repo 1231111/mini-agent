@@ -2,6 +2,7 @@ package com.miniagent.agent.memory;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.miniagent.common.ChatRole;
 import com.fasterxml.jackson.databind.SerializationFeature;
 
 import java.io.IOException;
@@ -109,7 +110,7 @@ public class ConversationStore {
         conv.messages.add(msg);
         conv.updatedAt = Instant.now().toEpochMilli();
         // 自动用第一条用户消息作为标题
-        if ("user".equals(role) && conv.messages.stream().filter(m -> "user".equals(m.role)).count() == 1) {
+        if (ChatRole.USER.getValue().equals(role) && conv.messages.stream().filter(m -> ChatRole.USER.getValue().equals(m.role)).count() == 1) {
             String autoTitle = content.length() > 40 ? content.substring(0, 40) + "…" : content;
             conv.title = autoTitle.replaceAll("[\\r\\n]", " ").trim();
         }
@@ -128,7 +129,7 @@ public class ConversationStore {
         msg.images = (Objects.isNull(imagePaths) || imagePaths.isEmpty()) ? null : new ArrayList<>(imagePaths);
         conv.messages.add(msg);
         conv.updatedAt = Instant.now().toEpochMilli();
-        if ("user".equals(role) && conv.messages.stream().filter(m -> "user".equals(m.role)).count() == 1) {
+        if (ChatRole.USER.getValue().equals(role) && conv.messages.stream().filter(m -> ChatRole.USER.getValue().equals(m.role)).count() == 1) {
             String autoTitle = content.length() > 40 ? content.substring(0, 40) + "…" : content;
             conv.title = autoTitle.replaceAll("[\r\n]", " ").trim();
         }

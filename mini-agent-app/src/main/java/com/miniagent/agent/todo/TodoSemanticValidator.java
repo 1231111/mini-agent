@@ -140,7 +140,9 @@ public final class TodoSemanticValidator {
 
     private static Path tryResolve(String path) {
         if (StringUtils.isBlank(path)) return null;
-        String normalized = path.replace('\\', '/').trim();
+        // 与 TaskTodoStore 一致：剥 file_exists:、截说明尾巴
+        String normalized = TaskTodoStore.extractPathSpec(path);
+        if (normalized.isBlank()) return null;
         // 去掉 markdown 包装
         if (normalized.startsWith("![") && normalized.contains("](")) {
             int a = normalized.indexOf("](");

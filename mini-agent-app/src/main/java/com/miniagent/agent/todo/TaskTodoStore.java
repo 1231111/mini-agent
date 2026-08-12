@@ -2,6 +2,7 @@ package com.miniagent.agent.todo;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.miniagent.agent.core.SessionEventCenter;
 import com.miniagent.agent.intent.TaskStep;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,6 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -67,8 +69,14 @@ public class TaskTodoStore {
     }
 
     private final Map<String, List<TodoItem>> todos = new ConcurrentHashMap<>();
+    /** 挂起计划 JSON（DB 模式缓存；每次 ensureLoaded 从持久化刷新） */
+    private final Map<String, String> suspendedJson = new ConcurrentHashMap<>();
+    /** 文件 mtime：仅 file 回退模式 */
+    private final Map<String, Long> fileMtimes = new ConcurrentHashMap<>();
     private final Path persistDir;
     private final List<TodoStepValidator> validators;
+    private SessionTodoPersistence persistence;
+    private SessionEventCenter eventCenter;
 
     /** 测试 / 无 Spring 场景 */
     public TaskTodoStore(String persistDir) {
@@ -87,6 +95,23 @@ public class TaskTodoStore {
         } catch (Exception e) {
             log.warn("无法创建 todo 持久化目录 {}: {}", this.persistDir, e.getMessage());
         }
+    }
+
+    @Autowired(required = false)
+    public void setPersistence(SessionTodoPersistence persistence) {
+        this.persistence = persistence;
+        if (persistence != null) {
+            log.info("TaskTodoStore 使用 DB 持久化（多副本）");
+        }
+    }
+
+    @Autowired(required = false)
+    public void setEventCenter(SessionEventCenter eventCenter) {
+        this.eventCenter = eventCenter;
+    }
+
+    private boolean useDb() {
+        return persistence != null;
     }
 
     public synchronized List<TodoItem> get(String sessionId) {
@@ -548,6 +573,8 @@ public class TaskTodoStore {
         }
     }
 
+    private static final String FILE_EXISTS_PREFIX = "file_exists:";
+
     public String verifyCompletion(String doneWhen, String evidence) {
         String dw = doneWhen == null ? "" : doneWhen.trim();
         String ev = evidence == null ? "" : evidence.trim();
@@ -559,13 +586,15 @@ public class TaskTodoStore {
             return null;
         }
 
-        if (dw.startsWith("file_exists:")) {
-            String path = dw.substring("file_exists:".length()).trim();
+        if (dw.regionMatches(true, 0, FILE_EXISTS_PREFIX, 0, FILE_EXISTS_PREFIX.length())) {
+            String path = extractPathSpec(dw);
             if (path.isEmpty()) return "done_when 的 file_exists 路径为空";
             Path p = resolvePath(path);
-            if (!Files.exists(p)) {
-                if (!ev.isBlank() && Files.exists(resolvePath(ev))) return null;
-                return "验收失败：文件不存在 " + path + "（可先 write_file 再 completed，或把实际路径写入 evidence）";
+            if (p == null || !Files.exists(p)) {
+                Path alt = resolvePath(ev);
+                if (alt != null && Files.exists(alt)) return null;
+                return "验收失败：文件不存在 " + path
+                        + "（可先 write_file 再 completed，或把实际路径写入 evidence）";
             }
             return null;
         }
@@ -585,21 +614,143 @@ public class TaskTodoStore {
         return ev.isBlank() ? "标记 completed 时必须提供 evidence（对照 done_when=" + dw + "）" : null;
     }
 
+    /**
+     * 从 done_when / evidence 抽出路径：剥 file_exists:，截掉括号/说明尾巴。
+     * 例：file_exists:C:/a.md（28814字节…）→ C:/a.md
+     */
+    static String extractPathSpec(String raw) {
+        if (raw == null) return "";
+        String s = raw.trim().replace('\\', '/');
+        if (s.regionMatches(true, 0, FILE_EXISTS_PREFIX, 0, FILE_EXISTS_PREFIX.length()))
+            s = s.substring(FILE_EXISTS_PREFIX.length()).trim();
+        int cut = s.length();
+        for (String sep : new String[]{"（", "(", "｜", "|", "；", ";"}) {
+            int i = s.indexOf(sep);
+            if (i > 0 && i < cut) cut = i;
+        }
+        // 空格后多为说明（保留 Windows 盘符 C:）
+        int sp = s.indexOf(' ');
+        if (sp > 0 && sp < cut) cut = sp;
+        return s.substring(0, cut).trim();
+    }
+
     private static Path resolvePath(String path) {
-        String normalized = path.replace('\\', '/').trim();
-        Path p = Path.of(normalized);
-        if (p.isAbsolute()) return p.normalize();
-        return com.miniagent.agent.tool.BuiltinTools.effectiveWorkspaceRoot().resolve(normalized).normalize();
+        String normalized = extractPathSpec(path);
+        if (normalized.isEmpty()) return null;
+        try {
+            Path p = Path.of(normalized);
+            if (p.isAbsolute()) return p.normalize();
+            return com.miniagent.agent.tool.BuiltinTools
+                    .effectiveWorkspaceRoot().resolve(normalized).normalize();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     public synchronized void clear(String sessionId) {
         String key = safeKey(sessionId);
         todos.remove(key);
+        suspendedJson.remove(key);
+        fileMtimes.remove(key);
+        if (useDb()) {
+            try {
+                persistence.delete(key);
+            } catch (Exception e) {
+                log.warn("删除 todo DB 行失败: {}", e.getMessage());
+            }
+            return;
+        }
         try {
             Files.deleteIfExists(persistFile(key));
+            Files.deleteIfExists(suspendedFile(key));
         } catch (Exception e) {
             log.warn("删除 todo 文件失败: {}", e.getMessage());
         }
+    }
+
+    /**
+     * 挂起未完成活动计划；「继续」时 {@link #resumeSuspended} 恢复。
+     * DB 模式下写入 agent_session_todos.suspended_json。
+     */
+    public synchronized boolean suspendActive(String sessionId) {
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        List<TodoItem> list = todos.get(key);
+        if (list == null || list.isEmpty()) return false;
+        boolean incomplete = false;
+        for (TodoItem it : list) {
+            if (it.status() == Status.pending || it.status() == Status.in_progress
+                    || it.status() == Status.awaiting_confirm || it.status() == Status.blocked) {
+                incomplete = true;
+                break;
+            }
+        }
+        if (!incomplete) return false;
+        try {
+            String sus = itemsToJson(list);
+            todos.put(key, new ArrayList<>());
+            suspendedJson.put(key, sus);
+            persist(key, List.of());
+            log.info("todo 已挂起: session={}", key);
+            return true;
+        } catch (Exception e) {
+            log.warn("挂起 todo 失败 {}: {}", key, e.getMessage());
+            return false;
+        }
+    }
+
+    /** 活动计划为空时恢复挂起计划。 */
+    public synchronized boolean resumeSuspended(String sessionId) {
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        List<TodoItem> active = todos.get(key);
+        if (active != null && !active.isEmpty()) return false;
+        String sus = suspendedJson.get(key);
+        if (sus == null && !useDb()) {
+            Path sf = suspendedFile(key);
+            if (!Files.exists(sf)) return false;
+            try {
+                List<TodoItem> items = readItems(sf);
+                if (items.isEmpty()) {
+                    Files.deleteIfExists(sf);
+                    return false;
+                }
+                todos.put(key, items);
+                suspendedJson.remove(key);
+                persist(key, items);
+                Files.deleteIfExists(sf);
+                log.info("todo 已恢复挂起计划: session={}, items={}", key, items.size());
+                return true;
+            } catch (Exception e) {
+                log.warn("恢复挂起 todo 失败 {}: {}", key, e.getMessage());
+                return false;
+            }
+        }
+        if (sus == null || sus.isBlank() || "[]".equals(sus.strip())) return false;
+        try {
+            List<TodoItem> items = parseItemsJson(sus);
+            if (items.isEmpty()) {
+                suspendedJson.remove(key);
+                persist(key, List.of());
+                return false;
+            }
+            todos.put(key, items);
+            suspendedJson.remove(key);
+            persist(key, items);
+            log.info("todo 已恢复挂起计划: session={}, items={}", key, items.size());
+            return true;
+        } catch (Exception e) {
+            log.warn("恢复挂起 todo 失败 {}: {}", key, e.getMessage());
+            return false;
+        }
+    }
+
+    public synchronized boolean hasSuspended(String sessionId) {
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        String sus = suspendedJson.get(key);
+        if (sus != null && !sus.isBlank() && !"[]".equals(sus.strip())) return true;
+        return !useDb() && Files.exists(suspendedFile(key));
     }
 
     public synchronized boolean seedFromSteps(String sessionId, List<TaskStep> steps) {
@@ -803,53 +954,154 @@ public class TaskTodoStore {
         return persistDir.resolve(safe + ".json");
     }
 
-    private void ensureLoaded(String key) {
-        if (todos.containsKey(key)) return;
-        Path file = persistFile(key);
-        if (!Files.exists(file)) {
-            todos.put(key, new ArrayList<>());
-            return;
-        }
+    private Path suspendedFile(String key) {
+        String safe = key.replaceAll("[^a-zA-Z0-9._-]", "_");
+        return persistDir.resolve(safe + ".suspended.json");
+    }
+
+    private static long fileMtime(Path file) {
         try {
-            String json = Files.readString(file, StandardCharsets.UTF_8);
-            List<PersistedItem> raw = MAPPER.readValue(json, new TypeReference<>() {});
-            List<TodoItem> items = new ArrayList<>();
-            if (raw != null) {
-                for (PersistedItem p : raw) {
-                    if (p == null || p.content == null || p.content.isBlank()) continue;
-                    List<Integer> deps = p.dependsOn == null ? List.of() : List.copyOf(p.dependsOn);
-                    items.add(new TodoItem(p.id, p.content, parseStatus(p.status),
-                            nullToEmpty(p.note), nullToEmpty(p.doneWhen), nullToEmpty(p.evidence),
-                            nullToEmpty(p.validationHash), deps));
-                }
-            }
-            todos.put(key, items);
+            return Files.exists(file) ? Files.getLastModifiedTime(file).toMillis() : -1L;
         } catch (Exception e) {
-            log.warn("加载 todo 失败 {}: {}", file, e.getMessage());
-            todos.put(key, new ArrayList<>());
+            return -1L;
         }
     }
 
-    private void persist(String key, List<TodoItem> items) {
-        try {
-            Files.createDirectories(persistDir);
-            List<PersistedItem> raw = new ArrayList<>();
-            for (TodoItem it : items) {
-                PersistedItem p = new PersistedItem();
-                p.id = it.id();
-                p.content = it.content();
-                p.status = it.status().name();
-                p.note = it.note();
-                p.doneWhen = it.doneWhen();
-                p.evidence = it.evidence();
-                p.validationHash = it.validationHash();
-                p.dependsOn = it.dependsOn() == null ? List.of() : new ArrayList<>(it.dependsOn());
-                raw.add(p);
+    private void ensureLoaded(String key) {
+        if (useDb()) {
+            try {
+                SessionTodoPersistence.State st = persistence.load(key);
+                List<TodoItem> active = parseItemsJson(st.activeJson());
+                // DB 空且本地文件有数据 → 一次性迁入
+                if (active.isEmpty() && (st.suspendedJson() == null || st.suspendedJson().isBlank())
+                        && Files.exists(persistFile(key))) {
+                    active = readItems(persistFile(key));
+                    String sus = Files.exists(suspendedFile(key))
+                            ? Files.readString(suspendedFile(key), StandardCharsets.UTF_8) : null;
+                    todos.put(key, active);
+                    if (sus != null) suspendedJson.put(key, sus);
+                    else suspendedJson.remove(key);
+                    persist(key, active);
+                    return;
+                }
+                todos.put(key, active);
+                if (st.suspendedJson() != null && !st.suspendedJson().isBlank()) {
+                    suspendedJson.put(key, st.suspendedJson());
+                } else {
+                    suspendedJson.remove(key);
+                }
+            } catch (Exception e) {
+                log.warn("从 DB 加载 todo 失败 {}: {}", key, e.getMessage());
+                todos.putIfAbsent(key, new ArrayList<>());
             }
-            Files.writeString(persistFile(key), MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(raw),
-                    StandardCharsets.UTF_8);
+            return;
+        }
+        Path file = persistFile(key);
+        long mtime = fileMtime(file);
+        Long cached = fileMtimes.get(key);
+        if (todos.containsKey(key) && Objects.equals(cached, mtime)) {
+            return;
+        }
+        if (!Files.exists(file)) {
+            todos.put(key, new ArrayList<>());
+            fileMtimes.put(key, -1L);
+            return;
+        }
+        try {
+            todos.put(key, readItems(file));
+            fileMtimes.put(key, mtime);
+        } catch (Exception e) {
+            log.warn("加载 todo 失败 {}: {}", file, e.getMessage());
+            todos.put(key, new ArrayList<>());
+            fileMtimes.put(key, -1L);
+        }
+    }
+
+    private List<TodoItem> readItems(Path file) throws Exception {
+        return parseItemsJson(Files.readString(file, StandardCharsets.UTF_8));
+    }
+
+    private List<TodoItem> parseItemsJson(String json) throws Exception {
+        if (json == null || json.isBlank()) return new ArrayList<>();
+        List<PersistedItem> raw = MAPPER.readValue(json, new TypeReference<>() {});
+        List<TodoItem> items = new ArrayList<>();
+        if (raw != null) {
+            for (PersistedItem p : raw) {
+                if (p == null || p.content == null || p.content.isBlank()) continue;
+                List<Integer> deps = p.dependsOn == null ? List.of() : List.copyOf(p.dependsOn);
+                items.add(new TodoItem(p.id, p.content, parseStatus(p.status),
+                        nullToEmpty(p.note), nullToEmpty(p.doneWhen), nullToEmpty(p.evidence),
+                        nullToEmpty(p.validationHash), deps));
+            }
+        }
+        return items;
+    }
+
+    private String itemsToJson(List<TodoItem> items) throws Exception {
+        List<PersistedItem> raw = new ArrayList<>();
+        for (TodoItem it : items) {
+            PersistedItem p = new PersistedItem();
+            p.id = it.id();
+            p.content = it.content();
+            p.status = it.status().name();
+            p.note = it.note();
+            p.doneWhen = it.doneWhen();
+            p.evidence = it.evidence();
+            p.validationHash = it.validationHash();
+            p.dependsOn = it.dependsOn() == null ? List.of() : new ArrayList<>(it.dependsOn());
+            raw.add(p);
+        }
+        return MAPPER.writeValueAsString(raw);
+    }
+
+    private void writeItems(Path file, List<TodoItem> items) throws Exception {
+        Files.writeString(file,
+                MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(MAPPER.readTree(itemsToJson(items))),
+                StandardCharsets.UTF_8);
+    }
+
+    private void persist(String key, List<TodoItem> items) {
+        List<TodoItem> safe = items == null ? List.of() : items;
+        try {
+            if (useDb()) {
+                String active = itemsToJson(safe);
+                String sus = suspendedJson.get(key);
+                persistence.save(key, active, sus);
+            } else {
+                Files.createDirectories(persistDir);
+                Path file = persistFile(key);
+                writeItems(file, safe);
+                fileMtimes.put(key, fileMtime(file));
+                // file 模式：挂起另写 .suspended.json
+                String sus = suspendedJson.get(key);
+                Path sf = suspendedFile(key);
+                if (sus != null && !sus.isBlank() && !"[]".equals(sus.strip())) {
+                    Files.writeString(sf, sus, StandardCharsets.UTF_8);
+                } else {
+                    Files.deleteIfExists(sf);
+                }
+            }
         } catch (Exception e) {
             log.warn("持久化 todo 失败 {}: {}", key, e.getMessage());
+        }
+        publishTodoUi(key, safe);
+    }
+
+    /** SSE：把当前计划列表推给前端（完成项置灰勾选）。 */
+    private void publishTodoUi(String sessionId, List<TodoItem> items) {
+        if (eventCenter == null) return;
+        try {
+            List<Map<String, Object>> payload = new ArrayList<>(items.size());
+            for (TodoItem it : items) {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("id", it.id());
+                row.put("content", it.content());
+                row.put("status", it.status().name());
+                payload.add(row);
+            }
+            eventCenter.publishTodo(sessionId, payload);
+        } catch (Exception e) {
+            log.debug("todo UI 推送跳过: {}", e.getMessage());
         }
     }
 

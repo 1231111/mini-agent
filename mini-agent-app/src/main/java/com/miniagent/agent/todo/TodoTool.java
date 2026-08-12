@@ -3,6 +3,7 @@ package com.miniagent.agent.todo;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.miniagent.common.RunStatus;
 import com.miniagent.agent.trace.TraceRecorder;
 import com.miniagent.agent.tool.Tool;
 import com.miniagent.agent.tool.ToolRegistry;
@@ -86,6 +87,8 @@ public class TodoTool {
     @SuppressWarnings("unchecked")
     private String handle(String json) {
         try {
+            String gate = com.miniagent.agent.planner.ProposalGate.denyTodoArgsJson(json);
+            if (gate != null) return gate;
             String sid = TaskTodoContext.currentSessionId();
             Map<String, Object> args = MAPPER.readValue(Optional.ofNullable(json).orElse("{}"), Map.class);
             String action = String.valueOf(args.getOrDefault("action", "list")).trim().toLowerCase();
@@ -106,7 +109,8 @@ public class TodoTool {
                             "stats", todoStore.stats(sid),
                             "items", updated
                     ));
-                    traceTodo("TODO_SET", sid, "set", updated, null);
+                    traceTodo("TASK_SET", sid, "set", updated, null);
+                    maybeTraceWaitingHuman(sid, updated);
                     return out;
                 }
                 case "update" -> {
@@ -127,10 +131,11 @@ public class TodoTool {
                             "stats", todoStore.stats(sid),
                             "items", updated
                     ));
-                    traceTodo("TODO_UPDATE", sid, "update", updated,
+                    traceTodo("TASK_UPDATE", sid, "update", updated,
                             Map.of("id", id, "status", Optional.ofNullable(status).orElse(""),
                                     "note", Optional.ofNullable(note).orElse(""),
                                     "evidence", Optional.ofNullable(evidence).orElse("")));
+                    maybeTraceWaitingHuman(sid, updated);
                     return out;
                 }
                 case "reopen" -> {
@@ -149,7 +154,7 @@ public class TodoTool {
                             "stats", todoStore.stats(sid),
                             "items", updated
                     ));
-                    traceTodo("TODO_REOPEN", sid, "reopen", updated, Map.of("id", id));
+                    traceTodo("TASK_REOPEN", sid, "reopen", updated, Map.of("id", id));
                     return out;
                 }
                 case "confirm" -> {
@@ -168,7 +173,7 @@ public class TodoTool {
                             "stats", todoStore.stats(sid),
                             "items", updated
                     ));
-                    traceTodo("TODO_CONFIRM", sid, "confirm", updated, Map.of("id", id));
+                    traceTodo("TASK_CONFIRM", sid, "confirm", updated, Map.of("id", id));
                     return out;
                 }
                 case "list" -> {
@@ -180,12 +185,12 @@ public class TodoTool {
                             "stats", todoStore.stats(sid),
                             "items", items
                     ));
-                    traceTodo("TODO_LIST", sid, "list", items, null);
+                    traceTodo("TASK_LIST", sid, "list", items, null);
                     return out;
                 }
                 case "clear" -> {
                     todoStore.clear(sid);
-                    traceTodo("TODO_CLEAR", sid, "clear", List.of(), null);
+                    traceTodo("TASK_CLEAR", sid, "clear", List.of(), null);
                     return MAPPER.writeValueAsString(Map.of("success", true, "action", "clear"));
                 }
                 default -> {
@@ -248,9 +253,21 @@ public class TodoTool {
             }
             payload.put("render", todoStore.render(sid));
             payload.put("stats", todoStore.stats(sid));
-            traceRecorder.recordNode(stepType, MAPPER.writeValueAsString(payload), "SUCCESS", 0);
+            traceRecorder.recordNode(stepType, MAPPER.writeValueAsString(payload), RunStatus.SUCCESS.name(), 0);
         } catch (Exception e) {
             log.debug("todo trace 写入跳过: {}", e.getMessage());
+        }
+    }
+
+    /** 关键步进入 awaiting_confirm 时记 WAITING_FOR_HUMAN */
+    private void maybeTraceWaitingHuman(String sid, List<TaskTodoStore.TodoItem> items) {
+        if (Objects.isNull(traceRecorder) || !traceRecorder.isActive() || Objects.isNull(items)) return;
+        for (TaskTodoStore.TodoItem it : items) {
+            if (it != null && it.status() == TaskTodoStore.Status.awaiting_confirm) {
+                traceRecorder.recordWaitingForHuman(sid, 0,
+                        "awaiting_confirm id=" + it.id() + " content=" + Optional.ofNullable(it.content()).orElse(""));
+                return;
+            }
         }
     }
 

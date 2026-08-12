@@ -442,6 +442,19 @@
             border-radius: 10px; margin-bottom: 8px;
             display: block;
         }
+        /* 任务计划：钉在对应用户提问下方（非 bot 气泡内） */
+        .plan-row .msg-inner {
+            max-width: var(--content-w);
+            margin: 0 auto;
+            padding: 0 20px 4px;
+        }
+        .plan-row .todo-panel {
+            margin-bottom: 4px;
+            position: sticky;
+            top: 0;
+            z-index: 5;
+            box-shadow: 0 4px 16px rgba(0,0,0,.06);
+        }
 
         /* ---- BOT message: card style with subtle background ---- */
         .bot-row .msg-inner {
@@ -1037,7 +1050,143 @@
             content: '⚡'; font-size: 11px;
         }
 
-        /* sub-goal 进度条：框架维护的当前子目标，展示任务推进 */
+        /* 过程时间线：中间正文 + 工具活动按序落盘，不整段抹掉 */
+        .tl-stream {
+            margin-bottom: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .tl-stream .tl-note {
+            font-size: 13px;
+            line-height: 1.6;
+            color: var(--text2);
+            padding: 8px 12px;
+            border-left: 2px solid var(--border);
+            background: var(--surface);
+            border-radius: 0 8px 8px 0;
+        }
+        .tl-stream .tl-note-label {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text3, #8a8a8a);
+            margin-bottom: 4px;
+        }
+        .tl-stream .tl-activity {
+            font-size: 12.5px;
+            color: var(--text2);
+            padding: 6px 10px;
+            background: var(--accent-soft);
+            border-radius: 8px;
+            display: flex;
+            align-items: flex-start;
+            gap: 6px;
+            word-break: break-word;
+        }
+        .tl-stream .tl-activity.done { opacity: 0.75; }
+        .tl-stream .tl-activity.fail {
+            background: rgba(196, 86, 86, 0.12);
+            color: #c45656;
+        }
+
+        /* 任务计划列表：按序展示，完成项置灰打勾 */
+        .todo-panel {
+            margin-bottom: 14px;
+            font-size: 13px;
+            animation: fadeIn .3s ease;
+            background: var(--surface);
+            border-radius: 10px;
+            padding: 12px 14px 10px;
+            border: 1px solid var(--border);
+        }
+        .todo-panel .todo-head {
+            color: var(--text2);
+            font-weight: 600;
+            font-size: 12.5px;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+        .todo-panel .todo-head-meta {
+            font-weight: 500;
+            color: var(--text3, #8a8a8a);
+            font-size: 11.5px;
+        }
+        .todo-panel .todo-list {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .todo-panel .todo-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            padding: 5px 6px;
+            border-radius: 6px;
+            line-height: 1.45;
+            color: var(--text);
+            transition: opacity .25s ease, color .25s ease;
+        }
+        .todo-panel .todo-mark {
+            flex: 0 0 18px;
+            width: 18px;
+            height: 18px;
+            margin-top: 1px;
+            border-radius: 50%;
+            border: 1.5px solid var(--border);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            color: transparent;
+            background: transparent;
+        }
+        .todo-panel .todo-text { flex: 1; min-width: 0; word-break: break-word; }
+        .todo-panel .todo-item.completed {
+            opacity: 0.45;
+            color: var(--text3, #8a8a8a);
+        }
+        .todo-panel .todo-item.completed .todo-text {
+            text-decoration: line-through;
+        }
+        .todo-panel .todo-item.completed .todo-mark {
+            border-color: var(--accent);
+            background: var(--accent);
+            color: #fff;
+        }
+        .todo-panel .todo-item.completed .todo-mark::after { content: '✓'; }
+        .todo-panel .todo-item.in_progress {
+            background: rgba(16, 163, 127, 0.08);
+        }
+        .todo-panel .todo-item.in_progress .todo-mark {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 2px rgba(16, 163, 127, 0.15);
+        }
+        .todo-panel .todo-item.in_progress .todo-mark::after {
+            content: '';
+            width: 6px; height: 6px; border-radius: 50%;
+            background: var(--accent);
+        }
+        .todo-panel .todo-item.awaiting_confirm .todo-mark {
+            border-color: #e6a23c;
+        }
+        .todo-panel .todo-item.blocked {
+            opacity: 0.7;
+            color: #c45656;
+        }
+        .todo-panel .todo-item.blocked .todo-mark {
+            border-color: #c45656;
+        }
+        .todo-panel .todo-item.cancelled {
+            opacity: 0.35;
+            text-decoration: line-through;
+        }
+        /* 无 todo 时回退：旧 sub-goal 单行进度 */
         .subgoal-bar {
             margin-bottom: 14px;
             font-size: 12.5px;
@@ -1052,9 +1201,6 @@
             margin-bottom: 8px;
             display: flex; align-items: center; gap: 6px;
         }
-        .subgoal-bar .subgoal-label::before {
-            content: '📋'; font-size: 12px;
-        }
         .subgoal-bar .subgoal-track {
             height: 6px;
             border-radius: 4px;
@@ -1067,7 +1213,6 @@
             border-radius: 4px;
             background: linear-gradient(90deg, var(--accent), #2dd4a8);
             transition: width .4s ease;
-            box-shadow: 0 0 8px rgba(16,163,127,.3);
         }
 
         @media (max-width: 700px) {
@@ -1241,7 +1386,7 @@
                           onkeydown="handleKey(event)" oninput="onInputChange()"></textarea>
                 <div class="input-toolbar">
                     <div class="input-left">
-                        <input type="file" id="fileInput" accept="image/*,.pdf,.docx,.pptx,.xlsx,.txt,.csv,.json,.md,.markdown,.xml,.html,.js,.py,.java" multiple style="display:none"
+                        <input type="file" id="fileInput" accept="image/*,audio/*,video/*,.mp3,.wav,.flac,.m4a,.ogg,.mp4,.mov,.avi,.wmv,.pdf,.docx,.pptx,.xlsx,.txt,.csv,.json,.md,.markdown,.xml,.html,.js,.py,.java" multiple style="display:none"
                                onchange="onFileSelected(event)">
                         <button class="in-tool-btn" id="imgBtn" title="上传图片或文档（pdf/docx/pptx/xlsx/md…）"
                                 onclick="document.getElementById('fileInput').click()">
@@ -1377,6 +1522,23 @@ const LS_THEME = 'mini_agent_theme';
 const MAX_CONVS     = 60;
 const MAX_MSG_CHARS = 8000;
 
+/** 解包统一 ApiResponse：有 success+data 时取 data，否则原样返回。 */
+async function apiJson(resp) {
+    const body = await resp.json();
+    if (body && typeof body === 'object'
+            && Object.prototype.hasOwnProperty.call(body, 'success')
+            && Object.prototype.hasOwnProperty.call(body, 'data'))
+        return body.data;
+    return body;
+}
+function unwrapApiBody(body) {
+    if (body && typeof body === 'object'
+            && Object.prototype.hasOwnProperty.call(body, 'success')
+            && Object.prototype.hasOwnProperty.call(body, 'data'))
+        return body.data;
+    return body;
+}
+
 let currentId    = null;
 let selectedFiles = [];
 let uploadedFileRefs = [];
@@ -1480,7 +1642,37 @@ document.addEventListener('drop', e => {
     files.forEach(addFile);
 });
 
+const MEDIA_MAX_BYTES = 35 * 1024 * 1024;
+const AUDIO_EXTS = new Set(['mp3', 'wav', 'flac', 'm4a', 'ogg']);
+const VIDEO_EXTS = new Set(['mp4', 'mov', 'avi', 'wmv']);
+
+function fileExt(name) {
+    const i = (name || '').lastIndexOf('.');
+    return i < 0 ? '' : name.slice(i + 1).toLowerCase();
+}
+function isAudioFile(f) {
+    if (!f) return false;
+    if ((f.type || '').startsWith('audio/')) return AUDIO_EXTS.has(fileExt(f.name)) || !fileExt(f.name);
+    return AUDIO_EXTS.has(fileExt(f.name));
+}
+function isVideoFile(f) {
+    if (!f) return false;
+    if ((f.type || '').startsWith('video/')) return VIDEO_EXTS.has(fileExt(f.name)) || !fileExt(f.name);
+    return VIDEO_EXTS.has(fileExt(f.name));
+}
+function isNativeMediaFile(f) { return isAudioFile(f) || isVideoFile(f); }
+
 function addFile(file) {
+    if (isNativeMediaFile(file) && file.size > MEDIA_MAX_BYTES) {
+        alert('音视频过大（上限约 35MB，MiMo Base64 限制）: ' + file.name);
+        return;
+    }
+    if ((file.type || '').startsWith('audio/') || (file.type || '').startsWith('video/')) {
+        if (!isNativeMediaFile(file)) {
+            alert('不支持的音视频格式（音频 mp3/wav/flac/m4a/ogg；视频 mp4/mov/avi/wmv）');
+            return;
+        }
+    }
     const idx = selectedFiles.length;
     selectedFiles.push(file);
     if (file.type.startsWith('image/')) {
@@ -1493,7 +1685,6 @@ function addFile(file) {
     } else {
         previewSrcs.push(null);
         renderImgPreview();
-        // Upload with progress tracking
         uploadingCount++;
         updateSendButton();
         const fd = new FormData();
@@ -1512,14 +1703,19 @@ function addFile(file) {
             let data = null;
             try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
             if (xhr.status === 200 && data && data.success) {
+                const d = unwrapApiBody(data) || data;
                 uploadedFileRefs[idx] = {
-                    filePath: data.filePath,
-                    filename: data.filename,
-                    mimeType: data.mimeType,
-                    fileSize: data.fileSize,
-                    extractedTextPath: data.extractedTextPath || null
+                    filePath: d.filePath,
+                    filename: d.filename,
+                    mimeType: d.mimeType,
+                    fileSize: d.fileSize,
+                    kind: d.kind || (isAudioFile(file) ? 'audio' : (isVideoFile(file) ? 'video' : null)),
+                    extractedTextPath: d.extractedTextPath || null
                 };
-                updateFileProgress(idx, 100, 'done', data.extractedTextPath ? '已解析' : null);
+                const doneHint = d.kind
+                    ? (d.kind === 'video' ? '视频已上传' : '音频已上传')
+                    : (d.extractedTextPath ? '已解析' : null);
+                updateFileProgress(idx, 100, 'done', doneHint);
             } else {
                 const msg = (data && data.message)
                     || (xhr.status === 413 ? '文件过大（上限 50MB）' : ('上传失败 HTTP ' + xhr.status));
@@ -1586,10 +1782,11 @@ function renderImgPreview() {
                 </button>`;
         } else {
             const ext = f.name.split('.').pop().toUpperCase();
+            const badge = isAudioFile(f) ? 'AUD' : (isVideoFile(f) ? 'VID' : ext);
             const progressId = 'file-progress-' + i;
             const isUploaded = uploadedFileRefs[i] != null;
             item.innerHTML = `
-                <div style="width:32px;height:32px;display:flex;align-items:center;justify-content:center;background:var(--surface2);border-radius:6px;font-size:10px;font-weight:700;color:var(--text2)">${esc(ext)}</div>
+                <div style="width:32px;height:32px;display:flex;align-items:center;justify-content:center;background:var(--surface2);border-radius:6px;font-size:10px;font-weight:700;color:var(--text2)">${esc(badge)}</div>
                 <div style="flex:1;min-width:0">
                     <span class="img-fname" title="${escA(f.name)}">${esc(f.name)}</span>
                     <div id="${progressId}">
@@ -1914,8 +2111,9 @@ async function approvePlan() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ sessionId: currentId, action: 'approve_plan' })
         });
-        const data = await resp.json();
-        if (data.success) {
+        const body = await resp.json();
+        if (body.success) {
+            const data = unwrapApiBody(body) || {};
             document.getElementById('planBannerText').textContent =
                 data.planApproved ? 'Plan 已批准，写工具已解锁' : 'Plan 模式';
         }
@@ -1971,7 +2169,8 @@ async function renderSidebar() {
     try {
         const resp = await fetch('/api/conversations');
         if (!resp.ok) { el.innerHTML = '<div style="padding:10px 8px;font-size:12px;color:var(--text3)">\u6682\u65e0\u5386\u53f2\u5bf9\u8bdd</div>'; return; }
-        list = await resp.json();
+        list = await apiJson(resp);
+        if (!Array.isArray(list)) list = [];
     } catch (e) {
         console.warn('Failed to load conversations:', e);
         el.innerHTML = '<div style="padding:10px 8px;font-size:12px;color:var(--text3)">\u52a0\u8f7d\u5931\u8d25</div>';
@@ -2123,7 +2322,7 @@ async function loadMoreMessages(sessionId, prepend) {
         const page = window._msgPage || 0;
         const resp = await fetch('/api/conversation/messages?sessionId=' + encodeURIComponent(sessionId) + '&page=' + page + '&size=20');
         if (!resp.ok) { window._msgLoading = false; return; }
-        const data = await resp.json();
+        const data = await apiJson(resp) || {};
 
         window._msgHasMore = data.hasMore;
         window._msgPage = page + 1;
@@ -2132,7 +2331,9 @@ async function loadMoreMessages(sessionId, prepend) {
         // Convert tasks to messages format: question→user, answer→assistant
         const messages = [];
         rawTasks.forEach(t => {
-            if (t.question) messages.push({ role: 'user', content: t.question });
+            const imgs = Array.isArray(t.images) ? t.images.filter(Boolean) : [];
+            if (t.question || imgs.length)
+                messages.push({ role: 'user', content: t.question || '', images: imgs });
             if (t.answer) messages.push({ role: 'assistant', content: t.answer });
         });
 
@@ -2145,7 +2346,7 @@ async function loadMoreMessages(sessionId, prepend) {
             const frag = document.createDocumentFragment();
             messages.forEach(m => {
                 if (m.role === 'user') {
-                    frag.appendChild(buildUserRow(m.content || ''));
+                    frag.appendChild(buildUserRow(m.content || '', m.images || []));
                 } else {
                     frag.appendChild(buildBotRow(m.content || ''));
                 }
@@ -2158,7 +2359,8 @@ async function loadMoreMessages(sessionId, prepend) {
             // Initial load: render normally
             messages.forEach(m => {
                 if (m.role === 'user') {
-                    renderUserMsg(m.content || '', null, 0, []);
+                    const imgs = m.images || [];
+                    renderUserMsg(m.content || '', imgs[0] || null, imgs.length, []);
                 } else {
                     const bd = renderBotMsg(renderMD(m.content || ''), false);
                     bindLightbox(bd.closest('.bot-row'));
@@ -2172,10 +2374,18 @@ async function loadMoreMessages(sessionId, prepend) {
     window._msgLoading = false;
 }
 
-function buildUserRow(text) {
+function buildUserRow(text, images = []) {
     const row = document.createElement('div');
     row.className = 'msg-row user-row';
-    row.innerHTML = '<div class="msg-inner"><div class="user-bubble">' + esc(text).replace(/\n/g, '<br>') + '</div></div>';
+    const imgs = Array.isArray(images) ? images.filter(Boolean) : [];
+    const imgHtml = imgs[0]
+        ? `<img src="${escA(imgs[0])}" alt="上传图片">`
+            + (imgs.length > 1
+                ? `<div style="font-size:11px;color:var(--text2);margin-top:4px">附 ${imgs.length} 张图片</div>`
+                : '')
+        : '';
+    const textHtml = text ? esc(text).replace(/\n/g, '<br>') : '';
+    row.innerHTML = `<div class="msg-inner"><div class="user-bubble">${imgHtml}${textHtml}</div></div>`;
     return row;
 }
 
@@ -2213,24 +2423,24 @@ function setStreaming(on) {
     onInputChange();
 }
 
-async function injectMessage(text, sessionId) {
+async function appendUserMessage(text, sessionId) {
     renderUserMsg(text, null, 0, [], true);
     $inp.value = '';
     $inp.style.height = 'auto';
     onInputChange();
     scrollToBottom();
     try {
-        const resp = await fetch('/api/chat/inject', {
+        const resp = await fetch('/api/chat/append-message', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ sessionId, message: text })
         });
         const data = await resp.json();
         if (!data.success) {
-            console.warn('inject failed:', data);
+            console.warn('append-message failed:', data);
         }
     } catch (e) {
-        console.warn('inject error:', e);
+        console.warn('append-message error:', e);
     }
 }
 
@@ -2244,7 +2454,7 @@ function send() {
 
     // 执行中追加模式：agent 正在运行时，发送追加消息
     if (isStreaming && currentId && text) {
-        injectMessage(text, currentId);
+        appendUserMessage(text, currentId);
         return;
     }
     if (isStreaming) return;
@@ -2284,14 +2494,15 @@ async function sendChatPost(text, sessionId, files, refs, botBody) {
     try {
         let images = [];
         let fileAttachments = [];
-        let fileRefs = refs || [];
+        const allRefs = refs || [];
+        const mediaRefs = allRefs.filter(r => r && (r.kind === 'audio' || r.kind === 'video'));
+        const fileRefs = allRefs.filter(r => r && r.kind !== 'audio' && r.kind !== 'video');
         if (files && files.length) {
             for (const f of files) {
                 if (f.type.startsWith('image/')) {
                     const b64 = await fileToDataUrl(f);
                     images.push(b64);
                 }
-                // Non-image files are already uploaded via /api/upload, skip base64
             }
         }
 
@@ -2301,6 +2512,7 @@ async function sendChatPost(text, sessionId, files, refs, botBody) {
             images: images,
             files: fileAttachments,
             fileRefs: fileRefs,
+            mediaRefs: mediaRefs,
             role: selectedRole,
             permissionMode: permissionMode || 'default'
         };
@@ -2332,30 +2544,119 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
   try {
         const decoder = new TextDecoder('utf-8');
         let buffer = '', answer = '', done = false;
-        let thinkText = '', actText = '', thinkCollapsed = false;
+        let thinkText = '', thinkCollapsed = false;
         // 增量渲染的 DOM 引用与已渲染游标（避免每个 token 重建整棵子树导致闪烁）
         let cleared = false, panelEl = null, headLabelEl = null, thinkTextEl = null,
-            thinkActEl = null, answerEl = null;
+            timelineEl = null, answerEl = null;
         let renderedThink = '', renderedAnswer = '', appliedCollapsed = null;
-        // sub-goal 进度条状态
+        let answerPaintTimer = null;
+        // 任务计划钉在用户提问下方；sub-goal 仍可回退到 bot 内
+        let todoItems = null;
+        let todoEl = null, todoListEl = null, todoMetaEl = null, planRowEl = null;
         let subGoalText = '', subGoalDone = 0, subGoalTotal = 0;
         let progressEl = null, progressLabelEl = null, progressFillEl = null;
         function clearOnce() { if (!cleared) { botBody.innerHTML = ''; cleared = true; } }
+        function findUserRowForBot() {
+            const botRow = botBody.closest('.bot-row');
+            let el = botRow ? botRow.previousElementSibling : null;
+            while (el) {
+                if (el.classList.contains('user-row')) return el;
+                if (el.classList.contains('plan-row')) {
+                    el = el.previousElementSibling;
+                    continue;
+                }
+                break;
+            }
+            return null;
+        }
+        function schedulePaintAnswer() {
+            if (answerPaintTimer) return;
+            answerPaintTimer = setTimeout(() => {
+                answerPaintTimer = null;
+                removeTyping();
+                ensureAnswer();
+                answerEl.innerHTML = renderMDStreaming(answer);
+                renderedAnswer = answer;
+                scrollToBottom();
+            }, 50);
+        }
 
+        function escTodo(s) {
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+        function ensureTimeline() {
+            if (timelineEl) return;
+            clearOnce();
+            timelineEl = document.createElement('div');
+            timelineEl.className = 'tl-stream';
+            // 时间线在思考面板之后、答案之前
+            if (answerEl) botBody.insertBefore(timelineEl, answerEl);
+            else if (panelEl && panelEl.nextSibling)
+                botBody.insertBefore(timelineEl, panelEl.nextSibling);
+            else botBody.appendChild(timelineEl);
+        }
+        /** 把当前流式正文封存为过程说明，再开新一段（不抹掉可见历史） */
+        function sealAnswerToTimeline() {
+            const text = (answer || '').trim();
+            if (text) {
+                ensureTimeline();
+                const note = document.createElement('div');
+                note.className = 'tl-note';
+                const lab = document.createElement('div');
+                lab.className = 'tl-note-label';
+                lab.textContent = '过程说明';
+                const body = document.createElement('div');
+                body.className = 'tl-note-body';
+                body.innerHTML = renderMDStreaming(text);
+                note.appendChild(lab);
+                note.appendChild(body);
+                timelineEl.appendChild(note);
+            }
+            answer = '';
+            renderedAnswer = '';
+            if (answerPaintTimer) {
+                clearTimeout(answerPaintTimer);
+                answerPaintTimer = null;
+            }
+            if (answerEl) answerEl.innerHTML = '';
+            thinkCollapsed = false;
+            if (panelEl) {
+                panelEl.classList.remove('collapsed', 'done');
+                appliedCollapsed = false;
+            }
+        }
+        function appendActivity(text) {
+            if (!text) return;
+            ensureTimeline();
+            const row = document.createElement('div');
+            row.className = 'tl-activity';
+            if (text.startsWith('✓')) row.classList.add('done');
+            if (text.startsWith('✗')) row.classList.add('fail');
+            row.textContent = text;
+            timelineEl.appendChild(row);
+            scrollToBottom();
+        }
         function finish(html) {
             if (done) return; done = true;
+            if (answerPaintTimer) {
+                clearTimeout(answerPaintTimer);
+                answerPaintTimer = null;
+            }
             botBody.classList.remove('streaming');
-            botBody.innerHTML = html;
+            // 保留思考 / 时间线；计划已在用户提问下，不塞进 bot
+            ensureAnswer();
+            answerEl.innerHTML = html;
+            if (panelEl) panelEl.classList.add('done');
+            const finalHtml = botBody.innerHTML;
             bindLightbox(botBody.closest('.bot-row'));
-            addMsgToConv('assistant', answer, html, null);
+            addMsgToConv('assistant', answer, finalHtml, null);
             setStreaming(false); onInputChange(); scrollToBottom();
-            // 停止该会话的轮询（如果有）
             stopPolling(sessionId);
             removeTaskRunningHint();
         }
 
-        // 组合渲染：思考/活动面板（可折叠）+ 答案区
-        // 增量更新：DOM 只建一次，之后仅追加新增文本，避免整树重建造成的闪烁
         function ensurePanel() {
             if (panelEl) return;
             clearOnce();
@@ -2371,22 +2672,87 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             head.appendChild(caret); head.appendChild(headLabelEl);
             const body = document.createElement('div');
             body.className = 'think-body';
-            thinkTextEl = document.createElement('span');   // white-space:pre-wrap 自动保留换行
-            thinkActEl = document.createElement('div');
-            thinkActEl.className = 'think-act';
-            thinkActEl.style.display = 'none';
-            body.appendChild(thinkTextEl); body.appendChild(thinkActEl);
+            thinkTextEl = document.createElement('span');
+            body.appendChild(thinkTextEl);
             panelEl.appendChild(head); panelEl.appendChild(body);
-            // 面板始终排在答案区之前
-            botBody.insertBefore(panelEl, answerEl || null);
+            botBody.insertBefore(panelEl, botBody.firstChild);
         }
         function ensureAnswer() {
             if (answerEl) return;
             clearOnce();
             answerEl = document.createElement('div');
+            answerEl.className = 'answer-stream md-body';
             botBody.appendChild(answerEl);
         }
+        /** 任务计划钉在用户提问与 bot 之间 */
+        function paintTodo() {
+            if (!todoItems || !todoItems.length) return;
+            const userRow = findUserRowForBot();
+            planRowEl = null;
+            todoEl = null;
+            todoListEl = null;
+            todoMetaEl = null;
+            if (userRow) {
+                const next = userRow.nextElementSibling;
+                if (next && next.classList.contains('plan-row'))
+                    planRowEl = next;
+            }
+            if (planRowEl) {
+                todoEl = planRowEl.querySelector('.todo-panel');
+                todoListEl = planRowEl.querySelector('.todo-list');
+                todoMetaEl = planRowEl.querySelector('.todo-head-meta');
+            }
+            if (!todoEl || !todoListEl || !todoMetaEl) {
+                if (!planRowEl) {
+                    planRowEl = document.createElement('div');
+                    planRowEl.className = 'msg-row plan-row';
+                    if (userRow) userRow.after(planRowEl);
+                    else {
+                        clearOnce();
+                        botBody.insertBefore(planRowEl, botBody.firstChild);
+                    }
+                }
+                planRowEl.innerHTML = '';
+                const inner = document.createElement('div');
+                inner.className = 'msg-inner';
+                todoEl = document.createElement('div');
+                todoEl.className = 'todo-panel';
+                const head = document.createElement('div');
+                head.className = 'todo-head';
+                const title = document.createElement('span');
+                title.textContent = '任务计划';
+                todoMetaEl = document.createElement('span');
+                todoMetaEl.className = 'todo-head-meta';
+                head.appendChild(title);
+                head.appendChild(todoMetaEl);
+                todoListEl = document.createElement('ol');
+                todoListEl.className = 'todo-list';
+                todoEl.appendChild(head);
+                todoEl.appendChild(todoListEl);
+                inner.appendChild(todoEl);
+                planRowEl.appendChild(inner);
+            }
+            let doneN = 0;
+            for (const it of todoItems)
+                if (it.status === 'completed' || it.status === 'cancelled') doneN++;
+            todoMetaEl.textContent = doneN + '/' + todoItems.length;
+            todoListEl.innerHTML = '';
+            for (const it of todoItems) {
+                const li = document.createElement('li');
+                li.className = 'todo-item ' + (it.status || 'pending').toLowerCase();
+                const mark = document.createElement('span');
+                mark.className = 'todo-mark';
+                const text = document.createElement('span');
+                text.className = 'todo-text';
+                text.textContent = (it.id != null ? it.id + '. ' : '') + (it.content || '');
+                li.appendChild(mark);
+                li.appendChild(text);
+                todoListEl.appendChild(li);
+            }
+            if (progressEl) { progressEl.remove(); progressEl = null; }
+        }
         function ensureProgress() {
+            if (todoItems && todoItems.length) return; // 有计划列表时不再画单行进度条
             if (progressEl) return;
             clearOnce();
             progressEl = document.createElement('div');
@@ -2400,10 +2766,10 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             track.appendChild(progressFillEl);
             progressEl.appendChild(progressLabelEl);
             progressEl.appendChild(track);
-            // 进度条始终排在最前（思考面板 / 答案区之上）
             botBody.insertBefore(progressEl, botBody.firstChild);
         }
         function paintProgress() {
+            if (todoItems && todoItems.length) return;
             if (!subGoalTotal) return;
             ensureProgress();
             const stepNo = Math.min(subGoalDone + 1, subGoalTotal);
@@ -2418,90 +2784,72 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             if (t) t.remove();
         }
         function paint() {
-            // 思考面板
-            if (thinkText || actText) {
+            if (thinkText) {
                 ensurePanel();
-                // 仅追加思考文本的新增部分
                 if (thinkText !== renderedThink) {
                     if (thinkText.startsWith(renderedThink)) {
-                        thinkTextEl.appendChild(document.createTextNode(thinkText.slice(renderedThink.length)));
+                        thinkTextEl.appendChild(document.createTextNode(
+                            thinkText.slice(renderedThink.length)));
                     } else {
-                        thinkTextEl.textContent = thinkText; // 极少数非追加式更新才整体替换
+                        thinkTextEl.textContent = thinkText;
                     }
                     renderedThink = thinkText;
                 }
-                if (actText) {
-                    thinkActEl.style.display = '';
-                    if (thinkActEl.textContent !== actText) thinkActEl.textContent = actText;
-                } else {
-                    thinkActEl.style.display = 'none';
-                }
-                // 折叠状态 / 标题只在变化时改一次
                 if (appliedCollapsed !== thinkCollapsed) {
                     panelEl.classList.toggle('collapsed', thinkCollapsed);
                     appliedCollapsed = thinkCollapsed;
                 }
                 const label = '💭 ' + (answer ? '思考过程' : '思考中…');
                 if (headLabelEl.textContent !== label) headLabelEl.textContent = label;
-                panelEl.classList.toggle('done', !!answer);
             }
-            // 答案区
             if (answer) {
                 removeTyping();
-                ensureAnswer();
-                if (answer !== renderedAnswer) {
-                    if (answer.startsWith(renderedAnswer)) {
-                        // 追加增量：换行转 <br>，保持与 renderStreaming 一致
-                        const add = answer.slice(renderedAnswer.length);
-                        answerEl.insertAdjacentHTML('beforeend', renderStreaming(add));
-                    } else {
-                        answerEl.innerHTML = renderStreaming(answer); // reset 等非追加情形
-                    }
-                    renderedAnswer = answer;
-                }
-            } else if (answerEl) {
-                // answer 被清空（reset 事件）
-                answerEl.innerHTML = '';
-                renderedAnswer = '';
-            } else if (!thinkText && !actText) {
-                // 尚无任何内容，保留初始的 typing-dots
+                if (answer !== renderedAnswer) schedulePaintAnswer();
             }
             scrollToBottom();
         }
 
         function onEvent(name, data) {
             if (name === 'thinking') {
+                // 工具轮之后新思考：展开面板
+                if (thinkCollapsed && !answer) thinkCollapsed = false;
                 thinkText += data; paint();
             } else if (name === 'progress') {
-                actText = data; paint();
+                // 工具开始/结束：追加时间线条，不再覆盖单行
+                appendActivity(typeof data === 'string' ? data : String(data || ''));
+            } else if (name === 'todo') {
+                try {
+                    const payload = typeof data === 'string' ? JSON.parse(data) : data;
+                    const items = payload && payload.items ? payload.items : [];
+                    todoItems = Array.isArray(items) ? items : [];
+                    paintTodo();
+                } catch (e) { /* 忽略坏 payload */ }
             } else if (name === 'subgoal') {
-                // 框架推进的当前子目标：{text, done, total}
                 try {
                     const sg = typeof data === 'string' ? JSON.parse(data) : data;
                     subGoalText = sg.text || '';
                     subGoalDone = sg.done || 0;
                     subGoalTotal = sg.total || 0;
                     paintProgress();
-                } catch (e) { /* 容错：忽略坏的子目标事件 */ }
-            } else if (name === 'reset') {
-                // 上一轮流出的文本只是中间思考，清空答案区等待最终答案
-                answer = ''; paint();
+                } catch (e) { /* 容错 */ }
+            } else if (name === 'seal' || name === 'reset') {
+                // 封存过程正文进时间线，再开下一段（兼容旧 reset）
+                sealAnswerToTimeline();
+                paint();
             } else if (name === 'start') {
                 answer = data; paint();
             } else if (name === 'token') {
-                if (!answer && !thinkCollapsed) thinkCollapsed = true; // 首个答案到达，折叠思考面板
+                if (!answer && !thinkCollapsed) thinkCollapsed = true;
                 answer += data; paint();
             } else if (name === 'end') {
-                // end 携带权威全文，覆盖流式增量（兜底图片追加/文件提醒等后处理）
+                // 最终定稿：只覆盖当前答案段，保留时间线
                 if (data) answer = data;
                 finish(renderMD(answer));
             } else if (name === 'error') {
                 finish(renderMD('❌ ' + (data || '服务处理出错')));
             } else if (name === 'user') {
-                // 重连时回放用户消息：若该 bot 行前面还没有用户气泡，补一个
                 renderUserEchoIfNeeded(botBody, data);
             } else if (name === 'gone') {
-                // 缓冲已驱逐（任务早已结束）→ 回退：从数据库重载该会话
                 done = true;
                 if (sessionId === currentId) { switchConv(sessionId); }
             } else if (name === 'permission_ask') {
@@ -2513,7 +2861,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                     if (data) showAskModal(String(data));
                 }
             } else if (name === 'session') { /* 忽略 */
-            } else if (name === 'inject_ack') { /* 前端已在 injectMessage() 中处理 */ }
+            } else if (name === 'append_ack') { /* 已在 appendUserMessage 处理 */ }
         }
 
         /**
@@ -2531,7 +2879,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             let stillRunning = false;
             try {
                 const r = await fetch('/api/task-status?sessionId=' + encodeURIComponent(sessionId));
-                if (r.ok) stillRunning = (await r.json()).running === true;
+                if (r.ok) stillRunning = (await apiJson(r) || {}).running === true;
             } catch (e) { /* 探测失败按未运行处理 */ }
 
             if (!stillRunning) {
@@ -2676,6 +3024,15 @@ function copyBotMsg(btn) {
 }
 
 function renderStreaming(t) { return esc(t).replace(/\n/g, '<br>'); }
+
+/** 流式阶段也走 MD：未闭合 ``` 时临时补闭合，避免只显示纯文本 */
+function renderMDStreaming(t) {
+    if (t == null || t === '') return '';
+    let s = String(t);
+    const fences = s.match(/```/g);
+    if (fences && fences.length % 2 === 1) s += '\n```';
+    return renderMD(s);
+}
 
 /* =========================================================================
    MARKDOWN RENDERER
@@ -2828,7 +3185,7 @@ async function syncFromBackend(sid) {
     try {
         const resp = await fetch('/api/conversation?sessionId=' + encodeURIComponent(sid));
         if (!resp.ok) return { synced: false };
-        const conv = await resp.json();
+        const conv = await apiJson(resp);
         if (!conv || !conv.messages || !conv.messages.length) return { synced: false };
         return { synced: true };
     } catch (e) {
@@ -2841,7 +3198,7 @@ async function checkAndPollTask(sid) {
     try {
         const resp = await fetch('/api/task-status?sessionId=' + encodeURIComponent(sid));
         if (!resp.ok) return;
-        const status = await resp.json();
+        const status = await apiJson(resp) || {};
         if (status.running) {
             // 任务正在运行 → 重连事件流，先回放已产出内容，再继续实时跟到结束
             await reconnectStream(sid);
@@ -2917,7 +3274,7 @@ function startPolling(sid) {
     pollingTimers[sid] = setInterval(async () => {
         try {
             const resp = await fetch('/api/task-status?sessionId=' + encodeURIComponent(sid));
-            const status = await resp.json();
+            const status = await apiJson(resp) || {};
             if (!status.running) {
                 // 任务完成，停止轮询，重新加载会话
                 stopPolling(sid);

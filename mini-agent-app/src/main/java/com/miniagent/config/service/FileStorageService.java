@@ -5,6 +5,7 @@ import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import com.miniagent.agent.web.UploadedDocumentService;
+import com.miniagent.agent.web.MultimodalMedia;
 import com.miniagent.config.entity.FileUpload;
 import com.miniagent.config.repository.FileUploadRepository;
 import com.miniagent.config.storage.MediaStorage;
@@ -75,13 +76,15 @@ public class FileStorageService {
             fileUpload.setFilePath(filePath.toAbsolutePath().toString());
             fileUpload.setSessionId(sessionId);
 
-            // 上传即提取：Office/PDF/大文本写侧车，后续对话与 Agent 复用
-            try {
-                String sidecar = uploadedDocumentService.extractAndWriteSidecar(
-                        userId, filePath, originalFilename, mimeType);
-                fileUpload.setExtractedTextPath(sidecar);
-            } catch (Exception e) {
-                log.warn("上传后文本提取失败（文件已保存）: {}", originalFilename, e);
+            // 上传即提取：Office/PDF/大文本写侧车；音视频走原生多模态，跳过抽文本
+            if (!MultimodalMedia.isNativeMedia(originalFilename, mimeType)) {
+                try {
+                    String sidecar = uploadedDocumentService.extractAndWriteSidecar(
+                            userId, filePath, originalFilename, mimeType);
+                    fileUpload.setExtractedTextPath(sidecar);
+                } catch (Exception e) {
+                    log.warn("上传后文本提取失败（文件已保存）: {}", originalFilename, e);
+                }
             }
 
             return fileUploadRepository.save(fileUpload);

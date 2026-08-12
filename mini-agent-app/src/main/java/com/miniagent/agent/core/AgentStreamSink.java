@@ -18,8 +18,8 @@ public interface AgentStreamSink {
     void onAnswerToken(String delta);
 
     /**
-     * 进入新一轮工具调用前触发：提示前端清空当前已流出的答案增量，
-     * 因为本轮流出的文本只是中间思考，真正答案在后续轮次。
+     * 进入工具调用前：把当前已流出的正文封存为「过程说明」时间线条目，
+     * 再开下一段（前端勿整段抹掉，避免「想完才突然出答案」的体感）。
      */
     default void onAnswerReset() {}
 

@@ -2,6 +2,7 @@ package com.miniagent.agent.memory;
 
 import org.springframework.beans.factory.annotation.Autowired;
 
+import com.miniagent.common.ChatRole;
 import com.miniagent.memory.MemoryStore;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
@@ -97,8 +98,8 @@ public class MemoryDailyAnalysisService {
             if (Objects.isNull(conv.messages)) continue;
             for (var msg : conv.messages) {
                 if (Objects.isNull(msg) || StringUtils.isBlank(msg.content)) continue;
-                String role = "user".equals(msg.role) ? "用户"
-                        : "assistant".equals(msg.role) ? "助手" : "其它";
+                String role = ChatRole.USER.getValue().equals(msg.role) ? "用户"
+                        : ChatRole.ASSISTANT.getValue().equals(msg.role) ? "助手" : "其它";
                 allMessages.add(role + ": " + msg.content);
             }
         }

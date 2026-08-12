@@ -1,11 +1,13 @@
 package com.miniagent.agent.core;
 
+import dev.langchain4j.data.message.AudioContent;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.Content;
 import dev.langchain4j.data.message.ImageContent;
 import dev.langchain4j.data.message.TextContent;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.VideoContent;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
@@ -35,6 +37,10 @@ public class TokenEstimator {
 
     /** 单张图片的近似 token 开销（多模态，按中等分辨率保守估） */
     private static final int IMAGE_TOKENS = 700;
+    /** 短音频占位（约 10s * 6.25） */
+    private static final int AUDIO_TOKENS = 80;
+    /** 短视频占位（粗估，避免低估导致压缩滞后） */
+    private static final int VIDEO_TOKENS = 2000;
 
     /** 文本估算缓存上限 */
     private static final int CACHE_MAX_SIZE = 1000;
@@ -145,6 +151,10 @@ public class TokenEstimator {
                         tokens += estimate(tc.text());
                     } else if (c instanceof ImageContent) {
                         tokens += IMAGE_TOKENS;
+                    } else if (c instanceof AudioContent) {
+                        tokens += AUDIO_TOKENS;
+                    } else if (c instanceof VideoContent) {
+                        tokens += VIDEO_TOKENS;
                     }
                 }
             }

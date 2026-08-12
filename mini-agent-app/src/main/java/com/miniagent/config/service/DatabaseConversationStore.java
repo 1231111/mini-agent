@@ -4,6 +4,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.miniagent.common.ChatRole;
 import com.miniagent.config.entity.ChatConversation;
 import com.miniagent.config.entity.ChatMessage;
 import com.miniagent.config.repository.ChatConversationRepository;
@@ -114,9 +115,9 @@ public class DatabaseConversationStore {
             long now = Instant.now().toEpochMilli();
             conv.setUpdatedAt(now);
             // Auto title from first user message
-            if ("user".equals(role)) {
+            if (ChatRole.USER.getValue().equals(role)) {
                 long userMsgCount = messageRepo.findByConversationIdOrderByTimestampAsc(id)
-                        .stream().filter(m -> "user".equals(m.getRole())).count();
+                        .stream().filter(m -> ChatRole.USER.getValue().equals(m.getRole())).count();
                 if (userMsgCount == 1) {
                     conv.setTitle(truncateTitle(content.length() > 40 ? content.substring(0, 40) + "..." : content));
                 }
@@ -145,9 +146,9 @@ public class DatabaseConversationStore {
 
             long now = Instant.now().toEpochMilli();
             conv.setUpdatedAt(now);
-            if ("user".equals(role)) {
+            if (ChatRole.USER.getValue().equals(role)) {
                 long userMsgCount = messageRepo.findByConversationIdOrderByTimestampAsc(id)
-                        .stream().filter(m -> "user".equals(m.getRole())).count();
+                        .stream().filter(m -> ChatRole.USER.getValue().equals(m.getRole())).count();
                 if (userMsgCount == 1) {
                     conv.setTitle(truncateTitle(content.length() > 40 ? content.substring(0, 40) + "..." : content));
                 }

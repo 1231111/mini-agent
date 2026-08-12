@@ -40,6 +40,7 @@ public class SecurityConfig {
                                 "/api/auth-status",
                                 "/api/logout",
                                 "/generated-images/**",
+                                "/conversation-images/**",
                                 "/static/images/**",
                                 "/actuator/health",
                                 "/actuator/info",

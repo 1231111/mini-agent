@@ -2,6 +2,7 @@ package com.miniagent.config.storage;
 
 import org.springframework.beans.factory.annotation.Autowired;
 
+import com.miniagent.common.MessageConstants;
 import com.miniagent.memory.AgentDataPaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -15,6 +16,8 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.UUID;
 
 /**
  * 统一媒体存储：generated / conversations / uploads 三桶，均在 {@link AgentDataPaths} 下。
@@ -44,7 +47,7 @@ public class MediaStorage {
         Path dir = generatedDir();
         Files.createDirectories(dir);
         Path file = dir.resolve(filename).normalize();
-        if (!file.startsWith(dir)) throw new IOException("非法文件名: " + filename);
+        if (!file.startsWith(dir)) throw new IOException(String.format(MessageConstants.FILE_INVALID_NAME, filename));
         Files.write(file, bytes);
         return "/generated-images/" + filename;
     }
@@ -79,5 +82,28 @@ public class MediaStorage {
             log.warn("保存对话图片失败: {}", e.getMessage());
         }
         return out;
+    }
+
+    /** 将已上传音/视频复制到会话目录，返回 conversation-images/{sessionId}/{file} 键 */
+    public String copyUploadToConversation(String sessionId, Path source, String originalFilename) {
+        try {
+            Path dir = conversationsDir().resolve(Optional.ofNullable(sessionId).orElse("_default"));
+            Files.createDirectories(dir);
+            String ext = "";
+            if (Objects.nonNull(originalFilename)) {
+                int dot = originalFilename.lastIndexOf('.');
+                if (dot > 0) ext = originalFilename.substring(dot);
+            }
+            String filename = System.currentTimeMillis() + "_"
+                    + UUID.randomUUID().toString().substring(0, 6) + ext;
+            Path dest = dir.resolve(filename).normalize();
+            if (!dest.startsWith(dir))
+                throw new IOException(String.format(MessageConstants.FILE_INVALID_NAME, filename));
+            Files.copy(source, dest);
+            return "conversation-images/" + sessionId + "/" + filename;
+        } catch (Exception e) {
+            log.warn("复制会话媒体失败: {}", e.getMessage());
+            return null;
+        }
     }
 }

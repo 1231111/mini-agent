@@ -2,6 +2,8 @@ package com.miniagent.web;
 
 import com.miniagent.agent.intent.IntentRuleLearningService;
 import com.miniagent.agent.intent.IntentRuleRuntime;
+import com.miniagent.common.ApiResponse;
+import com.miniagent.common.ErrorCode;
 import com.miniagent.config.entity.IntentRule;
 import com.miniagent.config.entity.IntentRuleFeedback;
 import com.miniagent.config.entity.IntentRuleProposal;
@@ -38,9 +40,9 @@ public class IntentRuleAdminController {
     @Autowired private IntentRuleProposalRepository proposalRepo;
     @Autowired private IntentRuleHitLogRepository hitLogRepo;
     @GetMapping(value = "/rules/active", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Map<String, Object> activeRules(HttpServletRequest request) {
+    public ApiResponse<Map<String, Object>> activeRules(HttpServletRequest request) {
         Long userId = uid(request);
-        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         Map<String, Object> out = new LinkedHashMap<>(runtime.activeSnapshot());
         ruleSetRepo.findFirstByStatusOrderByVersionDesc(IntentRuleSet.STATUS_ACTIVE).ifPresent(set -> {
             out.put("status", set.getStatus());
@@ -50,40 +52,40 @@ public class IntentRuleAdminController {
             List<IntentRule> rules = ruleRepo.findByRuleSetIdOrderByPriorityAscIdAsc(set.getId());
             out.put("rules", rules);
         });
-        return out;
+        return ApiResponse.ok(out);
     }
 
     @PostMapping(value = "/rules/reload", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Map<String, Object> reload(HttpServletRequest request) {
+    public ApiResponse<Map<String, Object>> reload(HttpServletRequest request) {
         Long userId = uid(request);
-        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         runtime.reload();
-        return Map.of("success", true, "runtime", runtime.activeSnapshot());
+        return ApiResponse.ok(Map.of("runtime", runtime.activeSnapshot()));
     }
 
     @GetMapping(value = "/hits", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Object hits(@RequestParam(required = false) String executionId, HttpServletRequest request) {
+    public ApiResponse<Object> hits(@RequestParam(required = false) String executionId, HttpServletRequest request) {
         Long userId = uid(request);
-        if (Objects.isNull(userId)) return List.of();
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         if (StringUtils.isNotBlank(executionId)) {
-            return hitLogRepo.findByExecutionIdOrderByIdAsc(executionId);
+            return ApiResponse.ok(hitLogRepo.findByExecutionIdOrderByIdAsc(executionId));
         }
-        return hitLogRepo.findTop50ByOrderByIdDesc();
+        return ApiResponse.ok(hitLogRepo.findTop50ByOrderByIdDesc());
     }
 
     @GetMapping(value = "/learning", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Map<String, Object> learningDashboard(HttpServletRequest request) {
+    public ApiResponse<Map<String, Object>> learningDashboard(HttpServletRequest request) {
         Long userId = uid(request);
-        if (Objects.isNull(userId)) return Map.of("error", "Not authenticated");
-        return learning.dashboard();
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        return ApiResponse.ok(learning.dashboard());
     }
 
     @PostMapping(value = "/feedback", consumes = MediaType.APPLICATION_JSON_VALUE,
             produces = MediaType.APPLICATION_JSON_VALUE)
-    public Map<String, Object> feedback(@RequestBody Map<String, Object> body, HttpServletRequest request) {
+    public ApiResponse<Map<String, Object>> feedback(@RequestBody Map<String, Object> body, HttpServletRequest request) {
         Long userId = uid(request);
-        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
-        if (Objects.isNull(body)) return Map.of("success", false, "message", "body required");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        if (Objects.isNull(body)) return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "body required");
         try {
             IntentRuleFeedback fb = learning.submitFeedback(
                     userId,
@@ -93,49 +95,49 @@ public class IntentRuleAdminController {
                     str(body.get("feedbackType")),
                     str(body.get("note")),
                     str(body.get("userText")));
-            return Map.of("success", true, "feedbackId", fb.getId(),
+            return ApiResponse.ok(Map.of("feedbackId", fb.getId(),
                     "proposalId", Objects.requireNonNullElse(fb.getProposalId(), 0L),
-                    "status", fb.getStatus());
+                    "status", fb.getStatus()));
         } catch (Exception e) {
-            return Map.of("success", false, "message", Objects.requireNonNullElse(e.getMessage(), "failed"));
+            return ApiResponse.fail(ErrorCode.INTENT_CLASSIFY_FAILED, Objects.requireNonNullElse(e.getMessage(), "failed"));
         }
     }
 
     @GetMapping(value = "/proposals", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Object proposals(@RequestParam(defaultValue = "PENDING") String status,
-                            HttpServletRequest request) {
+    public ApiResponse<Object> proposals(@RequestParam(defaultValue = "PENDING") String status,
+                                          HttpServletRequest request) {
         Long userId = uid(request);
-        if (Objects.isNull(userId)) return List.of();
-        if ("ALL".equalsIgnoreCase(status)) return proposalRepo.findTop50ByOrderByIdDesc();
-        return proposalRepo.findByStatusOrderByIdDesc(status.toUpperCase());
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        if ("ALL".equalsIgnoreCase(status)) return ApiResponse.ok(proposalRepo.findTop50ByOrderByIdDesc());
+        return ApiResponse.ok(proposalRepo.findByStatusOrderByIdDesc(status.toUpperCase()));
     }
 
     @PostMapping(value = "/proposals/{id}/approve", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Map<String, Object> approve(@PathVariable("id") Long id, HttpServletRequest request) {
+    public ApiResponse<Map<String, Object>> approve(@PathVariable("id") Long id, HttpServletRequest request) {
         Long userId = uid(request);
-        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         try {
             IntentRuleSet set = learning.approve(id, userId);
-            return Map.of("success", true, "ruleSetId", set.getId(), "version", set.getVersion(),
-                    "runtime", runtime.activeSnapshot());
+            return ApiResponse.ok(Map.of("ruleSetId", set.getId(), "version", set.getVersion(),
+                    "runtime", runtime.activeSnapshot()));
         } catch (Exception e) {
-            return Map.of("success", false, "message", Objects.requireNonNullElse(e.getMessage(), "failed"));
+            return ApiResponse.fail(ErrorCode.INTENT_CLASSIFY_FAILED, Objects.requireNonNullElse(e.getMessage(), "failed"));
         }
     }
 
     @PostMapping(value = "/proposals/{id}/reject", consumes = MediaType.APPLICATION_JSON_VALUE,
             produces = MediaType.APPLICATION_JSON_VALUE)
-    public Map<String, Object> reject(@PathVariable("id") Long id,
-                                      @RequestBody(required = false) Map<String, Object> body,
-                                      HttpServletRequest request) {
+    public ApiResponse<Map<String, Object>> reject(@PathVariable("id") Long id,
+                                                    @RequestBody(required = false) Map<String, Object> body,
+                                                    HttpServletRequest request) {
         Long userId = uid(request);
-        if (Objects.isNull(userId)) return Map.of("success", false, "message", "Not authenticated");
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         try {
             String reason = Objects.isNull(body) ? null : str(body.get("reason"));
             IntentRuleProposal p = learning.reject(id, userId, reason);
-            return Map.of("success", true, "status", p.getStatus());
+            return ApiResponse.ok(Map.of("status", p.getStatus()));
         } catch (Exception e) {
-            return Map.of("success", false, "message", Objects.requireNonNullElse(e.getMessage(), "failed"));
+            return ApiResponse.fail(ErrorCode.INTENT_CLASSIFY_FAILED, Objects.requireNonNullElse(e.getMessage(), "failed"));
         }
     }
 

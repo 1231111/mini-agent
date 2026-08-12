@@ -1,0 +1,5 @@
+# Docker 内按 Dockerfile 安装；本机脚本可对照此列表
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+sentence-transformers==3.4.1
+huggingface-hub==0.30.2

@@ -7,9 +7,9 @@ import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.miniagent.common.embedding.SharedEmbeddingModel;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.http.client.jdk.JdkHttpClientBuilder;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
@@ -248,11 +248,8 @@ public class CodebaseSearchTool {
 
     private EmbeddingModel embeddingModel() {
         if (Objects.isNull(embeddingModel)) {
-            JdkHttpClientBuilder http = new JdkHttpClientBuilder()
-                    .connectTimeout(java.time.Duration.ofSeconds(15))
-                    .readTimeout(java.time.Duration.ofSeconds(60));
             embeddingModel = OpenAiEmbeddingModel.builder()
-                    .httpClientBuilder(http)
+                    .httpClientBuilder(SharedEmbeddingModel.http1ClientBuilder())
                     .apiKey(apiKey)
                     .baseUrl(baseUrl)
                     .modelName(embeddingModelName)

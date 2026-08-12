@@ -4,6 +4,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 
 import com.miniagent.agent.tool.Tool;
 import com.miniagent.agent.tool.ToolRegistry;
+import com.miniagent.common.MessageConstants;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -63,7 +64,7 @@ public class McpToolBridge {
         List<String> fail = new ArrayList<>();
         if (!properties.isEnabled()) {
             report.put("success", false);
-            report.put("message", "MCP 未启用");
+            report.put("message", MessageConstants.MCP_NOT_ENABLED);
             return report;
         }
         for (McpProperties.Server server : properties.getServers()) {
@@ -171,13 +172,13 @@ public class McpToolBridge {
     private String invoke(String serverId, String toolName, String argsJson) {
         McpStdioClient client = clients.get(serverId);
         if (Objects.isNull(client)) {
-            return "{\"error\":\"MCP 服务器未连接: " + serverId + "\"}";
+            return "{\"error\":\"" + String.format(MessageConstants.MCP_SERVER_NOT_CONNECTED, serverId) + "\"}";
         }
         try {
             return client.callTool(toolName, argsJson);
         } catch (Exception e) {
             log.warn("MCP 调用失败 {}.{}: {}", serverId, toolName, e.getMessage());
-            return "{\"error\":\"MCP 调用失败: " + e.getMessage().replace("\"", "'") + "\"}";
+            return "{\"error\":\"" + String.format(MessageConstants.MCP_CALL_FAILED, e.getMessage().replace("\"", "'")) + "\"}";
         }
     }
 

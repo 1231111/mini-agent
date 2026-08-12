@@ -3,6 +3,7 @@ package com.miniagent.agent.comfyui;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.miniagent.common.MessageConstants;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.config.storage.MediaStorage;
 import lombok.extern.slf4j.Slf4j;
@@ -82,7 +83,7 @@ public class ComfyUIService {
             if (Objects.isNull(body)) {
                 return toJson(Map.of(
                         "online", false,
-                        "message", "ComfyUI 未运行或无法连接 (" + baseUrl() + ")",
+                        "message", String.format(MessageConstants.COMFYUI_NOT_RUNNING, baseUrl()),
                         "hint", "请先启动 ComfyUI：python main.py --listen 0.0.0.0 --port 8188"
                 ));
             }
@@ -123,7 +124,7 @@ public class ComfyUIService {
     public String listWorkflows() {
         try {
             String body = httpGet(baseUrl() + "/object_info");
-            if (Objects.isNull(body)) return error("无法获取工作流信息，ComfyUI 可能未启动");
+            if (Objects.isNull(body)) return error(String.format(MessageConstants.COMFYUI_GET_WORKFLOW_FAILED, ""));
 
             JsonNode nodes = mapper.readTree(body);
             List<String> nodeNames = new ArrayList<>();
@@ -141,7 +142,7 @@ public class ComfyUIService {
             result.put("hint", "使用 comfyui_execute 传入工作流 JSON 执行，或用 comfyui_txt2img 快捷文生图");
             return toJson(result);
         } catch (Exception e) {
-            return error("获取工作流失败: " + e.getMessage());
+            return error(String.format(MessageConstants.COMFYUI_GET_WORKFLOW_FAILED, e.getMessage()));
         }
     }
 
@@ -155,7 +156,7 @@ public class ComfyUIService {
             String body = httpGet(baseUrl() + "/object_info/CheckpointLoaderSimple");
             if (Objects.isNull(body)) {
                 body = httpGet(baseUrl() + "/object_info");
-                if (Objects.isNull(body)) return error("无法获取模型信息，ComfyUI 可能未启动");
+                if (Objects.isNull(body)) return error(String.format(MessageConstants.COMFYUI_GET_MODELS_FAILED, ""));
             }
 
             JsonNode root = mapper.readTree(body);
@@ -195,7 +196,7 @@ public class ComfyUIService {
             }
             return toJson(result);
         } catch (Exception e) {
-            return error("获取模型列表失败: " + e.getMessage());
+            return error(String.format(MessageConstants.COMFYUI_GET_MODELS_FAILED, e.getMessage()));
         }
     }
 
@@ -212,7 +213,7 @@ public class ComfyUIService {
                     ? workflowJson
                     : "{\"prompt\":" + workflowJson + "}";
             String body = httpPost(baseUrl() + "/prompt", wrappedJson);
-            if (Objects.isNull(body)) return error("提交工作流失败，ComfyUI 可能未启动");
+            if (Objects.isNull(body)) return error(MessageConstants.COMFYUI_SUBMIT_FAILED_NULL);
 
             JsonNode result = mapper.readTree(body);
             String promptId = result.path("prompt_id").asText("");
@@ -222,7 +223,7 @@ public class ComfyUIService {
                     "message", "工作流已提交，使用 comfyui_execute(action=status, prompt_id=\"" + promptId + "\") 查询进度"
             ));
         } catch (Exception e) {
-            return error("提交工作流失败: " + e.getMessage());
+            return error(String.format(MessageConstants.COMFYUI_SUBMIT_FAILED, e.getMessage()));
         }
     }
 
@@ -238,7 +239,7 @@ public class ComfyUIService {
         try {
             JsonNode submitted = mapper.readTree(submitResult);
             String promptId = submitted.path("prompt_id").asText("");
-            if (promptId.isEmpty()) return error("提交成功但未获取到 prompt_id");
+            if (promptId.isEmpty()) return error(MessageConstants.COMFYUI_NO_PROMPT_ID);
 
             log.info("ComfyUI 任务已提交: prompt_id={}, 等待完成(超时{}秒)", promptId, timeoutSeconds);
 
@@ -258,7 +259,7 @@ public class ComfyUIService {
                         String statusStr = status.path("status_str").asText("");
 
                         if ("error".equals(statusStr)) {
-                            return error("ComfyUI 执行出错: " + status.toString());
+                            return error(String.format(MessageConstants.COMFYUI_EXEC_ERROR, status.toString()));
                         }
 
                         // 有 outputs 就算完成
@@ -278,7 +279,7 @@ public class ComfyUIService {
             return toJson(Map.of(
                     "status", "timeout",
                     "prompt_id", promptId,
-                    "message", "图片生成超时(" + timeoutSeconds + "秒)，可能仍在处理中。用 comfyui_execute(action=status, prompt_id=\"" + promptId + "\") 手动查询。"
+                    "message", String.format(MessageConstants.COMFYUI_GENERATION_TIMEOUT, timeoutSeconds, promptId)
             ));
         } catch (Exception e) {
             return error("等待 ComfyUI 完成失败: " + e.getMessage());
@@ -424,10 +425,10 @@ public class ComfyUIService {
                          checkpoint = modelsNode.get("models").get(0).asText();
                         log.info("自动选择 checkpoint: {}", checkpoint);
                     } else {
-                        return error("ComfyUI 中没有可用的 checkpoint 模型。请先在 ComfyUI/models/checkpoints/ 中放置模型文件。");
+                        return error(MessageConstants.COMFYUI_NO_MODELS);
                     }
                 } catch (Exception e) {
-                    return error("获取模型列表失败: " + e.getMessage());
+                    return error(String.format(MessageConstants.COMFYUI_GET_MODELS_FAILED, e.getMessage()));
                 }
             }
 
@@ -478,7 +479,7 @@ public class ComfyUIService {
             return autoQualityCheck(result, prompt, negativePrompt, checkpoint,
                     "txt2img", width, height, 1.0, steps, cfg, null);
         } catch (Exception e) {
-            return error("文生图失败: " + e.getMessage());
+            return error(String.format(MessageConstants.COMFYUI_TXT2IMG_FAILED, e.getMessage()));
         }
     }
 
@@ -520,10 +521,10 @@ public class ComfyUIService {
                             && modelsNode.get("models").size() > 0) {
                         checkpoint = modelsNode.get("models").get(0).asText();
                     } else {
-                        return error("ComfyUI 中没有可用的 checkpoint 模型");
+                        return error(MessageConstants.COMFYUI_NO_MODELS);
                     }
                 } catch (Exception e) {
-                    return error("获取模型列表失败: " + e.getMessage());
+                    return error(String.format(MessageConstants.COMFYUI_GET_MODELS_FAILED, e.getMessage()));
                 }
             }
 
@@ -581,7 +582,7 @@ public class ComfyUIService {
             return autoQualityCheck(result, prompt, negativePrompt, checkpoint,
                     "img2img", 0, 0, denoise, steps, cfg, imagePath);
         } catch (Exception e) {
-            return error("图生图失败: " + e.getMessage());
+            return error(String.format(MessageConstants.COMFYUI_IMG2IMG_FAILED, e.getMessage()));
         }
     }
 
@@ -594,7 +595,7 @@ public class ComfyUIService {
     public String uploadImage(String imagePath) {
         try {
             java.io.File file = new java.io.File(imagePath);
-            if (!file.exists()) return error("图片文件不存在: " + imagePath);
+            if (!file.exists()) return error(String.format(MessageConstants.COMFYUI_IMAGE_NOT_FOUND, imagePath));
 
             // multipart upload
             String boundary = "----MiniAgent" + System.currentTimeMillis();
@@ -623,10 +624,10 @@ public class ComfyUIService {
                     "success", true,
                     "filename", result.path("name").asText(""),
                     "subfolder", result.path("subfolder").asText(""),
-                    "message", "图片已上传，可用于 img2img 工作流"
+                    "message", MessageConstants.COMFYUI_IMAGE_UPLOADED
             ));
         } catch (Exception e) {
-            return error("上传图片失败: " + e.getMessage());
+            return error(String.format(MessageConstants.COMFYUI_UPLOAD_FAILED, e.getMessage()));
         }
     }
 
@@ -676,7 +677,7 @@ public class ComfyUIService {
 
             return submitAndWait(workflow, 600);  // 视频生成 5-10 分钟
         } catch (Exception e) {
-            return error("图生视频失败: " + e.getMessage());
+            return error(String.format(MessageConstants.COMFYUI_IMG2VIDEO_FAILED, e.getMessage()));
         }
     }
 
@@ -711,7 +712,7 @@ public class ComfyUIService {
 
             return submitAndWait(workflow, 120);  // TTS 通常较快
         } catch (Exception e) {
-            return error("TTS 失败: " + e.getMessage());
+            return error(String.format(MessageConstants.COMFYUI_TTS_FAILED, e.getMessage()));
         }
     }
 

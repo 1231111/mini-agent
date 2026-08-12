@@ -1,5 +1,6 @@
 package com.miniagent.agent.security;
 
+import com.miniagent.common.MessageConstants;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -19,32 +20,32 @@ public class NetworkGuard {
 
     /** @return null if OK, else error message */
     public String validateUrl(String url) {
-        if (url == null || url.isBlank()) return "URL 为空";
+        if (url == null || url.isBlank()) return MessageConstants.NET_URL_EMPTY;
         URI uri;
         try {
             uri = URI.create(url.trim());
         } catch (Exception e) {
-            return "非法 URL: " + e.getMessage();
+            return String.format(MessageConstants.NET_URL_INVALID, e.getMessage());
         }
         String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
         if (!scheme.equals("http") && !scheme.equals("https")) {
-            return "仅允许 http/https 协议";
+            return MessageConstants.NET_PROTOCOL_NOT_ALLOWED;
         }
         String host = uri.getHost();
-        if (host == null || host.isBlank()) return "URL 缺少 host";
+        if (host == null || host.isBlank()) return MessageConstants.NET_HOST_MISSING;
         if (!blockPrivate) return null;
         if (isBlockedHost(host)) {
-            return "SSRF 防护：禁止访问内网/本地地址: " + host;
+            return String.format(MessageConstants.NET_SSRF_BLOCKED_HOST, host);
         }
         try {
             InetAddress[] addrs = InetAddress.getAllByName(host);
             for (InetAddress addr : addrs) {
                 if (isBlockedAddress(addr)) {
-                    return "SSRF 防护：解析到内网/本地地址: " + addr.getHostAddress();
+                    return String.format(MessageConstants.NET_SSRF_BLOCKED_RESOLVED, addr.getHostAddress());
                 }
             }
         } catch (UnknownHostException e) {
-            return "无法解析主机: " + host;
+            return String.format(MessageConstants.NET_HOST_UNRESOLVABLE, host);
         }
         return null;
     }

@@ -32,6 +32,10 @@ public class ModelClientFactory {
     @Value("${langchain4j.open-ai.chat-model.timeout:1200s}")
     private Duration timeout;
 
+    /** 有图/音视频时切换的预设；空=沿用用户当前模型 */
+    @Value("${agent.multimodal.vision-preset:default}")
+    private String visionPreset;
+
     private final Map<String, ResolvedModels> cache = new LinkedHashMap<>(32, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, ResolvedModels> eldest) {
@@ -46,13 +50,29 @@ public class ModelClientFactory {
     ) {}
 
     public synchronized ResolvedModels resolve(Long userId) {
-        EffectiveModelSettings settings = userModelConfigService.getEffective(userId);
-        String key = settings.cacheKey();
+        return build(userModelConfigService.getEffective(userId), true);
+    }
+
+    /**
+     * 多模态轮次：优先 vision-preset（默认 default / mimo-v2.5）。
+     */
+    public synchronized ResolvedModels resolveForMultimodal(Long userId) {
+        if (org.apache.commons.lang3.StringUtils.isBlank(visionPreset))
+            return resolve(userId);
+        EffectiveModelSettings vision = userModelConfigService.getEffectivePreset(visionPreset.trim());
+        log.info("多模态改用 vision 预设: userId={}, preset={}, model={}",
+                userId, vision.presetId(), vision.modelName());
+        // 视觉请求关闭 thinking，部分网关在 thinking schema 下只接受 text
+        return build(vision, false);
+    }
+
+    private ResolvedModels build(EffectiveModelSettings settings, boolean thinking) {
+        String key = settings.cacheKey() + "|think=" + thinking;
         ResolvedModels hit = cache.get(key);
         if (Objects.nonNull(hit)) return hit;
 
-        log.info("构建用户模型客户端: userId={}, preset={}, model={}, baseUrl={}",
-                userId, settings.presetId(), settings.modelName(), settings.baseUrl());
+        log.info("构建用户模型客户端: preset={}, model={}, baseUrl={}, thinking={}",
+                settings.presetId(), settings.modelName(), settings.baseUrl(), thinking);
 
         JdkHttpClientBuilder http = new JdkHttpClientBuilder()
                 .connectTimeout(Duration.ofSeconds(30))
@@ -64,11 +84,10 @@ public class ModelClientFactory {
                 .baseUrl(settings.baseUrl())
                 .modelName(settings.modelName())
                 .timeout(timeout)
-                .returnThinking(true)
+                .returnThinking(thinking)
                 .sendThinking(false)
                 .build();
 
-        // Streaming 需要独立 builder（JdkHttpClientBuilder 非线程安全复用）
         JdkHttpClientBuilder httpStream = new JdkHttpClientBuilder()
                 .connectTimeout(Duration.ofSeconds(30))
                 .readTimeout(timeout);
@@ -79,7 +98,7 @@ public class ModelClientFactory {
                 .baseUrl(settings.baseUrl())
                 .modelName(settings.modelName())
                 .timeout(timeout)
-                .returnThinking(true)
+                .returnThinking(thinking)
                 .sendThinking(false)
                 .build();
 

@@ -18,6 +18,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.commons.lang3.StringUtils;
 
@@ -45,6 +46,12 @@ public class ContextCompressor {
     /** 压缩触发阈值：上下文占比达到该比例即压缩，留出输出余量。可配置，默认 0.75。 */
     @Value("${agent.context.compress-threshold:0.75}")
     private double compressionThreshold;
+    /**
+     * true：压缩热路径同步调 LLM 摘要（会拉高 P99）。
+     * false（默认）：热路径硬截断 + 占位摘要，LLM 摘要异步后台跑，供下次/中期记忆。
+     */
+    @Value("${agent.context.llm-summary-enabled:false}")
+    private boolean llmSummaryEnabled;
     private static final double TAIL_TOKEN_RATIO = 0.4;
     private static final int PROTECT_FIRST_N = 2;
     private static final int MIN_MESSAGES_TO_COMPRESS = 8;
@@ -377,14 +384,36 @@ public class ContextCompressor {
         List<ChatMessage> toSummarize = messages.subList(headEnd, cutIdx);
         List<ChatMessage> tail = messages.subList(cutIdx, messages.size());
 
-        log.info("压缩边界: 头部 {} + 中间 {} + 尾部 {}", headEnd, toSummarize.size(), tail.size());
+        log.info("压缩边界: 头部 {} + 中间 {} + 尾部 {}，llmSummary={}",
+                headEnd, toSummarize.size(), tail.size(), llmSummaryEnabled);
 
-        // 阶段 3: 合并摘要生成 + 记忆提取（单次 LLM 调用）
-        int summaryBudget = Math.min(MAX_SUMMARY_TOKENS, (int)(maxTokens * 0.05));
-        String summary = generateSummaryAndExtractMemory(toSummarize, summaryBudget, state);
-
-        if (StringUtils.isBlank(summary)) {
-            summary = String.format("【上下文压缩】%d 条对话轮次已移除。请基于最近对话继续。", toSummarize.size());
+        // 阶段 3：默认硬截断占位（不阻塞 Loop）；可选同步 LLM；否则异步摘要
+        int summaryBudget = Math.min(MAX_SUMMARY_TOKENS, (int) (maxTokens * 0.05));
+        String stub = String.format(
+                "【上下文压缩】已硬截断移除中间 %d 条消息。请基于头部任务目标与最近对话继续。",
+                toSummarize.size());
+        String summary;
+        if (llmSummaryEnabled) {
+            summary = generateSummaryAndExtractMemory(toSummarize, summaryBudget, state);
+            if (StringUtils.isBlank(summary)) {
+                summary = stub;
+            }
+        } else {
+            summary = StringUtils.isNotBlank(state.previousSummary)
+                    ? state.previousSummary + "\n\n" + stub
+                    : stub;
+            List<ChatMessage> middleCopy = new ArrayList<>(toSummarize);
+            CompletableFuture.runAsync(() -> {
+                try {
+                    String s = generateSummaryAndExtractMemory(middleCopy, summaryBudget, state);
+                    if (StringUtils.isNotBlank(s)) {
+                        state.previousSummary = s;
+                        log.info("后台上下文摘要完成，len={}", s.length());
+                    }
+                } catch (Exception e) {
+                    log.warn("后台上下文摘要失败: {}", e.getMessage());
+                }
+            });
         }
 
         // 阶段 4：摘要以 SystemMessage 注入（背景信息，而非用户输入），避免模型误当成用户发言。

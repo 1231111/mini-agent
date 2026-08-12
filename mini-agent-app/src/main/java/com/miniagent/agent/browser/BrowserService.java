@@ -5,6 +5,7 @@ import com.microsoft.playwright.Locator.AriaSnapshotOptions;
 import com.microsoft.playwright.options.AriaRole;
 import com.microsoft.playwright.options.WaitUntilState;
 import com.miniagent.agent.security.NetworkGuard;
+import com.miniagent.common.MessageConstants;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -389,7 +390,7 @@ public class BrowserService {
 
         } catch (Exception e) {
             log.error("导航失败: {}", url, e);
-            return "导航失败: " + e.getMessage();
+            return String.format(MessageConstants.BROWSER_NAV_FAILED, e.getMessage());
         }
     }
 
@@ -412,7 +413,7 @@ public class BrowserService {
 
         } catch (Exception e) {
             log.error("获取快照失败", e);
-            return "获取快照失败: " + e.getMessage();
+            return String.format(MessageConstants.BROWSER_SNAPSHOT_FAILED, e.getMessage());
         }
     }
 
@@ -424,7 +425,7 @@ public class BrowserService {
     }
 
     public String click(String sessionId, String ref, String by) {
-        if (StringUtils.isBlank(ref)) return "点击失败: ref 为空";
+        if (StringUtils.isBlank(ref)) return MessageConstants.BROWSER_CLICK_FAILED_EMPTY_REF;
         String mode = StringUtils.isBlank(by) ? "auto" : by.trim().toLowerCase(Locale.ROOT);
         try {
             Page page = getPage(sessionId);
@@ -441,13 +442,12 @@ public class BrowserService {
                 default -> null;
             };
             if (Objects.isNull(loc)) {
-                return "点击失败: 未知 by=" + mode + "，可用 ref|text|role|css|aria";
+                return String.format(MessageConstants.BROWSER_CLICK_FAILED_UNKNOWN_BY, mode);
             }
             return clickAndSnap(page, loc, mode, ref);
         } catch (Exception e) {
             log.error("点击失败: ref={} by={}", ref, mode, e);
-            return "点击失败: ref=" + ref + " by=" + mode + " — " + e.getMessage()
-                    + "。请 browser_snapshot 后改 by。";
+            return String.format(MessageConstants.BROWSER_CLICK_FAILED, ref, mode, e.getMessage());
         }
     }
 
@@ -456,15 +456,15 @@ public class BrowserService {
         try {
             refNum = Integer.parseInt(ref);
         } catch (NumberFormatException e) {
-            return "点击失败: by=ref 需要数字编号，收到: " + ref;
+            return String.format(MessageConstants.BROWSER_CLICK_FAILED_NOT_DIGIT, ref);
         }
         String elementInfo = findElementByRef(page, refNum);
-        if (Objects.isNull(elementInfo)) return "点击失败: 快照中无 ref=" + ref + "。请先 browser_snapshot。";
+        if (Objects.isNull(elementInfo)) return String.format(MessageConstants.BROWSER_CLICK_FAILED_NO_REF, ref);
         log.info("click ref={} 对应元素: {}", ref, elementInfo);
         java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"([^\"]+)\"").matcher(elementInfo);
         String name = m.find() ? m.group(1) : null;
         if (StringUtils.isBlank(name)) {
-            return "点击失败: ref=" + ref + " 无可用名称 [" + elementInfo + "]。改用 by=css。";
+            return String.format(MessageConstants.BROWSER_CLICK_FAILED_NO_NAME, ref, elementInfo);
         }
         // 按快照角色选唯一策略；失败直接报错，不静默串联
         Locator loc = elementInfo.contains("button")
@@ -475,8 +475,7 @@ public class BrowserService {
         try {
             return clickAndSnap(page, loc, "ref", name);
         } catch (Exception e) {
-            return "点击失败: ref=" + ref + " name=\"" + name + "\" — " + e.getMessage()
-                    + "。可改 by=role（button=" + name + "）或 by=text。";
+            return String.format(MessageConstants.BROWSER_CLICK_FAILED_BY_NAME, ref, name, e.getMessage());
         }
     }
 
@@ -494,7 +493,7 @@ public class BrowserService {
     private String clickAndSnap(Page page, Locator locator, String strategy, String label) {
         locator.click(new Locator.ClickOptions().setTimeout(5000));
         page.waitForTimeout(1500);
-        return "点击成功 (" + strategy + "): " + label + "\n\n"
+        return String.format(MessageConstants.BROWSER_CLICK_SUCCESS, strategy, label) + "\n\n"
                 + formatSnapshot(page.locator("body").ariaSnapshot());
     }
 
@@ -526,7 +525,7 @@ public class BrowserService {
                     Locator input = findInputByInfo(page, elementInfo);
                     if (Objects.nonNull(input)) {
                         input.fill(text, new Locator.FillOptions().setTimeout(shortTimeout));
-                        return "输入成功: ref=" + ref + " text=\"" + text + "\"\n\n"
+                        return String.format(MessageConstants.BROWSER_INPUT_SUCCESS, ref, text) + "\n\n"
                                 + formatSnapshot(page.locator("body").ariaSnapshot());
                     }
                 }
@@ -535,22 +534,22 @@ public class BrowserService {
             // 策略2: ref 是文本 → 用 placeholder 匹配
             try {
                 page.getByPlaceholder(ref).fill(text, new Locator.FillOptions().setTimeout(shortTimeout));
-                return "输入成功: placeholder=" + ref + " text=\"" + text + "\"\n\n"
+                return String.format(MessageConstants.BROWSER_INPUT_SUCCESS_PLACEHOLDER, ref, text) + "\n\n"
                         + formatSnapshot(page.locator("body").ariaSnapshot());
             } catch (Exception ignored) {}
 
             // 策略3: ref 是文本 → 用 aria label 匹配
             try {
                 page.getByLabel(ref).fill(text, new Locator.FillOptions().setTimeout(shortTimeout));
-                return "输入成功: label=" + ref + " text=\"" + text + "\"\n\n"
+                return String.format(MessageConstants.BROWSER_INPUT_SUCCESS_LABEL, ref, text) + "\n\n"
                         + formatSnapshot(page.locator("body").ariaSnapshot());
             } catch (Exception ignored) {}
 
-            return "输入失败: 未找到匹配 ref=" + ref + " 的输入框。请用 browser_snapshot 后用编号或 placeholder 重试。";
+            return String.format(MessageConstants.BROWSER_INPUT_FAILED_NOT_FOUND, ref);
 
         } catch (Exception e) {
             log.error("输入失败: ref={}", ref, e);
-            return "输入失败: " + e.getMessage();
+            return String.format(MessageConstants.BROWSER_INPUT_FAILED, e.getMessage());
         }
     }
 
@@ -613,10 +612,10 @@ public class BrowserService {
         try {
             Page page = getPage(sessionId);
             page.keyboard().press(key);
-            return "按键成功: " + key;
+            return String.format(MessageConstants.BROWSER_PRESS_SUCCESS, key);
         } catch (Exception e) {
             log.error("按键失败: key={}", key, e);
-            return "按键失败: " + e.getMessage();
+            return String.format(MessageConstants.BROWSER_PRESS_FAILED, e.getMessage());
         }
     }
 
@@ -631,9 +630,9 @@ public class BrowserService {
             } else {
                 page.mouse().wheel(0, 500);
             }
-            return "滚动成功: " + direction;
+            return String.format(MessageConstants.BROWSER_SCROLL_SUCCESS, direction);
         } catch (Exception e) {
-            return "滚动失败: " + e.getMessage();
+            return String.format(MessageConstants.BROWSER_SCROLL_FAILED, e.getMessage());
         }
     }
 
@@ -647,9 +646,9 @@ public class BrowserService {
             page.screenshot(new Page.ScreenshotOptions()
                     .setPath(Paths.get(path))
                     .setFullPage(false));
-            return "截图已保存: " + path;
+            return String.format(MessageConstants.BROWSER_SCREENSHOT_SAVED, path);
         } catch (Exception e) {
-            return "截图失败: " + e.getMessage();
+            return String.format(MessageConstants.BROWSER_SCREENSHOT_FAILED, e.getMessage());
         }
     }
 
@@ -660,7 +659,7 @@ public class BrowserService {
         Page page = pages.remove(sessionId);
         if (Objects.nonNull(page)) {
             page.close();
-            return "浏览器页面已关闭: " + sessionId;
+            return String.format(MessageConstants.BROWSER_PAGE_CLOSED, sessionId);
         }
         return "没有找到 session: " + sessionId;
     }
@@ -672,9 +671,9 @@ public class BrowserService {
         try {
             Page page = getPage(sessionId);
             Object result = page.evaluate(expression);
-            return "执行结果: " + (Objects.nonNull(result) ? result.toString() : "null");
+            return String.format(MessageConstants.BROWSER_EVAL_RESULT, Objects.nonNull(result) ? result.toString() : "null");
         } catch (Exception e) {
-            return "执行失败: " + e.getMessage();
+            return String.format(MessageConstants.BROWSER_EVAL_FAILED, e.getMessage());
         }
     }
 
@@ -687,7 +686,7 @@ public class BrowserService {
      */
     private String formatSnapshot(String snapshot) {
         if (StringUtils.isBlank(snapshot)) {
-            return "（页面为空）";
+            return MessageConstants.BROWSER_EMPTY_PAGE;
         }
 
         StringBuilder sb = new StringBuilder();
