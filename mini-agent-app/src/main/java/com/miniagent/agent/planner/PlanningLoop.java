@@ -196,7 +196,16 @@ public class PlanningLoop {
                     "{\"version\":" + snap.version() + ",\"running\":"
                             + proposal.actions().size() + "}");
 
-            lastAnswer = proposalExecutor.execute(chat, systemPrompt, userMessage, multimodalUser,
+            String stepUser = userMessage;
+            if (StringUtils.isNotBlank(lastAnswer)
+                    && !StepEvaluator.looksLikeLoopAbort(lastAnswer)) {
+                String prior = lastAnswer.length() <= 6000
+                        ? lastAnswer : lastAnswer.substring(0, 6000) + "…";
+                stepUser = userMessage
+                        + "\n\n# 上一步进展（页面可能仍开着，不要再 navigate 同一 wiki 首页）\n"
+                        + prior;
+            }
+            lastAnswer = proposalExecutor.execute(chat, systemPrompt, stepUser, multimodalUser,
                     history, taskPlan, proposal, snap.graph(), sessionId, progress, streamSink);
 
             boolean drifted = ProposalExecutor.consumeLastDrift();

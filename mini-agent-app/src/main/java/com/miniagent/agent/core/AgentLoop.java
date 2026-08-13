@@ -97,6 +97,10 @@ public class AgentLoop {
     public void setEventCenter(SessionEventCenter eventCenter) { this.eventCenter = eventCenter; }
 
     private static final int MAX_ITERATIONS = 90;
+    public static final String LOOP_MAX_ITERATIONS = "MAX_ITERATIONS";
+    private static final int FAIL_REPEAT_ABORT = 3;
+
+    public record LoopOutcome(String text, String endReason, List<ChatMessage> messages) {}
     /** 虚拟线程池：工具并行执行专用，IO 密集型任务零开销 */
     private static final java.util.concurrent.ExecutorService VIRTUAL_EXECUTOR =
             Executors.newVirtualThreadPerTaskExecutor();
@@ -138,6 +142,7 @@ public class AgentLoop {
             Map.entry("web_extract",       12000),
             Map.entry("read_file",         10000),
             Map.entry("browser_snapshot",   6000),
+            Map.entry("browser_evaluate",   8000),
             Map.entry("browser_navigate",   5000),
             Map.entry("http_get",           8000),
             Map.entry("exec_command",       4000),
@@ -182,13 +187,11 @@ public class AgentLoop {
     private static final long DEFAULT_TOOL_TIMEOUT_SECONDS = 60L;
 
     /**
-     * 产生直接交付物（图片/截图/音视频）的工具白名单。
-     * 这类工具一旦成功执行，就视为模型已经把产出物交付给了前端，
-     * 不再要求额外调 write_file。
+     * 产生直接交付物（图片/音视频）的工具白名单。
+     * 截图是探路手段，不算交付（否则读网页任务会被强制收尾）。
      */
     private static final Set<String> MEDIA_TOOLS = Set.of(
             "image_generate",
-            "browser_screenshot",
             "video_generate",
             "audio_generate",
             "tts",
@@ -203,10 +206,24 @@ public class AgentLoop {
             "write_file"
     );
 
+    /** 飞书类页面虚拟列表：滚动/evaluate 探路，不是交付。 */
+    static final Set<String> BROWSER_PROBE_TOOLS = Set.of(
+            "browser_evaluate", "browser_scroll", "browser_screenshot");
+    /** 连续探测超过此次数后从工具面拿掉 evaluate/scroll。 */
+    static final int BROWSER_PROBE_CAP = 4;
+    /** 单次探测结果达到此长度视为已有正文，应立刻 write_file。 */
+    static final int BROWSER_EXTRACT_WRITE_CHARS = 1500;
+    static final String BROWSER_WRITE_NOW_HINT =
+            "【已拿到正文】立刻 write_file(path=学习资料.md)。"
+                    + "飞书虚拟滚动读不完，禁止再 evaluate/scroll。";
+    static final String BROWSER_PROBE_CAP_HINT =
+            "【探测过多】立刻用已有文本 write_file。"
+                    + "禁止 browser_evaluate/scroll/screenshot。不完整也先落盘。";
+
     /** 可缓存的只读工具：同一请求内重复调用直接返回缓存 */
     private static final Set<String> CACHEABLE_TOOLS = Set.of(
             "read_file", "list_files", "web_search", "web_extract", "http_get",
-            "exec_command", "browser_snapshot", "read_package"
+            "exec_command", "read_package"
     );
 
     /**
@@ -288,7 +305,39 @@ public class AgentLoop {
             messages.addAll(chatHistory);
         }
         messages.add(new UserMessage(userMessage));
-        return executeLoop(chatModel, messages, Optional.ofNullable(userMessage).orElse(""), maxIterations, progressCallback, taskPlan, streamSink);
+        return executeLoop(chatModel, messages, Optional.ofNullable(userMessage).orElse(""),
+                maxIterations, progressCallback, taskPlan, streamSink).text();
+    }
+
+    public LoopOutcome runOutcome(ChatModel chatModel,
+                                  String systemMessage,
+                                  String userMessage,
+                                  List<ChatMessage> chatHistory,
+                                  int maxIterations,
+                                  Consumer<String> progressCallback,
+                                  TaskPlan taskPlan,
+                                  AgentStreamSink streamSink) {
+        List<ChatMessage> messages = new ArrayList<>();
+        if (StringUtils.isNotBlank(systemMessage))
+            messages.add(new SystemMessage(systemMessage));
+        if (Objects.nonNull(taskPlan))
+            messages.add(new SystemMessage(taskPlan.toPromptBlock()));
+        if (Objects.nonNull(chatHistory))
+            messages.addAll(chatHistory);
+        messages.add(new UserMessage(userMessage));
+        return executeLoop(chatModel, messages, Optional.ofNullable(userMessage).orElse(""),
+                maxIterations, progressCallback, taskPlan, streamSink);
+    }
+
+    public LoopOutcome continueLoop(ChatModel chatModel,
+                                    List<ChatMessage> messages,
+                                    String userTextForFilePattern,
+                                    int maxIterations,
+                                    Consumer<String> progressCallback,
+                                    TaskPlan taskPlan,
+                                    AgentStreamSink streamSink) {
+        return executeLoop(chatModel, messages, Optional.ofNullable(userTextForFilePattern).orElse(""),
+                maxIterations, progressCallback, taskPlan, streamSink);
     }
 
     /**
@@ -349,6 +398,26 @@ public class AgentLoop {
         }
         messages.add(userMessage);
         return executeLoop(chatModel, messages, firstUserTextForFileIntent(userMessage),
+                maxIterations, progressCallback, taskPlan, streamSink).text();
+    }
+
+    public LoopOutcome runWithMultimodalOutcome(ChatModel chatModel,
+                                                String systemMessage,
+                                                UserMessage userMessage,
+                                                List<ChatMessage> chatHistory,
+                                                int maxIterations,
+                                                Consumer<String> progressCallback,
+                                                TaskPlan taskPlan,
+                                                AgentStreamSink streamSink) {
+        List<ChatMessage> messages = new ArrayList<>();
+        if (StringUtils.isNotBlank(systemMessage))
+            messages.add(new SystemMessage(systemMessage));
+        if (Objects.nonNull(taskPlan))
+            messages.add(new SystemMessage(taskPlan.toPromptBlock()));
+        if (Objects.nonNull(chatHistory))
+            messages.addAll(chatHistory);
+        messages.add(userMessage);
+        return executeLoop(chatModel, messages, firstUserTextForFileIntent(userMessage),
                 maxIterations, progressCallback, taskPlan, streamSink);
     }
 
@@ -370,7 +439,7 @@ public class AgentLoop {
         boolean imageGenerateUnavailable = false;
         boolean fileReminderSent = false; // 是否已注入过一次性文件落盘提醒
         final Map<String, String> toolResultCache = new HashMap<>();
-        final Map<String, Integer> dupCallCounter = new HashMap<>();
+        final Map<String, Integer> failDupCounter = new HashMap<>();
         int explorationCount = 0;
         int consecutiveFailures = 0;  // 连续同类工具失败计数
         String lastFailedTool = null; // 上次失败的工具名
@@ -394,28 +463,32 @@ public class AgentLoop {
         /** 寒暄/轻问答：不吃上一轮残留 todo，也不拦截收尾 */
         boolean lightQa = false;
 
-        /** 死循环检测：本轮全部工具是否已重复 >= 3 次 */
-        boolean allCallsRepeated(List<?> toolCalls) {
-            boolean allRepeated = true;
-            for (var tc : toolCalls) {
-                try {
-                    String key = tc.getClass().getMethod("name").invoke(tc) + "|"
-                            + (Objects.isNull(tc.getClass().getMethod("arguments").invoke(tc)) ? ""
-                               : tc.getClass().getMethod("arguments").invoke(tc));
-                    int count = dupCallCounter.getOrDefault(key, 0) + 1;
-                    dupCallCounter.put(key, count);
-                    if (count < 3) allRepeated = false;
-                } catch (Exception e) {
-                    allRepeated = false;
-                }
-            }
-            return allRepeated;
+        void noteToolFinished(String name, String args, String result) {
+            String key = name + "|" + (args == null ? "" : args);
+            if (TraceRecorder.isFailedResult(result))
+                failDupCounter.merge(key, 1, Integer::sum);
+            else
+                failDupCounter.remove(key);
         }
+
+        boolean allFailedRepeated(List<?> toolCalls) {
+            if (toolCalls == null || toolCalls.isEmpty()) return false;
+            for (var tc : toolCalls) {
+                String key = toolNameOf(tc) + "|" + argumentsOf(tc);
+                if (failDupCounter.getOrDefault(key, 0) < FAIL_REPEAT_ABORT)
+                    return false;
+            }
+            return true;
+        }
+    }
+
+    private static LoopOutcome finish(String text, LoopState state, List<ChatMessage> messages) {
+        return new LoopOutcome(text == null ? "" : text, state.loopEndReason, messages);
     }
 
     // ==================== executeLoop ====================
 
-    private String executeLoop(ChatModel chatModel,
+    private LoopOutcome executeLoop(ChatModel chatModel,
                               List<ChatMessage> messages,
                               String userTextForFilePattern,
                               int maxIterations,
@@ -513,7 +586,8 @@ public class AgentLoop {
             }
 
             // 1) 构建请求（按需过滤工具：复杂任务未 set 计划时仅放行 todo）
-            var specsForTurn = buildToolSpecsForTurn(toolSpecs, hasTools, state.mediaDelivered, state, sessionId);
+            var specsForTurn = buildToolSpecsForTurn(
+                    toolSpecs, hasTools, state.mediaDelivered, state, sessionId, messages);
             log.info("Agent循环第 {}/{} 轮: {}, messages={}, availableTools={}, alreadyInvoked={}",
                     turn + 1, iterations, truncate(subGoalLog, 80), messages.size(),
                     specsForTurn.size(), state.toolsInvoked);
@@ -591,7 +665,8 @@ public class AgentLoop {
                     if (Objects.nonNull(traceRecorder)) {
                         traceRecorder.recordError(sessionId, turn, "LLM 连续失败 " + state.llmFailureCount + " 次");
                     }
-                    return MessageConstants.AGENT_LLM_NETWORK_FAILED;
+                    state.loopEndReason = RunStatus.FAILURE.name();
+                    return finish(MessageConstants.AGENT_LLM_NETWORK_FAILED, state, messages);
                 }
             }
             // 成功后重置失败计数
@@ -611,9 +686,13 @@ public class AgentLoop {
                 if (state.lengthTruncationCount >= 4) {
                     log.warn("连续 {} 次长度截断仍未完成，终止避免空转", state.lengthTruncationCount);
                     if (state.writeFileSucceeded) {
-                        return "内容较长、多次写入后仍超出单轮输出上限。已写入的部分见 workspace/，建议把需求拆成更小的文件分别生成。";
+                        state.loopEndReason = RunStatus.SUCCESS.name();
+                        return finish("内容较长、多次写入后仍超出单轮输出上限。已写入的部分见 workspace/，建议把需求拆成更小的文件分别生成。",
+                                state, messages);
                     }
-                    return "要生成的内容超出了单轮输出上限，且多次分块续写仍未完成。建议把任务拆小（例如把 3D 仿真拆成 HTML 骨架、JS 逻辑、样式分别生成）后再试。";
+                    state.loopEndReason = RunStatus.FAILURE.name();
+                    return finish("要生成的内容超出了单轮输出上限，且多次分块续写仍未完成。建议把任务拆小（例如把 3D 仿真拆成 HTML 骨架、JS 逻辑、样式分别生成）后再试。",
+                            state, messages);
                 }
                 if (aiMessage.hasToolExecutionRequests()) {
                     // tool_call 被截断：先把工具结果产出（截断的 write_file 会回报参数错误），
@@ -644,12 +723,13 @@ public class AgentLoop {
                     }
                 }
 
-                if (state.allCallsRepeated(toolCalls)) {
-                    log.warn("死循环检测：全部工具已重复 >= 3 次，终止");
-                    return "我连续多次用相同参数调用同样的工具但没拿到新结果，停止避免空转。已调用：" + state.toolsInvoked;
-                }
-
                 executeToolCalls(toolCalls, messages, progressCallback, state);
+                if (state.allFailedRepeated(toolCalls)) {
+                    log.warn("死循环检测：失败工具重复 >= {} 次，终止", FAIL_REPEAT_ABORT);
+                    state.loopEndReason = "DUP_TOOLS";
+                    return finish("我连续多次用相同参数调用同样的工具但没拿到新结果，停止避免空转。已调用："
+                            + state.toolsInvoked, state, messages);
+                }
 
                 // tool_call 被长度截断：工具结果已入列（截断的 write_file 会回报"参数被截断"），
                 // 紧接着注入续写引导，让模型用 append 续写而不是重头再来。
@@ -681,7 +761,9 @@ public class AgentLoop {
                         log.info("媒体已交付但 LLM 还在调其他工具，第 {} 次忽略提醒", state.mediaIgnoreCount);
                         if (state.mediaIgnoreCount >= 1) {
                             log.warn("LLM 连续忽略 {} 次提醒，强制结束循环", state.mediaIgnoreCount);
-                            return Optional.ofNullable(state.lastMediaResult).orElse("图片已生成。");
+                            state.loopEndReason = "MEDIA_ABORT";
+                            return finish(Optional.ofNullable(state.lastMediaResult)
+                                    .orElse("图片已生成。"), state, messages);
                         }
                         messages.add(new SystemMessage(
                                 "图片已经生成完毕，不要再调用任何工具，直接输出 markdown 图片链接给用户。"));
@@ -704,14 +786,14 @@ public class AgentLoop {
                     traceRecorder.recordAnswer(sessionId, turn, result);
                 }
                 state.loopEndReason = RunStatus.SUCCESS.name();
-                return result;
+                return finish(result, state, messages);
             }
             // tryReturnFinalText 注入了提醒，继续循环
         }
 
         log.warn("Agent 循环达到最大迭代次数 {}", iterations);
-        state.loopEndReason = "MAX_ITERATIONS";
-        return buildMaxIterationFallback(state, iterations);
+        state.loopEndReason = LOOP_MAX_ITERATIONS;
+        return finish(buildMaxIterationFallback(state, iterations), state, messages);
         } finally {
             if (Objects.nonNull(traceRecorder)) {
                 if (SubagentContext.isActive()) {
@@ -720,8 +802,10 @@ public class AgentLoop {
                 } else {
                     String reason = state.loopEndReason == null ? "DONE" : state.loopEndReason;
                     traceRecorder.recordAgentLoopEnd(sessionId, Math.max(0, state.currentTurn), reason);
-                    if ("MAX_ITERATIONS".equalsIgnoreCase(reason)) {
-                        traceRecorder.recordAborted(sessionId, Math.max(0, state.currentTurn), reason);
+                    if (LOOP_MAX_ITERATIONS.equalsIgnoreCase(reason)
+                            || "MEDIA_ABORT".equalsIgnoreCase(reason)) {
+                        traceRecorder.recordAborted(
+                                sessionId, Math.max(0, state.currentTurn), reason);
                     }
                 }
             }
@@ -785,7 +869,8 @@ public class AgentLoop {
 
     /** 根据当前状态过滤本轮可用工具 */
     private List<?> buildToolSpecsForTurn(List<?> toolSpecs, boolean hasTools,
-                                           boolean mediaDelivered, LoopState state, String sessionId) {
+                                           boolean mediaDelivered, LoopState state, String sessionId,
+                                           List<ChatMessage> messages) {
         if (!hasTools) return List.of();  // mediaDelivered不再清空工具，让模型自己决定是否继续生成
         var specs = toolSpecs;
 
@@ -799,11 +884,7 @@ public class AgentLoop {
                     .toList();
             if (!specs.isEmpty()) {
                 log.info("Planner 提案工具面: {}", pc.allowedTools());
-                return specs.stream()
-                        .filter(s -> PermissionPolicy.allowInSpecs(
-                                PermissionContext.mode(), PermissionContext.planApproved(),
-                                ((dev.langchain4j.agent.tool.ToolSpecification) s).name()))
-                        .toList();
+                return capBrowserProbes(specs, messages);
             }
         }
 
@@ -834,10 +915,94 @@ public class AgentLoop {
         }
         PermissionMode mode = PermissionContext.mode();
         boolean planOk = PermissionContext.planApproved();
-        return specs.stream()
+        specs = specs.stream()
                 .filter(s -> PermissionPolicy.allowInSpecs(
                         mode, planOk, ((dev.langchain4j.agent.tool.ToolSpecification) s).name()))
                 .toList();
+        return capBrowserProbes(specs, messages);
+    }
+
+    private List<?> capBrowserProbes(List<?> specs, List<ChatMessage> messages) {
+        PermissionMode mode = PermissionContext.mode();
+        boolean planOk = PermissionContext.planApproved();
+        specs = specs.stream()
+                .filter(s -> PermissionPolicy.allowInSpecs(
+                        mode, planOk,
+                        ((dev.langchain4j.agent.tool.ToolSpecification) s).name()))
+                .toList();
+        if (!shouldDropBrowserProbes(
+                consecutiveProbeTurns(messages), pendingSubstantialExtract(messages)))
+            return specs;
+        List<?> kept = specs.stream()
+                .filter(s -> !BROWSER_PROBE_TOOLS.contains(
+                        ((dev.langchain4j.agent.tool.ToolSpecification) s).name()))
+                .toList();
+        if (kept.isEmpty()) return specs;
+        log.info("浏览器探测已过量或已有正文，本轮去掉 {}", BROWSER_PROBE_TOOLS);
+        return kept;
+    }
+
+    static boolean shouldDropBrowserProbes(int consecutive, boolean pendingExtract) {
+        return consecutive >= BROWSER_PROBE_CAP || pendingExtract;
+    }
+
+    static int consecutiveProbeTurns(List<ChatMessage> messages) {
+        if (messages == null || messages.isEmpty()) return 0;
+        int n = 0;
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            ChatMessage m = messages.get(i);
+            if (m instanceof SystemMessage) continue;
+            if (m instanceof UserMessage) break;
+            if (m instanceof ToolExecutionResultMessage tr) {
+                if (WRITE_TOOLS.contains(tr.toolName())) break;
+                if (!BROWSER_PROBE_TOOLS.contains(tr.toolName())) break;
+                continue;
+            }
+            if (m instanceof AiMessage ai && ai.hasToolExecutionRequests()) {
+                boolean probe = true;
+                for (var tc : ai.toolExecutionRequests()) {
+                    if (!BROWSER_PROBE_TOOLS.contains(toolNameOf(tc))) {
+                        probe = false;
+                        break;
+                    }
+                }
+                if (!probe) break;
+                n++;
+            }
+        }
+        return n;
+    }
+
+    static boolean pendingSubstantialExtract(List<ChatMessage> messages) {
+        if (messages == null) return false;
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            ChatMessage m = messages.get(i);
+            if (m instanceof UserMessage) break;
+            if (!(m instanceof ToolExecutionResultMessage tr)) continue;
+            if (WRITE_TOOLS.contains(tr.toolName())) return false;
+            if (BROWSER_PROBE_TOOLS.contains(tr.toolName())
+                    && tr.text() != null
+                    && tr.text().length() >= BROWSER_EXTRACT_WRITE_CHARS)
+                return true;
+        }
+        return false;
+    }
+
+    static String maybeBrowserWriteNudge(String toolName, String result, int consecutiveProbes) {
+        if (toolName == null || !BROWSER_PROBE_TOOLS.contains(toolName)) return null;
+        if (TraceRecorder.isFailedResult(result)) return null;
+        if (result != null && result.length() >= BROWSER_EXTRACT_WRITE_CHARS)
+            return BROWSER_WRITE_NOW_HINT;
+        if (consecutiveProbes >= BROWSER_PROBE_CAP)
+            return BROWSER_PROBE_CAP_HINT;
+        return null;
+    }
+
+    private static String applyBrowserNudge(String name, String result,
+                                            String resultForContext, List<ChatMessage> messages) {
+        String nudge = maybeBrowserWriteNudge(name, result, consecutiveProbeTurns(messages));
+        if (nudge == null) return resultForContext;
+        return resultForContext + "\n\n" + nudge;
     }
 
     /** 工具执行统一入口：权限闸门 + ToolHook */
@@ -1194,11 +1359,18 @@ public class AgentLoop {
             progressCallback.accept(names);
         }
 
-        if (toolCalls.size() > 1) {
+        if (toolCalls.size() > 1 && !hasBrowserTool(toolCalls)) {
             executeToolCallsParallel(toolCalls, messages, progressCallback, state);
         } else {
-            executeToolCallSingle(toolCalls.get(0), messages, progressCallback, state);
+            for (var tc : toolCalls)
+                executeToolCallSingle(tc, messages, progressCallback, state);
         }
+    }
+
+    private static boolean hasBrowserTool(List<?> toolCalls) {
+        for (var tc : toolCalls)
+            if (toolNameOf(tc).startsWith("browser_")) return true;
+        return false;
     }
 
     /** 并行执行多个工具 */
@@ -1214,6 +1386,8 @@ public class AgentLoop {
         final boolean ctxForced = PermissionContext.isForced();
         final PermissionMode ctxMode = PermissionContext.mode();
         final boolean ctxPlanOk = PermissionContext.planApproved();
+        final com.miniagent.agent.planner.PlanningContext.Holder ctxPlanning =
+                com.miniagent.agent.planner.PlanningContext.get();
         final int turn = state.currentTurn;
 
         for (var tc : toolCalls) {
@@ -1240,7 +1414,10 @@ public class AgentLoop {
                 }
                 if (ctxForced) PermissionContext.force(ctxSessionId, ctxMode, ctxPlanOk);
                 else PermissionContext.setSession(ctxSessionId);
-                if (Objects.nonNull(ctxUserId)) com.miniagent.memory.MemoryStore.setCurrentUser(ctxUserId);
+                if (Objects.nonNull(ctxUserId))
+                    com.miniagent.memory.MemoryStore.setCurrentUser(ctxUserId);
+                if (ctxPlanning != null)
+                    com.miniagent.agent.planner.PlanningContext.set(ctxPlanning);
                 try {
                     String r = executeToolWithHooks(name, args, turn);
                     results.put(toolIdOf(tc) + "|" + name, Optional.ofNullable(r).orElse(""));
@@ -1249,6 +1426,7 @@ public class AgentLoop {
                     com.miniagent.agent.todo.TaskTodoContext.clear();
                     com.miniagent.memory.MemoryStore.clearCurrentUser();
                     PermissionContext.clear();
+                    com.miniagent.agent.planner.PlanningContext.clear();
                 }
             }, VIRTUAL_EXECUTOR).orTimeout(timeout, java.util.concurrent.TimeUnit.SECONDS);
             futures.add(future);
@@ -1277,6 +1455,7 @@ public class AgentLoop {
             // 反思机制（并行）：失败时把反思提示并入工具结果，不伪装成用户消息
             String parallelReflection = buildReflectionHint(name, argumentsOf(tc), result);
             String resultForContext = clampForContext(result, name);
+            resultForContext = applyBrowserNudge(name, result, resultForContext, messages);
             if (Objects.nonNull(parallelReflection)) {
                 state.consecutiveFailures++;
                 if (!state.reflectionInjected && state.consecutiveFailures >= 2) {
@@ -1290,12 +1469,7 @@ public class AgentLoop {
             }
 
             log.info("  [并行] {}: {}", name, truncate(redactSensitive(result), 200));
-            if (Objects.nonNull(traceRecorder)) traceRecorder.recordToolResult(currentSessionId.get(), state.currentTurn, name, result, 0, result.contains("\"error\"") ? RunStatus.FAILURE.name() : RunStatus.SUCCESS.name());
-            if (Objects.nonNull(progressCallback)) {
-                boolean failed = result != null && result.contains("\"error\"");
-                progressCallback.accept((failed ? "✗ " : "✓ ") + name + ": "
-                        + truncate(redactSensitive(result), 120));
-            }
+            recordToolOutcome(state, name, argumentsOf(tc), result, progressCallback);
             messages.add(ToolExecutionResultMessage.from(
                     toolIdOf(tc), name, resultForContext));
         }
@@ -1311,6 +1485,7 @@ public class AgentLoop {
         if (state.lengthTruncatedToolCalls && !"write_file".equals(name) && !"read_file".equals(name)) {
             String truncErr = "{\"error\":\"本次工具调用的参数因模型输出长度上限被截断，无法执行。请用更短的参数重试。\"}";
             log.warn("  [截断保护] 跳过执行 {}，参数可能不完整", name);
+            recordToolOutcome(state, name, args, truncErr, progressCallback);
             messages.add(ToolExecutionResultMessage.from(toolIdOf(tc), name, truncErr));
             return;
         }
@@ -1335,13 +1510,18 @@ public class AgentLoop {
             final boolean ctxForced = PermissionContext.isForced();
             final PermissionMode ctxMode = PermissionContext.mode();
             final boolean ctxPlanOk = PermissionContext.planApproved();
+            final com.miniagent.agent.planner.PlanningContext.Holder ctxPlanning =
+                    com.miniagent.agent.planner.PlanningContext.get();
             CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
                 if (ctxForced) PermissionContext.force(ctxSessionId, ctxMode, ctxPlanOk);
                 else PermissionContext.setSession(ctxSessionId);
+                if (ctxPlanning != null)
+                    com.miniagent.agent.planner.PlanningContext.set(ctxPlanning);
                 try {
                     return executeToolWithHooks(fName, fArgs, turn);
                 } finally {
                     PermissionContext.clear();
+                    com.miniagent.agent.planner.PlanningContext.clear();
                 }
             }, VIRTUAL_EXECUTOR);
             try {
@@ -1366,6 +1546,7 @@ public class AgentLoop {
         // 反思机制：工具失败时把反思提示并入工具结果，不伪装成用户消息
         String reflectionHint = buildReflectionHint(name, args, result);
         String resultForContext = clampForContext(result, name);
+        resultForContext = applyBrowserNudge(name, result, resultForContext, messages);
         if (Objects.nonNull(reflectionHint)) {
             state.consecutiveFailures++;
             state.lastFailedTool = name;
@@ -1381,12 +1562,7 @@ public class AgentLoop {
         }
 
         log.info("  {}: {}", name, truncate(redactSensitive(result), 300));
-        if (Objects.nonNull(traceRecorder)) traceRecorder.recordToolResult(currentSessionId.get(), state.currentTurn, name, result, 0, result.contains("\"error\"") ? RunStatus.FAILURE.name() : RunStatus.SUCCESS.name());
-        if (Objects.nonNull(progressCallback)) {
-            boolean failed = result != null && result.contains("\"error\"");
-            progressCallback.accept((failed ? "✗ " : "✓ ") + name + ": "
-                    + truncate(redactSensitive(result), 120));
-        }
+        recordToolOutcome(state, name, args, result, progressCallback);
         messages.add(ToolExecutionResultMessage.from(
                 toolIdOf(tc), name, resultForContext));
     }
@@ -1416,19 +1592,27 @@ public class AgentLoop {
         return sb.toString().trim();
     }
 
+    private void recordToolOutcome(LoopState state, String name, String args, String result,
+                                   Consumer<String> progressCallback) {
+        state.noteToolFinished(name, args, result);
+        boolean failed = TraceRecorder.isFailedResult(result);
+        String st = failed ? RunStatus.FAILURE.name() : RunStatus.SUCCESS.name();
+        if (Objects.nonNull(traceRecorder))
+            traceRecorder.recordToolResult(
+                    currentSessionId.get(), state.currentTurn, name, result, 0, st);
+        if (Objects.nonNull(progressCallback))
+            progressCallback.accept((failed ? "✗ " : "✓ ") + name + ": "
+                    + truncate(redactSensitive(result), 120));
+    }
+
     /** 工具失败时注入反思上下文，引导模型换策略 */
     private String buildReflectionHint(String toolName, String args, String result) {
         if (StringUtils.isBlank(result)) return null;
-        // 对于 read_file / search_code，只有明确的错误 JSON 才算失败，文件内容本身不算
-        if ("read_file".equals(toolName) || "search_code".equals(toolName) || "read_package".equals(toolName)) {
-            boolean isExplicitError = result.startsWith("{\"error\"");
-            if (!isExplicitError) return null;
+        if ("read_file".equals(toolName) || "search_code".equals(toolName)
+                || "read_package".equals(toolName)) {
+            if (!result.contains("\"error\"")) return null;
         }
-        boolean failed = result.startsWith("{\"error\"")
-                || (result.contains("\"error\"") && result.length() < 500)
-                || result.startsWith("错误：")
-                || result.startsWith("Error:");
-        if (!failed) return null;
+        if (!TraceRecorder.isFailedResult(result)) return null;
 
         StringBuilder hint = new StringBuilder();
         hint.append("⚠️ 工具 ").append(toolName).append(" 执行失败。\n");
@@ -1448,6 +1632,12 @@ public class AgentLoop {
         } else if ("read_file".equals(toolName)) {
             hint.append("- 文件路径可能不对，先 list_files 确认目录结构\n");
             hint.append("- 检查文件扩展名和大小写\n");
+        } else if ("browser_click".equals(toolName)) {
+            hint.append("- SPA 按钮常点超时：改 by=css / by=text，不要盲重点同一 ref\n");
+            hint.append("- 密码页用 browser_type + browser_press，不要点侧栏目录\n");
+        } else if (result.contains("未知工具")) {
+            hint.append("- 该工具名不存在。浏览器用 browser_navigate/snapshot/click/type/press\n");
+            hint.append("- 写文件用 write_file，不要编造 feishu_* / document_parser\n");
         }
 
         hint.append("\n不要用相同参数重试。换一个完全不同的方法。");
@@ -1623,7 +1813,7 @@ public class AgentLoop {
     private String buildMaxIterationFallback(LoopState state, int iterations) {
         StringBuilder sb = new StringBuilder();
         String sid = currentSessionId.get();
-        if (state.writeFileSucceeded || state.mediaDelivered || (Objects.nonNull(sid) && taskTodoStore.hasPlan(sid))) {
+        if (state.writeFileSucceeded || state.mediaDelivered) {
             sb.append("任务轮次已达上限（").append(iterations).append("轮），但已有部分成果：");
             if (state.writeFileSucceeded) sb.append("\n- 文件已写入 workspace/");
             if (state.mediaDelivered) sb.append("\n- 图片已生成");

@@ -164,6 +164,8 @@ public final class MessageConstants {
     public static final String SSE_NOT_AUTHENTICATED = "Not authenticated";
     public static final String SSE_FORBIDDEN = "Forbidden";
     public static final String SSE_GONE = "gone";
+    /** 轨迹页 SSE 事件名：新步骤已落库 */
+    public static final String TRACE_SSE_EVENT = "trace";
 
     // ==================== AUTH 认证 ====================
     public static final String AUTH_NOT_AUTHENTICATED = "Not authenticated";

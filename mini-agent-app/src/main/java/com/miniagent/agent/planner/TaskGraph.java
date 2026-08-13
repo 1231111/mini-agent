@@ -111,7 +111,7 @@ public record TaskGraph(List<TaskNode> nodes) {
     public boolean allTerminalSuccess() {
         if (nodes.isEmpty()) return false;
         for (TaskNode n : nodes)
-            if (n.status() != TaskNodeStatus.SUCCESS && n.status() != TaskNodeStatus.CANCELLED)
+            if (n.status() != TaskNodeStatus.SUCCESS)
                 return false;
         return true;
     }

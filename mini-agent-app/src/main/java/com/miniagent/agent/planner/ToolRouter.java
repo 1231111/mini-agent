@@ -60,9 +60,14 @@ public class ToolRouter {
     }
 
     public String pickTool(TaskNode node) {
-        if (node.toolHint() != null && !node.toolHint().isBlank())
-            return node.toolHint().trim();
         List<String> candidates = capabilityIndex.toolsFor(node.capability());
+        String hint = node.toolHint() == null ? "" : node.toolHint().trim();
+        if (!hint.isEmpty() && capabilityIndex.containsTool(hint))
+            return hint;
+        if (!hint.isEmpty()) {
+            String mapped = mapAlias(hint, node);
+            if (mapped != null) return mapped;
+        }
         if (candidates.isEmpty()) return "todo";
         String best = candidates.get(0);
         int bestScore = score(node, best);
@@ -75,6 +80,25 @@ public class ToolRouter {
             }
         }
         return best;
+    }
+
+    /** 编译器常编造 feishu_browser 等未注册名，映射到真实工具。 */
+    private String mapAlias(String hint, TaskNode node) {
+        String h = hint.toLowerCase(Locale.ROOT);
+        String cap = node.capability() == null ? "" : node.capability().toLowerCase(Locale.ROOT);
+        if (h.contains("feishu") || h.contains("lark") || h.contains("browser")
+                || h.contains("password") || h.contains("wiki")
+                || h.contains("parser") || h.contains("document")
+                || cap.contains("browser")) {
+            List<String> browser = capabilityIndex.toolsFor("browser");
+            if (!browser.isEmpty()) return browser.get(0);
+        }
+        if (h.contains("write") || h.contains("markdown") || h.contains("md")
+                || cap.contains("write") || cap.contains("deliver")) {
+            List<String> write = capabilityIndex.toolsFor("file_write");
+            if (!write.isEmpty()) return write.get(0);
+        }
+        return null;
     }
 
     private int score(TaskNode node, String tool) {
@@ -110,6 +134,69 @@ public class ToolRouter {
         set.add("todo");
         if (!hardGate) set.add("memory");
         return new ArrayList<>(set);
+    }
+
+    /**
+     * 解析未注册 hint，并按能力展开同族工具（browser_navigate 同时放行 snapshot/click/type）。
+     */
+    public List<String> allowedFor(ActionProposal proposal, TaskGraph graph, boolean hardGate) {
+        Set<String> set = new LinkedHashSet<>();
+        for (ActionSpec a : proposal.actions()) {
+            if (a.tool() == null || a.tool().isBlank()) continue;
+            TaskNode node = graph == null ? null : graph.byId(a.taskId());
+            String picked = node != null ? pickTool(node) : mapOrKeep(a.tool());
+            set.add(picked);
+            expandFamily(set, picked, node == null ? "" : node.capability());
+        }
+        expandFromGraph(set, graph);
+        set.add("todo");
+        if (!hardGate) set.add("memory");
+        return new ArrayList<>(set);
+    }
+
+    private String mapOrKeep(String tool) {
+        if (capabilityIndex.containsTool(tool)) return tool;
+        TaskNode fake = new TaskNode("x", "", "general", List.of(),
+                TaskNodeStatus.READY, 1, "", tool, "", 0);
+        return pickTool(fake);
+    }
+
+    private void expandFamily(Set<String> set, String tool, String capability) {
+        String t = tool == null ? "" : tool.toLowerCase(Locale.ROOT);
+        String cap = capability == null ? "" : capability.toLowerCase(Locale.ROOT);
+        if (t.startsWith("browser_") || t.contains("feishu") || cap.contains("browser"))
+            set.addAll(capabilityIndex.toolsFor("browser"));
+        if (t.contains("write") || cap.contains("write") || cap.contains("deliver")
+                || t.contains("markdown")) {
+            set.addAll(capabilityIndex.toolsFor("file_write"));
+            set.addAll(capabilityIndex.toolsFor("file_read"));
+        }
+    }
+
+    /** 读链接写文件：写盘节点仍保留浏览器，避免拆步后丢掉正文。 */
+    private void expandFromGraph(Set<String> set, TaskGraph graph) {
+        if (graph == null) return;
+        boolean browser = false;
+        boolean write = false;
+        for (TaskNode n : graph.nodes()) {
+            String cap = n.capability().toLowerCase(Locale.ROOT);
+            String name = n.name().toLowerCase(Locale.ROOT);
+            String hint = n.toolHint().toLowerCase(Locale.ROOT);
+            if (cap.contains("browser") || cap.contains("web")
+                    || hint.startsWith("browser_") || hint.contains("feishu")
+                    || name.contains("飞书") || name.contains("网页")
+                    || name.contains("打开"))
+                browser = true;
+            if (cap.contains("write") || cap.contains("deliver")
+                    || hint.contains("write") || name.contains("写")
+                    || name.contains("md"))
+                write = true;
+        }
+        if (browser) set.addAll(capabilityIndex.toolsFor("browser"));
+        if (write) {
+            set.addAll(capabilityIndex.toolsFor("file_write"));
+            set.addAll(capabilityIndex.toolsFor("file_read"));
+        }
     }
 
     /** 避免 ActionSpec 依赖 Map 工厂散落 */

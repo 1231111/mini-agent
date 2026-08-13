@@ -332,7 +332,7 @@
            ================================================================= */
         #messages {
             flex: 1; overflow-y: auto;
-            scroll-behavior: smooth;
+            scroll-behavior: auto;
         }
         #messages::-webkit-scrollbar { width: 6px; }
         #messages::-webkit-scrollbar-track { background: transparent; }
@@ -454,6 +454,8 @@
             top: 0;
             z-index: 5;
             box-shadow: 0 4px 16px rgba(0,0,0,.06);
+            max-height: 36vh;
+            overflow-y: auto;
         }
 
         /* ---- BOT message: card style with subtle background ---- */
@@ -1365,7 +1367,7 @@
     <div id="messages"></div>
 
     <!-- Scroll to bottom -->
-    <button id="scrollBtn" onclick="scrollToBottom(true)" title="滚动到底部">
+    <button id="scrollBtn" onclick="scrollToBottom(true, true)" title="滚动到底部">
         <svg fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
             <path d="M6 9l6 6 6-6"/>
         </svg>
@@ -1549,6 +1551,8 @@ let selectedRole = '';  // 当前选择的角色
 let permissionMode = localStorage.getItem('mini_agent_perm_mode') || 'default';
 let pendingAskTool = null;
 let isStreaming  = false;
+const SCROLL_BOTTOM_PX = 80;
+let stickToBottom = true;
 
 const $msg  = document.getElementById('messages');
 const $inp  = document.getElementById('msgInput');
@@ -1845,8 +1849,8 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeLight
    ========================================================================= */
 const $scrollBtn = document.getElementById('scrollBtn');
 $msg.addEventListener('scroll', () => {
-    const atBottom = $msg.scrollHeight - $msg.scrollTop - $msg.clientHeight < 80;
-    $scrollBtn.classList.toggle('visible', !atBottom);
+    stickToBottom = $msg.scrollHeight - $msg.scrollTop - $msg.clientHeight < SCROLL_BOTTOM_PX;
+    $scrollBtn.classList.toggle('visible', !stickToBottom);
 
     // Infinite scroll: load older messages when scrolling to top
     if ($msg.scrollTop < 100 && window._msgHasMore && !window._msgLoading && currentId) {
@@ -2155,7 +2159,9 @@ async function grantAskTool() {
     refreshPlanBanner();
 })();
 
-function scrollToBottom(smooth = false) {
+function scrollToBottom(smooth = false, force = false) {
+    if (!force && !stickToBottom) return;
+    stickToBottom = true;
     $msg.scrollTo({ top: $msg.scrollHeight, behavior: smooth ? 'smooth' : 'instant' });
 }
 
@@ -2277,9 +2283,9 @@ const WELCOME = `
    NEW CHAT / SWITCH CONVERSATION
    ========================================================================= */
 function startNewChat(doFocus = true) {
-    // 停止旧会话的轮询
     if (currentId) stopPolling(currentId);
     removeTaskRunningHint();
+    setStreaming(false);
     currentId = null;
     localStorage.removeItem(LS_CUR);
     $msg.innerHTML = WELCOME;
@@ -2287,8 +2293,10 @@ function startNewChat(doFocus = true) {
     if (doFocus) $inp.focus();
 }
 
-async function switchConv(id) {
-    if (id === currentId) return;
+async function switchConv(id, force) {
+    if (id === currentId && !force) return;
+    if (currentId && currentId !== id) stopPolling(currentId);
+    setStreaming(false);
     currentId = id;
     localStorage.setItem(LS_CUR, id);
     removeTaskRunningHint();
@@ -2366,7 +2374,7 @@ async function loadMoreMessages(sessionId, prepend) {
                     bindLightbox(bd.closest('.bot-row'));
                 }
             });
-            scrollToBottom();
+            scrollToBottom(false, true);
         }
     } catch (e) {
         console.warn('Failed to load messages:', e);
@@ -2411,7 +2419,7 @@ function renderConvMessages(id) {
             }
         });
     }
-    scrollToBottom();
+    scrollToBottom(false, true);
 }
 
 /* =========================================================================
@@ -2423,12 +2431,17 @@ function setStreaming(on) {
     onInputChange();
 }
 
+function unlockComposer() {
+    setStreaming(false);
+    removeTaskRunningHint();
+}
+
 async function appendUserMessage(text, sessionId) {
     renderUserMsg(text, null, 0, [], true);
     $inp.value = '';
     $inp.style.height = 'auto';
     onInputChange();
-    scrollToBottom();
+    scrollToBottom(false, true);
     try {
         const resp = await fetch('/api/chat/append-message', {
             method: 'POST',
@@ -2479,7 +2492,7 @@ function send() {
     $inp.value = '';
     $inp.style.height = 'auto';
     onInputChange();
-    scrollToBottom();
+    scrollToBottom(false, true);
 
     // Bot placeholder
     const botBody = renderBotMsg('<div class="typing-dots"><span></span><span></span><span></span></div>', true);
@@ -2531,6 +2544,7 @@ async function sendChatPost(text, sessionId, files, refs, botBody) {
 
         // 读 SSE 流
         await consumeStream(resp.body.getReader(), botBody, sessionId);
+        if (isStreaming) unlockComposer();
     } catch (err) {
         botBody.innerHTML = renderMD('❌ ' + err.message);
         botBody.classList.remove('streaming');
@@ -2545,6 +2559,9 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         const decoder = new TextDecoder('utf-8');
         let buffer = '', answer = '', done = false;
         let thinkText = '', thinkCollapsed = false;
+        const MAX_THINK_CHARS = 12000;
+        const MAX_TL_ROWS = 40;
+        let thinkPaintTimer = null;
         // 增量渲染的 DOM 引用与已渲染游标（避免每个 token 重建整棵子树导致闪烁）
         let cleared = false, panelEl = null, headLabelEl = null, thinkTextEl = null,
             timelineEl = null, answerEl = null;
@@ -2630,13 +2647,30 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         function appendActivity(text) {
             if (!text) return;
             ensureTimeline();
+            const key = String(text).replace(/[:：].*/, '').replace(/\s×\d+$/, '').trim();
+            const last = timelineEl.lastElementChild;
+            if (last && last.dataset && last.dataset.key === key) {
+                const n = (+last.dataset.n || 1) + 1;
+                last.dataset.n = String(n);
+                last.textContent = text + ' ×' + n;
+                return;
+            }
             const row = document.createElement('div');
             row.className = 'tl-activity';
             if (text.startsWith('✓')) row.classList.add('done');
             if (text.startsWith('✗')) row.classList.add('fail');
+            row.dataset.key = key;
+            row.dataset.n = '1';
             row.textContent = text;
             timelineEl.appendChild(row);
-            scrollToBottom();
+            while (timelineEl.children.length > MAX_TL_ROWS)
+                timelineEl.removeChild(timelineEl.firstChild);
+            if (!thinkPaintTimer) {
+                thinkPaintTimer = setTimeout(() => {
+                    thinkPaintTimer = null;
+                    scrollToBottom();
+                }, 120);
+            }
         }
         function finish(html) {
             if (done) return; done = true;
@@ -2806,14 +2840,21 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 removeTyping();
                 if (answer !== renderedAnswer) schedulePaintAnswer();
             }
-            scrollToBottom();
+            if (!thinkPaintTimer) {
+                thinkPaintTimer = setTimeout(() => {
+                    thinkPaintTimer = null;
+                    scrollToBottom();
+                }, 120);
+            }
         }
 
         function onEvent(name, data) {
             if (name === 'thinking') {
-                // 工具轮之后新思考：展开面板
                 if (thinkCollapsed && !answer) thinkCollapsed = false;
-                thinkText += data; paint();
+                thinkText += data;
+                if (thinkText.length > MAX_THINK_CHARS)
+                    thinkText = thinkText.slice(thinkText.length - MAX_THINK_CHARS);
+                paint();
             } else if (name === 'progress') {
                 // 工具开始/结束：追加时间线条，不再覆盖单行
                 appendActivity(typeof data === 'string' ? data : String(data || ''));
@@ -2850,8 +2891,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             } else if (name === 'user') {
                 renderUserEchoIfNeeded(botBody, data);
             } else if (name === 'gone') {
-                done = true;
-                if (sessionId === currentId) { switchConv(sessionId); }
+                // 通道没了：不在这里定稿，等读流结束后走 tryResumeOrFinish
             } else if (name === 'permission_ask') {
                 try {
                     const payload = typeof data === 'string' ? JSON.parse(data) : data;
@@ -2883,10 +2923,12 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             } catch (e) { /* 探测失败按未运行处理 */ }
 
             if (!stillRunning) {
-                // 任务已结束：当前流没拿到 end 多半因为缓冲驱逐，回退到数据库重载
                 if (answer) finish(renderMD(answer));
-                else if (sessionId === currentId) { done = true; switchConv(sessionId); }
-                else finish(renderMD('❌ 连接中断' + (err ? '：' + err.message : '')));
+                else if (sessionId === currentId) {
+                    done = true;
+                    unlockComposer();
+                    await switchConv(sessionId, true);
+                } else finish(renderMD('❌ 连接中断' + (err ? '：' + err.message : '')));
                 return;
             }
 
@@ -2900,7 +2942,11 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             } catch (e) {
                 console.warn('resume stream failed:', e);
                 if (answer) finish(renderMD(answer));
-                else { showTaskRunningHint(sessionId); startPolling(sessionId); }
+                else {
+                    unlockComposer();
+                    showTaskRunningHint(sessionId);
+                    startPolling(sessionId);
+                }
             }
         }
 
@@ -3216,7 +3262,7 @@ async function reconnectStream(sid) {
     try {
         const resp = await fetch('/chat/stream/attach?sessionId=' + encodeURIComponent(sid));
         if (!resp.ok || !resp.body) {
-            // 重连失败，回退到旧的轮询逻辑
+            unlockComposer();
             showTaskRunningHint(sid);
             startPolling(sid);
             return;
@@ -3224,8 +3270,10 @@ async function reconnectStream(sid) {
         setStreaming(true);
         const botBody = renderBotMsg('<div class="typing-dots"><span></span><span></span><span></span></div>', true);
         await consumeStream(resp.body.getReader(), botBody, sid);
+        if (isStreaming) unlockComposer();
     } catch (e) {
         console.warn('reconnectStream failed:', e);
+        unlockComposer();
         showTaskRunningHint(sid);
         startPolling(sid);
     }
@@ -3276,12 +3324,9 @@ function startPolling(sid) {
             const resp = await fetch('/api/task-status?sessionId=' + encodeURIComponent(sid));
             const status = await apiJson(resp) || {};
             if (!status.running) {
-                // 任务完成，停止轮询，重新加载会话
                 stopPolling(sid);
-                removeTaskRunningHint();
-                if (sid === currentId) {
-                    await switchConv(sid);
-                }
+                unlockComposer();
+                if (sid === currentId) await switchConv(sid, true);
             }
         } catch (e) {
             console.warn('poll error:', e);

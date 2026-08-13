@@ -144,7 +144,13 @@ public class RecoveryEngine {
                 yield working.replace(recovering.withToolHint(alt)
                         .withStatus(TaskNodeStatus.PENDING).withRetryInc());
             }
-            case REWRITE_GRAPH -> rewriteAround(working, recovering, dx);
+            case REWRITE_GRAPH -> {
+                String dw = recovering.doneWhen() == null ? "" : recovering.doneWhen();
+                if (dw.startsWith("file_exists:"))
+                    yield working.replace(
+                            recovering.withStatus(TaskNodeStatus.PENDING).withRetryInc());
+                yield rewriteAround(working, recovering, dx);
+            }
             case REVISE_GOAL -> working.replace(
                     recovering.withStatus(TaskNodeStatus.PENDING).withRetryInc());
         };

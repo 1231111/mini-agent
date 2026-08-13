@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.core.SessionEventCenter;
 import com.miniagent.agent.intent.TaskStep;
+import com.miniagent.agent.tool.BuiltinTools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -635,13 +636,12 @@ public class TaskTodoStore {
     }
 
     private static Path resolvePath(String path) {
-        String normalized = extractPathSpec(path);
+        String normalized = BuiltinTools.stripWorkspaceAlias(extractPathSpec(path));
         if (normalized.isEmpty()) return null;
         try {
             Path p = Path.of(normalized);
             if (p.isAbsolute()) return p.normalize();
-            return com.miniagent.agent.tool.BuiltinTools
-                    .effectiveWorkspaceRoot().resolve(normalized).normalize();
+            return BuiltinTools.effectiveWorkspaceRoot().resolve(normalized).normalize();
         } catch (Exception e) {
             return null;
         }

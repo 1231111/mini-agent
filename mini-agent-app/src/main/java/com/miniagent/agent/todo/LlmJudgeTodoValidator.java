@@ -92,7 +92,12 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
         try {
             Path p = Path.of(ev.replace('\\', '/'));
             if (!p.isAbsolute()) {
-                p = com.miniagent.agent.tool.BuiltinTools.effectiveWorkspaceRoot().resolve(ev).normalize();
+                String rel = com.miniagent.agent.tool.BuiltinTools.stripWorkspaceAlias(
+                        ev.replace('\\', '/'));
+                p = rel.isBlank()
+                        ? com.miniagent.agent.tool.BuiltinTools.effectiveWorkspaceRoot()
+                        : com.miniagent.agent.tool.BuiltinTools.effectiveWorkspaceRoot()
+                                .resolve(rel).normalize();
             }
             if (Files.isRegularFile(p)) {
                 return Files.readString(p, StandardCharsets.UTF_8);

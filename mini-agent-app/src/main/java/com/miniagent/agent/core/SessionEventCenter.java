@@ -39,6 +39,7 @@ import java.util.concurrent.TimeUnit;
 public class SessionEventCenter {
 
     private static final long DONE_TTL_MS = 120_000L;
+    private static final int THINK_BUFFER_MAX_CHARS = 16_000;
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String SSE_PREFIX = "sse:";
     private static final String PENDING_USER_MSG_PREFIX = "pending-user-msg:";
@@ -388,7 +389,12 @@ public class SessionEventCenter {
 
     private static void applyEvent(SessionChannel channel, String name, String text) {
         switch (name) {
-            case "thinking" -> channel.think.append(text);
+            case "thinking" -> {
+                channel.think.append(text);
+                int max = THINK_BUFFER_MAX_CHARS;
+                if (channel.think.length() > max)
+                    channel.think.delete(0, channel.think.length() - max);
+            }
             case "token" -> channel.answer.append(text);
             // seal/reset：正文留给前端归档进时间线；服务端缓冲保留供重连，不再抹掉
             case "reset", "seal" -> { }

@@ -8,7 +8,10 @@ import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.agent.trace.TraceRecorder;
 import com.miniagent.application.PromptTemplates;
+import com.miniagent.memory.MemoryManager;
 import com.miniagent.memory.MemoryStore;
+import com.miniagent.memory.model.AgentContext;
+import com.miniagent.memory.model.MemoryContext;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.UserMessage;
@@ -42,6 +45,8 @@ public class ContextLoader {
 
     @Autowired
     private MemoryStore memoryStore;
+    @Autowired(required = false)
+    private MemoryManager memoryManager;
     @Autowired
     private SkillStore skillStore;
     @Autowired
@@ -208,6 +213,23 @@ public class ContextLoader {
             parts.add(memoryBlock);
         }
 
+        // 注入 Agent 记忆系统上下文（情景记忆、语义事实、SOP、工作记忆）
+        if (memoryManager != null && Objects.nonNull(sessionId)) {
+            try {
+                AgentContext agentCtx = new AgentContext();
+                agentCtx.setTenantId("default");
+                agentCtx.setUserId(String.valueOf(MemoryStore.getCurrentUser()));
+                agentCtx.setSessionId(sessionId);
+                agentCtx.setGoal(currentQuery);
+                MemoryContext memCtx = memoryManager.buildContext(agentCtx);
+                if (memCtx != null && !memCtx.isEmpty()) {
+                    parts.add(buildAgentMemoryBlock(memCtx));
+                }
+            } catch (Exception e) {
+                log.debug("Agent 记忆注入失败: {}", e.getMessage());
+            }
+        }
+
         if (policy.injectSkills()) {
             String skillSummary = skillStore.getSkillListSummary();
             if (StringUtils.isNotBlank(skillSummary)) {
@@ -276,5 +298,52 @@ public class ContextLoader {
         } catch (Exception e) {
             return Collections.emptySet();
         }
+    }
+
+    /** 将 Agent 记忆上下文格式化为 system prompt 片段 */
+    private String buildAgentMemoryBlock(MemoryContext ctx) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("## Agent 记忆\n");
+
+        if (ctx.getWorkingMemory() != null && ctx.getWorkingMemory().getGoal() != null) {
+            sb.append("当前任务: ").append(ctx.getWorkingMemory().getGoal()).append("\n");
+            if (ctx.getWorkingMemory().getCurrentTaskId() != null) {
+                sb.append("当前步骤: ").append(ctx.getWorkingMemory().getCurrentTaskId()).append("\n");
+            }
+        }
+
+        if (!ctx.getFacts().isEmpty()) {
+            sb.append("\n已知事实:\n");
+            for (String f : ctx.getFacts()) {
+                sb.append("- ").append(f).append("\n");
+            }
+        }
+
+        if (!ctx.getEpisodes().isEmpty()) {
+            sb.append("\n历史经验:\n");
+            for (var ep : ctx.getEpisodes()) {
+                sb.append("- ").append(ep.getTaskSummary());
+                if (ep.getResolution() != null) {
+                    sb.append(" → ").append(ep.getResolution());
+                }
+                sb.append("\n");
+            }
+        }
+
+        if (!ctx.getSkills().isEmpty()) {
+            sb.append("\n可用方法:\n");
+            for (String s : ctx.getSkills()) {
+                sb.append("- ").append(s).append("\n");
+            }
+        }
+
+        if (!ctx.getPreferences().isEmpty()) {
+            sb.append("\n用户偏好:\n");
+            for (String p : ctx.getPreferences()) {
+                sb.append("- ").append(p).append("\n");
+            }
+        }
+
+        return sb.toString().trim();
     }
 }

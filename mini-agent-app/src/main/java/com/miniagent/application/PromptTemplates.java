@@ -141,8 +141,17 @@ public final class PromptTemplates {
 
     public static final String BROWSER_GUIDANCE = """
 
-            browser_navigate 后先调 browser_snapshot 获取元素列表，再用 ref ID 操作。
-            需要视觉判断时用 browser_vision。动态内容加载后重新 snapshot。
+            browser_navigate 后立刻 browser_snapshot 再操作 ref。
+            密码页用 browser_type 填密码，再 browser_press Enter 或点确认按钮。
+            没有 browser_vision。点超时或元素在视口外：用 browser_evaluate 执行 click，
+            不要连点三次。飞书 wiki 常是知识空间首页：点目录章节，滚动加载后再提取。
+            禁止反复 browser_navigate 同一 wiki 链接（会回到首页）。
+            拿到 innerText 或 block 文本后立刻 write_file，禁止 substring 截断试探。
+            飞书文档虚拟滚动，innerText 只有视口几百字：
+            有 window.DATA.block_map 就转 md 并写入，
+            不要为 has_more / next_cursors 连滚十几轮。
+            不要并行调用多个 browser_*。
+            点不动就换 by=css / by=text，不要编造工具名。
             """;
 
     public static final String WEB_SEARCH_GUIDANCE = """

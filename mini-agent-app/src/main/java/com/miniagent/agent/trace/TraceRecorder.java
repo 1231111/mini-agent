@@ -22,6 +22,8 @@ public class TraceRecorder {
 
     @Autowired
     private AgentTraceStepRepository repo;
+    @Autowired(required = false)
+    private TraceSseHub traceSseHub;
 
     private final ThreadLocal<String> currentSessionId = new ThreadLocal<>();
     private final ThreadLocal<String> currentExecutionId = new ThreadLocal<>();
@@ -103,9 +105,21 @@ public class TraceRecorder {
                 null, null, 0, 0, RunStatus.RUNNING.name(), 0));
     }
 
+    /** 纯文本失败（点击超时、未知工具）也记 TOOL_ERROR，否则轨迹全是成功。 */
+    public static boolean isFailedResult(String result) {
+        if (result == null || result.isBlank()) return false;
+        return result.contains("\"error\"")
+                || result.contains("\"success\":false")
+                || result.contains("未知工具")
+                || result.contains("点击失败")
+                || result.contains("TimeoutError")
+                || result.contains("Timeout ");
+    }
+
     public void recordToolResult(String sessionId, int turn, String toolName, String result, long durationMs, String status) {
-        boolean fail = RunStatus.FAILURE.name().equalsIgnoreCase(status) || RunStatus.TIMEOUT.name().equalsIgnoreCase(status)
-                || (result != null && (result.contains("\"error\"") || result.contains("\"success\":false")));
+        boolean fail = RunStatus.FAILURE.name().equalsIgnoreCase(status)
+                || RunStatus.TIMEOUT.name().equalsIgnoreCase(status)
+                || isFailedResult(result);
         String type = fail ? AgentStepNode.TOOL_ERROR.name() : AgentStepNode.TOOL_RESULT.name();
         save(build(sessionId, turn, type, toolName, null,
                 truncate(result, 8000), null, 0, 0,
@@ -262,7 +276,9 @@ public class TraceRecorder {
             if (StringUtils.isBlank(step.getExecutionId())) {
                 step.setExecutionId("orphan_" + System.currentTimeMillis());
             }
-            return repo.save(step);
+            AgentTraceStep saved = repo.save(step);
+            if (traceSseHub != null) traceSseHub.publish(saved);
+            return saved;
         } catch (Exception e) {
             log.warn("TraceRecorder 写入失败: {}", e.getMessage());
             return step;

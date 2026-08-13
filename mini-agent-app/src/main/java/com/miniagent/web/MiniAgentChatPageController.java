@@ -56,6 +56,10 @@ public class MiniAgentChatPageController {
     @Autowired
     private  AgentChatApplicationService agentService;
     @Autowired
+    private  com.miniagent.application.ConversationService conversationService;
+    @Autowired
+    private  com.miniagent.application.ChatStreamingService streamingService;
+    @Autowired
     private  AuthService authService;
     @Autowired
     private  FileStorageService fileStorageService;
@@ -67,6 +71,8 @@ public class MiniAgentChatPageController {
     private  ChatTaskRepository chatTaskRepository;
     @Autowired
     private  AgentTraceStepRepository agentTraceStepRepository;
+    @Autowired
+    private  com.miniagent.agent.trace.TraceSseHub traceSseHub;
     @Autowired
     private  com.miniagent.agent.core.SessionEventCenter eventCenter;
     @Autowired
@@ -213,7 +219,7 @@ public class MiniAgentChatPageController {
         if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(message)) {
             return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "sessionId and message required");
         }
-        if (!ownsSession(userId, sessionId) && !agentService.isTaskRunning(sessionId)) {
+        if (!ownsSession(userId, sessionId) && !streamingService.isTaskRunning(sessionId)) {
             return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN);
         }
         boolean ok = eventCenter.appendUserMessage(sessionId, message);
@@ -306,10 +312,10 @@ public class MiniAgentChatPageController {
                                                        HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
         if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
-        if (!ownsSession(userId, sessionId) && !agentService.isTaskRunning(sessionId)) {
+        if (!ownsSession(userId, sessionId) && !streamingService.isTaskRunning(sessionId)) {
             return ApiResponse.ok(Map.of("sessionId", sessionId, "running", false));
         }
-        boolean running = agentService.isTaskRunning(sessionId);
+        boolean running = streamingService.isTaskRunning(sessionId);
         return ApiResponse.ok(Map.of("sessionId", sessionId, "running", running));
     }
 
@@ -331,7 +337,7 @@ public class MiniAgentChatPageController {
             }
             return emitter;
         }
-        if (!ownsSession(userId, sessionId) && !agentService.isTaskRunning(sessionId)) {
+        if (!ownsSession(userId, sessionId) && !streamingService.isTaskRunning(sessionId)) {
             SseEmitter emitter = new SseEmitter(0L);
             try {
                 emitter.send(SseEmitter.event().name("error").data("Forbidden"));
@@ -342,7 +348,7 @@ public class MiniAgentChatPageController {
             return emitter;
         }
         // 服务层已处理：建 emitter、挂载（重放+实时）、无通道时发 gone
-        return agentService.attachStream(sessionId);
+        return streamingService.attachStream(sessionId);
     }
 
     @GetMapping(value = "/api/conversations", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -364,7 +370,7 @@ public class MiniAgentChatPageController {
                                                HttpServletRequest request) {
         Long userId = getUserIdFromCookie(request);
         if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
-        var conv = agentService.getConversationForUser(userId, sessionId);
+        var conv = conversationService.getConversationForUser(userId, sessionId);
         if (Objects.isNull(conv)) {
             return ApiResponse.ok(Map.of("exists", false, "sessionId", sessionId));
         }
@@ -429,7 +435,7 @@ public class MiniAgentChatPageController {
             return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN);
         }
         chatTaskRepository.deleteByUserIdAndSessionId(userId, sessionId);
-        agentService.deleteConversationForUser(userId, sessionId);
+        conversationService.deleteConversationForUser(userId, sessionId);
         return ApiResponse.ok();
     }
 
@@ -460,6 +466,29 @@ public class MiniAgentChatPageController {
             return "login";
         }
         return "trace";
+    }
+
+    /** 轨迹页实时推送：落库一步推一步，替代前端轮询 */
+    @GetMapping(value = "/api/traces/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamTraces(@RequestParam("sessionId") String sessionId,
+                                   HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (Objects.isNull(userId))
+            return rejectTraceSse(MessageConstants.SSE_NOT_AUTHENTICATED);
+        if (StringUtils.isBlank(sessionId) || !ownsSession(userId, sessionId))
+            return rejectTraceSse(MessageConstants.SSE_FORBIDDEN);
+        return traceSseHub.attach(sessionId);
+    }
+
+    private static SseEmitter rejectTraceSse(String message) {
+        SseEmitter emitter = new SseEmitter(0L);
+        try {
+            emitter.send(SseEmitter.event().name("error").data(message));
+            emitter.complete();
+        } catch (Exception e) {
+            emitter.completeWithError(e);
+        }
+        return emitter;
     }
 
     /** Agent 节点全集目录（与 AgentStepNode 同步） */

@@ -10,6 +10,7 @@ import java.util.regex.Pattern;
 import java.util.Objects;
 import java.util.Optional;
 import org.apache.commons.lang3.StringUtils;
+import com.miniagent.agent.tool.BuiltinTools;
 
 /**
  * 语义层验收（双轨制第二轨）：在 file_exists / media 等存在性检查通过后，
@@ -152,7 +153,9 @@ public final class TodoSemanticValidator {
         try {
             Path p = Path.of(normalized);
             if (!p.isAbsolute()) {
-                p = com.miniagent.agent.tool.BuiltinTools.effectiveWorkspaceRoot().resolve(normalized).normalize();
+                String rel = BuiltinTools.stripWorkspaceAlias(normalized);
+                if (rel.isBlank()) return BuiltinTools.effectiveWorkspaceRoot();
+                p = BuiltinTools.effectiveWorkspaceRoot().resolve(rel).normalize();
             }
             return p.normalize();
         } catch (Exception e) {

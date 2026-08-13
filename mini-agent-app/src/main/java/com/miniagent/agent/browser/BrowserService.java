@@ -9,6 +9,7 @@ import com.miniagent.common.MessageConstants;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
@@ -20,6 +21,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.Objects;
 import org.apache.commons.lang3.StringUtils;
 
@@ -37,13 +39,18 @@ public class BrowserService {
 
     /** 与 mini-agent-app/pom.xml 中 playwright 依赖版本一致，用于在 classpath 未展开时定位 jar */
     private static final String PLAYWRIGHT_MAVEN_VERSION = "1.49.0";
+    private static final int CLICK_TIMEOUT_MS = 2000;
 
     private Playwright playwright;
     private Browser browser;
     private final Map<String, Page> pages = new ConcurrentHashMap<>();
+    private final ReentrantLock pageLock = new ReentrantLock();
 
     @Autowired
     private NetworkGuard networkGuard;
+
+    @Value("${agent.browser.headless:true}")
+    private boolean headless;
 
     /**
      * 确保浏览器实例已启动（懒初始化）
@@ -57,10 +64,8 @@ public class BrowserService {
         }
         if (Objects.isNull(browser)) {
             browser = playwright.chromium().launch(
-                    new BrowserType.LaunchOptions()
-                            .setHeadless(false)    // 改为有头模式，可见浏览器窗口
-                            .setSlowMo(200));       // 放慢操作，方便观察
-            log.info("浏览器已启动 (有头 Chromium)");
+                    new BrowserType.LaunchOptions().setHeadless(headless));
+            log.info("浏览器已启动 (headless={})", headless);
         }
     }
 
@@ -374,10 +379,18 @@ public class BrowserService {
      * 打开网页
      */
     public String navigate(String sessionId, String url) {
+        pageLock.lock();
         try {
             String blocked = networkGuard.validateUrl(url);
             if (Objects.nonNull(blocked)) return blocked;
             Page page = getPage(sessionId);
+            if (sameDocPath(page.url(), url)) {
+                String title = page.title();
+                String snapshot = page.locator("body").ariaSnapshot();
+                log.info("已在该页，跳过重新导航: {}", url);
+                return "已在该页，未重新加载（避免飞书 wiki 回到首页）。标题: "
+                        + title + "\n\n" + formatSnapshot(snapshot);
+            }
             page.navigate(url, new Page.NavigateOptions()
                     .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
                     .setTimeout(15000));
@@ -391,6 +404,8 @@ public class BrowserService {
         } catch (Exception e) {
             log.error("导航失败: {}", url, e);
             return String.format(MessageConstants.BROWSER_NAV_FAILED, e.getMessage());
+        } finally {
+            pageLock.unlock();
         }
     }
 
@@ -398,11 +413,10 @@ public class BrowserService {
      * 获取页面无障碍树快照
      */
     public String snapshot(String sessionId, boolean full) {
+        pageLock.lock();
         try {
             Page page = getPage(sessionId);
             String snapshot;
-            // Playwright 1.49：AriaSnapshotOptions 仅有 setTimeout，无 setDepth/setMode（高版本才有）。
-            // full=true 时用更长超时，避免大型页面无障碍树生成超时。
             if (full) {
                 snapshot = page.locator("body").ariaSnapshot(
                         new AriaSnapshotOptions().setTimeout(120_000));
@@ -414,6 +428,8 @@ public class BrowserService {
         } catch (Exception e) {
             log.error("获取快照失败", e);
             return String.format(MessageConstants.BROWSER_SNAPSHOT_FAILED, e.getMessage());
+        } finally {
+            pageLock.unlock();
         }
     }
 
@@ -427,6 +443,7 @@ public class BrowserService {
     public String click(String sessionId, String ref, String by) {
         if (StringUtils.isBlank(ref)) return MessageConstants.BROWSER_CLICK_FAILED_EMPTY_REF;
         String mode = StringUtils.isBlank(by) ? "auto" : by.trim().toLowerCase(Locale.ROOT);
+        pageLock.lock();
         try {
             Page page = getPage(sessionId);
             boolean numeric = ref.chars().allMatch(Character::isDigit);
@@ -448,6 +465,8 @@ public class BrowserService {
         } catch (Exception e) {
             log.error("点击失败: ref={} by={}", ref, mode, e);
             return String.format(MessageConstants.BROWSER_CLICK_FAILED, ref, mode, e.getMessage());
+        } finally {
+            pageLock.unlock();
         }
     }
 
@@ -491,10 +510,36 @@ public class BrowserService {
     }
 
     private String clickAndSnap(Page page, Locator locator, String strategy, String label) {
-        locator.click(new Locator.ClickOptions().setTimeout(5000));
-        page.waitForTimeout(1500);
+        try {
+            locator.scrollIntoViewIfNeeded();
+        } catch (Exception ignored) {}
+        try {
+            locator.click(new Locator.ClickOptions().setTimeout(CLICK_TIMEOUT_MS));
+        } catch (Exception clickEx) {
+            try {
+                locator.evaluate("el => el.click()");
+                log.info("click 超时，已改 JS click: {}", label);
+            } catch (Exception jsEx) {
+                throw clickEx;
+            }
+        }
+        page.waitForTimeout(400);
         return String.format(MessageConstants.BROWSER_CLICK_SUCCESS, strategy, label) + "\n\n"
                 + formatSnapshot(page.locator("body").ariaSnapshot());
+    }
+
+    static boolean sameDocPath(String currentUrl, String targetUrl) {
+        return normPath(currentUrl).equals(normPath(targetUrl));
+    }
+
+    private static String normPath(String url) {
+        if (url == null || url.isBlank()) return "";
+        try {
+            String p = java.net.URI.create(url.trim()).getPath();
+            return p == null ? url : p;
+        } catch (Exception e) {
+            return url;
+        }
     }
 
     private static AriaRole parseAriaRole(String raw) {
@@ -640,6 +685,7 @@ public class BrowserService {
      * 截图
      */
     public String screenshot(String sessionId) {
+        pageLock.lock();
         try {
             Page page = getPage(sessionId);
             String path = "screenshot_" + sessionId + ".png";
@@ -649,6 +695,8 @@ public class BrowserService {
             return String.format(MessageConstants.BROWSER_SCREENSHOT_SAVED, path);
         } catch (Exception e) {
             return String.format(MessageConstants.BROWSER_SCREENSHOT_FAILED, e.getMessage());
+        } finally {
+            pageLock.unlock();
         }
     }
 
@@ -668,12 +716,16 @@ public class BrowserService {
      * 在页面执行 JavaScript
      */
     public String evaluate(String sessionId, String expression) {
+        pageLock.lock();
         try {
             Page page = getPage(sessionId);
             Object result = page.evaluate(expression);
-            return String.format(MessageConstants.BROWSER_EVAL_RESULT, Objects.nonNull(result) ? result.toString() : "null");
+            return String.format(MessageConstants.BROWSER_EVAL_RESULT,
+                    Objects.nonNull(result) ? result.toString() : "null");
         } catch (Exception e) {
             return String.format(MessageConstants.BROWSER_EVAL_FAILED, e.getMessage());
+        } finally {
+            pageLock.unlock();
         }
     }
 

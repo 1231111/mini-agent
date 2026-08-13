@@ -39,7 +39,9 @@ public class StepEvaluator {
         String doneWhen = node.doneWhen() == null ? "" : node.doneWhen().trim();
         String ev = StringUtils.isNotBlank(evidence) ? evidence.trim()
                 : (toolResult == null ? "" : toolResult.trim());
-        if (looksLikeToolError(ev))
+        boolean worldCheck = doneWhen.regionMatches(true, 0, "file_exists:", 0, 12)
+                || "media_delivered".equalsIgnoreCase(doneWhen);
+        if (!worldCheck && (looksLikeToolError(ev) || looksLikeLoopAbort(ev)))
             return reject("tool error: " + abbreviate(ev, 200));
 
         if (doneWhen.regionMatches(true, 0, "llm_judge:", 0, "llm_judge:".length())) {
@@ -66,9 +68,13 @@ public class StepEvaluator {
 
     /** todo 已 completed 时：strict 下仍对 file_exists/media/llm_judge 复验 evidence */
     public EvalResult evaluateAfterLoop(TaskNode node, boolean todoCompleted, String evidence) {
+        String dw = node == null || node.doneWhen() == null ? "" : node.doneWhen().trim();
+        boolean worldCheck = dw.startsWith("file_exists:")
+                || "media_delivered".equalsIgnoreCase(dw);
+        if (!worldCheck && looksLikeLoopAbort(evidence))
+            return reject("loop abort: " + abbreviate(evidence, 120));
         if (todoCompleted && !properties.isStrictEval()) return EvalResult.pass();
         if (todoCompleted && properties.isStrictEval()) {
-            String dw = node == null || node.doneWhen() == null ? "" : node.doneWhen().trim();
             if (dw.startsWith("file_exists:") || "media_delivered".equalsIgnoreCase(dw)
                     || dw.regionMatches(true, 0, "llm_judge:", 0, "llm_judge:".length()))
                 return evaluate(node, evidence, evidence);
@@ -89,6 +95,12 @@ public class StepEvaluator {
         return t.contains("\"error\"") || t.startsWith("错误") || t.startsWith("未知工具")
                 || t.contains("tool execution error") || t.contains("timeout")
                 || t.contains("planner 硬闸门");
+    }
+
+    static boolean looksLikeLoopAbort(String s) {
+        if (s == null || s.isBlank()) return false;
+        return s.contains("达到最大迭代") || s.contains("任务轮次已达上限")
+                || s.contains("MAX_ITERATIONS");
     }
 
     private static String abbreviate(String s, int max) {

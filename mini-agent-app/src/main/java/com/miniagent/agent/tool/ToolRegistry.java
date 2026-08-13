@@ -73,7 +73,8 @@ public class ToolRegistry {
     public String execute(String toolName, String argumentsJson) {
         Tool tool = tools.get(toolName);
         if (Objects.isNull(tool)) {
-            return "未知工具: " + toolName + "。可用工具: " + availableToolNames();
+            return "{\"error\":\"未知工具: " + toolName
+                    + "。可用工具: " + availableToolNames() + "\"}";
         }
         // 延迟脱敏：只在 INFO 日志启用时执行正则替换
         if (log.isInfoEnabled()) {

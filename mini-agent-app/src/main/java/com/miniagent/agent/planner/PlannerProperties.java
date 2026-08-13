@@ -17,6 +17,8 @@ public class PlannerProperties {
     private int maxRecoveries = 3;
     private int proposalBatchSize = 1;
     private int proposalMaxIterations = 8;
+    /** 同一节点配额用尽后最多续跑几段（含第一段） */
+    private int proposalMaxChunks = 6;
     private int compilerRetry = 1;
     private int maxOuterRounds = 24;
     /** Proposal 硬闸门：锁定工具面 + 禁止改其它 todo */
@@ -52,6 +54,11 @@ public class PlannerProperties {
     public int getProposalMaxIterations() { return proposalMaxIterations; }
     public void setProposalMaxIterations(int proposalMaxIterations) {
         this.proposalMaxIterations = proposalMaxIterations;
+    }
+
+    public int getProposalMaxChunks() { return proposalMaxChunks; }
+    public void setProposalMaxChunks(int proposalMaxChunks) {
+        this.proposalMaxChunks = proposalMaxChunks;
     }
 
     public int getCompilerRetry() { return compilerRetry; }

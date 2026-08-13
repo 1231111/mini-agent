@@ -25,7 +25,9 @@ public class ToolCapabilityIndex {
             Map.entry("file", List.of("write_file", "read_file", "edit_file", "list_files")),
             Map.entry("web", List.of("web_search", "web_extract", "http_get")),
             Map.entry("browser", List.of(
-                    "browser_navigate", "browser_snapshot", "browser_click", "browser_type")),
+                    "browser_navigate", "browser_snapshot", "browser_click",
+                    "browser_type", "browser_press", "browser_evaluate",
+                    "browser_scroll")),
             Map.entry("image", List.of(
                     "image_generate", "comfyui_txt2img", "comfyui_img2img", "comfyui_models")),
             Map.entry("code", List.of(
@@ -91,5 +93,15 @@ public class ToolCapabilityIndex {
             out.removeIf(t -> !registered.contains(t));
         if (out.isEmpty()) out.add("todo");
         return new ArrayList<>(out);
+    }
+
+    public boolean containsTool(String name) {
+        if (name == null || name.isBlank()) return false;
+        rebuild();
+        Set<String> registered = toolRegistry.getToolNames();
+        if (!registered.isEmpty()) return registered.contains(name);
+        for (Set<String> s : index.values())
+            if (s.contains(name)) return true;
+        return false;
     }
 }

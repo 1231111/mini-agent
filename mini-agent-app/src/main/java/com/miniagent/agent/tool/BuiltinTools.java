@@ -433,9 +433,13 @@ public class BuiltinTools {
      */
     private Path resolveSearchPath(String path) {
         String normalized = path.replace('\\', '/').trim();
+        if (normalized.equalsIgnoreCase("workspace")
+                || normalized.regionMatches(true, 0, "workspace/", 0, 10))
+            return resolveWorkspacePath(path);
         Path p = Path.of(normalized);
         if (p.isAbsolute()) return p.normalize();
-        return Path.of(System.getProperty("user.dir")).toAbsolutePath().resolve(normalized).normalize();
+        return Path.of(System.getProperty("user.dir")).toAbsolutePath()
+                .resolve(normalized).normalize();
     }
 
     /** 把 glob（*.java、*.{ts,tsx}）转成文件名正则；null/空返回 null（不过滤）。 */
@@ -1067,34 +1071,56 @@ public class BuiltinTools {
     }
 
     /**
-     * 解析路径（写入）：默认强制落在 workspace/ 下；绝对路径仅当 allow-absolute-write=true。
+     * 提示词 / done_when 里的 {@code workspace/} 是数据目录别名，
+     * 不是进程 CWD 下的相对路径。
+     */
+    public static String stripWorkspaceAlias(String path) {
+        if (path == null) return "";
+        String n = path.replace('\\', '/').trim();
+        while (n.startsWith("./")) n = n.substring(2);
+        if (n.equalsIgnoreCase("workspace")) return "";
+        if (n.regionMatches(true, 0, "workspace/", 0, 10)) return n.substring(10);
+        return n;
+    }
+
+    /**
+     * 解析路径（写入）：默认强制落在真实 workspace 根下。
+     * {@code workspace/foo.md} → {@code {dataDir}/workspace/foo.md}。
      */
     private Path resolveWorkspacePath(String path) {
-        Path workspaceRoot = effectiveWorkspaceRoot();
         String task = com.miniagent.agent.core.WorkspaceContext.getTaskOverride();
         if (StringUtils.isBlank(task)) task = currentTaskName.get();
-        if (StringUtils.isBlank(path)) {
-            return workspaceRoot.resolve(task).normalize();
-        }
+        return resolveWritePath(effectiveWorkspaceRoot(), task, path, allowAbsoluteWrite);
+    }
+
+    static Path resolveWritePath(Path workspaceRoot, String task, String path,
+                                 boolean allowAbsolute) {
+        Path root = workspaceRoot.toAbsolutePath().normalize();
+        if (StringUtils.isBlank(path)) return root.resolve(task).normalize();
         String normalized = path.replace('\\', '/').trim();
         while (normalized.startsWith("./")) normalized = normalized.substring(2);
-        Path p = Path.of(normalized);
+        boolean aliased = normalized.equalsIgnoreCase("workspace")
+                || normalized.regionMatches(true, 0, "workspace/", 0, 10);
         Path resolved;
-        if (p.isAbsolute()) {
-            if (!allowAbsoluteWrite) {
-                throw new SecurityException("禁止绝对路径写入（agent.tools.allow-absolute-write=false）: " + path);
-            }
-            resolved = p.normalize();
-        } else if (normalized.startsWith("workspace/") || normalized.equals("workspace")) {
-            resolved = Path.of(".").toAbsolutePath().resolve(normalized).normalize();
-        } else if (Objects.isNull(p.getParent())) {
-            resolved = workspaceRoot.resolve(task).resolve(p).normalize();
+        if (aliased) {
+            String rest = stripWorkspaceAlias(normalized);
+            resolved = rest.isEmpty() ? root : root.resolve(rest).normalize();
         } else {
-            resolved = workspaceRoot.resolve(p).normalize();
+            Path p = Path.of(normalized);
+            if (p.isAbsolute()) {
+                if (!allowAbsolute)
+                    throw new SecurityException(
+                            "禁止绝对路径写入（agent.tools.allow-absolute-write=false）: "
+                                    + path);
+                resolved = p.normalize();
+            } else if (Objects.isNull(p.getParent())) {
+                resolved = root.resolve(task).resolve(p).normalize();
+            } else {
+                resolved = root.resolve(p).normalize();
+            }
         }
-        if (!resolved.startsWith(workspaceRoot) && !allowAbsoluteWrite) {
+        if (!resolved.startsWith(root) && !allowAbsolute)
             throw new SecurityException("写入路径必须位于 workspace/ 内: " + resolved);
-        }
         return resolved;
     }
 
@@ -1112,10 +1138,11 @@ public class BuiltinTools {
      *   3. 都不存在 → 退回 {@link #resolveWorkspacePath}，保留读取自身产出物的原有语义。
      */
     private Path resolveReadPath(String path) {
-        if (StringUtils.isBlank(path)) {
-            return resolveWorkspacePath(path);
-        }
+        if (StringUtils.isBlank(path)) return resolveWorkspacePath(path);
         String normalized = path.replace('\\', '/').trim();
+        if (normalized.equalsIgnoreCase("workspace")
+                || normalized.regionMatches(true, 0, "workspace/", 0, 10))
+            return resolveWorkspacePath(path);
         Path p = Path.of(normalized);
         if (p.isAbsolute()) return p.normalize();
 
