@@ -2267,6 +2267,9 @@ function refreshConfirmBanner() {
                 + ' 需要确认：' + pendingTodoConfirm.content;
         }
     }
+    document.querySelectorAll('.todo-confirm-btn').forEach(btn => {
+        btn.disabled = !!isStreaming;
+    });
 }
 function confirmPendingTodo() {
     if (!pendingTodoConfirm) return;
