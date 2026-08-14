@@ -42,7 +42,8 @@ public class TodoTool {
                         - 复杂任务必须先 action=set；每步必须含 done_when。
                         - 默认后一步 depends_on 前一步；可显式设 depends_on:[1,2] 或 depends_on:[]（无依赖/可并行）。
                         - completed 会做存在性 + 可插拔语义校验；依赖未满足或上游 hash 失效会拒绝。
-                        - 关键步（依赖数>2 或交付/上线类）会进入 awaiting_confirm，必须 action=confirm 后才能执行。
+                        - 危险操作确认策略下，上线/删除等步骤会进入 awaiting_confirm，
+                          页面确认或 action=confirm 后才能执行。
                         - action=reopen 回滚 completed/blocked，并级联重置下游为 pending。
                         - 工具连败会 blocked；不要编造 completed。
                         - done_when：file_exists:… | media_delivered | note_required | llm_judge:评判标准

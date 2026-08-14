@@ -87,6 +87,10 @@ public class PlanningLoop {
     }
 
     public boolean shouldHandle(TaskPlan plan) {
+        return shouldHandle(plan, null);
+    }
+
+    public boolean shouldHandle(TaskPlan plan, String sessionId) {
         if (!properties.isEnabled() || plan == null || plan.intent() == null) {
             return false;
         }
@@ -96,7 +100,12 @@ public class PlanningLoop {
                 return false;
             }
         }
-        return plan.requiresStructuredPlan();
+        if (plan.requiresStructuredPlan()) {
+            return true;
+        }
+        return stateStore.hasIncompleteGraph(sessionId)
+                && (plan.intent() == IntentType.CONTINUE_TASK
+                || stateStore.peekResume(sessionId));
     }
 
     public String run(ChatModel chat,
@@ -109,7 +118,7 @@ public class PlanningLoop {
                       String executionId,
                       Consumer<String> progress,
                       AgentStreamSink streamSink) {
-        if (!shouldHandle(taskPlan)) {
+        if (!shouldHandle(taskPlan, sessionId)) {
             if (multimodalUser != null)
                 return agentLoop.runWithMultimodal(chat, systemPrompt, multimodalUser, history,
                         90, progress, taskPlan, streamSink);
@@ -120,10 +129,13 @@ public class PlanningLoop {
         GoalCompiler.CompileResult compiled;
         StateSnapshot snap;
         var existing = stateStore.get(sessionId);
-        if (existing.isPresent()
-                && taskPlan.intent() == IntentType.CONTINUE_TASK
+        boolean resume = existing.isPresent()
+                && !existing.get().graph().isEmpty()
                 && !existing.get().graph().allTerminalSuccess()
-                && !existing.get().graph().isEmpty()) {
+                && (taskPlan.intent() == IntentType.CONTINUE_TASK
+                || stateStore.peekResume(sessionId));
+        if (resume) {
+            stateStore.clearResume(sessionId);
             snap = existing.get();
             compiled = new GoalCompiler.CompileResult(snap.goal(), snap.graph(), false);
             log.info("PlanningLoop 续跑已有图 session={} version={} nodes={}",
@@ -178,7 +190,7 @@ public class PlanningLoop {
             if (ready.isEmpty()) {
                 if (snap.graph().hasAwaitingConfirm()) {
                     log.info("PlanningLoop 等待人工 confirm session={}", sessionId);
-                    return "关键步骤等待确认：请对 awaiting_confirm 的 todo 执行 action=confirm 后继续。";
+                    return "关键步骤等待确认：请在页面点击「确认并继续」。";
                 }
                 log.warn("PlanningLoop 无 ready 节点且未全部成功，尝试 REWRITE session={}", sessionId);
                 TaskNode stuck = firstNonSuccess(snap.graph());

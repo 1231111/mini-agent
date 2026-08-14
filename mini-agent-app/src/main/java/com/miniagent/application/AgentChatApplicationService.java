@@ -355,7 +355,7 @@ public class AgentChatApplicationService {
         try {
             String executionId = Objects.nonNull(traceRecorder)
                     ? traceRecorder.currentExecutionId() : null;
-            if (planningLoop.shouldHandle(taskPlan)) {
+            if (planningLoop.shouldHandle(taskPlan, sessionId)) {
                 answer = planningLoop.run(effectiveChat, systemPrompt, userMessage, multimodalMsg,
                         history, taskPlan, sessionId, executionId, progress, streamSink);
             } else if (hasMedia) {

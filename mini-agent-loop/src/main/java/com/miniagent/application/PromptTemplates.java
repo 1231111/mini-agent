@@ -210,8 +210,8 @@ public final class PromptTemplates {
 
             completed 为双轨验收：存在性（文件/图片链接）+ 可插拔语义校验（非空、需图任务必须含 markdown 图片等）。
             默认后一步 depends_on 前一步；依赖未满足或上游 validation_hash 失效会拒绝推进。
-            关键步（depends_on 数量>2，或目标含最终/交付/上线等）会进入 awaiting_confirm，
-            必须 todo(action=confirm, note含CONFIRM) 后才放行执行工具。
+            危险操作确认策略下，上线/删除等步骤会进入 awaiting_confirm，
+            须页面确认或 todo(action=confirm, note含CONFIRM) 后才放行。
             done_when 可用 llm_judge:评判标准 做 LLM 语义验收（evidence 为文本或文件路径）。
             验收失败会拒绝勾选。同一子任务工具连续失败会标记 blocked；可用 todo(action=reopen) 回滚并级联下游。
             禁止编造 completed。

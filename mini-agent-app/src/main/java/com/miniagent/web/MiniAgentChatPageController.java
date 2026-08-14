@@ -11,8 +11,11 @@ import com.miniagent.config.service.DatabaseConversationStore;
 import com.miniagent.config.service.FileStorageService;
 import com.miniagent.config.service.UserModelConfigService;
 import com.miniagent.config.storage.MediaStorage;
+import com.miniagent.agent.permission.ConfirmPolicy;
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.permission.SessionPermissionStore;
+import com.miniagent.agent.planner.PlannerStateStore;
+import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.web.dto.ChatRequest;
 import com.miniagent.web.dto.FileAttachment;
 import com.miniagent.web.dto.FileRef;
@@ -92,6 +95,10 @@ public class MiniAgentChatPageController {
     private long videoMaxBytes;
     @Autowired
     private SessionPermissionStore permissionStore;
+    @Autowired
+    private TaskTodoStore todoStore;
+    @Autowired
+    private PlannerStateStore plannerStateStore;
     @Autowired(required = false)
     private com.miniagent.agent.mcp.McpToolBridge mcpToolBridge;
     @Autowired(required = false)
@@ -247,6 +254,15 @@ public class MiniAgentChatPageController {
         String message = req.getMessage();
         String sessionId = req.getSessionId();
         String role = req.getRole();  // 获取角色选择
+        if (StringUtils.isNotBlank(sessionId)) {
+            if (StringUtils.isNotBlank(req.getPermissionMode())) {
+                permissionStore.setMode(sessionId, PermissionMode.from(req.getPermissionMode()));
+            }
+            if (StringUtils.isNotBlank(req.getConfirmPolicy())) {
+                permissionStore.setConfirmPolicy(
+                        sessionId, ConfirmPolicy.from(req.getConfirmPolicy()));
+            }
+        }
         List<String> images = Objects.isNull(req.getImages()) ? List.of() : req.getImages();
         List<FileAttachment> files = Objects.isNull(req.getFiles()) ? List.of() : req.getFiles();
         List<MediaRef> mediaRefs = Objects.isNull(req.getMediaRefs()) ? List.of() : req.getMediaRefs();
@@ -667,9 +683,71 @@ public class MiniAgentChatPageController {
             eventCenter.appendUserMessage(sessionId, "【系统】用户已批准工具 " + tool + "，请继续。");
             return ApiResponse.ok(permissionStore.toView(sessionId));
         }
-        String mode = Objects.isNull(body.get("mode")) ? "default" : String.valueOf(body.get("mode"));
-        permissionStore.setMode(sessionId, PermissionMode.from(mode));
+        if (body.get("confirmPolicy") != null) {
+            permissionStore.setConfirmPolicy(
+                    sessionId, ConfirmPolicy.from(String.valueOf(body.get("confirmPolicy"))));
+        }
+        if (body.get("mode") != null) {
+            permissionStore.setMode(sessionId, PermissionMode.from(String.valueOf(body.get("mode"))));
+        } else if (body.get("confirmPolicy") == null) {
+            permissionStore.setMode(sessionId, PermissionMode.from("default"));
+        }
         return ApiResponse.ok(permissionStore.toView(sessionId));
+    }
+
+    @PostMapping(value = "/api/todo/confirm",
+            consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<Object> confirmTodo(@RequestBody Map<String, Object> body,
+                                           HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (Objects.isNull(userId)) {
+            return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        }
+        String sessionId = Objects.isNull(body)
+                ? null : String.valueOf(body.getOrDefault("sessionId", ""));
+        if (StringUtils.isBlank(sessionId) || "null".equals(sessionId)) {
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "sessionId required");
+        }
+        if (!ownsSession(userId, sessionId)) {
+            return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN);
+        }
+        int id = parseTodoId(body == null ? null : body.get("id"));
+        if (id <= 0) {
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "id required");
+        }
+        String[] err = new String[1];
+        List<TaskTodoStore.TodoItem> items = todoStore.confirm(sessionId, id, "CONFIRM: user", err);
+        if (items == null) {
+            String detail = err[0] == null ? "" : err[0];
+            if (detail.contains("未找到")) {
+                return ApiResponse.fail(ErrorCode.TODO_NOT_FOUND, detail);
+            }
+            return ApiResponse.fail(ErrorCode.TODO_INVALID_STATE,
+                    StringUtils.isBlank(detail) ? ErrorCode.TODO_INVALID_STATE.getMessage() : detail);
+        }
+        if (plannerStateStore.hasIncompleteGraph(sessionId)) {
+            plannerStateStore.markResume(sessionId);
+        }
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("id", id);
+        data.put("confirmed", true);
+        return ApiResponse.ok(data);
+    }
+
+    private static int parseTodoId(Object raw) {
+        if (raw instanceof Number n) {
+            return n.intValue();
+        }
+        if (raw == null) {
+            return 0;
+        }
+        try {
+            return Integer.parseInt(String.valueOf(raw).trim());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     // ========== MCP 状态 ==========

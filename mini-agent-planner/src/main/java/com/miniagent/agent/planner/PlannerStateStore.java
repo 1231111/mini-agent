@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -39,6 +40,8 @@ public class PlannerStateStore {
     private final ConcurrentHashMap<String, StateSnapshot> memory = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, List<DomainEvent>> memoryEvents = new ConcurrentHashMap<>();
     private final PlannerStatePersistence persistence;
+    /** ponytail: 进程内续跑标记；多实例时改走 persistence */
+    private final Set<String> resumeSessions = ConcurrentHashMap.newKeySet();
 
     /** 单测：纯内存 */
     public PlannerStateStore() {
@@ -160,10 +163,41 @@ public class PlannerStateStore {
     }
 
     public void clear(String sessionId) {
-        if (sessionId == null) return;
-        if (persistence != null) persistence.delete(sessionId);
+        if (sessionId == null) {
+            return;
+        }
+        if (persistence != null) {
+            persistence.delete(sessionId);
+        }
         memory.remove(sessionId);
         memoryEvents.remove(sessionId);
+        resumeSessions.remove(sessionId);
+    }
+
+    public void markResume(String sessionId) {
+        if (sessionId != null && !sessionId.isBlank()) {
+            resumeSessions.add(sessionId);
+        }
+    }
+
+    public boolean peekResume(String sessionId) {
+        return sessionId != null && resumeSessions.contains(sessionId);
+    }
+
+    public void clearResume(String sessionId) {
+        if (sessionId != null) {
+            resumeSessions.remove(sessionId);
+        }
+    }
+
+    public boolean hasIncompleteGraph(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return false;
+        }
+        return get(sessionId)
+                .filter(s -> s.graph() != null && !s.graph().isEmpty())
+                .filter(s -> !s.graph().allTerminalSuccess())
+                .isPresent();
     }
 
     private static List<DomainEvent> appendLocal(List<DomainEvent> cur, DomainEvent event) {

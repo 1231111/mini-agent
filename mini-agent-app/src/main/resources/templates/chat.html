@@ -851,6 +851,19 @@
             background: var(--accent); color: #fff; font-weight: 600; cursor: pointer;
             white-space: nowrap;
         }
+        .confirm-banner {
+            display: none;
+            align-items: center; gap: 10px; justify-content: space-between;
+            margin: 0 16px 8px; padding: 10px 14px;
+            background: rgba(230, 162, 60, 0.12); border: 1px solid #e6a23c;
+            border-radius: 10px; font-size: 13px; color: var(--text);
+        }
+        .confirm-banner.show { display: flex; }
+        .confirm-banner button {
+            border: none; border-radius: 8px; padding: 6px 12px;
+            background: #e6a23c; color: #fff; font-weight: 600; cursor: pointer;
+            white-space: nowrap;
+        }
         .ask-modal-backdrop {
             display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45);
             z-index: 1000; align-items: center; justify-content: center;
@@ -1176,6 +1189,22 @@
         }
         .todo-panel .todo-item.awaiting_confirm .todo-mark {
             border-color: #e6a23c;
+            box-shadow: 0 0 0 2px rgba(230, 162, 60, 0.2);
+        }
+        .todo-confirm-btn {
+            flex: 0 0 auto;
+            border: none;
+            border-radius: 6px;
+            padding: 2px 8px;
+            font-size: 12px;
+            background: #e6a23c;
+            color: #fff;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .todo-confirm-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
         }
         .todo-panel .todo-item.blocked {
             opacity: 0.7;
@@ -1379,6 +1408,10 @@
             <span id="planBannerText">Plan 模式：仅探索与规划，写操作已锁定</span>
             <button type="button" onclick="approvePlan()">批准计划并执行</button>
         </div>
+        <div class="confirm-banner" id="confirmBanner">
+            <span id="confirmBannerText">有步骤需要确认后才能继续</span>
+            <button type="button" onclick="confirmPendingTodo()">确认并继续</button>
+        </div>
         <div class="input-container">
             <!-- Image preview (multi-image, rendered by JS) -->
             <div class="img-preview" id="imgPreview"></div>
@@ -1418,6 +1451,22 @@
                                 </div>
                                 <div class="perm-item" data-mode="ask" onclick="selectPermissionMode('ask')">
                                     危险操作询问<small>写文件/终端等须确认</small>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="perm-selector" id="confirmSelector">
+                            <button class="in-tool-btn perm-btn" id="confirmPolicyBtn"
+                                    title="待办确认策略" onclick="toggleConfirmMenu()">
+                                <span id="confirmPolicyLabel">危险操作确认</span>
+                            </button>
+                            <div class="perm-menu" id="confirmMenu">
+                                <div class="perm-item active" data-policy="dangerous"
+                                     onclick="selectConfirmPolicy('dangerous')">
+                                    危险操作确认<small>上线/删除等步骤需点确认</small>
+                                </div>
+                                <div class="perm-item" data-policy="auto"
+                                     onclick="selectConfirmPolicy('auto')">
+                                    自动确认<small>待办关键步不等人，直接推进</small>
                                 </div>
                             </div>
                         </div>
@@ -1549,6 +1598,8 @@ let previewSrcs   = [];
 let sidebarOpen  = true;
 let selectedRole = '';  // 当前选择的角色
 let permissionMode = localStorage.getItem('mini_agent_perm_mode') || 'default';
+let confirmPolicy = localStorage.getItem('mini_agent_confirm_policy') || 'dangerous';
+let pendingTodoConfirm = null;
 let pendingAskTool = null;
 let isStreaming  = false;
 const SCROLL_BOTTOM_PX = 80;
@@ -1862,6 +1913,8 @@ $msg.addEventListener('scroll', () => {
 function toggleRoleMenu() {
     const menu = document.getElementById('roleMenu');
     menu.classList.toggle('show');
+    document.getElementById('permMenu')?.classList.remove('show');
+    document.getElementById('confirmMenu')?.classList.remove('show');
     // 点击外部关闭
     if (menu.classList.contains('show')) {
         setTimeout(() => {
@@ -1937,6 +1990,8 @@ function toggleModelMenu(e) {
     const opening = !menu.classList.contains('show');
     menu.classList.toggle('show');
     document.getElementById('roleMenu')?.classList.remove('show');
+    document.getElementById('permMenu')?.classList.remove('show');
+    document.getElementById('confirmMenu')?.classList.remove('show');
     if (opening) {
         setTimeout(() => {
             document.addEventListener('click', closeModelMenuOnOutside, { once: true });
@@ -2072,6 +2127,7 @@ function togglePermMenu() {
     menu.classList.toggle('show');
     document.getElementById('roleMenu')?.classList.remove('show');
     document.getElementById('modelMenu')?.classList.remove('show');
+    document.getElementById('confirmMenu')?.classList.remove('show');
     if (menu.classList.contains('show')) {
         setTimeout(() => document.addEventListener('click', closePermMenuOutside, { once: true }), 0);
     }
@@ -2086,7 +2142,7 @@ async function selectPermissionMode(mode) {
     localStorage.setItem('mini_agent_perm_mode', permissionMode);
     document.getElementById('permLabel').textContent = PERM_LABELS[permissionMode] || permissionMode;
     document.getElementById('permBtn').classList.toggle('active', permissionMode !== 'default');
-    document.querySelectorAll('.perm-item').forEach(el => {
+    document.querySelectorAll('#permMenu .perm-item').forEach(el => {
         el.classList.toggle('active', el.dataset.mode === permissionMode);
     });
     document.getElementById('permMenu')?.classList.remove('show');
@@ -2149,14 +2205,110 @@ async function grantAskTool() {
     pendingAskTool = null;
 }
 
+const CONFIRM_LABELS = { dangerous: '危险操作确认', auto: '自动确认' };
+
+function toggleConfirmMenu() {
+    const menu = document.getElementById('confirmMenu');
+    menu.classList.toggle('show');
+    document.getElementById('permMenu')?.classList.remove('show');
+    document.getElementById('roleMenu')?.classList.remove('show');
+    document.getElementById('modelMenu')?.classList.remove('show');
+    if (menu.classList.contains('show')) {
+        setTimeout(() => document.addEventListener('click', closeConfirmMenuOutside, { once: true }), 0);
+    }
+}
+function closeConfirmMenuOutside(ev) {
+    const wrap = document.getElementById('confirmSelector');
+    if (wrap && wrap.contains(ev.target)) return;
+    document.getElementById('confirmMenu')?.classList.remove('show');
+}
+function paintConfirmPolicyUi() {
+    const label = CONFIRM_LABELS[confirmPolicy] || confirmPolicy;
+    const btn = document.getElementById('confirmPolicyBtn');
+    const labelEl = document.getElementById('confirmPolicyLabel');
+    if (labelEl) labelEl.textContent = label;
+    if (btn) btn.classList.toggle('active', confirmPolicy !== 'dangerous');
+    document.querySelectorAll('#confirmMenu .perm-item').forEach(el => {
+        el.classList.toggle('active', el.dataset.policy === confirmPolicy);
+    });
+}
+async function selectConfirmPolicy(policy) {
+    confirmPolicy = policy === 'auto' ? 'auto' : 'dangerous';
+    localStorage.setItem('mini_agent_confirm_policy', confirmPolicy);
+    paintConfirmPolicyUi();
+    document.getElementById('confirmMenu')?.classList.remove('show');
+    if (currentId) {
+        try {
+            await fetch('/api/permission-mode', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sessionId: currentId, confirmPolicy: confirmPolicy })
+            });
+        } catch (e) { console.warn('set confirm policy failed', e); }
+    }
+}
+function syncPendingConfirm(items) {
+    const waiting = (items || []).find(it =>
+        String(it.status || '').toLowerCase() === 'awaiting_confirm');
+    pendingTodoConfirm = waiting
+        ? { id: waiting.id, content: waiting.content || '' }
+        : null;
+    refreshConfirmBanner();
+}
+function refreshConfirmBanner() {
+    const banner = document.getElementById('confirmBanner');
+    if (!banner) return;
+    const show = pendingTodoConfirm && !isStreaming;
+    banner.classList.toggle('show', !!show);
+    if (show) {
+        const text = document.getElementById('confirmBannerText');
+        if (text) {
+            text.textContent = '步骤 #' + pendingTodoConfirm.id
+                + ' 需要确认：' + pendingTodoConfirm.content;
+        }
+    }
+}
+function confirmPendingTodo() {
+    if (!pendingTodoConfirm) return;
+    confirmTodoAndContinue(pendingTodoConfirm.id);
+}
+async function confirmTodoAndContinue(id) {
+    if (!currentId || isStreaming) return;
+    try {
+        const resp = await fetch('/api/todo/confirm', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: currentId, id: id })
+        });
+        const body = await resp.json();
+        if (!body.success) {
+            alert(body.message || '确认失败');
+            return;
+        }
+        pendingTodoConfirm = null;
+        refreshConfirmBanner();
+        const text = '继续执行已确认的步骤 #' + id + '，请继续。';
+        document.getElementById('welcomeScreen')?.remove();
+        renderUserMsg(text, null, 0, []);
+        addMsgToConv('user', text, null, null);
+        const botBody = renderBotMsg(
+            '<div class="typing-dots"><span></span><span></span><span></span></div>', true);
+        setStreaming(true);
+        sendChatPost(text, currentId, [], [], botBody);
+    } catch (e) {
+        alert('确认失败: ' + e.message);
+    }
+}
+
 (function initPermUi() {
     // 仅同步本地 UI，避免首屏无 session 时误打 API
     document.getElementById('permLabel').textContent = PERM_LABELS[permissionMode] || permissionMode;
     document.getElementById('permBtn')?.classList.toggle('active', permissionMode !== 'default');
-    document.querySelectorAll('.perm-item').forEach(el => {
+    document.querySelectorAll('#permMenu .perm-item').forEach(el => {
         el.classList.toggle('active', el.dataset.mode === permissionMode);
     });
     refreshPlanBanner();
+    paintConfirmPolicyUi();
 })();
 
 function scrollToBottom(smooth = false, force = false) {
@@ -2285,6 +2437,7 @@ const WELCOME = `
 function startNewChat(doFocus = true) {
     if (currentId) stopPolling(currentId);
     removeTaskRunningHint();
+    pendingTodoConfirm = null;
     setStreaming(false);
     currentId = null;
     localStorage.removeItem(LS_CUR);
@@ -2296,6 +2449,7 @@ function startNewChat(doFocus = true) {
 async function switchConv(id, force) {
     if (id === currentId && !force) return;
     if (currentId && currentId !== id) stopPolling(currentId);
+    pendingTodoConfirm = null;
     setStreaming(false);
     currentId = id;
     localStorage.setItem(LS_CUR, id);
@@ -2316,7 +2470,11 @@ async function switchConv(id, force) {
             await fetch('/api/permission-mode', {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ sessionId: currentId, mode: permissionMode })
+                body: JSON.stringify({
+                    sessionId: currentId,
+                    mode: permissionMode,
+                    confirmPolicy: confirmPolicy
+                })
             });
         } catch (_) { /* ignore */ }
     }
@@ -2429,6 +2587,7 @@ function setStreaming(on) {
     isStreaming = on;
     $send.title = on ? '追加说明 (Enter)' : '发送 (Enter)';
     onInputChange();
+    refreshConfirmBanner();
 }
 
 function unlockComposer() {
@@ -2527,7 +2686,8 @@ async function sendChatPost(text, sessionId, files, refs, botBody) {
             fileRefs: fileRefs,
             mediaRefs: mediaRefs,
             role: selectedRole,
-            permissionMode: permissionMode || 'default'
+            permissionMode: permissionMode || 'default',
+            confirmPolicy: confirmPolicy || 'dangerous'
         };
         const resp = await fetch('/chat/stream', {
             method: 'POST',
@@ -2781,6 +2941,20 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 text.textContent = (it.id != null ? it.id + '. ' : '') + (it.content || '');
                 li.appendChild(mark);
                 li.appendChild(text);
+                if (String(it.status || '').toLowerCase() === 'awaiting_confirm') {
+                    const btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.className = 'todo-confirm-btn';
+                    btn.textContent = '确认并继续';
+                    btn.disabled = isStreaming;
+                    const todoId = it.id;
+                    btn.onclick = function (ev) {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        confirmTodoAndContinue(todoId);
+                    };
+                    li.appendChild(btn);
+                }
                 todoListEl.appendChild(li);
             }
             if (progressEl) { progressEl.remove(); progressEl = null; }
@@ -2864,6 +3038,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                     const items = payload && payload.items ? payload.items : [];
                     todoItems = Array.isArray(items) ? items : [];
                     paintTodo();
+                    syncPendingConfirm(todoItems);
                 } catch (e) { /* 忽略坏 payload */ }
             } else if (name === 'subgoal') {
                 try {

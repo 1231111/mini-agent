@@ -4,6 +4,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.core.SessionEventCenter;
 import com.miniagent.agent.intent.TaskStep;
+import com.miniagent.agent.permission.ConfirmPolicy;
+import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.agent.tool.BuiltinTools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,9 +38,11 @@ public class TaskTodoStore {
 
     public enum Status { pending, in_progress, awaiting_confirm, completed, cancelled, blocked }
 
-    /** 多依赖或关键交付类步骤：进入执行前必须 confirm */
-    private static final java.util.regex.Pattern CRITICAL_GOAL = java.util.regex.Pattern.compile(
-            "(?i)(最终|交付|上线|发布|汇总|合并验收|关键路径|生产环境|正式提交)");
+    /** 危险操作确认：仅匹配真实危险步，不含交付/汇总/最终 */
+    private static final java.util.regex.Pattern DANGEROUS_GOAL =
+            java.util.regex.Pattern.compile(
+                    "(?i)(上线|发布|生产环境|正式提交|删除全部|drop table|rm -rf|格式化"
+                            + "|清空数据库|exec_command)");
 
     /**
      * @param dependsOn 依赖的上游 todo id；未满足前不可推进/勾选
@@ -251,10 +255,14 @@ public class TaskTodoStore {
     }
 
     static boolean needsConfirmGate(TodoItem it) {
-        if (it == null) return false;
-        if (it.dependsOn() != null && it.dependsOn().size() > 2) return true;
+        if (it == null) {
+            return false;
+        }
+        if (PermissionContext.confirmPolicy() == ConfirmPolicy.AUTO) {
+            return false;
+        }
         String c = it.content() == null ? "" : it.content();
-        return CRITICAL_GOAL.matcher(c).find();
+        return DANGEROUS_GOAL.matcher(c).find();
     }
 
     public synchronized List<TodoItem> update(String sessionId, int id, String statusStr,
@@ -951,7 +959,9 @@ public class TaskTodoStore {
         }
         sb.append("\n执行原则：\n");
         sb.append("- 只聚焦依赖已满足的当前子目标；depends_on 未完成禁止推进\n");
-        sb.append("- 关键步（依赖>2 或交付/上线类）进入 awaiting_confirm，须 todo(action=confirm)\n");
+        if (PermissionContext.confirmPolicy() != ConfirmPolicy.AUTO) {
+            sb.append("- 上线/删除等危险步进入 awaiting_confirm，须页面确认或 todo(action=confirm)\n");
+        }
         sb.append("- completed 需存在性 + 可插拔语义校验；上游 hash 变化须先 reopen\n");
         sb.append("- 工具连败 → blocked；可用 todo(action=reopen) 回滚并级联下游\n");
         sb.append("- 未全部 completed/cancelled 前禁止最终收尾\n");

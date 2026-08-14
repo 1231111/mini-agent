@@ -22,5 +22,7 @@ public class ChatRequest {
     private String role;  // 角色选择：tester/developer/pm/designer/security/ops/dba/architect/tech_writer
     /** 权限模式：default | plan | accept_edits | ask */
     private String permissionMode;
+    /** 待办确认：auto | dangerous */
+    private String confirmPolicy;
 
 }

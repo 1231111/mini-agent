@@ -57,6 +57,13 @@ public final class PermissionContext {
                         .orElse(true));
     }
 
+    public static ConfirmPolicy confirmPolicy() {
+        return Optional.ofNullable(SESSION.get())
+                .filter(sid -> Objects.nonNull(STORE))
+                .map(STORE::getConfirmPolicy)
+                .orElse(ConfirmPolicy.DANGEROUS);
+    }
+
     public static boolean isForced() {
         return Objects.nonNull(FORCE_MODE.get());
     }
