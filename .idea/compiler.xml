@@ -17,14 +17,22 @@
         </processorPath>
         <module name="mini-agent-memory" />
         <module name="mini-agent-app" />
+        <module name="mini-agent-common" />
+        <module name="mini-agent-loop" />
+        <module name="mini-agent-tools" />
+        <module name="mini-agent-planner" />
       </profile>
     </annotationProcessing>
   </component>
   <component name="JavacSettings">
     <option name="ADDITIONAL_OPTIONS_OVERRIDE">
       <module name="mini-agent-app" options="-parameters" />
+      <module name="mini-agent-common" options="-parameters" />
+      <module name="mini-agent-loop" options="-parameters" />
       <module name="mini-agent-memory" options="-parameters" />
+      <module name="mini-agent-planner" options="-parameters" />
       <module name="mini-agent-springboot" options="-parameters" />
+      <module name="mini-agent-tools" options="-parameters" />
     </option>
   </component>
 </project>

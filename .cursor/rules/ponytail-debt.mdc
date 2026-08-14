@@ -1,0 +1,40 @@
+---
+description: >-
+  收集仓库里 ponytail: 注释做成债务台账。用户说 ponytail 欠债、推迟了什么、list the shortcuts、
+  /ponytail-debt 时使用。只读报告；用户明确要求时才写成文件。
+alwaysApply: false
+---
+
+# Ponytail Debt
+
+每条有意简化应带 `ponytail:` 注释，写明上限和升级条件。
+本规则把它们收成一张台账，避免「以后再说」变成永久。
+
+## 扫描
+
+Grep（跳过 `node_modules`、`.git`、构建产物）：
+
+```text
+(#|//) ?ponytail:
+```
+
+其它注释前缀按语言补。每命中一行。注释前缀可把正文里提到约定的句子排除在外。
+
+## 输出
+
+按文件分组，一行一条：
+
+```text
+路径:行号  ceiling: <上限>. upgrade: <触发条件>.
+```
+
+约定形态：`ponytail: <ceiling>, <upgrade if X>`。
+缺升级路径或触发条件的打 `no-trigger`（会静默腐烂）。
+需要责任人时再 `git blame` 对应行。
+
+结尾：`N markers, M with no trigger.`
+没有命中：`No ponytail: debt. Clean ledger.`
+
+## 边界
+
+默认只读。要落盘时等用户点头，再写例如 `PONYTAIL-DEBT.md`。

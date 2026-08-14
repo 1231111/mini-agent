@@ -1,0 +1,34 @@
+---
+description: >-
+  全仓库过度设计审计。用户说审计这个仓库、能删什么、找膨胀、audit for over-engineering、
+  /ponytail-audit 时使用。扫整棵树而非 diff，按可砍量排序。只出报告，不改代码。
+alwaysApply: false
+---
+
+# Ponytail Audit
+
+`ponytail-review` 的全仓版：扫整棵树，不审单个 diff。
+按可砍量从大到小排。只报告，不落地修改。
+
+## 标签
+
+与 review 相同：`delete:` `stdlib:` `native:` `yagni:` `shrink:`
+
+## 重点搜
+
+- 标准库/平台已提供、却自研或加依赖的
+- 单实现接口、单产品工厂、只做转发的包装
+- 只导出一件事的文件、死 flag / 没人改的配置
+- 手写 stdlib
+
+跳过 `node_modules`、`.git`、构建产物。
+
+## 输出
+
+一行一条，已排序：`标签: 砍什么. 替代. [路径]`
+结尾：`net: -N lines, -D deps possible.`
+无事可砍：`Lean already. Ship.`
+
+## 边界
+
+只审过度设计与复杂度。正确性、安全、性能不在范围。

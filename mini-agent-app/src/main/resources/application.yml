@@ -254,7 +254,8 @@ agent:
     max-recoveries: 3
     proposal-batch-size: 1
     proposal-max-iterations: 8
-    # 同一节点 16 轮用尽后接着同一份 messages 再跑，最多这么多段
+    proposal-browser-max-iterations: 16
+    # 同一节点配额用尽后接着同一份 messages 再跑，最多这么多段
     proposal-max-chunks: 6
     compiler-retry: 1
     max-outer-rounds: 24

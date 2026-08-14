@@ -1,0 +1,45 @@
+---
+description: >-
+  审这次 diff/PR/改动是否过度设计。用户说审查过度设计、能删什么、这次改动是否过重、
+  simplify review、/ponytail-review 时使用。只列复杂度，不改代码，不审正确性/安全/性能。
+alwaysApply: false
+---
+
+# Ponytail Review
+
+审 **当前 diff / 改动** 的不必要复杂度。一行一条：位置、砍什么、用什么替代。
+最佳结果是 diff 变短。只报告，不落地修改。
+
+## 格式
+
+`L行号: 标签: 砍什么. 替代.`
+多文件：`路径:L行号: 标签: ...`
+
+标签：
+
+- `delete:` 死代码、没用上的灵活性、臆想功能。替代：无
+- `stdlib:` 手写了标准库已有的。点名函数
+- `native:` 依赖/代码在做平台已有的事。点名能力
+- `yagni:` 单实现接口、没人改的配置、只有一个调用方的层
+- `shrink:` 同一逻辑更短。给出短写
+
+## 示例
+
+```text
+❌ This EmailValidator class might be more complex than necessary...
+✅ L12-38: stdlib: 27-line validator class. "@" in email, 1 line.
+✅ L4: native: moment.js for one format call. Intl.DateTimeFormat, 0 deps.
+✅ repo.py:L88: yagni: AbstractRepository with one impl. Inline until a second exists.
+✅ L52-71: delete: retry wrapper around idempotent local call. Nothing replaces it.
+✅ L30-44: shrink: manual loop builds dict. dict(zip(keys, values)), 1 line.
+```
+
+## 收尾
+
+`net: -N lines possible.`
+无事可砍：`Lean already. Ship.` 然后停。
+
+## 边界
+
+正确性、安全、性能不在范围，交给普通 review。
+一条 smoke / `assert` 自检是 ponytail 下限，不要当膨胀删掉。

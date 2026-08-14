@@ -61,24 +61,28 @@ alwaysApply: true
 
 ## 4. 代码排版（生成代码必须遵守）
 
-### 4.1 单行 if / else / for / while 不加 `{}`
+### 4.1 if / else / for / while / do 一律加大括号
 
-主体只有一条语句时，不加花括号；多条语句或嵌套块才加。
+即使主体只有一条语句，也必须用 `{}`。禁止单行紧跟语句。
 
 ```java
 // ✅
-if (userId == null) return "Not authenticated";
-if (ok) doWork();
-else skip();
-
-// ❌
 if (userId == null) {
     return "Not authenticated";
 }
+if (ok) {
+    doWork();
+} else {
+    skip();
+}
+
+// ❌
+if (userId == null) return "Not authenticated";
+if (ok) doWork();
+else skip();
 ```
 
-同理适用于 `else`、`for`、`while`、`do`（仅当体为单语句）。  
-例外：需要在体里放注释+语句、或语言强制要求括号的语法（如部分格式化/宏场景）再加 `{}`。
+同理适用于 `else`、`for`、`while`、`do`。语言强制要求括号的语法（如部分格式化/宏）同样加 `{}`。
 
 ### 4.2 行宽：一屏看全，禁止横向拖动
 

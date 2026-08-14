@@ -1,5 +1,6 @@
 package com.miniagent.config.service;
 
+import com.miniagent.agent.planner.SessionLock;
 import com.miniagent.config.entity.AgentTaskRun;
 import com.miniagent.config.repository.AgentTaskRunRepository;
 import com.miniagent.replica.RedisTaskConcurrency;
@@ -17,7 +18,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
-public class TaskRunService {
+public class TaskRunService implements SessionLock {
 
     private static final Logger log = LoggerFactory.getLogger(TaskRunService.class);
 

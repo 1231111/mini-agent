@@ -12,13 +12,29 @@
 
     <artifactId>mini-agent-app</artifactId>
     <name>mini-agent-app</name>
-    <description>可运行的 Spring Boot 应用（智能体、Web、编排）</description>
+    <description>聊天应用：Web、编排、配置、记忆实现</description>
     <packaging>jar</packaging>
 
     <dependencies>
         <dependency>
             <groupId>com.miniagent</groupId>
+            <artifactId>mini-agent-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.miniagent</groupId>
             <artifactId>mini-agent-memory</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.miniagent</groupId>
+            <artifactId>mini-agent-tools</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.miniagent</groupId>
+            <artifactId>mini-agent-loop</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.miniagent</groupId>
+            <artifactId>mini-agent-planner</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -60,12 +76,6 @@
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
         </dependency>
-        <!-- Playwright 浏览器自动化 -->
-        <dependency>
-            <groupId>com.microsoft.playwright</groupId>
-            <artifactId>playwright</artifactId>
-            <version>1.49.0</version>
-        </dependency>
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
@@ -80,24 +90,6 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
-        </dependency>
-        <!-- PDFBox for PDF text extraction -->
-        <dependency>
-            <groupId>org.apache.pdfbox</groupId>
-            <artifactId>pdfbox</artifactId>
-            <version>3.0.3</version>
-        </dependency>
-        <!-- Apache POI for DOCX/PPTX/XLSX text extraction -->
-        <dependency>
-            <groupId>org.apache.poi</groupId>
-            <artifactId>poi-ooxml</artifactId>
-            <version>5.2.5</version>
-        </dependency>
-        <!-- JavaParser：解析 Java 源码为 AST，供 ast_search 结构化检索 -->
-        <dependency>
-            <groupId>com.github.javaparser</groupId>
-            <artifactId>javaparser-core</artifactId>
-            <version>3.26.2</version>
         </dependency>
         <!-- MySQL Driver -->
         <dependency>
@@ -115,7 +107,6 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis</artifactId>
         </dependency>
-        <!-- 生产向量库 -->
         <dependency>
             <groupId>io.milvus</groupId>
             <artifactId>milvus-sdk-java</artifactId>
