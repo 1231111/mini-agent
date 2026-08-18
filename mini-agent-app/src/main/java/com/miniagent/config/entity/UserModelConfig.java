@@ -1,13 +1,12 @@
 package com.miniagent.config.entity;
 
 import jakarta.persistence.*;
-import java.time.LocalDateTime;
 
 @Entity
 @Table(name = "user_model_config", indexes = {
         @Index(name = "uk_user_model_config_user", columnList = "user_id", unique = true)
 })
-public class UserModelConfig {
+public class UserModelConfig extends BaseEntity {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -28,15 +27,6 @@ public class UserModelConfig {
     @Column(name = "custom_api_key", length = 512)
     private String customApiKey;
 
-    @Column(name = "updated_at")
-    private LocalDateTime updatedAt;
-
-    @PrePersist
-    @PreUpdate
-    protected void touch() {
-        updatedAt = LocalDateTime.now();
-    }
-
     public Long getId() { return id; }
     public void setId(Long id) { this.id = id; }
     public Long getUserId() { return userId; }
@@ -49,6 +39,4 @@ public class UserModelConfig {
     public void setCustomModelName(String customModelName) { this.customModelName = customModelName; }
     public String getCustomApiKey() { return customApiKey; }
     public void setCustomApiKey(String customApiKey) { this.customApiKey = customApiKey; }
-    public LocalDateTime getUpdatedAt() { return updatedAt; }
-    public void setUpdatedAt(LocalDateTime updatedAt) { this.updatedAt = updatedAt; }
 }

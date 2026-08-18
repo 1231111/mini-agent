@@ -8,6 +8,7 @@ import com.miniagent.agent.core.SessionEventCenter;
 import jakarta.annotation.PostConstruct;
 
 import com.miniagent.agent.core.AgentLoop;
+import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.intent.IntentPlanner;
 import com.miniagent.agent.intent.IntentType;
 import com.miniagent.agent.intent.TaskPlan;
@@ -82,6 +83,8 @@ public class AgentChatApplicationService {
 
     @Autowired
     private AgentLoop agentLoop;
+    @Autowired
+    private ExecutionControl executionControl;
     @Autowired
     private PlanningLoop planningLoop;
     @Autowired
@@ -179,6 +182,7 @@ public class AgentChatApplicationService {
             throw new IllegalStateException(acquireErr);
         }
         streamingService.markRunning(sessionId);
+        executionControl.start(sessionId);
         MemoryStore.setCurrentUser(userId);
         memoryStore.loadFromDisk();
 
@@ -198,7 +202,11 @@ public class AgentChatApplicationService {
 
             return answer;
         } catch (Exception e) {
-            taskRunService.markFailed(userId, sessionId, e.getMessage());
+            if (executionControl.isCancelled(sessionId)) {
+                taskRunService.markCancelled(userId, sessionId, "Cancelled by user");
+            } else {
+                taskRunService.markFailed(userId, sessionId, e.getMessage());
+            }
 
             // 记录任务失败事件
             recordEvent(sessionId, null, com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
@@ -207,19 +215,30 @@ public class AgentChatApplicationService {
 
             throw e;
         } finally {
+            executionControl.finish(sessionId);
             streamingService.markIdle(sessionId);
             MemoryStore.clearCurrentUser();
             TaskTodoContext.clear();
 
-            // 巩固记忆
+            // 巩固走后台，避免挡住 SSE end（PERM_ASK 批准后续跑会等流结束）
             if (memoryManager != null) {
-                try {
-                    memoryManager.consolidate(sessionId);
-                } catch (Exception e) {
-                    log.debug("记忆巩固失败: {}", e.getMessage());
-                }
+                final String consolidateSid = sessionId;
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        memoryManager.consolidate(consolidateSid);
+                    } catch (Exception e) {
+                        log.debug("记忆巩固失败: {}", e.getMessage());
+                    }
+                });
             }
         }
+    }
+
+    public void cancel(Long userId, String sessionId) {
+        if (StringUtils.isBlank(sessionId)) throw new IllegalArgumentException("sessionId required");
+        executionControl.cancel(sessionId);
+        taskRunService.markCancelled(userId, sessionId, "Cancelled by user");
+        streamingService.markIdle(sessionId);
     }
 
     private void recordEvent(String sessionId, String taskId,
@@ -243,8 +262,7 @@ public class AgentChatApplicationService {
     }
 
     private String truncate(String s, int maxLen) {
-        if (s == null) return "";
-        return s.length() > maxLen ? s.substring(0, maxLen) + "..." : s;
+        return com.miniagent.common.StringUtils.truncate(s, maxLen);
     }
 
     private String doExecuteAgent(Long userId, String sessionId, String userMessage,

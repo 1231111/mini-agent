@@ -19,11 +19,12 @@ import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.web.dto.ChatRequest;
 import com.miniagent.web.dto.FileAttachment;
 import com.miniagent.web.dto.FileRef;
+import com.miniagent.web.dto.LoginRequest;
 import com.miniagent.web.dto.MediaRef;
+import com.miniagent.web.dto.RegisterRequest;
 import com.miniagent.agent.web.MultimodalMedia;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
-import lombok.Data;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.UrlResource;
@@ -236,6 +237,21 @@ public class MiniAgentChatPageController {
         return ApiResponse.ok();
     }
 
+    @PostMapping(value = "/api/chat/cancel", consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<Void> cancelChat(@RequestBody Map<String, String> body, HttpServletRequest request) {
+        Long userId = getUserIdFromCookie(request);
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        String sessionId = body.get("sessionId");
+        if (StringUtils.isBlank(sessionId)) return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "sessionId required");
+        if (!ownsSession(userId, sessionId) && !streamingService.isTaskRunning(sessionId)) {
+            return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN);
+        }
+        agentService.cancel(userId, sessionId);
+        return ApiResponse.ok();
+    }
+
     // ========== SSE streaming ==========
 
     @PostMapping(value = "/chat/stream", consumes = MediaType.APPLICATION_JSON_VALUE)
@@ -276,19 +292,6 @@ public class MiniAgentChatPageController {
         }
         return agentService.chatStreamMultimodal(
                 userId, sessionId, queryTask.toString(), images, files, mediaRefs, role);
-    }
-
-    @Data
-    public static class LoginRequest {
-        private String username;
-        private String password;
-    }
-
-    @Data
-    public static class RegisterRequest {
-        private String username;
-        private String password;
-        private String displayName;
     }
 
     @GetMapping("/static/images/{filename}")
@@ -681,6 +684,9 @@ public class MiniAgentChatPageController {
             String tool = Objects.isNull(body.get("tool")) ? "" : String.valueOf(body.get("tool"));
             permissionStore.grantAskTool(sessionId, tool);
             eventCenter.appendUserMessage(sessionId, "【系统】用户已批准工具 " + tool + "，请继续。");
+            if (plannerStateStore.hasIncompleteGraph(sessionId)) {
+                plannerStateStore.markResume(sessionId);
+            }
             return ApiResponse.ok(permissionStore.toView(sessionId));
         }
         if (body.get("confirmPolicy") != null) {

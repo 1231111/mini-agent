@@ -3,14 +3,10 @@ package com.miniagent.agent.memory;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.miniagent.common.embedding.SharedEmbeddingModel;
+import com.miniagent.common.milvus.MilvusCollectionInitializer;
 import com.miniagent.common.milvus.SharedMilvusClient;
 import com.miniagent.memory.MemoryVectorIndex;
 import io.milvus.v2.client.MilvusClientV2;
-import io.milvus.v2.common.DataType;
-import io.milvus.v2.common.IndexParam;
-import io.milvus.v2.service.collection.request.AddFieldReq;
-import io.milvus.v2.service.collection.request.CreateCollectionReq;
-import io.milvus.v2.service.collection.request.HasCollectionReq;
 import io.milvus.v2.service.collection.request.LoadCollectionReq;
 import io.milvus.v2.service.vector.request.DeleteReq;
 import io.milvus.v2.service.vector.request.SearchReq;
@@ -176,24 +172,9 @@ public class MilvusMemoryVectorIndex implements MemoryVectorIndex {
     }
 
     private void ensureCollection(MilvusClientV2 client) {
-        Boolean has = client.hasCollection(HasCollectionReq.builder().collectionName(collection).build());
-        if (Boolean.TRUE.equals(has)) return;
-        CreateCollectionReq.CollectionSchema schema = CreateCollectionReq.CollectionSchema.builder().build();
-        schema.addField(AddFieldReq.builder().fieldName("pk").dataType(DataType.VarChar).maxLength(128).isPrimaryKey(true).autoID(false).build());
-        schema.addField(AddFieldReq.builder().fieldName("user_id").dataType(DataType.Int64).build());
-        schema.addField(AddFieldReq.builder().fieldName("text").dataType(DataType.VarChar).maxLength(65535).build());
-        schema.addField(AddFieldReq.builder().fieldName("vector").dataType(DataType.FloatVector).dimension(dimension).build());
-        IndexParam index = IndexParam.builder()
-                .fieldName("vector")
-                .indexType(IndexParam.IndexType.AUTOINDEX)
-                .metricType(IndexParam.MetricType.COSINE)
-                .build();
-        client.createCollection(CreateCollectionReq.builder()
-                .collectionName(collection)
-                .collectionSchema(schema)
-                .indexParams(List.of(index))
-                .build());
-        log.info("已创建 Milvus collection {}", collection);
+        MilvusCollectionInitializer.ensureCollection(client, collection, dimension, List.of(
+                MilvusCollectionInitializer.FieldDef.int64("user_id"),
+                MilvusCollectionInitializer.FieldDef.varchar("text", 65535)));
     }
 
     private static String pk(long userId, int idx, String text) {

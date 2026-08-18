@@ -44,6 +44,7 @@ public class TodoTool {
                         - completed 会做存在性 + 可插拔语义校验；依赖未满足或上游 hash 失效会拒绝。
                         - 危险操作确认策略下，上线/删除等步骤会进入 awaiting_confirm，
                           页面确认或 action=confirm 后才能执行。
+                        - 缺密钥或须用户提供信息：update status=awaiting_confirm，直接向用户提问。
                         - action=reopen 回滚 completed/blocked，并级联重置下游为 pending。
                         - 工具连败会 blocked；不要编造 completed。
                         - done_when：file_exists:… | media_delivered | note_required | llm_judge:评判标准
@@ -72,7 +73,7 @@ public class TodoTool {
         ));
         params.put("status", Map.of(
                 "type", "string",
-                "description", "update：pending / in_progress / completed / cancelled / blocked"
+                "description", "update：pending / in_progress / awaiting_confirm / completed / cancelled / blocked"
         ));
         params.put("note", Map.of(
                 "type", "string",

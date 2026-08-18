@@ -1,6 +1,7 @@
 package com.miniagent.agent.tool;
 
 import lombok.extern.slf4j.Slf4j;
+import com.miniagent.common.SecurityUtils;
 import org.springframework.stereotype.Component;
 
 import dev.langchain4j.agent.tool.ToolSpecification;
@@ -27,12 +28,17 @@ public class ToolRegistry {
      * 注册一个工具
      */
     public void register(Tool tool) {
+        Objects.requireNonNull(tool, "tool");
         if (StringUtils.isBlank(tool.getName())) {
             throw new IllegalArgumentException("工具名称不能为空");
         }
-        tools.put(tool.getName(), tool);
-        // 注册时预构建并缓存 ToolSpecification
-        specCache.put(tool.getName(), toSpecification(tool));
+        tool.descriptor();
+        ToolSpecification specification = toSpecification(tool);
+        Tool previous = tools.putIfAbsent(tool.getName(), tool);
+        if (previous != null) {
+            throw new IllegalStateException("工具重复注册: " + tool.getName());
+        }
+        specCache.put(tool.getName(), specification);
         log.debug("注册工具: {} - {}", tool.getName(), tool.getDescription());
     }
 
@@ -60,6 +66,13 @@ public class ToolRegistry {
                 .name(name)
                 .description(description)
                 .parameters(parameters)
+                .sideEffect(ToolConcurrencyPolicy.sideEffectOf(name))
+                .idempotent(ToolConcurrencyPolicy.isIdempotent(name))
+                .streamPrefetchSafe(ToolConcurrencyPolicy.isStreamPrefetchSafe(name))
+                .timeoutSeconds(ToolConcurrencyPolicy.timeoutSecondsOf(name))
+                .maxRetries(ToolConcurrencyPolicy.maxRetriesOf(name))
+                .concurrencyScope(ToolConcurrencyPolicy.concurrencyScopeOf(name))
+                .concurrencyKeyArgument(ToolConcurrencyPolicy.concurrencyKeyArgumentOf(name))
                 .handler(handler)
                 .build());
     }
@@ -71,10 +84,14 @@ public class ToolRegistry {
      * @return 执行结果
      */
     public String execute(String toolName, String argumentsJson) {
+        return executeResult(toolName, argumentsJson).legacyText();
+    }
+
+    public ToolResult executeResult(String toolName, String argumentsJson) {
         Tool tool = tools.get(toolName);
         if (Objects.isNull(tool)) {
-            return "{\"error\":\"未知工具: " + toolName
-                    + "。可用工具: " + availableToolNames() + "\"}";
+            return ToolResult.failure(ToolErrorCode.UNKNOWN_TOOL,
+                    "未知工具: " + toolName + "。可用工具: " + availableToolNames(), false);
         }
         // 延迟脱敏：只在 INFO 日志启用时执行正则替换
         if (log.isInfoEnabled()) {
@@ -83,18 +100,14 @@ public class ToolRegistry {
                     Objects.nonNull(safeArgs) && safeArgs.length() > 200
                             ? safeArgs.substring(0, 200) + "..." : safeArgs);
         }
-        return tool.execute(argumentsJson);
+        ToolResult result = tool.executeResult(argumentsJson);
+        log.debug("工具执行完成: {} status={} errorCode={}",
+                toolName, result.status(), result.errorCode());
+        return result;
     }
 
     private static String redactSensitive(String s) {
-        if (Objects.isNull(s)) return null;
-        return s
-                .replaceAll("(?i)(access_token=)[^&\\s\"'}]+", "$1***")
-                .replaceAll("(?i)(secret=)[^&\\s\"'}]+", "$1***")
-                .replaceAll("(?i)(api[_-]?key=)[^&\\s\"'}]+", "$1***")
-                .replaceAll("(?i)(\"access_token\"\\s*:\\s*\")[^\"]+\"", "$1***\"")
-                .replaceAll("(?i)(\"secret\"\\s*:\\s*\")[^\"]+\"", "$1***\"")
-                .replaceAll("(?i)(\"api[_-]?key\"\\s*:\\s*\")[^\"]+\"", "$1***\"");
+        return SecurityUtils.redactSensitive(s);
     }
 
     /**
@@ -138,6 +151,11 @@ public class ToolRegistry {
      */
     public boolean hasTool(String name) {
         return tools.containsKey(name);
+    }
+
+    public Optional<ToolDescriptor> getDescriptor(String name) {
+        Tool tool = tools.get(name);
+        return tool == null ? Optional.empty() : Optional.of(tool.descriptor());
     }
 
     /**

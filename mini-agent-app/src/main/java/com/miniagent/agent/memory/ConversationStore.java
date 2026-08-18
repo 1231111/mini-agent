@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.common.ChatRole;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import com.miniagent.common.dto.ConversationData;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;

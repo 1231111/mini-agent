@@ -10,7 +10,7 @@ import java.time.LocalDateTime;
     @Index(name = "idx_asf_subject", columnList = "subject"),
     @Index(name = "idx_asf_triple", columnList = "subject, predicate")
 })
-public class AgentSemanticFactEntity {
+public class AgentSemanticFactEntity extends BaseMemoryEntity {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -50,22 +50,11 @@ public class AgentSemanticFactEntity {
     @Column(name = "superseded_by")
     private Long supersededBy;
 
-    @Column(name = "created_at", nullable = false)
-    private LocalDateTime createdAt;
-
-    @Column(name = "updated_at", nullable = false)
-    private LocalDateTime updatedAt;
+    // createdAt/updatedAt 由 BaseMemoryEntity 管理
 
     @PrePersist
-    void onCreate() {
-        createdAt = LocalDateTime.now();
-        updatedAt = createdAt;
-        if (validFrom == null) validFrom = createdAt;
-    }
-
-    @PreUpdate
-    void onUpdate() {
-        updatedAt = LocalDateTime.now();
+    void onSemanticFactCreate() {
+        if (validFrom == null) validFrom = getCreatedAt();
     }
 
     // --- getters/setters ---
@@ -105,10 +94,4 @@ public class AgentSemanticFactEntity {
 
     public Long getSupersededBy() { return supersededBy; }
     public void setSupersededBy(Long supersededBy) { this.supersededBy = supersededBy; }
-
-    public LocalDateTime getCreatedAt() { return createdAt; }
-    public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
-
-    public LocalDateTime getUpdatedAt() { return updatedAt; }
-    public void setUpdatedAt(LocalDateTime updatedAt) { this.updatedAt = updatedAt; }
 }

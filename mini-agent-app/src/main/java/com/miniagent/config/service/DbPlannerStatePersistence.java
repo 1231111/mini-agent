@@ -86,7 +86,7 @@ public class DbPlannerStatePersistence implements PlannerStatePersistence {
             snap = new StateSnapshot(
                     row.getPlannerVersion(), snap.sessionId(), snap.executionId(),
                     snap.goal(), snap.graph(), snap.execution(), snap.environment(),
-                    snap.knowledgeRefs(), snap.recoveryCount());
+                    snap.knowledgeRefs(), snap.recoveryCount(), snap.planRevision());
         }
         return new Bundle(snap, PlannerStateJson.eventsFromJson(row.getEventsJson()));
     }

@@ -85,11 +85,19 @@ public class ContextLoader {
         boolean suspended = false;
         boolean resumed = false;
         if (Objects.nonNull(sessionId)) {
-            if (policy.resumeSuspendedTodo()) {
-                resumed = taskTodoStore.resumeSuspended(sessionId);
-            }
-            if (policy.suspendActiveTodo()) {
-                suspended = taskTodoStore.suspendActive(sessionId);
+            boolean waitingHuman = taskTodoStore.hasAwaitingConfirm(sessionId)
+                    && intent != IntentType.QUESTION
+                    && intent != IntentType.REVIEW;
+            if (waitingHuman) {
+                log.info("ContextLoader: 跳过 suspend，保留 awaiting_confirm session={}",
+                        sessionId);
+            } else {
+                if (policy.resumeSuspendedTodo()) {
+                    resumed = taskTodoStore.resumeSuspended(sessionId);
+                }
+                if (policy.suspendActiveTodo()) {
+                    suspended = taskTodoStore.suspendActive(sessionId);
+                }
             }
         }
 

@@ -12,7 +12,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
-import java.time.ZoneId;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -75,7 +74,7 @@ public class LocalHybridSearchEngine implements HybridSearchEngine {
 
         List<ScoredMemory> results = new ArrayList<>();
         for (AgentMemoryEntryEntity entity : candidates) {
-            MemoryEntry memory = toMemoryEntry(entity);
+            MemoryEntry memory = MemoryEntryMapper.fromEntity(entity);
 
             // 语义分数
             double semanticScore = 0;
@@ -87,10 +86,10 @@ public class LocalHybridSearchEngine implements HybridSearchEngine {
             }
 
             // 关键词分数
-            double keywordScore = keywordRelevance(query.getQuery(), memory.getContent());
+            double keywordScore = scoreCalculator.keywordRelevance(query.getQuery(), memory.getContent());
 
             // scope 匹配
-            double scopeMatch = scopeMatch(query, memory);
+            double scopeMatch = scoreCalculator.scopeMatch(query, memory);
 
             HybridScore score = scoreCalculator.buildScore(semanticScore, keywordScore, memory, scopeMatch);
             if (score.getFinalScore() >= minScore) {
@@ -103,46 +102,4 @@ public class LocalHybridSearchEngine implements HybridSearchEngine {
         return results.stream().limit(query.getTopK()).collect(Collectors.toList());
     }
 
-    private MemoryEntry toMemoryEntry(AgentMemoryEntryEntity entity) {
-        MemoryEntry entry = new MemoryEntry();
-        entry.setId(entity.getId());
-        entry.setTenantId(entity.getTenantId());
-        entry.setMemoryType(MemoryType.valueOf(entity.getMemoryType().name()));
-        entry.setScope(new MemoryScope(entity.getTenantId(),
-            MemoryScope.ScopeType.valueOf(entity.getScopeType().name()), entity.getScopeId()));
-        entry.setContent(entity.getContent());
-        entry.setSummary(entity.getSummary());
-        entry.setImportance(entity.getImportance() != null ? entity.getImportance() : 0.5);
-        entry.setConfidence(entity.getConfidence() != null ? entity.getConfidence() : 0.5);
-        entry.setAccessCount(entity.getAccessCount() != null ? entity.getAccessCount() : 0);
-        entry.setStatus(MemoryStatus.valueOf(entity.getStatus().name()));
-        entry.setCreatedAt(entity.getCreatedAt() != null ?
-            entity.getCreatedAt().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli() : 0);
-        return entry;
-    }
-
-    private double keywordRelevance(String query, String content) {
-        if (query == null || content == null) return 0;
-        String q = query.toLowerCase();
-        String c = content.toLowerCase();
-        if (c.contains(q)) return 1.0;
-        String[] words = q.split("\\s+");
-        int matched = 0;
-        for (String w : words) {
-            if (w.length() > 1 && c.contains(w)) matched++;
-        }
-        return words.length > 0 ? (double) matched / words.length : 0;
-    }
-
-    private double scopeMatch(MemoryQuery query, MemoryEntry memory) {
-        if (memory.getScope() == null) return 0.0;
-        if (memory.getScope().scopeType() == query.getScope().scopeType()
-            && Objects.equals(memory.getScope().scopeId(), query.getScope().scopeId())) {
-            return 1.0;
-        }
-        if (memory.getScope().scopeType() == MemoryScope.ScopeType.TENANT) {
-            return 0.5;
-        }
-        return 0.0;
-    }
 }

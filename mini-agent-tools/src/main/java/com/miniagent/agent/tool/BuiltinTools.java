@@ -4,9 +4,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.browser.BrowserService;
 import com.miniagent.agent.comfyui.ComfyUIService;
 import com.miniagent.agent.comfyui.ImageQualityChecker;
-import com.miniagent.memory.MemoryStore;
 import com.miniagent.agent.skill.SkillStore;
 import com.miniagent.agent.security.NetworkGuard;
+import com.miniagent.common.SecurityUtils;
 import com.miniagent.agent.web.WebSearchService;
 import com.miniagent.agent.web.ImageGenerationService;
 import lombok.extern.slf4j.Slf4j;
@@ -44,9 +44,6 @@ public class BuiltinTools {
     private  BrowserService browserService;
     @Autowired
     private  WebSearchService webSearchService;
-    @Autowired
-    private  MemoryStore memoryStore;
-    @Autowired
     private  SkillStore skillStore;
     @Autowired
     private  ComfyUIService comfyuiService;
@@ -110,7 +107,6 @@ public class BuiltinTools {
         registerWebSearchTools();
         registerExecTool();
         registerBrowserTools();
-        registerMemoryTool();
         registerSkillTools();
         registerImageGenerateTool();
         registerComfyUITools();
@@ -198,7 +194,21 @@ public class BuiltinTools {
                 ),
                 args -> {
                     Map<String, Object> p = parseJson(args);
-                    return httpGet((String) p.get("url"));
+                    return httpSend("GET", (String) p.get("url"), null, null);
+                });
+        registry.register("http_post",
+                "发送 HTTP POST。写接口（如微信草稿箱 draft/add）用这个；只读用 http_get。"
+                        + "首次调用会请用户批准。",
+                Map.of(
+                        "url", Map.of("type", "string", "description", "目标 URL", "required", true),
+                        "body", Map.of("type", "string", "description", "请求体，默认空"),
+                        "contentType", Map.of("type", "string",
+                                "description", "Content-Type，默认 application/json; charset=utf-8")
+                ),
+                args -> {
+                    Map<String, Object> p = parseJson(args);
+                    return httpSend("POST", (String) p.get("url"),
+                            (String) p.get("body"), (String) p.get("contentType"));
                 });
     }
 
@@ -477,10 +487,12 @@ public class BuiltinTools {
 
     private void registerExecTool() {
         if (!execEnabled) {
-            log.info("exec_command 未注册（agent.tools.exec-enabled=false）");
-            return;
+            log.info("exec_command 已注册，默认需会话批准（agent.tools.exec-enabled=false）");
         }
-        registry.register("exec_command", "执行命令（有安全检查，默认关闭）。工作目录为 workspace。当前运行环境是 Windows，优先使用 cmd / PowerShell 语法。搜索代码请用 search_code。",
+        registry.register("exec_command",
+                "执行命令（有安全检查）。工作目录为 workspace。"
+                        + "当前运行环境是 Windows，优先使用 cmd / PowerShell 语法。"
+                        + "全局未开启时首次调用会请用户批准。搜索代码请用 search_code。",
                 Map.of(
                         "command", Map.of("type", "string", "description", "要执行的命令", "required", true)
                 ),
@@ -645,50 +657,6 @@ public class BuiltinTools {
                     return browserService.close(sid);
                 });
     }
-
-    // ==================== 记忆工具（对标 hermes-agent memory） ====================
-
-    private void registerMemoryTool() {
-        registry.register("memory",
-                "持久化记忆工具，保存跨会话的重要事实。两个存储目标：'memory'（Agent笔记：环境事实、项目约定、工具经验）和 'user'（用户画像：偏好、沟通风格、技术领域）。" +
-                "三种操作：add（追加新条目）、replace（替换已有条目，需提供 old_text 匹配）、remove（删除条目）。" +
-                "每轮对话都会注入记忆快照，保持紧凑，只存将来真正有用的。不要存任务进度、已完成工作的日志、临时状态。",
-                Map.of(
-                        "action", Map.of("type", "string", "description", "操作类型: add / replace / remove", "required", true),
-                        "target", Map.of("type", "string", "description", "存储目标: memory（Agent笔记）或 user（用户画像）", "required", true),
-                        "content", Map.of("type", "string", "description", "条目内容（add/replace 时必填）"),
-                        "old_text", Map.of("type", "string", "description", "要匹配的旧文本片段（replace/remove 时必填，子串匹配）")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String action = (String) p.get("action");
-                    String target = (String) p.get("target");
-                    String content = (String) p.getOrDefault("content", "");
-                    String oldText = (String) p.getOrDefault("old_text", "");
-
-                    Map<String, Object> result;
-                    switch (action) {
-                        case "add":
-                            result = memoryStore.add(target, content);
-                            break;
-                        case "replace":
-                            result = memoryStore.replace(target, oldText, content);
-                            break;
-                        case "remove":
-                            result = memoryStore.remove(target, oldText);
-                            break;
-                        default:
-                            result = Map.of("success", false, "message",
-                                    "未知操作: " + action + "。支持: add / replace / remove");
-                    }
-                    try {
-                        return new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(result);
-                    } catch (Exception e) {
-                        return "{\"success\":false,\"message\":\"序列化失败\"}";
-                    }
-                });
-    }
-
 
     // ==================== 云端图像生成（多后端自动降级） ====================
 
@@ -1220,33 +1188,45 @@ public class BuiltinTools {
 
     // ==================== HTTP 工具实现 ====================
 
-    private String httpGet(String url) {
+    private String httpSend(String method, String url, String body, String contentType) {
         try {
             String blocked = networkGuard.validateUrl(url);
-            if (Objects.nonNull(blocked)) return "{\"error\":\"" + blocked.replace("\"", "'") + "\"}";
-            HttpRequest req = HttpRequest.newBuilder()
+            if (Objects.nonNull(blocked)) {
+                return "{\"error\":\"" + blocked.replace("\"", "'") + "\"}";
+            }
+            HttpRequest.Builder b = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .timeout(Duration.ofSeconds(20))
-                    .header("User-Agent", "MiniAgent/1.0")
-                    .GET()
-                    .build();
-            HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            String body = resp.body();
-            if (body.length() > 8000) body = body.substring(0, 8000) + "\n…（已截断）";
-            return body;
+                    .header("User-Agent", "MiniAgent/1.0");
+            if ("POST".equals(method)) {
+                String ct = StringUtils.isBlank(contentType)
+                        ? "application/json; charset=utf-8" : contentType;
+                b.header("Content-Type", ct);
+                String payload = body == null ? "" : body;
+                b.POST(HttpRequest.BodyPublishers.ofString(
+                        payload, StandardCharsets.UTF_8));
+            } else {
+                b.GET();
+            }
+            HttpResponse<String> resp = HTTP.send(
+                    b.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            String respBody = resp.body() == null ? "" : resp.body();
+            if (respBody.length() > 8000) {
+                respBody = respBody.substring(0, 8000) + "\n…（已截断）";
+            }
+            if ("POST".equals(method)) {
+                return "HTTP " + resp.statusCode() + "\n" + respBody;
+            }
+            return respBody;
         } catch (Exception e) {
-            return "{\"error\":\"HTTP GET 失败: " + e.getMessage() + "\"}";
+            return "{\"error\":\"HTTP " + method + " 失败: " + e.getMessage() + "\"}";
         }
     }
 
     // ==================== 命令执行实现 ====================
 
     private static String redactSensitive(String s) {
-        if (Objects.isNull(s)) return "";
-        return s
-                .replaceAll("(?i)(access_token=)[^&\\s\"'}\\]]+", "$1***")
-                .replaceAll("(?i)(secret=)[^&\\s\"'}\\]]+", "$1***")
-                .replaceAll("(?i)(api[_-]?key=)[^&\\s\"'}\\]]+", "$1***");
+        return SecurityUtils.redactSensitive(s);
     }
 
     private static final java.util.regex.Pattern DANGEROUS_PATTERN = java.util.regex.Pattern.compile(
@@ -1295,10 +1275,7 @@ public class BuiltinTools {
     );
 
     private String execCommand(String command) {
-        if (!execEnabled) {
-            return "{\"error\":\"exec_command 已禁用（agent.tools.exec-enabled=false）\"}";
-        }
-        // 安全加固：多层防护
+        // 是否允许执行由 AgentLoop 会话授权闸门决定；此处只做命令安全检查。
 
         // 第1层：危险命令黑名单检查
         String lc = command.toLowerCase().trim();
@@ -1467,8 +1444,7 @@ public class BuiltinTools {
 
     /** 截断超长字符串，附省略标记。供搜索结果控 token。 */
     private static String truncate(String s, int max) {
-        if (Objects.isNull(s)) return "";
-        return s.length() <= max ? s : s.substring(0, max) + "…";
+        return com.miniagent.common.StringUtils.truncate(s, max);
     }
 
     static String strArg(Map<String, Object> p, String key) {

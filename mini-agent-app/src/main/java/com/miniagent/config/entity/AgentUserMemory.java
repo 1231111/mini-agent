@@ -4,16 +4,12 @@ import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.Lob;
-import jakarta.persistence.PrePersist;
-import jakarta.persistence.PreUpdate;
 import jakarta.persistence.Table;
 import jakarta.persistence.Version;
 
-import java.time.LocalDateTime;
-
 @Entity
 @Table(name = "agent_user_memory")
-public class AgentUserMemory {
+public class AgentUserMemory extends BaseEntity {
 
     @Id
     @Column(name = "user_id", nullable = false)
@@ -35,15 +31,6 @@ public class AgentUserMemory {
     @Column(name = "version")
     private Long version;
 
-    @Column(name = "updated_at")
-    private LocalDateTime updatedAt;
-
-    @PrePersist
-    @PreUpdate
-    void touch() {
-        updatedAt = LocalDateTime.now();
-    }
-
     public Long getUserId() { return userId; }
     public void setUserId(Long userId) { this.userId = userId; }
     public String getMemoryContent() { return memoryContent; }
@@ -54,6 +41,4 @@ public class AgentUserMemory {
     public void setMidtermContent(String midtermContent) { this.midtermContent = midtermContent; }
     public Long getVersion() { return version; }
     public void setVersion(Long version) { this.version = version; }
-    public LocalDateTime getUpdatedAt() { return updatedAt; }
-    public void setUpdatedAt(LocalDateTime updatedAt) { this.updatedAt = updatedAt; }
 }

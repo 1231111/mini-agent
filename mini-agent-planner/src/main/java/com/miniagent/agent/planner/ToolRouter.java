@@ -106,6 +106,7 @@ public class ToolRouter {
             set.addAll(capabilityIndex.toolsFor(cap));
             expandFamily(set, hint, cap);
             expandFileToolsIfNeeded(set, node, a);
+            expandExternalIoIfNeeded(set, node);
         }
         set.add("todo");
         if (!hardGate) set.add("memory");
@@ -156,5 +157,35 @@ public class ToolRouter {
         if (node == null || !"browser".equals(node.capability())) {
             set.add("read_file");
         }
+    }
+
+    /**
+     * 发布/调外部 API 不能只给文件工具，否则硬闸门会拒掉 http_get / exec_command。
+     */
+    private void expandExternalIoIfNeeded(Set<String> set, TaskNode node) {
+        if (!looksLikeExternalPublish(node)) {
+            return;
+        }
+        set.addAll(capabilityIndex.toolsFor("web"));
+        set.addAll(capabilityIndex.toolsFor("shell"));
+        set.addAll(capabilityIndex.toolsFor("file_read"));
+        set.addAll(capabilityIndex.toolsFor("file_write"));
+    }
+
+    static boolean looksLikeExternalPublish(TaskNode node) {
+        if (node == null) {
+            return false;
+        }
+        if (node.doneWhen().isMedia() || node.doneWhen().isCommand()) {
+            return true;
+        }
+        String n = node.name().toLowerCase(Locale.ROOT);
+        String c = node.capability().toLowerCase(Locale.ROOT);
+        if ("shell".equals(c)) {
+            return true;
+        }
+        return n.contains("发布") || n.contains("草稿")
+                || n.contains("publish") || n.contains("draft")
+                || n.contains("wechat");
     }
 }

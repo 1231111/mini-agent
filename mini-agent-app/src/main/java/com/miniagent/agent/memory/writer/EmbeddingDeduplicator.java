@@ -3,8 +3,8 @@ package com.miniagent.agent.memory.writer;
 import com.miniagent.agent.memory.entity.AgentMemoryEntryEntity;
 import com.miniagent.agent.memory.repository.AgentMemoryEntryRepository;
 import com.miniagent.common.embedding.SharedEmbeddingModel;
+import com.miniagent.agent.memory.retriever.MemoryEntryMapper;
 import com.miniagent.memory.model.MemoryEntry;
-import com.miniagent.memory.model.MemoryType;
 import com.miniagent.memory.writer.Deduplicator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -76,7 +76,7 @@ public class EmbeddingDeduplicator implements Deduplicator {
 
         if (bestScore >= similarityThreshold && bestMatch != null) {
             log.debug("去重发现相似记忆: id={}, score={}", bestMatch.getId(), bestScore);
-            MemoryEntry match = toMemoryEntry(bestMatch);
+            MemoryEntry match = MemoryEntryMapper.fromEntity(bestMatch);
             match.setId(bestMatch.getId());
             return Optional.of(match);
         }
@@ -84,17 +84,4 @@ public class EmbeddingDeduplicator implements Deduplicator {
         return Optional.empty();
     }
 
-    private MemoryEntry toMemoryEntry(AgentMemoryEntryEntity entity) {
-        MemoryEntry entry = new MemoryEntry();
-        entry.setId(entity.getId());
-        entry.setTenantId(entity.getTenantId());
-        entry.setMemoryType(MemoryType.valueOf(entity.getMemoryType().name()));
-        entry.setContent(entity.getContent());
-        entry.setSummary(entity.getSummary());
-        entry.setImportance(entity.getImportance());
-        entry.setConfidence(entity.getConfidence());
-        entry.setAccessCount(entity.getAccessCount());
-        entry.setStatus(com.miniagent.memory.model.MemoryStatus.valueOf(entity.getStatus().name()));
-        return entry;
-    }
 }

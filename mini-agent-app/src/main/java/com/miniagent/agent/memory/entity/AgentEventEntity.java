@@ -2,8 +2,6 @@ package com.miniagent.agent.memory.entity;
 
 import jakarta.persistence.*;
 
-import java.time.LocalDateTime;
-
 @Entity
 @Table(name = "agent_events", indexes = {
     @Index(name = "idx_aevt_session", columnList = "session_id"),
@@ -11,7 +9,7 @@ import java.time.LocalDateTime;
     @Index(name = "idx_aevt_type", columnList = "event_type"),
     @Index(name = "idx_aevt_processed", columnList = "processed, created_at")
 })
-public class AgentEventEntity {
+public class AgentEventEntity extends BaseMemoryEntity {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -44,9 +42,6 @@ public class AgentEventEntity {
     @Column(name = "processed")
     private Boolean processed = false;
 
-    @Column(name = "created_at", nullable = false)
-    private LocalDateTime createdAt;
-
     public enum EventType {
         TOOL_EXECUTION, PLAN_CHANGE, ERROR, MEMORY_WRITE,
         USER_FEEDBACK, TASK_START, TASK_COMPLETE, TASK_FAIL
@@ -54,11 +49,6 @@ public class AgentEventEntity {
 
     public enum EventStatus {
         SUCCESS, FAILED
-    }
-
-    @PrePersist
-    void onCreate() {
-        createdAt = LocalDateTime.now();
     }
 
     // --- getters/setters ---
@@ -89,7 +79,4 @@ public class AgentEventEntity {
 
     public Boolean getProcessed() { return processed; }
     public void setProcessed(Boolean processed) { this.processed = processed; }
-
-    public LocalDateTime getCreatedAt() { return createdAt; }
-    public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
 }

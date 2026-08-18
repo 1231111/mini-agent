@@ -14,7 +14,7 @@ spring:
   datasource:
     url: jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
     username: root
-    password: mysql_root_pass
+    password: ${MYSQL_PASSWORD:mysql_root_pass}
     driver-class-name: com.mysql.cj.jdbc.Driver
   data:
     redis:
@@ -222,6 +222,11 @@ agent:
     exec-enabled: false
     allow-absolute-write: false
     block-private-network: true
+    max-concurrency: 8
+  execution:
+    deadline-ms: 1800000
+    max-tool-calls: 120
+    max-estimated-tokens: 240000
   rate-limit:
     per-minute: 60
   concurrency:

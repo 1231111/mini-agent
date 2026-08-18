@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * StateSnapshot.graph → Todo UI 投影（Todo 不再当主状态）。
@@ -72,6 +73,30 @@ public class TodoStateProjector {
             if (it.id() == todoId)
                 return it.status() == TaskTodoStore.Status.completed;
         return false;
+    }
+
+    public boolean isTodoAwaiting(String sessionId, TaskGraph graph, String taskId) {
+        int todoId = todoIdFor(graph, taskId);
+        if (todoId <= 0 || sessionId == null) {
+            return false;
+        }
+        for (TaskTodoStore.TodoItem it : taskTodoStore.get(sessionId)) {
+            if (it.id() == todoId) {
+                return it.status() == TaskTodoStore.Status.awaiting_confirm;
+            }
+        }
+        return false;
+    }
+
+    public void yieldNodeToHuman(String sessionId, TaskGraph graph, String taskId,
+                                 String note) {
+        int todoId = todoIdFor(graph, taskId);
+        Set<Integer> ids = todoId > 0 ? Set.of(todoId) : Set.of();
+        taskTodoStore.yieldToHuman(sessionId, ids, note);
+    }
+
+    public boolean confirmAwaiting(String sessionId, String note) {
+        return taskTodoStore.confirmAwaiting(sessionId, note);
     }
 
     public String todoEvidence(String sessionId, TaskGraph graph, String taskId) {

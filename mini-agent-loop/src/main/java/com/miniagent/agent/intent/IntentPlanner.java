@@ -3,6 +3,7 @@ package com.miniagent.agent.intent;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
@@ -26,6 +27,8 @@ public class IntentPlanner {
     private IntentRuleGate ruleGate;
     @Autowired
     private IntentSignalMatcher signals;
+    @Autowired
+    private IntentConfidenceCalibrator confidenceCalibrator;
     @Autowired(required = false)
     private IntentHitLogService hitLogService;
 
@@ -60,7 +63,8 @@ public class IntentPlanner {
         if (classifier != null && classifier.isEnabled()) {
             LlmIntentClassifier.Classification c =
                     classifier.classify(text, hasImage, recentHistory, chatModel);
-            if (c != null && c.confidence() >= minConfidence) {
+            if (c != null && c.confidence() >= Math.max(minConfidence,
+                    clamp(props.getRejectConfidence()))) {
                 return finish("L1", text, fromClassification(text, hasImage, c, minConfidence), c, t0);
             }
             if (c != null) {
@@ -88,6 +92,20 @@ public class IntentPlanner {
 
     private TaskPlan finish(String layer, String userText, TaskPlan plan,
                             LlmIntentClassifier.Classification c, long t0) {
+        IntentDecision decision = buildDecision(layer, userText, plan, c);
+        TaskPlan enriched = plan == null ? null : plan.withDecision(decision);
+        if (enriched != null && decision.needClarification()
+                && enriched.intent() != IntentType.QUESTION
+                && enriched.intent() != IntentType.REVIEW) {
+            String why = clarificationReason(decision);
+            decision = decision.withClarification(true, why);
+            enriched = new TaskPlan(IntentType.QUESTION,
+                    "请澄清：" + (enriched.taskGoal().isBlank() ? userText : enriched.taskGoal()),
+                    true, true, false,
+                    copy(props.getToolProfiles().getQuestion()), List.of(), why, false)
+                    .withDecision(decision);
+        }
+        plan = enriched;
         int toolCount = plan.allowedTools() == null ? -1 : plan.allowedTools().size();
         if (c != null) {
             log.info("意图漏斗: layer={} intent={} profile={} structured={} tools={} conf={} reason={}",
@@ -101,6 +119,70 @@ public class IntentPlanner {
             hitLogService.record(layer, userText, plan, c, System.currentTimeMillis() - t0);
         }
         return plan;
+    }
+
+    private IntentDecision buildDecision(String layer, String userText, TaskPlan plan,
+                                         LlmIntentClassifier.Classification c) {
+        IntentDecisionSource source = c != null ? c.source()
+                : "L0".equalsIgnoreCase(layer) ? IntentDecisionSource.RULE
+                : IntentDecisionSource.HEURISTIC;
+        double raw = c != null ? c.confidence()
+                : "L0".equalsIgnoreCase(layer) ? 0.98 : 0.72;
+        double confidence = confidenceCalibrator == null
+                ? raw : confidenceCalibrator.calibrate(raw, source);
+        List<IntentAlternative> alternatives = c == null ? List.of()
+                : c.alternatives().stream()
+                .map(a -> new IntentAlternative(a.intent(),
+                        confidenceCalibrator == null ? a.confidence()
+                                : confidenceCalibrator.calibrate(a.confidence(), source),
+                        a.reason()))
+                .sorted((left, right) -> Double.compare(right.confidence(), left.confidence()))
+                .toList();
+        List<String> capabilities = new ArrayList<>();
+        if (c != null) capabilities.addAll(c.requiredCapabilities());
+        if (plan != null) {
+            if (c != null && c.needsWeb()) capabilities.add("web");
+            if (c != null && c.needsFiles()) capabilities.add("file");
+            if (c != null && c.needsImageGen()) capabilities.add("image");
+            if (capabilities.isEmpty() && plan.needsTools()) capabilities.add("general");
+        }
+        IntentRiskLevel risk = c != null ? c.riskLevel() : inferRisk(plan);
+        IntentDecision provisional = new IntentDecision(
+                plan == null ? IntentType.UNKNOWN : plan.intent(), confidence,
+                alternatives, plan != null && plan.requiresStructuredPlan(), false,
+                capabilities, risk, plan == null ? userText : plan.taskGoal(),
+                c != null && c.needsWeb(), c != null && c.needsFiles(),
+                c != null && c.needsImageGen(), plan != null && plan.shouldUseHistory(),
+                c == null ? "FULL" : c.toolProfile(),
+                plan == null ? "" : plan.reason(), source);
+        boolean ambiguous = provisional.alternativeMargin()
+                < Math.max(0.0, props.getAlternativeMargin());
+        boolean lowButClarifiable = confidence < clamp(props.getMinConfidence())
+                && confidence >= clamp(props.getClarifyConfidence());
+        return provisional.withClarification(ambiguous || lowButClarifiable,
+                ambiguous ? "候选意图置信度接近，需要澄清" : "意图置信度不足，需要澄清");
+    }
+
+    private static IntentRiskLevel inferRisk(TaskPlan plan) {
+        if (plan == null || plan.intent() == null) return IntentRiskLevel.MEDIUM;
+        return switch (plan.intent()) {
+            case PUBLISHING, FILE_DELIVERY -> IntentRiskLevel.HIGH;
+            case RESEARCH, NEW_TASK, CONTINUE_TASK, MULTIMODAL_ANALYSIS -> IntentRiskLevel.MEDIUM;
+            default -> IntentRiskLevel.LOW;
+        };
+    }
+
+    private static String clarificationReason(IntentDecision decision) {
+        StringBuilder sb = new StringBuilder("意图不够明确");
+        if (!decision.alternatives().isEmpty()) {
+            sb.append("（候选：");
+            for (int i = 0; i < decision.alternatives().size(); i++) {
+                if (i > 0) sb.append("、");
+                sb.append(decision.alternatives().get(i).intent());
+            }
+            sb.append("）");
+        }
+        return sb.append("，请说明你希望查询、修改、生成还是发布什么内容。").toString();
     }
 
     private TaskPlan fromClassification(String text, boolean hasImage,

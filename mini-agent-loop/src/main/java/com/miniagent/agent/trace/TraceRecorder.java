@@ -294,8 +294,7 @@ public class TraceRecorder {
     }
 
     private String truncate(String s, int max) {
-        if (Objects.isNull(s)) return null;
-        return s.length() > max ? s.substring(0, max) + "...(truncated)" : s;
+        return com.miniagent.common.StringUtils.truncateOrNull(s, max);
     }
 
     private static String jsonStr(String s) {

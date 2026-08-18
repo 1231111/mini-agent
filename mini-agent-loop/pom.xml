@@ -67,5 +67,10 @@
             <artifactId>milvus-sdk-java</artifactId>
             <version>2.4.10</version>
         </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 </project>

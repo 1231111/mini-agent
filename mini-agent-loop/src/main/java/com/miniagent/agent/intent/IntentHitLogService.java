@@ -121,7 +121,6 @@ public class IntentHitLogService {
     }
 
     private static String truncate(String s, int max) {
-        if (StringUtils.isBlank(s)) return s;
-        return s.length() > max ? s.substring(0, max) + "...(truncated)" : s;
+        return com.miniagent.common.StringUtils.truncate(s, max);
     }
 }

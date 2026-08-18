@@ -26,18 +26,20 @@ public class GraphScheduler {
         for (TaskNode node : ready) {
             if (taken >= n) break;
             String cap = node.capability() == null ? "" : node.capability();
+            String tool = node.toolHint() == null || node.toolHint().isBlank() ? cap : node.toolHint();
+            String actionId = "act_" + UUID.randomUUID().toString().substring(0, 8);
             actions.add(new ActionSpec(
-                    "act_" + UUID.randomUUID().toString().substring(0, 8),
+                    actionId,
                     node.id(),
-                    cap,
-                    Map.of(),
-                    node.doneWhen().wire(),
-                    ""));
+                    tool, cap, node.toolArguments(), node.doneWhen(), node.compensation(),
+                    "idem-" + snap.planVersion() + "-" + node.id(), 60,
+                    ActionRetryPolicy.none(), ""));
             taken++;
         }
         return new ActionProposal(
                 "prop_" + UUID.randomUUID().toString().substring(0, 8),
                 snap.version(),
+                snap.planVersion(),
                 snap.executionId(),
                 actions);
     }

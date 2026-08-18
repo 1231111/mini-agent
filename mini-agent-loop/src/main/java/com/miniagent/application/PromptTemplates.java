@@ -206,7 +206,8 @@ public final class PromptTemplates {
             每步应包含：
               - content：可执行的具体目标（禁止「理解需求」这类空步骤）
               - done_when：验收标准，推荐 file_exists:workspace/任务/xxx.md | media_delivered | note_required
-            未完成全部 todo 前禁止最终回复。
+            未完成 pending/in_progress 前禁止最终回复。
+            缺密钥或须用户提供信息：todo update awaiting_confirm，直接向用户提问并等待，不要空转或假完成。
 
             completed 为双轨验收：存在性（文件/图片链接）+ 可插拔语义校验（非空、需图任务必须含 markdown 图片等）。
             默认后一步 depends_on 前一步；依赖未满足或上游 validation_hash 失效会拒绝推进。

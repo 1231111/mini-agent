@@ -10,7 +10,7 @@ import java.time.LocalDateTime;
     @Index(name = "idx_ae_project", columnList = "project_id"),
     @Index(name = "idx_ae_outcome", columnList = "outcome")
 })
-public class AgentEpisodeEntity {
+public class AgentEpisodeEntity extends BaseMemoryEntity {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -59,16 +59,8 @@ public class AgentEpisodeEntity {
     @Column(name = "last_accessed_at")
     private LocalDateTime lastAccessedAt;
 
-    @Column(name = "created_at", nullable = false)
-    private LocalDateTime createdAt;
-
     public enum Outcome {
         SUCCESS, FAILURE, PARTIAL
-    }
-
-    @PrePersist
-    void onCreate() {
-        createdAt = LocalDateTime.now();
     }
 
     // --- getters/setters ---
@@ -114,7 +106,4 @@ public class AgentEpisodeEntity {
 
     public LocalDateTime getLastAccessedAt() { return lastAccessedAt; }
     public void setLastAccessedAt(LocalDateTime lastAccessedAt) { this.lastAccessedAt = lastAccessedAt; }
-
-    public LocalDateTime getCreatedAt() { return createdAt; }
-    public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
 }

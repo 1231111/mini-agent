@@ -1,11 +1,12 @@
 package com.miniagent.agent.intent;
 
+import org.apache.commons.lang3.StringUtils;
+
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.Objects;
 import java.util.Optional;
-import org.apache.commons.lang3.StringUtils;
+import java.util.Set;
 
 public record TaskPlan(
         IntentType intent,
@@ -16,20 +17,29 @@ public record TaskPlan(
         List<String> allowedTools,
         List<TaskStep> steps,
         String reason,
-        /** 复杂任务：进入 AgentLoop 后必须先 todo.set，否则框架只放行 todo 工具 */
-        boolean requiresStructuredPlan
+        boolean requiresStructuredPlan,
+        IntentDecision decision
 ) {
-    /** 兼容旧 8 参构造：默认不强制结构化计划 */
     public TaskPlan(IntentType intent, String taskGoal, boolean directExecutable,
                     boolean shouldUseHistory, boolean needsTools,
                     List<String> allowedTools, List<TaskStep> steps, String reason) {
         this(intent, taskGoal, directExecutable, shouldUseHistory, needsTools,
-                allowedTools, steps, reason, false);
+                allowedTools, steps, reason, false, null);
     }
 
-    /**
-     * null = 不限制（注册表全量工具）；空集合 = 无工具。
-     */
+    public TaskPlan(IntentType intent, String taskGoal, boolean directExecutable,
+                    boolean shouldUseHistory, boolean needsTools,
+                    List<String> allowedTools, List<TaskStep> steps, String reason,
+                    boolean requiresStructuredPlan) {
+        this(intent, taskGoal, directExecutable, shouldUseHistory, needsTools,
+                allowedTools, steps, reason, requiresStructuredPlan, null);
+    }
+
+    public TaskPlan withDecision(IntentDecision value) {
+        return new TaskPlan(intent, taskGoal, directExecutable, shouldUseHistory, needsTools,
+                allowedTools, steps, reason, requiresStructuredPlan, value);
+    }
+
     public Set<String> allowedToolSet() {
         return Objects.isNull(allowedTools) ? null : new LinkedHashSet<>(allowedTools);
     }
@@ -43,6 +53,12 @@ public record TaskPlan(
         sb.append("- shouldUseHistory: ").append(shouldUseHistory).append('\n');
         sb.append("- needsTools: ").append(needsTools).append('\n');
         sb.append("- requiresStructuredPlan: ").append(requiresStructuredPlan).append('\n');
+        if (decision != null) {
+            sb.append("- intentConfidence: ").append(String.format("%.3f", decision.confidence())).append('\n');
+            sb.append("- intentRisk: ").append(decision.riskLevel()).append('\n');
+            sb.append("- intentSource: ").append(decision.source()).append('\n');
+            sb.append("- needClarification: ").append(decision.needClarification()).append('\n');
+        }
         sb.append("- allowedTools: ").append(Optional.ofNullable(allowedTools).orElse(List.of())).append('\n');
         if (StringUtils.isNotBlank(reason)) {
             sb.append("- reason: ").append(reason).append('\n');

@@ -128,6 +128,11 @@ public class TaskRunService implements SessionLock {
         finish(userId, sessionId, AgentTaskRun.Status.FAILED, error);
     }
 
+    @Transactional
+    public void markCancelled(Long userId, String sessionId, String reason) {
+        finish(userId, sessionId, AgentTaskRun.Status.CANCELLED, reason);
+    }
+
     private void finish(Long userId, String sessionId, AgentTaskRun.Status status, String error) {
         try {
             repository.findFirstBySessionIdAndStatusOrderByStartedAtDesc(sessionId, AgentTaskRun.Status.RUNNING)

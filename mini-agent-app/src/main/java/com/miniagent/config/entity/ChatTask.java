@@ -1,11 +1,10 @@
 package com.miniagent.config.entity;
 
 import jakarta.persistence.*;
-import java.time.LocalDateTime;
 
 @Entity
 @Table(name = "chat_tasks")
-public class ChatTask {
+public class ChatTask extends BaseEntity {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
@@ -20,10 +19,6 @@ public class ChatTask {
     /** 用户上传的图片路径（逗号分隔），相对于 conversation-images/ 目录 */
     @Column(name = "images", columnDefinition = "TEXT")
     private String images;
-    @Column(name = "created_at")
-    private LocalDateTime createdAt;
-    @PrePersist
-    protected void onCreate() { createdAt = LocalDateTime.now(); }
     public Long getId() { return id; }
     public void setId(Long id) { this.id = id; }
     public Long getUserId() { return userId; }
@@ -36,6 +31,4 @@ public class ChatTask {
     public void setAnswer(String answer) { this.answer = answer; }
     public String getImages() { return images; }
     public void setImages(String images) { this.images = images; }
-    public LocalDateTime getCreatedAt() { return createdAt; }
-    public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
 }

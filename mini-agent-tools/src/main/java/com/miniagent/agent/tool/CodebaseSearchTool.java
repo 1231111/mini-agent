@@ -265,8 +265,7 @@ public class CodebaseSearchTool {
     }
 
     private static String truncate(String s, int max) {
-        if (Objects.isNull(s)) return "";
-        return s.length() <= max ? s : s.substring(0, max) + "…";
+        return com.miniagent.common.StringUtils.truncate(s, max);
     }
 
     private String err(String msg) {

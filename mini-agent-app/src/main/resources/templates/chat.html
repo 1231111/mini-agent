@@ -479,9 +479,10 @@
         .bot-content {
             flex: 1; min-width: 0;
             background: var(--surface);
+            border: 1px solid var(--border);
             border-radius: 16px;
             padding: 16px 20px;
-            transition: background .2s ease;
+            transition: background .2s ease, border-color .2s ease;
         }
 
         /* Streaming blinking cursor */
@@ -724,14 +725,13 @@
         }
         .img-preview.active { display: flex; }
 
-        /* Main input box */
+        /* Main input box — 与 .bot-content 同一套卡片：底、边、圆角 */
         .input-box {
             background: var(--surface);
-            border: 1px solid var(--border-strong);
+            border: 1px solid var(--border);
             border-radius: 16px;
-            padding: 12px 12px 10px;
+            padding: 12px 16px 10px;
             display: flex; flex-direction: column; gap: 8px;
-            box-shadow: var(--shadow-input);
             transition: border-color .2s, box-shadow .2s;
         }
         .img-preview.active ~ .input-box,
@@ -740,12 +740,12 @@
         }
         .input-box:focus-within {
             border-color: var(--accent);
-            box-shadow: var(--shadow-input), 0 0 0 3px var(--accent-soft), 0 0 20px rgba(16,163,127,.08);
+            box-shadow: 0 0 0 3px var(--accent-soft);
         }
 
         .input-box textarea {
             background: none; border: none; outline: none;
-            color: var(--text); font-size: 15.5px;
+            color: var(--text); font-size: 15px;
             font-family: inherit; resize: none;
             line-height: 1.6; width: 100%;
             min-height: 26px; max-height: 200px;
@@ -757,12 +757,19 @@
             justify-content: space-between;
             gap: 8px;
         }
-        .input-left { display: flex; gap: 2px; }
+        .input-left {
+            display: flex;
+            align-items: center;
+            gap: 2px;
+            flex-wrap: nowrap;
+            min-width: 0;
+        }
         .in-tool-btn {
             width: 32px; height: 32px;
             display: flex; align-items: center; justify-content: center;
             border: none; background: none; color: var(--text2);
             border-radius: 8px; cursor: pointer;
+            flex-shrink: 0;
             transition: background .12s, color .12s;
         }
         .in-tool-btn:hover { background: var(--surface2); color: var(--text); }
@@ -776,6 +783,7 @@
             padding: 0 8px;
             gap: 4px;
             font-size: 12px;
+            white-space: nowrap;
         }
         .role-btn svg { width: 14px; height: 14px; }
         .role-btn.active {
@@ -811,7 +819,15 @@
         .role-icon { font-size: 16px; }
         .role-name { font-size: 13px; }
 
-        .perm-selector { position: relative; }
+        .perm-selector { position: relative; flex-shrink: 0; }
+        .perm-btn {
+            width: auto !important;
+            height: 32px;
+            padding: 0 8px;
+            gap: 4px;
+            font-size: 12px;
+            white-space: nowrap;
+        }
         .perm-btn.active {
             background: var(--accent-soft) !important;
             color: var(--accent) !important;
@@ -838,32 +854,33 @@
         .perm-item:hover { background: var(--surface2); }
         .perm-item.active { background: var(--accent-soft); color: var(--accent); }
         .perm-item small { display: block; color: var(--text3); font-size: 11px; margin-top: 2px; }
-        .plan-banner {
+        .plan-banner, .confirm-banner {
             display: none;
             align-items: center; gap: 10px; justify-content: space-between;
-            margin: 0 16px 8px; padding: 10px 14px;
-            background: var(--accent-soft); border: 1px solid var(--accent);
+            margin: 0 0 8px; padding: 10px 14px;
             border-radius: 10px; font-size: 13px; color: var(--text);
+            max-width: 100%;
+            box-sizing: border-box;
         }
-        .plan-banner.show { display: flex; }
-        .plan-banner button {
-            border: none; border-radius: 8px; padding: 6px 12px;
-            background: var(--accent); color: #fff; font-weight: 600; cursor: pointer;
-            white-space: nowrap;
-        }
+        .plan-banner { background: var(--accent-soft); border: 1px solid var(--accent); }
         .confirm-banner {
-            display: none;
-            align-items: center; gap: 10px; justify-content: space-between;
-            margin: 0 16px 8px; padding: 10px 14px;
             background: rgba(230, 162, 60, 0.12); border: 1px solid #e6a23c;
-            border-radius: 10px; font-size: 13px; color: var(--text);
         }
-        .confirm-banner.show { display: flex; }
-        .confirm-banner button {
-            border: none; border-radius: 8px; padding: 6px 12px;
-            background: #e6a23c; color: #fff; font-weight: 600; cursor: pointer;
+        .plan-banner.show, .confirm-banner.show { display: flex; }
+        .plan-banner span, .confirm-banner span {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
             white-space: nowrap;
         }
+        .plan-banner button, .confirm-banner button {
+            border: none; border-radius: 8px; padding: 6px 12px;
+            color: #fff; font-weight: 600; cursor: pointer;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .plan-banner button { background: var(--accent); }
+        .confirm-banner button { background: #e6a23c; }
         .ask-modal-backdrop {
             display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45);
             z-index: 1000; align-items: center; justify-content: center;
@@ -1201,6 +1218,7 @@
             color: #fff;
             cursor: pointer;
             white-space: nowrap;
+            align-self: center;
         }
         .todo-confirm-btn:disabled {
             opacity: 0.5;
@@ -1404,6 +1422,7 @@
 
     <!-- Input area -->
     <div class="input-wrap">
+        <div class="input-container">
         <div class="plan-banner" id="planBanner">
             <span id="planBannerText">Plan 模式：仅探索与规划，写操作已锁定</span>
             <button type="button" onclick="approvePlan()">批准计划并执行</button>
@@ -1412,7 +1431,6 @@
             <span id="confirmBannerText">有步骤需要确认后才能继续</span>
             <button type="button" onclick="confirmPendingTodo()">确认并继续</button>
         </div>
-        <div class="input-container">
             <!-- Image preview (multi-image, rendered by JS) -->
             <div class="img-preview" id="imgPreview"></div>
             <!-- Compose box -->
@@ -1457,7 +1475,7 @@
                         <div class="perm-selector" id="confirmSelector">
                             <button class="in-tool-btn perm-btn" id="confirmPolicyBtn"
                                     title="待办确认策略" onclick="toggleConfirmMenu()">
-                                <span id="confirmPolicyLabel">危险操作确认</span>
+                                <span id="confirmPolicyLabel">需确认</span>
                             </button>
                             <div class="perm-menu" id="confirmMenu">
                                 <div class="perm-item active" data-policy="dangerous"
@@ -1602,6 +1620,7 @@ let confirmPolicy = localStorage.getItem('mini_agent_confirm_policy') || 'danger
 let pendingTodoConfirm = null;
 let pendingAskTool = null;
 let isStreaming  = false;
+let streamEpoch  = 0;
 const SCROLL_BOTTOM_PX = 80;
 let stickToBottom = true;
 
@@ -2183,8 +2202,14 @@ async function approvePlan() {
 }
 function showAskModal(tool) {
     pendingAskTool = tool;
+    const labels = {
+        exec_command: '终端命令执行',
+        http_post: '发送 HTTP POST 请求'
+    };
+    const label = labels[tool] || tool;
     document.getElementById('askModalText').textContent =
-        'Agent 请求执行危险工具「' + tool + '」。批准后本会话可再次使用该工具。';
+        'Agent 需要「' + label + '」才能继续当前步骤。批准后本会话可再次使用该能力。'
+        + '（点批准，不要只点步骤里的「确认并继续」。）';
     document.getElementById('askModal').classList.add('show');
 }
 function denyAskTool() {
@@ -2194,6 +2219,7 @@ function denyAskTool() {
 async function grantAskTool() {
     const tool = pendingAskTool;
     document.getElementById('askModal').classList.remove('show');
+    pendingAskTool = null;
     if (!tool || !currentId) return;
     try {
         await fetch('/api/permission-mode', {
@@ -2201,11 +2227,28 @@ async function grantAskTool() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ sessionId: currentId, action: 'grant_ask', tool })
         });
-    } catch (e) { console.warn(e); }
-    pendingAskTool = null;
+    } catch (e) {
+        console.warn(e);
+        return;
+    }
+    const deadline = Date.now() + 90000;
+    while (isStreaming && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 150));
+    }
+    if (isStreaming) return;
+    await new Promise(r => setTimeout(r, 200));
+    if (isStreaming) return;
+    const text = '已批准「' + tool + '」，请继续执行。';
+    document.getElementById('welcomeScreen')?.remove();
+    renderUserMsg(text, null, 0, []);
+    addMsgToConv('user', text, null, null);
+    const botBody = renderBotMsg(
+        '<div class="typing-dots"><span></span><span></span><span></span></div>', true);
+    setStreaming(true);
+    sendChatPost(text, currentId, [], [], botBody);
 }
 
-const CONFIRM_LABELS = { dangerous: '危险操作确认', auto: '自动确认' };
+const CONFIRM_LABELS = { dangerous: '需确认', auto: '自动确认' };
 
 function toggleConfirmMenu() {
     const menu = document.getElementById('confirmMenu');
@@ -2227,7 +2270,10 @@ function paintConfirmPolicyUi() {
     const btn = document.getElementById('confirmPolicyBtn');
     const labelEl = document.getElementById('confirmPolicyLabel');
     if (labelEl) labelEl.textContent = label;
-    if (btn) btn.classList.toggle('active', confirmPolicy !== 'dangerous');
+    if (btn) {
+        btn.title = confirmPolicy === 'auto' ? '自动确认' : '危险操作确认';
+        btn.classList.toggle('active', confirmPolicy !== 'dangerous');
+    }
     document.querySelectorAll('#confirmMenu .perm-item').forEach(el => {
         el.classList.toggle('active', el.dataset.policy === confirmPolicy);
     });
@@ -2666,6 +2712,7 @@ function send() {
 
 /** POST /chat/stream (JSON body)，读 SSE 流式响应 */
 async function sendChatPost(text, sessionId, files, refs, botBody) {
+    const epoch = ++streamEpoch;
     try {
         let images = [];
         let fileAttachments = [];
@@ -2701,17 +2748,21 @@ async function sendChatPost(text, sessionId, files, refs, botBody) {
         if (!resp.ok || !resp.body) {
             botBody.innerHTML = renderMD('❌ HTTP ' + resp.status);
             botBody.classList.remove('streaming');
-            setStreaming(false); onInputChange(); scrollToBottom();
+            if (epoch === streamEpoch) {
+                setStreaming(false); onInputChange(); scrollToBottom();
+            }
             return;
         }
 
         // 读 SSE 流
         await consumeStream(resp.body.getReader(), botBody, sessionId);
-        if (isStreaming) unlockComposer();
+        if (isStreaming && epoch === streamEpoch) unlockComposer();
     } catch (err) {
         botBody.innerHTML = renderMD('❌ ' + err.message);
         botBody.classList.remove('streaming');
-        setStreaming(false); onInputChange(); scrollToBottom();
+        if (epoch === streamEpoch) {
+            setStreaming(false); onInputChange(); scrollToBottom();
+        }
     }
 }
 
@@ -3445,10 +3496,11 @@ async function reconnectStream(sid) {
             startPolling(sid);
             return;
         }
+        const epoch = ++streamEpoch;
         setStreaming(true);
         const botBody = renderBotMsg('<div class="typing-dots"><span></span><span></span><span></span></div>', true);
         await consumeStream(resp.body.getReader(), botBody, sid);
-        if (isStreaming) unlockComposer();
+        if (isStreaming && epoch === streamEpoch) unlockComposer();
     } catch (e) {
         console.warn('reconnectStream failed:', e);
         unlockComposer();

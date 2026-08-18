@@ -3,6 +3,7 @@ package com.miniagent.agent.memory.manager;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.memory.entity.*;
+import com.miniagent.agent.memory.MemoryIndexOutboxService;
 import com.miniagent.agent.memory.lifecycle.DefaultConsolidationService;
 import com.miniagent.agent.memory.lifecycle.RetentionForgettingPolicy;
 import com.miniagent.agent.memory.lifecycle.WorkingMemoryManager;
@@ -78,6 +79,9 @@ public class DefaultMemoryManager implements MemoryManager {
     @Autowired(required = false)
     private MilvusHybridSearchEngine milvusSearchEngine;
 
+    @Autowired(required = false)
+    private MemoryIndexOutboxService indexOutbox;
+
     @Autowired
     private ObjectMapper objectMapper;
 
@@ -107,8 +111,8 @@ public class DefaultMemoryManager implements MemoryManager {
         // 异步处理事件转化为记忆
         try {
             MemoryEntry memory = eventProcessor.process(event);
-            if (memory != null && memory.getId() != null && milvusSearchEngine != null) {
-                milvusSearchEngine.upsert(memory.getTenantId(), memory.getId(), memory.getContent());
+            if (memory != null && memory.getId() != null && indexOutbox != null) {
+                indexOutbox.enqueueUpsert(memory.getId());
             }
         } catch (Exception e) {
             log.warn("事件处理失败: {}", e.getMessage());
@@ -123,8 +127,8 @@ public class DefaultMemoryManager implements MemoryManager {
         entry.setId(entity.getId());
 
         // 写入向量
-        if (milvusSearchEngine != null) {
-            milvusSearchEngine.upsert(entry.getTenantId(), entity.getId(), entry.getContent());
+        if (indexOutbox != null) {
+            indexOutbox.enqueueUpsert(entity.getId());
         }
     }
 
@@ -139,8 +143,8 @@ public class DefaultMemoryManager implements MemoryManager {
             entryRepository.save(entity);
 
             // 更新向量
-            if (milvusSearchEngine != null && update.getContent() != null) {
-                milvusSearchEngine.upsert(entity.getTenantId(), id, update.getContent());
+            if (indexOutbox != null && update.getContent() != null) {
+                indexOutbox.enqueueUpsert(id);
             }
         });
     }
@@ -151,6 +155,7 @@ public class DefaultMemoryManager implements MemoryManager {
         entryRepository.findById(id).ifPresent(entity -> {
             entity.setStatus(AgentMemoryEntryEntity.Status.DELETED);
             entryRepository.save(entity);
+            if (indexOutbox != null) indexOutbox.enqueueDelete(id);
         });
     }
 
@@ -353,10 +358,12 @@ public class DefaultMemoryManager implements MemoryManager {
             if (newStatus == MemoryStatus.ARCHIVED && entity.getStatus() != AgentMemoryEntryEntity.Status.ARCHIVED) {
                 entity.setStatus(AgentMemoryEntryEntity.Status.ARCHIVED);
                 entryRepository.save(entity);
+                if (indexOutbox != null) indexOutbox.enqueueDelete(entity.getId());
                 archived++;
             } else if (newStatus == MemoryStatus.DELETED && entity.getStatus() != AgentMemoryEntryEntity.Status.DELETED) {
                 entity.setStatus(AgentMemoryEntryEntity.Status.DELETED);
                 entryRepository.save(entity);
+                if (indexOutbox != null) indexOutbox.enqueueDelete(entity.getId());
                 deleted++;
             }
         }

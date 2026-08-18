@@ -2,8 +2,12 @@ package com.miniagent.agent.memory.retriever;
 
 import com.miniagent.memory.model.HybridScore;
 import com.miniagent.memory.model.MemoryEntry;
+import com.miniagent.memory.model.MemoryQuery;
+import com.miniagent.memory.model.MemoryScope;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+
+import java.util.Objects;
 
 /**
  * 混合评分计算器。
@@ -62,6 +66,31 @@ public class HybridScoreCalculator {
         score.setFinalScore(calculate(semanticScore, keywordScore, entry.getImportance(),
             entry.getCreatedAt(), entry.getConfidence(), scopeMatch));
         return score;
+    }
+
+    public double scopeMatch(MemoryQuery query, MemoryEntry memory) {
+        if (memory.getScope() == null) return 0.0;
+        if (memory.getScope().scopeType() == query.getScope().scopeType()
+            && Objects.equals(memory.getScope().scopeId(), query.getScope().scopeId())) {
+            return 1.0;
+        }
+        if (memory.getScope().scopeType() == MemoryScope.ScopeType.TENANT) {
+            return 0.5;
+        }
+        return 0.0;
+    }
+
+    public double keywordRelevance(String query, String content) {
+        if (query == null || content == null) return 0;
+        String q = query.toLowerCase();
+        String c = content.toLowerCase();
+        if (c.contains(q)) return 1.0;
+        String[] words = q.split("\\s+");
+        int matched = 0;
+        for (String w : words) {
+            if (w.length() > 1 && c.contains(w)) matched++;
+        }
+        return words.length > 0 ? (double) matched / words.length : 0;
     }
 
     /**

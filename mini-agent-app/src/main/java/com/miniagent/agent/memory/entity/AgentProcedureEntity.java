@@ -9,7 +9,7 @@ import java.time.LocalDateTime;
     @Index(name = "idx_ap_scope", columnList = "scope_type, scope_id"),
     @Index(name = "idx_ap_name", columnList = "name")
 })
-public class AgentProcedureEntity {
+public class AgentProcedureEntity extends BaseMemoryEntity {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -57,22 +57,7 @@ public class AgentProcedureEntity {
     @Column(name = "status", length = 32)
     private AgentMemoryEntryEntity.Status status = AgentMemoryEntryEntity.Status.ACTIVE;
 
-    @Column(name = "created_at", nullable = false)
-    private LocalDateTime createdAt;
-
-    @Column(name = "updated_at", nullable = false)
-    private LocalDateTime updatedAt;
-
-    @PrePersist
-    void onCreate() {
-        createdAt = LocalDateTime.now();
-        updatedAt = createdAt;
-    }
-
-    @PreUpdate
-    void onUpdate() {
-        updatedAt = LocalDateTime.now();
-    }
+    // createdAt/updatedAt 由 BaseMemoryEntity 管理
 
     // --- getters/setters ---
 
@@ -114,10 +99,4 @@ public class AgentProcedureEntity {
 
     public AgentMemoryEntryEntity.Status getStatus() { return status; }
     public void setStatus(AgentMemoryEntryEntity.Status status) { this.status = status; }
-
-    public LocalDateTime getCreatedAt() { return createdAt; }
-    public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
-
-    public LocalDateTime getUpdatedAt() { return updatedAt; }
-    public void setUpdatedAt(LocalDateTime updatedAt) { this.updatedAt = updatedAt; }
 }

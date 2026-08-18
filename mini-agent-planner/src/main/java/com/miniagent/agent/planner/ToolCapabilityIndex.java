@@ -23,7 +23,7 @@ public class ToolCapabilityIndex {
             Map.entry("file_write", List.of("write_file", "edit_file")),
             Map.entry("file_read", List.of("read_file", "list_files", "read_package")),
             Map.entry("file", List.of("write_file", "read_file", "edit_file", "list_files")),
-            Map.entry("web", List.of("web_search", "web_extract", "http_get")),
+            Map.entry("web", List.of("web_search", "web_extract", "http_get", "http_post")),
             Map.entry("browser", List.of(
                     "browser_navigate", "browser_snapshot", "browser_click",
                     "browser_type", "browser_press", "browser_extract_text",
@@ -35,7 +35,8 @@ public class ToolCapabilityIndex {
             Map.entry("shell", List.of("exec_command")),
             Map.entry("memory", List.of("memory")),
             Map.entry("todo", List.of("todo")),
-            Map.entry("research", List.of("web_search", "web_extract", "http_get", "read_file")),
+            Map.entry("research", List.of(
+                    "web_search", "web_extract", "http_get", "http_post", "read_file")),
             Map.entry("deliver", List.of("write_file", "edit_file")),
             Map.entry("plan", List.of("todo")),
             Map.entry("general", List.of("todo", "memory", "web_search", "write_file", "read_file"))

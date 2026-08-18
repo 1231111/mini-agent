@@ -237,6 +237,10 @@ public class GoalCompiler {
         if (plan != null && plan.intent() == IntentType.IMAGE_GENERATION) return "image";
         if (looksLikeBrowser(t)) return "browser";
         if (plan != null && plan.intent() == IntentType.RESEARCH) return "research";
+        if (t.contains("发布") || t.contains("草稿") || t.contains("publish")
+                || t.contains("draft")) {
+            return "web";
+        }
         if (plan != null && plan.intent() == IntentType.FILE_DELIVERY) return "file_write";
         if (t.contains("图") || t.contains("画") || t.contains("image")) return "image";
         if (t.contains("搜索") || t.contains("调研") || t.contains("网页")) return "web";

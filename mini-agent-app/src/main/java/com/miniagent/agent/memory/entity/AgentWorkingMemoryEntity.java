@@ -2,14 +2,12 @@ package com.miniagent.agent.memory.entity;
 
 import jakarta.persistence.*;
 
-import java.time.LocalDateTime;
-
 @Entity
 @Table(name = "agent_working_memories", indexes = {
     @Index(name = "idx_awm_tenant", columnList = "tenant_id"),
     @Index(name = "idx_awm_status", columnList = "status")
 })
-public class AgentWorkingMemoryEntity {
+public class AgentWorkingMemoryEntity extends BaseMemoryEntity {
 
     @Id
     @Column(name = "session_id", nullable = false, length = 128)
@@ -57,19 +55,6 @@ public class AgentWorkingMemoryEntity {
     @Column(name = "status", length = 32)
     private String status = "ACTIVE";
 
-    @Column(name = "updated_at", nullable = false)
-    private LocalDateTime updatedAt;
-
-    @PrePersist
-    void onCreate() {
-        updatedAt = LocalDateTime.now();
-    }
-
-    @PreUpdate
-    void onUpdate() {
-        updatedAt = LocalDateTime.now();
-    }
-
     // --- getters/setters ---
 
     public String getSessionId() { return sessionId; }
@@ -110,7 +95,4 @@ public class AgentWorkingMemoryEntity {
 
     public String getStatus() { return status; }
     public void setStatus(String status) { this.status = status; }
-
-    public LocalDateTime getUpdatedAt() { return updatedAt; }
-    public void setUpdatedAt(LocalDateTime updatedAt) { this.updatedAt = updatedAt; }
 }

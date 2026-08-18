@@ -44,7 +44,18 @@ public final class MessageConstants {
     public static final String PLANNER_CONTINUE_HINT =
             "本段轮次用尽。接着当前工具上下文继续，不要重复已经完成的打开/导航。";
     public static final String PLANNER_FOCUS_RULES =
-            "框架已过滤工具表。禁止 todo.set/clear；只能 update 当前 focusTodoIds。立刻执行本步，不要探盘或重建计划。";
+            "框架已过滤工具表。禁止 todo.set/clear；只能 update 当前 focusTodoIds。"
+                    + "缺密钥或须用户提供信息时：todo update status=awaiting_confirm，"
+                    + "然后直接向用户提问并结束本段；禁止为凑完成写无法执行的脚本。"
+                    + "缺终端执行或 HTTP POST 时直接调用 exec_command / http_post，"
+                    + "由框架向用户弹授权，不要改 awaiting_confirm，不要让用户去改配置或双击脚本。"
+                    + "立刻执行本步，不要探盘或重建计划。";
+    public static final String SSE_PERMISSION_ASK = "permission_ask";
+    public static final String AGENT_PERM_ASK_WAIT =
+            "需要你批准才能执行「%s」。请点击弹窗中的「批准并继续」，不要只点步骤确认。";
+    public static final String AGENT_PERM_ASK_TOOL_ERROR =
+            "{\"error\":\"工具 %s 需用户批准后才能执行。已向用户弹出授权。"
+                    + "不要把步骤标为 awaiting_confirm，不要让用户双击脚本或去改配置。\"}";
     public static final String AGENT_CONTEXT_TRUNCATED = "【上下文已硬截断，部分早期内容丢失】";
     public static final String AGENT_DRIFT_CORRECTION = "注意：你偏离了原始任务目标。请回到用户最初的问题。";
 

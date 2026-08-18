@@ -43,6 +43,7 @@ public class TaskTodoStore {
             java.util.regex.Pattern.compile(
                     "(?i)(上线|发布|生产环境|正式提交|删除全部|drop table|rm -rf|格式化"
                             + "|清空数据库|exec_command)");
+    private static final int YIELD_NOTE_MAX_CHARS = 200;
 
     /**
      * @param dependsOn 依赖的上游 todo id；未满足前不可推进/勾选
@@ -135,7 +136,19 @@ public class TaskTodoStore {
     public synchronized boolean hasIncomplete(String sessionId) {
         for (TodoItem it : get(sessionId)) {
             if (it.status() == Status.pending || it.status() == Status.in_progress
-                    || it.status() == Status.awaiting_confirm) return true;
+                    || it.status() == Status.awaiting_confirm) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** pending / in_progress 仍可自动推进；awaiting_confirm 应把问句交给用户。 */
+    public synchronized boolean hasRunnableIncomplete(String sessionId) {
+        for (TodoItem it : get(sessionId)) {
+            if (it.status() == Status.pending || it.status() == Status.in_progress) {
+                return true;
+            }
         }
         return false;
     }
@@ -419,6 +432,69 @@ public class TaskTodoStore {
         }
         if (errorOut != null && errorOut.length > 0) errorOut[0] = "未找到 id=" + id;
         return null;
+    }
+
+    /** 用户在聊天里答复密钥/确认时，放行当前 awaiting_confirm。 */
+    public synchronized boolean confirmAwaiting(String sessionId, String note) {
+        TodoItem it = awaitingConfirmItem(sessionId);
+        if (it == null) {
+            return false;
+        }
+        String[] err = new String[1];
+        return confirm(sessionId, it.id(), note, err) != null;
+    }
+
+    /**
+     * 向用户提问时挂起当前步。ids 空则挂起所有 in_progress。
+     */
+    public synchronized boolean yieldToHuman(String sessionId, Set<Integer> ids, String note) {
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        List<TodoItem> list = todos.get(key);
+        if (list == null || list.isEmpty()) {
+            return false;
+        }
+        String n = truncate(note, YIELD_NOTE_MAX_CHARS);
+        Set<Integer> target = new LinkedHashSet<>();
+        if (ids != null) {
+            for (int id : ids) {
+                if (id > 0) {
+                    target.add(id);
+                }
+            }
+        }
+        if (target.isEmpty()) {
+            for (TodoItem it : list) {
+                if (it.status() == Status.in_progress) {
+                    target.add(it.id());
+                }
+            }
+        }
+        if (target.isEmpty()) {
+            return hasAwaitingConfirm(sessionId);
+        }
+        boolean changed = false;
+        for (int i = 0; i < list.size(); i++) {
+            TodoItem it = list.get(i);
+            if (!target.contains(it.id())) {
+                continue;
+            }
+            if (it.status() == Status.completed
+                    || it.status() == Status.cancelled
+                    || it.status() == Status.blocked) {
+                continue;
+            }
+            if (it.status() != Status.awaiting_confirm) {
+                list.set(i, new TodoItem(it.id(), it.content(), Status.awaiting_confirm, n,
+                        it.doneWhen(), it.evidence(), it.validationHash(), it.dependsOn()));
+                changed = true;
+            }
+        }
+        if (changed) {
+            persist(key, list);
+            log.info("todo 挂起等待人工输入 session={} ids={}", sessionId, target);
+        }
+        return changed || hasAwaitingConfirm(sessionId);
     }
 
     public synchronized boolean markBlocked(String sessionId, int id, String reason) {
@@ -964,7 +1040,8 @@ public class TaskTodoStore {
         }
         sb.append("- completed 需存在性 + 可插拔语义校验；上游 hash 变化须先 reopen\n");
         sb.append("- 工具连败 → blocked；可用 todo(action=reopen) 回滚并级联下游\n");
-        sb.append("- 未全部 completed/cancelled 前禁止最终收尾\n");
+        sb.append("- pending/in_progress 未完成前禁止最终收尾\n");
+        sb.append("- 缺密钥或须用户提供信息：update awaiting_confirm，向用户提问并等待\n");
         return sb.toString();
     }
 

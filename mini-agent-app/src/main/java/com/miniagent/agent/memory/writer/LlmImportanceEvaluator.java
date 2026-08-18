@@ -1,5 +1,6 @@
 package com.miniagent.agent.memory.writer;
 
+import com.miniagent.common.StringUtils;
 import com.miniagent.memory.model.AgentEvent;
 import com.miniagent.memory.writer.ImportanceEvaluator;
 import dev.langchain4j.data.message.SystemMessage;
@@ -101,7 +102,6 @@ public class LlmImportanceEvaluator implements ImportanceEvaluator {
     }
 
     private String truncate(String s, int maxLen) {
-        if (s == null) return "";
-        return s.length() > maxLen ? s.substring(0, maxLen) + "..." : s;
+        return StringUtils.truncate(s, maxLen);
     }
 }

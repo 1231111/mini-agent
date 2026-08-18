@@ -8,11 +8,9 @@ import jakarta.persistence.PrePersist;
 import jakarta.persistence.PreUpdate;
 import jakarta.persistence.Table;
 
-import java.time.LocalDateTime;
-
 @Entity
 @Table(name = "agent_session_planner")
-public class AgentSessionPlanner {
+public class AgentSessionPlanner extends BaseEntity {
 
     @Id
     @Column(name = "session_id", length = 100, nullable = false)
@@ -30,13 +28,9 @@ public class AgentSessionPlanner {
     @Column(name = "events_json", columnDefinition = "LONGTEXT")
     private String eventsJson = "[]";
 
-    @Column(name = "updated_at")
-    private LocalDateTime updatedAt;
-
     @PrePersist
     @PreUpdate
     void touch() {
-        updatedAt = LocalDateTime.now();
         if (stateJson == null || stateJson.isBlank()) stateJson = "{}";
         if (eventsJson == null || eventsJson.isBlank()) eventsJson = "[]";
     }
@@ -49,6 +43,4 @@ public class AgentSessionPlanner {
     public void setStateJson(String stateJson) { this.stateJson = stateJson; }
     public String getEventsJson() { return eventsJson; }
     public void setEventsJson(String eventsJson) { this.eventsJson = eventsJson; }
-    public LocalDateTime getUpdatedAt() { return updatedAt; }
-    public void setUpdatedAt(LocalDateTime updatedAt) { this.updatedAt = updatedAt; }
 }

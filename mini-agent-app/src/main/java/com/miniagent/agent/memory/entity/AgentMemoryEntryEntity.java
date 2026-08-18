@@ -11,7 +11,7 @@ import java.time.LocalDateTime;
     @Index(name = "idx_ame_status", columnList = "status"),
     @Index(name = "idx_ame_importance", columnList = "importance")
 })
-public class AgentMemoryEntryEntity {
+public class AgentMemoryEntryEntity extends BaseMemoryEntity {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -71,11 +71,7 @@ public class AgentMemoryEntryEntity {
     @Column(name = "metadata_json", columnDefinition = "TEXT")
     private String metadataJson;
 
-    @Column(name = "created_at", nullable = false)
-    private LocalDateTime createdAt;
-
-    @Column(name = "updated_at", nullable = false)
-    private LocalDateTime updatedAt;
+    // createdAt/updatedAt 由 BaseMemoryEntity 管理
 
     public enum MemoryType {
         WORKING, EPISODIC, SEMANTIC, PROCEDURAL, USER, PROJECT, ORGANIZATION
@@ -91,17 +87,6 @@ public class AgentMemoryEntryEntity {
 
     public enum SourceType {
         USER_STATED, SYSTEM_CONFIG, TOOL_OBSERVED, AGENT_INFERRED, LLM_EXTRACTED
-    }
-
-    @PrePersist
-    void onCreate() {
-        createdAt = LocalDateTime.now();
-        updatedAt = createdAt;
-    }
-
-    @PreUpdate
-    void onUpdate() {
-        updatedAt = LocalDateTime.now();
     }
 
     // --- getters/setters ---
@@ -156,10 +141,4 @@ public class AgentMemoryEntryEntity {
 
     public String getMetadataJson() { return metadataJson; }
     public void setMetadataJson(String metadataJson) { this.metadataJson = metadataJson; }
-
-    public LocalDateTime getCreatedAt() { return createdAt; }
-    public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
-
-    public LocalDateTime getUpdatedAt() { return updatedAt; }
-    public void setUpdatedAt(LocalDateTime updatedAt) { this.updatedAt = updatedAt; }
 }

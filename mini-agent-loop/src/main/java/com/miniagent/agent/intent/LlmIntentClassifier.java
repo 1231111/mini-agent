@@ -1,7 +1,5 @@
 package com.miniagent.agent.intent;
 
-import org.springframework.beans.factory.annotation.Autowired;
-
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.message.AiMessage;
@@ -13,6 +11,8 @@ import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.net.ConnectException;
@@ -22,8 +22,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicBoolean;
-import org.apache.commons.lang3.StringUtils;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * L1：可配独立小模型做多轮意图 JSON 分类。端点与 prompt 来自 {@link IntentProperties}。
@@ -41,7 +40,9 @@ public class LlmIntentClassifier {
             toolProfile: QUESTION|IMAGE|FULL
             needsWeb/needsFiles/needsImageGen/requiresStructuredPlan/shouldUseHistory: true|false
             taskGoal: 一句目标; confidence: 0到1小数; reason: 一句理由
-            示例: {"intent":"NEW_TASK","taskGoal":"continue previous work","needsWeb":false,"needsFiles":true,"needsImageGen":false,"requiresStructuredPlan":false,"shouldUseHistory":true,"toolProfile":"FULL","confidence":0.8,"reason":"multi-turn"}
+            alternatives: 最多2个次优候选，元素为 {intent,confidence,reason}
+            requiredCapabilities: 字符串数组; riskLevel: LOW|MEDIUM|HIGH
+            示例: {"intent":"NEW_TASK","taskGoal":"continue previous work","needsWeb":false,"needsFiles":true,"needsImageGen":false,"requiresStructuredPlan":false,"shouldUseHistory":true,"toolProfile":"FULL","confidence":0.8,"alternatives":[],"requiredCapabilities":["file"],"riskLevel":"MEDIUM","reason":"multi-turn"}
             规则:
             1. 不确定→intent=NEW_TASK,toolProfile=FULL
             2. 仅纯生图用 IMAGE；需要网页或写文件→FULL
@@ -52,8 +53,8 @@ public class LlmIntentClassifier {
     @Autowired
     private IntentProperties props;
     private volatile ChatModel dedicatedModel;
-    /** ponytail: 本地 Ollama 挂掉后本进程内不再重试，重启后才会再探 */
-    private final AtomicBoolean localDown = new AtomicBoolean(false);
+    private final AtomicInteger dedicatedFailures = new AtomicInteger(0);
+    private volatile long circuitOpenUntilMs;
 
     @PostConstruct
     void initDedicatedModel() {
@@ -104,27 +105,47 @@ public class LlmIntentClassifier {
         UserMessage msg = UserMessage.from(
                 system + "\n\n" + buildPrompt(userMessage, hasImage, recentHistory));
 
-        if (dedicatedModel != null && !localDown.get()) {
+        if (dedicatedModel != null && !isCircuitOpen()) {
             try {
-                return chatOnce(dedicatedModel, msg);
+                Classification classification = chatOnce(dedicatedModel, msg);
+                if (classification == null) throw new IllegalStateException("invalid structured output");
+                dedicatedFailures.set(0);
+                return classification.withSource(IntentDecisionSource.DEDICATED_MODEL);
             } catch (Exception e) {
-                if (!isConnectFailure(e)) {
-                    log.warn("意图本地模型调用失败，将回退启发式: {}", e.getMessage());
-                    return null;
-                }
-                localDown.set(true);
-                log.warn("意图本地模型不可用，改用会话模型: {}", e.getMessage());
+                recordDedicatedFailure(e);
+                log.warn("意图独立模型失败，改用会话模型/启发式: {}", e.getMessage());
             }
         }
         if (fallback == null) {
             return null;
         }
         try {
-            return chatOnce(fallback, msg);
+            Classification classification = chatOnce(fallback, msg);
+            return classification == null ? null
+                    : classification.withSource(IntentDecisionSource.FALLBACK_MODEL);
         } catch (Exception e) {
             log.warn("意图会话模型调用失败，将回退启发式: {}", e.getMessage());
             return null;
         }
+    }
+
+    public boolean isCircuitOpen() {
+        long until = circuitOpenUntilMs;
+        if (until <= 0) return false;
+        if (System.currentTimeMillis() < until) return true;
+        circuitOpenUntilMs = 0;
+        dedicatedFailures.set(0);
+        return false;
+    }
+
+    private void recordDedicatedFailure(Exception error) {
+        int failures = dedicatedFailures.incrementAndGet();
+        int threshold = Math.max(1, props.getCircuitFailureThreshold());
+        if (failures < threshold) return;
+        circuitOpenUntilMs = System.currentTimeMillis()
+                + Math.max(1, props.getCircuitCooldownSeconds()) * 1000L;
+        log.warn("意图分类熔断器打开 failures={} cooldown={}s connectFailure={}",
+                failures, props.getCircuitCooldownSeconds(), isConnectFailure(error));
     }
 
     private Classification chatOnce(ChatModel model, UserMessage msg) {
@@ -218,7 +239,11 @@ public class LlmIntentClassifier {
                     bool(n, "shouldUseHistory"),
                     toolProfile,
                     n.path("confidence").isNumber() ? n.path("confidence").asDouble(0.5) : 0.5,
-                    text(n, "reason")
+                    text(n, "reason"),
+                    parseAlternatives(n.path("alternatives")),
+                    stringList(n.path("requiredCapabilities")),
+                    IntentRiskLevel.parse(text(n, "riskLevel")),
+                    IntentDecisionSource.DEDICATED_MODEL
             );
         } catch (Exception e) {
             return null;
@@ -242,6 +267,29 @@ public class LlmIntentClassifier {
     private static String text(JsonNode n, String field) {
         JsonNode v = n.get(field);
         return Objects.isNull(v) || v.isNull() ? "" : v.asText("").trim();
+    }
+
+    private static List<IntentAlternative> parseAlternatives(JsonNode node) {
+        if (node == null || !node.isArray()) return List.of();
+        List<IntentAlternative> alternatives = new ArrayList<>();
+        for (JsonNode item : node) {
+            if (!item.isObject()) continue;
+            alternatives.add(new IntentAlternative(
+                    parseIntent(text(item, "intent")),
+                    item.path("confidence").asDouble(0.0),
+                    text(item, "reason")));
+            if (alternatives.size() >= 3) break;
+        }
+        return List.copyOf(alternatives);
+    }
+
+    private static List<String> stringList(JsonNode node) {
+        if (node == null || !node.isArray()) return List.of();
+        List<String> values = new ArrayList<>();
+        for (JsonNode item : node) {
+            if (item.isTextual() && !item.asText().isBlank()) values.add(item.asText().trim());
+        }
+        return List.copyOf(values);
     }
 
     private static boolean blank(String s) {
@@ -272,6 +320,40 @@ public class LlmIntentClassifier {
             boolean shouldUseHistory,
             String toolProfile,
             double confidence,
-            String reason
-    ) {}
+            String reason,
+            List<IntentAlternative> alternatives,
+            List<String> requiredCapabilities,
+            IntentRiskLevel riskLevel,
+            IntentDecisionSource source
+    ) {
+        public Classification(IntentType intent, String taskGoal, boolean needsWeb,
+                              boolean needsFiles, boolean needsImageGen,
+                              boolean requiresStructuredPlan, boolean shouldUseHistory,
+                              String toolProfile, double confidence, String reason) {
+            this(intent, taskGoal, needsWeb, needsFiles, needsImageGen,
+                    requiresStructuredPlan, shouldUseHistory, toolProfile, confidence, reason,
+                    List.of(), List.of(), IntentRiskLevel.MEDIUM,
+                    IntentDecisionSource.DEDICATED_MODEL);
+        }
+
+        public Classification {
+            intent = intent == null ? IntentType.UNKNOWN : intent;
+            taskGoal = Objects.requireNonNullElse(taskGoal, "").trim();
+            toolProfile = Objects.requireNonNullElse(toolProfile, "FULL").trim().toUpperCase(Locale.ROOT);
+            confidence = Double.isFinite(confidence)
+                    ? Math.max(0.0, Math.min(1.0, confidence)) : 0.0;
+            reason = Objects.requireNonNullElse(reason, "").trim();
+            alternatives = alternatives == null ? List.of() : List.copyOf(alternatives);
+            requiredCapabilities = requiredCapabilities == null
+                    ? List.of() : List.copyOf(requiredCapabilities);
+            riskLevel = riskLevel == null ? IntentRiskLevel.MEDIUM : riskLevel;
+            source = source == null ? IntentDecisionSource.DEDICATED_MODEL : source;
+        }
+
+        public Classification withSource(IntentDecisionSource value) {
+            return new Classification(intent, taskGoal, needsWeb, needsFiles, needsImageGen,
+                    requiresStructuredPlan, shouldUseHistory, toolProfile, confidence, reason,
+                    alternatives, requiredCapabilities, riskLevel, value);
+        }
+    }
 }

@@ -2,9 +2,12 @@ package com.miniagent.agent.planner;
 
 import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.core.AgentStreamSink;
+import com.miniagent.agent.core.ExecutionTurnContext;
 import com.miniagent.agent.core.LoopTurnContext;
+import com.miniagent.agent.core.NodeExecutor;
 import com.miniagent.agent.intent.IntentType;
 import com.miniagent.agent.intent.TaskPlan;
+import com.miniagent.agent.todo.HumanYield;
 import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.agent.trace.TraceRecorder;
 import com.miniagent.common.ErrorCode;
@@ -37,6 +40,7 @@ public class PlanningLoop {
 
     private static final Logger log = LoggerFactory.getLogger(PlanningLoop.class);
     private static final int PRIOR_OUTPUT_CHARS = 6000;
+    private static final int AWAITING_HINT_CHARS = 500;
 
     private final PlannerProperties properties;
     private final GoalCompiler goalCompiler;
@@ -47,7 +51,7 @@ public class PlanningLoop {
     private final StepEvaluator stepEvaluator;
     private final RecoveryEngine recoveryEngine;
     private final TodoStateProjector todoProjector;
-    private final AgentLoop agentLoop;
+    private final NodeExecutor nodeExecutor;
     private final PlannerMetrics metrics;
     private final SessionLock sessionLock;
     private final ToolSuccessStats toolSuccessStats;
@@ -62,7 +66,7 @@ public class PlanningLoop {
                         StepEvaluator stepEvaluator,
                         RecoveryEngine recoveryEngine,
                         TodoStateProjector todoProjector,
-                        AgentLoop agentLoop,
+                        NodeExecutor nodeExecutor,
                         PlannerMetrics metrics,
                         SessionLock sessionLock,
                         ToolSuccessStats toolSuccessStats) {
@@ -75,7 +79,7 @@ public class PlanningLoop {
         this.stepEvaluator = stepEvaluator;
         this.recoveryEngine = recoveryEngine;
         this.todoProjector = todoProjector;
-        this.agentLoop = agentLoop;
+        this.nodeExecutor = nodeExecutor;
         this.metrics = metrics;
         this.sessionLock = sessionLock;
         this.toolSuccessStats = toolSuccessStats;
@@ -103,9 +107,24 @@ public class PlanningLoop {
         if (plan.requiresStructuredPlan()) {
             return true;
         }
+        boolean awaiting = hasAwaitingGraph(sessionId);
         return stateStore.hasIncompleteGraph(sessionId)
-                && (plan.intent() == IntentType.CONTINUE_TASK
-                || stateStore.peekResume(sessionId));
+                && shouldResumeExisting(plan.intent(),
+                stateStore.peekResume(sessionId), awaiting, true);
+    }
+
+    static boolean shouldResumeExisting(IntentType intent, boolean peekResume,
+                                        boolean awaitingConfirm, boolean incomplete) {
+        if (!incomplete) {
+            return false;
+        }
+        return intent == IntentType.CONTINUE_TASK || peekResume || awaitingConfirm;
+    }
+
+    private boolean hasAwaitingGraph(String sessionId) {
+        return stateStore.get(sessionId)
+                .map(s -> s.graph() != null && s.graph().hasAwaitingConfirm())
+                .orElse(false);
     }
 
     public String run(ChatModel chat,
@@ -120,26 +139,35 @@ public class PlanningLoop {
                       AgentStreamSink streamSink) {
         if (!shouldHandle(taskPlan, sessionId)) {
             if (multimodalUser != null)
-                return agentLoop.runWithMultimodal(chat, systemPrompt, multimodalUser, history,
+                return nodeExecutor.runDirectMultimodal(chat, systemPrompt, multimodalUser, history,
                         90, progress, taskPlan, streamSink);
-            return agentLoop.run(chat, systemPrompt, userMessage, history,
+            return nodeExecutor.runDirect(chat, systemPrompt, userMessage, history,
                     90, progress, taskPlan, streamSink);
         }
 
         GoalCompiler.CompileResult compiled;
         StateSnapshot snap;
         var existing = stateStore.get(sessionId);
-        boolean resume = existing.isPresent()
+        boolean incompleteGraph = existing.isPresent()
                 && !existing.get().graph().isEmpty()
-                && !existing.get().graph().allTerminalSuccess()
-                && (taskPlan.intent() == IntentType.CONTINUE_TASK
-                || stateStore.peekResume(sessionId));
+                && !existing.get().graph().allTerminalSuccess();
+        boolean awaitingGraph = existing.isPresent()
+                && existing.get().graph().hasAwaitingConfirm();
+        boolean resume = shouldResumeExisting(
+                taskPlan.intent(),
+                stateStore.peekResume(sessionId),
+                awaitingGraph,
+                incompleteGraph);
         if (resume) {
             stateStore.clearResume(sessionId);
             snap = existing.get();
             compiled = new GoalCompiler.CompileResult(snap.goal(), snap.graph(), false);
             log.info("PlanningLoop 续跑已有图 session={} version={} nodes={}",
                     sessionId, snap.version(), snap.graph().nodes().size());
+            if (snap.graph().hasAwaitingConfirm()
+                    && !HumanYield.looksLikeBareContinue(userMessage)) {
+                todoProjector.confirmAwaiting(sessionId, userMessage);
+            }
         } else {
             compiled = compileAndValidate(chat, userMessage, taskPlan);
             if (!planValidator.accept(compiled.graph(), taskPlan)) {
@@ -190,6 +218,13 @@ public class PlanningLoop {
             if (ready.isEmpty()) {
                 if (snap.graph().hasAwaitingConfirm()) {
                     log.info("PlanningLoop 等待人工 confirm session={}", sessionId);
+                    String hint = firstAwaitingHint(snap.graph());
+                    if (StringUtils.isNotBlank(lastAnswer)) {
+                        return lastAnswer;
+                    }
+                    if (StringUtils.isNotBlank(hint)) {
+                        return hint;
+                    }
                     return "关键步骤等待确认：请在页面点击「确认并继续」。";
                 }
                 log.warn("PlanningLoop 无 ready 节点且未全部成功，尝试 REWRITE session={}", sessionId);
@@ -212,13 +247,19 @@ public class PlanningLoop {
                 if (n == null || n.status() != TaskNodeStatus.READY) {
                     log.warn("拒绝非 READY 节点进入提案: {}", a.taskId());
                     proposal = new ActionProposal(proposal.proposalId(), proposal.basedOnVersion(),
-                            proposal.executionId(), List.of());
+                            proposal.basedOnPlanVersion(), proposal.executionId(), List.of());
                     break;
                 }
             }
             if (proposal.actions().isEmpty()) continue;
 
             snap = markRunning(sessionId, snap, proposal);
+            if (!ownsRunningProposal(snap, proposal)) {
+                metrics.casConflict();
+                log.info("丢弃过期 ActionProposal session={} proposal={} stateVersion={} planVersion={}",
+                        sessionId, proposal.proposalId(), snap.version(), snap.planVersion());
+                continue;
+            }
             todoProjector.project(sessionId, snap.graph());
             trace(sessionId, AgentStepNode.GRAPH_UPDATED,
                     "{\"version\":" + snap.version() + ",\"running\":"
@@ -233,18 +274,43 @@ public class PlanningLoop {
                 stepUser = userMessage + "\n\n# 前置节点产出\n" + prior;
             StepExec step = executeProposal(chat, systemPrompt, stepUser,
                     multimodalUser, history, taskPlan, proposal, snap.graph(),
-                    sessionId, progress, streamSink);
+                    snap.version(), sessionId, progress, streamSink);
             lastAnswer = step.text();
             boolean drifted = step.drifted();
             boolean quotaAbort = AgentLoop.LOOP_MAX_ITERATIONS.equals(step.endReason());
+            boolean permAsk = AgentLoop.PERM_ASK.equals(step.endReason());
 
             snap = stateStore.get(sessionId).orElse(snap);
+            if (!ownsRunningProposal(snap, proposal)) {
+                metrics.casConflict();
+                log.warn("丢弃过期执行结果 session={} proposal={} planVersion={} observedPlanVersion={}",
+                        sessionId, proposal.proposalId(), proposal.basedOnPlanVersion(), snap.planVersion());
+                continue;
+            }
             boolean anyFail = false;
             TaskGraph g = snap.graph();
             for (ActionSpec action : proposal.actions()) {
                 TaskNode node = g.byId(action.taskId());
                 if (node == null) {
                     continue;
+                }
+                if (permAsk) {
+                    g = g.replace(node.withStatus(TaskNodeStatus.READY).withError(""));
+                    continue;
+                }
+                boolean todoDone = todoProjector.isTodoCompleted(sessionId, g, action.taskId());
+                if (!todoDone) {
+                    if (HumanYield.looksLikeNeedHuman(lastAnswer)
+                            && !todoProjector.isTodoAwaiting(
+                                    sessionId, g, action.taskId())) {
+                        todoProjector.yieldNodeToHuman(
+                                sessionId, g, action.taskId(), lastAnswer);
+                    }
+                    if (todoProjector.isTodoAwaiting(sessionId, g, action.taskId())) {
+                        g = g.replace(node.withStatus(TaskNodeStatus.AWAITING_CONFIRM)
+                                .withError(clip(lastAnswer, AWAITING_HINT_CHARS)));
+                        continue;
+                    }
                 }
                 if (drifted) {
                     anyFail = true;
@@ -263,7 +329,6 @@ public class PlanningLoop {
                     g = snap.graph();
                     continue;
                 }
-                boolean todoDone = todoProjector.isTodoCompleted(sessionId, g, action.taskId());
                 String evidence = todoProjector.todoEvidence(sessionId, g, action.taskId());
                 if (StringUtils.isBlank(evidence)) {
                     evidence = lastAnswer;
@@ -316,6 +381,23 @@ public class PlanningLoop {
             }
             todoProjector.project(sessionId,
                     stateStore.get(sessionId).map(StateSnapshot::graph).orElse(g));
+            if (permAsk) {
+                stateStore.markResume(sessionId);
+                log.info("PlanningLoop 等待工具授权 session={}", sessionId);
+                if (StringUtils.isNotBlank(lastAnswer)) {
+                    return lastAnswer;
+                }
+                return "需要你批准危险工具后才能继续。请点击弹窗中的「批准并继续」。";
+            }
+            TaskGraph latest = stateStore.get(sessionId).map(StateSnapshot::graph).orElse(g);
+            if (latest.hasAwaitingConfirm() || g.hasAwaitingConfirm()) {
+                stateStore.markResume(sessionId);
+                log.info("PlanningLoop 等待人工输入 session={}", sessionId);
+                if (StringUtils.isNotBlank(lastAnswer)) {
+                    return lastAnswer;
+                }
+                return "关键步骤等待确认：请在页面点击「确认并继续」。";
+            }
             if (quotaAbort && hasUnfinishedProposalNode(g, proposal)) {
                 log.info("本段未完成，节点保持 READY session={}", sessionId);
                 break;
@@ -360,6 +442,19 @@ public class PlanningLoop {
             }
         }
         return false;
+    }
+
+    private static String firstAwaitingHint(TaskGraph graph) {
+        if (graph == null) {
+            return "";
+        }
+        for (TaskNode n : graph.nodes()) {
+            if (n.status() == TaskNodeStatus.AWAITING_CONFIRM
+                    && StringUtils.isNotBlank(n.lastError())) {
+                return n.lastError();
+            }
+        }
+        return "";
     }
 
     static String predecessorOutputs(TaskGraph graph, ActionProposal proposal) {
@@ -413,6 +508,7 @@ public class PlanningLoop {
                                      TaskPlan taskPlan,
                                      ActionProposal proposal,
                                      TaskGraph graph,
+                                     long dispatchStateVersion,
                                      String sessionId,
                                      Consumer<String> progress,
                                      AgentStreamSink streamSink) {
@@ -433,12 +529,19 @@ public class PlanningLoop {
         String label = StringUtils.isNotBlank(focusName) ? focusName : focusTask;
         ProposalTurnPolicy policy = new ProposalTurnPolicy(allowed, hard, label, focusTodos);
         LoopTurnContext.set(policy);
+        List<ExecutionTurnContext.ActionBinding> bindings = proposal.actions().stream()
+                .map(a -> new ExecutionTurnContext.ActionBinding(
+                        a.actionId(), a.taskId(), a.tool(), a.idempotencyKey()))
+                .toList();
+        ExecutionTurnContext.open(sessionId, proposal.basedOnPlanVersion(), bindings,
+                () -> dispatchFenceValid(sessionId, proposal));
         metrics.proposal();
         try {
             if (traceRecorder != null)
                 traceRecorder.recordNode(sessionId, 0, AgentStepNode.PROPOSAL.name(),
                         "{\"proposalId\":\"" + proposal.proposalId()
                                 + "\",\"basedOnVersion\":" + proposal.basedOnVersion()
+                                + ",\"planVersion\":" + proposal.basedOnPlanVersion()
                                 + ",\"hardGate\":" + hard
                                 + ",\"focusTodoIds\":" + focusTodos
                                 + ",\"tools\":" + toJsonArray(allowed) + "}",
@@ -452,26 +555,36 @@ public class PlanningLoop {
                 }
             }
             AgentLoop.LoopOutcome out;
-            if (multimodalUser != null)
-                out = agentLoop.runWithMultimodalOutcome(chat, focus, multimodalUser,
-                        history, maxIter, progress, taskPlan, streamSink);
-            else
-                out = agentLoop.runOutcome(chat, focus, userMessage, history,
-                        maxIter, progress, taskPlan, streamSink);
+            out = nodeExecutor.execute(chat, focus, userMessage, multimodalUser,
+                    history, maxIter, progress, taskPlan, streamSink);
             int chunks = 1;
             int maxChunks = Math.max(1, properties.getProposalMaxChunks());
             while (shouldResumeChunk(out.endReason(), chunks, maxChunks)) {
                 log.info("配额续跑 chunk={}/{} task={}", chunks + 1, maxChunks, focusTask);
                 ArrayList<ChatMessage> live = new ArrayList<>(out.messages());
                 live.add(new SystemMessage(MessageConstants.PLANNER_CONTINUE_HINT));
-                out = agentLoop.continueLoop(chat, live, userMessage,
+                out = nodeExecutor.continueNode(chat, live, userMessage,
                         maxIter, progress, taskPlan, streamSink);
                 chunks++;
             }
             return new StepExec(out.text(), out.endReason(), policy.consumeDrift());
         } finally {
+            ExecutionTurnContext.clear();
             LoopTurnContext.clear();
         }
+    }
+
+    private boolean dispatchFenceValid(String sessionId, ActionProposal proposal) {
+        return ownsRunningProposal(stateStore.get(sessionId).orElse(null), proposal);
+    }
+
+    static boolean ownsRunningProposal(StateSnapshot snapshot, ActionProposal proposal) {
+        if (snapshot == null || proposal == null || proposal.actions().isEmpty()
+                || snapshot.planVersion() != proposal.basedOnPlanVersion()) return false;
+        return proposal.actions().stream().allMatch(action -> {
+            TaskNode node = snapshot.graph().byId(action.taskId());
+            return node != null && node.status() == TaskNodeStatus.RUNNING;
+        });
     }
 
     private static String focusBlock(ActionProposal proposal, TaskGraph graph,
@@ -480,6 +593,7 @@ public class PlanningLoop {
         sb.append("# ActionProposal（硬闸门=").append(hard).append("）\n");
         sb.append("- proposalId: ").append(proposal.proposalId()).append('\n');
         sb.append("- basedOnVersion: ").append(proposal.basedOnVersion()).append('\n');
+        sb.append("- planVersion: ").append(proposal.basedOnPlanVersion()).append('\n');
         sb.append("- focusTodoIds: ").append(focusTodos).append('\n');
         sb.append(MessageConstants.PLANNER_FOCUS_RULES).append('\n');
         sb.append("本步动作：\n");
@@ -488,7 +602,12 @@ public class PlanningLoop {
             String cap = n != null ? n.capability() : a.tool();
             String hint = n != null ? n.toolHint() : "";
             sb.append("- taskId=").append(a.taskId())
-                    .append(" capability=").append(cap);
+                    .append(" capability=").append(cap)
+                    .append(" tool=").append(a.tool())
+                    .append(" arguments=").append(a.arguments())
+                    .append(" acceptance=").append(a.acceptance().wire())
+                    .append(" idempotencyKey=").append(a.idempotencyKey())
+                    .append(" timeoutSeconds=").append(a.timeoutSeconds());
             if (StringUtils.isNotBlank(hint))
                 sb.append(" hint=").append(hint);
             sb.append(" expected=").append(a.expectedResult()).append('\n');
@@ -536,14 +655,17 @@ public class PlanningLoop {
     }
 
     private StateSnapshot markRunning(String sessionId, StateSnapshot snap, ActionProposal proposal) {
-        TaskGraph g = snap.graph();
+        StateSnapshot current = stateStore.get(sessionId).orElse(snap);
+        if (current.version() != snap.version() || current.planVersion() != proposal.basedOnPlanVersion()
+                || proposal.basedOnVersion() != current.version()) return current;
+        TaskGraph g = current.graph();
         for (ActionSpec a : proposal.actions()) {
             TaskNode n = g.byId(a.taskId());
-            if (n != null && n.status() == TaskNodeStatus.READY)
-                g = g.replace(n.withStatus(TaskNodeStatus.RUNNING));
+            if (n == null || n.status() != TaskNodeStatus.READY) return current;
+            g = g.replace(n.withStatus(TaskNodeStatus.RUNNING));
         }
         try {
-            return stateStore.commit(sessionId, snap.version(), snap.withGraph(g));
+            return stateStore.commit(sessionId, current.version(), current.withGraph(g));
         } catch (PlannerStateStore.VersionConflictException e) {
             metrics.casConflict();
             log.warn("markRunning 版本冲突: {}", e.getMessage());

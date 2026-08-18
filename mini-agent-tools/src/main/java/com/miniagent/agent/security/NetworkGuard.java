@@ -10,7 +10,7 @@ import java.net.UnknownHostException;
 import java.util.Locale;
 
 /**
- * SSRF guard for http_get / browser_navigate / web fetch.
+ * SSRF guard for http_get / http_post / browser_navigate / web fetch.
  */
 @Component
 public class NetworkGuard {

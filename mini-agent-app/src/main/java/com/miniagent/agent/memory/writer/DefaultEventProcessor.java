@@ -1,9 +1,12 @@
 package com.miniagent.agent.memory.writer;
 
+import com.miniagent.common.StringUtils;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.memory.entity.AgentMemoryEntryEntity;
+import com.miniagent.agent.memory.MemoryIndexOutboxService;
 import com.miniagent.agent.memory.repository.AgentMemoryEntryRepository;
 import com.miniagent.common.embedding.SharedEmbeddingModel;
+import com.miniagent.memory.MemoryScopePolicy;
 import com.miniagent.memory.model.*;
 import com.miniagent.memory.writer.Deduplicator;
 import com.miniagent.memory.writer.EventProcessor;
@@ -41,6 +44,9 @@ public class DefaultEventProcessor implements EventProcessor {
 
     @Autowired
     private AgentMemoryEntryRepository entryRepository;
+
+    @Autowired(required = false)
+    private MemoryIndexOutboxService indexOutbox;
 
     @Autowired(required = false)
     private SharedEmbeddingModel embeddingModel;
@@ -87,8 +93,7 @@ public class DefaultEventProcessor implements EventProcessor {
         MemoryEntry entry = new MemoryEntry();
         entry.setTenantId(event.getTenantId());
         entry.setMemoryType(type);
-        entry.setScope(MemoryScope.ofSession(event.getTenantId(),
-            event.getSessionId() != null ? event.getSessionId() : "global"));
+        entry.setScope(MemoryScopePolicy.resolve(event, type));
         entry.setContent(buildContent(event));
         entry.setSummary(buildSummary(event));
         entry.setImportance(importance);
@@ -153,6 +158,7 @@ public class DefaultEventProcessor implements EventProcessor {
 
         entity = entryRepository.save(entity);
         entry.setId(entity.getId());
+        if (indexOutbox != null) indexOutbox.enqueueUpsert(entity.getId());
 
         // 异步生成 embedding（不阻塞主流程）
         if (embeddingModel != null && embeddingModel.isEnabled()) {
@@ -175,11 +181,11 @@ public class DefaultEventProcessor implements EventProcessor {
         entryRepository.findById(id).ifPresent(entity -> {
             entity.setStatus(AgentMemoryEntryEntity.Status.ARCHIVED);
             entryRepository.save(entity);
+            if (indexOutbox != null) indexOutbox.enqueueDelete(id);
         });
     }
 
     private String truncate(String s, int maxLen) {
-        if (s == null) return "";
-        return s.length() > maxLen ? s.substring(0, maxLen) + "..." : s;
+        return StringUtils.truncate(s, maxLen);
     }
 }

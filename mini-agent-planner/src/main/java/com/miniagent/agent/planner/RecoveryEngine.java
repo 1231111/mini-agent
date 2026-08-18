@@ -166,7 +166,9 @@ public class RecoveryEngine {
         exec.put(RECOVERY_KEY_PREFIX + dx.failureClass().name(), used + 1);
         exec.put("lastFailureKind", dx.kind().name());
 
-        StateSnapshot patched = cur.withGraph(nextGraph).withGoal(nextGoal)
+        // Recovery 可能替换工具、重写节点或修订目标，必须让旧 dispatch fence 失效。
+        StateSnapshot patched = cur.revisePlan(nextGraph, nextGoal,
+                "recovery_" + dx.failureClass().name().toLowerCase())
                 .withExecution(exec).withRecoveryInc();
         try {
             StateSnapshot committed = stateStore.commit(sessionId, cur.version(), patched);

@@ -1,5 +1,6 @@
 package com.miniagent.agent.memory.lifecycle;
 
+import com.miniagent.common.StringUtils;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.memory.entity.AgentEventEntity;
@@ -218,7 +219,6 @@ public class DefaultConsolidationService implements ConsolidationService {
     }
 
     private String truncate(String s, int maxLen) {
-        if (s == null) return "";
-        return s.length() > maxLen ? s.substring(0, maxLen) + "..." : s;
+        return StringUtils.truncate(s, maxLen);
     }
 }

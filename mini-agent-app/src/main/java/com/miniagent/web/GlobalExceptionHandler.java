@@ -5,12 +5,14 @@ import com.miniagent.common.ErrorCode;
 import com.miniagent.common.MessageConstants;
 import com.miniagent.common.exception.BusinessException;
 import com.miniagent.common.exception.SystemException;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.async.AsyncRequestTimeoutException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
@@ -88,6 +90,13 @@ public class GlobalExceptionHandler {
     public ResponseEntity<Void> handleNoResource(NoResourceFoundException e) {
         log.debug("静态资源不存在: {}", e.getResourcePath());
         return ResponseEntity.notFound().build();
+    }
+
+    // ==================== SSE 异步超时（连接到期，不是业务崩溃）====================
+
+    @ExceptionHandler(AsyncRequestTimeoutException.class)
+    public void handleAsyncTimeout(AsyncRequestTimeoutException e, HttpServletRequest request) {
+        log.warn("SSE 连接超时: {} {}", request.getMethod(), request.getRequestURI());
     }
 
     // ==================== 兜底 ====================

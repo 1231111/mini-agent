@@ -139,7 +139,8 @@ public class ContextCompressor {
         return switch (toolName) {
             case "read_file", "write_file", "list_files" -> toolName + "(" + extractJsonField(arguments, "path") + ")";
             case "web_search" -> toolName + "(" + extractJsonField(arguments, "query") + ")";
-            case "web_extract", "http_get" -> toolName + "(" + extractJsonField(arguments, "url") + ")";
+            case "web_extract", "http_get", "http_post" ->
+                    toolName + "(" + extractJsonField(arguments, "url") + ")";
             case "exec_command" -> toolName + "(" + truncateStr(extractJsonField(arguments, "command"), 60) + ")";
             case "image_generate" -> toolName + "(" + truncateStr(extractJsonField(arguments, "prompt"), 40) + ")";
             case "browser_navigate" -> toolName + "(" + extractJsonField(arguments, "url") + ")";
@@ -153,8 +154,7 @@ public class ContextCompressor {
     }
 
     private static String truncateStr(String s, int max) {
-        if (Objects.isNull(s)) return "";
-        return s.length() <= max ? s : s.substring(0, max) + "...";
+        return com.miniagent.common.StringUtils.truncate(s, max);
     }
 
     // ─── 阶段 2: 确定切割点 ───
@@ -485,6 +485,6 @@ public class ContextCompressor {
     }
 
     private String truncate(String s, int maxLen) {
-        return Objects.nonNull(s) && s.length() > maxLen ? s.substring(0, maxLen) + "..." : s;
+        return com.miniagent.common.StringUtils.truncate(s, maxLen);
     }
 }

@@ -22,7 +22,7 @@ public final class PermissionPolicy {
 
     /** Ask 模式下需用户确认的危险工具 */
     public static final Set<String> ASK_DANGEROUS_TOOLS = Set.of(
-            "exec_command",
+            "exec_command", "http_post",
             "write_file", "edit_file",
             "browser_click", "browser_type", "browser_press", "browser_scroll",
             "browser_evaluate", "browser_extract_text",
@@ -35,10 +35,35 @@ public final class PermissionPolicy {
     }
 
     public static boolean isAskDangerous(String toolName) {
-        if (Objects.isNull(toolName)) return false;
+        if (Objects.isNull(toolName)) {
+            return false;
+        }
         // MCP 外部工具默认视为危险（需 Ask 确认或 Plan 批准）
-        if (toolName.startsWith("mcp__")) return true;
+        if (toolName.startsWith("mcp__")) {
+            return true;
+        }
         return ASK_DANGEROUS_TOOLS.contains(toolName);
+    }
+
+    /**
+     * 执行前是否必须有本会话 grant。Ask 模式沿用危险工具集；
+     * 默认模式也对未全局开启的 exec、以及 HTTP POST 弹一次授权。
+     */
+    public static boolean needsSessionGrant(
+            PermissionMode mode, String toolName, boolean execEnabled) {
+        if (Objects.isNull(toolName)) {
+            return false;
+        }
+        if (mode == PermissionMode.ACCEPT_EDITS) {
+            return false;
+        }
+        if (mode == PermissionMode.ASK && isAskDangerous(toolName)) {
+            return true;
+        }
+        if ("exec_command".equals(toolName) && !execEnabled) {
+            return true;
+        }
+        return "http_post".equals(toolName);
     }
 
     /**

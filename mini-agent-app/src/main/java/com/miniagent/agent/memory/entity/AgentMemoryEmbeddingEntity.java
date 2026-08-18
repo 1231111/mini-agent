@@ -2,15 +2,13 @@ package com.miniagent.agent.memory.entity;
 
 import jakarta.persistence.*;
 
-import java.time.LocalDateTime;
-
 /**
  * 向量存储的 MySQL fallback 表。
  * 正常走 Milvus 检索，此表用于索引重建和 Milvus 不可用时的降级。
  */
 @Entity
 @Table(name = "agent_memory_embeddings")
-public class AgentMemoryEmbeddingEntity {
+public class AgentMemoryEmbeddingEntity extends BaseMemoryEntity {
 
     @Id
     @Column(name = "memory_id", nullable = false)
@@ -27,16 +25,8 @@ public class AgentMemoryEmbeddingEntity {
     @Column(name = "vector_json", nullable = false, columnDefinition = "LONGTEXT")
     private String vectorJson;
 
-    @Column(name = "created_at", nullable = false)
-    private LocalDateTime createdAt;
-
     public enum EmbeddingMemoryType {
         ENTRY, EPISODE
-    }
-
-    @PrePersist
-    void onCreate() {
-        createdAt = LocalDateTime.now();
     }
 
     // --- getters/setters ---
@@ -52,7 +42,4 @@ public class AgentMemoryEmbeddingEntity {
 
     public String getVectorJson() { return vectorJson; }
     public void setVectorJson(String vectorJson) { this.vectorJson = vectorJson; }
-
-    public LocalDateTime getCreatedAt() { return createdAt; }
-    public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
 }
