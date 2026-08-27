@@ -1,0 +1,33 @@
+---
+description: >-
+  展示 ponytail 公开基准的收益记分板（代码量/费用/速度）。用户说 ponytail 省了多少、效果如何、
+  scoreboard、/ponytail-gain 时使用。一次性展示，不改仓库，不编造本仓节省数字。
+alwaysApply: false
+---
+
+# Ponytail Gain
+
+展示下面记分板。一次性：不改模式、不写文件、不持久化。
+
+数字是公开基准中位数（5 个日常任务 × 3 个模型），**不是本仓库算出来的**。
+来源：https://github.com/DietrichGebert/ponytail `benchmarks/` 与 README。
+
+## 记分板
+
+```text
+  ponytail gain                     benchmark median · 5 tasks · 3 models
+
+  Lines of code   no-skill  ████████████████████  100%
+                  ponytail  ██▌·················    6–20%   ▼ 80–94%
+  Cost            no-skill  ████████████████████  100%
+                  ponytail  █████▌··············   23–53%  ▼ 47–77%
+  Speed           ponytail  ▸ 3–6× faster
+
+  This repo:  /ponytail-debt  (shortcuts you deferred)
+              /ponytail-audit (what's still cuttable)
+```
+
+## 诚实边界
+
+禁止打印「本仓节省了 X 行/token」：没写出的那一版不存在，没有可减的基线。
+本仓可数的数字只来自 `/ponytail-debt`（台账条数）和 `/ponytail-audit`（可砍项）。

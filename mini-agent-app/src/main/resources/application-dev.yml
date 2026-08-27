@@ -1,0 +1,18 @@
+# 开发环境配置示例
+# 复制此文件为 application-local.yml 并填入真实值
+# 或通过环境变量设置以下变量
+
+# MySQL
+# MYSQL_PASSWORD=your_mysql_password
+
+# MiMo API (对话 + 图像生成)
+# MIMO_API_KEY=your_mimo_api_key
+
+# Cookie 签名密钥 (至少 32 字符)
+# COOKIE_SECRET=your_cookie_secret_at_least_32_chars
+
+# 第三方 API (可选)
+# CHATANYWHERE_API_KEY=your_chatanywhere_key
+# TAVILY_API_KEY=your_tavily_key
+# BING_API_KEY=your_bing_key
+# SILICONFLOW_API_KEY=your_siliconflow_key

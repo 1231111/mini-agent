@@ -1,0 +1,177 @@
+package com.miniagent.agent.core;
+
+import dev.langchain4j.data.message.AudioContent;
+import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.Content;
+import dev.langchain4j.data.message.ImageContent;
+import dev.langchain4j.data.message.TextContent;
+import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.VideoContent;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Objects;
+import org.apache.commons.lang3.StringUtils;
+
+/**
+ * Token 估算器：基于字符分类近似估算 token 数。
+ * CJK（中日韩）字符信息密度高，约 0.7 token/字；其余（英文/数字/符号）约 0.3 token/字符。
+ * 比单一系数更贴近真实分词，避免中文场景严重低估导致压缩滞后。
+ */
+@Component
+public class TokenEstimator {
+
+    /** CJK 字符的 token 系数 */
+    private static final double CJK_TOKENS_PER_CHAR = 0.7;
+    /** 非 CJK 字符（英文/数字/符号/空白）的 token 系数 */
+    private static final double LATIN_TOKENS_PER_CHAR = 0.3;
+
+    /** 消息格式开销（role、分隔符等） */
+    private static final int MESSAGE_OVERHEAD_TOKENS = 8;
+
+    /** System prompt 额外开销 */
+    private static final int SYSTEM_OVERHEAD_TOKENS = 16;
+
+    /** 单张图片的近似 token 开销（多模态，按中等分辨率保守估） */
+    private static final int IMAGE_TOKENS = 700;
+    /** 短音频占位（约 10s * 6.25） */
+    private static final int AUDIO_TOKENS = 80;
+    /** 短视频占位（粗估，避免低估导致压缩滞后） */
+    private static final int VIDEO_TOKENS = 2000;
+
+    /** 文本估算缓存上限 */
+    private static final int CACHE_MAX_SIZE = 1000;
+
+    /** 文本 → token 数缓存（避免重复遍历长文本） */
+    private final Map<String, Integer> estimateCache = new ConcurrentHashMap<>();
+
+    /**
+     * 估算文本的 token 数：按 CJK / 非 CJK 分别加权。带缓存。
+     */
+    public int estimate(String text) {
+        if (StringUtils.isBlank(text)) {
+            return 0;
+        }
+        // 短文本不走缓存（缓存查找开销 > 重算）
+        if (text.length() < 200) {
+            return estimateDirect(text);
+        }
+        return estimateCache.computeIfAbsent(text, this::estimateDirect);
+    }
+
+    /** 实际估算逻辑（无缓存） */
+    private int estimateDirect(String text) {
+        if (StringUtils.isBlank(text)) {
+            return 0;
+        }
+        int cjk = 0, other = 0;
+        for (int i = 0; i < text.length(); i++) {
+            if (isCjk(text.charAt(i))) {
+                cjk++;
+            } else {
+                other++;
+            }
+        }
+        int result = (int) Math.ceil(cjk * CJK_TOKENS_PER_CHAR + other * LATIN_TOKENS_PER_CHAR);
+        // 缓存淘汰：超过上限时清空（简单策略，避免 LRU 开销）
+        if (estimateCache.size() > CACHE_MAX_SIZE) {
+            estimateCache.clear();
+        }
+        return result;
+    }
+
+    /** 判断是否为 CJK 表意文字 / 假名 / 韩文等高密度字符 */
+    private static boolean isCjk(char c) {
+        return (c >= 0x4E00 && c <= 0x9FFF)   // CJK 统一表意
+            || (c >= 0x3400 && c <= 0x4DBF)   // CJK 扩展 A
+            || (c >= 0x3040 && c <= 0x30FF)   // 平假名 + 片假名
+            || (c >= 0xAC00 && c <= 0xD7AF)   // 韩文音节
+            || (c >= 0xF900 && c <= 0xFAFF)   // CJK 兼容表意
+            || (c >= 0xFF00 && c <= 0xFFEF);  // 全角符号
+    }
+
+    /**
+     * 估算单条 ChatMessage 的 token 数
+     */
+    public int estimate(ChatMessage message) {
+        int tokens = MESSAGE_OVERHEAD_TOKENS;
+
+        if (message instanceof dev.langchain4j.data.message.SystemMessage sm) {
+            tokens = SYSTEM_OVERHEAD_TOKENS;
+            tokens += estimateContent(sm);
+        } else if (message instanceof dev.langchain4j.data.message.UserMessage um) {
+            tokens += estimateContent(um);
+        } else if (message instanceof dev.langchain4j.data.message.AiMessage am) {
+            if (Objects.nonNull(am.text())) {
+                tokens += estimate(am.text());
+            }
+            if (am.hasToolExecutionRequests()) {
+                tokens += am.toolExecutionRequests().size() * 30; // 工具调用开销
+            }
+        } else if (message instanceof dev.langchain4j.data.message.ToolExecutionResultMessage tr) {
+            tokens += estimate(tr.text());
+        }
+
+        return tokens;
+    }
+
+    /**
+     * 估算消息列表的总 token 数
+     */
+    public int estimateMessages(List<ChatMessage> messages) {
+        if (Objects.isNull(messages) || messages.isEmpty()) {
+            return 0;
+        }
+        int total = 0;
+        for (ChatMessage msg : messages) {
+            total += estimate(msg);
+        }
+        return total;
+    }
+
+    /**
+     * 计算消息列表在给定上下文窗口中的占比
+     * @param messages 当前消息
+     * @param maxContextTokens 最大上下文 token 数
+     * @return 占比 (0.0 - 1.0+)
+     */
+    public double contextRatio(List<ChatMessage> messages, int maxContextTokens) {
+        int tokens = estimateMessages(messages);
+        return (double) tokens / maxContextTokens;
+    }
+
+    /**
+     * 提取 Content 的 token 估算（直接类型检查，避免反射开销）
+     */
+    private int estimateContent(ChatMessage message) {
+        int tokens = 0;
+        try {
+            List<Content> contents = null;
+            if (message instanceof UserMessage um) {
+                contents = um.contents();
+            } else if (message instanceof SystemMessage sm) {
+                // SystemMessage 只有纯文本
+                return estimate(sm.text());
+            }
+            if (Objects.nonNull(contents)) {
+                for (Content c : contents) {
+                    if (c instanceof TextContent tc) {
+                        tokens += estimate(tc.text());
+                    } else if (c instanceof ImageContent) {
+                        tokens += IMAGE_TOKENS;
+                    } else if (c instanceof AudioContent) {
+                        tokens += AUDIO_TOKENS;
+                    } else if (c instanceof VideoContent) {
+                        tokens += VIDEO_TOKENS;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            tokens += estimate(message.toString());
+        }
+        return tokens;
+    }
+}

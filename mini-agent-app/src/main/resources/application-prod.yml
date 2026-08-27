@@ -1,0 +1,67 @@
+# Docker / 生产覆盖：MySQL + Redis + Milvus
+spring:
+  thymeleaf:
+    cache: true
+  datasource:
+    url: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
+    username: root
+    password: mysql_root_pass
+  data:
+    redis:
+      host: redis
+      port: 6379
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+  jpa:
+    hibernate:
+      ddl-auto: validate
+
+logging:
+  level:
+    com.miniagent: INFO
+    root: WARN
+
+agent:
+  auth:
+    cookie-secret: ${COOKIE_SECRET:}
+    secure-cookie: true
+    registration-enabled: false
+    same-site: Strict
+    bcrypt-strength: 12
+  replica:
+    mode: redis
+  models:
+    custom-base-url-enabled: false
+  memory:
+    storage: db
+    vector:
+      backend: milvus
+      milvus:
+        uri: http://milvus:19530
+  todo:
+    storage: db
+  planner:
+    enabled: true
+    storage: db
+  tools:
+    exec-enabled: false
+    allow-absolute-write: false
+    block-private-network: true
+    allowed-http-ports: 80,443
+    max-http-redirects: 3
+  browser:
+    evaluate-enabled: false
+    headless: true
+  rate-limit:
+    per-minute: 30
+  concurrency:
+    max-tasks-per-user: 2
+
+management:
+  endpoint:
+    health:
+      show-details: never
+  health:
+    redis:
+      enabled: true

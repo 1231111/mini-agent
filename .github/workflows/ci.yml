@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: schema-test-root
+          MYSQL_DATABASE: mini_agent_schema_test
+          MYSQL_USER: miniagent
+          MYSQL_PASSWORD: schema-test-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pschema-test-root --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      MINIAGENT_SCHEMA_TEST: 'true'
+      SCHEMA_DB_URL: jdbc:mysql://127.0.0.1:3306/mini_agent_schema_test?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      SCHEMA_DB_USERNAME: miniagent
+      SCHEMA_DB_PASSWORD: schema-test-password
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Compile and test
+        run: |
+          chmod +x mvnw
+          ./mvnw -B -ntp verify
+
+      - name: Validate Flyway migration sequence
+        run: bash scripts/verify-migrations.sh
+
+      - name: Validate production Compose
+        run: docker compose --env-file .env.example config --quiet
+
+      - name: Scan tracked files for high-signal secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -nE 'sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----' -- ':!*.example' ':!.env.example'; then
+            echo 'Potential secret found in tracked files' >&2
+            exit 1
+          fi

@@ -1,0 +1,36 @@
+---
+description: >-
+  Ponytail 规则速查。用户说 ponytail 怎么用、有哪些口令、what ponytail commands、
+  /ponytail-help 时使用。一次性展示，不改模式、不写文件。
+alwaysApply: false
+---
+
+# Ponytail Help
+
+一次性展示，不改模式、不写文件。
+
+核心精简（写代码时的 ladder）由插件始终生效。下面几条按任务选用，见 `.cursor/rules/`。
+
+## 强度
+
+| 级别 | 口令 | 行为 |
+|---|---|---|
+| **Lite** | `/ponytail lite` | 按需求做，另起一行给出更懒的替代，用户选 |
+| **Full** | `/ponytail` | 强制 ladder。默认 |
+| **Ultra** | `/ponytail ultra` | 先删再加，先质疑需求再写 |
+
+级别保持到改口令或会话结束。`stop ponytail` / `normal mode` 关闭。
+
+## 按任务选用
+
+| 规则文件 | 口令 | 何时用 |
+|---|---|---|
+| （插件）ponytail | `/ponytail` | 写/改/修代码 |
+| `ponytail-review.mdc` | `/ponytail-review` | 审这次 diff 是否过重 |
+| `ponytail-audit.mdc` | `/ponytail-audit` | 扫全仓找可删可简 |
+| `ponytail-debt.mdc` | `/ponytail-debt` | 列出 `ponytail:` 欠债 |
+| `ponytail-gain.mdc` | `/ponytail-gain` | 看公开基准收益卡 |
+| `ponytail-help.mdc` | `/ponytail-help` | 本卡 |
+
+工程约定（魔法值、统一 API 错误码等）见 `code-engineering.mdc`，始终生效。
+SOLID 由插件始终生效；有第二处真实实现才抽象。

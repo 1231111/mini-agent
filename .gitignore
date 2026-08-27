@@ -1,0 +1,28 @@
+# Build outputs
+target/
+dist/
+build/
+out/
+
+# Java / Maven local state
+.m2-local/
+
+# Node / Electron local state
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local tool and agent output
+.codex-build/
+.tools/
+generated-images/
+
+# Downloaded embedding/model cache
+embedding-server/models/
+
+# IDE and OS noise
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
