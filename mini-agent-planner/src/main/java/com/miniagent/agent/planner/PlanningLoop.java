@@ -777,11 +777,43 @@ public class PlanningLoop {
     private GoalCompiler.CompileResult compileAndValidate(ChatModel chat,
                                                          String userMessage,
                                                          TaskPlan taskPlan) {
+        // 第一次编译
         GoalCompiler.CompileResult compiled = goalCompiler.compile(chat, userMessage, taskPlan);
-        if (planValidator.accept(compiled.graph(), taskPlan)) {
+
+        // 结构化验证
+        PlanValidationReport report = planValidator.validate(compiled.graph(), taskPlan);
+        if (report.valid()) {
             return compiled;
         }
-        log.info("PlanValidator 拒绝，改用模板 nodes={}", compiled.graph().nodes().size());
+
+        // 验证失败，进入 replan 闭环
+        log.info("PlanValidator 拒绝，进入 replan 闭环，错误数={}", report.errors().size());
+        log.debug("验证报告: {}", report.summary());
+
+        // 尝试 replan，最多重试 maxReplanRetries 次
+        int maxReplanRetries = Math.max(0, properties.getMaxReplanRetries());
+        for (int attempt = 1; attempt <= maxReplanRetries; attempt++) {
+            log.info("Replan 尝试 {}/{}", attempt, maxReplanRetries);
+
+            // 生成修正提示
+            String correctionPrompt = report.toCorrectionPrompt();
+
+            // 重新编译，注入修正提示
+            GoalCompiler.CompileResult replanned = goalCompiler.compileWithCorrection(
+                chat, userMessage, taskPlan, correctionPrompt);
+
+            // 验证重新编译的结果
+            report = planValidator.validate(replanned.graph(), taskPlan);
+            if (report.valid()) {
+                log.info("Replan 成功，尝试次数={}", attempt);
+                return replanned;
+            }
+
+            log.warn("Replan 尝试 {} 仍然失败，错误数={}", attempt, report.errors().size());
+        }
+
+        // 所有 replan 尝试失败，使用 fallback 模板
+        log.warn("Replan 全部失败，改用 fallback 模板，最终错误数={}", report.errors().size());
         return goalCompiler.fallback(compiled.goal(), userMessage, taskPlan);
     }
 

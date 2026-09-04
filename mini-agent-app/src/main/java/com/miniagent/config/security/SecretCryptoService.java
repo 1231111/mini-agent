@@ -1,6 +1,8 @@
 package com.miniagent.config.security;
 
+import jakarta.annotation.PostConstruct;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -21,11 +23,14 @@ public class SecretCryptoService {
     private static final int NONCE_BYTES = 12;
     private static final int TAG_BITS = 128;
 
-    private final SecureRandom random = new SecureRandom();
-    private final SecretKeySpec key;
+    @Value("${agent.security.model-config-encryption-key:}")
+    private String encodedKey;
 
-    public SecretCryptoService(
-            @Value("${agent.security.model-config-encryption-key:}") String encodedKey) {
+    private final SecureRandom random = new SecureRandom();
+    private SecretKeySpec key;
+
+    @PostConstruct
+    void init() {
         if (StringUtils.isBlank(encodedKey)) {
             this.key = null;
             return;

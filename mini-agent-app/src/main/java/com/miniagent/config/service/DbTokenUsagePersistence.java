@@ -6,6 +6,8 @@ import com.miniagent.config.entity.AgentTokenUsage;
 import com.miniagent.config.repository.AgentTokenUsageRepository;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import jakarta.annotation.PostConstruct;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -15,12 +17,17 @@ import java.util.Map;
 
 @Service
 public class DbTokenUsagePersistence implements TokenUsagePersistence {
-    private final AgentTokenUsageRepository repository;
-    private final Counter inputCounter;
-    private final Counter outputCounter;
 
-    public DbTokenUsagePersistence(AgentTokenUsageRepository repository, MeterRegistry meters) {
-        this.repository = repository;
+    @Autowired
+    private AgentTokenUsageRepository repository;
+    @Autowired
+    private MeterRegistry meters;
+
+    private Counter inputCounter;
+    private Counter outputCounter;
+
+    @PostConstruct
+    void init() {
         this.inputCounter = meters.counter("miniagent.tokens", "direction", "input");
         this.outputCounter = meters.counter("miniagent.tokens", "direction", "output");
     }

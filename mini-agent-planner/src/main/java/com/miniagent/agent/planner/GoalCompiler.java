@@ -78,6 +78,61 @@ public class GoalCompiler {
     public record CompileResult(Goal goal, TaskGraph graph, boolean fromTemplate) {}
     public record ParsedCompilation(Goal goal, TaskGraph graph) {}
 
+    /**
+     * 带修正提示的编译方法，用于 replan 闭环
+     * @param chat 聊天模型
+     * @param userMessage 用户消息
+     * @param plan 任务计划
+     * @param correctionPrompt 验证失败的修正提示
+     * @return 编译结果
+     */
+    public CompileResult compileWithCorrection(ChatModel chat, String userMessage,
+                                               TaskPlan plan, String correctionPrompt) {
+        Goal base = goalFromPlan(userMessage, plan);
+
+        // 如果有修正提示，尝试使用 LLM 重新编译
+        if (chat != null && StringUtils.isNotBlank(correctionPrompt)) {
+            try {
+                ParsedCompilation parsed = compileWithLlmAndCorrection(
+                    chat, userMessage, plan, correctionPrompt);
+                if (parsed != null && parsed.graph() != null && !parsed.graph().isEmpty()) {
+                    return new CompileResult(parsed.goal(), markPending(parsed.graph()), false);
+                }
+            } catch (Exception e) {
+                log.warn("GoalCompiler 带修正的 LLM 编译失败: {}", e.getMessage());
+            }
+        }
+
+        // 如果修正编译失败，使用 fallback
+        return fallback(base, userMessage, plan);
+    }
+
+    /**
+     * 带修正提示的 LLM 编译
+     */
+    private ParsedCompilation compileWithLlmAndCorrection(ChatModel chat, String userMessage,
+                                                          TaskPlan plan, String correctionPrompt) {
+        if (chat == null) {
+            return null;
+        }
+
+        String user = "用户消息:\n" + userMessage
+                + "\n\n意图:" + (plan == null ? "UNKNOWN" : plan.intent())
+                + "\n任务目标:" + (plan == null ? "" : plan.taskGoal())
+                + "\n\n**修正要求**:\n" + correctionPrompt
+                + "\n\n请根据上述修正要求重新生成任务图。";
+
+        var response = chat.chat(ChatRequest.builder()
+                .messages(List.of(new SystemMessage(COMPILER_SYSTEM), UserMessage.from(user)))
+                .build());
+        String text = response.aiMessage() == null ? "" : response.aiMessage().text();
+        try {
+            return parseCompilation(text, goalFromPlan(userMessage, plan));
+        } catch (Exception e) {
+            throw new IllegalStateException("parse graph failed: " + e.getMessage(), e);
+        }
+    }
+
     public CompileResult compile(ChatModel chat, String userMessage, TaskPlan plan) {
         Goal base = goalFromPlan(userMessage, plan);
         if (looksLikeFetchWrite(userMessage, plan)) {

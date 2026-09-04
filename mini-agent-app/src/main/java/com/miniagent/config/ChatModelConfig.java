@@ -2,6 +2,7 @@ package com.miniagent.config;
 
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
@@ -9,11 +10,8 @@ import org.springframework.context.annotation.Primary;
 @Configuration
 public class ChatModelConfig {
 
-    private final OpenAiModelProperties props;
-
-    public ChatModelConfig(OpenAiModelProperties props) {
-        this.props = props;
-    }
+    @Autowired
+    private OpenAiModelProperties props;
 
     @Bean
     @Primary

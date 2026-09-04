@@ -58,14 +58,16 @@ management:
 langchain4j:
   open-ai:
     chat-model:
-      api-key: ${LLM_API_KEY:not-configured}
+      # LLM_API_KEY 未设置时复用 MiMo 配置，避免对话和 Episode 提炼使用占位 Key。
+      api-key: ${LLM_API_KEY:${image.gen.mimo-api-key:not-configured}}
       base-url: ${LLM_BASE_URL:https://token-plan-cn.xiaomimimo.com/v1}
       model-name: ${LLM_MODEL:mimo-v2.5}
       timeout: 1200s
       returnThinking: true
       sendThinking: false
     streaming-chat-model:
-      api-key: ${LLM_API_KEY:not-configured}
+      # 流式模型与普通模型保持同一套认证配置。
+      api-key: ${LLM_API_KEY:${image.gen.mimo-api-key:not-configured}}
       base-url: ${LLM_BASE_URL:https://token-plan-cn.xiaomimimo.com/v1}
       model-name: ${LLM_MODEL:mimo-v2.5}
       timeout: 1200s
@@ -79,7 +81,9 @@ agent:
   data-dir: ${MINI_AGENT_HOME:${user.home}/.miniagent}
   auth:
     cookie-secret: ${COOKIE_SECRET:local-dev-cookie-secret-not-for-production}
-    cookie-max-age-seconds: 604800
+    # JWT 方案：exp 仅为硬性上限；真实滑动超时由 Redis TTL 控制
+    jwt-exp-seconds: 604800      # JWT 有效期上限（7 天），兜底用
+    jwt-ttl-seconds: 1800       # Redis 滑动会话窗口（30 分钟），每次鉴权刷新
     secure-cookie: false
     same-site: Lax
     registration-enabled: true
@@ -167,8 +171,7 @@ agent:
         label: ChatAnywhere
         base-url: https://api.chatanywhere.tech/v1
         model-name: gpt-4o-mini
-        api-key: ${CHATANYWHERE_API_KEY:}
-    custom-base-url-enabled: true
+        api-key: sk-S5B6jjx0B3yMvxLAojE3Y94yxOzQUj7FmZFO8UTaFWcsDyby
   chat-memory:
     max-messages: 24
   context:
@@ -311,25 +314,25 @@ logging:
 web:
   search:
     backend:
-    tavily-api-key: ${TAVILY_API_KEY:}
-    bing-api-key: ${BING_API_KEY:}
-    google-api-key: ${GOOGLE_API_KEY:}
+    tavily-api-key: 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
+    bing-api-key: 0b2cfa02558fbed1e87c58a7ad6ee4dd9bd74c2a5526fe55097e435ffdcd4d8d
+    google-api-key:
     google-cse-id:
 
 # 图像生成配置
 image:
   gen:
-    mimo-api-key: ${MIMO_API_KEY:${LLM_API_KEY:not-configured}}
+    mimo-api-key: tp-c9w1dsoho0uhtzdzmndf2a89pmzos44uut4za8rt2wkatxuc
     mimo-base-url: https://token-plan-cn.xiaomimimo.com/v1
     mimo-model: MiMo-V2.5
-    chatanywhere-key: ${CHATANYWHERE_API_KEY:}
+    chatanywhere-key: sk-S5B6jjx0B3yMvxLAojE3Y94yxOzQUj7FmZFO8UTaFWcsDyby
     chatanywhere-base-url: https://api.chatanywhere.tech/v1
     chatanywhere-model: gpt-image-2-ca
     # gpt-image-2-ca 慢，120s 必超时；500s≈8 分钟
     chatanywhere-timeout-seconds: 500
-    siliconflow-api-key: ${SILICONFLOW_API_KEY:}
-    fal-key: ${FAL_KEY:}
-    zhipu-api-key: ${ZHIPU_API_KEY:}
+    siliconflow-api-key: cdfe3b37-673d-4830-9b27-621fd84193e1:d7706f80a383dad428e6f948b9b57e26
+    fal-key:
+    zhipu-api-key:
 
 file:
   upload:

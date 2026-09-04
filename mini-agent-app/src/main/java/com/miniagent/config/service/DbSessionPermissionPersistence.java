@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.permission.SessionPermissionPersistence;
 import com.miniagent.config.entity.AgentSessionPermission;
 import com.miniagent.config.repository.AgentSessionPermissionRepository;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -13,14 +14,11 @@ import java.util.Set;
 
 @Service
 public class DbSessionPermissionPersistence implements SessionPermissionPersistence {
-    private final AgentSessionPermissionRepository repository;
-    private final ObjectMapper objectMapper;
 
-    public DbSessionPermissionPersistence(AgentSessionPermissionRepository repository,
-                                          ObjectMapper objectMapper) {
-        this.repository = repository;
-        this.objectMapper = objectMapper;
-    }
+    @Autowired
+    private AgentSessionPermissionRepository repository;
+    @Autowired
+    private ObjectMapper objectMapper;
 
     @Override
     @Transactional(readOnly = true)

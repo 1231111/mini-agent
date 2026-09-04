@@ -3,6 +3,7 @@ package com.miniagent.config.service;
 import com.miniagent.agent.todo.SessionTodoPersistence;
 import com.miniagent.config.entity.AgentSessionTodo;
 import com.miniagent.config.repository.AgentSessionTodoRepository;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Component;
@@ -12,11 +13,8 @@ import org.springframework.transaction.annotation.Transactional;
 @ConditionalOnProperty(name = "agent.todo.storage", havingValue = "db", matchIfMissing = true)
 public class DbSessionTodoPersistence implements SessionTodoPersistence {
 
-    private final AgentSessionTodoRepository repo;
-
-    public DbSessionTodoPersistence(AgentSessionTodoRepository repo) {
-        this.repo = repo;
-    }
+    @Autowired
+    private AgentSessionTodoRepository repo;
 
     @Override
     @Transactional(readOnly = true)

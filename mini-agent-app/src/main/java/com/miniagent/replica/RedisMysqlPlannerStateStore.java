@@ -6,6 +6,7 @@ import com.miniagent.agent.planner.PlannerStatePersistence;
 import com.miniagent.agent.planner.StateSnapshot;
 import com.miniagent.config.service.DbPlannerStatePersistence;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Primary;
@@ -31,17 +32,12 @@ public class RedisMysqlPlannerStateStore implements PlannerStatePersistence {
 
     private static final String KEY_PREFIX = "planner:session:";
 
-    private final StringRedisTemplate redis;
-    private final DbPlannerStatePersistence mysql;
-    private final ReplicaProperties properties;
-
-    public RedisMysqlPlannerStateStore(StringRedisTemplate redis,
-                                       DbPlannerStatePersistence mysql,
-                                       ReplicaProperties properties) {
-        this.redis = redis;
-        this.mysql = mysql;
-        this.properties = properties;
-    }
+    @Autowired
+    private StringRedisTemplate redis;
+    @Autowired
+    private DbPlannerStatePersistence mysql;
+    @Autowired
+    private ReplicaProperties properties;
 
     private static String redisKey(String sessionId) {
         return KEY_PREFIX + sessionId;

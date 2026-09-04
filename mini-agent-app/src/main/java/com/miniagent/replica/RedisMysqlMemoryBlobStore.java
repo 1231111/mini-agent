@@ -3,6 +3,7 @@ package com.miniagent.replica;
 import com.miniagent.config.service.DbMemoryBlobStore;
 import com.miniagent.memory.MemoryBlobStore;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Primary;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -19,15 +20,12 @@ import java.util.Map;
 @ConditionalOnProperty(name = "agent.replica.mode", havingValue = "redis")
 public class RedisMysqlMemoryBlobStore implements MemoryBlobStore {
 
-    private final StringRedisTemplate redis;
-    private final DbMemoryBlobStore mysql;
-    private final ReplicaProperties properties;
-
-    public RedisMysqlMemoryBlobStore(StringRedisTemplate redis, DbMemoryBlobStore mysql, ReplicaProperties properties) {
-        this.redis = redis;
-        this.mysql = mysql;
-        this.properties = properties;
-    }
+    @Autowired
+    private StringRedisTemplate redis;
+    @Autowired
+    private DbMemoryBlobStore mysql;
+    @Autowired
+    private ReplicaProperties properties;
 
     private static String redisKey(long userId) {
         return "mem:" + userId;

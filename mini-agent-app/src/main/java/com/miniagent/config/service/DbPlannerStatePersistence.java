@@ -6,6 +6,7 @@ import com.miniagent.agent.planner.PlannerStatePersistence;
 import com.miniagent.agent.planner.StateSnapshot;
 import com.miniagent.config.entity.AgentSessionPlanner;
 import com.miniagent.config.repository.AgentSessionPlannerRepository;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -18,11 +19,8 @@ import java.util.Optional;
 @ConditionalOnProperty(name = "agent.planner.storage", havingValue = "db", matchIfMissing = true)
 public class DbPlannerStatePersistence implements PlannerStatePersistence {
 
-    private final AgentSessionPlannerRepository repo;
-
-    public DbPlannerStatePersistence(AgentSessionPlannerRepository repo) {
-        this.repo = repo;
-    }
+    @Autowired
+    private AgentSessionPlannerRepository repo;
 
     @Override
     @Transactional(readOnly = true)

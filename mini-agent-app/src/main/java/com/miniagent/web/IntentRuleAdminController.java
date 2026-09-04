@@ -13,7 +13,7 @@ import com.miniagent.config.repository.IntentRuleHitLogRepository;
 import com.miniagent.config.repository.IntentRuleProposalRepository;
 import com.miniagent.config.repository.IntentRuleRepository;
 import com.miniagent.config.repository.IntentRuleSetRepository;
-import com.miniagent.config.security.SessionCookieService;
+import com.miniagent.config.security.JwtSessionService;
 import jakarta.servlet.http.HttpServletRequest;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -162,7 +162,7 @@ public class IntentRuleAdminController {
     }
 
     private Long uid(HttpServletRequest request) {
-        return SessionCookieService.userIdFromRequest(request);
+        return JwtSessionService.userIdFromRequest(request);
     }
 
     private static String str(Object v) {

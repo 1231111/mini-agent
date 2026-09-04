@@ -16,6 +16,7 @@ import io.milvus.v2.service.vector.response.SearchResp;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Primary;
@@ -38,8 +39,10 @@ public class MilvusMemoryVectorIndex implements MemoryVectorIndex {
 
     private static final Long DEFAULT_USER = -1L;
 
-    private final SharedMilvusClient milvus;
-    private final SharedEmbeddingModel embedding;
+    @Autowired
+    private SharedMilvusClient milvus;
+    @Autowired
+    private SharedEmbeddingModel embedding;
 
     @Value("${agent.memory.vector.enabled:true}")
     private boolean enabled;
@@ -53,11 +56,6 @@ public class MilvusMemoryVectorIndex implements MemoryVectorIndex {
     private int dimension;
 
     private volatile boolean ready;
-
-    public MilvusMemoryVectorIndex(SharedMilvusClient milvus, SharedEmbeddingModel embedding) {
-        this.milvus = milvus;
-        this.embedding = embedding;
-    }
 
     @PostConstruct
     void init() {

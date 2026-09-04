@@ -1,6 +1,7 @@
 package com.miniagent.replica;
 
 import com.miniagent.agent.core.ExecutionSignalStore;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
@@ -11,11 +12,9 @@ import java.util.Map;
 @Component
 @ConditionalOnProperty(name = "agent.replica.mode", havingValue = "redis")
 public class RedisExecutionSignalStore implements ExecutionSignalStore {
-    private final StringRedisTemplate redis;
 
-    public RedisExecutionSignalStore(StringRedisTemplate redis) {
-        this.redis = redis;
-    }
+    @Autowired
+    private StringRedisTemplate redis;
 
     @Override
     public void start(String sessionId, long deadlineEpochMillis, long ttlMillis) {

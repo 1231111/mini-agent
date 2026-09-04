@@ -5,6 +5,7 @@ import com.miniagent.config.repository.UserModelConfigRepository;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.stereotype.Component;
@@ -15,14 +16,10 @@ import org.springframework.transaction.annotation.Transactional;
 public class ModelConfigSecretMigrator implements ApplicationRunner {
     private static final Logger log = LoggerFactory.getLogger(ModelConfigSecretMigrator.class);
 
-    private final UserModelConfigRepository repository;
-    private final SecretCryptoService crypto;
-
-    public ModelConfigSecretMigrator(UserModelConfigRepository repository,
-                                     SecretCryptoService crypto) {
-        this.repository = repository;
-        this.crypto = crypto;
-    }
+    @Autowired
+    private UserModelConfigRepository repository;
+    @Autowired
+    private SecretCryptoService crypto;
 
     @Override
     @Transactional

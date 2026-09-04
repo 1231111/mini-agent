@@ -172,14 +172,23 @@ public class ToolRouter {
             file = true;
         }
         boolean hasOut = node != null && !node.outputs().isEmpty();
-        if (!file && !hasOut) {
+        boolean isImageCapability = node != null && "image".equals(node.capability());
+
+        // 如果不是文件需求且没有输出且不是 image 能力，则不展开
+        if (!file && !hasOut && !isImageCapability) {
             return;
         }
+
         set.add("write_file");
         set.add("edit_file");
         set.addAll(capabilityIndex.toolsFor("file_write"));
         if (node == null || !"browser".equals(node.capability())) {
             set.add("read_file");
+        }
+
+        // 为 image 能力添加额外的文件写入工具，支持降级到 SVG/HTML/Mermaid
+        if (isImageCapability) {
+            set.addAll(capabilityIndex.toolsFor("file_write"));
         }
     }
 

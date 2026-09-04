@@ -3,6 +3,7 @@ package com.miniagent.web;
 import com.miniagent.agent.planner.PlannerMetrics;
 import com.miniagent.agent.planner.PlannerProperties;
 import com.miniagent.agent.planner.PlannerStateStore;
+import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.actuate.health.Health;
@@ -29,20 +30,16 @@ import java.util.Map;
 public class HealthController implements HealthIndicator {
 
     @Autowired
-    private  PlannerMetrics metrics;
-
+    private PlannerMetrics metrics;
     @Autowired
-    private  PlannerProperties properties;
-
+    private PlannerProperties properties;
     @Autowired
-    private  PlannerStateStore stateStore;
+    private ObjectProvider<PlannerStateStore> stateStoreProvider;
 
-    @Autowired
-    public HealthController(PlannerMetrics metrics,
-                            PlannerProperties properties,
-                            ObjectProvider<PlannerStateStore> stateStoreProvider) {
-        this.metrics = metrics;
-        this.properties = properties;
+    private PlannerStateStore stateStore;
+
+    @PostConstruct
+    void init() {
         this.stateStore = stateStoreProvider.getIfAvailable();
     }
 

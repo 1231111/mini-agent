@@ -1,6 +1,7 @@
 package com.miniagent.config.security;
 
 import jakarta.annotation.PostConstruct;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Profile;
 import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
@@ -15,11 +16,9 @@ import java.time.ZoneId;
 @Component
 @Profile("prod")
 public class ProductionReadinessValidator {
-    private final Environment environment;
 
-    public ProductionReadinessValidator(Environment environment) {
-        this.environment = environment;
-    }
+    @Autowired
+    private Environment environment;
 
     @PostConstruct
     void validate() {
@@ -69,8 +68,8 @@ public class ProductionReadinessValidator {
         if (environment.getProperty("agent.auth.bcrypt-strength", Integer.class, 0) < 12) {
             errors.add("BCrypt strength must be at least 12");
         }
-        if (environment.getProperty("agent.auth.cookie-max-age-seconds", Integer.class, 0) < 300) {
-            errors.add("session cookie lifetime must be at least 300 seconds");
+        if (environment.getProperty("agent.auth.jwt-exp-seconds", Integer.class, 0) < 300) {
+            errors.add("session lifetime (agent.auth.jwt-exp-seconds) must be at least 300 seconds");
         }
         String origins = environment.getProperty("agent.auth.allowed-origins", "");
         for (String origin : origins.split(",")) {

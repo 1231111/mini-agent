@@ -1891,7 +1891,12 @@ function closeTracePush() {
 function syncTracePush() {
     closeTracePush();
     if (!autoRefreshOn || !currentSid) return;
-    const es = new EventSource('/api/traces/stream?sessionId=' + encodeURIComponent(currentSid));
+    // EventSource 不能自定义头，token 通过 access_token 查询参数携带（cookie 兜底也会自动发送）
+    let tk = '';
+    try { tk = sessionStorage.getItem('ma_token') || ''; } catch (_) {}
+    const traceUrl = '/api/traces/stream?sessionId=' + encodeURIComponent(currentSid)
+        + (tk ? '&access_token=' + encodeURIComponent(tk) : '');
+    const es = new EventSource(traceUrl);
     traceEs = es;
     es.addEventListener('trace', ev => {
         let data = null;

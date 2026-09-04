@@ -1737,7 +1737,12 @@ function isVideoFile(f) {
 }
 function isNativeMediaFile(f) { return isAudioFile(f) || isVideoFile(f); }
 
+/**
+ * 添加文件到上传队列
+ * @param {File} file - 要上传的文件对象
+ */
 function addFile(file) {
+    // 1. 验证文件大小和格式
     if (isNativeMediaFile(file) && file.size > MEDIA_MAX_BYTES) {
         alert('音视频过大（上限约 35MB，MiMo Base64 限制）: ' + file.name);
         return;
@@ -1748,66 +1753,273 @@ function addFile(file) {
             return;
         }
     }
+    
+    // 2. 添加到文件列表
     const idx = selectedFiles.length;
     selectedFiles.push(file);
+    
+    // 3. 根据文件类型处理
     if (file.type.startsWith('image/')) {
-        const r = new FileReader();
-        r.onload = ev => {
-            previewSrcs.push(ev.target.result);
-            renderImgPreview();
-        };
-        r.readAsDataURL(file);
+        // 图片：预览
+        previewImageFile(file);
     } else {
-        previewSrcs.push(null);
-        renderImgPreview();
-        uploadingCount++;
-        updateSendButton();
-        const fd = new FormData();
-        fd.append('file', file);
-        fd.append('sessionId', currentId || 'default');
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', '/api/upload');
-        xhr.upload.onprogress = e => {
-            if (e.lengthComputable) {
-                const pct = Math.round(e.loaded / e.total * 100);
-                updateFileProgress(idx, pct, 'uploading');
-            }
-        };
-        xhr.onload = () => {
-            uploadingCount--;
-            let data = null;
-            try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
-            if (xhr.status === 200 && data && data.success) {
-                const d = unwrapApiBody(data) || data;
-                uploadedFileRefs[idx] = {
-                    filePath: d.filePath,
-                    filename: d.filename,
-                    mimeType: d.mimeType,
-                    fileSize: d.fileSize,
-                    kind: d.kind || (isAudioFile(file) ? 'audio' : (isVideoFile(file) ? 'video' : null)),
-                    extractedTextPath: d.extractedTextPath || null
-                };
-                const doneHint = d.kind
-                    ? (d.kind === 'video' ? '视频已上传' : '音频已上传')
-                    : (d.extractedTextPath ? '已解析' : null);
-                updateFileProgress(idx, 100, 'done', doneHint);
-            } else {
-                const msg = (data && data.message)
-                    || (xhr.status === 413 ? '文件过大（上限 50MB）' : ('上传失败 HTTP ' + xhr.status));
-                updateFileProgress(idx, 0, 'error', msg);
-            }
-            updateSendButton();
-        };
-        xhr.onerror = () => {
-            uploadingCount--;
-            updateFileProgress(idx, 0, 'error', '网络错误');
-            updateSendButton();
-        };
-        xhr.send(fd);
+        // 音视频：上传
+        previewNonImageFile();
+        uploadFile(file, idx);
     }
+    
+    // 4. 更新UI状态
+    updateUIAfterFileAdd();
+}
+
+/**
+ * 预览图片文件
+ */
+function previewImageFile(file) {
+    const reader = new FileReader();
+    reader.onload = ev => {
+        previewSrcs.push(ev.target.result);
+        renderImgPreview();
+    };
+    reader.readAsDataURL(file);
+}
+
+/**
+ * 预览非图片文件（音视频）
+ */
+function previewNonImageFile() {
+    previewSrcs.push(null);
+    renderImgPreview();
+    uploadingCount++;
+    updateSendButton();
+}
+
+/**
+ * 更新添加文件后的UI状态
+ */
+function updateUIAfterFileAdd() {
     document.getElementById('imgBtn').classList.add('on');
     document.getElementById('inputBox').classList.add('has-preview');
     onInputChange();
+}
+
+/**
+ * 上传文件（带CSRF保护）
+ * @param {File} file - 要上传的文件
+ * @param {number} idx - 文件在列表中的索引
+ */
+function uploadFile(file, idx) {
+    // 1. 确保CSRF token存在
+    ensureCsrfToken()
+        .then(() => {
+            // 2. CSRF token就绪，执行上传
+            performFileUpload(file, idx);
+        })
+        .catch(err => {
+            // CSRF token获取失败
+            console.error('[Upload] Failed to ensure CSRF token:', err);
+            uploadingCount--;
+            updateFileProgress(idx, 0, 'error', 'CSRF token 获取失败');
+            updateSendButton();
+        });
+}
+
+/**
+ * 确保CSRF token cookie存在，如果不存在则从服务器获取
+ * @returns {Promise<void>}
+ */
+function ensureCsrfToken() {
+    return new Promise((resolve, reject) => {
+        // 1. 检查cookie中是否已有CSRF token
+        const csrfToken = getCsrfTokenFromCookie();
+        if (csrfToken) {
+            console.log('[Upload] CSRF token already exists');
+            resolve();
+            return;
+        }
+        
+        // 2. 没有token，从服务器获取
+        console.log('[Upload] No CSRF token found, fetching from /api/auth-status');
+        fetchCsrfToken()
+            .then(() => {
+                console.log('[Upload] CSRF token fetched successfully');
+                // 等待一小段时间让cookie设置
+                setTimeout(resolve, 50);
+            })
+            .catch(reject);
+    });
+}
+
+/**
+ * 从cookie中获取CSRF token
+ * @returns {string|null} CSRF token值或null
+ */
+function getCsrfTokenFromCookie() {
+    const match = document.cookie.match(/(?:^|;\s*)XSRF-TOKEN=([^;]*)/);
+    return match ? match[1] : null;
+}
+
+/**
+ * 从服务器获取CSRF token
+ * @returns {Promise<Response>}
+ */
+function fetchCsrfToken() {
+    return fetch('/api/auth-status', {
+        credentials: 'same-origin',
+        cache: 'no-store'
+    }).then(response => {
+        if (!response.ok) {
+            throw new Error('Failed to fetch CSRF token: ' + response.status);
+        }
+        return response;
+    });
+}
+
+/**
+ * 执行文件上传
+ * @param {File} file - 要上传的文件
+ * @param {number} idx - 文件在列表中的索引
+ */
+function performFileUpload(file, idx) {
+    // 1. 创建 FormData
+    const formData = createUploadFormData(file);
+    
+    // 2. 创建并配置 XMLHttpRequest
+    const xhr = createUploadXhr();
+    
+    // 3. 设置请求头
+    setUploadHeaders(xhr);
+    
+    // 4. 设置事件处理器
+    setUploadEventHandlers(xhr, file, idx);
+    
+    // 5. 发送请求
+    xhr.send(formData);
+}
+
+/**
+ * 创建上传用的 FormData
+ */
+function createUploadFormData(file) {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('sessionId', currentId || 'default');
+    return fd;
+}
+
+/**
+ * 创建并配置上传用的 XMLHttpRequest
+ */
+function createUploadXhr() {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload');
+    xhr.withCredentials = true; // 确保发送cookies（包括CSRF token）
+    return xhr;
+}
+
+/**
+ * 设置上传请求头
+ */
+function setUploadHeaders(xhr) {
+    // CSRF token
+    const csrfToken = getCsrfTokenFromCookie();
+    if (csrfToken) {
+        const token = decodeURIComponent(csrfToken);
+        xhr.setRequestHeader('X-XSRF-TOKEN', token);
+        console.log('[Upload] CSRF token attached:', token.substring(0, 10) + '...');
+    } else {
+        console.warn('[Upload] No XSRF-TOKEN cookie found');
+    }
+    
+    // JWT auth token
+    const jwtToken = sessionStorage.getItem('ma_token');
+    if (jwtToken) {
+        xhr.setRequestHeader('Authorization', 'Bearer ' + jwtToken);
+    }
+}
+
+/**
+ * 设置上传事件处理器
+ */
+function setUploadEventHandlers(xhr, file, idx) {
+    // 上传进度
+    xhr.upload.onprogress = e => {
+        if (e.lengthComputable) {
+            const pct = Math.round(e.loaded / e.total * 100);
+            updateFileProgress(idx, pct, 'uploading');
+        }
+    };
+    
+    // 请求完成
+    xhr.onload = () => handleUploadSuccess(xhr, file, idx);
+    
+    // 网络错误
+    xhr.onerror = () => handleUploadError(idx, '网络错误');
+}
+
+/**
+ * 处理上传成功响应
+ */
+function handleUploadSuccess(xhr, file, idx) {
+    uploadingCount--;
+    
+    // 解析响应
+    let data = null;
+    try { 
+        data = JSON.parse(xhr.responseText || '{}'); 
+    } catch (e) {
+        console.error('[Upload] Failed to parse response:', e);
+    }
+    
+    // 检查响应状态
+    if (xhr.status === 200 && data && data.success) {
+        handleUploadSuccessResponse(data, file, idx);
+    } else {
+        handleUploadErrorResponse(xhr, data, idx);
+    }
+    
+    updateSendButton();
+}
+
+/**
+ * 处理上传成功的响应数据
+ */
+function handleUploadSuccessResponse(data, file, idx) {
+    const d = unwrapApiBody(data) || data;
+    
+    // 保存文件引用
+    uploadedFileRefs[idx] = {
+        filePath: d.filePath,
+        filename: d.filename,
+        mimeType: d.mimeType,
+        fileSize: d.fileSize,
+        kind: d.kind || (isAudioFile(file) ? 'audio' : (isVideoFile(file) ? 'video' : null)),
+        extractedTextPath: d.extractedTextPath || null
+    };
+    
+    // 显示成功提示
+    const doneHint = d.kind
+        ? (d.kind === 'video' ? '视频已上传' : '音频已上传')
+        : (d.extractedTextPath ? '已解析' : null);
+    updateFileProgress(idx, 100, 'done', doneHint);
+}
+
+/**
+ * 处理上传错误响应
+ */
+function handleUploadErrorResponse(xhr, data, idx) {
+    const msg = (data && data.message)
+        || (xhr.status === 413 ? '文件过大（上限 50MB）' : ('上传失败 HTTP ' + xhr.status));
+    updateFileProgress(idx, 0, 'error', msg);
+}
+
+/**
+ * 处理上传错误
+ */
+function handleUploadError(idx, errorMsg) {
+    uploadingCount--;
+    updateFileProgress(idx, 0, 'error', errorMsg);
+    updateSendButton();
 }
 
 function updateFileProgress(idx, pct, status, errMsg) {

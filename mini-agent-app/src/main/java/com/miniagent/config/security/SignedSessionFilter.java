@@ -4,6 +4,7 @@ import com.miniagent.config.entity.Tenant;
 import com.miniagent.config.entity.User;
 import com.miniagent.config.repository.TenantRepository;
 import com.miniagent.config.repository.UserRepository;
+import com.miniagent.config.security.JwtSessionService;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import jakarta.servlet.FilterChain;
@@ -25,16 +26,13 @@ import java.util.Objects;
 public class SignedSessionFilter extends OncePerRequestFilter {
 
     @Autowired
-
-    private SessionCookieService sessionCookieService;
+    private JwtSessionService jwtSessionService;
 
     @Autowired
     private UserRepository userRepository;
 
     @Autowired
     private TenantRepository tenantRepository;
-
-    
 
     /** SSE/异步派发必须重新挂载认证，否则 async dispatch 会 Access Denied */
     @Override
@@ -50,11 +48,17 @@ public class SignedSessionFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
-        Long userId = sessionCookieService.resolveUserId(request);
+        // 放行 OPTIONS 预检请求，避免干扰 CORS
+        if ("OPTIONS".equalsIgnoreCase(request.getMethod())) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+        
+        Long userId = jwtSessionService.resolveUserIdAndRefresh(request);
         AuthenticatedUser principal = resolvePrincipal(userId);
         if (Objects.nonNull(principal)) {
-            request.setAttribute(SessionCookieService.ATTR_USER_ID, principal.userId());
-            request.setAttribute(SessionCookieService.ATTR_PRINCIPAL, principal);
+            request.setAttribute(JwtSessionService.ATTR_USER_ID, principal.userId());
+            request.setAttribute(JwtSessionService.ATTR_PRINCIPAL, principal);
             SecurityContext context = SecurityContextHolder.createEmptyContext();
             context.setAuthentication(new UsernamePasswordAuthenticationToken(
                     principal, null, List.of(new SimpleGrantedAuthority("ROLE_" + principal.role().name()))));

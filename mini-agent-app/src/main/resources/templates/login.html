@@ -172,6 +172,9 @@
             }
         }
 
+        // 进入登录页即视为未登录态：清空可能残留的 token
+        try { sessionStorage.removeItem('ma_token'); } catch (_) {}
+
         async function doLogin() {
             const username = document.getElementById('loginUsername').value.trim();
             const password = document.getElementById('loginPassword').value;
@@ -192,6 +195,7 @@
                 });
                 const data = await resp.json();
                 if (data.success) {
+                    if (data.token) { try { sessionStorage.setItem('ma_token', data.token); } catch (_) {} }
                     window.location.href = '/';
                 } else {
                     errEl.textContent = data.message || 'Login failed';
@@ -224,6 +228,7 @@
                 });
                 const data = await resp.json();
                 if (data.success) {
+                    if (data.token) { try { sessionStorage.setItem('ma_token', data.token); } catch (_) {} }
                     window.location.href = '/';
                 } else {
                     errEl.textContent = data.message || 'Registration failed';

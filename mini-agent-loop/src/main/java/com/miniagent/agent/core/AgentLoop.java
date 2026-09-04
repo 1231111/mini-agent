@@ -31,6 +31,7 @@ import com.miniagent.agent.tool.ToolDescriptor;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.ToolResult;
 import com.miniagent.agent.tool.ToolSideEffect;
+import com.miniagent.agent.tool.ToolStatus;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.Content;
@@ -485,7 +486,6 @@ public class AgentLoop {
         int explorationCount = 0;
         int consecutiveFailures = 0;  // 连续同类工具失败计数
         String lastFailedTool = null; // 上次失败的工具名
-        boolean reflectionInjected = false; // 本轮是否已注入反思提示
         SystemMessage currentSubGoalMsg = null; // 框架注入的「当前子目标」可刷新指针消息
         String lastSubGoalText = null;          // 上次推送给前端的子目标文字（去重用）
         int lastSubGoalDone = 0;
@@ -1780,14 +1780,13 @@ public class AgentLoop {
             resultForContext = applyBrowserNudge(name, result, resultForContext, messages);
             if (Objects.nonNull(parallelReflection)) {
                 state.consecutiveFailures++;
-                if (!state.reflectionInjected && state.consecutiveFailures >= 2) {
+                // 每次失败都注入反思提示，不再限制为 one-shot
+                if (state.consecutiveFailures >= 2) {
                     resultForContext = resultForContext + "\n\n" + parallelReflection;
-                    state.reflectionInjected = true;
-                    log.info("  [反思-并行] 工具结果附加失败反思提示: {}", name);
+                    log.info("  [反思-并行] 工具结果附加失败反思提示: {}, 连续失败={}", name, state.consecutiveFailures);
                 }
             } else {
                 state.consecutiveFailures = 0;
-                state.reflectionInjected = false;
             }
 
             log.info("  [并行] {}: {}", name, truncate(redactSensitive(result), 200));
@@ -1887,15 +1886,14 @@ public class AgentLoop {
         if (Objects.nonNull(reflectionHint)) {
             state.consecutiveFailures++;
             state.lastFailedTool = name;
-            if (!state.reflectionInjected && state.consecutiveFailures >= 1) {
+            // 每次失败都注入反思提示，不再限制为 one-shot
+            if (state.consecutiveFailures >= 1) {
                 resultForContext = resultForContext + "\n\n" + reflectionHint;
-                state.reflectionInjected = true;
-                log.info("  [反思] 工具结果附加失败反思提示: {}", name);
+                log.info("  [反思] 工具结果附加失败反思提示: {}, 连续失败={}", name, state.consecutiveFailures);
             }
         } else {
             state.consecutiveFailures = 0;
             state.lastFailedTool = null;
-            state.reflectionInjected = false;
         }
 
         log.info("  {}: {}", name, truncate(redactSensitive(result), 300));
@@ -1988,6 +1986,11 @@ public class AgentLoop {
         } else if ("read_file".equals(toolName)) {
             hint.append("- 文件路径可能不对，先 list_files 确认目录结构\n");
             hint.append("- 检查文件扩展名和大小写\n");
+        } else if ("image_generate".equals(toolName)) {
+            hint.append("- 图片生成服务不可用或已禁用\n");
+            hint.append("- 降级方案：使用 write_file 生成 SVG/HTML/Mermaid 代码\n");
+            hint.append("- 示例：write_file('diagram.svg', '<svg>...</svg>')\n");
+            hint.append("- 或使用 web_search 搜索公开图片并下载\n");
         } else if ("browser_click".equals(toolName)) {
             hint.append("- SPA 按钮常点超时：改 by=css / by=text，不要盲重点同一 ref\n");
             hint.append("- 密码页用 browser_type + browser_press，不要点侧栏目录\n");
@@ -2037,8 +2040,16 @@ public class AgentLoop {
                     e.getKey().startsWith("read_file:") || e.getKey().startsWith("list_files:")
                             || e.getKey().startsWith("read_package:"));
         }
-        if ("image_generate".equals(toolName) && isImageGenerateUnavailable(result)) {
-            state.imageGenerateUnavailable = true;
+        // 使用结构化 ToolResult 判断 image_generate 是否可用
+        if ("image_generate".equals(toolName)) {
+            ToolResult toolResult = ToolResult.fromLegacy(result);
+            if (toolResult.status() == ToolStatus.FAILED && !toolResult.retriable()) {
+                state.imageGenerateUnavailable = true;
+                log.warn("image_generate 标记为不可用: {}", toolResult.message());
+            } else if (isImageGenerateUnavailable(result)) {
+                // 备用判断
+                state.imageGenerateUnavailable = true;
+            }
         }
         if (MEDIA_TOOLS.contains(toolName) && Objects.nonNull(result) && looksLikeMediaSuccess(result)) {
             state.mediaDelivered = true;
@@ -2310,10 +2321,22 @@ public class AgentLoop {
         if (Objects.isNull(result)) {
             return false;
         }
+        // 使用结构化 ToolResult 字段判断
+        ToolResult toolResult = ToolResult.fromLegacy(result);
+        if (toolResult.status() == ToolStatus.FAILED && !toolResult.retriable()) {
+            return true;
+        }
+        // 备用：检查特定错误码
+        if (toolResult.errorCode() == ToolErrorCode.DEPENDENCY_UNAVAILABLE
+                || toolResult.errorCode() == ToolErrorCode.PERMISSION_DENIED) {
+            return true;
+        }
+        // 后备：字符串匹配（兼容旧格式）
         return result.contains("图片生成失败")
                 || result.contains("API Key 无效")
                 || result.contains("Invalid token")
-                || result.contains("不要再重试");
+                || result.contains("不要再重试")
+                || result.contains("所有后端均失败");
     }
 
     /** 把工具结果压到可接受长度再塞进上下文（按工具类型取不同上限）。 */

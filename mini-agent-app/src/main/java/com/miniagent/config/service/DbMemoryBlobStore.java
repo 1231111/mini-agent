@@ -3,6 +3,7 @@ package com.miniagent.config.service;
 import com.miniagent.config.entity.AgentUserMemory;
 import com.miniagent.config.repository.AgentUserMemoryRepository;
 import com.miniagent.memory.MemoryBlobStore;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -11,11 +12,8 @@ import org.springframework.transaction.annotation.Transactional;
 @ConditionalOnProperty(name = "agent.memory.storage", havingValue = "db", matchIfMissing = true)
 public class DbMemoryBlobStore implements MemoryBlobStore {
 
-    private final AgentUserMemoryRepository repo;
-
-    public DbMemoryBlobStore(AgentUserMemoryRepository repo) {
-        this.repo = repo;
-    }
+    @Autowired
+    private AgentUserMemoryRepository repo;
 
     @Override
     @Transactional(readOnly = true)

@@ -1,5 +1,6 @@
 package com.miniagent.replica;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
@@ -18,8 +19,10 @@ import java.util.concurrent.ConcurrentHashMap;
 @ConditionalOnProperty(name = "agent.replica.mode", havingValue = "redis")
 public class RedisTaskConcurrency {
 
-    private final StringRedisTemplate redis;
-    private final ReplicaProperties properties;
+    @Autowired
+    private StringRedisTemplate redis;
+    @Autowired
+    private ReplicaProperties properties;
     /** 本 JVM 持有的 session → lockToken */
     private final ConcurrentHashMap<String, String> heldSessionTokens = new ConcurrentHashMap<>();
 
@@ -48,11 +51,6 @@ public class RedisTaskConcurrency {
             end
             return 0
             """, Long.class);
-
-    public RedisTaskConcurrency(StringRedisTemplate redis, ReplicaProperties properties) {
-        this.redis = redis;
-        this.properties = properties;
-    }
 
     public boolean tryOccupyUserQuota(long userId, int maxPerUser) {
         Long ok = redis.execute(OCCUPY_USER_QUOTA,

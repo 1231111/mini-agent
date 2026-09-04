@@ -25,6 +25,9 @@ logging:
 agent:
   auth:
     cookie-secret: ${COOKIE_SECRET:}
+    # JWT 方案：exp 上限 + Redis 滑动超时（生产可酌情缩短 ttl）
+    jwt-exp-seconds: 604800
+    jwt-ttl-seconds: 1800
     secure-cookie: true
     registration-enabled: false
     same-site: Strict

@@ -7,6 +7,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import com.miniagent.config.security.JwtSessionService;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpStatus;
@@ -30,7 +31,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private int perMinuteConfig;
     private int perMinute = 60;
     @Autowired
-    private SessionCookieService sessionCookieService;
+    private JwtSessionService jwtSessionService;
     /** 最大限流窗口数，防止 OOM */
     private static final int MAX_WINDOWS = 10_000;
     private final Map<String, Deque<Long>> windows = new ConcurrentHashMap<>();
@@ -43,6 +44,10 @@ public class RateLimitFilter extends OncePerRequestFilter {
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
         String path = request.getRequestURI();
+        // 放行 OPTIONS 预检请求，避免干扰 CORS
+        if ("OPTIONS".equalsIgnoreCase(request.getMethod())) {
+            return true;
+        }
         return path.startsWith("/actuator")
                 || path.startsWith("/css")
                 || path.startsWith("/js");
@@ -78,7 +83,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
     }
 
     private String rateKey(HttpServletRequest request) {
-        Long uid = sessionCookieService.resolveUserId(request);
+        Long uid = jwtSessionService.resolveUserIdAndRefresh(request);
         if (uid != null) {
             return "u:" + uid;
         }

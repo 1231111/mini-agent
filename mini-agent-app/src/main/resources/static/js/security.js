@@ -36,6 +36,15 @@
         document.cookie = 'XSRF-TOKEN=; Path=/; Max-Age=0';
     }
 
+    // JWT 从登录接口返回后存入 sessionStorage，这里读取并附带到同域请求头。
+    function authToken() {
+        try {
+            return sessionStorage.getItem('ma_token') || '';
+        } catch (_) {
+            return '';
+        }
+    }
+
     window.fetch = async function (input, init) {
         const options = Object.assign({}, init || {});
         const inputRequest = typeof input !== 'string' ? input : null;
@@ -44,7 +53,12 @@
             : new URL(input.url, window.location.href);
         const sameOrigin = url.origin === window.location.origin;
         const unsafeRequest = sameOrigin && !safeMethods.has(method);
-        const baseHeaders = new Headers(options.headers || (inputRequest && inputRequest.headers));
+        // Some browsers reject `new Headers(null)`. Start empty, then copy
+        // headers from the fetch options or the Request object explicitly.
+        const baseHeaders = new Headers(options.headers || undefined);
+        if (!options.headers && inputRequest) {
+            inputRequest.headers.forEach((value, name) => baseHeaders.set(name, value));
+        }
         const id = baseHeaders.get('X-Request-ID') || (sameOrigin ? requestId() : null);
         if (sameOrigin) {
             baseHeaders.set('X-Request-ID', id);
@@ -72,6 +86,10 @@
         const send = target => {
             const attemptOptions = Object.assign({}, options);
             const headers = new Headers(baseHeaders);
+            const tk = authToken();
+            if (sameOrigin && tk) {
+                headers.set('Authorization', 'Bearer ' + tk);
+            }
             if (unsafeRequest && csrfToken) {
                 headers.set('X-XSRF-TOKEN', csrfToken);
             }
@@ -93,6 +111,9 @@
                     });
                     response = await send(retryInput);
                 }
+            }
+            if (response.status === 401) {
+                try { sessionStorage.removeItem('ma_token'); } catch (_) {}
             }
             const elapsedMs = Math.round(performance.now() - startedAt);
             const responseId = response.headers.get('X-Request-ID') || id || null;

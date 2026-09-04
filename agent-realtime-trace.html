@@ -1,0 +1,1899 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能体实时动态轨迹图</title>
+    <style>
+        :root {
+            --bg: #0e0f12;
+            --sidebar-bg: #16181d;
+            --surface: #1e2127;
+            --surface2: #2a2e36;
+            --border: rgba(255,255,255,.09);
+            --border-strong: rgba(255,255,255,.16);
+            --text: #f3f4f6;
+            --text2: #a8adba;
+            --text3: #6b7180;
+            --heading: #ffffff;
+            --accent: #10a37f;
+            --accent-soft: rgba(16,163,127,.14);
+            --success: #22c55e;
+            --failure: #ef4444;
+            --warning: #f59e0b;
+            --running: #3b82f6;
+            --code-bg: #0a0b0d;
+            --code-text: #c9d1d9;
+        }
+
+        [data-theme="light"] {
+            --bg: #ffffff;
+            --sidebar-bg: #f7f7f8;
+            --surface: #f4f4f5;
+            --surface2: #e8e8ea;
+            --border: rgba(0,0,0,.1);
+            --border-strong: rgba(0,0,0,.18);
+            --text: #1f2024;
+            --text2: #5d6068;
+            --text3: #9296a0;
+            --heading: #0d0d10;
+            --code-bg: #f6f8fa;
+            --code-text: #24292f;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            display: flex;
+            overflow: hidden;
+            height: 100vh;
+        }
+
+        /* 侧边栏 */
+        .sidebar {
+            width: 220px;
+            background: var(--sidebar-bg);
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+            height: 100vh;
+            border-right: 1px solid var(--border);
+            transition: width 0.3s ease, margin-left 0.3s ease;
+            position: relative;
+        }
+
+        .sidebar.collapsed {
+            width: 0;
+            margin-left: -220px;
+            overflow: hidden;
+        }
+
+        .sidebar-header {
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .sidebar-header h2 {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--heading);
+        }
+
+        .sidebar-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+
+        .session-item {
+            padding: 8px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin-bottom: 2px;
+            transition: background .12s;
+            border: 1px solid transparent;
+        }
+
+        .session-item:hover {
+            background: var(--surface);
+        }
+
+        .session-item.active {
+            background: var(--surface);
+            border-color: var(--accent);
+        }
+
+        .session-title {
+            font-size: 12px;
+            color: var(--text);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .session-time {
+            font-size: 10px;
+            color: var(--text3);
+            margin-top: 1px;
+        }
+
+        /* 主内容区 */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            height: 100vh;
+        }
+
+        .toolbar {
+            padding: 8px 16px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-shrink: 0;
+            flex-wrap: wrap;
+            min-height: 40px;
+        }
+
+        .toolbar h1 {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--heading);
+            white-space: nowrap;
+        }
+
+        .toolbar-actions {
+            margin-left: auto;
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .btn {
+            padding: 4px 10px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: none;
+            color: var(--text2);
+            font-size: 11px;
+            cursor: pointer;
+            transition: all .15s;
+            font-family: inherit;
+            white-space: nowrap;
+        }
+
+        .btn:hover {
+            background: var(--surface);
+            color: var(--text);
+        }
+
+        .btn.primary {
+            background: var(--accent);
+            color: #fff;
+            border-color: var(--accent);
+        }
+
+        /* 轨迹画布 */
+        .trace-canvas {
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+            perspective: 1200px;
+        }
+
+        #traceSvg {
+            width: 100%;
+            height: 100%;
+            transition: transform 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        /* 2.5D等距视角模式 */
+        #traceSvg.iso-mode {
+            transform: rotateX(45deg) rotateZ(-30deg) scale(0.85);
+            transform-style: preserve-3d;
+        }
+
+        /* 节点样式 */
+        .node {
+            cursor: pointer;
+        }
+
+        .node:hover .node-circle {
+            filter: drop-shadow(0 0 12px rgba(59,130,246,.8));
+            stroke-width: 3;
+        }
+
+        .node-circle {
+            fill: var(--surface);
+            stroke: var(--border-strong);
+            stroke-width: 2;
+            transition: all 0.3s;
+        }
+
+        .node-circle.running {
+            stroke: var(--running);
+            filter: drop-shadow(0 0 8px rgba(59,130,246,.5));
+            animation: pulse 2s infinite;
+        }
+
+        .node-circle.success {
+            stroke: var(--success);
+            filter: drop-shadow(0 0 8px rgba(34,197,94,.5));
+        }
+
+        .node-circle.failure {
+            stroke: var(--failure);
+            filter: drop-shadow(0 0 8px rgba(239,68,68,.5));
+        }
+
+        .node-circle.warning {
+            stroke: var(--warning);
+            filter: drop-shadow(0 0 8px rgba(245,158,11,.5));
+        }
+
+        /* 2.5D节点立体效果 */
+        .iso-mode .node-circle {
+            fill: url(#nodeGradient);
+            stroke-width: 2.5;
+            filter: drop-shadow(2px 4px 6px rgba(0,0,0,.4));
+        }
+
+        .iso-mode .node {
+            transform-style: preserve-3d;
+        }
+
+        .iso-mode .node-label,
+        .iso-mode .node-time {
+            transform: rotateZ(30deg) rotateX(-45deg);
+        }
+
+        .node-icon {
+            font-size: 24px;
+            text-anchor: middle;
+            dominant-baseline: central;
+            pointer-events: none;
+        }
+
+        .node-label {
+            font-size: 12px;
+            fill: var(--text);
+            text-anchor: middle;
+            pointer-events: none;
+        }
+
+        .node-time {
+            font-size: 10px;
+            fill: var(--text3);
+            text-anchor: middle;
+            pointer-events: none;
+        }
+
+        /* 连接线 */
+        .connection {
+            stroke: var(--border-strong);
+            stroke-width: 2;
+            fill: none;
+            marker-end: url(#arrowhead);
+        }
+
+        .connection.active {
+            stroke: var(--running);
+            stroke-width: 3;
+            stroke-dasharray: 10 10;
+            animation: flow 1s linear infinite;
+        }
+
+        /* 2.5D连接线立体效果 */
+        .iso-mode .connection {
+            stroke-width: 3;
+            filter: drop-shadow(1px 2px 3px rgba(0,0,0,.3));
+        }
+
+        .iso-mode .connection.active {
+            stroke-width: 4;
+            filter: drop-shadow(2px 3px 5px rgba(59,130,246,.5));
+        }
+
+        @keyframes flow {
+            0% { stroke-dashoffset: 20; }
+            100% { stroke-dashoffset: 0; }
+        }
+
+        /* 轨迹粒子 */
+        .particle {
+            fill: var(--running);
+            filter: drop-shadow(0 0 6px rgba(59,130,246,.8));
+        }
+
+        /* 状态栏 */
+        .status-bar {
+            padding: 6px 16px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            gap: 20px;
+            flex-shrink: 0;
+            background: var(--surface);
+            align-items: center;
+        }
+
+        .status-item {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .status-value {
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--heading);
+            line-height: 1.2;
+        }
+
+        .status-label {
+            font-size: 10px;
+            color: var(--text3);
+            margin-top: 1px;
+        }
+
+        /* 详情面板 */
+        .detail-panel {
+            position: fixed;
+            right: 20px;
+            top: 20px;
+            width: 320px;
+            max-height: 80vh;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0,0,0,.2);
+            z-index: 100;
+            display: none;
+            overflow: hidden;
+        }
+
+        .detail-panel.show {
+            display: block;
+        }
+
+        .detail-header {
+            padding: 16px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .detail-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--heading);
+        }
+
+        .detail-close {
+            background: none;
+            border: none;
+            color: var(--text3);
+            cursor: pointer;
+            font-size: 16px;
+        }
+
+        .detail-body {
+            padding: 16px;
+            max-height: 60vh;
+            overflow-y: auto;
+        }
+
+        .detail-row {
+            display: flex;
+            margin-bottom: 12px;
+        }
+
+        .detail-key {
+            width: 100px;
+            color: var(--text3);
+            font-size: 12px;
+        }
+
+        .detail-value {
+            flex: 1;
+            color: var(--text);
+            font-size: 12px;
+            word-break: break-word;
+        }
+
+        /* 图例 */
+        .legend {
+            position: absolute;
+            bottom: 12px;
+            left: 12px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 10px;
+            font-size: 10px;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 2px;
+        }
+
+        .legend-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .legend-color {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+
+        /* 控制面板 (已废弃，使用 zoom-panel) */
+
+        /* 动画 */
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: .5; }
+        }
+
+        @keyframes moveAlongPath {
+            0% { offset-distance: 0%; }
+            100% { offset-distance: 100%; }
+        }
+
+        /* 2.5D模式下的阶段标签样式 */
+        .iso-mode .stage-label {
+            transform: rotateZ(30deg) rotateX(-45deg);
+            transform-origin: left center;
+        }
+
+        /* 实时状态指示器 */
+        .realtime-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 10px;
+            border-radius: 16px;
+            background: rgba(34, 197, 94, 0.1);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+            font-size: 11px;
+            color: var(--success);
+        }
+
+        .realtime-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--success);
+            animation: pulse 1.5s infinite;
+        }
+
+        /* 日志面板 */
+        .log-panel {
+            position: absolute;
+            bottom: 12px;
+            right: 12px;
+            width: 320px;
+            max-height: 200px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px;
+            font-family: "Fira Code", Consolas, monospace;
+            font-size: 11px;
+            color: var(--text2);
+            z-index: 10;
+        }
+
+        .log-content {
+            max-height: 150px;
+            overflow-y: auto;
+        }
+
+        .log-entry {
+            margin-bottom: 3px;
+            padding: 2px 0;
+            border-bottom: 1px dashed var(--border);
+            font-size: 10px;
+        }
+
+        .log-time {
+            color: var(--text3);
+            margin-right: 8px;
+        }
+
+        .log-type {
+            color: var(--accent);
+            margin-right: 8px;
+        }
+
+        .log-status {
+            color: var(--success);
+        }
+
+        .log-status.error {
+            color: var(--failure);
+        }
+
+        /* 全屏模式 */
+        body.fullscreen-mode .sidebar {
+            display: none;
+        }
+        body.fullscreen-mode .sidebar-toggle {
+            display: none;
+        }
+        body.fullscreen-mode .main-content {
+            width: 100vw;
+        }
+
+        /* 缩放控制面板 - 右上角 */
+        .zoom-panel {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-size: 11px;
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .zoom-panel .btn {
+            padding: 4px 10px;
+            font-size: 14px;
+            font-weight: bold;
+        }
+
+        /* 日志面板最小化 */
+        .log-panel.minimized {
+            max-height: 32px;
+            overflow: hidden;
+            cursor: pointer;
+        }
+
+        .log-panel.minimized::after {
+            content: '▶ 展开日志';
+            display: block;
+            text-align: center;
+            color: var(--text3);
+            font-size: 10px;
+            padding: 4px;
+        }
+
+        .log-toggle-btn {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            background: none;
+            border: none;
+            color: var(--text3);
+            cursor: pointer;
+            font-size: 10px;
+            padding: 2px 4px;
+        }
+
+        .log-toggle-btn:hover {
+            color: var(--text);
+        }
+
+    </style>
+</head>
+<body>
+    <div class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <h2>🚀 实时轨迹</h2>
+            <button class="btn" onclick="loadSessions()">刷新</button>
+        </div>
+        <div class="sidebar-content" id="sessionList"></div>
+        <div class="sidebar-toggle" id="sidebarToggle" onclick="toggleSidebar()" title="折叠/展开侧边栏">◀</div>
+    </div>
+
+    <div class="main-content">
+        <div class="toolbar">
+            <h1>智能体实时动态轨迹图</h1>
+            <div class="toolbar-actions">
+                <div class="realtime-indicator">
+                    <div class="realtime-dot"></div>
+                    <span id="connectionStatus">实时连接</span>
+                </div>
+                <button class="btn" id="viewModeBtn" onclick="toggleViewMode()">切换 3D</button>
+                <button class="btn" onclick="resetView()">重置视图</button>
+                <button class="btn" onclick="toggleTheme()">主题</button>
+                <button class="btn" onclick="clearLog()">清除日志</button>
+                <button class="btn" onclick="toggleSidebar()">折叠侧栏</button>
+                <button class="btn primary" id="connectBtn" onclick="toggleConnection()">断开连接</button>
+            </div>
+        </div>
+
+        <div class="trace-canvas">
+            <svg id="traceSvg" viewBox="0 0 1200 700">
+                <defs>
+                    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="var(--text3)" />
+                    </marker>
+                    <marker id="arrowhead-active" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="var(--running)" />
+                    </marker>
+                </defs>
+            </svg>
+
+            <div class="zoom-panel">
+                <button class="btn" onclick="zoomOut()">−</button>
+                <span id="zoomValue" style="min-width: 40px; text-align: center;">100%</span>
+                <button class="btn" onclick="zoomIn()">+</button>
+                <button class="btn" onclick="resetView()" style="font-size: 10px;">重置</button>
+            </div>
+
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-color" style="background: var(--running)"></div>
+                    <span>运行中</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: var(--success)"></div>
+                    <span>成功</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: var(--failure)"></div>
+                    <span>失败</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: var(--warning)"></div>
+                    <span>警告</span>
+                </div>
+            </div>
+
+            <div class="log-panel" id="logPanel">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <span style="font-weight: 600; color: var(--text); font-size: 11px;">日志</span>
+                    <button class="log-toggle-btn" onclick="toggleLogPanel()">收起</button>
+                </div>
+                <div class="log-content" id="logContent">
+                    <div class="log-entry">
+                        <span class="log-time">--:--:--</span>
+                        <span class="log-type">系统</span>
+                        <span>等待连接...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="status-bar">
+            <div class="status-item">
+                <span class="status-value" id="nodeCount">0</span>
+                <span class="status-label">节点数</span>
+            </div>
+            <div class="status-item">
+                <span class="status-value" id="edgeCount">0</span>
+                <span class="status-label">连接数</span>
+            </div>
+            <div class="status-item">
+                <span class="status-value" id="totalTime">0ms</span>
+                <span class="status-label">总耗时</span>
+            </div>
+            <div class="status-item">
+                <span class="status-value" id="currentStep">0</span>
+                <span class="status-label">当前步骤</span>
+            </div>
+            <div class="status-item">
+                <span class="status-value" id="realtimeUpdates">0</span>
+                <span class="status-label">实时更新</span>
+            </div>
+            <div class="status-item">
+                <span class="status-value" id="viewModeLabel">2D</span>
+                <span class="status-label">视图模式</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="detail-panel" id="detailPanel">
+        <div class="detail-header">
+            <span class="detail-title" id="detailTitle">节点详情</span>
+            <button class="detail-close" onclick="closeDetail()">×</button>
+        </div>
+        <div class="detail-body" id="detailBody"></div>
+    </div>
+
+    <script src="/js/security.js"></script>
+    <script>
+        // API基础URL — 如果页面不在8080端口运行，自动指向后端
+        const API_BASE = (location.port === '8080' || location.port === '')
+            ? ''
+            : 'http://localhost:8080';
+
+        // 全局变量
+        let currentSession = null;
+        let currentExecution = null;
+        let traceData = [];
+        let nodes = [];
+        let edges = [];
+        let eventSource = null;
+        let isConnected = false;
+        let isIsoMode = false; // 2.5D模式状态
+        let realtimeUpdateCount = 0;
+        let logEntries = [];
+        let processedStepIds = new Set(); // 跟踪已处理的步骤ID，防止重复
+        let processedDeduplicationKeys = new Set(); // 跟踪已处理的复合去重键，防止重复
+
+        // 画布交互变量
+        let isDragging = false;
+        let dragStartX = 0;
+        let dragStartY = 0;
+        let viewBoxX = 0;
+        let viewBoxY = 0;
+        let viewBoxWidth = 1200;
+        let viewBoxHeight = 700;
+        let scale = 1;
+
+        // 标准化步骤ID，确保格式一致
+        function normalizeStepId(id) {
+            if (id === null || id === undefined) return null;
+            // 如果是数字，转换为字符串
+            if (typeof id === 'number') return id.toString();
+            // 如果是字符串，保持原样
+            return String(id);
+        }
+
+        // 生成复合去重键（步骤类型 + 时间戳 + 会话ID）
+        function generateDeduplicationKey(data) {
+            const stepType = data.stepType || 'UNKNOWN';
+            const createdAt = data.createdAt || '';
+            const sessionId = data.sessionId || currentSession || '';
+            return `${stepType}_${createdAt}_${sessionId}`;
+        }
+
+        // 节点类型配置 —— 与 AgentStepNode.java 完全对齐
+        const NODE_TYPES = {
+            // 生命周期
+            RUN_START:           { icon: '🚀', label: '任务开始',     group: '生命周期', col: 0 },
+            AGENT_LOOP_START:    { icon: '🔄', label: '进入主循环',   group: '生命周期', col: 0 },
+            AGENT_LOOP_END:      { icon: '🔄', label: '离开主循环',   group: '生命周期', col: 0 },
+            SUBAGENT_LOOP_START: { icon: '🔀', label: '子代理启动',   group: '生命周期', col: 0 },
+            SUBAGENT_LOOP_END:   { icon: '🔀', label: '子代理结束',   group: '生命周期', col: 0 },
+            COMPRESSION:         { icon: '🗜️', label: '上下文压缩',   group: '生命周期', col: 0 },
+            // 上下文加载
+            CONTEXT_LOAD:        { icon: '📦', label: '加载上下文',   group: '上下文',   col: 1 },
+            // 意图识别
+            INTENT_START:        { icon: '🧭', label: '意图识别开始', group: '意图识别', col: 2 },
+            INTENT_L0:           { icon: '⚡', label: 'L0规则',       group: '意图识别', col: 2 },
+            INTENT_L1:           { icon: '🔎', label: 'L1小模型',     group: '意图识别', col: 2 },
+            INTENT_L2:           { icon: '📐', label: 'L2启发式',     group: '意图识别', col: 2 },
+            INTENT_END:          { icon: '🧭', label: '意图识别结束', group: '意图识别', col: 2 },
+            // 执行计划
+            TASK_PLAN:           { icon: '🗺️', label: '执行计划定案', group: '执行计划', col: 3 },
+            // 规划控制
+            GOAL_COMPILED:       { icon: '🎯', label: '目标编译',     group: '规划控制', col: 3 },
+            GRAPH_UPDATED:       { icon: '📊', label: '任务图更新',   group: '规划控制', col: 3 },
+            PROPOSAL:            { icon: '📋', label: '动作提案',     group: '规划控制', col: 3 },
+            STATE_COMMIT:        { icon: '💾', label: '状态提交',     group: '规划控制', col: 3 },
+            RECOVERY_LOCAL:      { icon: '🛠️', label: '局部修复',     group: '规划控制', col: 3 },
+            RECOVERY_REPLACE_TOOL:{ icon: '🔧', label: '换工具',       group: '规划控制', col: 3 },
+            RECOVERY_REWRITE_GRAPH:{ icon: '📐', label: '改图',        group: '规划控制', col: 3 },
+            RECOVERY_REVISE_GOAL:{ icon: '🎯', label: '改目标',       group: '规划控制', col: 3 },
+            // 任务拆分
+            TASK_SEED:           { icon: '🌱', label: '播种任务',     group: '任务管理', col: 3 },
+            TASK_SET:            { icon: '📋', label: '建立任务',     group: '任务管理', col: 3 },
+            TASK_UPDATE:         { icon: '☑️', label: '更新任务',     group: '任务管理', col: 3 },
+            TASK_REOPEN:         { icon: '🔄', label: '回滚重开',     group: '任务管理', col: 3 },
+            TASK_CONFIRM:        { icon: '✅', label: '人工确认',     group: '任务管理', col: 3 },
+            TASK_CLEAR:          { icon: '🗑️', label: '清空任务',     group: '任务管理', col: 3 },
+            // 各轮目标
+            PLAN:                { icon: '🎯', label: '本轮目标',     group: '各轮目标', col: 4 },
+            SUB_GOAL:            { icon: '📌', label: '当前子目标',   group: '各轮目标', col: 4 },
+            // 决策/模型
+            THINKING:            { icon: '💭', label: '模型思考',     group: '模型调用', col: 5 },
+            DECISION:            { icon: '🧠', label: '决策说明',     group: '模型调用', col: 5 },
+            LLM_CALL:            { icon: '🤖', label: '模型调用',     group: '模型调用', col: 5 },
+            LLM_CALL_ERROR:      { icon: '💥', label: '模型调用失败', group: '模型调用', col: 5 },
+            LLM_RETRY:           { icon: '🔁', label: '模型重试',     group: '模型调用', col: 5 },
+            // 工具调用
+            TOOL_CALL:           { icon: '🔧', label: '工具调用',     group: '工具调用', col: 6 },
+            TOOL_RESULT:         { icon: '✅', label: '工具返回',     group: '工具调用', col: 6 },
+            TOOL_ERROR:          { icon: '❌', label: '工具异常',     group: '工具调用', col: 6 },
+            TOOL_RETRY:          { icon: '🔁', label: '工具重试',     group: '工具调用', col: 6 },
+            PERM_DENY:           { icon: '🚫', label: '权限拒绝',     group: '工具调用', col: 6 },
+            HOOK_DENY:           { icon: '⛔', label: '钩子拒绝',     group: '工具调用', col: 6 },
+            // 人机协作
+            WAITING_FOR_HUMAN:   { icon: '⏳', label: '等待人工',     group: '人机协作', col: 4 },
+            HUMAN_CONFIRM_REJECTED:{ icon: '🚫', label: '人工驳回',   group: '人机协作', col: 4 },
+            // 最终结果
+            ANSWER:              { icon: '📝', label: '最终回答',     group: '最终结果', col: 7 },
+            CANCELED:            { icon: '🚫', label: '用户取消',     group: '最终结果', col: 7 },
+            ABORTED:             { icon: '💥', label: '异常终止',     group: '最终结果', col: 7 },
+            ERROR:               { icon: '❌', label: '执行错误',     group: '最终结果', col: 7 },
+            RUN_END:             { icon: '🏁', label: '任务结束',     group: '最终结果', col: 7 }
+        };
+
+        // 各阶段的推荐列序（用于时间线布局）
+        const STAGE_ORDER = ['生命周期','上下文','意图识别','执行计划','规划控制','任务管理','各轮目标','人机协作','模型调用','工具调用','最终结果'];
+
+        // 初始化
+        document.addEventListener('DOMContentLoaded', () => {
+            // 初始化视口尺寸
+            const svg = document.getElementById('traceSvg');
+            const rect = svg.getBoundingClientRect();
+            viewBoxWidth = rect.width;
+            viewBoxHeight = rect.height;
+            updateViewBox();
+            
+            loadSessions();
+            setupEventListeners();
+        });
+
+        // 加载会话列表
+        async function loadSessions() {
+            try {
+                const resp = await fetch(API_BASE + '/api/conversations', { credentials: 'include' });
+                if (!resp.ok) return;
+                const list = await resp.json();
+                const sessionList = document.getElementById('sessionList');
+                sessionList.innerHTML = '';
+
+                if (!list.data || list.data.length === 0) {
+                    sessionList.innerHTML = '<div style="padding:12px;color:var(--text3)">暂无会话</div>';
+                    return;
+                }
+
+                list.data.forEach(session => {
+                    const item = document.createElement('div');
+                    item.className = 'session-item' + (session.sessionId === currentSession ? ' active' : '');
+                    item.innerHTML = `
+                        <div class="session-title">${session.title || '新对话'}</div>
+                        <div class="session-time">${session.sessionId}</div>
+                    `;
+                    item.onclick = () => selectSession(session.sessionId);
+                    sessionList.appendChild(item);
+                });
+
+                // 自动选择第一个会话
+                if (list.data.length > 0 && !currentSession) {
+                    selectSession(list.data[0].sessionId);
+                }
+            } catch (e) {
+                console.error('加载会话失败:', e);
+                addLog('系统', '加载会话失败: ' + e.message, 'error');
+            }
+        }
+
+        // 选择会话
+        async function selectSession(sessionId) {
+            currentSession = sessionId;
+            currentExecution = null;
+            processedStepIds.clear(); // 清空已处理步骤ID集合
+            
+            // 更新UI
+            document.querySelectorAll('.session-item').forEach(item => {
+                item.classList.remove('active');
+                if (item.querySelector('.session-title').textContent === sessionId) {
+                    item.classList.add('active');
+                }
+            });
+
+            // 加载执行记录
+            await loadExecutions(sessionId);
+            
+            // 连接SSE
+            connectSSE(sessionId);
+        }
+
+        // 加载执行记录
+        async function loadExecutions(sessionId) {
+            try {
+                const resp = await fetch(API_BASE + `/api/traces/executions?sessionId=${sessionId}`, { credentials: 'include' });
+                if (!resp.ok) return;
+                const execs = await resp.json();
+                
+                if (execs.data && execs.data.length > 0) {
+                    currentExecution = execs.data[0].executionId;
+                    await loadTraceData(currentExecution);
+                }
+            } catch (e) {
+                console.error('加载执行记录失败:', e);
+                addLog('系统', '加载执行记录失败: ' + e.message, 'error');
+            }
+        }
+
+        // 加载轨迹数据
+        async function loadTraceData(executionId) {
+            try {
+                const resp = await fetch(API_BASE + `/api/traces?executionId=${executionId}`, { credentials: 'include' });
+                if (!resp.ok) return;
+                const data = await resp.json();
+                
+                traceData = data.data || [];
+                processTraceData();
+                renderTrace();
+                updateStats();
+                addLog('系统', '加载轨迹数据完成，共 ' + traceData.length + ' 步骤');
+            } catch (e) {
+                console.error('加载轨迹数据失败:', e);
+                addLog('系统', '加载轨迹数据失败: ' + e.message, 'error');
+            }
+        }
+
+        // 连接SSE
+        function connectSSE(sessionId) {
+            // 断开现有连接
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+
+            if (!sessionId) {
+                updateConnectionStatus(false);
+                return;
+            }
+
+            try {
+                // 获取token
+                let token = '';
+                try { token = sessionStorage.getItem('ma_token') || ''; } catch (_) {}
+
+                // 构建URL
+                const traceUrl = API_BASE + '/api/traces/stream?sessionId=' + encodeURIComponent(sessionId)
+                    + (token ? '&access_token=' + encodeURIComponent(token) : '');
+
+                // 创建EventSource
+                eventSource = new EventSource(traceUrl);
+                isConnected = true;
+                updateConnectionStatus(true);
+
+                // 监听trace事件
+                eventSource.addEventListener('trace', ev => {
+                    let data = null;
+                    try { data = JSON.parse(ev.data); } catch (e) { return; }
+                    if (!data || data.sessionId !== currentSession) return;
+                    
+                    // 处理实时数据
+                    handleRealtimeData(data);
+                });
+
+                // 监听错误
+                eventSource.onerror = (e) => {
+                    console.error('SSE连接错误:', e);
+                    addLog('系统', 'SSE连接错误', 'error');
+                    updateConnectionStatus(false);
+                    isConnected = false;
+                };
+
+                // 监听打开
+                eventSource.onopen = (e) => {
+                    console.log('SSE连接已建立');
+                    addLog('系统', 'SSE连接已建立');
+                    updateConnectionStatus(true);
+                    isConnected = true;
+                };
+
+                addLog('系统', '连接SSE端点: ' + sessionId);
+            } catch (e) {
+                console.error('连接SSE失败:', e);
+                addLog('系统', '连接SSE失败: ' + e.message, 'error');
+                updateConnectionStatus(false);
+                isConnected = false;
+            }
+        }
+
+        // 处理实时数据
+        function handleRealtimeData(data) {
+            realtimeUpdateCount++;
+            document.getElementById('realtimeUpdates').textContent = realtimeUpdateCount;
+
+            // 添加日志
+            const timestamp = new Date().toLocaleTimeString();
+            const stepType = data.stepType || 'UNKNOWN';
+            const status = data.status || 'PENDING';
+            const icon = NODE_TYPES[stepType]?.icon || '❓';
+            const label = NODE_TYPES[stepType]?.label || stepType;
+            
+            addLog(timestamp, `${icon} ${label} - ${status}`);
+
+            // 标准化步骤ID
+            const rawId = data.id;
+            const stepId = normalizeStepId(rawId);
+            
+            // 生成复合去重键
+            const deduplicationKey = generateDeduplicationKey(data);
+            
+            // 检查是否已经处理过该步骤（使用ID或复合键）
+            const isDuplicateById = stepId && processedStepIds.has(stepId);
+            const isDuplicateByKey = processedDeduplicationKeys.has(deduplicationKey);
+            
+            // 如果已经是重复步骤，只更新状态
+            if (isDuplicateById || isDuplicateByKey) {
+                // 查找现有节点
+                let existingNode = null;
+                if (stepId) {
+                    existingNode = nodes.find(n => n.id === stepId);
+                }
+                
+                // 如果找不到，尝试通过复合键查找
+                if (!existingNode) {
+                    existingNode = nodes.find(n => {
+                        const nodeDedupKey = generateDeduplicationKey(n.data);
+                        return nodeDedupKey === deduplicationKey;
+                    });
+                }
+                
+                if (existingNode) {
+                    existingNode.status = status;
+                    existingNode.duration = data.durationMs || existingNode.duration;
+                    existingNode.data = { ...existingNode.data, ...data };
+                    
+                    // 更新可视化
+                    renderTrace();
+                    updateStats();
+                }
+                return; // 不创建重复节点
+            }
+
+            // 查找或创建节点
+            let node = nodes.find(n => n.id === stepId);
+            if (!node) {
+                // 创建新节点
+                const nodeType = NODE_TYPES[stepType] || { icon: '❓', label: stepType, group: '其他', col: 9 };
+                node = {
+                    id: stepId,
+                    type: stepType,
+                    icon: nodeType.icon,
+                    label: nodeType.label,
+                    group: nodeType.group,
+                    col: nodeType.col,
+                    status: status,
+                    duration: data.durationMs || 0,
+                    time: data.createdAt || new Date().toISOString(),
+                    data: data,
+                    x: 0,
+                    y: 0,
+                    order: nodes.length
+                };
+                nodes.push(node);
+                processedStepIds.add(stepId); // 记录已处理的步骤ID
+                processedDeduplicationKeys.add(deduplicationKey); // 记录复合去重键
+
+                // 添加连接
+                if (nodes.length > 1) {
+                    const prevNode = nodes[nodes.length - 2];
+                    edges.push({
+                        from: prevNode.id,
+                        to: node.id,
+                        active: true
+                    });
+                }
+            } else {
+                // 更新现有节点
+                node.status = status;
+                node.duration = data.durationMs || node.duration;
+                node.data = { ...node.data, ...data };
+            }
+
+            // 更新可视化
+            renderTrace();
+            updateStats();
+        }
+
+        // 断开SSE
+        function disconnectSSE() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            isConnected = false;
+            updateConnectionStatus(false);
+            addLog('系统', 'SSE连接已断开');
+        }
+
+        // 切换连接状态
+        function toggleConnection() {
+            if (isConnected) {
+                disconnectSSE();
+                document.getElementById('connectBtn').textContent = '连接';
+            } else {
+                if (currentSession) {
+                    connectSSE(currentSession);
+                    document.getElementById('connectBtn').textContent = '断开连接';
+                }
+            }
+        }
+
+        // 更新连接状态显示
+        function updateConnectionStatus(connected) {
+            const indicator = document.querySelector('.realtime-indicator');
+            const dot = document.querySelector('.realtime-dot');
+            const text = document.getElementById('connectionStatus');
+            
+            if (connected) {
+                indicator.style.background = 'rgba(34, 197, 94, 0.1)';
+                indicator.style.borderColor = 'rgba(34, 197, 94, 0.3)';
+                dot.style.background = 'var(--success)';
+                text.textContent = '实时连接';
+                text.style.color = 'var(--success)';
+            } else {
+                indicator.style.background = 'rgba(239, 68, 68, 0.1)';
+                indicator.style.borderColor = 'rgba(239, 68, 68, 0.3)';
+                dot.style.background = 'var(--failure)';
+                dot.style.animation = 'none';
+                text.textContent = '未连接';
+                text.style.color = 'var(--failure)';
+            }
+        }
+
+        // 处理轨迹数据 —— 按时间顺序创建节点，每个节点连接到下一个
+        function processTraceData() {
+            nodes = [];
+            edges = [];
+            processedStepIds.clear(); // 清空已处理步骤ID集合
+            processedDeduplicationKeys.clear(); // 清空复合去重键集合
+
+            // 按时间排序
+            traceData.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+
+            // 创建节点
+            traceData.forEach((step, index) => {
+                const nodeType = NODE_TYPES[step.stepType] || { icon: '❓', label: step.stepType || 'UNKNOWN', group: '其他', col: 9 };
+                const rawId = step.id || 'step_' + index;
+                const stepId = normalizeStepId(rawId);
+                const deduplicationKey = generateDeduplicationKey(step);
+                
+                const node = {
+                    id: stepId,
+                    type: step.stepType,
+                    icon: nodeType.icon,
+                    label: nodeType.label,
+                    group: nodeType.group,
+                    col: nodeType.col,
+                    status: step.status || 'PENDING',
+                    duration: step.durationMs || 0,
+                    time: step.createdAt,
+                    data: step,
+                    x: 0,
+                    y: 0,
+                    order: index
+                };
+                nodes.push(node);
+                processedStepIds.add(stepId); // 记录已处理的步骤ID
+                processedDeduplicationKeys.add(deduplicationKey); // 记录复合去重键
+            });
+
+            // 按时间顺序，每个节点连接到下一个 —— 保证完整的时间线链
+            for (let i = 0; i < nodes.length - 1; i++) {
+                const from = nodes[i];
+                const to = nodes[i + 1];
+                edges.push({
+                    from: from.id,
+                    to: to.id,
+                    active: i === nodes.length - 2  // 最后一条边高亮
+                });
+            }
+        }
+
+        // 渲染轨迹图 —— 增量更新模式，避免每次重建整个SVG
+        let svgDefsReady = false;
+        let renderedEdgeIds = new Set();
+        let renderedNodeIds = new Set();
+
+        function renderTrace() {
+            const svg = document.getElementById('traceSvg');
+
+            // 首次渲染：创建 defs
+            if (!svgDefsReady) {
+                const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+                defs.innerHTML = `
+                    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="var(--text3)" />
+                    </marker>
+                    <marker id="arrowhead-active" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="var(--running)" />
+                    </marker>
+                    <linearGradient id="nodeGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" style="stop-color:var(--surface);stop-opacity:1" />
+                        <stop offset="100%" style="stop-color:var(--surface2);stop-opacity:1" />
+                    </linearGradient>
+                    <linearGradient id="nodeGradientRunning" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:1" />
+                        <stop offset="100%" style="stop-color:#1d4ed8;stop-opacity:1" />
+                    </linearGradient>
+                    <linearGradient id="nodeGradientSuccess" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" style="stop-color:#22c55e;stop-opacity:1" />
+                        <stop offset="100%" style="stop-color:#15803d;stop-opacity:1" />
+                    </linearGradient>
+                    <linearGradient id="nodeGradientFailure" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" style="stop-color:#ef4444;stop-opacity:1" />
+                        <stop offset="100%" style="stop-color:#b91c1c;stop-opacity:1" />
+                    </linearGradient>
+                    <filter id="nodeShadow" x="-50%" y="-50%" width="200%" height="200%">
+                        <feDropShadow dx="2" dy="4" stdDeviation="3" flood-color="rgba(0,0,0,0.4)"/>
+                    </filter>
+                `;
+                svg.appendChild(defs);
+                svgDefsReady = true;
+            }
+
+            if (nodes.length === 0) return;
+
+            // 计算节点位置
+            calculateNodePositions();
+
+            // 动态调整 viewBox 以适应所有节点
+            updateViewBoxToFitNodes();
+
+            // 获取或创建分组图
+            let stageGroup = svg.querySelector('#stage-group');
+            if (!stageGroup) {
+                stageGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                stageGroup.setAttribute('id', 'stage-group');
+                svg.appendChild(stageGroup);
+            }
+            let edgeGroup = svg.querySelector('#edge-group');
+            if (!edgeGroup) {
+                edgeGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                edgeGroup.setAttribute('id', 'edge-group');
+                svg.appendChild(edgeGroup);
+            }
+            let nodeGroup = svg.querySelector('#node-group');
+            if (!nodeGroup) {
+                nodeGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                nodeGroup.setAttribute('id', 'node-group');
+                svg.appendChild(nodeGroup);
+            }
+
+            // 更新阶段标签
+            renderColumnHeaders(stageGroup);
+
+            // 增量更新连接线
+            const currentEdgeKeys = new Set();
+            edges.forEach(edge => {
+                const key = edge.from + '->' + edge.to;
+                currentEdgeKeys.add(key);
+                const fromNode = nodes.find(n => n.id === edge.from);
+                const toNode = nodes.find(n => n.id === edge.to);
+                if (!fromNode || !toNode) return;
+
+                let line = edgeGroup.querySelector(`[data-edge="${key}"]`);
+                if (!line) {
+                    line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                    line.setAttribute('data-edge', key);
+                    line.setAttribute('class', 'connection');
+                    edgeGroup.appendChild(line);
+                }
+                const path = calculatePath(fromNode, toNode);
+                line.setAttribute('d', path);
+                line.setAttribute('class', 'connection' + (edge.active ? ' active' : ''));
+                line.setAttribute('marker-end', edge.active ? 'url(#arrowhead-active)' : 'url(#arrowhead)');
+            });
+
+            // 移除不再存在的连接线
+            edgeGroup.querySelectorAll('.connection').forEach(line => {
+                const key = line.getAttribute('data-edge');
+                if (!currentEdgeKeys.has(key)) {
+                    line.remove();
+                }
+            });
+
+            // 增量更新节点
+            const currentNodeIds = new Set();
+            nodes.forEach(node => {
+                currentNodeIds.add(node.id);
+                let g = nodeGroup.querySelector(`[data-node="${node.id}"]`);
+                if (!g) {
+                    // 创建新节点
+                    g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                    g.setAttribute('data-node', node.id);
+                    g.setAttribute('class', 'node');
+                    g.onclick = () => showNodeDetail(node);
+
+                    const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                    circle.setAttribute('r', '20');
+                    circle.setAttribute('class', 'node-circle');
+                    circle.setAttribute('filter', 'url(#nodeShadow)');
+                    g.appendChild(circle);
+
+                    const icon = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                    icon.setAttribute('class', 'node-icon');
+                    icon.setAttribute('font-size', '16');
+                    g.appendChild(icon);
+
+                    const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                    label.setAttribute('class', 'node-label');
+                    label.setAttribute('y', '32');
+                    label.setAttribute('font-size', '10');
+                    g.appendChild(label);
+
+                    const time = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                    time.setAttribute('class', 'node-time');
+                    time.setAttribute('y', '44');
+                    g.appendChild(time);
+
+                    nodeGroup.appendChild(g);
+                }
+
+                // 更新节点属性（不重建DOM）
+                g.setAttribute('transform', `translate(${node.x}, ${node.y})`);
+                
+                // 根据状态选择渐变填充
+                const circle = g.querySelector('.node-circle');
+                let fillAttr = 'url(#nodeGradient)';
+                if (isIsoMode) {
+                    switch (node.status?.toUpperCase()) {
+                        case 'RUNNING': fillAttr = 'url(#nodeGradientRunning)'; break;
+                        case 'SUCCESS': case 'COMPLETED': fillAttr = 'url(#nodeGradientSuccess)'; break;
+                        case 'FAILURE': case 'ERROR': fillAttr = 'url(#nodeGradientFailure)'; break;
+                    }
+                }
+                circle.setAttribute('fill', fillAttr);
+                circle.setAttribute('class', 'node-circle ' + getStatusClass(node.status));
+                g.querySelector('.node-icon').textContent = node.icon;
+                g.querySelector('.node-label').textContent = node.label;
+                g.querySelector('.node-time').textContent = formatDuration(node.duration);
+            });
+
+            // 移除不再存在的节点
+            nodeGroup.querySelectorAll('.node').forEach(g => {
+                const nid = g.getAttribute('data-node');
+                if (!currentNodeIds.has(nid)) {
+                    g.remove();
+                }
+            });
+        }
+
+        // 动态调整 viewBox 以适应所有节点
+        function updateViewBoxToFitNodes() {
+            if (nodes.length === 0) return;
+            
+            const svg = document.getElementById('traceSvg');
+            const rect = svg.getBoundingClientRect();
+            const screenW = rect.width || 1200;
+            const screenH = rect.height || 700;
+
+            // 计算所有节点的边界
+            let minX = Infinity, maxX = -Infinity;
+            let minY = Infinity, maxY = -Infinity;
+            nodes.forEach(n => {
+                if (n.x < minX) minX = n.x;
+                if (n.x > maxX) maxX = n.x;
+                if (n.y < minY) minY = n.y;
+                if (n.y > maxY) maxY = n.y;
+            });
+
+            const padding = 60;
+            minX -= padding;
+            minY -= padding;
+            maxX += padding + 100; // 额外空间给标签
+            maxY += padding + 20;
+
+            const contentW = maxX - minX;
+            const contentH = maxY - minY;
+
+            // 根据内容比例调整 viewBox
+            const contentAspect = contentW / contentH;
+            const screenAspect = screenW / screenH;
+
+            if (contentAspect > screenAspect) {
+                // 内容更宽
+                viewBoxWidth = contentW;
+                viewBoxHeight = contentW / screenAspect;
+            } else {
+                // 内容更高
+                viewBoxHeight = contentH;
+                viewBoxWidth = contentH * screenAspect;
+            }
+
+            viewBoxX = minX - (viewBoxWidth - contentW) / 2;
+            viewBoxY = minY - (viewBoxHeight - contentH) / 2;
+
+            svg.setAttribute('viewBox', `${viewBoxX} ${viewBoxY} ${viewBoxWidth} ${viewBoxHeight}`);
+        }
+
+        // 渲染阶段标签 —— 在左侧显示阶段名称
+        function renderColumnHeaders(parentGroup) {
+            const STAGE_LEVELS = {
+                '生命周期': 0,
+                '上下文': 1,
+                '意图识别': 2,
+                '执行计划': 3,
+                '规划控制': 4,
+                '任务管理': 5,
+                '各轮目标': 6,
+                '人机协作': 7,
+                '模型调用': 8,
+                '工具调用': 9,
+                '最终结果': 10
+            };
+
+            const svgH = 700;
+            const PAD_TOP = 40;
+            const PAD_BOT = 30;
+            const availH = svgH - PAD_TOP - PAD_BOT;
+            const levelCount = Object.keys(STAGE_LEVELS).length;
+            const levelHeight = availH / (levelCount - 1 || 1);
+
+            // 清除旧的标签
+            parentGroup.innerHTML = '';
+
+            // 在左侧显示阶段标签
+            Object.entries(STAGE_LEVELS).forEach(([stage, level]) => {
+                const y = PAD_TOP + level * levelHeight;
+
+                // 阶段标签
+                const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                text.setAttribute('x', 10);
+                text.setAttribute('y', y + 4);
+                text.setAttribute('text-anchor', 'start');
+                text.setAttribute('fill', 'var(--text3)');
+                text.setAttribute('font-size', '11');
+                text.setAttribute('font-weight', '500');
+                text.textContent = stage;
+                parentGroup.appendChild(text);
+
+                // 水平参考线（虚线）
+                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line.setAttribute('x1', 60);
+                line.setAttribute('y1', y);
+                line.setAttribute('x2', '10000');
+                line.setAttribute('y2', y);
+                line.setAttribute('stroke', 'var(--border)');
+                line.setAttribute('stroke-width', '1');
+                line.setAttribute('stroke-dasharray', '4 4');
+                line.setAttribute('opacity', '0.3');
+                parentGroup.appendChild(line);
+            });
+        }
+
+        // 计算节点位置 —— 水平时间线 + 阶段分层布局
+        function calculateNodePositions() {
+            const svg = document.getElementById('traceSvg');
+            const svgW = svg.clientWidth || 1200;
+            const svgH = svg.clientHeight || 700;
+
+            const PAD_LEFT = 70;  // 左侧留白（给阶段标签）
+            const PAD_RIGHT = 40; // 右侧留白
+            const PAD_TOP = 40;   // 顶部留白
+            const PAD_BOT = 30;   // 底部留白
+            const NODE_R = 20;    // 节点半径
+
+            // 阶段定义（从上到下的y坐标层级）
+            const STAGE_LEVELS = {
+                '生命周期': 0,
+                '上下文': 1,
+                '意图识别': 2,
+                '执行计划': 3,
+                '规划控制': 4,
+                '任务管理': 5,
+                '各轮目标': 6,
+                '人机协作': 7,
+                '模型调用': 8,
+                '工具调用': 9,
+                '最终结果': 10,
+                '其他': 11
+            };
+
+            const levelCount = Object.keys(STAGE_LEVELS).length;
+            const availH = svgH - PAD_TOP - PAD_BOT;
+            const levelHeight = availH / (levelCount - 1 || 1);
+
+            // 计算每个节点的层级y坐标
+            nodes.forEach(node => {
+                const level = STAGE_LEVELS[node.group] ?? 11;
+                node.y = PAD_TOP + level * levelHeight;
+            });
+
+            // 按时间顺序排列节点，计算x坐标
+            const totalNodes = nodes.length;
+            const availW = svgW - PAD_LEFT - PAD_RIGHT;
+            
+            // 如果节点太多，需要压缩间距
+            const minNodeSpacing = NODE_R * 2.5; // 最小节点间距
+            let nodeSpacing = totalNodes > 1 ? availW / (totalNodes - 1) : 0;
+            
+            // 如果间距太小，使用最小间距，并允许画布滚动
+            if (nodeSpacing < minNodeSpacing && totalNodes > 1) {
+                nodeSpacing = minNodeSpacing;
+            }
+
+            nodes.forEach((node, index) => {
+                node.x = PAD_LEFT + index * nodeSpacing;
+            });
+
+            // 对同一层级内的节点进行微调，避免重叠
+            const levelNodes = {};
+            nodes.forEach(node => {
+                const level = STAGE_LEVELS[node.group] ?? 11;
+                if (!levelNodes[level]) levelNodes[level] = [];
+                levelNodes[level].push(node);
+            });
+
+            // 检查并调整重叠的节点 - 使用蛇形布局
+            Object.values(levelNodes).forEach(lnodes => {
+                // 按x坐标排序
+                lnodes.sort((a, b) => a.x - b.x);
+                
+                // 如果节点太多，使用多行布局
+                if (lnodes.length > 8) {
+                    const nodesPerRow = Math.ceil(lnodes.length / 2);
+                    lnodes.forEach((node, idx) => {
+                        const row = Math.floor(idx / nodesPerRow);
+                        const col = idx % nodesPerRow;
+                        // 调整y坐标，形成两行
+                        node.y += row * (NODE_R * 2 + 10);
+                    });
+                }
+                
+                for (let i = 1; i < lnodes.length; i++) {
+                    const prev = lnodes[i - 1];
+                    const curr = lnodes[i];
+                    const minDist = NODE_R * 2 + 5; // 最小间距
+                    
+                    if (curr.x - prev.x < minDist) {
+                        curr.x = prev.x + minDist;
+                    }
+                }
+            });
+        }
+
+        // 计算路径 —— 贝塞尔曲线，从右边缘到左边缘
+        function calculatePath(from, to) {
+            const NODE_R = 20;
+            // 起点：from 右边缘；终点：to 左边缘
+            const sx = from.x + NODE_R;
+            const sy = from.y;
+            const ex = to.x - NODE_R;
+            const ey = to.y;
+            const dx = ex - sx;
+            const dy = ey - sy;
+            
+            // 根据节点位置关系调整控制点
+            let cp1x, cp1y, cp2x, cp2y;
+            
+            if (Math.abs(dy) < 10) {
+                // 几乎水平：简单的S曲线
+                const cp = Math.max(Math.abs(dx) * 0.4, 30);
+                cp1x = sx + cp;
+                cp1y = sy;
+                cp2x = ex - cp;
+                cp2y = ey;
+            } else {
+                // 有垂直偏移：使用更大的控制点使曲线平滑
+                const cp = Math.max(Math.abs(dx) * 0.3, 20);
+                cp1x = sx + cp;
+                cp1y = sy;
+                cp2x = ex - cp;
+                cp2y = ey;
+            }
+            
+            return `M ${sx} ${sy} C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${ex} ${ey}`;
+        }
+
+        // 获取状态类
+        function getStatusClass(status) {
+            switch (status?.toUpperCase()) {
+                case 'RUNNING': return 'running';
+                case 'SUCCESS': case 'COMPLETED': return 'success';
+                case 'FAILURE': case 'ERROR': return 'failure';
+                case 'WARNING': return 'warning';
+                default: return '';
+            }
+        }
+
+        // 格式化时长
+        function formatDuration(ms) {
+            if (!ms || ms === 0) return '0ms';
+            if (ms < 1000) return ms + 'ms';
+            if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+            return (ms / 60000).toFixed(1) + 'min';
+        }
+
+        // 更新统计信息
+        function updateStats() {
+            document.getElementById('nodeCount').textContent = nodes.length;
+            document.getElementById('edgeCount').textContent = edges.length;
+            document.getElementById('currentStep').textContent = nodes.length;
+            
+            // 计算总耗时
+            const totalTime = nodes.reduce((sum, node) => sum + (node.duration || 0), 0);
+            document.getElementById('totalTime').textContent = formatDuration(totalTime);
+        }
+
+        // 显示节点详情
+        function showNodeDetail(node) {
+            const panel = document.getElementById('detailPanel');
+            const title = document.getElementById('detailTitle');
+            const body = document.getElementById('detailBody');
+            
+            title.textContent = `${node.icon} ${node.label}`;
+            
+            let html = '';
+            html += `<div class="detail-row"><div class="detail-key">类型</div><div class="detail-value">${node.type}</div></div>`;
+            html += `<div class="detail-row"><div class="detail-key">状态</div><div class="detail-value">${node.status || 'PENDING'}</div></div>`;
+            html += `<div class="detail-row"><div class="detail-key">耗时</div><div class="detail-value">${formatDuration(node.duration)}</div></div>`;
+            html += `<div class="detail-row"><div class="detail-key">时间</div><div class="detail-value">${node.time || '未知'}</div></div>`;
+            html += `<div class="detail-row"><div class="detail-key">分组</div><div class="detail-value">${node.group}</div></div>`;
+            
+            if (node.data) {
+                html += `<div class="detail-row"><div class="detail-key">详细数据</div><div class="detail-value"><pre style="white-space:pre-wrap;font-size:10px;max-height:200px;overflow:auto">${JSON.stringify(node.data, null, 2)}</pre></div></div>`;
+            }
+            
+            body.innerHTML = html;
+            panel.classList.add('show');
+        }
+
+        // 关闭详情面板
+        function closeDetail() {
+            document.getElementById('detailPanel').classList.remove('show');
+        }
+
+        // 添加日志
+        function addLog(type, message, status = '') {
+            const logContent = document.getElementById('logContent');
+            if (!logContent) return;
+            const timestamp = new Date().toLocaleTimeString();
+
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `
+                <span class="log-time">${timestamp}</span>
+                <span class="log-type">${type}</span>
+                <span class="log-status ${status}">${message}</span>
+            `;
+
+            logContent.insertBefore(entry, logContent.firstChild);
+
+            // 保持日志数量
+            while (logContent.children.length > 50) {
+                logContent.removeChild(logContent.lastChild);
+            }
+        }
+
+        // 清除日志
+        function clearLog() {
+            const logContent = document.getElementById('logContent');
+            if (logContent) logContent.innerHTML = '';
+            addLog('系统', '日志已清除');
+        }
+
+        // 切换主题
+        function toggleTheme() {
+            const body = document.body;
+            const currentTheme = body.getAttribute('data-theme');
+            body.setAttribute('data-theme', currentTheme === 'light' ? 'dark' : 'light');
+        }
+
+        // 切换2.5D/2D视图模式
+        function toggleViewMode() {
+            const svg = document.getElementById('traceSvg');
+            const btn = document.getElementById('viewModeBtn');
+            const modeLabel = document.getElementById('viewModeLabel');
+            
+            isIsoMode = !isIsoMode;
+            
+            if (isIsoMode) {
+                svg.classList.add('iso-mode');
+                btn.textContent = '切换 2D';
+                modeLabel.textContent = '2.5D';
+                addLog('系统', '已切换到2.5D等距视角');
+            } else {
+                svg.classList.remove('iso-mode');
+                btn.textContent = '切换 3D';
+                modeLabel.textContent = '2D';
+                addLog('系统', '已切换到2D平面视图');
+            }
+            
+            // 重新渲染以更新节点样式
+            renderTrace();
+        }
+
+        // 设置事件监听器
+        function setupEventListeners() {
+            // 窗口大小改变时重新渲染
+            window.addEventListener('resize', () => {
+                if (nodes.length > 0) {
+                    calculateNodePositions();
+                    renderTrace();
+                }
+            });
+
+            // 画布交互事件
+            const svg = document.getElementById('traceSvg');
+            
+            // 鼠标按下 - 开始拖动
+            svg.addEventListener('mousedown', (e) => {
+                if (e.target.closest('.node')) return; // 如果点击的是节点，不开始拖动
+                isDragging = true;
+                dragStartX = e.clientX;
+                dragStartY = e.clientY;
+                svg.style.cursor = 'grabbing';
+                e.preventDefault();
+            });
+
+            // 鼠标移动 - 拖动中
+            document.addEventListener('mousemove', (e) => {
+                if (!isDragging) return;
+                
+                const dx = e.clientX - dragStartX;
+                const dy = e.clientY - dragStartY;
+                
+                // 更新视口位置
+                viewBoxX -= dx / scale;
+                viewBoxY -= dy / scale;
+                
+                // 更新拖动起始点
+                dragStartX = e.clientX;
+                dragStartY = e.clientY;
+                
+                // 应用视口变换
+                updateViewBox();
+            });
+
+            // 鼠标释放 - 结束拖动
+            document.addEventListener('mouseup', () => {
+                isDragging = false;
+                svg.style.cursor = 'default';
+            });
+
+            // 鼠标滚轮 - 缩放
+            svg.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                
+                const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+                const newScale = Math.max(0.2, Math.min(5, scale * zoomFactor));
+                
+                // 计算缩放中心（鼠标位置）
+                const rect = svg.getBoundingClientRect();
+                const mouseX = e.clientX - rect.left;
+                const mouseY = e.clientY - rect.top;
+                
+                // 转换为SVG坐标
+                const svgX = viewBoxX + mouseX / scale;
+                const svgY = viewBoxY + mouseY / scale;
+                
+                // 更新缩放比例
+                scale = newScale;
+                
+                // 调整视口，使鼠标位置保持不变
+                viewBoxX = svgX - mouseX / scale;
+                viewBoxY = svgY - mouseY / scale;
+                
+                // 更新视口尺寸
+                updateViewBoxSize();
+                updateViewBox();
+                
+                // 显示当前缩放比例
+                addLog('系统', `缩放: ${Math.round(scale * 100)}%`);
+            });
+
+            // 双击重置视图
+            svg.addEventListener('dblclick', (e) => {
+                if (e.target.closest('.node')) return;
+                resetView();
+            });
+
+            // 缩放滑块事件
+            const zoomSlider = document.getElementById('zoomSlider');
+            if (zoomSlider) {
+                zoomSlider.addEventListener('input', (e) => {
+                    const newScale = parseInt(e.target.value) / 100;
+                    zoomTo(newScale);
+                });
+            }
+        }
+
+        // 更新视口
+        function updateViewBox() {
+            const svg = document.getElementById('traceSvg');
+            svg.setAttribute('viewBox', `${viewBoxX} ${viewBoxY} ${viewBoxWidth} ${viewBoxHeight}`);
+        }
+
+        // 更新视口尺寸（基于缩放）
+        function updateViewBoxSize() {
+            const svg = document.getElementById('traceSvg');
+            const rect = svg.getBoundingClientRect();
+            const baseW = viewBoxWidth || (rect.width || 1200);
+            const baseH = viewBoxHeight || (rect.height || 700);
+            viewBoxWidth = baseW / scale;
+            viewBoxHeight = baseH / scale;
+        }
+
+        // 重置视图
+        function resetView() {
+            scale = 1;
+            updateViewBoxToFitNodes();
+            updateZoomSlider();
+            addLog('系统', '视图已重置');
+        }
+
+        // 放大
+        function zoomIn() {
+            const newScale = Math.min(5, scale * 1.2);
+            zoomTo(newScale);
+        }
+
+        // 缩小
+        function zoomOut() {
+            const newScale = Math.max(0.2, scale / 1.2);
+            zoomTo(newScale);
+        }
+
+        // 缩放到指定比例
+        function zoomTo(newScale) {
+            const svg = document.getElementById('traceSvg');
+            const rect = svg.getBoundingClientRect();
+            
+            // 计算中心点
+            const centerX = rect.width / 2;
+            const centerY = rect.height / 2;
+            
+            // 转换为SVG坐标
+            const svgX = viewBoxX + centerX / scale;
+            const svgY = viewBoxY + centerY / scale;
+            
+            // 更新缩放比例
+            scale = newScale;
+            
+            // 调整视口，使中心点保持不变
+            viewBoxX = svgX - centerX / scale;
+            viewBoxY = svgY - centerY / scale;
+            
+            // 更新视口尺寸
+            updateViewBoxSize();
+            updateViewBox();
+            updateZoomSlider();
+        }
+
+        // 更新缩放滑块
+        function updateZoomSlider() {
+            const value = document.getElementById('zoomValue');
+            if (value) {
+                value.textContent = Math.round(scale * 100) + '%';
+            }
+        }
+
+        // 切换侧边栏显示/隐藏
+        function toggleSidebar() {
+            const sidebar = document.getElementById('sidebar');
+            sidebar.classList.toggle('collapsed');
+            // 触发窗口resize事件，让画布重新计算大小
+            setTimeout(() => {
+                window.dispatchEvent(new Event('resize'));
+            }, 350);
+        }
+
+        // 切换全屏模式
+        function toggleFullscreen() {
+            document.body.classList.toggle('fullscreen-mode');
+            setTimeout(() => {
+                window.dispatchEvent(new Event('resize'));
+            }, 100);
+        }
+
+        // 切换日志面板展开/收起
+        function toggleLogPanel() {
+            const logPanel = document.getElementById('logPanel');
+            const logContent = document.getElementById('logContent');
+            const btn = logPanel.querySelector('.log-toggle-btn');
+            if (logContent.style.display === 'none') {
+                logContent.style.display = 'block';
+                btn.textContent = '收起';
+            } else {
+                logContent.style.display = 'none';
+                btn.textContent = '展开';
+            }
+        }
+    </script>
+</body>
+</html>

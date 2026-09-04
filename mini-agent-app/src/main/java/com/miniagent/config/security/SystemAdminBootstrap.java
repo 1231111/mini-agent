@@ -6,6 +6,7 @@ import com.miniagent.config.entity.UserRole;
 import com.miniagent.config.repository.TenantRepository;
 import com.miniagent.config.repository.UserRepository;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
@@ -19,9 +20,13 @@ import java.util.regex.Pattern;
 @Component
 public class SystemAdminBootstrap implements ApplicationRunner {
     private static final Pattern USERNAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9_.-]{2,49}");
-    private final UserRepository users;
-    private final TenantRepository tenants;
-    private final PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private UserRepository users;
+    @Autowired
+    private TenantRepository tenants;
+    @Autowired
+    private PasswordEncoder passwordEncoder;
 
     @Value("${agent.auth.bootstrap-admin.username:}")
     private String username;
@@ -31,13 +36,6 @@ public class SystemAdminBootstrap implements ApplicationRunner {
     private String displayName;
     @Value("${agent.auth.bootstrap-admin.required:false}")
     private boolean required;
-
-    public SystemAdminBootstrap(UserRepository users, TenantRepository tenants,
-                                PasswordEncoder passwordEncoder) {
-        this.users = users;
-        this.tenants = tenants;
-        this.passwordEncoder = passwordEncoder;
-    }
 
     @Override
     @Transactional

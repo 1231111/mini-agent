@@ -5,7 +5,7 @@ import com.miniagent.agent.core.TokenUsageTracker;
 import com.miniagent.common.ApiResponse;
 import com.miniagent.common.ErrorCode;
 import com.miniagent.common.MessageConstants;
-import com.miniagent.config.security.SessionCookieService;
+import com.miniagent.config.security.JwtSessionService;
 import com.miniagent.config.security.AuthenticatedUser;
 import com.miniagent.config.security.SessionAuthorizationService;
 import com.miniagent.config.service.AuthService;
@@ -25,6 +25,7 @@ import com.miniagent.web.dto.LoginRequest;
 import com.miniagent.web.dto.MediaRef;
 import com.miniagent.web.dto.RegisterRequest;
 import com.miniagent.agent.web.MultimodalMedia;
+import com.miniagent.web.dto.resp.UserDTO;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -84,7 +85,7 @@ public class MiniAgentChatPageController {
     @Autowired
     private  com.miniagent.agent.core.SessionEventCenter eventCenter;
     @Autowired
-    private  SessionCookieService sessionCookieService;
+    private  JwtSessionService jwtSessionService;
     @Autowired
     private  DatabaseConversationStore conversationStore;
     @Autowired
@@ -111,7 +112,7 @@ public class MiniAgentChatPageController {
 
     @GetMapping("/")
     public String showChatPage(HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return "login";
         }
@@ -125,8 +126,13 @@ public class MiniAgentChatPageController {
     public ApiResponse<Map<String, Object>> login(@RequestBody LoginRequest req, HttpServletResponse response) {
         return authService.login(req.getUsername(), req.getPassword())
                 .map(user -> {
-                    sessionCookieService.issueSession(response, user.getId(), user.getUsername());
-                    return ApiResponse.ok(Map.<String, Object>of("userId", user.getId(), "username", user.getUsername(), "displayName", user.getDisplayName()));
+                    String token = jwtSessionService.issueToken(response, user.getId(), user.getUsername());
+                    UserDTO userDTO = UserDTO.builder().userId(user.getId())
+                            .username(user.getUsername())
+                            .displayName(user.getDisplayName())
+                            .role(user.getRole())
+                            .build();
+                    return ApiResponse.ok(Map.<String, Object>of("user", userDTO, "token", token));
                 })
                 .orElse(ApiResponse.fail(ErrorCode.AUTH_LOGIN_FAILED));
     }
@@ -136,15 +142,20 @@ public class MiniAgentChatPageController {
     public ApiResponse<Map<String, Object>> register(@RequestBody RegisterRequest req, HttpServletResponse response) {
         return authService.register(req.getUsername(), req.getPassword(), req.getDisplayName())
                 .map(user -> {
-                    sessionCookieService.issueSession(response, user.getId(), user.getUsername());
-                    return ApiResponse.ok(Map.<String, Object>of("userId", user.getId(), "username", user.getUsername()));
+                    String token = jwtSessionService.issueToken(response, user.getId(), user.getUsername());
+                    UserDTO userDTO = UserDTO.builder().userId(user.getId())
+                            .username(user.getUsername())
+                            .displayName(user.getDisplayName())
+                            .role(user.getRole())
+                            .build();
+                    return ApiResponse.ok(Map.<String, Object>of("user", userDTO, "token", token));
                 })
                 .orElse(ApiResponse.fail(ErrorCode.AUTH_USER_EXISTS));
     }
 
     @GetMapping("/api/logout")
-    public String logout(HttpServletResponse response) {
-        sessionCookieService.clearSession(response);
+    public String logout(HttpServletRequest request, HttpServletResponse response) {
+        jwtSessionService.logout(request, response);
         return "redirect:/";
     }
 
@@ -154,7 +165,7 @@ public class MiniAgentChatPageController {
     public ApiResponse<Map<String, Object>> uploadFile(@RequestParam("file") MultipartFile file,
                                                        @RequestParam(value = "sessionId", defaultValue = "default") String sessionId,
                                                        HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -203,7 +214,7 @@ public class MiniAgentChatPageController {
     @GetMapping(value = "/api/auth-status", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<Map<String, Object>> authStatus(HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.ok(Map.of("authenticated", false));
         }
@@ -212,12 +223,12 @@ public class MiniAgentChatPageController {
                 .orElse(ApiResponse.ok(Map.of("authenticated", false)));
     }
 
-    private Long getUserIdFromCookie(HttpServletRequest request) {
-        Long fromAttr = SessionCookieService.userIdFromRequest(request);
+    private Long resolveUserId(HttpServletRequest request) {
+        Long fromAttr = JwtSessionService.userIdFromRequest(request);
         if (Objects.nonNull(fromAttr)) {
             return fromAttr;
         }
-        return sessionCookieService.resolveUserId(request);
+        return jwtSessionService.resolveUserIdAndRefresh(request);
     }
 
     /** Ensure session belongs to user (via conversation or prior tasks). */
@@ -236,7 +247,7 @@ public class MiniAgentChatPageController {
     @PostMapping(value = "/api/chat/append-message", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<Void> appendUserMessage(@RequestBody Map<String, String> body, HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -259,7 +270,7 @@ public class MiniAgentChatPageController {
             produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<Void> cancelChat(@RequestBody Map<String, String> body, HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -278,7 +289,7 @@ public class MiniAgentChatPageController {
 
     @PostMapping(value = "/chat/stream", consumes = MediaType.APPLICATION_JSON_VALUE)
     public SseEmitter chatStreamMultimodal(@RequestBody ChatRequest req, HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             SseEmitter emitter = new SseEmitter(0L);
             try {
@@ -326,7 +337,7 @@ public class MiniAgentChatPageController {
                                                  @PathVariable("filename") String filename,
                                                  HttpServletRequest request) {
         Object rawPrincipal = request == null ? null
-                : request.getAttribute(SessionCookieService.ATTR_PRINCIPAL);
+                : request.getAttribute(JwtSessionService.ATTR_PRINCIPAL);
         if (!(rawPrincipal instanceof AuthenticatedUser principal)) {
             return ResponseEntity.status(401).body("Authentication required");
         }
@@ -373,7 +384,7 @@ public class MiniAgentChatPageController {
                                                      @PathVariable("filename") String filename,
                                                      HttpServletRequest request) {
         Object rawPrincipal = request == null ? null
-                : request.getAttribute(SessionCookieService.ATTR_PRINCIPAL);
+                : request.getAttribute(JwtSessionService.ATTR_PRINCIPAL);
         if (!(rawPrincipal instanceof AuthenticatedUser principal)) {
             return ResponseEntity.status(401).body("Authentication required");
         }
@@ -442,7 +453,7 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public ApiResponse<Map<String, Object>> taskStatus(@RequestParam("sessionId") String sessionId,
                                                        HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -460,7 +471,7 @@ public class MiniAgentChatPageController {
     @GetMapping(value = "/chat/stream/attach", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter attachStream(@RequestParam("sessionId") String sessionId,
                                    HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             SseEmitter emitter = new SseEmitter(0L);
             try {
@@ -488,7 +499,7 @@ public class MiniAgentChatPageController {
     @GetMapping(value = "/api/conversations", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<List<Map<String, Object>>> listConversations(HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -504,7 +515,7 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public ApiResponse<Object> getConversation(@RequestParam("sessionId") String sessionId,
                                                HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -522,7 +533,7 @@ public class MiniAgentChatPageController {
             @RequestParam("sessionId") String sessionId,
             @RequestParam(value = "page", defaultValue = "0") int page,
             @RequestParam(value = "size", defaultValue = "10") int size) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -584,7 +595,7 @@ public class MiniAgentChatPageController {
     public ApiResponse<Void> deleteConversationApi(
             HttpServletRequest request,
             @RequestParam("sessionId") String sessionId) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -599,7 +610,7 @@ public class MiniAgentChatPageController {
     @GetMapping(value = "/api/token-usage", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<Object> tokenUsage(@RequestParam("sessionId") String sessionId, HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -612,7 +623,7 @@ public class MiniAgentChatPageController {
     @GetMapping(value = "/api/token-usage/all", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<Object> allTokenUsage(HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -624,7 +635,7 @@ public class MiniAgentChatPageController {
 
     @GetMapping("/trace")
     public String showTracePage(HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return "login";
         }
@@ -635,7 +646,7 @@ public class MiniAgentChatPageController {
     @GetMapping(value = "/api/traces/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter streamTraces(@RequestParam("sessionId") String sessionId,
                                    HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId))
             return rejectTraceSse(MessageConstants.SSE_NOT_AUTHENTICATED);
         if (StringUtils.isBlank(sessionId) || !ownsSession(userId, sessionId))
@@ -667,7 +678,7 @@ public class MiniAgentChatPageController {
             HttpServletRequest request,
             @RequestParam(value = "sessionId", required = false) String sessionId,
             @RequestParam(value = "executionId", required = false) String executionId) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -697,7 +708,7 @@ public class MiniAgentChatPageController {
     public ApiResponse<Object> getPlannerDecisions(
             HttpServletRequest request,
             @RequestParam("executionId") String executionId) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -721,7 +732,7 @@ public class MiniAgentChatPageController {
     public ApiResponse<List<Map<String, Object>>> getExecutions(
             @RequestParam("sessionId") String sessionId,
             HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId) || !ownsSession(userId, sessionId)) {
             return ApiResponse.ok(List.of());
         }
@@ -765,7 +776,7 @@ public class MiniAgentChatPageController {
             HttpServletRequest request,
             @RequestParam(value = "sessionId", required = false) String sessionId,
             @RequestParam(value = "executionId", required = false) String executionId) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -845,7 +856,7 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public ApiResponse<Object> getPermissionMode(@RequestParam("sessionId") String sessionId,
                                                   HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -858,7 +869,7 @@ public class MiniAgentChatPageController {
     @PutMapping(value = "/api/permission-mode", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<Object> putPermissionMode(@RequestBody Map<String, Object> body, HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -899,7 +910,7 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public ApiResponse<Object> confirmTodo(@RequestBody Map<String, Object> body,
                                            HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -953,7 +964,7 @@ public class MiniAgentChatPageController {
     @GetMapping(value = "/api/mcp/status", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<Map<String, Object>> mcpStatus(HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -973,7 +984,7 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public ApiResponse<Object> mcpRefresh(@RequestBody(required = false) Map<String, Object> body,
                                            HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
@@ -997,7 +1008,7 @@ public class MiniAgentChatPageController {
     @GetMapping(value = "/api/model-config", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public Map<String, Object> getModelConfig(HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return Map.of("success", false, "message", "Not authenticated");
         }
@@ -1007,7 +1018,7 @@ public class MiniAgentChatPageController {
     @PutMapping(value = "/api/model-config", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public Map<String, Object> putModelConfig(@RequestBody Map<String, Object> body, HttpServletRequest request) {
-        Long userId = getUserIdFromCookie(request);
+        Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return Map.of("success", false, "message", "Not authenticated");
         }

@@ -4,7 +4,7 @@ import com.miniagent.common.ApiResponse;
 import com.miniagent.config.entity.UserRole;
 import com.miniagent.config.security.AuthenticatedUser;
 import com.miniagent.config.security.SessionAuthorizationService;
-import com.miniagent.config.security.SessionCookieService;
+import com.miniagent.config.security.JwtSessionService;
 import com.miniagent.memory.MemoryManager;
 import com.miniagent.memory.model.*;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -293,7 +293,7 @@ public class MemoryController {
 
     private AuthenticatedUser requireUser(HttpServletRequest request) {
         Object principal = request == null ? null
-                : request.getAttribute(SessionCookieService.ATTR_PRINCIPAL);
+                : request.getAttribute(JwtSessionService.ATTR_PRINCIPAL);
         if (principal instanceof AuthenticatedUser user) {
             return user;
         }

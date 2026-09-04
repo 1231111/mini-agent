@@ -10,6 +10,7 @@ import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -23,20 +24,19 @@ public class MemoryIndexOutboxService {
     private static final Logger log = LoggerFactory.getLogger(MemoryIndexOutboxService.class);
     private static final int MAX_ATTEMPTS = 10;
 
-    private final AgentMemoryIndexOutboxRepository outboxRepository;
-    private final AgentMemoryEntryRepository memoryRepository;
-    private final MilvusHybridSearchEngine milvus;
+    @Autowired
+    private AgentMemoryIndexOutboxRepository outboxRepository;
+    @Autowired
+    private AgentMemoryEntryRepository memoryRepository;
+    @Autowired
+    private ObjectProvider<MilvusHybridSearchEngine> milvusProvider;
 
-    public MemoryIndexOutboxService(AgentMemoryIndexOutboxRepository outboxRepository,
-                                    AgentMemoryEntryRepository memoryRepository,
-                                    ObjectProvider<MilvusHybridSearchEngine> milvusProvider) {
-        this.outboxRepository = outboxRepository;
-        this.memoryRepository = memoryRepository;
-        this.milvus = milvusProvider.getIfAvailable();
-    }
+    private MilvusHybridSearchEngine milvus;
 
     @PostConstruct
-    void recoverInterruptedItems() {
+    void init() {
+        this.milvus = milvusProvider.getIfAvailable();
+        // recover interrupted items
         List<AgentMemoryIndexOutboxEntity> interrupted = outboxRepository.findByStatus(
                 AgentMemoryIndexOutboxEntity.Status.PROCESSING);
         for (AgentMemoryIndexOutboxEntity item : interrupted) {

@@ -46,25 +46,11 @@ public class SystemAdminService {
     @Autowired
     private  PasswordEncoder passwordEncoder;
 
+    @Autowired
     private  ObjectMapper objectMapper;
 
     @Value("${agent.auth.password-min-length:12}")
     private int passwordMinLength;
-
-    @Autowired
-    public SystemAdminService(TenantRepository tenants,
-                              UserRepository users,
-                              AuthSessionRepository sessions,
-                              AdminAuditLogRepository auditLogs,
-                              PasswordEncoder passwordEncoder,
-                              ObjectMapper objectMapper) {
-        this.tenants = tenants;
-        this.users = users;
-        this.sessions = sessions;
-        this.auditLogs = auditLogs;
-        this.passwordEncoder = passwordEncoder;
-        this.objectMapper = objectMapper;
-    }
 
 
 

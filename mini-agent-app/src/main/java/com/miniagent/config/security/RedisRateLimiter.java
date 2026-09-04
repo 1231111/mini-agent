@@ -1,5 +1,6 @@
 package com.miniagent.config.security;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
@@ -17,11 +18,8 @@ public class RedisRateLimiter {
                     + "if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end "
                     + "return count", Long.class);
 
-    private final StringRedisTemplate redis;
-
-    public RedisRateLimiter(StringRedisTemplate redis) {
-        this.redis = redis;
-    }
+    @Autowired
+    private StringRedisTemplate redis;
 
     public long increment(String key, long ttlSeconds) {
         Long count = redis.execute(INCREMENT, List.of(key), String.valueOf(Math.max(1, ttlSeconds)));

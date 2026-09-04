@@ -6,30 +6,38 @@ import com.miniagent.config.repository.TenantDailyUsageRepository;
 import com.miniagent.config.repository.TenantRepository;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import jakarta.annotation.PostConstruct;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.beans.factory.annotation.Value;
 
 import java.time.LocalDate;
 import java.time.ZoneId;
 
 @Service
 public class DbTenantTokenQuota implements TenantTokenQuota {
-    private final TenantRepository tenants;
-    private final TenantDailyUsageRepository usage;
-    private final Counter denied;
-    private final Counter consumed;
-    private final ZoneId quotaZone;
 
-    public DbTenantTokenQuota(TenantRepository tenants, TenantDailyUsageRepository usage,
-                              MeterRegistry meters,
-                              @Value("${agent.quota.zone-id:Asia/Shanghai}") String quotaZone) {
-        this.tenants = tenants;
-        this.usage = usage;
+    @Autowired
+    private TenantRepository tenants;
+    @Autowired
+    private TenantDailyUsageRepository usage;
+    @Autowired
+    private MeterRegistry meters;
+
+    @Value("${agent.quota.zone-id:Asia/Shanghai}")
+    private String quotaZoneId;
+
+    private Counter denied;
+    private Counter consumed;
+    private ZoneId quotaZone;
+
+    @PostConstruct
+    void init() {
         this.denied = meters.counter("miniagent.quota.denied", "kind", "tenant_daily_tokens");
         this.consumed = meters.counter("miniagent.quota.tokens", "kind", "tenant_daily_tokens");
-        this.quotaZone = ZoneId.of(quotaZone);
+        this.quotaZone = ZoneId.of(quotaZoneId);
     }
 
     @Override

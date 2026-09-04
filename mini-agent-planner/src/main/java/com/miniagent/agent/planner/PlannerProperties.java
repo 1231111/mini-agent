@@ -44,6 +44,8 @@ public class PlannerProperties {
     private int maxReplaceTool = 2;
     private int maxRewriteGraph = 2;
     private int maxReviseGoal = 1;
+    /** 验证失败后 replan 重试次数 */
+    private int maxReplanRetries = 2;
 
     public boolean isEnabled() { return enabled; }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -104,4 +106,7 @@ public class PlannerProperties {
 
     public int getMaxReviseGoal() { return maxReviseGoal; }
     public void setMaxReviseGoal(int maxReviseGoal) { this.maxReviseGoal = maxReviseGoal; }
+
+    public int getMaxReplanRetries() { return maxReplanRetries; }
+    public void setMaxReplanRetries(int maxReplanRetries) { this.maxReplanRetries = maxReplanRetries; }
 }
