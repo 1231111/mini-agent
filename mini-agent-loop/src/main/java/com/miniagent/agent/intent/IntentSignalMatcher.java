@@ -94,7 +94,15 @@ public class IntentSignalMatcher {
 
     public boolean needsWeb(String text) { return any(web, text); }
     public boolean needsFiles(String text) { return any(file, text); }
-    public boolean imageIntoDoc(String text) { return any(imageIntoDoc, text); }
+
+    /**
+     * 「图写入文档」必须真有配图词。旧 MySQL rule_set 里
+     * {@code 写入.{0,40}.md} 会把「写入 news.md」打成 image-into-doc。
+     */
+    public boolean imageIntoDoc(String text) {
+        return any(imageIntoDoc, text) && hasPictureToken(text);
+    }
+
     public boolean pureImage(String text) { return any(pureImage, text); }
     public boolean taskAction(String text) { return any(taskAction, text); }
     public boolean continueTask(String text) { return any(continueSig, text); }
@@ -110,6 +118,111 @@ public class IntentSignalMatcher {
             return true;
         }
         return false;
+    }
+
+    /**
+     * 架构图/mermaid 必须走文件交付，不能被文生图短路。
+     * 不进可热更规则：旧 rule_set 往往不含这些词。
+     */
+    public boolean deliverableDiagram(String text) {
+        if (StringUtils.isBlank(text)) {
+            return false;
+        }
+        String t = text.toLowerCase();
+        return t.contains("架构图") || t.contains("流程图") || t.contains("时序图")
+                || t.contains("结构图") || t.contains("mermaid") || t.contains(".mmd")
+                || t.contains("render_diagram") || t.contains("出设计图")
+                || t.contains("architecture.png") || t.contains("architecture.mmd");
+    }
+
+    /** 真发布/上线；「生成并发布 Excel」不算。 */
+    public boolean looksLikePublish(String text) {
+        if (StringUtils.isBlank(text)) {
+            return false;
+        }
+        String t = text.toLowerCase();
+        if (t.contains("上线") || t.contains("部署到") || t.contains("发布到")
+                || t.contains("发布上线") || t.contains("生产环境")
+                || t.contains("push to prod") || t.contains("drop table")) {
+            return true;
+        }
+        if (!t.contains("发布")) {
+            return false;
+        }
+        return !t.contains("xlsx") && !t.contains("docx") && !t.contains("pptx")
+                && !t.contains("write_xlsx") && !t.contains("write_docx")
+                && !t.contains("excel") && !t.contains("word")
+                && !t.contains("成绩表") && !t.contains("生成");
+    }
+
+    /**
+     * 单文件、短指令写盘（一行文本 / 单个源码），不走规划器与 todo 闸门。
+     */
+    public boolean simpleFileDelivery(String text) {
+        if (StringUtils.isBlank(text)) {
+            return false;
+        }
+        String t = text.trim();
+        if (t.length() > 280 || complex(t) || needsWeb(t) || deliverableDiagram(t)) {
+            return false;
+        }
+        if (!needsFiles(t) && !taskAction(t)) {
+            return false;
+        }
+        if (t.matches("(?s).*(两个|2\\s*个|两份|分别|各自|multiple|flask|requirements).*")) {
+            return false;
+        }
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\\.(txt|md|java|py|json|xml|yaml|yml|html|css|js|tsx?|go|rs|properties|xlsx|docx|pptx)\\b",
+                Pattern.CASE_INSENSITIVE).matcher(t);
+        int extHits = 0;
+        while (m.find()) {
+            extHits++;
+        }
+        return extHits <= 1;
+    }
+
+    /**
+     * 纯内存即可完成的短任务：算术、排序、格式化输出，不写文件不联网。
+     */
+    public boolean inMemoryTask(String text) {
+        if (factualQuestion(text)) {
+            return true;
+        }
+        if (StringUtils.isBlank(text)) {
+            return false;
+        }
+        String t = text.trim();
+        if (t.length() > props.getRules().getQuestionMaxLen()) {
+            return false;
+        }
+        if (needsFiles(t) || needsWeb(t) || deliverableDiagram(t) || taskAction(t)) {
+            return false;
+        }
+        return t.contains("排列") || t.contains("排序") || t.contains("按字母");
+    }
+
+    /**
+     * 短问答/算术，不写文件不联网。问候走 {@link #questionIntent}。
+     */
+    public boolean factualQuestion(String text) {
+        if (questionIntent(text)) {
+            return true;
+        }
+        if (StringUtils.isBlank(text)) {
+            return false;
+        }
+        String t = text.trim();
+        if (t.length() > props.getRules().getQuestionMaxLen()) {
+            return false;
+        }
+        if (taskAction(t) || needsFiles(t) || needsWeb(t) || pureImage(t)
+                || deliverableDiagram(t)) {
+            return false;
+        }
+        return t.contains("？") || t.contains("?")
+                || t.contains("等于") || t.contains("多少")
+                || t.contains("什么是") || t.contains("为什么");
     }
 
     public boolean questionIntent(String text) {
@@ -148,6 +261,17 @@ public class IntentSignalMatcher {
             }
         }
         return false;
+    }
+
+    static boolean hasPictureToken(String text) {
+        if (StringUtils.isBlank(text)) {
+            return false;
+        }
+        String t = text.toLowerCase();
+        return t.contains("图片") || t.contains("海报") || t.contains("插画")
+                || t.contains("壁纸") || t.contains("封面") || t.contains("配图")
+                || t.contains("文生图") || t.contains("txt2img") || t.contains("img2img")
+                || t.contains("photograph") || t.contains("illustration");
     }
 
     private static List<Pattern> compileAll(List<String> raw) {

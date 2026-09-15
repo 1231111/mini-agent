@@ -16,6 +16,8 @@ import org.springframework.web.context.request.async.AsyncRequestTimeoutExceptio
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import java.io.IOException;
+
 /**
  * 全统异常处理器：所有异常统一转换为 {@link ApiResponse} 格式返回。
  * <p>
@@ -97,6 +99,19 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(AsyncRequestTimeoutException.class)
     public void handleAsyncTimeout(AsyncRequestTimeoutException e, HttpServletRequest request) {
         log.warn("SSE 连接超时: {} {}", request.getMethod(), request.getRequestURI());
+    }
+
+    // ==================== SSE 连接中断（客户端断开，非服务端错误）====================
+
+    @ExceptionHandler(IOException.class)
+    public void handleIoException(IOException e, HttpServletRequest request) {
+        // SSE 心跳或推送时客户端已断开，属于正常行为，不打 ERROR 日志
+        String uri = request.getRequestURI();
+        if (uri != null && uri.contains("/trace")) {
+            log.debug("SSE 连接已断开: {} {}", request.getMethod(), uri);
+        } else {
+            log.warn("IO 异常: {} {} - {}", request.getMethod(), uri, e.getMessage());
+        }
     }
 
     // ==================== 兜底 ====================

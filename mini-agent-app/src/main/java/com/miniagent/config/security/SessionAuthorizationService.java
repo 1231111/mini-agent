@@ -1,5 +1,6 @@
 package com.miniagent.config.security;
 
+import com.miniagent.config.repository.AgentTaskRunRepository;
 import com.miniagent.config.repository.ChatConversationRepository;
 import com.miniagent.config.repository.ChatTaskRepository;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -14,13 +15,18 @@ public class SessionAuthorizationService {
     private ChatConversationRepository conversations;
     @Autowired
     private ChatTaskRepository tasks;
+    @Autowired
+    private AgentTaskRunRepository runs;
 
     public boolean owns(Long userId, String sessionId) {
         if (userId == null || sessionId == null || sessionId.isBlank()) {
             return false;
         }
-        return conversations.existsByIdAndUserId(sessionId, userId)
-                || tasks.existsByUserIdAndSessionIdAndDeletedFalse(userId, sessionId);
+        // 会话行与 ChatTask 都要等本轮跑完才写，任务执行期间只有 AgentTaskRun 能证明归属；
+        // 少了这一条，运行中的 /api/traces 一律返回空，轨迹页要等任务结束才有内容。
+        return conversations.existsByIdAndUserIdAndDeletedFalse(sessionId, userId)
+                || tasks.existsByUserIdAndSessionIdAndDeletedFalse(userId, sessionId)
+                || runs.existsByUserIdAndSessionId(userId, sessionId);
     }
 
     public void requireOwner(Long userId, String sessionId) {

@@ -31,30 +31,98 @@ public class GoalCompiler {
     static final String ARTIFACT_NOTES = "notes_md";
     static final String SOURCE_FILE = "_source.md";
     static final String NOTES_FILE = "notes.md";
+    static final String DIAGRAM_MMD = "architecture.mmd";
+    static final String DIAGRAM_PNG = "architecture.png";
+
+    /**
+     * 告诉模型的 capability 词表。必须与 ToolCapabilityIndex 的 key 保持一致，
+     * 否则编译出的节点会在硬闸门下拿不到工具面。由 ToolCapabilityIndex.selfCheck 校验。
+     */
+    static final List<String> CAPABILITIES = List.of(
+            "file_write", "web", "code", "image", "browser", "shell",
+            "research", "deliver", "plan", "general");
 
     private static final String COMPILER_SYSTEM = """
             你是任务图编译器。把用户目标编译成可执行、可验收、无环的 DAG。
             只输出 JSON。不执行任务，不编造工具，不预写失败重试路径。
+
+            【核心规则：用户意图优先级】
+            用户意图的判断依据（按优先级从高到低）：
+            1. 用户的文字描述 > 附件内容（绝对优先）
+            2. 如果用户只上传了文件，没有文字描述 → 任务类型由文件内容决定
+            3. 如果用户上传了文件，同时有文字描述 → 以文字描述为准，文件只是源内容输入
+
+            适用范围：不管产出物是什么类型（图片、视频、语音、文档、代码、...），
+            只要用户有文字描述，就必须以文字描述为依据拆解任务！
+
+            文字描述中的关键词提取：
+            - 动词决定任务类型：生成/创建/写/分析/搜索/转换/美化/...
+            - 名词决定产出物：图片/图表/视频/语音/文档/代码/报告/...
+            - 形容词决定标准：美观/详细/简洁/专业/...
+
+            常见错误：
+            - 看到附件就进入"分析文档"模式，忽略用户文字描述
+            - 看到图片附件就认为是"图片识别"任务，忽略用户要的是"生成图片"
+            - 看到视频附件就认为是"视频分析"任务，忽略用户要的是"生成视频"
+            附件只是源内容，不是任务类型定义！
+
+            【第一步：识别任务类型】
+            根据用户文字描述（优先）或文件内容（仅无文字时），判断用户要的最终产出物：
+            - 图片生成：用户要生成/创建/美化图片（架构图、流程图、海报、设计图等）
+            - 视频生成：用户要生成/编辑/转换视频
+            - 语音生成：用户要生成/转换语音
+            - 文档生成：用户要写文档、报告、方案
+            - 代码生成：用户要写代码、脚本、程序
+            - 数据分析：用户要分析数据、统计、可视化
+            - 信息检索：用户要搜索、查找、了解信息
+            - 文件操作：用户要读写、修改、整理文件
+            - 问答对话：用户要解释、说明、回答问题
+
+            【第二步：按类型选择拆解策略】
+            图表生成类任务的正确流程：
+            1. 读取源内容（文档/数据/需求）
+            2. 提取关键信息（结构、模块、流程）
+            3. 生成图表代码（SVG/Mermaid/HTML）
+            4. 验证图表内容
+            注意：不要把图表生成拆成"分析报告"！
+
+            文档/报告类任务的流程：
+            1. 读取源内容
+            2. 提取关键信息
+            3. 分析/评估
+            4. 生成文档
+            5. 整合输出
+
+            【第三步：输出 JSON】
             {
-              "objective":"...",
-              "constraints":["..."],
-              "successCriteria":["..."],
-              "entities":{"k":"v"},
-              "nodes":[
-                {"id":"n1","name":"...","capability":"...",
-                 "dependsOn":[],"inputs":[],"outputs":[],"priority":50,
-                 "doneWhen":{"type":"note_required","path":"","criteria":""},
-                 "toolHint":""}
+              "taskType": "图表生成/文档生成/代码生成/...",
+              "objective": "...",
+              "constraints": ["..."],
+              "successCriteria": ["..."],
+              "entities": {"k": "v"},
+              "nodes": [
+                {"id": "n1", "name": "...", "capability": "...",
+                 "dependsOn": [], "inputs": [], "outputs": [], "priority": 50,
+                 "doneWhen": {"type": "note_required", "path": "", "criteria": ""},
+                 "toolHint": ""}
               ]
             }
+
             capability 取值：file_write / web / code / image / browser / shell /
             research / deliver / plan / general。
+            写代码/改代码用 code；写文档、报告落盘用 file_write；
+            架构图/流程图用 image：先 write_file 写 .mmd，再 render_diagram 产出 .png，
+            不要只交 Mermaid 源码；最终交付物用 deliver；跑命令、编译、测试用 shell。
+            涉及网页的任务按用户真实动作拆：要整篇正文（飞书/wiki 等长文）就用 browser_extract_text
+            一次抽全再落盘；要点击、填表、读取局部字段，就拆成 navigate → snapshot → click/type
+            这类交互步骤，不要一律套「抽正文写文档」。
             doneWhen.type 仅：note_required / file_exists / media_delivered / llm_judge /
             command_success / validation_passed。
             file_exists 填 path，可加 criteria 做内容验收。
             llm_judge、validation_passed 可填 criteria。
             command_success 要求 evidence 含 exit_code=0。
-            规则：
+
+            【规则】
             有独立验收的步骤必须拆开。不要为凑数拆节点。
             复杂任务通常 ≥3 个有独立价值的节点；凑不出就不要拆。
             问答/单步可 1 节点。依赖无环；id 唯一。
@@ -63,7 +131,12 @@ public class GoalCompiler {
             dependsOn 只表示执行前置；无依赖的节点可并行。
             后续节点的 inputs 必须引用前置节点的 outputs。
             不要制造无意义的 input/output。
-            每节点必须有 doneWhen，按本步如何证明完成来选，不要默认落盘。
+            每节点必须有 doneWhen，按本步如何证明完成来选。
+            凡是产出文件的节点（代码、文档、报告、图表、数据），doneWhen 必须用
+            file_exists 并填具体 path，outputs 不能为空；只有产出结论/信息、
+            本身不落盘的节点才允许 note_required。
+            path 必须是 workspace 相对文件名（如 news.json），禁止 /tmp 或盘符绝对路径。
+            note_required 只靠一段文字就算通过，用错会让"什么都没交付"被判成功。
             capability 是能力类别，不决定具体工具；执行阶段按能力与上下文路由。
             toolHint 只是路由候选，不是强制。不确定就留空。填写必须是已注册工具名。
             priority 为 0~100 的整数，越大越优先，只影响同批 READY 调度。
@@ -135,10 +208,12 @@ public class GoalCompiler {
 
     public CompileResult compile(ChatModel chat, String userMessage, TaskPlan plan) {
         Goal base = goalFromPlan(userMessage, plan);
-        if (looksLikeFetchWrite(userMessage, plan)) {
-            log.info("GoalCompiler 使用读链写文件模板 nodes=3");
-            return new CompileResult(base, markPending(fetchWriteTemplate()), true);
+        if (looksLikeDiagram(userMessage, plan)) {
+            log.info("GoalCompiler 使用出图模板 nodes=2");
+            return new CompileResult(base, markPending(diagramTemplate()), true);
         }
+        // 抓网页写文档模板不再抢在 LLM 前面：带链接又提到 .md 时，用户可能是填表/抽字段。
+        // 该模板只留在 fallback 的 templateGraph 里。
         if (plan == null || !plan.requiresStructuredPlan()) {
             return fallback(base, userMessage, plan);
         }
@@ -245,21 +320,25 @@ public class GoalCompiler {
         TaskGraph graph = parseGraph(text);
         Goal seed = base == null
                 ? new Goal("goal_" + UUID.randomUUID().toString().substring(0, 8), "", "UNKNOWN",
-                Map.of(), List.of(), List.of())
+                null, Map.of(), List.of(), List.of())
                 : base;
         String objective = textOr(root, "objective", seed.objective());
         String intent = textOr(root, "intent", seed.intent());
+        String taskType = textOr(root, "taskType", seed.taskType());
         Map<String, String> entities = stringMap(root.get("entities"), seed.entities());
         List<String> constraints = stringList(root, "constraints");
         if (constraints.isEmpty()) constraints = seed.constraints();
         List<String> criteria = stringList(root, "successCriteria");
         if (criteria.isEmpty()) criteria = stringList(root, "success_criteria");
         if (criteria.isEmpty()) criteria = seed.successCriteria();
-        Goal goal = new Goal(seed.goalId(), objective, intent, entities, constraints, criteria);
+        Goal goal = new Goal(seed.goalId(), objective, intent, taskType, entities, constraints, criteria);
         return new ParsedCompilation(goal, graph);
     }
 
     TaskGraph templateGraph(String userMessage, TaskPlan plan) {
+        if (looksLikeDiagram(userMessage, plan)) {
+            return diagramTemplate();
+        }
         if (looksLikeFetchWrite(userMessage, plan))
             return fetchWriteTemplate();
         List<TaskNode> nodes = new ArrayList<>();
@@ -294,6 +373,30 @@ public class GoalCompiler {
         return new TaskGraph(nodes);
     }
 
+    static TaskGraph diagramTemplate() {
+        return new TaskGraph(List.of(
+                new TaskNode("n1",
+                        "把架构写成 Mermaid 写入 " + DIAGRAM_MMD,
+                        "image", List.of(), List.of(), List.of("diagram_mmd"),
+                        TaskNodeStatus.PENDING, 10,
+                        DoneWhen.file(DIAGRAM_MMD), "write_file", "", 0, ""),
+                new TaskNode("n2",
+                        "调用 render_diagram 把 " + DIAGRAM_MMD + " 渲染成 " + DIAGRAM_PNG,
+                        "image", List.of("n1"), List.of("diagram_mmd"), List.of("diagram_png"),
+                        TaskNodeStatus.PENDING, 9,
+                        DoneWhen.file(DIAGRAM_PNG), "render_diagram", "", 0, "")));
+    }
+
+    static boolean looksLikeDiagram(String userMessage, TaskPlan plan) {
+        String t = ((userMessage == null ? "" : userMessage) + " "
+                + (plan == null || plan.taskGoal() == null ? "" : plan.taskGoal()))
+                .toLowerCase();
+        return t.contains("架构图") || t.contains("流程图") || t.contains("时序图")
+                || t.contains("结构图") || t.contains("mermaid") || t.contains(".mmd")
+                || t.contains("render_diagram") || t.contains("出设计图")
+                || t.contains("architecture.png") || t.contains("architecture.mmd");
+    }
+
     static TaskGraph fetchWriteTemplate() {
         return new TaskGraph(List.of(
                 new TaskNode("n1",
@@ -318,7 +421,10 @@ public class GoalCompiler {
         String t = ((userMessage == null ? "" : userMessage) + " "
                 + (plan == null || plan.taskGoal() == null ? "" : plan.taskGoal()))
                 .toLowerCase();
-        boolean fetch = t.contains("http") || t.contains("feishu") || t.contains("wiki")
+        // 必须是真链接：裸 "http" 会把 http.server / http_get 这类词误判成抓网页，
+        // 而本方法命中就会在 LLM 编译之前强制套用 3 节点浏览器模板。
+        boolean fetch = t.contains("http://") || t.contains("https://")
+                || t.contains("feishu") || t.contains("wiki")
                 || t.contains("飞书") || t.contains("网页");
         boolean write = t.contains(".md") || t.contains("写入") || t.contains("markdown")
                 || t.contains("写文件") || t.contains("学习资料")

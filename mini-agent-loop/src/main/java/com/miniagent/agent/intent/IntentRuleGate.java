@@ -44,13 +44,24 @@ public class IntentRuleGate {
         if ((rules.isForceFullOnWebAndFile() && web && files)
                 || (rules.isForceFullOnImageIntoDoc() && intoDoc)) {
             String reason = web && files ? "rule:web+file" : "rule:image-into-doc";
-            return full(t, reason, true);
+            IntentType intent = signals.deliverableDiagram(t)
+                    ? IntentType.FILE_DELIVERY : IntentType.NEW_TASK;
+            return typed(intent, t, reason, true);
         }
 
-        if (signals.questionIntent(t)) {
+        if (signals.questionIntent(t) || signals.inMemoryTask(t)) {
             return new TaskPlan(IntentType.QUESTION, t, true, false, true,
                     copyTools(props.getToolProfiles().getQuestion()), List.of(),
-                    "rule:question", false);
+                    signals.questionIntent(t) ? "rule:question" : "rule:in-memory",
+                    false);
+        }
+
+        if (signals.simpleFileDelivery(t)) {
+            return typed(IntentType.FILE_DELIVERY, t, "rule:simple-file", false);
+        }
+
+        if (signals.deliverableDiagram(t)) {
+            return typed(IntentType.FILE_DELIVERY, t, "rule:diagram-file", true);
         }
 
         boolean pureImage = signals.pureImage(t);
@@ -66,9 +77,16 @@ public class IntentRuleGate {
     }
 
     TaskPlan full(String goal, String reason, boolean structured) {
-        // full=null → 注册表全量（含 MCP）；不写死工具名列表
+        return typed(IntentType.NEW_TASK, goal, reason, structured);
+    }
+
+    TaskPlan fileDelivery(String goal, String reason, boolean structured) {
+        return typed(IntentType.FILE_DELIVERY, goal, reason, structured);
+    }
+
+    private TaskPlan typed(IntentType intent, String goal, String reason, boolean structured) {
         List<String> tools = props.getToolProfiles().getFull();
-        return new TaskPlan(IntentType.NEW_TASK, goal, true, true, true,
+        return new TaskPlan(intent, goal, true, true, true,
                 Objects.isNull(tools) || tools.isEmpty() ? null : List.copyOf(tools),
                 List.of(), reason, structured);
     }

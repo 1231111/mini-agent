@@ -61,8 +61,10 @@ public class IntentPlanner {
         noteSkip("L0", "规则未命中，继续下层");
 
         if (classifier != null && classifier.isEnabled()) {
+            // 运行信号匹配，将结果注入 L1 分类器上下文，消除与 L2 的关键词不一致
+            String signalContext = buildSignalContext(text);
             LlmIntentClassifier.Classification c =
-                    classifier.classify(text, hasImage, recentHistory, chatModel);
+                    classifier.classify(text, hasImage, recentHistory, chatModel, signalContext);
             if (c != null && c.confidence() >= Math.max(minConfidence,
                     clamp(props.getRejectConfidence()))) {
                 return finish("L1", text, fromClassification(text, hasImage, c, minConfidence), c, t0);
@@ -98,13 +100,23 @@ public class IntentPlanner {
         TaskPlan enriched = plan == null ? null : plan.withDecision(decision);
         if (enriched != null && decision.needClarification()
                 && enriched.intent() != IntentType.QUESTION
-                && enriched.intent() != IntentType.REVIEW) {
+                && enriched.intent() != IntentType.REVIEW
+                && !clarificationKeepsFullTools(enriched.intent())) {
             String why = clarificationReason(decision);
             decision = decision.withClarification(true, why);
+            // 如果原始意图是 NEW_TASK 或 CONTINUE_TASK，保留 FULL 工具（null=全量），
+            // 而不是限制为 question 专用工具（仅 skill_list/skill_view/memory）。
+            // 这样即使进入澄清模式，agent 仍然可以执行文件操作等任务。
+            List<String> clarificationTools;
+            if (clarificationKeepsFullTools(enriched.intent())) {
+                clarificationTools = enriched.allowedTools(); // null = all tools
+            } else {
+                clarificationTools = copy(props.getToolProfiles().getQuestion());
+            }
             enriched = new TaskPlan(IntentType.QUESTION,
                     "请澄清：" + (enriched.taskGoal().isBlank() ? userText : enriched.taskGoal()),
                     true, true, false,
-                    copy(props.getToolProfiles().getQuestion()), List.of(), why, false)
+                    clarificationTools, List.of(), why, false)
                     .withDecision(decision);
         }
         plan = enriched;
@@ -211,13 +223,35 @@ public class IntentPlanner {
         boolean needsWeb = c.needsWeb() || signals.needsWeb(text);
         boolean needsFiles = c.needsFiles() || signals.needsFiles(text);
         boolean needsImage = c.needsImageGen();
+        boolean diagram = signals.deliverableDiagram(text);
+
+        if (intent == IntentType.PUBLISHING && !signals.looksLikePublish(text)) {
+            intent = needsFiles || diagram ? IntentType.FILE_DELIVERY : IntentType.NEW_TASK;
+        }
+        if (intent == IntentType.NEW_TASK && signals.inMemoryTask(text)) {
+            intent = IntentType.QUESTION;
+            profile = "QUESTION";
+        }
+
+        if (diagram) {
+            profile = "FULL";
+            needsFiles = true;
+            if (intent != IntentType.CONTINUE_TASK) {
+                intent = IntentType.FILE_DELIVERY;
+            }
+        }
+        if (intent == IntentType.FILE_DELIVERY || intent == IntentType.RESEARCH
+                || intent == IntentType.PUBLISHING
+                || intent == IntentType.MULTIMODAL_ANALYSIS) {
+            profile = "FULL";
+        }
 
         if ("IMAGE".equals(profile)) {
             if (needsWeb || needsFiles || c.confidence() < minConfidence
                     || signals.imageIntoDoc(text)) {
                 profile = "FULL";
                 if (intent == IntentType.IMAGE_GENERATION) {
-                    intent = IntentType.NEW_TASK;
+                    intent = IntentType.FILE_DELIVERY;
                 }
             }
         }
@@ -227,9 +261,28 @@ public class IntentPlanner {
             profile = "FULL";
             intent = IntentType.NEW_TASK;
         }
+        // 如果 intent 是 QUESTION 但需要网络或文件，也应该提升为 NEW_TASK
+        if (intent == IntentType.QUESTION
+                && (needsWeb || needsFiles || needsImage
+                || text.length() > props.getRules().getQuestionMaxLen())) {
+            intent = needsFiles ? IntentType.FILE_DELIVERY : IntentType.NEW_TASK;
+            profile = "FULL";
+        }
+        if (intent == IntentType.NEW_TASK && needsFiles && !signals.looksLikePublish(text)
+                && !needsWeb) {
+            intent = IntentType.FILE_DELIVERY;
+        }
 
+        boolean simpleFile = signals.simpleFileDelivery(text);
+        if (simpleFile) {
+            intent = IntentType.FILE_DELIVERY;
+            profile = "FULL";
+        }
         boolean structured = c.requiresStructuredPlan()
                 || signals.complex(text)
+                || diagram
+                || (intent == IntentType.FILE_DELIVERY && !simpleFile)
+                || intent == IntentType.RESEARCH
                 || (needsImage && needsFiles)
                 || (needsWeb && needsFiles);
 
@@ -283,6 +336,9 @@ public class IntentPlanner {
         boolean files = signals.needsFiles(text);
         IntentProperties.Rules rules = props.getRules();
 
+        if (signals.deliverableDiagram(text)) {
+            return ruleGate.fileDelivery(text, "heuristic:diagram-file", true);
+        }
         if (rules.isForceFullOnImageIntoDoc() && intoDoc) {
             return ruleGate.full(text, "heuristic:image-into-doc", true);
         }
@@ -305,7 +361,10 @@ public class IntentPlanner {
                     tools == null || tools.isEmpty() ? null : List.copyOf(tools),
                     List.of(), "heuristic:continue", false);
         }
-        if (signals.questionIntent(text)) {
+        if (signals.simpleFileDelivery(text)) {
+            return ruleGate.fileDelivery(text, "heuristic:simple-file", false);
+        }
+        if (signals.questionIntent(text) || signals.inMemoryTask(text)) {
             return new TaskPlan(IntentType.QUESTION, text, true, false, true,
                     copy(props.getToolProfiles().getQuestion()), List.of(),
                     "heuristic:question", false);
@@ -319,6 +378,35 @@ public class IntentPlanner {
 
     private static double clamp(double v) {
         return Math.max(0.0, Math.min(1.0, v));
+    }
+
+    /**
+     * 构建信号匹配上下文字符串，注入 L1 分类器提示词。
+     * 复用 L2 的 {@link IntentSignalMatcher} 信号定义，消除与 L2 的关键词不一致。
+     */
+    private String buildSignalContext(String text) {
+        if (StringUtils.isBlank(text)) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("text_length=").append(text.length());
+        if (signals.needsWeb(text)) sb.append("\n  - 命中 web 信号");
+        if (signals.needsFiles(text)) sb.append("\n  - 命中 file 信号");
+        if (signals.pureImage(text)) sb.append("\n  - 命中 pureImage 信号");
+        if (signals.imageIntoDoc(text)) sb.append("\n  - 命中 imageIntoDoc 信号");
+        if (signals.continueTask(text)) sb.append("\n  - 命中 continue 信号");
+        if (signals.taskAction(text)) sb.append("\n  - 命中 taskAction 信号");
+        if (signals.complex(text)) sb.append("\n  - 命中 complex 信号");
+        if (signals.questionIntent(text)) sb.append("\n  - 命中 question 信号");
+        return sb.toString();
+    }
+
+    /**
+     * 判断指定意图在澄清模式下是否应保留完整工具集。
+     * 直接读取 {@link IntentType#requiresFullTools()} 枚举属性，零配置。
+     */
+    private boolean clarificationKeepsFullTools(IntentType intent) {
+        return intent != null && intent.requiresFullTools();
     }
 
     /** 暴露给测试 */

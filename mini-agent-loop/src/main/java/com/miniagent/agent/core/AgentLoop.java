@@ -26,6 +26,7 @@ import com.miniagent.agent.permission.PermissionPolicy;
 import com.miniagent.agent.permission.SessionPermissionStore;
 import com.miniagent.agent.todo.HumanYield;
 import com.miniagent.agent.todo.TaskTodoStore;
+import com.miniagent.agent.tool.ToolConcurrencyPolicy;
 import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.agent.tool.ToolDescriptor;
 import com.miniagent.agent.tool.ToolErrorCode;
@@ -122,7 +123,8 @@ public class AgentLoop {
     public static final String OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN";
     public static final String CANCELLED = "CANCELLED";
     public static final String DEADLINE_EXCEEDED = "DEADLINE_EXCEEDED";
-    public static final String RESOURCE_QUOTA_EXCEEDED = "RESOURCE_QUOTA_EXCEEDED";
+    public static final String RESOURCE_QUOTA_EXCEEDED = "RESOURCE_EXCEEDED";
+    public static final String STEP_SEGMENT_DONE = "本步已完成。";
     private static final int FAIL_REPEAT_ABORT = 3;
 
     public record LoopOutcome(String text, String endReason, List<ChatMessage> messages) {}
@@ -483,6 +485,8 @@ public class AgentLoop {
         boolean fileReminderSent = false; // 是否已注入过一次性文件落盘提醒
         final Map<String, String> toolResultCache = new HashMap<>();
         final Map<String, Integer> failDupCounter = new HashMap<>();
+        /** 硬闸门拒绝次数，按工具名计：闸门拒的是工具本身，换参数重试永远过不去 */
+        final Map<String, Integer> gateDenyCounter = new java.util.concurrent.ConcurrentHashMap<>();
         int explorationCount = 0;
         int consecutiveFailures = 0;  // 连续同类工具失败计数
         String lastFailedTool = null; // 上次失败的工具名
@@ -508,11 +512,16 @@ public class AgentLoop {
         volatile boolean unknownOutcome = false;
         volatile String unknownOutcomeMessage = "";
 
-        void noteStructuredResult(ToolResult result) {
-            if (result != null && result.status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN) {
-                unknownOutcome = true;
-                unknownOutcomeMessage = Objects.requireNonNullElse(result.message(), "");
+        void noteStructuredResult(String toolName, ToolResult result) {
+            if (result == null || result.status() != com.miniagent.agent.tool.ToolStatus.UNKNOWN) {
+                return;
             }
+            // 页面操作超时后可以 snapshot 核验，不必把整条任务打死
+            if (ToolConcurrencyPolicy.isOutcomeVerifiable(toolName)) {
+                return;
+            }
+            unknownOutcome = true;
+            unknownOutcomeMessage = Objects.requireNonNullElse(result.message(), "");
         }
 
         void noteToolFinished(String name, String args, String result) {
@@ -523,16 +532,39 @@ public class AgentLoop {
                 failDupCounter.remove(key);
         }
 
+        void noteGateDenied(String name) {
+            if (name != null) {
+                gateDenyCounter.merge(name, 1, Integer::sum);
+            }
+        }
+
+        boolean gateBlocked(String name) {
+            return gateDenyCounter.getOrDefault(name, 0) >= FAIL_REPEAT_ABORT;
+        }
+
         boolean allFailedRepeated(List<?> toolCalls) {
             if (toolCalls == null || toolCalls.isEmpty()) {
                 return false;
             }
             for (var tc : toolCalls) {
-                String key = toolNameOf(tc) + "|" + argumentsOf(tc);
+                String name = toolNameOf(tc);
+                // 被闸门反复拒掉的工具：参数换了也是拒，不能让参数变化把 failDupCounter 清零
+                if (gateBlocked(name)) {
+                    continue;
+                }
+                String key = name + "|" + argumentsOf(tc);
                 if (failDupCounter.getOrDefault(key, 0) < FAIL_REPEAT_ABORT)
                     return false;
             }
             return true;
+        }
+
+        /** 被闸门锁死的工具名，用于终止时说清是哪一步的工具面不够。 */
+        List<String> blockedTools() {
+            return gateDenyCounter.entrySet().stream()
+                    .filter(e -> e.getValue() >= FAIL_REPEAT_ABORT)
+                    .map(Map.Entry::getKey)
+                    .toList();
         }
     }
 
@@ -839,13 +871,18 @@ public class AgentLoop {
                         && taskTodoStore.hasIncomplete(sessionId)) {
                     log.info("提案 focus todo 已完成，结束本段");
                     state.loopEndReason = RunStatus.SUCCESS.name();
-                    return finish("本步已完成。", state, messages);
+                    return finish(STEP_SEGMENT_DONE, state, messages);
                 }
                 if (state.allFailedRepeated(toolCalls)) {
-                    log.warn("死循环检测：失败工具重复 >= {} 次，终止", FAIL_REPEAT_ABORT);
+                    List<String> blocked = state.blockedTools();
+                    log.warn("死循环检测：失败工具重复 >= {} 次，终止（闸门锁死: {}）",
+                            FAIL_REPEAT_ABORT, blocked);
                     state.loopEndReason = "DUP_TOOLS";
-                    return finish("我连续多次用相同参数调用同样的工具但没拿到新结果，停止避免空转。已调用："
-                            + state.toolsInvoked, state, messages);
+                    String why = blocked.isEmpty()
+                            ? "我连续多次用相同参数调用同样的工具但没拿到新结果，停止避免空转。"
+                            : "工具 " + blocked + " 不在本步骤允许的工具面内，重试多次仍被闸门拒绝，"
+                                    + "停止避免空转；这类操作需要由具备对应能力的步骤来做。";
+                    return finish(why + "已调用：" + state.toolsInvoked, state, messages);
                 }
 
                 // tool_call 被长度截断：工具结果已入列（截断的 write_file 会回报"参数被截断"），
@@ -988,9 +1025,20 @@ public class AgentLoop {
     private List<?> buildToolSpecsForTurn(List<?> toolSpecs, boolean hasTools,
                                            boolean mediaDelivered, LoopState state, String sessionId,
                                            List<ChatMessage> messages) {
-        if (!hasTools) return List.of();  // mediaDelivered不再清空工具，让模型自己决定是否继续生成
+        if (!hasTools) {
+            return List.of();
+        }
+        if (state.lightQa) {
+            return List.of();
+        }
         var specs = toolSpecs;
 
+        if (!execEnabled) {
+            specs = specs.stream()
+                    .filter(s -> !"exec_command".equals(
+                            ((dev.langchain4j.agent.tool.ToolSpecification) s).name()))
+                    .toList();
+        }
         LoopTurnPolicy policy = LoopTurnContext.current();
         if (policy.forceToolsOnly() && !policy.allowedTools().isEmpty()) {
             specs = specs.stream()
@@ -1152,6 +1200,7 @@ public class AgentLoop {
         }
         String proposalDeny = LoopTurnContext.current().denyTool(name);
         if (proposalDeny != null) {
+            state.noteGateDenied(name);
             if (Objects.nonNull(traceRecorder)) {
                 traceRecorder.recordNode(sid, turn, "HOOK_DENY",
                         "{\"tool\":\"" + name + "\",\"reason\":\"planner_hard_gate\"}",
@@ -1199,7 +1248,7 @@ public class AgentLoop {
         String processed = toolHookChain.after(
                 new ToolHookContext(sid, name, effective, turn, sub), raw.legacyText());
         ToolResult result = Objects.equals(processed, raw.legacyText()) ? raw : ToolResult.fromLegacy(processed);
-        state.noteStructuredResult(result);
+        state.noteStructuredResult(name, result);
         return result.legacyText();
     }
 
@@ -1701,6 +1750,7 @@ public class AgentLoop {
         final boolean ctxPlanOk = PermissionContext.planApproved();
         final LoopTurnPolicy ctxTurn = LoopTurnContext.current();
         final String ctxTask = com.miniagent.agent.tool.BuiltinTools.currentTaskName();
+        final String ctxWriteTask = com.miniagent.agent.tool.WorkspaceContext.getTaskOverride();
         final int turn = state.currentTurn;
         final boolean denyProbes = shouldDropBrowserProbes(
                 consecutiveProbeTurns(messages));
@@ -1737,6 +1787,9 @@ public class AgentLoop {
                     }
                     LoopTurnContext.set(ctxTurn);
                     com.miniagent.agent.tool.BuiltinTools.restoreTaskName(ctxTask);
+                    if (ctxWriteTask != null) {
+                        com.miniagent.agent.tool.WorkspaceContext.setTaskOverride(ctxWriteTask);
+                    }
                     try {
                         String r = executeToolWithHooks(name, args, turn, denyProbes, state);
                         results.put(toolIdOf(tc) + "|" + name, Optional.ofNullable(r).orElse(""));
@@ -1746,6 +1799,7 @@ public class AgentLoop {
                         PermissionContext.clear();
                         LoopTurnContext.clear();
                         com.miniagent.agent.tool.BuiltinTools.clearCurrentTaskName();
+                        com.miniagent.agent.tool.WorkspaceContext.clearTaskOverride();
                     }
                 }
             }, VIRTUAL_EXECUTOR).orTimeout(timeout, java.util.concurrent.TimeUnit.SECONDS);
@@ -1766,8 +1820,9 @@ public class AgentLoop {
         for (var tc : toolCalls) {
             String name = toolNameOf(tc);
             String result = results.getOrDefault(toolIdOf(tc) + "|" + name,
-                    timeoutToolResult(name, 0).legacyText());
-            state.noteStructuredResult(ToolResult.fromLegacy(result));
+                    timeoutToolResult(name, toolExecutionGuards.timeoutSeconds(name))
+                            .legacyText());
+            state.noteStructuredResult(name, ToolResult.fromLegacy(result));
             String cacheKey = name + ":" + argumentsOf(tc);
             if (isCacheableTool(name) && ToolResult.fromLegacy(result).isSuccess() && !result.isEmpty()) {
                 state.toolResultCache.put(cacheKey, result);
@@ -1835,6 +1890,7 @@ public class AgentLoop {
             final boolean ctxPlanOk = PermissionContext.planApproved();
             final LoopTurnPolicy ctxTurn = LoopTurnContext.current();
             final String ctxTask = com.miniagent.agent.tool.BuiltinTools.currentTaskName();
+            final String ctxWriteTask = com.miniagent.agent.tool.WorkspaceContext.getTaskOverride();
             final boolean denyProbes = shouldDropBrowserProbes(
                     consecutiveProbeTurns(messages));
             CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
@@ -1849,6 +1905,9 @@ public class AgentLoop {
                 }
                 LoopTurnContext.set(ctxTurn);
                 com.miniagent.agent.tool.BuiltinTools.restoreTaskName(ctxTask);
+                if (ctxWriteTask != null) {
+                    com.miniagent.agent.tool.WorkspaceContext.setTaskOverride(ctxWriteTask);
+                }
                 try {
                     return executeToolWithHooks(fName, fArgs, turn, denyProbes, state);
                 } finally {
@@ -1857,6 +1916,7 @@ public class AgentLoop {
                     PermissionContext.clear();
                     LoopTurnContext.clear();
                     com.miniagent.agent.tool.BuiltinTools.clearCurrentTaskName();
+                    com.miniagent.agent.tool.WorkspaceContext.clearTaskOverride();
                 }
             }, VIRTUAL_EXECUTOR);
             try {
@@ -1865,7 +1925,7 @@ public class AgentLoop {
                 future.cancel(true);
                 log.warn("  工具 {} 执行超时（{}s），请求取消", name, timeout);
                 ToolResult timeoutResult = timeoutToolResult(name, timeout);
-                state.noteStructuredResult(timeoutResult);
+                state.noteStructuredResult(name, timeoutResult);
                 result = timeoutResult.legacyText();
             } catch (Exception e) {
                 future.cancel(true);
@@ -1905,8 +1965,13 @@ public class AgentLoop {
     private ToolResult timeoutToolResult(String name, long timeoutSeconds) {
         ToolDescriptor descriptor = toolExecutionGuards.descriptor(name);
         String message = "工具执行超时" + (timeoutSeconds > 0 ? "（" + timeoutSeconds + "s）" : "");
-        if (descriptor.sideEffect() == ToolSideEffect.READ_ONLY) {
-            return ToolResult.failure(ToolErrorCode.TIMEOUT, message, descriptor.idempotent());
+        if (descriptor.sideEffect() == ToolSideEffect.READ_ONLY
+                || descriptor.idempotent()
+                || ToolConcurrencyPolicy.isOutcomeVerifiable(name)) {
+            String extra = ToolConcurrencyPolicy.isOutcomeVerifiable(name)
+                    ? "，页面终态未知；先 browser_snapshot 核验当前页面，再决定重试还是换策略"
+                    : "，可安全重试";
+            return ToolResult.failure(ToolErrorCode.TIMEOUT, message + extra, true);
         }
         return ToolResult.unknown(message + "，调用可能已产生副作用；必须先核验", null);
     }
@@ -2065,7 +2130,7 @@ public class AgentLoop {
     private String tryReturnFinalText(AiMessage aiMessage, List<ChatMessage> messages,
                                        LoopState state, boolean explicitlyNeedsFile,
                                        int turn, int iterations, String sessionId) {
-        String finalText = aiMessage.text();
+        String finalText = sanitizeFinalAnswer(aiMessage.text());
         log.info("Agent收尾 {}/{}: 生成最终回复", turn + 1, iterations);
 
         StopDecision stop = stopHookChain.evaluate(new StopContext(
@@ -2266,6 +2331,17 @@ public class AgentLoop {
     }
 
     // ==================== 工具方法 ====================
+
+    /** 去掉模型偶发泄漏的工具标记，避免直接展示给用户。 */
+    private static String sanitizeFinalAnswer(String text) {
+        if (StringUtils.isBlank(text)) {
+            return text;
+        }
+        return text
+                .replaceAll("(?s)</?tool_call[^>]*>", "")
+                .replaceAll("(?s)<\\|tool[^|]*\\|>", "")
+                .trim();
+    }
 
     /**
      * 兜底格式转换：确保工具返回的图片结果是 markdown 格式。

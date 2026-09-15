@@ -61,7 +61,7 @@ public class ToolRegistry {
     }
 
     /**
-     * 便捷注册
+     * 便捷注册（使用Map定义参数）
      */
     public void register(String name, String description,
                          Map<String, Object> parameters,
@@ -78,6 +78,36 @@ public class ToolRegistry {
                 .concurrencyScope(ToolConcurrencyPolicy.concurrencyScopeOf(name))
                 .concurrencyKeyArgument(ToolConcurrencyPolicy.concurrencyKeyArgumentOf(name))
                 .handler(handler)
+                .build());
+    }
+
+    /**
+     * 类型安全注册：使用参数实体类定义参数
+     *
+     * @param name        工具名称
+     * @param description 工具描述
+     * @param paramsClass 参数实体类（继承自ToolParams）
+     * @param handler     执行函数，接收参数实体类，返回结果字符串
+     */
+    public <T extends ToolParams> void register(String name, String description,
+                                                 Class<T> paramsClass,
+                                                 java.util.function.Function<T, String> handler) {
+        Map<String, Object> schema = ToolParams.generateSchema(paramsClass);
+        register(Tool.builder()
+                .name(name)
+                .description(description)
+                .parameters(schema)
+                .sideEffect(ToolConcurrencyPolicy.sideEffectOf(name))
+                .idempotent(ToolConcurrencyPolicy.isIdempotent(name))
+                .streamPrefetchSafe(ToolConcurrencyPolicy.isStreamPrefetchSafe(name))
+                .timeoutSeconds(ToolConcurrencyPolicy.timeoutSecondsOf(name))
+                .maxRetries(ToolConcurrencyPolicy.maxRetriesOf(name))
+                .concurrencyScope(ToolConcurrencyPolicy.concurrencyScopeOf(name))
+                .concurrencyKeyArgument(ToolConcurrencyPolicy.concurrencyKeyArgumentOf(name))
+                .handler(json -> {
+                    T params = ToolParams.fromJson(json, paramsClass);
+                    return handler.apply(params);
+                })
                 .build());
     }
 
@@ -115,10 +145,14 @@ public class ToolRegistry {
     }
 
     /**
-     * 获取所有已注册工具的 ToolSpecification 列表（供 LangChain4j 使用）
+     * 获取所有已注册工具的 ToolSpecification 列表（供 LangChain4j 使用）。
+     *
+     * 顺序固定：内置工具在前、MCP 工具在后，各自按名称排序。
+     * 工具清单直接参与模型侧提示词前缀，顺序一旦抖动会整段击穿前缀缓存，
+     * 所以这里不能直接暴露哈希表的迭代序。
      */
     public List<ToolSpecification> getSpecifications() {
-        return new ArrayList<>(specCache.values());
+        return stableOrder(specCache.values());
     }
 
     public List<ToolSpecification> getSpecifications(Set<String> allowedToolNames) {
@@ -144,7 +178,24 @@ public class ToolRegistry {
                 result.add(spec);
             }
         }
-        return result;
+        return stableOrder(result);
+    }
+
+    /**
+     * 工具清单定序：内置在前、MCP 在后，同类按名称排序。
+     * 上层装配工具池时同样遵循「内置段 + MCP 段各自有序」的约定，这里保持一致。
+     */
+    private static List<ToolSpecification> stableOrder(Collection<ToolSpecification> specs) {
+        List<ToolSpecification> out = new ArrayList<>(specs);
+        out.sort(Comparator
+                .comparingInt((ToolSpecification s) -> isMcpSpec(s) ? 1 : 0)
+                .thenComparing(s -> Objects.toString(s.name(), ""), String.CASE_INSENSITIVE_ORDER));
+        return out;
+    }
+
+    private static boolean isMcpSpec(ToolSpecification spec) {
+        String n = spec.name();
+        return Objects.nonNull(n) && n.startsWith("mcp__");
     }
 
     /**

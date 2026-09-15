@@ -94,6 +94,29 @@ public record DoneWhen(String type, String criteria, String path) {
         return isNote() || isMedia() || isCommand() || isValidation();
     }
 
+    /**
+     * LLM 常把验收路径写成 /tmp/xxx，workspace 沙箱会拒写。
+     * 只保留文件名，落到默认写出目录。
+     */
+    public DoneWhen sandboxWritePath() {
+        if (!isFile() || StringUtils.isBlank(path)) {
+            return this;
+        }
+        String p = path.replace('\\', '/');
+        boolean tmp = p.startsWith("/tmp/") || p.startsWith("/var/tmp/")
+                || p.contains("/tmp/")
+                || p.matches("(?i)^[a-z]:/tmp/.*");
+        if (!tmp) {
+            return this;
+        }
+        int slash = p.lastIndexOf('/');
+        String name = slash >= 0 ? p.substring(slash + 1) : p;
+        if (StringUtils.isBlank(name)) {
+            return note();
+        }
+        return file(name, criteria);
+    }
+
     /** Todo / 语义校验仍吃前缀字符串。 */
     public String wire() {
         if (isFile()) {
@@ -124,7 +147,7 @@ public record DoneWhen(String type, String criteria, String path) {
             return note();
         }
         String t = text(n, "type", NOTE);
-        return new DoneWhen(t, text(n, "criteria", ""), text(n, "path", ""));
+        return new DoneWhen(t, text(n, "criteria", ""), text(n, "path", "")).sandboxWritePath();
     }
 
     public static DoneWhen parseWire(String s) {
@@ -133,7 +156,7 @@ public record DoneWhen(String type, String criteria, String path) {
         }
         String t = s.trim();
         if (t.regionMatches(true, 0, FILE + ":", 0, FILE.length() + 1))
-            return file(t.substring(FILE.length() + 1).trim());
+            return file(t.substring(FILE.length() + 1).trim()).sandboxWritePath();
         if (t.regionMatches(true, 0, JUDGE + ":", 0, JUDGE.length() + 1))
             return judge(t.substring(JUDGE.length() + 1).trim());
         if (MEDIA.equalsIgnoreCase(t)) {

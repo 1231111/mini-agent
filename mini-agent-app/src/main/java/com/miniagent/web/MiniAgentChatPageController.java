@@ -231,15 +231,9 @@ public class MiniAgentChatPageController {
         return jwtSessionService.resolveUserIdAndRefresh(request);
     }
 
-    /** Ensure session belongs to user (via conversation or prior tasks). */
+    /** Ensure session belongs to user. 判定逻辑只留 SessionAuthorizationService 一份。 */
     private boolean ownsSession(Long userId, String sessionId) {
-        if (Objects.isNull(userId) || StringUtils.isBlank(sessionId)) {
-            return false;
-        }
-        if (conversationStore.ownedBy(userId, sessionId)) {
-            return true;
-        }
-        return chatTaskRepository.existsByUserIdAndSessionIdAndDeletedFalse(userId, sessionId);
+        return sessionAuthorization.owns(userId, sessionId);
     }
 
     // ========== 执行中追加消息 ==========

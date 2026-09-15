@@ -42,11 +42,15 @@ public final class PermissionContext {
     }
 
     public static PermissionMode mode() {
-        return Optional.ofNullable(FORCE_MODE.get()).orElseGet(() ->
-                Optional.ofNullable(SESSION.get())
-                        .filter(sid -> Objects.nonNull(STORE))
-                        .map(STORE::getMode)
-                        .orElse(PermissionMode.DEFAULT));
+        PermissionMode forced = FORCE_MODE.get();
+        if (forced != null) {
+            return forced;
+        }
+        String sid = SESSION.get();
+        if (sid == null || STORE == null) {
+            return PermissionMode.DEFAULT;
+        }
+        return STORE.getMode(sid);
     }
 
     public static boolean planApproved() {
@@ -58,10 +62,11 @@ public final class PermissionContext {
     }
 
     public static ConfirmPolicy confirmPolicy() {
-        return Optional.ofNullable(SESSION.get())
-                .filter(sid -> Objects.nonNull(STORE))
-                .map(STORE::getConfirmPolicy)
-                .orElse(ConfirmPolicy.DANGEROUS);
+        String sid = SESSION.get();
+        if (sid == null || STORE == null) {
+            return ConfirmPolicy.DANGEROUS;
+        }
+        return STORE.getConfirmPolicy(sid);
     }
 
     public static boolean isForced() {

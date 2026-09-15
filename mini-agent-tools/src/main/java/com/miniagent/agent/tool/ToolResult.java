@@ -54,7 +54,9 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
             JsonNode node = JSON.readTree(rawText);
             if (node != null && node.isObject()) {
                 String status = node.path("status").asText("").toLowerCase(Locale.ROOT);
-                boolean failed = node.has("error") || (node.has("success") && !node.path("success").asBoolean(true));
+                boolean failed = (node.has("success") && !node.path("success").asBoolean(true))
+                        || (!node.has("success") && node.has("error")
+                        && !node.path("error").asText("").isBlank());
                 if ("unknown".equals(status)) {
                     return unknown(node.path("error").asText("工具结果未知"), rawText);
                 }
@@ -71,6 +73,7 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
                             : classifyLegacyFailure(message);
                     return failure(code, message, isRetriable(code));
                 }
+                return success(rawText);
             }
         } catch (Exception ignored) {
             // Plain text remains a supported legacy result.

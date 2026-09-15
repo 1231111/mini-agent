@@ -6,6 +6,7 @@ import com.miniagent.agent.core.SessionEventCenter;
 import com.miniagent.agent.intent.TaskStep;
 import com.miniagent.agent.permission.ConfirmPolicy;
 import com.miniagent.agent.permission.PermissionContext;
+import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.tool.BuiltinTools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,11 +39,11 @@ public class TaskTodoStore {
 
     public enum Status { pending, in_progress, awaiting_confirm, completed, cancelled, blocked }
 
-    /** 危险操作确认：仅匹配真实危险步，不含交付/汇总/最终 */
+    /** 危险操作确认：上线/部署，不含「生成并发布 Excel」这类写盘标题 */
     private static final java.util.regex.Pattern DANGEROUS_GOAL =
             java.util.regex.Pattern.compile(
-                    "(?i)(上线|发布|生产环境|正式提交|删除全部|drop table|rm -rf|格式化"
-                            + "|清空数据库|exec_command)");
+                    "(?i)(上线|发布到|发布上线|部署到|生产环境|正式提交|删除全部"
+                            + "|drop table|rm -rf|格式化|清空数据库|exec_command)");
     private static final int YIELD_NOTE_MAX_CHARS = 200;
 
     /**
@@ -303,7 +304,8 @@ public class TaskTodoStore {
         if (it == null) {
             return false;
         }
-        if (PermissionContext.confirmPolicy() == ConfirmPolicy.AUTO) {
+        if (PermissionContext.confirmPolicy() == ConfirmPolicy.AUTO
+                || PermissionContext.mode() == PermissionMode.ACCEPT_EDITS) {
             return false;
         }
         String c = it.content() == null ? "" : it.content();

@@ -116,14 +116,15 @@ agent:
       file-signals:
         - "(?i)\\.md\\b|markdown|md\\s*文件"
         - "(?i)写(到|入)?桌面|桌面上|文档|write_file|保存到"
+        - "(?i)架构图|流程图|时序图|结构图|mermaid|render_diagram|\\.mmd\\b"
       image-into-doc-signals:
-        - "(?i)(替换|写入|插入|写进|写到|放到|更新到|贴到).{0,40}(md|markdown|文档|\\.md)"
-        - "(?i)(md|markdown|文档|\\.md).{0,40}(替换|写入|插入)"
+        - "(?i)(图片|海报|插画|壁纸|封面|配图).{0,40}(替换|写入|插入|写进|写到|放到|贴到).{0,40}(md|markdown|文档|\\.md)"
+        - "(?i)(替换|写入|插入|写进|写到|放到|贴到).{0,40}(md|markdown|文档|\\.md).{0,40}(图片|海报|插画|配图)"
         - "(?i)替换到你生成的|要有图片|包含图片|带上?图片|配上?图"
       pure-image-signals:
         - "(?i)画一?[张幅]|画个|画一张"
         - "(?i)文生图|图生图|txt2img|img2img"
-        - "(?i)生成一?[张幅].{0,24}(图|图片|插画|海报|封面|壁纸|结构图|架构图|流程图)"
+        - "(?i)生成一?[张幅].{0,24}(海报|封面|壁纸|插画|图片)"
         - "(?i)draw\\s+(a|an|me)|generate\\s+(an?\\s+)?image|create\\s+(an?\\s+)?image"
         - "(?i)make\\s+(an?\\s+)?(image|picture|illustration)"
       question-signals:
@@ -270,6 +271,7 @@ agent:
       - FILE_DELIVERY
       - PUBLISHING
       - CONTINUE_TASK
+      - MULTIMODAL_ANALYSIS
     skip-intents:
       - QUESTION
       - REVIEW

@@ -183,12 +183,70 @@ public final class TodoSemanticValidator {
                 if (Files.exists(underTask)) {
                     return underTask;
                 }
+                String baseName = Path.of(rel).getFileName().toString();
+                Path byName = findByFileName(baseName);
+                if (Objects.nonNull(byName)) {
+                    return byName;
+                }
                 p = atRoot;
+            } else if (!Files.exists(p)) {
+                Path byName = findByFileName(p.getFileName().toString());
+                if (Objects.nonNull(byName)) {
+                    return byName;
+                }
             }
-            return p.normalize();
+            return Files.exists(p) ? p.normalize() : null;
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private static Path findByFileName(String fileName) {
+        if (StringUtils.isBlank(fileName) || fileName.contains("/") || fileName.contains("\\")) {
+            return null;
+        }
+        try {
+            Path root = BuiltinTools.effectiveWorkspaceRoot();
+            Path hit = searchFileName(root, fileName, 3);
+            if (Objects.nonNull(hit)) {
+                return hit;
+            }
+            String task = BuiltinTools.currentTaskName();
+            if (StringUtils.isNotBlank(task) && !"default".equals(task)) {
+                return searchFileName(root.resolve(task), fileName, 2);
+            }
+        } catch (Exception ignored) {
+            // fall through
+        }
+        return null;
+    }
+
+    private static Path searchFileName(Path dir, String fileName, int depth) {
+        if (depth < 0 || !Files.isDirectory(dir)) {
+            return null;
+        }
+        try (var entries = Files.list(dir)) {
+            java.util.List<Path> listed = entries.toList();
+            for (Path p : listed) {
+                if (Files.isRegularFile(p) && fileName.equals(p.getFileName().toString())) {
+                    return p;
+                }
+            }
+            if (depth > 0) {
+                for (Path sub : listed) {
+                    if (!Files.isDirectory(sub)) {
+                        continue;
+                    }
+                    Path hit = searchFileName(sub, fileName, depth - 1);
+                    if (Objects.nonNull(hit)) {
+                        return hit;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // fall through
+        }
+        return null;
     }
 
     private static String sha256(byte[] data) {

@@ -16,4 +16,7 @@ public interface AgentTaskRunRepository extends JpaRepository<AgentTaskRun, Long
     List<AgentTaskRun> findByStatus(AgentTaskRun.Status status);
 
     boolean existsBySessionIdAndStatus(String sessionId, AgentTaskRun.Status status);
+
+    /** 归属判定用：任务一 tryStart 就有行，比会话/ChatTask（跑完才写）早得多。 */
+    boolean existsByUserIdAndSessionId(Long userId, String sessionId);
 }

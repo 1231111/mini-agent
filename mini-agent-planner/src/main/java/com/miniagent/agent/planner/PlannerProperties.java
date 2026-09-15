@@ -25,7 +25,8 @@ public class PlannerProperties {
     private int plannerTimeoutSeconds = 60;
 
     private List<String> forceForIntents = new ArrayList<>(List.of(
-            "NEW_TASK", "RESEARCH", "FILE_DELIVERY", "PUBLISHING", "CONTINUE_TASK"));
+            "NEW_TASK", "RESEARCH", "FILE_DELIVERY", "PUBLISHING",
+            "CONTINUE_TASK", "MULTIMODAL_ANALYSIS"));
     private List<String> skipIntents = new ArrayList<>(List.of("QUESTION", "REVIEW"));
     private int maxRecoveries = 3;
     private int proposalBatchSize = 1;

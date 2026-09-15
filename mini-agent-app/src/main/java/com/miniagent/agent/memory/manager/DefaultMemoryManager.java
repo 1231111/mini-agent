@@ -255,9 +255,13 @@ public class DefaultMemoryManager implements MemoryManager {
             memories = reranker.rerank(ctx.getGoal(), memories, 10);
 
             // 分类注入
+            List<Long> touchedIds = new ArrayList<>();
             for (ScoredMemory sm : memories) {
                 MemoryEntry m = sm.getMemory();
-                m.touch(); // 更新访问计数
+                m.touch(); // 内存侧更新访问计数
+                if (m.getId() != null) {
+                    touchedIds.add(m.getId());
+                }
 
                 switch (m.getMemoryType()) {
                     case SEMANTIC -> context.addFact(m.getContent());
@@ -274,6 +278,10 @@ public class DefaultMemoryManager implements MemoryManager {
                     default -> context.getRawMemories().add(m);
                 }
             }
+
+            // 持久化「被召回」这一事实：遗忘策略依赖 accessCount 与 lastAccessedAt，
+            // 只改内存对象等于让这两个因子永远失效。
+            persistAccess(touchedIds);
         }
 
         // 3. 查询语义事实
@@ -300,6 +308,21 @@ public class DefaultMemoryManager implements MemoryManager {
         }
 
         return context;
+    }
+
+    /**
+     * 批量持久化访问记录。刻意不抛异常：召回已经完成，
+     * 访问统计失败不应让整轮上下文装配失败。
+     */
+    private void persistAccess(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return;
+        }
+        try {
+            entryRepository.touchAccessBatch(ids);
+        } catch (Exception e) {
+            log.debug("更新记忆访问计数失败: count={}, {}", ids.size(), e.getMessage());
+        }
     }
 
     // === 工作记忆 ===
@@ -517,6 +540,10 @@ public class DefaultMemoryManager implements MemoryManager {
         entry.setImportance(entity.getImportance() != null ? entity.getImportance() : 0.5);
         entry.setConfidence(entity.getConfidence() != null ? entity.getConfidence() : 0.5);
         entry.setAccessCount(entity.getAccessCount() != null ? entity.getAccessCount() : 0);
+        // 必须映射：RetentionForgettingPolicy 的 recency 因子读的就是这个值，
+        // 漏掉它会让 recencyDecay 永远走「从未访问」分支（恒 0.5）。
+        entry.setLastAccessedAt(entity.getLastAccessedAt() != null ?
+            entity.getLastAccessedAt().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli() : 0);
         entry.setStatus(MemoryStatus.valueOf(entity.getStatus().name()));
         entry.setCreatedAt(entity.getCreatedAt() != null ?
             entity.getCreatedAt().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli() : 0);
@@ -537,6 +564,8 @@ public class DefaultMemoryManager implements MemoryManager {
         ep.setResolution(entity.getResolution());
         ep.setImportance(entity.getImportance() != null ? entity.getImportance() : 0.5);
         ep.setAccessCount(entity.getAccessCount() != null ? entity.getAccessCount() : 0);
+        ep.setLastAccessedAt(entity.getLastAccessedAt() != null ?
+            entity.getLastAccessedAt().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli() : 0);
         ep.setCreatedAt(entity.getCreatedAt() != null ?
             entity.getCreatedAt().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli() : 0);
         return ep;

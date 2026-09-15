@@ -401,6 +401,9 @@ public class AgentChatApplicationService {
                 answer = agentLoop.run(effectiveChat, systemPrompt, userMessage, history,
                         MAX_ITERATIONS, progress, taskPlan, streamSink);
             }
+            if (planningLoop.isAwaitingConfirm(sessionId)) {
+                runStatus = RunStatus.WAITING.name();
+            }
         } finally {
             PermissionContext.clear();
             AgentLoop.clearCurrentModels();

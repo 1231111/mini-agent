@@ -1,5 +1,6 @@
 package com.miniagent.agent.planner;
 
+import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.todo.LlmJudgeTodoValidator;
 import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.agent.todo.TodoSemanticValidator;
@@ -46,8 +47,12 @@ public class StepEvaluator {
         String spec = dw.wire();
         String ev = StringUtils.isNotBlank(evidence) ? evidence.trim()
                 : (toolResult == null ? "" : toolResult.trim());
-        if (!dw.worldCheck() && (looksLikeToolError(ev) || looksLikeLoopAbort(ev)))
+        if (looksLikeFileDelivery(node) && isHollowEvidence(ev)) {
+            return reject("file delivery 节点不能用空洞 evidence 放行");
+        }
+        if (!dw.worldCheck() && (looksLikeToolError(ev) || looksLikeLoopAbort(ev))) {
             return reject("tool error: " + abbreviate(ev, 200));
+        }
 
         if (dw.isJudge()) {
             return judge(node, dw.criteria(), ev);
@@ -61,12 +66,16 @@ public class StepEvaluator {
             return checkValidation(ev);
         }
 
+        if (dw.isNote() && looksLikeFileDelivery(node)) {
+            return evaluateFile(node, ev, dw.path());
+        }
         if (dw.isNote()) {
             if (StringUtils.isBlank(ev)) {
                 return reject("缺少 evidence");
             }
-            if (properties.isStrictEval() && ev.length() < NOTE_MIN_EVIDENCE)
+            if (properties.isStrictEval() && ev.length() < NOTE_MIN_EVIDENCE) {
                 return reject("evidence 过短（<" + NOTE_MIN_EVIDENCE + "）");
+            }
             return EvalResult.pass();
         }
 
@@ -76,28 +85,62 @@ public class StepEvaluator {
             if (!r.ok()) {
                 return reject(r.error());
             }
-            if (dw.isFile() && StringUtils.isNotBlank(dw.criteria())) {
-                return judge(node, dw.criteria(),
-                        StringUtils.isNotBlank(ev) ? ev : dw.path());
-            }
             return EvalResult.pass();
         }
 
         return reject("未知 doneWhen.type: " + dw.type());
     }
 
+    private EvalResult evaluateFile(TaskNode node, String evidence, String pathHint) {
+        String path = StringUtils.isNotBlank(pathHint) ? pathHint.trim() : "";
+        String spec = DoneWhen.FILE + ":" + path;
+        TodoSemanticValidator.Result r = TodoSemanticValidator.validate(
+                node.name(), spec, evidence);
+        if (!r.ok()) {
+            return reject(r.error());
+        }
+        return EvalResult.pass();
+    }
+
+    /** 写文件/出图/交代码节点不能靠 note_required 放行。 */
+    static boolean looksLikeFileDelivery(TaskNode node) {
+        if (node == null) {
+            return false;
+        }
+        DoneWhen dw = node.doneWhen();
+        if (dw != null && (dw.isFile() || dw.isMedia())) {
+            return true;
+        }
+        if (node.outputs() != null && !node.outputs().isEmpty()) {
+            return true;
+        }
+        String cap = node.capability() == null ? "" : node.capability();
+        if (cap.equals("file_write") || cap.equals("deliver")
+                || cap.equals("image") || cap.equals("code")) {
+            return true;
+        }
+        String n = node.name() == null ? "" : node.name().toLowerCase();
+        return n.contains(".md") || n.contains(".png") || n.contains(".java")
+                || n.contains(".docx") || n.contains(".xlsx") || n.contains(".pptx")
+                || n.contains(".mmd") || n.contains(".py") || n.contains(".html")
+                || n.contains("架构图") || n.contains("流程图") || n.contains("时序图");
+    }
+
     /** todo 已 completed 时：strict 下仍对世界检查 / 命令 / 校验复验 */
     public EvalResult evaluateAfterLoop(TaskNode node, boolean todoCompleted, String evidence) {
         DoneWhen dw = node == null || node.doneWhen() == null
                 ? DoneWhen.note() : node.doneWhen();
-        if (!dw.worldCheck() && looksLikeLoopAbort(evidence))
+        if (!dw.worldCheck() && looksLikeLoopAbort(evidence)) {
             return reject("loop abort: " + abbreviate(evidence, 120));
-        if (todoCompleted && !properties.isStrictEval()) {
+        }
+        if (todoCompleted && !properties.isStrictEval() && !looksLikeFileDelivery(node)) {
             return EvalResult.pass();
         }
         if (todoCompleted && properties.isStrictEval()) {
-            if (dw.worldCheck() || dw.isJudge() || dw.isCommand() || dw.isValidation())
+            if (dw.worldCheck() || dw.isJudge() || dw.isCommand() || dw.isValidation()
+                    || looksLikeFileDelivery(node)) {
                 return evaluate(node, evidence, evidence);
+            }
             if (StringUtils.isBlank(evidence)) {
                 return reject("todo completed 但缺少 evidence");
             }
@@ -163,6 +206,16 @@ public class StepEvaluator {
         return t.contains("\"error\"") || t.startsWith("错误") || t.startsWith("未知工具")
                 || t.contains("tool execution error") || t.contains("timeout")
                 || t.contains("planner 硬闸门");
+    }
+
+    static boolean isHollowEvidence(String s) {
+        if (StringUtils.isBlank(s)) {
+            return true;
+        }
+        String t = s.trim();
+        return t.equals(AgentLoop.STEP_SEGMENT_DONE)
+                || t.equals("本步已完成")
+                || t.startsWith("已按规划图推进任务");
     }
 
     static boolean looksLikeLoopAbort(String s) {

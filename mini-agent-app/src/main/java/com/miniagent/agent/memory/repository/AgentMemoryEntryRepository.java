@@ -5,7 +5,9 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
@@ -31,9 +33,23 @@ public interface AgentMemoryEntryRepository extends JpaRepository<AgentMemoryEnt
                                                   @Param("keyword") String keyword);
 
     @Modifying
+    @Transactional
     @Query("UPDATE AgentMemoryEntryEntity e SET e.accessCount = e.accessCount + 1, " +
            "e.lastAccessedAt = CURRENT_TIMESTAMP WHERE e.id = :id")
     void touchAccess(@Param("id") Long id);
+
+    /**
+     * 批量更新访问计数与最近访问时间。
+     *
+     * <p>召回后必须调用 —— 否则 {@code accessCount} 恒为 0、{@code lastAccessedAt} 恒为空，
+     * {@code RetentionForgettingPolicy} 里的 accessFreq 与 recency 两个因子永远失效，
+     * 遗忘会退化成"只看 importance 和 confidence"。
+     */
+    @Modifying
+    @Transactional
+    @Query("UPDATE AgentMemoryEntryEntity e SET e.accessCount = COALESCE(e.accessCount, 0) + 1, " +
+           "e.lastAccessedAt = CURRENT_TIMESTAMP WHERE e.id IN :ids")
+    void touchAccessBatch(@Param("ids") Collection<Long> ids);
 
     long countByTenantIdAndStatus(String tenantId, AgentMemoryEntryEntity.Status status);
 

@@ -36,18 +36,36 @@ public class LlmIntentClassifier {
     private static final String DEFAULT_SYSTEM = """
             你是意图路由器。只输出一行 JSON，禁止 markdown，禁止其它文字。
             字段必须齐全，枚举只能用下列值（勿自造）：
-            intent: QUESTION|IMAGE_GENERATION|NEW_TASK|CONTINUE_TASK|REVIEW
+            intent: QUESTION, IMAGE_GENERATION, NEW_TASK, CONTINUE_TASK, REVIEW,
+            RESEARCH, FILE_DELIVERY, PUBLISHING, MULTIMODAL_ANALYSIS,
+            HISTORY_REFERENCE
             toolProfile: QUESTION|IMAGE|FULL
             needsWeb/needsFiles/needsImageGen/requiresStructuredPlan/shouldUseHistory: true|false
             taskGoal: 一句目标; confidence: 0到1小数; reason: 一句理由
             alternatives: 最多2个次优候选，元素为 {intent,confidence,reason}
             requiredCapabilities: 字符串数组; riskLevel: LOW|MEDIUM|HIGH
-            示例: {"intent":"NEW_TASK","taskGoal":"continue previous work","needsWeb":false,"needsFiles":true,"needsImageGen":false,"requiresStructuredPlan":false,"shouldUseHistory":true,"toolProfile":"FULL","confidence":0.8,"alternatives":[],"requiredCapabilities":["file"],"riskLevel":"MEDIUM","reason":"multi-turn"}
-            规则:
-            1. 不确定→intent=NEW_TASK,toolProfile=FULL
-            2. 仅纯生图用 IMAGE；需要网页或写文件→FULL
-            3. 继续上一轮→CONTINUE_TASK,shouldUseHistory=true,FULL
-            4. 寒暄/能力询问→QUESTION
+            示例1: {"intent":"NEW_TASK","taskGoal":"生成一个登录页面","needsWeb":false,"needsFiles":true,"needsImageGen":false,"requiresStructuredPlan":false,"shouldUseHistory":false,"toolProfile":"FULL","confidence":0.85,"alternatives":[],"requiredCapabilities":["file"],"riskLevel":"MEDIUM","reason":"new task"}
+            示例2: {"intent":"FILE_DELIVERY","taskGoal":"画出架构图并保存 png","needsWeb":false,"needsFiles":true,"needsImageGen":false,"requiresStructuredPlan":true,"shouldUseHistory":false,"toolProfile":"FULL","confidence":0.88,"alternatives":[],"requiredCapabilities":["file","image"],"riskLevel":"MEDIUM","reason":"diagram file"}
+            意图判断规则:
+            - CONTINUE_TASK: 继续/接着之前的任务，shouldUseHistory=true，toolProfile=FULL
+            - NEW_TASK: 创建/生成/修改/执行任何新任务，toolProfile=FULL
+            - RESEARCH: 搜索/调研/对比资料，needsWeb=true，toolProfile=FULL，requiresStructuredPlan=true
+            - FILE_DELIVERY: 写文件/文档/代码/表格，或架构图/流程图/mermaid 出图落盘，needsFiles=true，toolProfile=FULL，requiresStructuredPlan=true。生成 xlsx/docx/pptx 是 FILE_DELIVERY，不是 PUBLISHING
+            - PUBLISHING: 仅上线/部署/发布到生产，toolProfile=FULL。禁止把「生成 Excel/Word」判成 PUBLISHING
+            - MULTIMODAL_ANALYSIS: 结合图文分析，toolProfile=FULL
+            - HISTORY_REFERENCE: 明确引用历史话题，shouldUseHistory=true
+            - IMAGE_GENERATION: 仅海报/壁纸/插画且不写文件、不是架构图/mermaid，toolProfile=IMAGE
+            - QUESTION: 问候、能力询问，以及不调工具的算术/事实问答（如 9乘以7等于多少），toolProfile=QUESTION
+            - 架构图/流程图/时序图/结构图/mermaid → FILE_DELIVERY，禁止 IMAGE_GENERATION
+            - 「写入 xxx.md」且无图片/海报 → FILE_DELIVERY 或 RESEARCH，禁止当配图入文档
+            - 不确定时默认 NEW_TASK, toolProfile=FULL
+            信号匹配提示（由系统自动注入）:
+            - "命中 web 信号" → needsWeb=true, toolProfile=FULL
+            - "命中 file 信号" → needsFiles=true, toolProfile=FULL
+            - "命中 pureImage 信号" → 可能 IMAGE_GENERATION（但若同时命中 file 信号或架构图则为 FILE_DELIVERY）
+            - "命中 continue 信号" → 优先 CONTINUE_TASK
+            - "命中 question 信号" → 可能 QUESTION（但若同时命中 taskAction 信号则为 NEW_TASK）
+            - "命中 taskAction 信号" → 涉及执行操作，优先 NEW_TASK
             """;
 
     @Autowired
@@ -92,18 +110,24 @@ public class LlmIntentClassifier {
 
     public Classification classify(String userMessage, boolean hasImage,
                                    List<ChatMessage> recentHistory) {
-        return classify(userMessage, hasImage, recentHistory, null);
+        return classify(userMessage, hasImage, recentHistory, null, null);
     }
 
     public Classification classify(String userMessage, boolean hasImage,
                                    List<ChatMessage> recentHistory, ChatModel fallback) {
+        return classify(userMessage, hasImage, recentHistory, fallback, null);
+    }
+
+    public Classification classify(String userMessage, boolean hasImage,
+                                   List<ChatMessage> recentHistory, ChatModel fallback,
+                                   String signalContext) {
         if (!isEnabled()) {
             return null;
         }
         String system = blank(props.getClassifierSystemPrompt())
                 ? DEFAULT_SYSTEM : props.getClassifierSystemPrompt();
         UserMessage msg = UserMessage.from(
-                system + "\n\n" + buildPrompt(userMessage, hasImage, recentHistory));
+                system + "\n\n" + buildPrompt(userMessage, hasImage, recentHistory, signalContext));
 
         if (dedicatedModel != null && !isCircuitOpen()) {
             try {
@@ -179,7 +203,13 @@ public class LlmIntentClassifier {
     }
 
     String buildPrompt(String userMessage, boolean hasImage, List<ChatMessage> recentHistory) {
+        return buildPrompt(userMessage, hasImage, recentHistory, null);
+    }
+
+    String buildPrompt(String userMessage, boolean hasImage,
+                       List<ChatMessage> recentHistory, String signalContext) {
         String historyBlock = formatHistory(recentHistory);
+        String signalBlock = StringUtils.isBlank(signalContext) ? "" : signalContext;
         return """
                 【最近对话】
                 %s
@@ -189,10 +219,12 @@ public class LlmIntentClassifier {
 
                 【附加】
                 hasImage=%s
+                %s
                 """.formatted(
                 StringUtils.isBlank(historyBlock) ? "（无）" : historyBlock,
                 Optional.ofNullable(userMessage).orElse(""),
-                hasImage
+                hasImage,
+                StringUtils.isBlank(signalBlock) ? "" : "\n【信号匹配】\n" + signalBlock
         );
     }
 

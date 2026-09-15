@@ -10,6 +10,7 @@ public record Goal(
         String goalId,
         String objective,
         String intent,
+        String taskType,
         Map<String, String> entities,
         List<String> constraints,
         List<String> successCriteria
@@ -18,5 +19,11 @@ public record Goal(
         entities = entities == null ? Map.of() : Map.copyOf(entities);
         constraints = constraints == null ? List.of() : List.copyOf(constraints);
         successCriteria = successCriteria == null ? List.of() : List.copyOf(successCriteria);
+    }
+
+    /** 向后兼容：不含 taskType 的构造函数 */
+    public Goal(String goalId, String objective, String intent,
+                Map<String, String> entities, List<String> constraints, List<String> successCriteria) {
+        this(goalId, objective, intent, null, entities, constraints, successCriteria);
     }
 }

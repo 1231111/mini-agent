@@ -12,6 +12,7 @@ import com.miniagent.memory.writer.Deduplicator;
 import com.miniagent.memory.writer.EventProcessor;
 import com.miniagent.memory.writer.ImportanceEvaluator;
 import com.miniagent.memory.writer.MemoryClassifier;
+import com.miniagent.memory.writer.MemoryWriteGate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -39,6 +40,10 @@ public class DefaultEventProcessor implements EventProcessor {
     @Autowired
     private Deduplicator deduplicator;
 
+    /** 写入闸门：可选注入，缺失时退化为无闸门（保持既有行为）。 */
+    @Autowired(required = false)
+    private MemoryWriteGate writeGate;
+
     @Autowired
     private com.miniagent.memory.lifecycle.ConflictResolver conflictResolver;
 
@@ -59,20 +64,33 @@ public class DefaultEventProcessor implements EventProcessor {
 
     @Override
     public MemoryEntry process(AgentEvent event) {
-        // 1. 评估重要度
+        // 1. 分类
+        MemoryType type = classifier.classify(event);
+
+        // 2. 评估重要度
         double importance = importanceEvaluator.evaluate(event);
+
+        // 3. 构建候选记忆（闸门要读到 content 才能裁决）
+        MemoryEntry entry = buildMemoryEntry(event, type, importance);
+
+        // 4. 写入闸门：先判「能不能记」，再判「值不值得记」。
+        //    顺序不可颠倒 —— 闸门是一票否决；若先按阈值放行，
+        //    等于把否决权交回给打分器，而打分器正是通不过的那一环。
+        if (writeGate != null) {
+            GateDecision decision = writeGate.evaluate(event, entry);
+            if (!decision.isAllowed()) {
+                log.debug("写入闸门拒绝: type={}, {}", type, decision.describe());
+                return null;
+            }
+        }
+
+        // 5. 重要度阈值
         if (importance < importanceThreshold) {
             log.debug("事件重要度 {} 低于阈值 {}，跳过", importance, importanceThreshold);
             return null;
         }
 
-        // 2. 分类
-        MemoryType type = classifier.classify(event);
-
-        // 3. 构建 MemoryEntry
-        MemoryEntry entry = buildMemoryEntry(event, type, importance);
-
-        // 4. 去重
+        // 6. 去重
         Optional<MemoryEntry> duplicate = deduplicator.findDuplicate(entry);
         if (duplicate.isPresent()) {
             MemoryEntry resolved = conflictResolver.resolve(duplicate.get(), entry);
@@ -85,7 +103,7 @@ public class DefaultEventProcessor implements EventProcessor {
             return persistEntry(resolved);
         }
 
-        // 5. 无重复，直接保存
+        // 7. 无重复，直接保存
         return persistEntry(entry);
     }
 

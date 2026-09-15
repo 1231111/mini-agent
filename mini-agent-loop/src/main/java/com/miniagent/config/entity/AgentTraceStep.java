@@ -48,8 +48,8 @@ public class AgentTraceStep {
     private int subGoalDone;
     @Column(name = "sub_goal_total")
     private int subGoalTotal;
-    /** 状态：RUNNING / SUCCESS / FAILURE / TIMEOUT */
-    @Column(length = 20)
+    /** 状态：RUNNING / SUCCESS / FAILURE / TIMEOUT 等 */
+    @Column(length = 50)
     private String status;
     /** 耗时毫秒（仅 TOOL_RESULT） */
     @Column(name = "duration_ms")

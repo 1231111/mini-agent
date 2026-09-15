@@ -153,11 +153,21 @@ public class ToolRouter {
     private void expandFamily(Set<String> set, String tool, String capability) {
         String t = tool == null ? "" : tool.toLowerCase(Locale.ROOT);
         String cap = capability == null ? "" : capability.toLowerCase(Locale.ROOT);
-        if (t.startsWith("browser_") || t.contains("feishu") || cap.contains("browser"))
+        if (t.startsWith("browser_") || t.contains("feishu") || cap.contains("browser")) {
             set.addAll(capabilityIndex.toolsFor("browser"));
-        if (t.contains("write") || t.contains("read") || cap.contains("write")
+        }
+        // image 步只要能写 mermaid + 渲染；展开 file_write 会带上 exec/read_package，模型就会去翻仓库
+        if ("image".equals(cap) || t.contains("render_diagram")) {
+            set.add("write_file");
+            set.add("edit_file");
+            set.add("render_diagram");
+            return;
+        }
+        if (t.contains("write") || cap.contains("write")
                 || cap.contains("deliver") || t.contains("markdown")) {
             set.addAll(capabilityIndex.toolsFor("file_write"));
+        }
+        if (t.contains("read") || cap.contains("read")) {
             set.addAll(capabilityIndex.toolsFor("file_read"));
         }
     }
@@ -179,16 +189,18 @@ public class ToolRouter {
             return;
         }
 
+        if (isImageCapability) {
+            set.add("write_file");
+            set.add("edit_file");
+            set.add("render_diagram");
+            return;
+        }
+
         set.add("write_file");
         set.add("edit_file");
         set.addAll(capabilityIndex.toolsFor("file_write"));
         if (node == null || !"browser".equals(node.capability())) {
             set.add("read_file");
-        }
-
-        // 为 image 能力添加额外的文件写入工具，支持降级到 SVG/HTML/Mermaid
-        if (isImageCapability) {
-            set.addAll(capabilityIndex.toolsFor("file_write"));
         }
     }
 

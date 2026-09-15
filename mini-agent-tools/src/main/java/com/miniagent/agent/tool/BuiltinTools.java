@@ -29,6 +29,9 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.commons.lang3.StringUtils;
 
+// 新增参数类导入
+import com.miniagent.agent.tool.impl.*;
+
 /**
  * 内置工具集合：文件操作、HTTP 请求、命令执行、浏览器操控
  *
@@ -116,125 +119,68 @@ public class BuiltinTools {
     // ==================== 文件工具 ====================
 
     private void registerFileTools() {
+        // 使用新的实体类注册方式
         registry.register("read_file", "读取文件内容",
-                Map.of(
-                        "path", Map.of("type", "string", "description", "文件路径", "required", true),
-                        "offset", Map.of("type", "integer", "description", "起始行号（默认1）"),
-                        "limit", Map.of("type", "integer", "description", "最大行数（默认200）")
-                ),
-                args -> {
+                ReadFileParams.class,
+                params -> {
                     // 缓存命中检查
-                    String cacheKey = "read_file|" + args;
+                    String cacheKey = "read_file|" + params.toJson();
                     String cached = toolResultCache.get(cacheKey);
                     if (Objects.nonNull(cached)) {
                         log.debug("read_file 缓存命中: {}", cacheKey);
                         return cached;
                     }
-                    Map<String, Object> p = parseJson(args);
-                    String path = (String) p.get("path");
-                    int offset = p.containsKey("offset") ? ((Number) p.get("offset")).intValue() : 1;
-                    int limit = p.containsKey("limit") ? ((Number) p.get("limit")).intValue() : 200;
-                    String result = readFile(path, offset, limit);
+                    String result = readFile(params.getPath(), 
+                                          params.getOffsetOrDefault(), 
+                                          params.getLimitOrDefault());
                     toolResultCache.put(cacheKey, result);
                     return result;
                 });
 
-        registry.register("write_file", "写入文件内容。文件自动保存到 workspace/任务名/ 目录下，路径只需写文件名如 design.md 即可。"
+        registry.register("write_file", "写入文件内容。路径写文件名即可，落在 workspace 根下，如 design.md。"
+                        + "子任务隔离目录仅在子 Agent 覆盖 workspace 时使用。"
                         + "【大文件必读】单轮输出有长度上限，超长文件（如完整的 3D 仿真 HTML、长代码）一次写不完会被截断。"
                         + "正确做法：第一次用 mode=\"overwrite\"（默认）写开头部分，之后多次用 mode=\"append\" 把剩余内容续写到同一文件，直到写完。不要试图一次塞进全部内容。",
-                Map.of(
-                        "path", Map.of("type", "string", "description", "文件路径", "required", true),
-                        "content", Map.of("type", "string", "description", "文件内容（本次要写入/追加的片段）", "required", true),
-                        "mode", Map.of("type", "string", "description", "写入模式：overwrite=覆盖（默认，用于首次写入）；append=追加到文件末尾（用于分块续写大文件）")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    if (Boolean.TRUE.equals(p.get(PARSE_ERROR_KEY))) {
-                        return "{\"error\":\"参数 JSON 不完整，疑似本次输出被长度上限截断。请改用分块写入：先 mode=overwrite 写前半部分，再多次 mode=append 续写剩余内容，每次内容不要太长。\"}";
-                    }
-                    String content = (String) p.get("content");
-                    if (Objects.isNull(content)) {
+                WriteFileParams.class,
+                params -> {
+                    if (Objects.isNull(params.getContent())) {
                         return "{\"error\":\"缺少 content 参数（或参数被截断）。大文件请分块写入：首次 mode=overwrite，后续 mode=append。\"}";
                     }
-                    boolean append = "append".equalsIgnoreCase(String.valueOf(p.get("mode")));
-                    return writeFile((String) p.get("path"), content, append);
+                    return writeFile(params.getPath(), params.getContent(), params.isAppendMode());
                 });
 
         registry.register("list_files", "列出目录文件",
-                Map.of(
-                        "path", Map.of("type", "string", "description", "目录路径", "required", true),
-                        "recursive", Map.of("type", "boolean", "description", "是否递归列出")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String path = (String) p.get("path");
-                    boolean recursive = Boolean.TRUE.equals(p.get("recursive"));
-                    return listFiles(path, recursive);
-                });
+                ListFilesParams.class,
+                params -> listFiles(params.getPath(), params.isRecursiveOrDefault()));
 
         registry.register("read_package", "按Java包名读取包下所有源码文件。传包名如 com.miniagent.agent.intent，自动解析路径并返回全部代码。分析项目架构时优先用这个，不要逐个 read_file。",
-                Map.of(
-                        "package_name", Map.of("type", "string", "description", "Java包名，如 com.miniagent.agent.intent", "required", true),
-                        "max_chars_per_file", Map.of("type", "integer", "description", "每个文件最大字符数（默认8000）")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String packageName = (String) p.get("package_name");
-                    int maxChars = p.containsKey("max_chars_per_file") ? ((Number) p.get("max_chars_per_file")).intValue() : 8000;
-                    return readPackage(packageName, maxChars);
-                });
+                ReadPackageParams.class,
+                params -> readPackage(params.getPackageName(), params.getMaxCharsPerFileOrDefault()));
     }
 
     // ==================== HTTP 工具 ====================
 
     private void registerHttpTools() {
         registry.register("http_get", "发送 HTTP GET 请求并返回响应体",
-                Map.of(
-                        "url", Map.of("type", "string", "description", "目标 URL", "required", true)
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    return httpSend("GET", (String) p.get("url"), null, null);
-                });
+                HttpGetParams.class,
+                params -> httpSend("GET", params.getUrl(), null, null));
         registry.register("http_post",
                 "发送 HTTP POST。写接口（如微信草稿箱 draft/add）用这个；只读用 http_get。"
                         + "首次调用会请用户批准。",
-                Map.of(
-                        "url", Map.of("type", "string", "description", "目标 URL", "required", true),
-                        "body", Map.of("type", "string", "description", "请求体，默认空"),
-                        "contentType", Map.of("type", "string",
-                                "description", "Content-Type，默认 application/json; charset=utf-8")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    return httpSend("POST", (String) p.get("url"),
-                            (String) p.get("body"), (String) p.get("contentType"));
-                });
+                HttpPostParams.class,
+                params -> httpSend("POST", params.getUrl(), params.getBody(), params.getContentTypeOrDefault()));
     }
 
     // ==================== Web 搜索工具（对标 hermes-agent） ====================
 
     private void registerWebSearchTools() {
         registry.register("web_search", "搜索网页，返回结构化的搜索结果（标题、URL、描述）。",
-                Map.of(
-                        "query", Map.of("type", "string", "description", "搜索关键词", "required", true),
-                        "limit", Map.of("type", "integer", "description", "返回结果数量（默认5，最大10）")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String query = (String) p.get("query");
-                    int limit = p.containsKey("limit") ? Math.min(((Number) p.get("limit")).intValue(), 10) : 5;
-                    return webSearchService.search(query, limit);
-                });
+                WebSearchParams.class,
+                params -> webSearchService.search(params.getQuery(), params.getLimitOrDefault()));
 
         registry.register("web_extract", "抓取网页内容，返回纯文本。支持任何公开网页。对于大页面会截断到合理长度。",
-                Map.of(
-                        "url", Map.of("type", "string", "description", "要抓取的网页 URL", "required", true)
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    return webSearchService.extract((String) p.get("url"));
-                });
+                WebExtractParams.class,
+                params -> webSearchService.extract(params.getUrl()));
     }
 
     // ==================== 代码检索 + 精确编辑（Cursor 风格） ====================
@@ -244,42 +190,26 @@ public class BuiltinTools {
         registry.register("search_code",
                 "在代码/文本文件中按正则搜索内容，返回 文件:行号:匹配行。定位函数、类、符号、关键字时优先用这个，不要逐个 read_file 盲找。" +
                 "path 默认项目根目录；glob 可限定文件类型如 *.java。",
-                Map.of(
-                        "pattern", Map.of("type", "string", "description", "正则表达式（ripgrep/Java 正则语法）", "required", true),
-                        "path", Map.of("type", "string", "description", "搜索目录或文件，默认项目根目录"),
-                        "glob", Map.of("type", "string", "description", "文件名过滤，如 *.java、*.{ts,tsx}"),
-                        "max_results", Map.of("type", "integer", "description", "最大匹配条数，默认100")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String pattern = (String) p.get("pattern");
-                    if (StringUtils.isBlank(pattern)) {
+                SearchParams.class,
+                params -> {
+                    if (StringUtils.isBlank(params.getPattern())) {
                         return "{\"error\":\"pattern 不能为空\"}";
                     }
-                    String path = (String) p.get("path");
-                    String glob = (String) p.get("glob");
-                    int max = p.containsKey("max_results") ? ((Number) p.get("max_results")).intValue() : 100;
-                    return searchCode(pattern, path, glob, max);
+                    return searchCode(params.getPattern(), 
+                                    params.getPath(), 
+                                    params.getGlob(), 
+                                    params.getMaxResultsOrDefault());
                 });
 
         // edit_file：锚点替换，改已有文件只传 diff，不重发整文件。
         registry.register("edit_file",
-                "精确编辑已有文件：把 old_string 替换为 new_string。修改已存在的文件用这个，不要用 write_file 重写整个文件。" +
-                "old_string 必须与文件中的原文逐字符一致（含缩进），且默认必须唯一匹配——不唯一时请在 old_string 里多带几行上下文。删除内容时 new_string 传空字符串。",
-                Map.of(
-                        "path", Map.of("type", "string", "description", "要编辑的文件路径", "required", true),
-                        "old_string", Map.of("type", "string", "description", "被替换的原文（逐字符一致，含缩进）", "required", true),
-                        "new_string", Map.of("type", "string", "description", "替换后的新内容；删除则传空串", "required", true),
-                        "replace_all", Map.of("type", "boolean", "description", "替换所有匹配（默认 false，只替换唯一一处）")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String path = (String) p.get("path");
-                    String oldStr = (String) p.get("old_string");
-                    String newStr = Objects.isNull(p.get("new_string")) ? "" : (String) p.get("new_string");
-                    boolean replaceAll = Boolean.TRUE.equals(p.get("replace_all"));
-                    return editFile(path, oldStr, newStr, replaceAll);
-                });
+                "精确编辑已有文件：把 oldString 替换为 newString。修改已存在的文件用这个，不要用 write_file 重写整个文件。" +
+                "oldString 必须与文件中的原文逐字符一致（含缩进），且默认必须唯一匹配——不唯一时请在 oldString 里多带几行上下文。删除内容时 newString 传空字符串。",
+                EditFileParams.class,
+                params -> editFile(params.getPath(), 
+                                 params.getOldString(), 
+                                 params.getNewString() != null ? params.getNewString() : "", 
+                                 params.isReplaceAllOrDefault()));
     }
 
     /** search_code 实现：优先 ripgrep，失败回退 Java 正则扫描。 */
@@ -478,8 +408,15 @@ public class BuiltinTools {
         if (p.isAbsolute()) {
             return p.normalize();
         }
-        return Path.of(System.getProperty("user.dir")).toAbsolutePath()
+        Path fromRoot = Path.of(System.getProperty("user.dir")).toAbsolutePath()
                 .resolve(normalized).normalize();
+        if (Files.exists(fromRoot)) {
+            return fromRoot;
+        }
+        // 项目根下不存在就退回 workspace：agent 自己 write_file 产出的文件落在
+        // workspace 根，否则 write → edit 这条链路会断在「文件不存在」。
+        Path fromWorkspace = resolveWorkspacePath(path);
+        return Files.exists(fromWorkspace) ? fromWorkspace : fromRoot;
     }
 
     /** 把 glob（*.java、*.{ts,tsx}）转成文件名正则；null/空返回 null（不过滤）。 */
@@ -524,156 +461,82 @@ public class BuiltinTools {
             log.info("exec_command 已注册，默认需会话批准（agent.tools.exec-enabled=false）");
         }
         registry.register("exec_command",
-                "执行命令（有安全检查）。工作目录为 workspace。"
-                        + "当前运行环境是 Windows，优先使用 cmd / PowerShell 语法。"
-                        + "全局未开启时首次调用会请用户批准。搜索代码请用 search_code。",
-                Map.of(
-                        "command", Map.of("type", "string", "description", "要执行的命令", "required", true)
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    return execCommand((String) p.get("command"));
-                });
+                "在 workspace 目录下执行一条 shell 命令并返回输出；当前是 Windows，用 cmd / PowerShell 语法。\n"
+                        + "什么时候用：跑构建/测试/脚本、调用命令行工具、验证刚生成的产出物能否真正运行。\n"
+                        + "什么时候不要用（改用专用工具，更快也更安全）：\n"
+                        + "- 读文件 → read_file；写文件 → write_file；列目录 → list_files\n"
+                        + "- 搜代码 → search_code（不要用 findstr / Select-String 全库扫）\n"
+                        + "- 抓网页 → web_extract；请求接口 → http_get / http_post\n"
+                        + "危险操作（递归删除、覆盖已有文件、格式化磁盘、git 强制推送或重置）执行前必须先向用户确认。\n"
+                        + "不要跑交互式命令（会挂到超时）；需要确认时改用非交互参数（如 -y / --yes）。\n"
+                        + "全局未开启时首次调用会请用户批准。",
+                ExecCommandParams.class,
+                params -> execCommand(params.getCommand()));
     }
 
     // ==================== 浏览器工具 ====================
 
     private void registerBrowserTools() {
         registry.register("browser_navigate", "打开网页，返回页面标题和无障碍树快照",
-                Map.of(
-                        "url", Map.of("type", "string", "description", "要打开的网页地址", "required", true),
-                        "sessionId", Map.of("type", "string", "description", "浏览器会话ID（可选，默认default）")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String url = (String) p.get("url");
-                    String blocked = networkGuard.validateUrl(url);
+                BrowserNavigateParams.class,
+                params -> {
+                    String blocked = networkGuard.validateUrl(params.getUrl());
                     if (Objects.nonNull(blocked)) {
                         return "{\"error\":\"" + blocked.replace("\"", "'") + "\"}";
                     }
-                    String sid = (String) p.getOrDefault("sessionId", "default");
-                    return browserService.navigate(sid, url);
+                    return browserService.navigate(params.getSessionIdOrDefault(), params.getUrl());
                 });
 
         registry.register("browser_snapshot", "获取当前页面的无障碍树快照，显示可交互元素的编号ref",
-                Map.of(
-                        "full", Map.of("type", "boolean", "description", "是否获取完整深度快照"),
-                        "sessionId", Map.of("type", "string", "description", "浏览器会话ID")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    boolean full = Boolean.TRUE.equals(p.get("full"));
-                    String sid = (String) p.getOrDefault("sessionId", "default");
-                    return browserService.snapshot(sid, full);
-                });
+                BrowserSnapshotParams.class,
+                params -> browserService.snapshot(params.getSessionIdOrDefault(), params.isFullOrDefault()));
 
         registry.register("browser_click",
                 "点击页面元素。默认用快照编号 ref（如 \"10\"）。解析失败时不要盲重试同参，改 by 切换策略："
                         + "ref=仅编号；text=精确文本；role=button=名称 或 link=名称；css=CSS选择器；aria=aria-label/placeholder。",
-                Map.of(
-                        "ref", Map.of("type", "string",
-                                "description", "快照编号（推荐）或文本/选择器，含义由 by 决定", "required", true),
-                        "by", Map.of("type", "string",
-                                "description", "解析策略: auto|ref|text|role|css|aria，默认 auto"),
-                        "sessionId", Map.of("type", "string", "description", "浏览器会话ID")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String ref = strArg(p, "ref");
-                    String by = strArg(p, "by");
-                    if (StringUtils.isBlank(by)) {
-                        by = "auto";
-                    }
-                    String sid = (String) p.getOrDefault("sessionId", "default");
-                    return browserService.click(sid, ref, by);
-                });
+                BrowserClickParams.class,
+                params -> browserService.click(params.getSessionIdOrDefault(), 
+                                            params.getRef(), 
+                                            params.getByOrDefault()));
 
         registry.register("browser_type", "在输入框中输入文字",
-                Map.of(
-                        "ref", Map.of("type", "string", "description", "输入框编号或placeholder", "required", true),
-                        "text", Map.of("type", "string", "description", "要输入的文字", "required", true),
-                        "sessionId", Map.of("type", "string", "description", "浏览器会话ID")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String ref = (String) p.get("ref");
-                    String text = (String) p.get("text");
-                    String sid = (String) p.getOrDefault("sessionId", "default");
-                    return browserService.type(sid, ref, text);
-                });
+                BrowserTypeParams.class,
+                params -> browserService.type(params.getSessionIdOrDefault(), 
+                                           params.getRef(), 
+                                           params.getText()));
 
         registry.register("browser_press", "按下键盘按键（Enter, Tab, Escape, ArrowDown 等）",
-                Map.of(
-                        "key", Map.of("type", "string", "description", "按键名称", "required", true),
-                        "sessionId", Map.of("type", "string", "description", "浏览器会话ID")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String key = (String) p.get("key");
-                    String sid = (String) p.getOrDefault("sessionId", "default");
-                    return browserService.press(sid, key);
-                });
+                BrowserPressParams.class,
+                params -> browserService.press(params.getSessionIdOrDefault(), params.getKey()));
 
         registry.register("browser_scroll", "滚动页面",
-                Map.of(
-                        "direction", Map.of("type", "string", "description", "滚动方向: up 或 down", "required", true),
-                        "sessionId", Map.of("type", "string", "description", "浏览器会话ID")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String dir = (String) p.get("direction");
-                    String sid = (String) p.getOrDefault("sessionId", "default");
-                    return browserService.scroll(sid, dir);
-                });
+                BrowserScrollParams.class,
+                params -> browserService.scroll(params.getSessionIdOrDefault(), params.getDirection()));
 
         registry.register("browser_screenshot", "截取当前页面截图并保存为 PNG 文件",
-                Map.of(
-                        "sessionId", Map.of("type", "string", "description", "浏览器会话ID")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String sid = (String) p.getOrDefault("sessionId", "default");
-                    return browserService.screenshot(sid);
-                });
+                BrowserScreenshotParams.class,
+                params -> browserService.screenshot(params.getSessionIdOrDefault()));
 
         registry.register("browser_evaluate", "在页面中执行 JavaScript 代码",
-                Map.of(
-                        "expression", Map.of("type", "string", "description", "JavaScript 表达式", "required", true),
-                        "sessionId", Map.of("type", "string", "description", "浏览器会话ID")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String expr = (String) p.get("expression");
-                    String sid = (String) p.getOrDefault("sessionId", "default");
-                    return browserService.evaluate(sid, expr);
-                });
+                BrowserEvaluateParams.class,
+                params -> browserService.evaluate(params.getSessionIdOrDefault(), params.getScript()));
 
         registry.register("browser_extract_text",
                 "抽取当前页正文并写入文件。飞书/wiki 有侧栏目录时会按目录逐章抽取，"
                         + "一次调用覆盖全部章节。代码块写成 Markdown 围栏，图片保存到"
                         + "同目录 images/。禁止 browser_evaluate 手动滚屏。",
-                Map.of(
-                        "path", Map.of("type", "string",
-                                "description", "写入路径，默认 _source.md"),
-                        "mode", Map.of("type", "string",
-                                "description", "overwrite 或 append，默认 overwrite"),
-                        "sessionId", Map.of("type", "string",
-                                "description", "浏览器会话ID")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String sid = (String) p.getOrDefault("sessionId", "default");
-                    String path = (String) p.get("path");
+                BrowserExtractTextParams.class,
+                params -> {
+                    String path = params.getPath();
                     if (StringUtils.isBlank(path)) {
                         path = "_source.md";
                     }
-                    boolean append = "append".equalsIgnoreCase(
-                            String.valueOf(p.get("mode")));
+                    boolean append = "append".equalsIgnoreCase(params.getMode());
                     Path mdFile = resolveWorkspacePath(path);
                     Path mdParent = mdFile.getParent();
                     Path imgDir = (mdParent == null ? mdFile : mdParent)
                             .resolve(EXTRACT_IMAGES_DIR);
-                    String text = browserService.extractArticleText(sid, imgDir);
+                    String text = browserService.extractArticleText(params.getSessionIdOrDefault(), imgDir);
                     if (text.startsWith("抽取失败")) {
                         return text;
                     }
@@ -686,14 +549,8 @@ public class BuiltinTools {
                 });
 
         registry.register("browser_close", "关闭浏览器会话",
-                Map.of(
-                        "sessionId", Map.of("type", "string", "description", "浏览器会话ID")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String sid = (String) p.getOrDefault("sessionId", "default");
-                    return browserService.close(sid);
-                });
+                BrowserCloseParams.class,
+                params -> browserService.close(params.getSessionIdOrDefault()));
     }
 
     // ==================== 云端图像生成（多后端自动降级） ====================
@@ -1001,8 +858,14 @@ public class BuiltinTools {
                 return "{\"error\":\"文件不存在: " + path + "\"}";
             }
             List<String> lines = Files.readAllLines(target, StandardCharsets.UTF_8);
-            int from = Math.max(0, offset - 1);
-            int to   = Math.min(lines.size(), from + limit);
+            // offset 超出文件行数时 from 会大于 to，subList 直接抛 fromIndex > toIndex，
+            // 模型只会看到一句异常文本，不知道是自己读过了尾部
+            int from = Math.min(Math.max(0, offset - 1), lines.size());
+            int to   = Math.min(lines.size(), from + Math.max(0, limit));
+            if (from >= lines.size() && !lines.isEmpty()) {
+                return "{\"error\":\"起始行 " + offset + " 超出文件末尾，该文件共 "
+                        + lines.size() + " 行\"}";
+            }
             List<String> slice = lines.subList(from, to);
             StringBuilder sb = new StringBuilder();
             for (int i = 0; i < slice.size(); i++) {
@@ -1097,7 +960,8 @@ public class BuiltinTools {
 
     private String writeFile(String path, String content, boolean append) {
         try {
-            // 如果 path 只是文件名（无目录分隔符），自动放到 workspace/任务名/ 下
+            // 如果 path 只是文件名（无目录分隔符），默认写到 workspace 根；
+            // 子 Agent 通过 WorkspaceContext.taskOverride 隔离。
             Path target = resolveWorkspacePath(path);
             Files.createDirectories(target.getParent());
             // 保留受保护的媒体 URL；不再把旧路径改写成匿名静态资源。
@@ -1179,18 +1043,26 @@ public class BuiltinTools {
      * {@code workspace/foo.md} → {@code {dataDir}/workspace/foo.md}。
      */
     private Path resolveWorkspacePath(String path) {
-        String task = WorkspaceContext.getTaskOverride();
-        if (StringUtils.isBlank(task)) {
-            task = currentTaskName.get();
-        }
-        return resolveWritePath(effectiveWorkspaceRoot(), task, path, allowAbsoluteWrite);
+        return resolveWritePath(effectiveWorkspaceRoot(), writeTaskDir(), path, allowAbsoluteWrite);
+    }
+
+    /** Office/文档工具统一落盘路径（对齐 AgentDataPaths workspace，禁止 user.dir/workspace）。 */
+    public static Path resolveOutputPath(String path) {
+        return resolveWritePath(
+                effectiveWorkspaceRoot(), writeTaskDir(), path, false);
+    }
+
+    /** 主会话写根目录；仅子 Agent 的 taskOverride 才分子目录。 */
+    public static String writeTaskDir() {
+        String override = WorkspaceContext.getTaskOverride();
+        return override == null ? "" : override;
     }
 
     static Path resolveWritePath(Path workspaceRoot, String task, String path,
                                  boolean allowAbsolute) {
         Path root = workspaceRoot.toAbsolutePath().normalize();
         if (StringUtils.isBlank(path)) {
-            return root.resolve(task).normalize();
+            return StringUtils.isBlank(task) ? root : root.resolve(task).normalize();
         }
         String normalized = path.replace('\\', '/').trim();
         while (normalized.startsWith("./")) {
@@ -1207,14 +1079,43 @@ public class BuiltinTools {
             if (p.isAbsolute()) {
                 resolved = p.toAbsolutePath().normalize();
             } else if (Objects.isNull(p.getParent())) {
-                resolved = root.resolve(task).resolve(p).normalize();
+                resolved = StringUtils.isBlank(task)
+                        ? root.resolve(p).normalize()
+                        : root.resolve(task).resolve(p).normalize();
             } else {
                 resolved = root.resolve(p).normalize();
             }
         }
-        if (!resolved.startsWith(root) && !allowAbsolute)
-            throw new SecurityException("写入路径必须位于 workspace/ 内: " + resolved);
+        if (!resolved.startsWith(root) && !allowAbsolute) {
+            Path rebased = rebaseIntoWorkspace(root, resolved);
+            if (Objects.isNull(rebased)) {
+                throw new SecurityException("写入路径必须位于 workspace/ 内: " + resolved);
+            }
+            return rebased;
+        }
         return resolved;
+    }
+
+    /**
+     * read_file / search_code 按项目根解析，write_file 却锁在数据目录 workspace，
+     * 模型顺着读链路会拼出 {projectDir}/workspace/xxx 再来写，直接拒会让
+     * 多文件任务连续失败。这里把最后一个 workspace 段之后的部分重挂到真实根下。
+     * 结果仍强制落在 root 内，不放宽写入边界。
+     */
+    private static Path rebaseIntoWorkspace(Path root, Path resolved) {
+        int idx = -1;
+        for (int i = resolved.getNameCount() - 1; i >= 0; i--) {
+            if ("workspace".equalsIgnoreCase(resolved.getName(i).toString())) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0 || idx == resolved.getNameCount() - 1) {
+            return null;
+        }
+        Path tail = resolved.subpath(idx + 1, resolved.getNameCount());
+        Path rebased = root.resolve(tail).normalize();
+        return rebased.startsWith(root) ? rebased : null;
     }
 
     /**

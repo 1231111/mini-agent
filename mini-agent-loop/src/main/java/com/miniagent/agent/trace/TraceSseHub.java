@@ -142,6 +142,8 @@ public class TraceSseHub {
                 try {
                     em.send(SseEmitter.event().comment("hb"));
                 } catch (Exception e) {
+                    // 静默移除已断开的连接，不传播异常
+                    try { em.complete(); } catch (Exception ignored) {}
                     list.remove(em);
                 }
             }

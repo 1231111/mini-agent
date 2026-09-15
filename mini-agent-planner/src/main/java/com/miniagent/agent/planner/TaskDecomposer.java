@@ -3,7 +3,6 @@ package com.miniagent.agent.planner;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.intent.TaskPlan;
-import com.miniagent.agent.intent.TaskStep;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatModel;
@@ -14,6 +13,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -117,8 +117,7 @@ public class TaskDecomposer {
         }
 
         List<TaskNode> decomposedNodes = new ArrayList<>();
-        Map<String, TaskNode> originalNodes = graph.nodes().stream()
-                .collect(java.util.stream.Collectors.toMap(TaskNode::id, n -> n));
+        Map<String, String> replacedBy = new HashMap<>();
 
         for (TaskNode node : graph.nodes()) {
             if (needsDecomposition(node)) {
@@ -126,12 +125,15 @@ public class TaskDecomposer {
                     List<TaskNode> subSteps = decomposeNode(node, graph, chat);
                     if (subSteps != null && !subSteps.isEmpty()) {
                         decomposedNodes.addAll(subSteps);
-                        log.info("TaskDecomposer: 节点 {} 分解为 {} 个子步骤", node.id(), subSteps.size());
+                        replacedBy.put(node.id(), subSteps.get(subSteps.size() - 1).id());
+                        log.info("TaskDecomposer: 节点 {} 分解为 {} 个子步骤",
+                                node.id(), subSteps.size());
                     } else {
                         decomposedNodes.add(node);
                     }
                 } catch (Exception e) {
-                    log.warn("TaskDecomposer: 节点 {} 分解失败，保持原样: {}", node.id(), e.getMessage());
+                    log.warn("TaskDecomposer: 节点 {} 分解失败，保持原样: {}",
+                            node.id(), e.getMessage());
                     decomposedNodes.add(node);
                 }
             } else {
@@ -139,7 +141,31 @@ public class TaskDecomposer {
             }
         }
 
-        return new TaskGraph(decomposedNodes);
+        return remapDependencies(new TaskGraph(decomposedNodes), replacedBy);
+    }
+
+    /** 被拆掉的父 id 改指最后一个子步骤，避免 n3 → n2 悬空。 */
+    private static TaskGraph remapDependencies(TaskGraph graph, Map<String, String> replacedBy) {
+        if (replacedBy == null || replacedBy.isEmpty()) {
+            return graph;
+        }
+        List<TaskNode> remapped = new ArrayList<>();
+        for (TaskNode n : graph.nodes()) {
+            List<String> deps = new ArrayList<>();
+            for (String d : n.dependsOn()) {
+                deps.add(replacedBy.getOrDefault(d, d));
+            }
+            if (deps.equals(n.dependsOn())) {
+                remapped.add(n);
+            } else {
+                remapped.add(new TaskNode(n.id(), n.name(), n.capability(), deps,
+                        n.inputs(), n.outputs(), n.status(), n.priority(),
+                        n.doneWhen(), n.toolHint(), n.toolArguments(),
+                        n.compensation(), n.covers(), n.lastError(),
+                        n.retryCount(), n.output()));
+            }
+        }
+        return new TaskGraph(remapped);
     }
 
     /**
@@ -293,14 +319,7 @@ public class TaskDecomposer {
                 }
 
                 // 处理验收标准
-                DoneWhen doneWhen = DoneWhen.note();
-                JsonNode dw = step.get("doneWhen");
-                if (dw != null) {
-                    String type = textOr(dw, "type", "note_required");
-                    String criteria = textOr(dw, "criteria", "");
-                    String path = textOr(dw, "path", "");
-                    doneWhen = new DoneWhen(type, criteria, path);
-                }
+                DoneWhen doneWhen = parseDoneWhen(step.get("doneWhen"), originalNode);
 
                 // 处理工具参数
                 Map<String, Object> toolArguments = Map.of();
@@ -369,6 +388,18 @@ public class TaskDecomposer {
             return trimmed.substring(s, e + 1);
         }
         return "{}";
+    }
+
+    private static DoneWhen parseDoneWhen(JsonNode dw, TaskNode original) {
+        DoneWhen parsed = dw == null ? DoneWhen.note() : DoneWhen.parse(dw);
+        if (parsed.valid()) {
+            return parsed;
+        }
+        DoneWhen fallback = original == null ? DoneWhen.note() : original.doneWhen();
+        if (fallback != null && fallback.valid()) {
+            return fallback;
+        }
+        return DoneWhen.note();
     }
 
     private static String textOr(JsonNode n, String field, String def) {

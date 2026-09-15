@@ -183,7 +183,7 @@ public class RecoveryEngine {
             List<String> cons = new ArrayList<>(nextGoal.constraints());
             cons.add("recovery: " + abbreviate(dx.reason(), 80));
             nextGoal = new Goal(nextGoal.goalId(), nextGoal.objective(), nextGoal.intent(),
-                    nextGoal.entities(), cons, nextGoal.successCriteria());
+                    nextGoal.taskType(), nextGoal.entities(), cons, nextGoal.successCriteria());
         }
 
         Map<String, Object> exec = new HashMap<>(cur.execution());
