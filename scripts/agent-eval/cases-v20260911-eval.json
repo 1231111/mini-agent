@@ -1,0 +1,682 @@
+[
+  {
+    "id": "QA01",
+    "category": "qa",
+    "tier": "smoke",
+    "promptFile": "v20260911-eval/QA01.txt",
+    "timeoutSec": 120,
+    "sloMs": 20000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "no_planner"
+      },
+      {
+        "type": "response_contains",
+        "value": "63"
+      },
+      {
+        "type": "response_not_contains",
+        "value": "6363"
+      }
+    ]
+  },
+  {
+    "id": "QA02",
+    "category": "qa",
+    "tier": "smoke",
+    "promptFile": "v20260911-eval/QA02.txt",
+    "timeoutSec": 120,
+    "sloMs": 25000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "no_planner"
+      },
+      {
+        "type": "response_contains",
+        "value": "apple"
+      },
+      {
+        "type": "response_contains",
+        "value": "mango"
+      },
+      {
+        "type": "response_contains",
+        "value": "zebra"
+      }
+    ]
+  },
+  {
+    "id": "QA03",
+    "category": "qa",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/QA03.txt",
+    "timeoutSec": 120,
+    "sloMs": 30000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "no_planner"
+      },
+      {
+        "type": "response_min_length",
+        "number": 4
+      },
+      {
+        "type": "response_regex",
+        "value": "未找到|不存在|找不到|Not Found|404"
+      }
+    ]
+  },
+  {
+    "id": "QA04",
+    "category": "qa",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/QA04.txt",
+    "timeoutSec": 120,
+    "sloMs": 25000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "no_planner"
+      },
+      {
+        "type": "response_contains",
+        "value": "true"
+      },
+      {
+        "type": "response_contains",
+        "value": "false"
+      }
+    ]
+  },
+  {
+    "id": "QA05",
+    "category": "qa",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/QA05.txt",
+    "timeoutSec": 120,
+    "sloMs": 20000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "no_planner"
+      },
+      {
+        "type": "response_contains",
+        "value": "1000"
+      }
+    ]
+  },
+  {
+    "id": "QA06",
+    "category": "qa",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/QA06.txt",
+    "timeoutSec": 120,
+    "sloMs": 20000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "no_planner"
+      },
+      {
+        "type": "response_contains",
+        "value": "255"
+      }
+    ]
+  },
+  {
+    "id": "QA07",
+    "category": "qa",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/QA07.txt",
+    "timeoutSec": 120,
+    "sloMs": 25000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "no_planner"
+      },
+      {
+        "type": "response_regex",
+        "value": "否|不是|不完全|还|也"
+      }
+    ]
+  },
+  {
+    "id": "QA08",
+    "category": "qa",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/QA08.txt",
+    "timeoutSec": 120,
+    "sloMs": 20000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "no_planner"
+      },
+      {
+        "type": "response_contains",
+        "value": "hello"
+      }
+    ]
+  },
+  {
+    "id": "QA09",
+    "category": "qa",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/QA09.txt",
+    "timeoutSec": 120,
+    "sloMs": 20000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "no_planner"
+      },
+      {
+        "type": "response_contains",
+        "value": "1024"
+      }
+    ]
+  },
+  {
+    "id": "QA10",
+    "category": "qa",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/QA10.txt",
+    "timeoutSec": 120,
+    "sloMs": 25000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "no_planner"
+      },
+      {
+        "type": "response_contains",
+        "value": "TCP"
+      }
+    ]
+  },
+  {
+    "id": "SIM01",
+    "category": "simple",
+    "tier": "smoke",
+    "promptFile": "v20260911-eval/SIM01.txt",
+    "timeoutSec": 300,
+    "sloMs": 120000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "no_planner"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_sim01.txt"
+      },
+      {
+        "type": "workspace_file_contains",
+        "glob": "t20260911eval_sim01.txt",
+        "value": "GEN-20260911eval-SIM01"
+      }
+    ]
+  },
+  {
+    "id": "SIM02",
+    "category": "simple",
+    "tier": "smoke",
+    "promptFile": "v20260911-eval/SIM02.txt",
+    "timeoutSec": 600,
+    "sloMs": 180000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_Hello.java"
+      },
+      {
+        "type": "workspace_file_contains",
+        "glob": "t20260911eval_Hello.java",
+        "value": "GEN-20260911eval-SIM02"
+      }
+    ]
+  },
+  {
+    "id": "SIM03",
+    "category": "simple",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/SIM03.txt",
+    "timeoutSec": 600,
+    "sloMs": 180000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_calc.py"
+      },
+      {
+        "type": "workspace_file_contains",
+        "glob": "t20260911eval_calc.py",
+        "value": "add("
+      }
+    ]
+  },
+  {
+    "id": "SIM04",
+    "category": "simple",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/SIM04.txt",
+    "timeoutSec": 300,
+    "sloMs": 120000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_config.json"
+      },
+      {
+        "type": "workspace_file_contains",
+        "glob": "t20260911eval_config.json",
+        "value": "version"
+      }
+    ]
+  },
+  {
+    "id": "SIM05",
+    "category": "simple",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/SIM05.txt",
+    "timeoutSec": 600,
+    "sloMs": 180000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_scores.xlsx"
+      },
+      {
+        "type": "workspace_file_min_length",
+        "glob": "t20260911eval_scores.xlsx",
+        "number": 1000
+      }
+    ]
+  },
+  {
+    "id": "SIM06",
+    "category": "simple",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/SIM06.txt",
+    "timeoutSec": 600,
+    "sloMs": 180000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_note.docx"
+      },
+      {
+        "type": "workspace_file_min_length",
+        "glob": "t20260911eval_note.docx",
+        "number": 2000
+      }
+    ]
+  },
+  {
+    "id": "SIM07",
+    "category": "simple",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/SIM07.txt",
+    "timeoutSec": 300,
+    "sloMs": 120000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_readme.md"
+      },
+      {
+        "type": "workspace_file_contains",
+        "glob": "t20260911eval_readme.md",
+        "value": "GEN-20260911eval-SIM07"
+      },
+      {
+        "type": "workspace_file_min_lines",
+        "glob": "t20260911eval_readme.md",
+        "number": 4
+      }
+    ]
+  },
+  {
+    "id": "SIM08",
+    "category": "simple",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/SIM08.txt",
+    "timeoutSec": 300,
+    "sloMs": 120000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_greet.sh"
+      },
+      {
+        "type": "workspace_file_contains",
+        "glob": "t20260911eval_greet.sh",
+        "value": "GEN-20260911eval-SIM08"
+      }
+    ]
+  },
+  {
+    "id": "SIM09",
+    "category": "simple",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/SIM09.txt",
+    "timeoutSec": 600,
+    "sloMs": 240000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "response_min_length",
+        "number": 5
+      },
+      {
+        "type": "response_regex",
+        "value": "17|21|25|LTS|JDK"
+      }
+    ]
+  },
+  {
+    "id": "SIM10",
+    "category": "simple",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/SIM10.txt",
+    "timeoutSec": 300,
+    "sloMs": 120000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_flow.mmd"
+      },
+      {
+        "type": "workspace_file_contains",
+        "glob": "t20260911eval_flow.mmd",
+        "value": "flowchart"
+      }
+    ]
+  },
+  {
+    "id": "CPL01",
+    "category": "complex",
+    "tier": "smoke",
+    "promptFile": "v20260911-eval/CPL01.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_ai_news.md"
+      },
+      {
+        "type": "workspace_file_min_lines",
+        "glob": "t20260911eval_ai_news.md",
+        "number": 6
+      }
+    ]
+  },
+  {
+    "id": "CPL02",
+    "category": "complex",
+    "tier": "smoke",
+    "promptFile": "v20260911-eval/CPL02.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_app.py"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_requirements.txt"
+      },
+      {
+        "type": "workspace_file_contains",
+        "glob": "t20260911eval_app.py",
+        "value": "Hello"
+      }
+    ]
+  },
+  {
+    "id": "CPL03",
+    "category": "complex",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/CPL03.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_openjdk.md"
+      },
+      {
+        "type": "workspace_file_min_length",
+        "glob": "t20260911eval_openjdk.md",
+        "number": 20
+      }
+    ]
+  },
+  {
+    "id": "CPL04",
+    "category": "complex",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/CPL04.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_arch.mmd"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_arch.png"
+      }
+    ]
+  },
+  {
+    "id": "CPL05",
+    "category": "complex",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/CPL05.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_main.py"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_utils.py"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_README.md"
+      }
+    ]
+  },
+  {
+    "id": "CPL06",
+    "category": "complex",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/CPL06.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_spring_report.md"
+      },
+      {
+        "type": "workspace_file_contains",
+        "glob": "t20260911eval_spring_report.md",
+        "value": "Spring Boot"
+      },
+      {
+        "type": "workspace_file_min_length",
+        "glob": "t20260911eval_spring_report.md",
+        "number": 200
+      }
+    ]
+  },
+  {
+    "id": "CPL07",
+    "category": "complex",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/CPL07.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_page.html"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_page.docx"
+      }
+    ]
+  },
+  {
+    "id": "CPL08",
+    "category": "complex",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/CPL08.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_api_design.md"
+      },
+      {
+        "type": "workspace_file_min_lines",
+        "glob": "t20260911eval_api_design.md",
+        "number": 8
+      }
+    ]
+  },
+  {
+    "id": "CPL09",
+    "category": "complex",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/CPL09.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_data.csv"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_data_summary.md"
+      }
+    ]
+  },
+  {
+    "id": "CPL10",
+    "category": "complex",
+    "tier": "regression",
+    "promptFile": "v20260911-eval/CPL10.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      {
+        "type": "status_done"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_checklist.md"
+      },
+      {
+        "type": "workspace_file_exists",
+        "glob": "t20260911eval_deploy.env"
+      },
+      {
+        "type": "workspace_file_contains",
+        "glob": "t20260911eval_deploy.env",
+        "value": "APP_NAME=20260911eval"
+      }
+    ]
+  }
+]

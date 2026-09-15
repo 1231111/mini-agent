@@ -1,0 +1,1 @@
+请写入 JSON 文件 t20260911eval_config.json，含 run、version、ok 三个字段，格式化缩进 2 空格。

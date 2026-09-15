@@ -1,0 +1,1 @@
+请用 web_extract 或 http_get 获取 https://openjdk.org/ 页面信息，将站点标题或首段说明写入 t20260911eval_openjdk.md（至少 20 字）。不要开浏览器。

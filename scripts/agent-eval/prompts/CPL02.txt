@@ -1,0 +1,1 @@
+请在工作区写两个文件：eval_cpl02_app.py 是最小 Flask 应用，GET / 返回纯文本 Hello Eval；eval_cpl02_requirements.txt 只有一行 flask。不要写其它文件。

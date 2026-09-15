@@ -1,0 +1,1 @@
+请在工作区创建三文件迷你 Python 项目：eval_cpl05_readme.md（说明项目用途）、eval_cpl05_main.py（调用 utils.greet 并 print）、eval_cpl05_utils.py（def greet(): return "EVAL-CPL05"）。不要写其它文件。

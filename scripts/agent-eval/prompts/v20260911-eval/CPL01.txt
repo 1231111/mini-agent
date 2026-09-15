@@ -1,0 +1,1 @@
+请搜索近期 AI 行业一条简讯（可用 web_search），整理成 Markdown 文件 t20260911eval_ai_news.md：含标题、日期、3 条要点，至少 8 行。

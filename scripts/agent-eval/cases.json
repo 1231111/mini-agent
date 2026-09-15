@@ -1,0 +1,258 @@
+[
+  {
+    "id": "QA01",
+    "category": "qa",
+    "tier": "smoke",
+    "promptFile": "QA01.txt",
+    "timeoutSec": 120,
+    "sloMs": 15000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "no_planner" },
+      { "type": "no_tool_errors" },
+      { "type": "response_min_length", "number": 2 },
+      { "type": "no_error_phrases" }
+    ]
+  },
+  {
+    "id": "QA02",
+    "category": "qa",
+    "tier": "smoke",
+    "promptFile": "QA02.txt",
+    "timeoutSec": 120,
+    "sloMs": 20000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "no_planner" },
+      { "type": "response_contains", "value": "63" },
+      { "type": "response_not_contains", "value": "6363" }
+    ]
+  },
+  {
+    "id": "QA03",
+    "category": "qa",
+    "tier": "regression",
+    "promptFile": "QA03.txt",
+    "timeoutSec": 120,
+    "sloMs": 25000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "no_planner" },
+      { "type": "response_regex", "value": "是|yes" }
+    ]
+  },
+  {
+    "id": "QA04",
+    "category": "qa",
+    "tier": "regression",
+    "promptFile": "QA04.txt",
+    "timeoutSec": 120,
+    "sloMs": 30000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "no_planner" },
+      { "type": "response_min_length", "number": 20 },
+      { "type": "response_contains", "value": "API" }
+    ]
+  },
+  {
+    "id": "QA05",
+    "category": "qa",
+    "tier": "regression",
+    "promptFile": "QA05.txt",
+    "timeoutSec": 120,
+    "sloMs": 30000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "no_planner" },
+      { "type": "response_contains", "value": "apple" },
+      { "type": "response_contains", "value": "banana" },
+      { "type": "response_contains", "value": "cherry" }
+    ]
+  },
+  {
+    "id": "QA06",
+    "category": "qa",
+    "tier": "regression",
+    "promptFile": "QA06.txt",
+    "timeoutSec": 120,
+    "sloMs": 20000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "no_planner" },
+      { "type": "response_contains", "value": "6" }
+    ]
+  },
+  {
+    "id": "SIM01",
+    "category": "simple",
+    "tier": "smoke",
+    "promptFile": "SIM01.txt",
+    "timeoutSec": 300,
+    "sloMs": 90000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "no_planner" },
+      { "type": "workspace_file_exists", "glob": "eval_sim01_hello.txt" },
+      { "type": "workspace_file_contains", "glob": "eval_sim01_hello.txt", "value": "EVAL-SIM01" }
+    ]
+  },
+  {
+    "id": "SIM02",
+    "category": "simple",
+    "tier": "smoke",
+    "promptFile": "SIM02.txt",
+    "timeoutSec": 600,
+    "sloMs": 180000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "workspace_file_exists", "glob": "EvalSim02.java" },
+      { "type": "workspace_file_contains", "glob": "EvalSim02.java", "value": "EVAL-SIM02" }
+    ]
+  },
+  {
+    "id": "SIM03",
+    "category": "simple",
+    "tier": "regression",
+    "promptFile": "SIM03.txt",
+    "timeoutSec": 600,
+    "sloMs": 180000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "workspace_file_exists", "glob": "eval_sim03_calc.py" },
+      { "type": "workspace_file_contains", "glob": "eval_sim03_calc.py", "value": "add(" }
+    ]
+  },
+  {
+    "id": "SIM04",
+    "category": "simple",
+    "tier": "regression",
+    "promptFile": "SIM04.txt",
+    "timeoutSec": 600,
+    "sloMs": 240000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "no_error_phrases" },
+      { "type": "response_min_length", "number": 40 },
+      { "type": "tool_used", "value": "web_search" }
+    ]
+  },
+  {
+    "id": "SIM05",
+    "category": "simple",
+    "tier": "regression",
+    "promptFile": "SIM05.txt",
+    "timeoutSec": 600,
+    "sloMs": 180000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "workspace_file_exists", "glob": "eval_sim05.xlsx" }
+    ]
+  },
+  {
+    "id": "SIM06",
+    "category": "simple",
+    "tier": "regression",
+    "promptFile": "SIM06.txt",
+    "timeoutSec": 600,
+    "sloMs": 180000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "workspace_file_exists", "glob": "eval_sim06.docx" },
+      { "type": "workspace_file_contains", "glob": "eval_sim06.docx", "value": "EVAL-SIM06" }
+    ]
+  },
+  {
+    "id": "SIM07",
+    "category": "simple",
+    "tier": "regression",
+    "promptFile": "SIM07.txt",
+    "timeoutSec": 300,
+    "sloMs": 120000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "workspace_file_exists", "glob": "eval_sim07_config.json" },
+      { "type": "workspace_file_contains", "glob": "eval_sim07_config.json", "value": "\"version\":1" }
+    ]
+  },
+  {
+    "id": "CPL01",
+    "category": "complex",
+    "tier": "smoke",
+    "promptFile": "CPL01.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "workspace_file_exists", "glob": "eval_cpl01_news.md" },
+      { "type": "workspace_file_min_lines", "glob": "eval_cpl01_news.md", "number": 4 }
+    ]
+  },
+  {
+    "id": "CPL02",
+    "category": "complex",
+    "tier": "smoke",
+    "promptFile": "CPL02.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "workspace_file_exists", "glob": "eval_cpl02_app.py" },
+      { "type": "workspace_file_exists", "glob": "eval_cpl02_requirements.txt" },
+      { "type": "workspace_file_contains", "glob": "eval_cpl02_app.py", "value": "Hello Eval" }
+    ]
+  },
+  {
+    "id": "CPL03",
+    "category": "complex",
+    "tier": "regression",
+    "promptFile": "CPL03.txt",
+    "timeoutSec": 1800,
+    "sloMs": 900000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "workspace_file_exists", "glob": "eval_cpl03_openjdk.md" },
+      { "type": "workspace_file_min_length", "glob": "eval_cpl03_openjdk.md", "number": 10 }
+    ]
+  },
+  {
+    "id": "CPL04",
+    "category": "complex",
+    "tier": "regression",
+    "promptFile": "CPL04.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "workspace_file_exists", "glob": "eval_cpl04_arch.mmd" },
+      { "type": "workspace_file_exists", "glob": "eval_cpl04_arch.png" }
+    ]
+  },
+  {
+    "id": "CPL05",
+    "category": "complex",
+    "tier": "regression",
+    "promptFile": "CPL05.txt",
+    "timeoutSec": 1200,
+    "sloMs": 600000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "workspace_file_exists", "glob": "eval_cpl05_readme.md" },
+      { "type": "workspace_file_exists", "glob": "eval_cpl05_main.py" },
+      { "type": "workspace_file_exists", "glob": "eval_cpl05_utils.py" }
+    ]
+  },
+  {
+    "id": "CPL06",
+    "category": "complex",
+    "tier": "regression",
+    "promptFile": "CPL06.txt",
+    "timeoutSec": 1800,
+    "sloMs": 900000,
+    "checks": [
+      { "type": "status_done" },
+      { "type": "workspace_file_exists", "glob": "eval_cpl06_report.md" },
+      { "type": "workspace_file_contains", "glob": "eval_cpl06_report.md", "value": "Spring Boot" }
+    ]
+  }
+]
