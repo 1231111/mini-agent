@@ -720,43 +720,54 @@ function resolveStepKind(step) {
     return step.stepType;
 }
 
-/** IntentType 英文码 → 中文（与 Java IntentType 一致；库内仍存英文） */
-const INTENT_META = {
-    QUESTION:            { label: '问答咨询', desc: '寒暄、能力询问或纯问答，通常不需要复杂工具链' },
-    REVIEW:              { label: '截图点评', desc: '用户附带截图/图片，走点评反馈快路径' },
-    NEW_TASK:            { label: '新任务', desc: '需要动手执行的新任务；分类不确定时的默认兜底' },
-    CONTINUE_TASK:       { label: '继续任务', desc: '延续上一轮未完成工作，应带上历史上下文' },
-    RESEARCH:            { label: '调研检索', desc: '偏信息搜集/调研类任务' },
-    FILE_DELIVERY:       { label: '文件交付', desc: '以产出或交付文件为主的任务' },
-    PUBLISHING:          { label: '发布上线', desc: '发布、上线、对外发布类任务' },
-    IMAGE_GENERATION:    { label: '图像生成', desc: '以文生图/改图为主的任务' },
-    MULTIMODAL_ANALYSIS: { label: '多模态分析', desc: '需要结合图文等多模态内容分析' },
-    HISTORY_REFERENCE:   { label: '引用历史', desc: '明确引用历史话题/会话内容' },
-    UNKNOWN:             { label: '未知意图', desc: '无法归类；流水线中通常会回落到新任务' }
+/**
+ * 任务信号码 → 中文（与 Java TaskSignals.hits() 产出的名字一致；库内仍存英文）。
+ * 信号是「原文里出现了什么」的事实，不是「本轮属于哪一类」的分类结果。
+ */
+const SIGNAL_META = {
+    web:           { label: '联网',     desc: '出现了网址，或搜索/检索/抓取/查一下这类说法' },
+    file:          { label: '文件',     desc: '出现了文件相关说法，或带扩展名的文件名' },
+    read:          { label: '读取',     desc: '命中读类动词且没有写类动词：这轮要读已有内容' },
+    diagram:       { label: '架构图',   desc: '点名要架构图/流程图/mermaid，必须走文件交付' },
+    pureImage:     { label: '文生图',   desc: '点名要生成图片/海报/封面/插画' },
+    imageIntoDoc:  { label: '图入文档', desc: '要把图片替换或写进 md 文档' },
+    simpleFile:    { label: '单文件',   desc: '单文件短指令写盘，不必拆多节点图' },
+    question:      { label: '短问答',   desc: '寒暄、能力询问、算术等短问题' },
+    complex:       { label: '复杂度词', desc: '命中了「一整套/多模块/分步/从零搭建」等说法' },
+    continue:      { label: '续任务',   desc: '出现「继续/接着上次/按刚才的」等续做说法' },
+    publish:       { label: '发布上线', desc: '发布、上线、部署到生产环境类动作' }
 };
-const TOOL_PROFILE_ZH = { QUESTION: '问答工具面', IMAGE: '生图工具面', FULL: '全量工具面' };
+/** 与 Java TaskSignals.hits() 的输出顺序一致。 */
+const SIGNAL_ORDER = ['web', 'file', 'read', 'diagram', 'pureImage', 'imageIntoDoc',
+    'simpleFile', 'question', 'complex', 'continue', 'publish'];
 
-function intentLabel(code) {
+function signalMeta(code) {
+    if (!code) return null;
+    return SIGNAL_META[String(code)] || SIGNAL_META[String(code).toLowerCase()] || null;
+}
+function signalLabel(code) {
     if (!code) return '—';
-    const m = INTENT_META[String(code).toUpperCase()];
+    const m = signalMeta(code);
     return m ? m.label : String(code);
 }
-function intentDesc(code) {
-    if (!code) return '';
-    const m = INTENT_META[String(code).toUpperCase()];
+function signalDesc(code) {
+    const m = signalMeta(code);
     return m ? m.desc : '';
 }
-function toolProfileZh(code) {
-    if (!code) return '—';
-    const k = String(code).toUpperCase();
-    return TOOL_PROFILE_ZH[k] || String(code);
+/** 把命中清单 "web,file" 转成中文，并标注原始信号名，便于回源码检索。 */
+function signalsZh(described) {
+    if (!described || described === 'none') return '未命中任何信号';
+    return String(described).split(',')
+        .map(s => s.trim()).filter(Boolean)
+        .map(s => signalLabel(s) + '（' + s + '）')
+        .join('、');
 }
 
 /**
  * Trace 展示契约（给非开发看）：
  * 1) 摘要一律【字段名】值，禁止无标签拼接
  * 2) 枚举/状态必须中文；英文码只留在详情或 title
- * 3) 「意图类型」≠ 任务全文；任务正文只出现在【任务目标】/【用户问题】
+ * 3) 「命中信号」≠ 任务全文；任务正文只出现在【任务目标】/【用户问题】
  */
 function tagged(pairs) {
     return pairs
@@ -791,38 +802,36 @@ function permModeZh(m) {
     return PERM_MODE_ZH[u] || m;
 }
 
-function intentLayerExplain(kind) {
-    if (kind === 'INTENT_START') return { code: '开始', how: '进入意图识别阶段' };
-    if (kind === 'INTENT_END') return { code: '结束', how: '意图识别定案完成' };
-    if (kind === 'INTENT_L0') return { code: 'L0', how: '规则（YAML/MySQL），未调小模型' };
-    if (kind === 'INTENT_L1') return { code: 'L1', how: '独立意图小模型分类' };
-    if (kind === 'INTENT_L2') return { code: 'L2', how: '代码启发式兜底' };
-    if (kind === 'TASK_PLAN') return { code: '计划', how: '意图下游：执行计划快照' };
-    return { code: '?', how: '意图相关' };
+function signalStepExplain(kind) {
+    if (kind === 'TASK_SIGNALS') {
+        return { code: '观察', how: '按词表从用户消息里读事实，不做分类' };
+    }
+    if (kind === 'TASK_PLAN') {
+        return { code: '参数', how: '任务参数（目标/白名单/是否走结构化计划）' };
+    }
+    return { code: '?', how: '任务相关' };
 }
 function cleanReason(reason) {
     if (!reason) return '';
-    return String(reason).replace(/^small-model:\s*/i, '').replace(/^small-model$/i, '')
+    return String(reason).replace(/^signals:\s*/i, '信号：')
+        .replace(/^small-model:\s*/i, '').replace(/^small-model$/i, '')
         .replace(/^rule:\s*/i, '规则：').trim();
 }
-function intentPlanSummary(kind, j) {
+function signalPlanSummary(kind, j) {
     if (!j) return tagged([['说明', '无结构化内容']]);
-    const layer = intentLayerExplain(kind);
+    const layer = signalStepExplain(kind);
     if (j.skipped) {
         return tagged([
-            ['判定层', layer.code], ['判定方式', layer.how],
+            ['步骤', layer.code], ['做法', layer.how],
             ['结果', '未命中/跳过'], ['说明', clip(j.reason || '继续下层', 100)]
         ]);
     }
     return tagged([
-        ['判定层', layer.code],
-        ['判定方式', layer.how],
-        ['结果', kind === 'TASK_PLAN' ? '执行计划定案' : '命中定案'],
-        ['意图类型', intentLabel(j.intent) + '（类别，不是任务全文）'],
+        ['步骤', layer.code],
+        ['做法', layer.how],
+        ['命中信号', j.signals ? signalsZh(j.signals) : null],
         ['任务目标', j.taskGoal ? clip(j.taskGoal, 100) : null],
-        ['判定理由', cleanReason(j.reason) || cleanReason(j.classifierReason) || null],
-        ['置信度', j.confidence != null ? String(j.confidence) : null],
-        ['工具面', j.toolProfile ? toolProfileZh(j.toolProfile) : null],
+        ['判定理由', cleanReason(j.reason) || null],
         ['强制拆计划', j.requiresStructuredPlan == null ? null : (j.requiresStructuredPlan ? '是' : '否')]
     ]);
 }
@@ -855,34 +864,21 @@ function stepSummary(step) {
                 ['事件', '任务结束'],
                 ['结束状态', statusZh((j && j.status) || step.status)]
             ]);
-        case 'INTENT_START':
+        case 'TASK_SIGNALS':
             return tagged([
-                ['阶段', '意图识别'],
-                ['事件', '开始'],
-                ['漏斗', j && j.pipeline ? j.pipeline : 'L0规则→L1小模型→L2启发式'],
+                ['阶段', '任务信号观察'],
+                ['事件', '读取文本事实'],
+                ['命中信号', j && j.signals ? signalsZh(j.signals) : '未命中'],
+                ['强制拆计划', j && j.requiresStructuredPlan != null
+                    ? (j.requiresStructuredPlan ? '是' : '否') : null],
                 ['用户问题', j && j.question ? clip(j.question, 100) : null]
             ]);
-        case 'INTENT_END':
-            return tagged([
-                ['阶段', '意图识别'],
-                ['事件', '结束定案'],
-                ['定案层', j && j.decidedLayer ? j.decidedLayer : null],
-                ['意图类型', j ? intentLabel(j.intent) : null],
-                ['任务目标', j && j.taskGoal ? clip(j.taskGoal, 100) : null],
-                ['置信度', j && j.confidence != null ? String(j.confidence) : null]
-            ]);
-        case 'INTENT_L0': case 'INTENT_L1': case 'INTENT_L2': case 'TASK_PLAN':
-            return intentPlanSummary(kind, j);
-        case 'REVIEW_PATH':
-            return tagged([
-                ['路径', '截图点评快路径'],
-                ['说明', '不进入完整 Agent 主循环'],
-                ['含图', j && j.hasImage != null ? (j.hasImage ? '是' : '否') : null]
-            ]);
+        case 'TASK_PLAN':
+            return signalPlanSummary(kind, j);
         case 'AGENT_LOOP_START':
             return tagged([
                 ['事件', '进入主 Agent 循环'],
-                ['意图类型', j ? intentLabel(j.intent) : null],
+                ['命中信号', j && j.signals ? signalsZh(j.signals) : null],
                 ['强制拆计划', j && j.requiresStructuredPlan != null ? (j.requiresStructuredPlan ? '是' : '否') : null]
             ]);
         case 'AGENT_LOOP_END': {
@@ -899,7 +895,7 @@ function stepSummary(step) {
         case 'SUBAGENT_LOOP_START':
             return tagged([
                 ['事件', '启动子代理循环'],
-                ['意图类型', j ? intentLabel(j.intent) : null],
+                ['命中信号', j && j.signals ? signalsZh(j.signals) : null],
                 ['强制拆计划', j && j.requiresStructuredPlan != null ? (j.requiresStructuredPlan ? '是' : '否') : null]
             ]);
         case 'SUBAGENT_LOOP_END':
@@ -1000,7 +996,7 @@ function stepSummary(step) {
             return tagged([
                 ['任务动作', '播种任务清单'],
                 ['子目标步数', j && j.steps != null ? String(j.steps) : null],
-                ['说明', '用意图计划预填子目标栈']
+                ['说明', '用任务参数里的步骤预填子目标栈']
             ]);
         case 'WAITING_FOR_HUMAN':
             return tagged([['事件', '等待人工'], ['说明', clip(c, 120) || '已请求确认，阻塞等待用户']]);
@@ -1035,7 +1031,8 @@ function stepSummary(step) {
             const j = (() => { try { return c ? JSON.parse(c) : null; } catch (e) { return null; } })();
             return tagged([
                 ['事件', '加载本轮上下文'],
-                ['意图', j && j.intent ? intentLabel(j.intent) : null],
+                ['命中信号', j && j.signals ? signalsZh(j.signals) : null],
+                ['轻问答', j && j.lightTurn != null ? (j.lightTurn ? '是' : '否') : null],
                 ['历史条数', j && j.historyMessages != null ? String(j.historyMessages) : null],
                 ['注入todo', j ? (j.injectTodo ? '是' : '否') : null],
                 ['挂起旧todo', j && j.todoSuspended ? '是' : null],
@@ -1079,31 +1076,27 @@ function stepDetailHtml(step) {
         ['耗时', step.durationMs ? fmtDur(step.durationMs) : '—']
     ].filter(r => r[1] && r[1] !== '—'));
 
-    if (kind === 'TASK_PLAN' || (kind && kind.startsWith('INTENT_') && j)) {
-        const layer = intentLayerExplain(kind);
-        if (j.skipped) {
-            return head + kvTable([
-                ['判定层', layer.code],
-                ['判定方式', layer.how],
-                ['结果', '未命中 / 跳过（本层未定案，继续下层）'],
-                ['说明', j.reason || '—']
-            ]);
-        }
-        const idesc = intentDesc(j.intent);
+    if (kind === 'TASK_SIGNALS' || kind === 'TASK_PLAN') {
+        const layer = signalStepExplain(kind);
         const rows = [
-            ['判定层', layer.code],
-            ['判定方式', layer.how],
-            ['结果', kind === 'TASK_PLAN' ? '执行计划定案' : '命中定案'],
-            ['意图类型', intentLabel(j.intent) + (idesc ? ' — ' + idesc : '')],
-            ['任务目标', j.taskGoal || '—'],
-            ['判定理由', cleanReason(j.reason) || cleanReason(j.classifierReason) || '—'],
-            ['强制拆计划', j.requiresStructuredPlan ? '是' : '否'],
-            ['使用历史', j.shouldUseHistory ? '是' : '否'],
-            ['置信度', j.confidence != null ? String(j.confidence) : '—'],
-            ['工具面', toolProfileZh(j.toolProfile)],
-            ['工具白名单', j.allowedTools == null ? '全量' : (j.allowedTools.join?.('、') || String(j.allowedTools))]
-        ].filter(r => r[1] != null && r[1] !== '');
-        return head + kvTable(rows.map(([k, v]) => [k, String(v)]));
+            ['步骤', layer.code],
+            ['做法', layer.how],
+            ['命中信号', j && j.signals ? signalsZh(j.signals) : '未命中任何信号'],
+            ['原始信号码', j && j.signals ? j.signals : 'none'],
+            ['强制拆计划', j && j.requiresStructuredPlan != null
+                ? (j.requiresStructuredPlan ? '是（首轮须 todo.set）' : '否') : '—'],
+            ['任务目标', (j && j.taskGoal) || '—'],
+            ['判定理由', cleanReason(j && j.reason) || '—'],
+            ['工具白名单', j && j.allowedTools == null ? '不限制（全量）'
+                : (j && j.allowedTools.length ? j.allowedTools.join('、') : '—')]
+        ];
+        let body = head + kvTable(rows);
+        if (j && j.signals) {
+            body += '<div class="panel-h" style="border-top:1px solid var(--border)">信号释义</div>'
+                + kvTable(String(j.signals).split(',').map(s => s.trim()).filter(Boolean)
+                    .map(s => [signalLabel(s) + '（' + s + '）', signalDesc(s) || '—']));
+        }
+        return body;
     }
     if (kind && (kind.startsWith('TASK_') || kind.startsWith('TODO_')) && kind !== 'TASK_PLAN'
             && j && Array.isArray(j.items)) {
@@ -1380,44 +1373,43 @@ function unwrapPanel(html) {
         .replace(/<\/div>\s*$/, '');
 }
 
-/** 意图识别独立切片（与执行计划分离） */
-function renderIntentPanel(traces) {
-    const intentSteps = traces.filter(s => s.stepType && s.stepType.startsWith('INTENT_'));
-    if (!intentSteps.length) {
-        return panelEmpty('🧭 意图识别', '', '本任务无意图识别节点（旧轨迹或未走漏斗）');
+/** 任务信号独立切片：本轮从用户消息里读到了哪些事实 */
+function renderSignalPanel(traces) {
+    const sigSteps = traces.filter(s => s.stepType === 'TASK_SIGNALS');
+    if (!sigSteps.length) {
+        return panelEmpty('📡 任务信号', '', '本任务无任务信号节点（旧轨迹或未走该步骤）');
     }
-    const start = intentSteps.find(s => s.stepType === 'INTENT_START');
-    const end = [...intentSteps].reverse().find(s => s.stepType === 'INTENT_END');
-    const layers = intentSteps.filter(s => /^INTENT_L[012]$/.test(s.stepType));
-    const hit = [...layers].reverse().find(s => {
-        const sk = tryParse(s.content);
-        return !(sk && sk.skipped);
-    });
-    const endJ = end ? tryParse(end.content) : null;
+    const first = sigSteps[0];
+    const j = tryParse(first.content) || {};
+    const hits = String(j.signals || '').split(',').map(s => s.trim()).filter(Boolean);
     const rows = [];
-    rows.push(['功能阶段', '意图识别（独立于执行计划）']);
-    rows.push(['漏斗顺序', 'L0 规则 → L1 小模型 → L2 启发式']);
-    if (start) rows.push(['开始时间', fmtTime(start.createdAt)]);
-    rows.push(['漏斗路径', layers.map(s => {
-        const m = stepMeta(s.stepType);
-        const sk = tryParse(s.content);
-        return m.label + (sk && sk.skipped ? '（未命中）' : '（命中定案）');
-    }).join(' → ') || '—']);
-    if (hit) {
-        rows.push(['定案层', stepMeta(hit.stepType).label]);
-        rows.push(['定案方式', intentLayerExplain(hit.stepType).how]);
+    rows.push(['功能步骤', '任务信号观察（在任务图与上下文加载之前）']);
+    rows.push(['判据来源', 'TaskSignalMatcher 的配置词表 + 固定文件名/动词正则']);
+    rows.push(['性质', '只描述「原文里出现了什么」，不含「用户想干什么」的推断']);
+    rows.push(['命中信号', hits.length ? signalsZh(j.signals) : '未命中任何信号']);
+    rows.push(['是否轻问答', hits.includes('question') && !hits.some(h => h !== 'question' && h !== 'read')
+        ? '是（不挂 todo、不注入长期记忆）' : '否']);
+    if (j.requiresStructuredPlan != null) {
+        rows.push(['强制拆计划', j.requiresStructuredPlan ? '是（走规划器 + 任务图）' : '否（主循环直接执行）']);
     }
-    if (endJ) {
-        rows.push(['意图类型', intentLabel(endJ.intent)]);
-        rows.push(['任务目标', endJ.taskGoal || '—']);
-        if (endJ.confidence != null) rows.push(['置信度', String(endJ.confidence)]);
-        if (endJ.route) rows.push(['路由标签', endJ.route]);
-    }
-    if (end) rows.push(['结束时间', fmtTime(end.createdAt)]);
-    let html = `<div class="panel"><div class="panel-h">🧭 意图识别<span class="hint">独立功能阶段</span></div>${kvTable(rows)}`;
-    html += `<div class="panel-h" style="border-top:1px solid var(--border)">意图节点流水</div>
+    rows.push(['观察时间', fmtTime(first.createdAt)]);
+
+    let html = `<div class="panel"><div class="panel-h">📡 任务信号<span class="hint">独立功能步骤</span></div>${kvTable(rows)}`;
+    html += `<div class="panel-h" style="border-top:1px solid var(--border)">信号清单</div>
+        <table class="data-table"><thead><tr><th>信号</th><th>原始码</th><th>含义</th><th>是否命中</th></tr></thead><tbody>`;
+    SIGNAL_ORDER.forEach(code => {
+        const on = hits.includes(code);
+        html += `<tr>
+            <td>${esc(signalLabel(code))}</td>
+            <td><code>${esc(code)}</code></td>
+            <td>${esc(SIGNAL_META[code].desc)}</td>
+            <td>${on ? '✅ 命中' : '—'}</td>
+        </tr>`;
+    });
+    html += '</tbody></table>';
+    html += `<div class="panel-h" style="border-top:1px solid var(--border)">信号节点流水</div>
         <table class="data-table"><thead><tr><th>时间</th><th>节点</th><th>状态</th><th>摘要</th></tr></thead><tbody>`;
-    intentSteps.forEach(s => {
+    sigSteps.forEach(s => {
         const m = stepMeta(s.stepType);
         html += `<tr>
             <td>${fmtTime(s.createdAt)}</td>
@@ -1432,14 +1424,14 @@ function renderIntentPanel(traces) {
 
 function renderPlanPanel(traces) {
     const planStep = traces.find(s => s.stepType === 'TASK_PLAN');
-    const intentSteps = traces.filter(s => s.stepType && s.stepType.startsWith('INTENT_'));
-    const intentHit = [...intentSteps].reverse().find(s => {
-        const sk = tryParse(s.content);
-        return !(sk && sk.skipped);
-    }) || null;
+    const sigStep = traces.find(s => s.stepType === 'TASK_SIGNALS');
+    const loopStep = traces.find(s => s.stepType === 'AGENT_LOOP_START'
+        || s.stepType === 'SUBAGENT_LOOP_START');
+    const seedStep = traces.find(s => s.stepType === 'TASK_SEED');
     const runStart = traces.find(s => s.stepType === 'RUN_START');
-    const plan = planStep ? tryParse(planStep.content) : null;
-    const intentMeta = intentHit ? stepMeta(intentHit.stepType) : null;
+    const plan = planStep ? tryParse(planStep.content) : (sigStep ? tryParse(sigStep.content) : null);
+    const loop = loopStep ? tryParse(loopStep.content) : null;
+    const seed = seedStep ? tryParse(seedStep.content) : null;
     let q = '';
     if (runStart) {
         const rs = tryParse(runStart.content);
@@ -1448,33 +1440,28 @@ function renderPlanPanel(traces) {
 
     const rows = [];
     rows.push(['用户问题', q || '—']);
-    if (intentSteps.length) {
-        rows.push(['漏斗路径', intentSteps.map(s => {
-            const m = stepMeta(s.stepType);
-            const sk = tryParse(s.content);
-            const how = intentLayerExplain(s.stepType).how;
-            return m.label + '／' + how + (sk && sk.skipped ? ' →未命中' : ' →命中');
-        }).join(' ｜ ')]);
+    const signals = (plan && plan.signals) || (loop && loop.signals);
+    if (signals) {
+        rows.push(['命中信号', signalsZh(signals)]);
+        rows.push(['原始信号码', signals]);
     }
-    if (intentMeta) {
-        rows.push(['定案层', intentMeta.label]);
-        rows.push(['定案方式', intentLayerExplain(intentHit.stepType).how]);
+    const needsPlan = plan && plan.requiresStructuredPlan != null
+        ? plan.requiresStructuredPlan : (loop && loop.requiresStructuredPlan);
+    if (needsPlan != null) {
+        rows.push(['强制拆计划', needsPlan ? '是（首轮须 todo.set）' : '否']);
     }
+    if (plan && plan.taskGoal) rows.push(['任务目标', plan.taskGoal]);
+    if (plan && plan.reason) rows.push(['判定理由', cleanReason(plan.reason) || '—']);
+    if (seed && seed.steps != null) rows.push(['播种子目标数', String(seed.steps)]);
+    const tools = plan ? plan.allowedTools : null;
     if (plan) {
-        rows.push(['意图类型', intentLabel(plan.intent) + '（任务类别，不是任务全文）']);
-        const idesc = intentDesc(plan.intent);
-        if (idesc) rows.push(['意图说明', idesc]);
-        rows.push(['任务目标', plan.taskGoal || '—']);
-        rows.push(['判定理由', cleanReason(plan.reason) || '—']);
-        rows.push(['强制拆计划', plan.requiresStructuredPlan ? '是（首轮须 todo.set）' : '否']);
-        rows.push(['使用历史', plan.shouldUseHistory ? '是' : '否']);
-        rows.push(['需要工具', plan.needsTools === false ? '否' : '是']);
-        const tools = plan.allowedTools;
-        rows.push(['工具白名单', tools == null ? '不限制（全量）' : (tools.length ? tools.join('、') : '空→按全量')]);
-        if (plan.confidence != null) rows.push(['分类置信度', String(plan.confidence)]);
-        if (plan.toolProfile) rows.push(['工具面', toolProfileZh(plan.toolProfile)]);
-    } else rows.push(['执行计划', '未记录执行计划节点']);
-    return `<div class="panel"><div class="panel-h">🗺️ 执行计划<span class="hint">意图识别的下游产物</span></div>${kvTable(rows)}</div>`;
+        rows.push(['工具白名单', tools == null ? '不限制（全量）'
+            : (tools.length ? tools.join('、') : '空→按全量')]);
+    }
+    if (!plan && !signals) {
+        rows.push(['执行计划', '未记录任务信号节点（旧轨迹）']);
+    }
+    return `<div class="panel"><div class="panel-h">🗺️ 执行计划<span class="hint">任务信号的下游产物</span></div>${kvTable(rows)}</div>`;
 }
 
 function renderTodoPanel(traces) {
@@ -1708,8 +1695,8 @@ function renderTimeline(traces, newIds) {
     $timeline.innerHTML = `<div class="timeline">
         ${renderDiagnosisPanel(traces)}
         ${renderLifecyclePanel(traces, newIds)}
-        ${themeSection('🧭 意图识别', '独立功能阶段 · L0规则→L1小模型→L2启发式', unwrapPanel(renderIntentPanel(traces)), false)}
-        ${themeSection('🗺️ 执行计划', '意图识别的下游产物 · TaskPlan', unwrapPanel(renderPlanPanel(traces)), false)}
+        ${themeSection('📡 任务信号', '独立功能步骤 · 词表观察，不做分类', unwrapPanel(renderSignalPanel(traces)), false)}
+        ${themeSection('🗺️ 执行计划', '任务信号的下游产物 · TaskPlan', unwrapPanel(renderPlanPanel(traces)), false)}
         ${themeSection('📌 任务拆分', '按分组过滤 · 节点分组=任务拆分', unwrapPanel(renderTodoPanel(traces)), false)}
         ${themeSection('🎯 各轮目标', '按分组过滤 · 节点分组=各轮目标', renderTurnsPanel(traces), false)}
         ${themeSection('🧠 决策 / 反思', '按分组过滤 · 节点分组=决策/反思', unwrapPanel(renderDecisionPanel(traces)), false)}
@@ -1722,8 +1709,7 @@ function renderTimeline(traces, newIds) {
 
 /** 兜底元数据；启动时由 /api/traces/node-catalog（AgentStepNode）覆盖 */
 const STEP_ICONS = {
-    RUN_START:'🚀', RUN_END:'🏁', INTENT_START:'🧭', INTENT_END:'🧭',
-    INTENT_L0:'⚡', INTENT_L1:'🔎', INTENT_L2:'📐', TASK_PLAN:'🗺️', REVIEW_PATH:'🖼️',
+    RUN_START:'🚀', RUN_END:'🏁', TASK_SIGNALS:'📡', TASK_PLAN:'🗺️',
     AGENT_LOOP_START:'🔄', AGENT_LOOP_END:'🔄', SUBAGENT_LOOP_START:'👶', SUBAGENT_LOOP_END:'👶', PLAN:'🎯',
     LLM_REQUEST:'📤', LLM_RESPONSE:'📥', LLM_CALL:'⏱️', LLM_CALL_ERROR:'⚠️', LLM_RETRY:'🔁', THINKING:'💭', DECISION:'🧠',
     TOOL_CALL:'🔧', TOOL_RESULT:'✅', TOOL_ERROR:'💥', TOOL_RETRY:'🔁', PERM_DENY:'🚫', HOOK_DENY:'🪝',
@@ -1736,13 +1722,8 @@ let NODE_CATALOG = [];
 const STEP_META = {
     RUN_START:            { group: '生命周期', icon: '🚀', label: '任务开始',     desc: '收到用户问题，创建本次执行（executionId）' },
     RUN_END:              { group: '最终结果', icon: '🏁', label: '任务结束',     desc: '本轮用户任务收尾（成功/失败）' },
-    INTENT_START:         { group: '意图识别', icon: '🧭', label: '意图识别开始', desc: '进入意图漏斗（独立功能阶段）', core: true },
-    INTENT_L0:            { group: '意图识别', icon: '⚡', label: '意图·L0规则',   desc: '规则层：命中短路，未命中继续 L1', core: true },
-    INTENT_L1:            { group: '意图识别', icon: '🔎', label: '意图·L1小模型', desc: '小模型分类层', core: true },
-    INTENT_L2:            { group: '意图识别', icon: '📐', label: '意图·L2启发式', desc: '启发式兜底层', core: true },
-    INTENT_END:           { group: '意图识别', icon: '🧭', label: '意图识别结束', desc: '漏斗定案，产出意图类型与任务目标', core: true },
-    TASK_PLAN:            { group: '执行计划', icon: '🗺️', label: '执行计划定案', desc: '意图识别下游产物 TaskPlan', core: true },
-    REVIEW_PATH:          { group: '意图识别', icon: '🖼️', label: '截图点评路径', desc: '已废弃，见 route 标签', core: false },
+    TASK_SIGNALS:         { group: '任务信号', icon: '📡', label: '任务信号观察', desc: '按词表读文本事实（联网/落盘/读取/出图/复杂/续任务…），不做分类', core: true },
+    TASK_PLAN:            { group: '执行计划', icon: '🗺️', label: '执行计划定案', desc: '任务信号的下游产物 TaskPlan（历史节点，当前不再产生）', core: false },
     AGENT_LOOP_START:     { group: '生命周期', icon: '🔄', label: '进入主循环',   desc: '开始 Agent 多轮：模型 → 工具 → 再决策' },
     SUBAGENT_LOOP_START:  { group: '生命周期', icon: '👶', label: '子代理启动',   desc: 'delegate_task 拉起子 Agent 循环' },
     SUBAGENT_LOOP_END:    { group: '生命周期', icon: '👶', label: '子代理结束',   desc: '子 Agent 循环结束，结果回父任务' },
@@ -1756,7 +1737,7 @@ const STEP_META = {
     TOOL_RESULT:          { group: '工具调用', icon: '✅', label: '结果返回',     desc: '工具执行返回（成功/失败内容）' },
     PERM_DENY:            { group: '工具调用', icon: '🚫', label: '权限拒绝',     desc: 'Plan/Ask 权限闸门拦住了该工具' },
     HOOK_DENY:            { group: '工具调用', icon: '🪝', label: '钩子拒绝',     desc: 'ToolHook 拒绝了该工具调用' },
-    TASK_SEED:            { group: '任务拆分', icon: '📌', label: '播种任务清单', desc: '用意图计划预填子目标栈', core: true },
+    TASK_SEED:            { group: '任务拆分', icon: '📌', label: '播种任务清单', desc: '把任务参数里的步骤预填进子目标栈', core: true },
     TASK_SET:             { group: '任务拆分', icon: '📋', label: '建立任务清单', desc: 'task.set：写入完整拆分', core: true },
     TASK_UPDATE:          { group: '任务拆分', icon: '☑️', label: '更新任务状态', desc: 'task.update', core: true },
     TASK_LIST:            { group: '任务拆分', icon: '📃', label: '查询任务列表', desc: '只读，非核心', core: false },
@@ -1779,7 +1760,7 @@ const STEP_META = {
     TOOL_ERROR:           { group: '工具调用', icon: '💥', label: '工具执行异常', desc: '失败结果', core: true },
     TOOL_RETRY:           { group: '工具调用', icon: '🔁', label: '工具自动重试', desc: '失败后重试', core: true },
     COMPRESSION:          { group: '生命周期', icon: '🗜️', label: '上下文压缩',   desc: '历史消息过长，压缩后继续' },
-    CONTEXT_LOAD:         { group: '上下文加载', icon: '📥', label: '加载本轮上下文', desc: 'ContextLoader 按意图裁剪后的注入说明', core: true },
+    CONTEXT_LOAD:         { group: '上下文加载', icon: '📥', label: '加载本轮上下文', desc: 'ContextLoader 按命中信号裁剪后的注入说明', core: true },
     ANSWER:               { group: '最终结果', icon: '📝', label: '最终回答',     desc: '本轮对用户的最终文本/产物' },
     CANCELED:             { group: '最终结果', icon: '🛑', label: '用户取消',     desc: '用户主动取消本次执行', core: true },
     ABORTED:              { group: '最终结果', icon: '⛔', label: '异常终止',     desc: '超时/熔断/达迭代上限等', core: true },

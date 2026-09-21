@@ -37,6 +37,8 @@ public class MemoryStore {
     private static final int USER_CHAR_LIMIT = 1375;
     private static final int MIDTERM_CHAR_LIMIT = 6000;
     private static final Long DEFAULT_USER = -1L;
+    /** 结构化记忆未绑定时的租户兜底，与历史数据 "default" 对齐。 */
+    public static final String FALLBACK_TENANT = "default";
 
     /** 当前用户 ID（由 AgentChatApplicationService 每轮入口 set/clear）。null → _default。 */
     private static final ThreadLocal<Long> currentUserId = new ThreadLocal<>();
@@ -158,6 +160,16 @@ public class MemoryStore {
     private Long effectiveUserId() {
         Long uid = currentUserId.get();
         return Optional.ofNullable(uid).orElse(DEFAULT_USER);
+    }
+
+    public static String effectiveTenantId() {
+        String tenant = getCurrentTenant();
+        return StringUtils.isBlank(tenant) ? FALLBACK_TENANT : tenant;
+    }
+
+    public static String effectiveUserIdString() {
+        Long uid = getCurrentUser();
+        return String.valueOf(Optional.ofNullable(uid).orElse(DEFAULT_USER));
     }
 
     /** 当前用户的记忆根目录：memory/users/{userId}/ （_default 用于匿名/系统）。 */
@@ -350,7 +362,7 @@ public class MemoryStore {
     }
 
     /**
-     * 按开关加载记忆块，供 ContextLoader 按意图裁剪。
+     * 按开关加载记忆块，供 ContextLoader 按本轮命中信号裁剪。
      *
      * @param userMaxChars USER 截断；0=不截断
      */
@@ -466,6 +478,7 @@ public class MemoryStore {
             entries.add(content);
             setEntries(um, target, entries);
             persistEntries(uid, target, entries);
+            refreshSnapshots(um);
             reindexVector(uid, um);
             return result(true, "条目已添加。", target, entries, limit);
         } finally {
@@ -512,6 +525,7 @@ public class MemoryStore {
 
             setEntries(um, target, entries);
             persistEntries(uid, target, entries);
+            refreshSnapshots(um);
             reindexVector(uid, um);
             return result(true, "条目已替换。", target, entries, limit);
         } finally {
@@ -543,6 +557,7 @@ public class MemoryStore {
             entries.remove((int) matchIdx.get(0));
             setEntries(um, target, entries);
             persistEntries(uid, target, entries);
+            refreshSnapshots(um);
             reindexVector(uid, um);
             return result(true, "条目已删除。", target, entries, limit);
         } finally {
@@ -595,6 +610,13 @@ public class MemoryStore {
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to write midterm memory: " + path, e);
         }
+    }
+
+    /** 写入后同步冻结快照，避免同请求 retrieve 仍读到旧块。 */
+    private void refreshSnapshots(UserMemory um) {
+        um.memorySnapshot = renderBlock("MEMORY", um.memoryEntries, MEMORY_CHAR_LIMIT);
+        um.userSnapshot = renderBlock("USER", um.userEntries, USER_CHAR_LIMIT);
+        um.midtermSnapshot = renderTextBlock("MIDTERM", um.midtermMemory, MIDTERM_CHAR_LIMIT);
     }
 
     private List<String> entriesOf(UserMemory um, String target) {

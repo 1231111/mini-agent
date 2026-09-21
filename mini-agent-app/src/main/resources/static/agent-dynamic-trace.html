@@ -537,11 +537,7 @@
         const NODE_TYPES = {
             RUN_START: { icon: '🚀', label: '任务开始', group: '生命周期' },
             RUN_END: { icon: '🏁', label: '任务结束', group: '生命周期' },
-            INTENT_START: { icon: '🧭', label: '意图识别开始', group: '意图识别' },
-            INTENT_L0: { icon: '⚡', label: '意图·L0规则', group: '意图识别' },
-            INTENT_L1: { icon: '🔎', label: '意图·L1小模型', group: '意图识别' },
-            INTENT_L2: { icon: '📐', label: '意图·L2启发式', group: '意图识别' },
-            INTENT_END: { icon: '🧭', label: '意图识别结束', group: '意图识别' },
+            TASK_SIGNALS: { icon: '📡', label: '任务信号观察', group: '任务信号' },
             TASK_PLAN: { icon: '🗺️', label: '执行计划定案', group: '执行计划' },
             AGENT_LOOP_START: { icon: '🔄', label: '进入主循环', group: '生命周期' },
             AGENT_LOOP_END: { icon: '🔄', label: '离开主循环', group: '生命周期' },
@@ -681,8 +677,8 @@
                 const to = nodes[i + 1];
                 
                 // 只连接同组或相关节点
-                if (from.group === to.group || 
-                    from.type.includes('INTENT') && to.type.includes('INTENT') ||
+                if (from.group === to.group ||
+                    from.type === 'TASK_SIGNALS' && to.type === 'TASK_PLAN' ||
                     from.type.includes('LLM') && to.type.includes('TOOL') ||
                     from.type.includes('TOOL') && to.type.includes('RESULT')) {
                     edges.push({

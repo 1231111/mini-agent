@@ -252,6 +252,19 @@ public class DatabaseConversationStore {
         return conversationRepo.findById(id).filter(c -> !c.isDeleted()).isPresent();
     }
 
+    /**
+     * 会话归属的用户。后台任务（巩固 Worker 等）只拿到 sessionId，
+     * 需要据此反查用户，才能把该用户配置的模型绑定到当前线程。
+     */
+    public Optional<Long> findUserIdBySession(String id) {
+        if (Objects.isNull(id) || id.isBlank()) {
+            return Optional.empty();
+        }
+        return conversationRepo.findById(id)
+                .filter(c -> !c.isDeleted())
+                .map(ChatConversation::getUserId);
+    }
+
     /** Convert entity to model */
     private Conversation toModel(ChatConversation entity) {
         Conversation conv = new Conversation();

@@ -22,7 +22,9 @@
            ===================================================================== */
         :root {
             --sidebar-w: 260px;
-            --content-w: 768px;   /* 消息区与输入框统一内容宽度 */
+            --sidebar-rail: 52px;
+            --content-w: 800px;
+            --page-pad: 20px;
             /* —— 深色主题（默认）：更柔和的近黑 + 更高文本对比 —— */
             --bg:            #0e0f12;   /* main canvas */
             --sidebar-bg:    #16181d;   /* left panel */
@@ -105,17 +107,29 @@
             overflow: hidden;
             transition: width .2s ease;
         }
-        .sidebar.collapsed { width: 0; }
-        .sidebar.collapsed * { visibility: hidden; }
+        .sidebar.collapsed { width: var(--sidebar-rail); }
+        .sidebar.collapsed .sb-logo,
+        .sidebar.collapsed .sb-history,
+        .sidebar.collapsed .sb-footer,
+        .sidebar.collapsed .sb-new-chat { display: none; }
+        .sidebar.collapsed .sb-top {
+            justify-content: center;
+            padding: 12px 6px;
+        }
+        .sidebar.collapsed .sb-toggle .icon-collapse { display: none; }
+        .sidebar.collapsed .sb-toggle .icon-expand { display: block; }
 
-        /* Top area: logo + new-chat icon */
+        /* Top area: logo + new-chat + collapse */
         .sb-top {
             display: flex;
             align-items: center;
             justify-content: space-between;
             padding: 12px 10px 8px;
             flex-shrink: 0;
+            gap: 4px;
         }
+        .sb-top-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+        .sb-toggle .icon-expand { display: none; }
         .sb-logo {
             display: flex; align-items: center; gap: 8px;
             padding: 4px 6px; border-radius: 8px;
@@ -201,63 +215,23 @@
             font-size: 14px; flex-shrink: 0;
         }
         .sb-user-name { font-size: 13px; font-weight: 500; flex: 1; }
-        .sb-logout-btn {
+        .sb-settings-btn {
             flex-shrink: 0; padding: 4px 10px; border-radius: 6px;
             border: 1px solid var(--border); background: transparent;
             color: var(--text2); font-size: 12px; cursor: pointer;
-            transition: all .12s; text-decoration: none;
+            transition: all .12s; font-family: inherit;
             display: inline-flex; align-items: center;
         }
-        .sb-logout-btn:hover { background: var(--danger); color: #fff; border-color: var(--danger); }
+        .sb-settings-btn:hover { background: var(--surface2); color: var(--text); }
 
         /* =================================================================
            MAIN
            ================================================================= */
         .main {
             flex: 1; display: flex; flex-direction: column;
-            min-width: 0; height: 100vh;
+            min-width: 0; min-height: 0; height: 100vh;
         }
 
-        /* Thin topbar — just toggle + model */
-        .topbar {
-            display: flex; align-items: center; gap: 10px;
-            padding: 10px 16px;
-            flex-shrink: 0;
-        }
-        .topbar-toggle {
-            width: 34px; height: 34px;
-            display: flex; align-items: center; justify-content: center;
-            border: none; background: none; color: var(--text2);
-            border-radius: 8px; cursor: pointer; flex-shrink: 0;
-            transition: background .15s, color .15s;
-        }
-        .topbar-toggle:hover { background: var(--surface); color: var(--text); }
-        .topbar-toggle svg { width: 16px; height: 16px; }
-        .model-badge-wrap { position: relative; }
-        .model-badge {
-            display: inline-flex; align-items: center; gap: 5px;
-            font-size: 14px; font-weight: 600; color: var(--text);
-            padding: 4px 10px; border-radius: 8px; cursor: pointer;
-            user-select: none; border: none; background: transparent;
-        }
-        .model-badge svg { width: 14px; height: 14px; color: var(--text2); }
-        .model-badge:hover { background: var(--surface); }
-        .model-menu {
-            display: none;
-            position: absolute;
-            top: 100%;
-            left: 0;
-            margin-top: 8px;
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 12px;
-            min-width: 320px;
-            max-width: 380px;
-            box-shadow: 0 8px 28px rgba(0,0,0,.28);
-            z-index: 200;
-        }
-        .model-menu.show { display: block; }
         .model-menu-title {
             font-size: 12px; font-weight: 600; color: var(--text2);
             margin-bottom: 8px; text-transform: uppercase; letter-spacing: .04em;
@@ -301,43 +275,118 @@
         .model-btn-secondary { background: var(--surface2); color: var(--text); }
         .model-btn-primary { background: var(--accent); color: #fff; }
         .model-menu-hint { font-size: 11px; color: var(--text3); margin-top: 8px; line-height: 1.4; }
-        .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
         .theme-toggle {
             width: 34px; height: 34px;
             display: flex; align-items: center; justify-content: center;
-            border: none; background: none; color: var(--text2);
+            border: none; background: var(--surface2); color: var(--text2);
             border-radius: 8px; cursor: pointer; flex-shrink: 0;
             transition: background .15s, color .15s;
         }
-        .theme-toggle:hover { background: var(--surface); color: var(--text); }
+        .theme-toggle:hover { background: var(--border); color: var(--text); }
         .theme-toggle svg { width: 17px; height: 17px; }
-        /* 深色主题显示月亮，浅色主题显示太阳 */
         .theme-toggle .icon-sun  { display: none; }
         .theme-toggle .icon-moon { display: block; }
         [data-theme="light"] .theme-toggle .icon-sun  { display: block; }
         [data-theme="light"] .theme-toggle .icon-moon { display: none; }
-        .new-chat-top-btn {
-            display: flex; align-items: center; gap: 6px;
-            padding: 6px 14px; border-radius: 20px;
-            border: 1px solid var(--border);
-            background: none; color: var(--text2);
-            font-size: 13px; font-family: inherit;
-            cursor: pointer; transition: all .15s;
+        .settings-modal {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: 14px; padding: 20px;
+            width: min(420px, calc(100vw - 32px));
+            max-height: min(86vh, 720px); overflow-y: auto;
+            box-shadow: 0 12px 40px rgba(0,0,0,.35);
         }
-        .new-chat-top-btn:hover { background: var(--surface); color: var(--text); }
-        .new-chat-top-btn svg { width: 14px; height: 14px; }
+        .settings-head {
+            display: flex; align-items: center; justify-content: space-between;
+            margin-bottom: 16px;
+        }
+        .settings-head h3 { margin: 0; font-size: 16px; }
+        .settings-close {
+            width: 32px; height: 32px; border: none; background: none;
+            color: var(--text2); border-radius: 8px; cursor: pointer; font-size: 16px;
+        }
+        .settings-close:hover { background: var(--surface2); color: var(--text); }
+        .settings-section { margin-bottom: 18px; }
+        .settings-current { font-size: 13px; color: var(--text2); margin-bottom: 10px; }
+        .settings-current strong { color: var(--text); font-weight: 600; }
+        .settings-row {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 12px; padding: 8px 0;
+        }
+        .settings-row-label { font-size: 13px; color: var(--text); }
+        .settings-row-meta { font-size: 12px; color: var(--text2); }
+        .settings-logout {
+            display: block; text-align: center; text-decoration: none;
+            padding: 8px 12px; border-radius: 8px;
+            border: 1px solid var(--border); color: var(--danger);
+            font-size: 13px; font-weight: 600;
+        }
+        .settings-logout:hover { background: var(--danger); color: #fff; }
 
         /* =================================================================
            MESSAGES AREA
            ================================================================= */
         #messages {
-            flex: 1; overflow-y: auto;
+            flex: 1; min-height: 0; overflow-y: auto;
             scroll-behavior: auto;
+            padding: 0 var(--page-pad);
+            scrollbar-gutter: stable;
         }
         #messages::-webkit-scrollbar { width: 6px; }
         #messages::-webkit-scrollbar-track { background: transparent; }
         #messages::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }
         #messages::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-h); }
+
+        /* ----- 顶部任务条（task pin） -----
+           固定在消息区上方，显示「当前视口顶部所属的那条用户任务」。
+           外层透明、不铺满：整条通栏色带视觉上像多出一条工具栏，太宽。
+           可见的只有 .task-pin-inner —— 与消息列同宽的圆角描边盒，缩在内容列里。 */
+        .task-pin {
+            flex-shrink: 0;
+            display: none;
+            padding: 8px var(--page-pad) 6px;
+            cursor: pointer;
+            user-select: none;
+            scrollbar-gutter: stable;
+        }
+        .task-pin.show { display: block; }
+        .task-pin-inner {
+            max-width: var(--content-w);
+            width: 100%;
+            margin: 0 auto;
+            padding: 7px 14px;
+            display: flex; align-items: center; gap: 8px;
+            background: var(--surface);
+            border: 1px solid var(--border-strong);
+            border-radius: 12px;
+            transition: background .15s, border-color .15s;
+        }
+        .task-pin:hover .task-pin-inner { background: var(--surface2); }
+        .task-pin-tag {
+            flex-shrink: 0;
+            font-size: 10.5px; font-weight: 700; letter-spacing: .04em;
+            color: var(--accent); background: var(--accent-soft);
+            padding: 2px 7px; border-radius: 999px;
+        }
+        .task-pin-idx {
+            flex-shrink: 0;
+            font-size: 11px; color: var(--text3);
+            font-variant-numeric: tabular-nums;
+        }
+        .task-pin-text {
+            flex: 1; min-width: 0;
+            font-size: 12.5px; color: var(--text2);
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .task-pin:hover .task-pin-text { color: var(--text); }
+        .task-pin:hover .task-pin-idx  { color: var(--text2); }
+        /* 右端定位图标（对应参考图里那个 ↵） */
+        .task-pin-go {
+            flex-shrink: 0;
+            width: 15px; height: 15px;
+            color: var(--text3);
+            transition: color .15s, transform .15s;
+        }
+        .task-pin:hover .task-pin-go { color: var(--accent); transform: translateX(-2px); }
 
         /* Scroll-to-bottom floating button */
         #scrollBtn {
@@ -360,9 +409,9 @@
 
         /* ----- Welcome Screen ----- */
         .welcome {
-            max-width: 680px;
+            max-width: var(--content-w);
             margin: 0 auto;
-            padding: 10vh 24px 40px;
+            padding: 10vh 0 40px;
             display: flex; flex-direction: column;
             align-items: center; text-align: center;
         }
@@ -389,7 +438,7 @@
         }
         .suggestion-grid {
             display: grid; grid-template-columns: 1fr 1fr;
-            gap: 12px; width: 100%; max-width: 560px;
+            gap: 12px; width: 100%; max-width: 720px;
             text-align: left;
         }
         .sug-card {
@@ -416,8 +465,9 @@
         /* Container limits width and centers */
         .msg-inner {
             max-width: var(--content-w);
+            width: 100%;
             margin: 0 auto;
-            padding: 10px 20px;
+            padding: 10px 0;
         }
 
         /* ---- USER message: right-side bubble ---- */
@@ -445,8 +495,9 @@
         /* 任务计划：钉在对应用户提问下方（非 bot 气泡内） */
         .plan-row .msg-inner {
             max-width: var(--content-w);
+            width: 100%;
             margin: 0 auto;
-            padding: 0 20px 4px;
+            padding: 0 0 4px;
         }
         .plan-row .todo-panel {
             margin-bottom: 4px;
@@ -456,9 +507,10 @@
             box-shadow: 0 4px 16px rgba(0,0,0,.06);
             max-height: 36vh;
             overflow-y: auto;
+            overscroll-behavior: contain;
         }
 
-        /* ---- BOT message: card style with subtle background ---- */
+        /* ---- BOT message ---- */
         .bot-row .msg-inner {
             display: flex;
             gap: 16px;
@@ -478,11 +530,8 @@
         }
         .bot-content {
             flex: 1; min-width: 0;
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 16px;
-            padding: 16px 20px;
-            transition: background .2s ease, border-color .2s ease;
+            padding: 4px 0 0;
+            overflow-wrap: anywhere;
         }
 
         /* Streaming blinking cursor */
@@ -682,16 +731,27 @@
             transform: scale(1.015);
             box-shadow: 0 8px 32px rgba(0,0,0,.3);
         }
+        /* Generated audio (song_generate) */
+        .bot-body audio {
+            display: block;
+            width: 100%; max-width: 520px;
+            margin: 14px 0;
+            border-radius: 12px;
+            background: var(--code-inline-bg);
+            box-shadow: var(--shadow-img);
+        }
 
         /* =================================================================
            INPUT AREA — chatgpt style: centered, floating
            ================================================================= */
         .input-wrap {
             flex-shrink: 0;
-            padding: 0 20px 24px;
+            padding: 0 var(--page-pad) 24px;
+            scrollbar-gutter: stable;
         }
         .input-container {
             max-width: var(--content-w);
+            width: 100%;
             margin: 0 auto;
             position: relative;
         }
@@ -725,7 +785,7 @@
         }
         .img-preview.active { display: flex; }
 
-        /* Main input box — 与 .bot-content 同一套卡片：底、边、圆角 */
+        /* Main input box */
         .input-box {
             background: var(--surface);
             border: 1px solid var(--border);
@@ -899,6 +959,12 @@
         }
         .ask-deny { background: var(--surface2); color: var(--text); }
         .ask-allow { background: var(--accent); color: #fff; }
+        .ask-modal .question-options {
+            display: flex; flex-wrap: wrap; gap: 8px;
+            justify-content: flex-start; margin: 0 0 16px;
+        }
+        #questionModal .ask-modal { max-width: 520px; }
+        #questionModalText { white-space: pre-wrap; }
 
         /* Send button — circle, green when active */
         .send-btn {
@@ -1028,7 +1094,8 @@
 
         /* 思考 / 活动面板：实时展示模型思考与工具规划，让等待变可见 */
         .think-panel {
-            background: var(--surface);
+            background: var(--bg);
+            border: 1px solid var(--border);
             border-radius: 12px;
             padding: 10px 14px;
             margin-bottom: 14px;
@@ -1067,10 +1134,13 @@
             margin-top: 8px;
             padding-top: 8px;
             white-space: pre-wrap;
+            overflow-wrap: anywhere;
             word-break: break-word;
-            max-height: 280px;
+            max-height: 420px;
             overflow-y: auto;
+            overscroll-behavior: contain;
             font-size: 12px;
+            line-height: 1.7;
             color: var(--text3);
         }
         .think-panel .think-act {
@@ -1266,8 +1336,9 @@
 
         @media (max-width: 700px) {
             .sidebar { display: none; }
-            .msg-inner { padding: 8px 12px; }
-            .input-wrap { padding: 0 10px 18px; }
+            :root { --page-pad: 12px; }
+            .msg-inner { padding: 8px 0; }
+            .input-wrap { padding: 0 var(--page-pad) 18px; }
             .suggestion-grid { grid-template-columns: 1fr; }
         }
 
@@ -1331,21 +1402,35 @@
             <div class="sb-logo-icon">🤖</div>
             Mini Agent
         </div>
-        <button class="sb-icon-btn" onclick="startNewChat()" title="新对话">
-            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-            </svg>
-        </button>
+        <div class="sb-top-actions">
+            <button type="button" class="sb-icon-btn sb-new-chat" onclick="startNewChat()"
+                    title="新对话">
+                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                </svg>
+            </button>
+            <button type="button" class="sb-icon-btn sb-toggle" id="sidebarToggle"
+                    onclick="toggleSidebar()" title="收起侧栏">
+                <svg class="icon-collapse" fill="none" stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+                    <path d="M19 12H5M12 19l-7-7 7-7"/>
+                </svg>
+                <svg class="icon-expand" fill="none" stroke="currentColor" stroke-width="2"
+                     stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+                    <path d="M5 12h14M12 5l7 7-7 7"/>
+                </svg>
+            </button>
+        </div>
     </div>
 
     <div class="sb-history" id="sbHistory"></div>
 
     <div class="sb-footer">
-        <div class="sb-user">
+        <div class="sb-user" onclick="openSettings()" title="设置">
             <div class="sb-user-avatar">👤</div>
             <span class="sb-user-name" id="sbUserName">用户</span>
-            <a class="sb-logout-btn" href="/api/logout" title="退出登录">退出</a>
+            <button type="button" class="sb-settings-btn">设置</button>
         </div>
     </div>
 </div>
@@ -1353,60 +1438,17 @@
 <!-- ===================== MAIN ===================== -->
 <div class="main">
 
-    <!-- Topbar -->
-    <div class="topbar">
-        <button class="topbar-toggle" id="sidebarToggle" onclick="toggleSidebar()" title="切换侧边栏">
-            <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                <line x1="3" y1="6" x2="21" y2="6"/>
-                <line x1="3" y1="12" x2="21" y2="12"/>
-                <line x1="3" y1="18" x2="21" y2="18"/>
+    <!-- 顶部任务条：随滚动切换到当前视口所属的用户任务 -->
+    <div class="task-pin" id="taskPin" onclick="taskPinJump()" title="点击定位到该任务">
+        <div class="task-pin-inner">
+            <span class="task-pin-tag">任务</span>
+            <span class="task-pin-idx" id="taskPinIdx"></span>
+            <span class="task-pin-text" id="taskPinText"></span>
+            <svg class="task-pin-go" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 4v7a4 4 0 0 1-4 4H4"/>
+                <path d="m9 10-5 5 5 5"/>
             </svg>
-        </button>
-        <div class="model-badge-wrap">
-            <button class="model-badge" id="modelBadgeBtn" onclick="toggleModelMenu(event)" title="模型配置">
-                <span id="modelBadgeLabel">模型</span>
-                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                    <path d="M6 9l6 6 6-6"/>
-                </svg>
-            </button>
-            <div class="model-menu" id="modelMenu" onclick="event.stopPropagation()">
-                <div class="model-menu-title">选择预设</div>
-                <div class="model-preset-list" id="modelPresetList"></div>
-                <div class="model-menu-title">自定义覆盖</div>
-                <div class="model-custom-fields">
-                    <label>Base URL
-                        <input type="text" id="modelBaseUrl" placeholder="留空则用预设/全局默认">
-                    </label>
-                    <label>Model Name
-                        <input type="text" id="modelNameInput" placeholder="如 gpt-4o-mini">
-                    </label>
-                    <label>API Key
-                        <input type="password" id="modelApiKey" placeholder="已配置则留空不改" autocomplete="off">
-                    </label>
-                </div>
-                <div class="model-menu-actions">
-                    <button type="button" class="model-btn-secondary" onclick="resetModelConfig()">恢复默认</button>
-                    <button type="button" class="model-btn-primary" onclick="saveModelConfig()">保存</button>
-                </div>
-                <div class="model-menu-hint" id="modelMenuHint">配置按登录用户保存；API Key 不会回显明文。</div>
-            </div>
-        </div>
-        <div class="topbar-right">
-            <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="切换主题">
-                <svg class="icon-sun" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                    <circle cx="12" cy="12" r="4"/>
-                    <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
-                </svg>
-                <svg class="icon-moon" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-                </svg>
-            </button>
-            <button class="new-chat-top-btn" onclick="startNewChat()">
-                <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                    <path d="M12 5v14M5 12h14"/>
-                </svg>
-                新对话
-            </button>
         </div>
     </div>
 
@@ -1578,6 +1620,80 @@
     </div>
 </div>
 
+<div class="ask-modal-backdrop" id="questionModal">
+    <div class="ask-modal">
+        <h3>需要你补充信息</h3>
+        <p id="questionModalText">请选择或回复</p>
+        <div class="question-options" id="questionModalOptions"></div>
+        <div class="ask-actions">
+            <button type="button" class="ask-deny" onclick="dismissQuestionModal()">
+                稍后在输入框回答
+            </button>
+        </div>
+    </div>
+</div>
+
+<div class="ask-modal-backdrop" id="settingsModal" onclick="closeSettings()">
+    <div class="settings-modal" onclick="event.stopPropagation()">
+        <div class="settings-head">
+            <h3>设置</h3>
+            <button type="button" class="settings-close" onclick="closeSettings()" title="关闭">✕</button>
+        </div>
+        <div class="settings-section">
+            <div class="model-menu-title">模型</div>
+            <div class="settings-current">当前：<strong id="modelBadgeLabel">模型</strong></div>
+            <div id="modelMenu">
+                <div class="model-menu-title">选择预设</div>
+                <div class="model-preset-list" id="modelPresetList"></div>
+                <div class="model-menu-title">自定义覆盖</div>
+                <div class="model-custom-fields">
+                    <label>Base URL
+                        <input type="text" id="modelBaseUrl" placeholder="留空则用预设/全局默认">
+                    </label>
+                    <label>Model Name
+                        <input type="text" id="modelNameInput" placeholder="如 gpt-4o-mini">
+                    </label>
+                    <label>API Key
+                        <input type="password" id="modelApiKey" placeholder="已配置则留空不改" autocomplete="off">
+                    </label>
+                </div>
+                <div class="model-menu-actions">
+                    <button type="button" class="model-btn-secondary" onclick="resetModelConfig()">
+                        恢复默认
+                    </button>
+                    <button type="button" class="model-btn-primary" onclick="saveModelConfig()">
+                        保存
+                    </button>
+                </div>
+                <div class="model-menu-hint" id="modelMenuHint">
+                    配置按登录用户保存；API Key 不会回显明文。
+                </div>
+            </div>
+        </div>
+        <div class="settings-section">
+            <div class="model-menu-title">外观</div>
+            <div class="settings-row">
+                <div>
+                    <div class="settings-row-label">背景主题</div>
+                    <div class="settings-row-meta" id="themeLabel">深色</div>
+                </div>
+                <button type="button" class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="切换主题">
+                    <svg class="icon-sun" fill="none" stroke="currentColor" stroke-width="2"
+                         viewBox="0 0 24 24">
+                        <circle cx="12" cy="12" r="4"/>
+                        <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
+                    </svg>
+                    <svg class="icon-moon" fill="none" stroke="currentColor" stroke-width="2"
+                         viewBox="0 0 24 24">
+                        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+                    </svg>
+                </button>
+            </div>
+        </div>
+        <a class="settings-logout" href="/api/logout">退出登录</a>
+    </div>
+</div>
+
 <script src="/js/security.js"></script>
 <script th:inline="none">
 /* =========================================================================
@@ -1693,17 +1809,46 @@ function fillInput(t) {
 function toggleSidebar() {
     sidebarOpen = !sidebarOpen;
     document.getElementById('sidebar').classList.toggle('collapsed', !sidebarOpen);
+    const btn = document.getElementById('sidebarToggle');
+    if (btn) {
+        btn.title = sidebarOpen ? '收起侧栏' : '展开侧栏';
+    }
 }
 
 /* =========================================================================
    THEME TOGGLE — 明暗切换，持久化到 localStorage
    ========================================================================= */
+function paintThemeUi() {
+    const light = document.documentElement.getAttribute('data-theme') === 'light';
+    const el = document.getElementById('themeLabel');
+    if (el) {
+        el.textContent = light ? '浅色' : '深色';
+    }
+}
+
 function toggleTheme() {
     const cur = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
     const next = cur === 'light' ? 'dark' : 'light';
     document.documentElement.setAttribute('data-theme', next);
     try { localStorage.setItem(LS_THEME, next); } catch (e) {}
+    paintThemeUi();
 }
+
+function openSettings() {
+    document.getElementById('settingsModal')?.classList.add('show');
+    paintThemeUi();
+}
+
+function closeSettings() {
+    document.getElementById('settingsModal')?.classList.remove('show');
+}
+
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+        closeSettings();
+    }
+});
+paintThemeUi();
 
 /* =========================================================================
    FILE / DRAG
@@ -2131,15 +2276,125 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeLight
    SCROLL-TO-BOTTOM BUTTON
    ========================================================================= */
 const $scrollBtn = document.getElementById('scrollBtn');
+const $main = document.querySelector('.main');
+
+function innerCanScroll(el, deltaY) {
+    if (!el || el.scrollHeight <= el.clientHeight + 1) {
+        return false;
+    }
+    if (deltaY < 0) {
+        return el.scrollTop > 0;
+    }
+    return el.scrollTop + el.clientHeight < el.scrollHeight - 1;
+}
+
 $msg.addEventListener('scroll', () => {
     stickToBottom = $msg.scrollHeight - $msg.scrollTop - $msg.clientHeight < SCROLL_BOTTOM_PX;
     $scrollBtn.classList.toggle('visible', !stickToBottom);
+    scheduleTaskPinUpdate();
 
     // Infinite scroll: load older messages when scrolling to top
     if ($msg.scrollTop < 100 && window._msgHasMore && !window._msgLoading && currentId) {
         loadMoreMessages(currentId, true);
     }
 });
+
+// 任务条 / 输入框不在 #messages 里，滚轮落在上面时原先滚不动对话。
+// 往上滚立刻松吸底，避免流式 scrollToBottom 把人拽回去。
+$main.addEventListener('wheel', (e) => {
+    if (e.deltaY < 0) {
+        stickToBottom = false;
+    }
+    if (e.target.closest('textarea, input, select')) {
+        return;
+    }
+    const inner = e.target.closest('.think-body, .plan-row .todo-panel');
+    if (innerCanScroll(inner, e.deltaY)) {
+        return;
+    }
+    if ($msg.contains(e.target)) {
+        return;
+    }
+    $msg.scrollTop += e.deltaY;
+}, { passive: true });
+$msg.addEventListener('touchmove', () => { stickToBottom = false; }, { passive: true });
+
+/* =========================================================================
+   顶部任务条（task pin）
+   -------------------------------------------------------------------------
+   命中规则：取「顶边已经滚过消息区上沿」的最后一条 .user-row。
+   之所以用「最后一条滚过上沿的」而不是「离上沿最近的」：
+   后者会在两条用户消息的交界处来回跳，前者只会单向替换，滚动时稳定。
+
+   重算时机：滚动 / $msg 内容变化（流式追加、历史 prepend、会话切换）/
+             窗口缩放。全部经 rAF 合并，一次滚动只算一帧。
+   ========================================================================= */
+const $taskPin     = document.getElementById('taskPin');
+const $taskPinIdx  = document.getElementById('taskPinIdx');
+const $taskPinText = document.getElementById('taskPinText');
+
+let _pinRows      = null;  // .user-row 缓存
+let _pinRowsStamp = -1;    // 缓存对应的 $msg.childElementCount
+let _pinCurrent   = null;  // 当前命中的 row
+let _pinCount     = -1;    // 当前命中时的任务总数
+let _pinRaf       = 0;
+
+/** 取 .user-row 列表；子节点数变了才重新 query，避免每次滚动都扫 DOM */
+function pinRows() {
+    const stamp = $msg.childElementCount;
+    if (!_pinRows || stamp !== _pinRowsStamp) {
+        _pinRows = Array.from($msg.querySelectorAll('.user-row'));
+        _pinRowsStamp = stamp;
+        _pinCurrent = null;
+        _pinCount = -1;
+    }
+    return _pinRows;
+}
+
+function scheduleTaskPinUpdate() {
+    if (_pinRaf) return;
+    _pinRaf = requestAnimationFrame(() => { _pinRaf = 0; updateTaskPin(); });
+}
+
+function updateTaskPin() {
+    const rows = pinRows();
+    if (!rows.length) {
+        _pinCurrent = null; _pinCount = -1;
+        $taskPin.classList.remove('show');
+        return;
+    }
+
+    // 只读一次布局：首次 getBoundingClientRect 触发布局，后续读都是命中缓存的
+    const top = $msg.getBoundingClientRect().top;
+    let hit = null, hitIdx = -1;
+    for (let i = 0; i < rows.length; i++) {
+        if (rows[i].getBoundingClientRect().top <= top + 8) { hit = rows[i]; hitIdx = i; }
+        else break;   // 块级布局里 top 单调递增，可提前退出
+    }
+    // 首条用户消息都还没滚过（如刚 prepend 完老消息），退化为第一条
+    if (!hit) { hit = rows[0]; hitIdx = 0; }
+
+    if (hit === _pinCurrent && rows.length === _pinCount) return;
+
+    _pinCurrent = hit;
+    _pinCount = rows.length;
+    const label = hit.dataset.task || '';
+    $taskPinIdx.textContent = (hitIdx + 1) + '/' + rows.length;
+    $taskPinText.textContent = label || '（本条无文本，仅附件）';
+    $taskPin.title = (label ? '任务：' + label + '\n' : '') + '点击定位到该任务';
+    $taskPin.classList.add('show');
+}
+
+/** 点击任务条 → 把该条用户消息滚到消息区顶部 */
+function taskPinJump() {
+    if (!_pinCurrent) return;
+    _pinCurrent.scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
+// 内容变化即重算（流式增量写的是 bot-body 的文本节点，所以必须监听 characterData）
+new MutationObserver(scheduleTaskPinUpdate)
+    .observe($msg, { childList: true, subtree: true, characterData: true });
+window.addEventListener('resize', scheduleTaskPinUpdate);
 
 // ---- 角色选择器 ----
 function toggleRoleMenu() {
@@ -2215,27 +2470,6 @@ let modelConfigState = {
     customModelName: '',
     hasCustomApiKey: false
 };
-
-function toggleModelMenu(e) {
-    if (e) e.stopPropagation();
-    const menu = document.getElementById('modelMenu');
-    const opening = !menu.classList.contains('show');
-    menu.classList.toggle('show');
-    document.getElementById('roleMenu')?.classList.remove('show');
-    document.getElementById('permMenu')?.classList.remove('show');
-    document.getElementById('confirmMenu')?.classList.remove('show');
-    if (opening) {
-        setTimeout(() => {
-            document.addEventListener('click', closeModelMenuOnOutside, { once: true });
-        }, 0);
-    }
-}
-
-function closeModelMenuOnOutside(ev) {
-    const wrap = document.querySelector('.model-badge-wrap');
-    if (wrap && wrap.contains(ev.target)) return;
-    document.getElementById('modelMenu')?.classList.remove('show');
-}
 
 function selectModelPreset(presetId) {
     modelConfigState.presetId = presetId || 'default';
@@ -2321,7 +2555,6 @@ async function saveModelConfig() {
             return;
         }
         applyModelConfigView(data);
-        document.getElementById('modelMenu').classList.remove('show');
     } catch (e) {
         document.getElementById('modelMenuHint').textContent = '保存失败: ' + e.message;
     }
@@ -2336,7 +2569,6 @@ async function resetModelConfig() {
         });
         const data = await resp.json();
         applyModelConfigView(data);
-        document.getElementById('modelMenu').classList.remove('show');
     } catch (e) {
         document.getElementById('modelMenuHint').textContent = '恢复失败: ' + e.message;
     }
@@ -2358,7 +2590,6 @@ function togglePermMenu() {
     const menu = document.getElementById('permMenu');
     menu.classList.toggle('show');
     document.getElementById('roleMenu')?.classList.remove('show');
-    document.getElementById('modelMenu')?.classList.remove('show');
     document.getElementById('confirmMenu')?.classList.remove('show');
     if (menu.classList.contains('show')) {
         setTimeout(() => document.addEventListener('click', closePermMenuOutside, { once: true }), 0);
@@ -2413,15 +2644,19 @@ async function approvePlan() {
         alert('批准失败: ' + e.message);
     }
 }
-function showAskModal(tool) {
+function showAskModal(tool, display) {
     pendingAskTool = tool;
     const labels = {
         exec_command: '终端命令执行',
         http_post: '发送 HTTP POST 请求'
     };
     const label = labels[tool] || tool;
+    // 只说「终端命令执行」，用户不知道这条命令要干什么，只能盲批。
+    // 有 display 就把它摊开说清楚。
+    const detail = display ? '本次调用：' + display + '。' : '';
     document.getElementById('askModalText').textContent =
-        'Agent 需要「' + label + '」才能继续当前步骤。批准后本会话可再次使用该能力。'
+        'Agent 需要「' + label + '」才能继续当前步骤。' + detail
+        + '批准后本会话可再次使用该能力。'
         + '（点批准，不要只点步骤里的「确认并继续」。）';
     document.getElementById('askModal').classList.add('show');
 }
@@ -2451,7 +2686,50 @@ async function grantAskTool() {
     if (isStreaming) return;
     await new Promise(r => setTimeout(r, 200));
     if (isStreaming) return;
-    const text = '已批准「' + tool + '」，请继续执行。';
+    const text = '【系统】已批准「' + tool + '」，请继续执行。';
+    document.getElementById('welcomeScreen')?.remove();
+    renderUserMsg(text, null, 0, []);
+    addMsgToConv('user', text, null, null);
+    const botBody = renderBotMsg(
+        '<div class="typing-dots"><span></span><span></span><span></span></div>', true);
+    setStreaming(true);
+    sendChatPost(text, currentId, [], [], botBody);
+}
+
+function showUserQuestionModal(payload) {
+    const q = payload && payload.question ? String(payload.question) : '';
+    const options = Array.isArray(payload && payload.options) ? payload.options : [];
+    document.getElementById('questionModalText').textContent =
+        q || '需要你补充一点信息才能继续。';
+    const box = document.getElementById('questionModalOptions');
+    box.innerHTML = '';
+    options.forEach((opt) => {
+        const label = String(opt || '').trim();
+        if (!label) return;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'ask-allow';
+        btn.textContent = label;
+        btn.onclick = () => answerUserQuestion(label);
+        box.appendChild(btn);
+    });
+    document.getElementById('questionModal').classList.add('show');
+}
+
+function dismissQuestionModal() {
+    document.getElementById('questionModal').classList.remove('show');
+}
+
+async function answerUserQuestion(text) {
+    dismissQuestionModal();
+    if (!text || !currentId) return;
+    const deadline = Date.now() + 90000;
+    while (isStreaming && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 150));
+    }
+    if (isStreaming) return;
+    await new Promise(r => setTimeout(r, 200));
+    if (isStreaming) return;
     document.getElementById('welcomeScreen')?.remove();
     renderUserMsg(text, null, 0, []);
     addMsgToConv('user', text, null, null);
@@ -2468,7 +2746,6 @@ function toggleConfirmMenu() {
     menu.classList.toggle('show');
     document.getElementById('permMenu')?.classList.remove('show');
     document.getElementById('roleMenu')?.classList.remove('show');
-    document.getElementById('modelMenu')?.classList.remove('show');
     if (menu.classList.contains('show')) {
         setTimeout(() => document.addEventListener('click', closeConfirmMenuOutside, { once: true }), 0);
     }
@@ -2575,7 +2852,9 @@ async function confirmTodoAndContinue(id) {
 
 function scrollToBottom(smooth = false, force = false) {
     if (!force && !stickToBottom) return;
-    stickToBottom = true;
+    if (force) {
+        stickToBottom = true;
+    }
     $msg.scrollTo({ top: $msg.scrollHeight, behavior: smooth ? 'smooth' : 'instant' });
 }
 
@@ -2805,6 +3084,7 @@ async function loadMoreMessages(sessionId, prepend) {
 function buildUserRow(text, images = []) {
     const row = document.createElement('div');
     row.className = 'msg-row user-row';
+    row.dataset.task = text || '';   // 同上，历史 prepend 路径
     const imgs = Array.isArray(images) ? images.filter(Boolean) : [];
     const imgHtml = imgs[0]
         ? `<img src="${escA(imgs[0])}" alt="上传图片">`
@@ -3342,6 +3622,13 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 } catch (_) {
                     if (data) showAskModal(String(data));
                 }
+            } else if (name === 'user_question') {
+                try {
+                    const payload = typeof data === 'string' ? JSON.parse(data) : data;
+                    showUserQuestionModal(payload);
+                } catch (_) {
+                    showUserQuestionModal({ question: String(data || ''), options: [] });
+                }
             } else if (name === 'session') { /* 忽略 */
             } else if (name === 'append_ack') { /* 已在 appendUserMessage 处理 */ }
         }
@@ -3455,6 +3742,7 @@ function addMsgToConv(role, text, html, imgSrc) {
 function renderUserMsg(text, imgSrc, imgCount = imgSrc ? 1 : 0, fileNames = [], isInject = false) {
     const row = document.createElement('div');
     row.className = 'msg-row user-row';
+    row.dataset.task = text || '';   // 顶部任务条读这里，避免从 DOM 反推被图片/附件污染
     const moreCount = imgCount > 1 ? `<div style="font-size:11px;color:var(--text2);margin-top:4px">附 ${imgCount} 张图片</div>` : '';
     const fileList = fileNames.length > 0 ? `<div style="font-size:11px;color:var(--text2);margin-top:4px">附文件: ${fileNames.map(esc).join(', ')}</div>` : '';
     const injectBadge = isInject ? `<span style="font-size:10px;background:var(--accent);color:#fff;padding:1px 6px;border-radius:8px;margin-right:6px;vertical-align:middle">补充</span>` : '';
@@ -3537,7 +3825,20 @@ function balancedUrl(s, open) {
     return null;
 }
 
-function parseImgBang(s) {
+/**
+ * `![alt](url)` → 图片或音频。
+ *
+ * 同一个 markdown 语法承担两种交付物：图片出 <img>，音频出 <audio controls>。
+ * 判据只看 URL 扩展名（复用上传校验用的 AUDIO_EXTS，避免两套扩展名清单漂移），
+ * 所以 song_generate 返回的 `![生成的歌曲](/api/generated-media/<owner>/xxx.mp3)`
+ * 会渲染成播放器；以前一律拼 <img>，音频就变成一张碎图。
+ */
+function isAudioUrl(url) {
+    const clean = String(url).split('?')[0].split('#')[0];
+    return AUDIO_EXTS.has(fileExt(clean));
+}
+
+function parseMediaBang(s) {
     let out = '', i = 0;
     while (i < s.length) {
         const p = s.indexOf('![', i);
@@ -3551,7 +3852,11 @@ function parseImgBang(s) {
         const url = u.url.replace(/&amp;/g, '&');
         if (!/^https?:\/\//i.test(url) && !/^\/api\/generated-media\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/i.test(url) && !/^\/api\/conversation-media\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/i.test(url) && !/^data:image\//i.test(url))
             { out += s.slice(p, u.end + 1); i = u.end + 1; continue; }
-        out += `<img src="${escA(url)}" alt="${escA(alt)}" referrerpolicy="no-referrer" loading="lazy">`;
+        if (isAudioUrl(url)) {
+            out += `<audio controls preload="metadata" src="${escA(url)}"></audio>`;
+        } else {
+            out += `<img src="${escA(url)}" alt="${escA(alt)}" referrerpolicy="no-referrer" loading="lazy">`;
+        }
         i = u.end + 1;
     }
     return out;
@@ -3638,7 +3943,7 @@ function renderMD(t) {
         return html;
     });
 
-    t = parseImgBang(t);
+    t = parseMediaBang(t);
     t = parseBracketImg(t, '图片');
     t = parseLinks(t);
     t = t.replace(/^- (.+)$/gm, '<li>$1</li>');

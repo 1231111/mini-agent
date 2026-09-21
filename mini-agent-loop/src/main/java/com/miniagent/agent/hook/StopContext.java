@@ -18,5 +18,18 @@ public record StopContext(
         boolean requiresStructuredPlan,
         boolean subagent,
         PermissionMode permissionMode,
-        boolean planApproved
-) {}
+        boolean planApproved,
+        boolean lightQa,
+        boolean plannerOwned,
+        boolean hasTodoPlan,
+        boolean runnableIncomplete,
+        int missingPlanNudges,
+        int incompleteNudges,
+        String todoRender
+) {
+    public StopContext {
+        toolsInvoked = toolsInvoked == null ? Set.of() : Set.copyOf(toolsInvoked);
+        finalText = finalText == null ? "" : finalText;
+        todoRender = todoRender == null ? "" : todoRender;
+    }
+}

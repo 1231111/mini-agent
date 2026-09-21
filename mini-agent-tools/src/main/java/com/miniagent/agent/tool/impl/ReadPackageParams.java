@@ -12,7 +12,7 @@ import lombok.EqualsAndHashCode;
 @EqualsAndHashCode(callSuper = true)
 public class ReadPackageParams extends ToolParams {
 
-    @ToolParamSchema(description = "Java包名，如 com.miniagent.agent.intent", required = true)
+    @ToolParamSchema(description = "Java包名，如 com.miniagent.agent.task", required = true)
     private String packageName;
 
     @ToolParamSchema(description = "每个文件最大字符数（默认8000）", defaultValue = "8000")

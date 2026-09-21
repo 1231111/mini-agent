@@ -1,41 +1,30 @@
 package com.miniagent.agent.context;
 
-import com.miniagent.agent.intent.IntentType;
-import com.miniagent.agent.intent.TaskPlan;
+import com.miniagent.agent.scope.TaskBoundary;
+import com.miniagent.agent.scope.TaskScopeRegistry;
+import com.miniagent.agent.task.TaskPlan;
+import com.miniagent.agent.task.TaskSignals;
 import com.miniagent.common.RunStatus;
-import com.miniagent.agent.skill.SkillStore;
 import com.miniagent.agent.todo.TaskTodoStore;
-import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.agent.trace.TraceRecorder;
-import com.miniagent.application.PromptTemplates;
-import com.miniagent.memory.MemoryManager;
-import com.miniagent.memory.MemoryStore;
-import com.miniagent.memory.model.AgentContext;
-import com.miniagent.memory.model.MemoryContext;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.UserMessage;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
 /**
- * 上下文加载器：每次调模型前按意图裁剪并加载上下文。
- * 无会话级可变字段；todo/memory 仍读共享存储（多副本一致性见 TaskTodoStore / MemoryStore）。
+ * 每轮按本轮观察到的事实裁历史、释放上一任务的活动计划，
+ * 并把 system prompt 交给 {@link ContextBuilder}。
  */
 @Component
 @Slf4j
@@ -44,21 +33,23 @@ public class ContextLoader {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     @Autowired
-    private MemoryStore memoryStore;
-    @Autowired(required = false)
-    private MemoryManager memoryManager;
-    @Autowired
-    private SkillStore skillStore;
-    @Autowired
     private TaskTodoStore taskTodoStore;
     @Autowired
-    private ToolRegistry toolRegistry;
+    private TaskScopeRegistry taskScopeRegistry;
     @Autowired(required = false)
     private TraceRecorder traceRecorder;
     @Autowired
     private ContextHistorySelector historySelector;
+    @Autowired
+    private ContextBuilder contextBuilder;
 
-    @Value("${agent.context.history.question:0}")
+    /**
+     * 问答轮（无动手信号）保留的历史条数。
+     *
+     * <p>这里必须是个正数。给 0 会把整段历史清空，模型连上一轮在谈什么都不知道，
+     * 跨轮追问必然答错。历史没带够只会让回答变浅，带成 0 是直接答不出来。</p>
+     */
+    @Value("${agent.context.history.question:6}")
     private int historyQuestion;
     @Value("${agent.context.history.question-with-ref:6}")
     private int historyQuestionWithRef;
@@ -66,28 +57,25 @@ public class ContextLoader {
     private int historyRefScanMax;
     @Value("${agent.context.history.ref-pronoun-anchor:4}")
     private int historyRefPronounAnchor;
-    @Value("${agent.context.history.review:4}")
-    private int historyReview;
-    @Value("${agent.context.history.new-task:6}")
-    private int historyNewTask;
-    @Value("${agent.context.history.continue:-1}")
-    private int historyContinue;
-    @Value("${agent.context.history.image:-1}")
-    private int historyImage;
-    @Value("${agent.context.history.default:-1}")
-    private int historyDefault;
 
-    public LoadedContext load(String sessionId, String query, TaskPlan taskPlan, List<ChatMessage> memMsgs) {
-        IntentType intent = Objects.isNull(taskPlan) ? null : taskPlan.intent();
+    /**
+     * @param hasMedia 本轮用户消息是否带图片/音视频。只影响「点评轮」那段附加提示词，
+     *                 不影响历史条数、todo 挂起与工具清单。
+     */
+    public LoadedContext load(String sessionId, String query, boolean hasMedia,
+                              TaskPlan taskPlan, List<ChatMessage> memMsgs) {
+        TaskSignals signals = Objects.isNull(taskPlan) ? TaskSignals.NONE : taskPlan.signals();
         ContextReferenceDecision ref = ContextReference.detect(query);
-        ContextIntentPolicy policy = resolvePolicy(intent, ref);
+        ContextLoadPolicy policy = resolvePolicy(signals, ref);
 
         boolean suspended = false;
         boolean resumed = false;
+        TaskBoundary boundary = TaskBoundary.SAME;
+        String boundaryReason = "same-task";
         if (Objects.nonNull(sessionId)) {
+            // 轻问答不碰 todo；正在等人工确认时也不释放，否则用户答复会被自己的挂起吃掉
             boolean waitingHuman = taskTodoStore.hasAwaitingConfirm(sessionId)
-                    && intent != IntentType.QUESTION
-                    && intent != IntentType.REVIEW;
+                    && !signals.lightTurn();
             if (waitingHuman) {
                 log.info("ContextLoader: 跳过 suspend，保留 awaiting_confirm session={}",
                         sessionId);
@@ -99,14 +87,30 @@ public class ContextLoader {
                     suspended = taskTodoStore.suspendActive(sessionId);
                 }
             }
+            if (resumed) {
+                // 用户明确说「继续」→ 回到被挂起的那个任务，图按它自己的键取得到
+                boundary = TaskBoundary.RESUME;
+                boundaryReason = "todo-resumed";
+            } else if (suspended) {
+                // 上一任务的工作集被释放 → 开新任务。挂起的旧任务留在自己的键上，
+                // 用户说「继续」还能回来；归档的旧任务已终态，没有可回的东西。
+                boundary = TaskBoundary.NEW;
+                boundaryReason = taskTodoStore.hasSuspended(sessionId)
+                        ? "prev-plan-suspended" : "prev-plan-archived";
+            }
         }
+        String scopeKey = Objects.isNull(sessionId)
+                ? null
+                : taskScopeRegistry.resolve(sessionId, boundary, boundaryReason).scopeKey();
 
         List<ChatMessage> history = selectHistory(sessionId, memMsgs, query, policy, ref);
-        Set<String> toolsForPrompt = toolsForPrompt(taskPlan);
-        String systemPrompt = buildSystemPrompt(sessionId, query, policy, toolsForPrompt, ref);
+        String systemPrompt = contextBuilder.build(new ContextBuildContext(
+                sessionId, query, policy, Set.of(), ref, taskPlan, hasMedia));
 
         Map<String, Object> info = new HashMap<>();
-        info.put("intent", Objects.isNull(intent) ? "null" : String.valueOf(intent));
+        info.put("signals", signals.describe());
+        info.put("lightTurn", signals.lightTurn());
+        info.put("hasMedia", hasMedia);
         info.put("hasReference", ref.hasReference());
         info.put("referenceNegated", ref.isNegated());
         info.put("referenceConfidence", ref.confidence());
@@ -120,7 +124,10 @@ public class ContextLoader {
         info.put("injectSkills", policy.injectSkills());
         info.put("todoSuspended", suspended);
         info.put("todoResumed", resumed);
-        info.put("toolGuidanceCount", toolsForPrompt.size());
+        info.put("scopeKey", scopeKey);
+        info.put("taskBoundary", boundary.name());
+        info.put("boundaryReason", boundaryReason);
+        info.put("toolGuidanceCount", 0);
 
         if (Objects.nonNull(traceRecorder) && Objects.nonNull(sessionId)) {
             try {
@@ -131,47 +138,46 @@ public class ContextLoader {
             }
         }
 
-        log.info("ContextLoader: intent={}, ref={}/neg={}/conf={}, history={}/{}, todoInject={}, suspended={}, resumed={}",
-                info.get("intent"), ref.hasReference(), ref.isNegated(), ref.confidence(),
+        log.info("ContextLoader: signals=[{}], lightTurn={}, ref={}/neg={}/conf={}, "
+                        + "history={}/{}, todoInject={}, suspended={}, resumed={}, "
+                        + "scope={}/{}, tools={}",
+                signals.describe(), signals.lightTurn(),
+                ref.hasReference(), ref.isNegated(), ref.confidence(),
                 history.size(), policy.historyMaxMessages(),
-                policy.injectTodo(), suspended, resumed);
+                policy.injectTodo(), suspended, resumed,
+                scopeKey, boundaryReason, 0);
 
-        return new LoadedContext(systemPrompt, history, policy, info);
+        return new LoadedContext(systemPrompt, history, policy, scopeKey, info);
     }
 
-    /** 基线策略 + 配置条数 + QUESTION 指代补历史 */
-    ContextIntentPolicy resolvePolicy(IntentType intent, ContextReferenceDecision ref) {
-        ContextIntentPolicy base = ContextIntentPolicy.forIntent(intent);
-        IntentType t = intent == null ? IntentType.NEW_TASK : intent;
-        boolean loadRef = ref != null && ref.shouldLoadPriorHistory();
-        int hist = switch (t) {
-            case QUESTION -> loadRef ? historyQuestionWithRef : historyQuestion;
-            case REVIEW -> historyReview;
-            case NEW_TASK -> historyNewTask;
-            case CONTINUE_TASK -> historyContinue;
-            case IMAGE_GENERATION -> historyImage;
-            case HISTORY_REFERENCE -> historyQuestionWithRef;
-            default -> historyDefault;
-        };
-        ContextIntentPolicy p = base.withHistoryMaxMessages(hist);
-        if (t == IntentType.QUESTION && loadRef) {
-            // 指代追问：相关历史精捞 + 记忆/中期，仍不注入旧 todo
-            p = p.withInjectMemory(true).withInjectMidterm(true);
+    ContextLoadPolicy resolvePolicy(TaskSignals signals, ContextReferenceDecision ref) {
+        TaskSignals s = signals == null ? TaskSignals.NONE : signals;
+        ContextLoadPolicy base = ContextLoadPolicy.forSignals(s);
+        if (!s.lightTurn()) {
+            return base;
         }
-        return p;
+        boolean loadRef = ref != null && ref.shouldLoadPriorHistory();
+        ContextLoadPolicy p = base.withHistoryMaxMessages(
+                loadRef ? historyQuestionWithRef : historyQuestion);
+        return loadRef ? p.withInjectMemory(true) : p;
     }
 
-    private List<ChatMessage> selectHistory(String sessionId, List<ChatMessage> all, String query,
-                                            ContextIntentPolicy policy, ContextReferenceDecision ref) {
+    List<ChatMessage> selectHistory(String sessionId, List<ChatMessage> all, String query,
+                                    ContextLoadPolicy policy,
+                                    ContextReferenceDecision ref) {
         int maxKeep = policy.historyMaxMessages();
         if (Objects.isNull(all) || all.isEmpty() || maxKeep == 0) {
             return List.of();
         }
-        // QUESTION 指代：持久化向量检索 / 扫描窗精捞，禁止盲目最近 N
         if (ref != null && ref.shouldLoadPriorHistory() && maxKeep > 0) {
             return historySelector.selectRelevant(
-                    sessionId, all, query, ref, maxKeep, historyRefScanMax, historyRefPronounAnchor);
+                    sessionId, all, query, ref, maxKeep, historyRefScanMax,
+                    historyRefPronounAnchor);
         }
+        // 任务级隔离现在由作用域键负责（规划图/压缩摘要按 scopeKey 取），
+        // 这里不再按「任务边界」截断历史。原因：跨轮追问必须看得见上一轮在谈什么，
+        // 把历史砍掉是拿「答不出来」换「不污染」，方向错了 ——
+        // 硬污染（用户的新问题被旧规划图接管）由 Planner 侧的接管判据解决。
         if (maxKeep < 0 || maxKeep >= all.size()) {
             return new ArrayList<>(all);
         }
@@ -183,175 +189,5 @@ public class ContextLoader {
             start = all.size() - maxKeep;
         }
         return new ArrayList<>(all.subList(start, all.size()));
-    }
-
-    private Set<String> toolsForPrompt(TaskPlan taskPlan) {
-        Set<String> registered = getAvailableToolNames();
-        if (Objects.isNull(taskPlan) || Objects.isNull(taskPlan.allowedTools())) {
-            return registered;
-        }
-        Set<String> allowed = new LinkedHashSet<>(taskPlan.allowedTools());
-        Set<String> out = new LinkedHashSet<>();
-        for (String n : registered) {
-            if (allowed.contains(n)) {
-                out.add(n);
-            }
-        }
-        return out;
-    }
-
-    private String buildSystemPrompt(String sessionId, String currentQuery,
-                                     ContextIntentPolicy policy, Set<String> toolNames,
-                                     ContextReferenceDecision ref) {
-        List<String> parts = new ArrayList<>();
-        parts.add(PromptTemplates.identity());
-        parts.add(PromptTemplates.AUTHORITY);
-        if (ref != null && ref.shouldLoadPriorHistory()) {
-            parts.add("以下消息中可能夹带按相关度检索到的历史片段，仅供指代消解参考；"
-                    + "若与当前问题无关请忽略，勿编造未出现的报告/数据。");
-        }
-
-        String memoryBlock = memoryStore.getSnapshotForQuery(
-                currentQuery,
-                policy.injectMemory(),
-                policy.injectUser(),
-                policy.injectMidterm(),
-                policy.userMaxChars());
-        if (StringUtils.isNotBlank(memoryBlock)) {
-            parts.add(memoryBlock);
-        }
-
-        // 注入 Agent 记忆系统上下文（情景记忆、语义事实、SOP、工作记忆）
-        if (memoryManager != null && Objects.nonNull(sessionId)) {
-            try {
-                AgentContext agentCtx = new AgentContext();
-                agentCtx.setTenantId("default");
-                agentCtx.setUserId(String.valueOf(MemoryStore.getCurrentUser()));
-                agentCtx.setSessionId(sessionId);
-                agentCtx.setGoal(currentQuery);
-                MemoryContext memCtx = memoryManager.buildContext(agentCtx);
-                if (memCtx != null && !memCtx.isEmpty()) {
-                    parts.add(buildAgentMemoryBlock(memCtx));
-                }
-            } catch (Exception e) {
-                log.debug("Agent 记忆注入失败: {}", e.getMessage());
-            }
-        }
-
-        if (policy.injectSkills()) {
-            String skillSummary = skillStore.getSkillListSummary();
-            if (StringUtils.isNotBlank(skillSummary)) {
-                parts.add(skillSummary);
-            }
-        }
-
-        parts.add(PromptTemplates.REASONING);
-        parts.add(PromptTemplates.COMPLETION);
-
-        if (toolNames.contains("read_file")) {
-            parts.add(PromptTemplates.FILE_GUIDANCE);
-        }
-        if (toolNames.contains("search_code") || toolNames.contains("edit_file")) {
-            parts.add(PromptTemplates.CODE_TOOLS_GUIDANCE);
-        }
-        if (toolNames.contains("delegate_task")) {
-            parts.add(PromptTemplates.REASONING_STRATEGY);
-        }
-        if (!toolNames.isEmpty()) {
-            parts.add(PromptTemplates.BEHAVIOR);
-        }
-        if (toolNames.contains("browser_navigate")) {
-            parts.add(PromptTemplates.BROWSER_GUIDANCE);
-        }
-        if (toolNames.contains("web_search")) {
-            parts.add(PromptTemplates.WEB_SEARCH_GUIDANCE);
-        }
-        if (toolNames.contains("comfyui_status")) {
-            parts.add(PromptTemplates.COMFYUI_GUIDANCE);
-        }
-        if (toolNames.contains("image_generate") && !toolNames.contains("comfyui_status")) {
-            parts.add(PromptTemplates.IMAGE_GENERATE_GUIDANCE);
-        }
-        if (toolNames.contains("memory")) {
-            parts.add(PromptTemplates.MEMORY_GUIDANCE);
-        }
-        if (toolNames.contains("todo") || toolNames.contains("delegate_task")) {
-            parts.add(PromptTemplates.PLANNING_GUIDANCE);
-        }
-        if (toolNames.contains("delegate_task")) {
-            parts.add(PromptTemplates.ROLE_DELEGATION_GUIDANCE);
-        }
-        if (toolNames.contains("write_file") && toolNames.contains("exec_command")) {
-            parts.add(PromptTemplates.VERIFICATION_GUIDANCE);
-        }
-
-        if (policy.injectTodo() && Objects.nonNull(sessionId)) {
-            String todoBlock = taskTodoStore.render(sessionId);
-            if (StringUtils.isNotBlank(todoBlock)) {
-                parts.add(todoBlock);
-            }
-        }
-
-        parts.add(PromptTemplates.CONFIRMATION);
-        parts.add(PromptTemplates.OUTPUT);
-        String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy年MM月dd日 HH:mm:ss"));
-        parts.add("当前时间：" + now);
-
-        return String.join("\n\n", parts);
-    }
-
-    private Set<String> getAvailableToolNames() {
-        try {
-            return new HashSet<>(toolRegistry.getToolNames());
-        } catch (Exception e) {
-            return Collections.emptySet();
-        }
-    }
-
-    /** 将 Agent 记忆上下文格式化为 system prompt 片段 */
-    private String buildAgentMemoryBlock(MemoryContext ctx) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("## Agent 记忆\n");
-
-        if (ctx.getWorkingMemory() != null && ctx.getWorkingMemory().getGoal() != null) {
-            sb.append("当前任务: ").append(ctx.getWorkingMemory().getGoal()).append("\n");
-            if (ctx.getWorkingMemory().getCurrentTaskId() != null) {
-                sb.append("当前步骤: ").append(ctx.getWorkingMemory().getCurrentTaskId()).append("\n");
-            }
-        }
-
-        if (!ctx.getFacts().isEmpty()) {
-            sb.append("\n已知事实:\n");
-            for (String f : ctx.getFacts()) {
-                sb.append("- ").append(f).append("\n");
-            }
-        }
-
-        if (!ctx.getEpisodes().isEmpty()) {
-            sb.append("\n历史经验:\n");
-            for (var ep : ctx.getEpisodes()) {
-                sb.append("- ").append(ep.getTaskSummary());
-                if (ep.getResolution() != null) {
-                    sb.append(" → ").append(ep.getResolution());
-                }
-                sb.append("\n");
-            }
-        }
-
-        if (!ctx.getSkills().isEmpty()) {
-            sb.append("\n可用方法:\n");
-            for (String s : ctx.getSkills()) {
-                sb.append("- ").append(s).append("\n");
-            }
-        }
-
-        if (!ctx.getPreferences().isEmpty()) {
-            sb.append("\n用户偏好:\n");
-            for (String p : ctx.getPreferences()) {
-                sb.append("- ").append(p).append("\n");
-            }
-        }
-
-        return sb.toString().trim();
     }
 }

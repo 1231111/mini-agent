@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.memory.entity.AgentWorkingMemoryEntity;
 import com.miniagent.agent.memory.repository.AgentWorkingMemoryRepository;
 import com.miniagent.memory.model.WorkingMemory;
+import com.miniagent.replica.ReplicaProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -25,13 +26,16 @@ public class WorkingMemoryManager {
 
     private static final Logger log = LoggerFactory.getLogger(WorkingMemoryManager.class);
     private static final String REDIS_PREFIX = "wm:";
-    private static final long TTL_HOURS = 24;
+    private static final long FALLBACK_TTL_SECONDS = 86400;
 
     @Autowired
     private AgentWorkingMemoryRepository repository;
 
     @Autowired(required = false)
     private StringRedisTemplate redisTemplate;
+
+    @Autowired(required = false)
+    private ReplicaProperties replicaProperties;
 
     @Autowired
     private ObjectMapper objectMapper;
@@ -71,7 +75,9 @@ public class WorkingMemoryManager {
         if (redisTemplate != null) {
             try {
                 String json = objectMapper.writeValueAsString(wm);
-                redisTemplate.opsForValue().set(REDIS_PREFIX + wm.getSessionId(), json, TTL_HOURS, TimeUnit.HOURS);
+                redisTemplate.opsForValue().set(
+                        REDIS_PREFIX + wm.getSessionId(), json,
+                        cacheTtlSeconds(), TimeUnit.SECONDS);
             } catch (Exception e) {
                 log.debug("Redis 写入工作记忆失败: {}", e.getMessage());
             }
@@ -128,6 +134,30 @@ public class WorkingMemoryManager {
         }
 
         save(existing);
+    }
+
+    /**
+     * 巩固成功后续上 Redis 缓存 TTL。MySQL 是真相源，到期只丢缓存不丢 goal。
+     */
+    public void touch(String sessionId) {
+        if (redisTemplate == null || sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        try {
+            String key = REDIS_PREFIX + sessionId;
+            Boolean exists = redisTemplate.hasKey(key);
+            if (Boolean.TRUE.equals(exists)) {
+                redisTemplate.expire(key, cacheTtlSeconds(), TimeUnit.SECONDS);
+            }
+        } catch (Exception e) {
+            log.debug("Redis 续期工作记忆失败: {}", e.getMessage());
+        }
+    }
+
+    long cacheTtlSeconds() {
+        long seconds = replicaProperties == null
+                ? FALLBACK_TTL_SECONDS : replicaProperties.getMemoryTtlSeconds();
+        return seconds > 0 ? seconds : FALLBACK_TTL_SECONDS;
     }
 
     /**

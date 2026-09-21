@@ -52,7 +52,7 @@ class MemoryStoreProductionTest {
     }
 
     @Test
-    void 同会话内add后快照不刷新_注入仍读旧内容() {
+    void 同会话内add后快照立即可见() {
         MemoryStore.setCurrentUser(100L);
         store.loadFromDisk();
         String emptySnapshot = store.getMemorySnapshot();
@@ -60,21 +60,19 @@ class MemoryStoreProductionTest {
 
         store.add("memory", "第一轮已知事实");
         assertTrue(store.readEntries("memory").stream().anyMatch(s -> s.contains("第一轮")));
-        assertFalse(store.getMemorySnapshot().contains("第一轮"),
-                "BUG: add 落盘后 memorySnapshot 未重建，readEntries 与注入快照不一致");
+        assertTrue(store.getMemorySnapshot().contains("第一轮"),
+                "add 后应重建 memorySnapshot，同轮 retrieve 可见");
 
         Map<String, Object> addResult = store.add("memory", "第二轮新增事实");
         assertTrue((Boolean) addResult.get("success"));
         assertEquals(2, store.readEntries("memory").size());
 
         String snapshotAfterAdd = store.getMemorySnapshot();
-        assertFalse(snapshotAfterAdd.contains("第一轮已知事实"));
-        assertFalse(snapshotAfterAdd.contains("第二轮新增事实"),
-                "BUG: 同会话多次 add 后注入快照仍为空/旧值");
+        assertTrue(snapshotAfterAdd.contains("第一轮已知事实"));
+        assertTrue(snapshotAfterAdd.contains("第二轮新增事实"));
 
         String querySnapshot = store.getSnapshotForQuery("第二轮");
-        assertFalse(querySnapshot.contains("第二轮新增事实"),
-                "无向量时 getSnapshotForQuery 走冻结快照，同轮写入对 prompt 不可见");
+        assertTrue(querySnapshot.contains("第二轮新增事实"));
     }
 
     @Test

@@ -22,22 +22,17 @@ public enum AgentStepNode {
     SUBAGENT_LOOP_START("生命周期", "子代理启动", "delegate_task 拉起子 Agent；子步骤挂 parentStepId", true, true),
     SUBAGENT_LOOP_END("生命周期", "子代理结束", "子 Agent 结束，结果回父任务", true, true),
     COMPRESSION("生命周期", "上下文压缩", "历史过长，压缩后继续（有耗时）", true, true),
-    /** ContextLoader 按意图加载本轮上下文后的审计快照 */
-    CONTEXT_LOAD("上下文加载", "加载本轮上下文", "按意图裁剪后的历史/记忆/todo 注入说明", true, true),
+    /** ContextLoader 按本轮信号加载完上下文后的审计快照 */
+    CONTEXT_LOAD("上下文加载", "加载本轮上下文", "按信号裁剪后的历史/记忆/todo 注入说明", true, true),
 
-    // —— 意图识别（独立功能阶段，先于执行计划）——
-    INTENT_START("意图识别", "意图识别开始", "进入意图漏斗：L0规则 → L1小模型 → L2启发式", true, true),
-    INTENT_L0("意图识别", "意图·L0规则", "规则层（YAML/MySQL）：命中则短路，未命中继续下层", true, true),
-    INTENT_L1("意图识别", "意图·L1小模型", "小模型分类层：独立意图分类模型", true, true),
-    INTENT_L2("意图识别", "意图·L2启发式", "启发式兜底层：规则与小模型未定案时", true, true),
-    INTENT_END("意图识别", "意图识别结束", "漏斗定案完成，产出意图类型与任务目标", true, true),
-    /** 意图识别的下游产物：供主循环执行用的计划快照 */
-    TASK_PLAN("执行计划", "执行计划定案", "由意图识别产出的 TaskPlan（目标/白名单/是否强制拆任务）", true, true),
-    /** @deprecated 用 INTENT 的 route 标签；不再落库 */
-    REVIEW_PATH("意图识别", "截图点评路径(已废弃)", "请用 route=REVIEW_FAST_PATH 标签", false, false),
+    // —— 任务信号（独立功能阶段，先于执行计划）——
+    /** 从用户消息里观察到的事实信号，逐条可复核；不产出任何类别 */
+    TASK_SIGNALS("任务信号", "观察本轮任务信号", "命中的文本事实（联网/落盘/出图/复杂/续任务…）", true, true),
+    /** 信号的下游产物：供主循环执行用的计划快照 */
+    TASK_PLAN("执行计划", "执行计划定案", "TaskPlan（目标/白名单/是否走结构化计划/命中信号）", true, true),
 
     // —— 生产级 Planner（Goal / DAG / Proposal / Recovery）——
-    GOAL_COMPILED("规划控制", "目标编译完成", "NL+Intent → Goal + TaskGraph", true, true),
+    GOAL_COMPILED("规划控制", "目标编译完成", "NL+信号 → Goal + TaskGraph", true, true),
     GRAPH_UPDATED("规划控制", "任务图更新", "DAG 节点状态或结构变更", true, true),
     PROPOSAL("规划控制", "动作提案", "ActionProposal（basedOnVersion + actions）", true, true),
     STATE_COMMIT("规划控制", "状态提交", "PlannerStateStore CAS 升版本", true, true),
@@ -46,7 +41,7 @@ public enum AgentStepNode {
     RECOVERY_REWRITE_GRAPH("规划控制", "恢复·改图", "FailureClass=REWRITE_GRAPH", true, true),
     RECOVERY_REVISE_GOAL("规划控制", "恢复·改目标", "FailureClass=REVISE_GOAL", true, true),
 
-    TASK_SEED("任务拆分", "播种任务清单", "用意图计划预填子目标栈", true, true),
+    TASK_SEED("任务拆分", "播种任务清单", "用 TaskPlan 预填子目标栈", true, true),
     TASK_SET("任务拆分", "建立任务清单", "task.set：写入完整拆分", true, true),
     TASK_UPDATE("任务拆分", "更新任务状态", "task.update：推进/完成/阻塞", true, true),
     TASK_LIST("任务拆分", "查询任务列表", "只读查询，不改变业务状态", true, false),

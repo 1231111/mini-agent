@@ -37,7 +37,6 @@ public final class TodoSemanticValidator {
     public static Result validate(String content, String doneWhen, String evidence) {
         String dw = Objects.isNull(doneWhen) ? "" : doneWhen.trim();
         String ev = Objects.isNull(evidence) ? "" : evidence.trim();
-        String goal = Optional.ofNullable(content).orElse("");
 
         if (dw.startsWith("file_exists:")) {
             String path = dw.substring("file_exists:".length()).trim();
@@ -45,7 +44,7 @@ public final class TodoSemanticValidator {
             if (Objects.isNull(p)) {
                 return Result.fail("语义验收失败：找不到可校验文件（done_when/evidence）");
             }
-            return validateFile(p, goal);
+            return validateFile(p);
         }
 
         if ("media_delivered".equalsIgnoreCase(dw) || "media".equalsIgnoreCase(dw)) {
@@ -59,39 +58,28 @@ public final class TodoSemanticValidator {
         if (!StringUtils.isBlank(ev)) {
             Path maybe = tryResolve(ev);
             if (Objects.nonNull(maybe) && Files.isRegularFile(maybe)) {
-                return validateFile(maybe, goal);
+                return validateFile(maybe);
             }
             return Result.pass(sha256(ev.getBytes(StandardCharsets.UTF_8)));
         }
         return Result.fail("语义验收失败：缺少可校验 evidence");
     }
 
-    private static Result validateFile(Path p, String goal) {
+    private static Result validateFile(Path p) {
         try {
             long size = Files.size(p);
             if (size <= 0) {
                 return Result.fail("语义验收失败：文件为空 " + p);
             }
             String name = p.getFileName().toString().toLowerCase(Locale.ROOT);
-            String lowerGoal = goal.toLowerCase(Locale.ROOT);
 
             if (name.endsWith(".md") || name.endsWith(".markdown") || name.endsWith(".txt")) {
                 if (size < 40) {
                     return Result.fail("语义验收失败：文档过短（<" + size + " bytes），疑似未写完 " + p);
                 }
-                if ((lowerGoal.contains("全部") || lowerGoal.contains("章节")
-                        || lowerGoal.contains("目录")) && size < 2000) {
-                    return Result.fail("语义验收失败：文档过短，疑似未抽全 " + p);
-                }
                 String body = Files.readString(p, StandardCharsets.UTF_8);
                 if (StringUtils.isBlank(body)) {
                     return Result.fail("语义验收失败：文档无有效文本 " + p);
-                }
-                boolean needsImage = lowerGoal.contains("图") || lowerGoal.contains("image")
-                        || lowerGoal.contains("替换") || lowerGoal.contains("插图")
-                        || lowerGoal.contains("结构图") || lowerGoal.contains("架构图");
-                if (needsImage && !IMAGE_MD.matcher(body).find() && !IMAGE_PATH.matcher(body).find()) {
-                    return Result.fail("语义验收失败：任务要求图片/替换，但文档中无 markdown 图片引用 " + p);
                 }
                 return Result.pass(sha256(body.getBytes(StandardCharsets.UTF_8)));
             }

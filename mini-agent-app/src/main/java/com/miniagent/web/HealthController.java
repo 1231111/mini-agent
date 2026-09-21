@@ -4,6 +4,7 @@ import com.miniagent.agent.planner.PlannerMetrics;
 import com.miniagent.agent.planner.PlannerProperties;
 import com.miniagent.agent.planner.PlannerStateStore;
 import jakarta.annotation.PostConstruct;
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.actuate.health.Health;
@@ -83,7 +84,10 @@ public class HealthController implements HealthIndicator {
         config.put("enabled", properties.isEnabled());
         config.put("maxOuterRounds", properties.getMaxOuterRounds());
         config.put("proposalBatchSize", properties.getProposalBatchSize());
-        config.put("plannerModel", properties.getPlannerModelName() != null ? "configured" : "fallback");
+        config.put("plannerModel", StringUtils.isNotBlank(properties.getPlannerModelName())
+                ? "configured" : "fallback");
+        config.put("judgeModel", StringUtils.isNotBlank(properties.getJudgeModelName())
+                ? "configured" : "fallback");
         details.put("config", config);
 
         // Planner 状态存储

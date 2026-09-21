@@ -32,6 +32,13 @@ public interface LoopTurnPolicy {
 
     boolean consumeDrift();
 
+    /**
+     * 本步节点超时上限（秒）。0=不额外封顶，沿用工具自身 timeout。
+     */
+    default int actionTimeoutSeconds() {
+        return 0;
+    }
+
     /** 非规划：不过滤、不闸门。 */
     final class Open implements LoopTurnPolicy {
         @Override

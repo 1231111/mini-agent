@@ -1,5 +1,7 @@
 package com.miniagent.agent.permission;
 
+import com.miniagent.agent.tool.impl.SongGenerateParams;
+
 import java.util.Set;
 import java.util.Objects;
 
@@ -27,6 +29,7 @@ public final class PermissionPolicy {
             "browser_click", "browser_type", "browser_press", "browser_scroll",
             "browser_evaluate", "browser_extract_text",
             "comfyui_execute", "comfyui_txt2img", "comfyui_img2img", "comfyui_img2video", "comfyui_tts",
+            SongGenerateParams.TOOL_NAME,
             "delegate_task"
     );
 
@@ -46,8 +49,9 @@ public final class PermissionPolicy {
     }
 
     /**
-     * 执行前是否必须有本会话 grant。Ask 模式沿用危险工具集；
-     * 默认模式也对未全局开启的 exec、以及 HTTP POST 弹一次授权。
+     * 执行前是否必须有本会话 grant。
+     * exec-enabled=true 时 exec_command 免批（含 Ask）；未开启则默认/Ask 都要批。
+     * HTTP POST 在默认模式仍弹一次。
      */
     public static boolean needsSessionGrant(
             PermissionMode mode, String toolName, boolean execEnabled) {
@@ -55,6 +59,9 @@ public final class PermissionPolicy {
             return false;
         }
         if (mode == PermissionMode.ACCEPT_EDITS) {
+            return false;
+        }
+        if ("exec_command".equals(toolName) && execEnabled) {
             return false;
         }
         if (mode == PermissionMode.ASK && isAskDangerous(toolName)) {

@@ -4,9 +4,6 @@ import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
-import java.util.ArrayList;
-import java.util.List;
-
 @Component
 @ConfigurationProperties(prefix = "agent.planner")
 @Data
@@ -24,10 +21,6 @@ public class PlannerProperties {
     /** 专用规划模型超时（秒）。默认 60s，比主模型短避免拖慢。 */
     private int plannerTimeoutSeconds = 60;
 
-    private List<String> forceForIntents = new ArrayList<>(List.of(
-            "NEW_TASK", "RESEARCH", "FILE_DELIVERY", "PUBLISHING",
-            "CONTINUE_TASK", "MULTIMODAL_ANALYSIS"));
-    private List<String> skipIntents = new ArrayList<>(List.of("QUESTION", "REVIEW"));
     private int maxRecoveries = 3;
     private int proposalBatchSize = 1;
     private int proposalMaxIterations = 8;
@@ -47,19 +40,16 @@ public class PlannerProperties {
     private int maxReviseGoal = 1;
     /** 验证失败后 replan 重试次数 */
     private int maxReplanRetries = 2;
+    /** 节点级工具超时上限（秒）。0=不额外封顶，沿用工具自身 timeout。 */
+    private int actionTimeoutSeconds = 0;
+    /** 专用评判模型。为空时 llm_judge 走主对话模型。 */
+    private String judgeModelName;
+    private String judgeBaseUrl;
+    private String judgeApiKey;
+    private int judgeTimeoutSeconds = 60;
 
     public boolean isEnabled() { return enabled; }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }
-
-    public List<String> getForceForIntents() { return forceForIntents; }
-    public void setForceForIntents(List<String> forceForIntents) {
-        this.forceForIntents = forceForIntents == null ? List.of() : forceForIntents;
-    }
-
-    public List<String> getSkipIntents() { return skipIntents; }
-    public void setSkipIntents(List<String> skipIntents) {
-        this.skipIntents = skipIntents == null ? List.of() : skipIntents;
-    }
 
     public int getMaxRecoveries() { return maxRecoveries; }
     public void setMaxRecoveries(int maxRecoveries) { this.maxRecoveries = maxRecoveries; }
@@ -110,4 +100,25 @@ public class PlannerProperties {
 
     public int getMaxReplanRetries() { return maxReplanRetries; }
     public void setMaxReplanRetries(int maxReplanRetries) { this.maxReplanRetries = maxReplanRetries; }
+
+    public int getActionTimeoutSeconds() { return actionTimeoutSeconds; }
+    public void setActionTimeoutSeconds(int actionTimeoutSeconds) {
+        this.actionTimeoutSeconds = Math.max(0, actionTimeoutSeconds);
+    }
+
+    public String getJudgeModelName() { return judgeModelName; }
+    public void setJudgeModelName(String judgeModelName) {
+        this.judgeModelName = judgeModelName;
+    }
+
+    public String getJudgeBaseUrl() { return judgeBaseUrl; }
+    public void setJudgeBaseUrl(String judgeBaseUrl) { this.judgeBaseUrl = judgeBaseUrl; }
+
+    public String getJudgeApiKey() { return judgeApiKey; }
+    public void setJudgeApiKey(String judgeApiKey) { this.judgeApiKey = judgeApiKey; }
+
+    public int getJudgeTimeoutSeconds() { return judgeTimeoutSeconds; }
+    public void setJudgeTimeoutSeconds(int judgeTimeoutSeconds) {
+        this.judgeTimeoutSeconds = judgeTimeoutSeconds;
+    }
 }

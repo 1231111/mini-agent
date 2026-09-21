@@ -54,11 +54,15 @@ public final class PermissionContext {
     }
 
     public static boolean planApproved() {
-        return Optional.ofNullable(FORCE_PLAN_OK.get()).orElseGet(() ->
-                Optional.ofNullable(SESSION.get())
-                        .filter(sid -> Objects.nonNull(STORE))
-                        .map(STORE::isPlanApproved)
-                        .orElse(true));
+        Boolean forced = FORCE_PLAN_OK.get();
+        if (forced != null) {
+            return forced;
+        }
+        String sid = SESSION.get();
+        if (sid == null || STORE == null) {
+            return true;
+        }
+        return STORE.isPlanApproved(sid);
     }
 
     public static ConfirmPolicy confirmPolicy() {

@@ -1,15 +1,14 @@
 package com.miniagent.agent.planner;
 
+import com.miniagent.agent.scope.TaskScopeRegistry;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -17,6 +16,18 @@ import java.util.concurrent.ConcurrentHashMap;
  * Planner 单一事实源：session 绑定 + version CAS。
  * 有 {@link PlannerStatePersistence} 时走共享存储（DB/Redis，可水平扩容）；
  * 无持久化时回退进程内 map（单测）。
+ *
+ * <h2>为什么内部 key 是「任务作用域键」而不是 sessionId</h2>
+ *
+ * <p>规划图属于<b>某一次交付</b>，不属于整个会话。挂在 sessionId 上就会出现
+ * 「上一轮那张没做完的图，被这一轮的新问题读到并接管」（实测就是这条通路）。
+ * 因此这里所有读写都先把 sessionId 翻成 {@link TaskScopeRegistry#scopeKey(String)}
+ * 再落到存储层。对调用方（{@code PlanningLoop} 的 40 处调用）完全透明 ——
+ * 它们继续传 sessionId，而这个类自己保证「同一任务内稳定、换任务后不串台」。</p>
+ *
+ * <p>切换点是 {@code ContextLoader} 每轮判定的任务边界，见 {@link TaskScopeRegistry}。
+ * 这样做的价值是：<b>不需要任何模块记得在换任务时清状态</b> ——
+ * 旧状态的 key 已经不再被任何人查。</p>
  */
 @Component
 public class PlannerStateStore {
@@ -37,36 +48,55 @@ public class PlannerStateStore {
 
     private static final int MAX_EVENTS = 500;
     private static final int TRIM_TO = 400;
-    private static final String RESUME_REQUESTED_KEY = "_planner.resumeRequested";
 
     private final ConcurrentHashMap<String, StateSnapshot> memory = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, List<DomainEvent>> memoryEvents = new ConcurrentHashMap<>();
     private final PlannerStatePersistence persistence;
-    /** ponytail: 进程内续跑标记；多实例时改走 persistence */
-    private final Set<String> resumeSessions = ConcurrentHashMap.newKeySet();
+    /** 任务作用域解析器；单测直接 new 时为 null，此时 key 退化为 sessionId（等价 taskId=0）。 */
+    private final TaskScopeRegistry scopeRegistry;
 
     /** 单测：纯内存 */
     public PlannerStateStore() {
         this.persistence = null;
+        this.scopeRegistry = null;
+    }
+
+    public PlannerStateStore(TaskScopeRegistry scopeRegistry) {
+        this.persistence = null;
+        this.scopeRegistry = scopeRegistry;
     }
 
     @Autowired
-    public PlannerStateStore(@Autowired(required = false) PlannerStatePersistence persistence) {
+    public PlannerStateStore(@Autowired(required = false) PlannerStatePersistence persistence,
+                             @Autowired(required = false) TaskScopeRegistry scopeRegistry) {
         this.persistence = persistence;
+        this.scopeRegistry = scopeRegistry;
+    }
+
+    /**
+     * sessionId → 任务作用域键。
+     *
+     * <p>唯一的翻译点。{@code taskId == 0} 时与原 sessionId 逐字节相同，
+     * 因此历史数据不用迁移。</p>
+     */
+    private String key(String sessionId) {
+        return scopeRegistry == null ? sessionId : scopeRegistry.scopeKey(sessionId);
     }
 
     public Optional<StateSnapshot> get(String sessionId) {
-        if (sessionId == null) {
+        String k = key(sessionId);
+        if (k == null) {
             return Optional.empty();
         }
         if (persistence != null)
-            return persistence.load(sessionId).map(PlannerStatePersistence.Bundle::snapshot);
-        return Optional.ofNullable(memory.get(sessionId));
+            return persistence.load(k).map(PlannerStatePersistence.Bundle::snapshot);
+        return Optional.ofNullable(memory.get(k));
     }
 
     public StateSnapshot init(String sessionId, String executionId, Goal goal, TaskGraph graph) {
+        String k = key(sessionId);
         StateSnapshot snap = new StateSnapshot(
-                1L, sessionId, executionId, goal, graph,
+                1L, k, executionId, goal, graph,
                 Map.of(), Map.of(), List.of(), 0, PlanRevision.initial("initial_compile"));
         DomainEvent ev = new DomainEvent(
                 "ev_" + UUID.randomUUID().toString().substring(0, 8),
@@ -74,10 +104,10 @@ public class PlannerStateStore {
                 Map.of("nodes", graph.nodes().size(), "version", 1L, "planVersion", snap.planVersion()), null);
         List<DomainEvent> events = List.of(ev);
         if (persistence != null) {
-            persistence.replace(sessionId, snap, events);
+            persistence.replace(k, snap, events);
         } else {
-            memory.put(sessionId, snap);
-            memoryEvents.put(sessionId, new ArrayList<>(events));
+            memory.put(k, snap);
+            memoryEvents.put(k, new ArrayList<>(events));
         }
         return snap;
     }
@@ -86,11 +116,12 @@ public class PlannerStateStore {
      * CAS：仅当 expectedVersion 匹配时提交新快照（版本自动 +1）。
      */
     public StateSnapshot commit(String sessionId, long expectedVersion, StateSnapshot next) {
-        Objects.requireNonNull(sessionId, "sessionId");
+        String k = key(sessionId);
+        Objects.requireNonNull(k, "sessionId");
         Objects.requireNonNull(next, "next");
         if (persistence != null)
-            return commitPersistent(sessionId, expectedVersion, next);
-        return commitMemory(sessionId, expectedVersion, next);
+            return commitPersistent(k, expectedVersion, next);
+        return commitMemory(k, expectedVersion, next);
     }
 
     private StateSnapshot commitPersistent(String sessionId, long expectedVersion, StateSnapshot next) {
@@ -192,92 +223,61 @@ public class PlannerStateStore {
     }
 
     public List<DomainEvent> events(String sessionId) {
+        String k = key(sessionId);
+        if (k == null) {
+            return List.of();
+        }
         if (persistence != null)
-            return persistence.load(sessionId)
+            return persistence.load(k)
                     .map(PlannerStatePersistence.Bundle::events)
                     .orElse(List.of());
-        return List.copyOf(memoryEvents.getOrDefault(sessionId, List.of()));
+        return List.copyOf(memoryEvents.getOrDefault(k, List.of()));
     }
 
     public void appendEvent(String sessionId, DomainEvent event) {
-        if (sessionId == null || event == null) {
+        String k = key(sessionId);
+        if (k == null || event == null) {
             return;
         }
         if (persistence != null) {
             for (int i = 0; i < 3; i++) {
-                Optional<PlannerStatePersistence.Bundle> loaded = persistence.load(sessionId);
+                Optional<PlannerStatePersistence.Bundle> loaded = persistence.load(k);
                 if (loaded.isEmpty()) {
                     return;
                 }
                 long ver = loaded.get().snapshot().version();
                 List<DomainEvent> events = appendLocal(loaded.get().events(), event);
-                if (persistence.updateEvents(sessionId, ver, events)) {
+                if (persistence.updateEvents(k, ver, events)) {
                     return;
                 }
             }
             return;
         }
-        memoryEvents.compute(sessionId, (k, v) -> appendLocal(v, event));
+        memoryEvents.compute(k, (x, v) -> appendLocal(v, event));
     }
 
+    /**
+     * 清掉该会话<b>当前任务</b>的规划状态。
+     *
+     * <p>注意这是「显式重置」用的，不是换任务的必要步骤 ——
+     * 换任务靠作用域键自动隔离，没有任何调用方需要记得清。
+     * 实测这个方法在主代码里零调用，保留是给运维/后台重置用。</p>
+     */
     public void clear(String sessionId) {
-        if (sessionId == null) {
+        String k = key(sessionId);
+        if (k == null) {
             return;
         }
         if (persistence != null) {
-            persistence.delete(sessionId);
+            persistence.delete(k);
         }
-        memory.remove(sessionId);
-        memoryEvents.remove(sessionId);
-        resumeSessions.remove(sessionId);
-    }
-
-    public void markResume(String sessionId) {
-        if (sessionId != null && !sessionId.isBlank()) {
-            resumeSessions.add(sessionId);
-            updateResumeFlag(sessionId, true);
-        }
-    }
-
-    public boolean peekResume(String sessionId) {
-        return sessionId != null && (resumeSessions.contains(sessionId)
-                || get(sessionId).map(s -> Boolean.TRUE.equals(s.execution().get(RESUME_REQUESTED_KEY))).orElse(false));
-    }
-
-    public void clearResume(String sessionId) {
-        if (sessionId != null) {
-            resumeSessions.remove(sessionId);
-            updateResumeFlag(sessionId, false);
-        }
-    }
-
-    private void updateResumeFlag(String sessionId, boolean requested) {
-        for (int i = 0; i < 3; i++) {
-            StateSnapshot current = get(sessionId).orElse(null);
-            if (current == null) {
-                return;
-            }
-            boolean existing = Boolean.TRUE.equals(current.execution().get(RESUME_REQUESTED_KEY));
-            if (existing == requested) {
-                return;
-            }
-            Map<String, Object> execution = new HashMap<>(current.execution());
-            if (requested) {
-                execution.put(RESUME_REQUESTED_KEY, true);
-            } else {
-                execution.remove(RESUME_REQUESTED_KEY);
-            }
-            try {
-                commit(sessionId, current.version(), current.withExecution(execution));
-                return;
-            } catch (VersionConflictException ignored) {
-                // Retry against the latest snapshot.
-            }
-        }
+        memory.remove(k);
+        memoryEvents.remove(k);
     }
 
     public boolean hasIncompleteGraph(String sessionId) {
-        if (sessionId == null || sessionId.isBlank()) {
+        String k = key(sessionId);
+        if (k == null || k.isBlank()) {
             return false;
         }
         return get(sessionId)

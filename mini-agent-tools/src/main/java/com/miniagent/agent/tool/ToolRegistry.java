@@ -9,6 +9,7 @@ import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.StringUtils;
 
@@ -142,6 +143,31 @@ public class ToolRegistry {
 
     private static String redactSensitive(String s) {
         return SecurityUtils.redactSensitive(s);
+    }
+
+    /**
+     * 取某次调用的超时秒数：优先用参数算出来的自适应值，没有就用注册期的静态值。
+     *
+     * <p>{@code AgentLoop} 用它设外层闸门。返回的必须是<b>外层</b>预算（比工具自身宽），
+     * 否则外层先触发会把超时升级成「终态未知」。</p>
+     */
+    public long timeoutSeconds(String toolName, String argumentsJson) {
+        Tool tool = tools.get(toolName);
+        if (Objects.isNull(tool)) {
+            return 60L;
+        }
+        Function<String, Long> adaptive = tool.getAdaptiveTimeoutSeconds();
+        if (Objects.nonNull(adaptive)) {
+            try {
+                Long value = adaptive.apply(argumentsJson);
+                if (Objects.nonNull(value) && value > 0) {
+                    return value;
+                }
+            } catch (Exception e) {
+                log.debug("自适应超时计算失败，回退静态值: {} - {}", toolName, e.getMessage());
+            }
+        }
+        return tool.getTimeoutSeconds();
     }
 
     /**

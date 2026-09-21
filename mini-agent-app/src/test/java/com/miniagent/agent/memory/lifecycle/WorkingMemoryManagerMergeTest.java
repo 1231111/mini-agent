@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.memory.entity.AgentWorkingMemoryEntity;
 import com.miniagent.agent.memory.repository.AgentWorkingMemoryRepository;
 import com.miniagent.memory.model.WorkingMemory;
+import com.miniagent.replica.ReplicaProperties;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -67,5 +68,22 @@ class WorkingMemoryManagerMergeTest {
         assertTrue(saved.getCompletedTasksJson().contains("t2"));
         assertTrue(saved.getVariablesJson().contains("\"a\":1"));
         assertTrue(saved.getVariablesJson().contains("\"b\":2"));
+    }
+
+    @Test
+    void redis缓存ttl走replica配置() {
+        ReplicaProperties props = new ReplicaProperties();
+        props.setMemoryTtlSeconds(120);
+        ReflectionTestUtils.setField(manager, "replicaProperties", props);
+        assertEquals(120, manager.cacheTtlSeconds());
+
+        props.setMemoryTtlSeconds(0);
+        assertEquals(86400, manager.cacheTtlSeconds());
+    }
+
+    @Test
+    void touch在无redis时是空操作() {
+        manager.touch("s1");
+        verify(repository, never()).deleteById(any());
     }
 }

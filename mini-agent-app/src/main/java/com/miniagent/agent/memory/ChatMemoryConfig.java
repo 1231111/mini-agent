@@ -11,6 +11,7 @@ import com.miniagent.memory.MemoryStore;
 import com.miniagent.memory.MemoryVectorIndex;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.memory.ChatMemory;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
@@ -29,7 +30,7 @@ import org.apache.commons.lang3.StringUtils;
 @Configuration
 public class ChatMemoryConfig {
 
-    @Value("${agent.chat-memory.max-messages:24}")
+    @Value("${agent.chat-memory.max-messages:64}")
     private int maxMessages;
 
     private final Map<String, ChatMemory> memories = new ConcurrentHashMap<>();
@@ -86,6 +87,8 @@ public class ChatMemoryConfig {
                         }
                     } else if (ChatRole.ASSISTANT.getValue().equals(msg.role)) {
                         memory.add(AiMessage.from(msg.content));
+                    } else if (ChatRole.SYSTEM.getValue().equals(msg.role)) {
+                        memory.add(SystemMessage.from(msg.content));
                     }
                 }
             }

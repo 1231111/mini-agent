@@ -3,6 +3,7 @@ package com.miniagent.agent.trace;
 import com.miniagent.config.entity.AgentTraceStep;
 import com.miniagent.config.repository.AgentTraceStepRepository;
 import lombok.extern.slf4j.Slf4j;
+import com.miniagent.common.MessageConstants;
 import com.miniagent.common.RunStatus;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -118,8 +119,19 @@ public class TraceRecorder {
     }
 
     /** 纯文本失败（点击超时、未知工具）也记 TOOL_ERROR，否则轨迹全是成功。 */
+    /**
+     * 工具结果算不算「失败」。
+     *
+     * <p>{@code awaiting_user} 必须排在最前面短路掉：那是「工具压根没执行、在等用户
+     * 批准或回答」，既不是成功也不是失败。放它过去，所有调用方 —— 失败反思提示、
+     * 连续失败计数、轨迹状态、同参数重复失败去重 —— 会一起把它读成「工具坏了」，
+     * 于是给模型注入「换个策略、不要用相同参数重试」，而它其实只差用户点一下批准。</p>
+     */
     public static boolean isFailedResult(String result) {
         if (result == null || result.isBlank()) {
+            return false;
+        }
+        if (result.contains("\"" + MessageConstants.AWAITING_USER_STATUS + "\"")) {
             return false;
         }
         return result.contains("\"error\"")

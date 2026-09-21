@@ -25,14 +25,36 @@ public final class MessageConstants {
     public static final String CHAT_USER_UPLOADED_MEDIA = "\n\n[用户上传了音视频附件]\n";
     public static final String CHAT_IMAGE_LOCAL_PATH = "图片%d 本地路径: %s";
     public static final String CHAT_MEDIA_LOCAL_PATH = "%s 本地路径: %s";
-    public static final String CHAT_REVIEW_ANALYZE_IMAGES = "请分析这些截图反映的问题。";
-    public static final String CHAT_REVIEW_QUALITY_FEEDBACK = "这是结果质量反馈，不应该继续执行旧任务。问题通常来自上下文被旧任务牵引、工具循环未及时停止或最终兜底回复过短。";
     public static final String CHAT_TRUNCATED = "\n...（已截断）";
     public static final String CHAT_PERSIST_FAILED = "持久化会话历史失败: sessionId={}, err={}";
     public static final String CHAT_PROCESSING_ERROR = "处理出错: ";
 
     // ==================== AGENT 循环 ====================
+
+    /**
+     * 系统自己拼进会话的控制语前缀（批准 Plan / 批准工具等）。
+     *
+     * <p>这类文本被当成「用户消息」送进主循环，但它不是用户打的字。必须能与原话区分开，
+     * 否则「已批准「write_file」，请继续执行。」会被任务信号提取读成一整条新任务 ——
+     * 它命中 {@code file-signals} 里的 {@code write_file}，于是
+     * {@code needsFiles=true} 而消息里一个真实文件名都没有。</p>
+     */
+    public static final String SYSTEM_MESSAGE_PREFIX = "【系统】";
+
+    /**
+     * 是否是系统拼进会话的控制语，而不是用户自己打的字。
+     *
+     * <p>用途是把它排除在任务信号提取之外：控制语只表达「上一步被放行了」，
+     * 不表达任何新的交付目标。并发/拼装点都必须用 {@link #SYSTEM_MESSAGE_PREFIX} 统一前缀，
+     * 不能各写各的字面量，否则这条判定失效且不会报错。</p>
+     */
+    public static boolean isSystemControlMessage(String text) {
+        return text != null && text.stripLeading().startsWith(SYSTEM_MESSAGE_PREFIX);
+    }
+
+    public static final String TURN_TOOLS_HEADER = "# 本轮工具面";
     public static final String AGENT_LLM_NO_RESPONSE = "LLM 无响应/超时";
+    public static final String AGENT_LLM_REFUSED = "模型未能给出可用答复，请换个说法再试。";
     public static final String AGENT_LLM_NETWORK_RECONNECT = "【系统通知】上次模型调用遇到临时网络问题，已自动重连。请继续刚才的任务。";
     public static final String AGENT_LLM_NETWORK_FAILED = "（模型连接异常，已自动重试但仍失败，请稍后再试或联系管理员）";
     public static final String AGENT_SUBTASK_PROMPT = "\n（已收到你的补充说明，正在融入当前任务...）\n";
@@ -50,14 +72,44 @@ public final class MessageConstants {
                     + "缺终端执行或 HTTP POST 时直接调用 exec_command / http_post，"
                     + "由框架向用户弹授权，不要改 awaiting_confirm，不要让用户去改配置或双击脚本。"
                     + "立刻执行本步，不要探盘或重建计划。";
+    public static final String STOP_NEED_TODO_PLAN =
+            "【收尾被拦截】这是复杂任务，你还没有用 todo(action=set) 写出带 done_when 的计划。"
+                    + "下一轮必须先调用 todo set，再逐步执行。不要直接给最终结论。";
+    public static final String STOP_INCOMPLETE_TODO =
+            "【收尾被拦截】仍有未完成的子任务。请继续执行「当前子目标」，"
+                    + "完成后 todo update 标 completed 并提供 evidence。"
+                    + "缺密钥时 todo update awaiting_confirm 并直接向用户提问。";
+    public static final String TASK_GRAPH_OWNED =
+            "【任务图由规划器持有】禁止 todo.set/clear。只 update 当前 focus 步骤并附 evidence。"
+                    + "本段只完成当前步骤，不要重建计划，也不要按整张清单收尾。";
     public static final String SSE_PERMISSION_ASK = "permission_ask";
+    public static final String SSE_USER_QUESTION = "user_question";
     public static final String AGENT_PERM_ASK_WAIT =
             "需要你批准才能执行「%s」。请点击弹窗中的「批准并继续」，不要只点步骤确认。";
-    public static final String AGENT_PERM_ASK_TOOL_ERROR =
-            "{\"error\":\"工具 %s 需用户批准后才能执行。已向用户弹出授权。"
+    /**
+     * 「工具未执行，在等用户」的统一状态字。
+     *
+     * <p>工具结果有三种终态，不是一个布尔：成功 / 失败 / <b>未执行（等人工）</b>。
+     * 过去没有第三种表示法，只好把「等人」塞成 {@code {"error": ...}} —— 于是所有
+     * 靠「文本里有没有 error」判断失败的地方（{@code TraceRecorder.isFailedResult}
+     * 及依赖它的反思提示、连续失败计数、轨迹状态）都会把「用户还没点批准」读成
+     * 「工具执行失败」，进而给模型注入「请换策略、不要用相同参数重试」——
+     * 而它其实只差用户点一下。</p>
+     *
+     * <p>这类结果的形状是 {@code {"status":"awaiting_user", ...}}，<b>不含 error 键</b>，
+     * 所以按文本判失败的旧逻辑天然不会误判；{@code ToolResult.fromLegacy} 另有一支
+     * 把它映射成 {@code ToolStatus.AWAITING_USER}。</p>
+     */
+    public static final String AWAITING_USER_STATUS = "awaiting_user";
+    public static final String AGENT_PERM_ASK_TOOL_PENDING =
+            "{\"status\":\"" + AWAITING_USER_STATUS + "\",\"tool\":\"%s\","
+                    + "\"message\":\"工具 %s 需用户批准后才能执行。已向用户弹出授权。"
                     + "不要把步骤标为 awaiting_confirm，不要让用户双击脚本或去改配置。\"}";
+    public static final String AGENT_USER_QUESTION_TOOL_PENDING =
+            "{\"status\":\"" + AWAITING_USER_STATUS + "\",\"tool\":\"ask_user_question\","
+                    + "\"message\":\"已向用户提问并等待回答。不要重试 ask_user_question，"
+                    + "等用户下一条消息再继续。\"}";
     public static final String AGENT_CONTEXT_TRUNCATED = "【上下文已硬截断，部分早期内容丢失】";
-    public static final String AGENT_DRIFT_CORRECTION = "注意：你偏离了原始任务目标。请回到用户最初的问题。";
 
     // ==================== MEMORY 记忆 ====================
     public static final String MEMORY_EMPTY_CONTENT = "内容不能为空。";

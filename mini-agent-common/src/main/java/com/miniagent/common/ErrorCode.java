@@ -5,7 +5,7 @@ package com.miniagent.common;
  * <p>
  * 格式：{@code XX.YY.ZZ}
  * <ul>
- *   <li>XX — 模块（AUTH / CHAT / AGENT / MEMORY / INTENT / TODO / FILE / MEDIA / BROWSER / MCP / CONFIG / SYSTEM）</li>
+ *   <li>XX — 模块（AUTH / CHAT / AGENT / MEMORY / TODO / FILE / MEDIA / BROWSER / MCP / CONFIG / SYSTEM）</li>
  *   <li>YY — 功能区（01=核心流程, 02=校验/权限, 03=外部调用 …）</li>
  *   <li>ZZ — 具体错误</li>
  * </ul>
@@ -34,6 +34,7 @@ public enum ErrorCode {
     AGENT_LLM_TIMEOUT("AGENT.02.01", "模型调用超时"),
     AGENT_LLM_NO_RESPONSE("AGENT.02.02", "模型无响应"),
     AGENT_LLM_ERROR("AGENT.02.03", "模型调用失败"),
+    AGENT_LLM_REFUSED("AGENT.02.04", "模型拒绝回答"),
     AGENT_TOOL_TIMEOUT("AGENT.03.01", "工具执行超时"),
     AGENT_TOOL_ERROR("AGENT.03.02", "工具执行失败"),
     AGENT_CONTEXT_OVERFLOW("AGENT.04.01", "上下文溢出"),
@@ -50,12 +51,11 @@ public enum ErrorCode {
     MEMORY_WRITE_FAILED("MEMORY.02.01", "记忆写入失败"),
     MEMORY_MIDTERM_UPDATE_FAILED("MEMORY.03.01", "中期记忆更新失败"),
 
-    // ==================== INTENT 意图分类 ====================
-    INTENT_CLASSIFY_FAILED("INTENT.01.01", "意图分类失败"),
-
     // ==================== TODO 任务待办 ====================
     TODO_NOT_FOUND("TODO.01.01", "待办项不存在"),
     TODO_INVALID_STATE("TODO.02.01", "待办项状态非法"),
+    TODO_STOP_MISSING_PLAN("TODO.03.01", "复杂任务尚未建立计划"),
+    TODO_STOP_INCOMPLETE("TODO.03.02", "仍有未完成的子任务"),
 
     // ==================== FILE 文件 ====================
     FILE_EMPTY("FILE.01.01", "文件为空"),

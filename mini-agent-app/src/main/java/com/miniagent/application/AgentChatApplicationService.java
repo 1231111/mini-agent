@@ -9,10 +9,12 @@ import jakarta.annotation.PostConstruct;
 
 import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.core.ExecutionControl;
-import com.miniagent.agent.intent.IntentPlanner;
-import com.miniagent.agent.intent.IntentType;
-import com.miniagent.agent.intent.TaskPlan;
+import com.miniagent.agent.core.ExecutionProperties;
+import com.miniagent.agent.task.TaskPlan;
+import com.miniagent.agent.task.TaskPlanFactory;
+import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.agent.planner.PlanningLoop;
+import com.miniagent.memory.MemoryService;
 import com.miniagent.memory.MemoryStore;
 import com.miniagent.agent.todo.TaskTodoContext;
 import com.miniagent.agent.memory.ChatMemoryConfig;
@@ -22,13 +24,9 @@ import com.miniagent.web.dto.FileAttachment;
 import com.miniagent.web.dto.MediaRef;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.ImageContent;
-import dev.langchain4j.data.message.SystemMessage;
-import dev.langchain4j.data.message.TextContent;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.memory.ChatMemory;
 import dev.langchain4j.model.chat.ChatModel;
-import dev.langchain4j.model.chat.request.ChatRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -44,6 +42,7 @@ import com.miniagent.config.service.TaskRunService;
 import com.miniagent.agent.delegate.RoleContext;
 import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.config.model.ModelClientFactory;
+import com.miniagent.config.model.UserModelBinder;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -61,17 +60,8 @@ import org.apache.commons.lang3.StringUtils;
 
 
 /**
- * 直接 Agent 模式：分层系统提示词 + Agent 循环 + 冻结快照记忆
- *
- * 记忆设计完全参考 hermes-agent：
- * - MEMORY.md + USER.md 两个文件
- * - § 分隔条目，字符数硬上限
- * - 冻结快照：session 开始时加载，session 中写盘但不刷新快照（保持 prefix cache 稳定）
- * - 自动用户画像：从日常提问中提取用户偏好
- *
- * 会话管理参考 ChatGPT WebUI：
- * - ConversationStore 持久化会话历史到 JSON 文件
- * - 侧边栏显示历史会话列表，支持切换/删除/重命名
+ * 直接 Agent 模式：身份/记忆/信号拼 system prompt，Loop 只吃字符串 + 历史。
+ * 记忆写入走 memory 工具 / 事件 / 回合结束巩固，不经过 Loader。
  */
 @Service
 @Slf4j
@@ -85,11 +75,11 @@ public class AgentChatApplicationService {
     @Autowired
     private AgentLoop agentLoop;
     @Autowired
+    private ExecutionProperties executionProperties;
+    @Autowired
     private ExecutionControl executionControl;
     @Autowired
     private PlanningLoop planningLoop;
-    @Autowired
-    private ChatModel chatModel;
     @Autowired
     private com.miniagent.agent.trace.TraceRecorder traceRecorder;
 
@@ -98,9 +88,11 @@ public class AgentChatApplicationService {
     @Autowired
     private MemoryStore memoryStore;
     @Autowired
+    private MemoryService memoryService;
+    @Autowired
     private DatabaseConversationStore conversationStore;
     @Autowired
-    private IntentPlanner intentPlanner;
+    private TaskPlanFactory taskPlanFactory;
     @Autowired
     private ContextLoader contextLoader;
     @Autowired
@@ -119,6 +111,9 @@ public class AgentChatApplicationService {
     private TaskRunService taskRunService;
     @Autowired
     private ModelClientFactory modelClientFactory;
+    /** 后台异步任务（记忆巩固）在新线程上跑，不继承 ThreadLocal，需要显式绑定用户模型。 */
+    @Autowired
+    private UserModelBinder userModelBinder;
     @Autowired
     private MultimodalMessageBuilder multimodalBuilder;
     @Autowired
@@ -127,13 +122,18 @@ public class AgentChatApplicationService {
     private SessionHistoryVectorStore sessionHistoryVectorStore;
     @Autowired(required = false)
     private com.miniagent.memory.MemoryManager memoryManager;
+    @Autowired
+    private com.miniagent.agent.memory.writer.MemoryToolExecutionSink toolExecutionSink;
 
-    private static final int MAX_ITERATIONS = 90;
+    private int maxIterations() {
+        return executionProperties.getMaxIterations();
+    }
 
     @PostConstruct
     private void init() {
         agentLoop.setTraceRecorder(traceRecorder);
         agentLoop.setEventCenter(eventCenter);
+        agentLoop.setToolExecutionSink(toolExecutionSink);
         planningLoop.setTraceRecorder(traceRecorder);
     }
 
@@ -196,6 +196,11 @@ public class AgentChatApplicationService {
             executionControl.start(sessionId, tenantId);
             executionStarted = true;
             memoryStore.loadFromDisk();
+            try {
+                memoryService.promoteUserBlob();
+            } catch (Exception e) {
+                log.debug("用户画像晋升跳过: {}", e.getMessage());
+            }
             // 记录任务开始事件
             recordEvent(sessionId, null, com.miniagent.memory.model.AgentEvent.EventType.TASK_START,
                 "user", Map.of("question", truncate(userMessage, 500)), null);
@@ -232,8 +237,12 @@ public class AgentChatApplicationService {
             // 巩固走后台，避免挡住 SSE end（PERM_ASK 批准后续跑会等流结束）
             if (memoryManager != null) {
                 final String consolidateSid = sessionId;
+                final Long consolidateUserId = userId;
                 CompletableFuture.runAsync(() -> {
-                    try (var ignoredOwner = MemoryStore.bindOwnerContext(owner)) {
+                    // 异步线程不继承 ThreadLocal：显式绑定归属与该用户配置的模型，
+                    // 否则巩固的 LLM 提炼会回退到全局 Bean（全局 key 失效即稳定 401）。
+                    try (var ignoredOwner = MemoryStore.bindOwnerContext(owner);
+                         var ignoredModel = userModelBinder.bindModel(consolidateUserId)) {
                         memoryManager.consolidate(consolidateSid);
                     } catch (Exception e) {
                         log.debug("记忆巩固失败: {}", e.getMessage());
@@ -261,7 +270,7 @@ public class AgentChatApplicationService {
         }
         try {
             com.miniagent.memory.model.AgentEvent event = new com.miniagent.memory.model.AgentEvent();
-            event.setTenantId("default");
+            event.setTenantId(MemoryStore.effectiveTenantId());
             event.setSessionId(sessionId);
             event.setTaskId(taskId);
             event.setEventType(eventType);
@@ -308,8 +317,23 @@ public class AgentChatApplicationService {
 
         ChatMemory memory = chatMemoryProvider.get(sessionId);
         List<ChatMessage> memMsgs = memory.messages();
-        TaskPlan taskPlan = intentPlanner.plan(effectiveChat, userMessage, hasMedia, memMsgs);
-        LoadedContext loaded = contextLoader.load(sessionId, userMessage, taskPlan, memMsgs);
+        // 本轮只观察事实信号，不做分类：模型不该因为一次判断失误就同时丢掉
+        // 工具面、历史与执行路径。hasMedia 不参与工具清单与历史条数的判定，
+        // 只用于决定要不要拼上「点评轮」那段提示词。
+        TaskPlan taskPlan = taskPlanFactory.build(userMessage);
+        if (Objects.nonNull(traceRecorder)) {
+            traceRecorder.recordNode(sessionId, 0, AgentStepNode.TASK_SIGNALS.name(),
+                    "{\"signals\":\"" + taskPlan.signals().describe()
+                            + "\",\"requiresStructuredPlan\":"
+                            + taskPlan.requiresStructuredPlan() + "}",
+                    RunStatus.SUCCESS.name(), 0);
+        }
+        LoadedContext loaded =
+                contextLoader.load(sessionId, userMessage, hasMedia, taskPlan, memMsgs);
+        // 任务级隔离不在这里做。曾经的做法是在换任务时往会话里落一条 system 边界标记，
+        // 下一轮重建历史时只取标记之后的消息 —— 那是拿「跨轮追问答不出来」换「不污染」，方向错了。
+        // 现在：对话历史整段保留（追问要看得见上文），任务级状态（规划图、压缩摘要）
+        // 按 loaded.scopeKey() 隔离，换任务后天然读不到旧状态。边界判定见 TaskScopeRegistry。
         // 历史一律文本化：旧轮 image_url 会让文本端点直接 400
         List<ChatMessage> history = ChatMessageTexts.textOnlyHistory(loaded.history());
 
@@ -322,39 +346,6 @@ public class AgentChatApplicationService {
                 ? multimodalBuilder.buildMultimodalUserMessage(userId, userMessage, images, savedImagePaths, media, savedMediaPaths)
                 : null;
         String displayQuestion = MultimodalMessageBuilder.buildDisplayQuestion(userMessage, images.size(), media.size());
-
-        if (taskPlan.intent() == IntentType.REVIEW) {
-            AgentLoop.setCurrentModels(effectiveChat, models.streaming());
-            try {
-                String answer = answerReview(userId, userMessage, images, media, history);
-                if (hasMedia) {
-                    memory.add(multimodalMsg);
-                } else {
-                    memory.add(UserMessage.from(userMessage));
-                }
-                memory.add(AiMessage.from(answer));
-                ChatTask task = new ChatTask();
-                task.setUserId(userId);
-                task.setSessionId(sessionId);
-                task.setQuestion(displayQuestion);
-                task.setAnswer(answer);
-                if (!allSavedPaths.isEmpty()) {
-                    task.setImages(String.join(",", allSavedPaths));
-                }
-                chatTaskRepository.save(task);
-                persistTurn(userId, sessionId,
-                        StringUtils.isNotBlank(userMessage) ? userMessage : displayQuestion,
-                        answer,
-                        allSavedPaths.isEmpty() ? null : allSavedPaths);
-                updateMidtermMemoryAsync(userId, displayQuestion, answer);
-                if (Objects.nonNull(traceRecorder)) {
-                    traceRecorder.recordAnswer(sessionId, 0, answer);
-                }
-                return answer;
-            } finally {
-                AgentLoop.clearCurrentModels();
-            }
-        }
 
         String firstLine = StringUtils.isNotBlank(userMessage)
                 ? userMessage.split("[\r\n]", 2)[0]
@@ -391,15 +382,15 @@ public class AgentChatApplicationService {
         try {
             String executionId = Objects.nonNull(traceRecorder)
                     ? traceRecorder.currentExecutionId() : null;
-            if (planningLoop.shouldHandle(taskPlan, sessionId)) {
+            if (planningLoop.shouldHandle(taskPlan, sessionId, userMessage)) {
                 answer = planningLoop.run(effectiveChat, systemPrompt, userMessage, multimodalMsg,
                         history, taskPlan, sessionId, executionId, progress, streamSink);
             } else if (hasMedia) {
                 answer = agentLoop.runWithMultimodal(effectiveChat, systemPrompt, multimodalMsg, history,
-                        MAX_ITERATIONS, progress, taskPlan, streamSink);
+                        maxIterations(), progress, taskPlan, streamSink);
             } else {
                 answer = agentLoop.run(effectiveChat, systemPrompt, userMessage, history,
-                        MAX_ITERATIONS, progress, taskPlan, streamSink);
+                        maxIterations(), progress, taskPlan, streamSink);
             }
             if (planningLoop.isAwaitingConfirm(sessionId)) {
                 runStatus = RunStatus.WAITING.name();
@@ -430,7 +421,6 @@ public class AgentChatApplicationService {
                 StringUtils.isNotBlank(userMessage) ? userMessage : displayQuestion,
                 answer,
                 allSavedPaths.isEmpty() ? null : allSavedPaths);
-        updateMidtermMemoryAsync(userId, displayQuestion, answer);
         return answer;
         } catch (Exception e) {
             runStatus = RunStatus.FAILURE.name();
@@ -443,99 +433,6 @@ public class AgentChatApplicationService {
                 traceRecorder.endExecution(runStatus);
             }
         }
-    }
-
-    private String answerReview(Long userId, String userMessage, List<String> images,
-                                List<MediaRef> media, List<ChatMessage> history) {
-        try {
-            List<ChatMessage> messages = new ArrayList<>();
-            messages.add(new SystemMessage(PromptTemplates.REVIEW_MODE_PROMPT));
-            if (Objects.nonNull(history) && !history.isEmpty()) {
-                int from = Math.max(0, history.size() - 4);
-                messages.addAll(history.subList(from, history.size()));
-            }
-            String text = StringUtils.isBlank(userMessage)
-                    ? MessageConstants.CHAT_REVIEW_ANALYZE_IMAGES
-                    : userMessage;
-            List<dev.langchain4j.data.message.Content> contents = new ArrayList<>();
-            contents.add(TextContent.from(text));
-            if (Objects.nonNull(images))
-                for (String img : images) {
-                    contents.add(ImageContent.from(img));
-                }
-            if (Objects.nonNull(media)) {
-                for (MediaRef ref : media) {
-                    try {
-                        multimodalBuilder.appendMediaContent(contents, userId, ref);
-                    } catch (Exception e) {
-                        contents.add(TextContent.from("[媒体读取失败: " + ref.getFilename() + "]"));
-                    }
-                }
-            }
-            messages.add(UserMessage.from(contents));
-            ChatModel model = Optional.ofNullable(AgentLoop.getCurrentChatModel()).orElse(chatModel);
-            var response = model.chat(ChatRequest.builder().messages(messages).build());
-            String answer = response.aiMessage().text();
-            return StringUtils.isBlank(answer)
-                    ? MessageConstants.CHAT_REVIEW_QUALITY_FEEDBACK
-                    : answer;
-        } catch (Exception e) {
-            return MessageConstants.CHAT_REVIEW_QUALITY_FEEDBACK + " 当前评审模式调用失败：" + e.getMessage();
-        }
-    }
-
-    private void updateMidtermMemoryAsync(Long userId, String userMessage, String answer) {
-        MemoryStore.OwnerContext owner = MemoryStore.captureOwnerContext();
-        if (!Objects.equals(owner.userId(), userId)) {
-            owner = new MemoryStore.OwnerContext(userId, owner.tenantId());
-        }
-        MemoryStore.OwnerContext capturedOwner = owner;
-        CompletableFuture.runAsync(() -> {
-            try (var ignoredOwner = MemoryStore.bindOwnerContext(capturedOwner)) {
-                String oldMemory = memoryStore.getRawMidtermMemory();
-                String input = """
-                        【旧中期记忆】
-                        %s
-
-                        【最新用户消息】
-                        %s
-
-                        【最新助手回答】
-                        %s
-                        """.formatted(
-                        StringUtils.isBlank(oldMemory) ? MessageConstants.MEMORY_EMPTY : oldMemory,
-                        sanitizeForMemory(userMessage, 2500),
-                        sanitizeForMemory(answer, 3500)
-                );
-                var response = chatModel.chat(ChatRequest.builder()
-                        .messages(List.of(
-                                new SystemMessage(PromptTemplates.MIDTERM_MEMORY_PROMPT),
-                                new UserMessage(input)
-                        ))
-                        .build());
-                String summary = response.aiMessage().text();
-                if (StringUtils.isNotBlank(summary)) {
-                    memoryStore.updateMidtermMemory(summary);
-                }
-            } catch (Exception ignored) {
-                // 中期记忆是增强能力，失败不影响主对话。
-            }
-        });
-    }
-
-    /** 判断是否是简单问答：短消息 + 不涉及文件/工具操作 */
-    private static String sanitizeForMemory(String text, int maxChars) {
-        if (Objects.isNull(text)) {
-            return "";
-        }
-        String sanitized = text
-                .replaceAll("(?i)(access_token=)[^&\\s\"'}]+", "$1***")
-                .replaceAll("(?i)(secret=)[^&\\s\"'}]+", "$1***")
-                .replaceAll("(?i)(api[_-]?key=)[^&\\s\"'}]+", "$1***")
-                .replaceAll("(?i)(\"access_token\"\\s*:\\s*\")[^\"]+\"", "$1***\"")
-                .replaceAll("(?i)(\"secret\"\\s*:\\s*\")[^\"]+\"", "$1***\"")
-                .replaceAll("(?i)(\"api[_-]?key\"\\s*:\\s*\")[^\"]+\"", "$1***\"");
-        return sanitized.length() <= maxChars ? sanitized : sanitized.substring(0, maxChars) + MessageConstants.CHAT_TRUNCATED;
     }
 
     // =========================================================================

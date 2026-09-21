@@ -12,7 +12,7 @@
 
     <artifactId>mini-agent-loop</artifactId>
     <name>mini-agent-loop</name>
-    <description>循环核：AgentLoop、意图、待办、权限、钩子、委派、上下文、轨迹</description>
+    <description>循环核：AgentLoop、任务信号、待办、权限、钩子、委派、上下文、轨迹</description>
     <packaging>jar</packaging>
 
     <dependencies>

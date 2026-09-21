@@ -17,6 +17,9 @@ import com.miniagent.agent.permission.ConfirmPolicy;
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.permission.SessionPermissionStore;
 import com.miniagent.agent.planner.PlannerStateStore;
+import com.miniagent.agent.planner.StateSnapshot;
+import com.miniagent.agent.planner.TaskGraph;
+import com.miniagent.agent.planner.TodoStateProjector;
 import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.web.dto.ChatRequest;
 import com.miniagent.web.dto.FileAttachment;
@@ -105,6 +108,8 @@ public class MiniAgentChatPageController {
     private TaskTodoStore todoStore;
     @Autowired
     private PlannerStateStore plannerStateStore;
+    @Autowired
+    private TodoStateProjector todoProjector;
     @Autowired(required = false)
     private com.miniagent.agent.mcp.McpToolBridge mcpToolBridge;
     @Autowired(required = false)
@@ -874,16 +879,17 @@ public class MiniAgentChatPageController {
         String action = Objects.isNull(body.get("action")) ? "set" : String.valueOf(body.get("action"));
         if ("approve_plan".equalsIgnoreCase(action)) {
             permissionStore.approvePlan(sessionId);
-            eventCenter.appendUserMessage(sessionId, "【系统】用户已批准 Plan，请按 todo 开始执行写操作与交付。");
+            eventCenter.appendUserMessage(sessionId,
+                    com.miniagent.common.MessageConstants.SYSTEM_MESSAGE_PREFIX
+                            + "用户已批准 Plan，请按 todo 开始执行写操作与交付。");
             return ApiResponse.ok(permissionStore.toView(sessionId));
         }
         if ("grant_ask".equalsIgnoreCase(action)) {
             String tool = Objects.isNull(body.get("tool")) ? "" : String.valueOf(body.get("tool"));
             permissionStore.grantAskTool(sessionId, tool);
-            eventCenter.appendUserMessage(sessionId, "【系统】用户已批准工具 " + tool + "，请继续。");
-            if (plannerStateStore.hasIncompleteGraph(sessionId)) {
-                plannerStateStore.markResume(sessionId);
-            }
+            eventCenter.appendUserMessage(sessionId,
+                    com.miniagent.common.MessageConstants.SYSTEM_MESSAGE_PREFIX
+                            + "用户已批准工具 " + tool + "，请继续。");
             return ApiResponse.ok(permissionStore.toView(sessionId));
         }
         if (body.get("confirmPolicy") != null) {
@@ -920,6 +926,27 @@ public class MiniAgentChatPageController {
         if (id <= 0) {
             return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "id required");
         }
+        var snapOpt = plannerStateStore.get(sessionId);
+        if (snapOpt.isPresent() && !snapOpt.get().graph().isEmpty()) {
+            StateSnapshot snap = snapOpt.get();
+            TaskGraph next = todoProjector.confirmByTodoId(snap.graph(), id);
+            if (next == snap.graph()) {
+                return ApiResponse.fail(ErrorCode.TODO_INVALID_STATE,
+                        "图节点不是等待确认状态");
+            }
+            try {
+                plannerStateStore.commit(
+                        sessionId, snap.version(), snap.withGraph(next));
+            } catch (PlannerStateStore.VersionConflictException e) {
+                return ApiResponse.fail(
+                        ErrorCode.TODO_INVALID_STATE, "状态已变更，请刷新后重试");
+            }
+            todoProjector.project(sessionId, next);
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("id", id);
+            data.put("confirmed", true);
+            return ApiResponse.ok(data);
+        }
         String[] err = new String[1];
         List<TaskTodoStore.TodoItem> items = todoStore.confirm(sessionId, id, "CONFIRM: user", err);
         if (items == null) {
@@ -929,9 +956,6 @@ public class MiniAgentChatPageController {
             }
             return ApiResponse.fail(ErrorCode.TODO_INVALID_STATE,
                     StringUtils.isBlank(detail) ? ErrorCode.TODO_INVALID_STATE.getMessage() : detail);
-        }
-        if (plannerStateStore.hasIncompleteGraph(sessionId)) {
-            plannerStateStore.markResume(sessionId);
         }
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("id", id);

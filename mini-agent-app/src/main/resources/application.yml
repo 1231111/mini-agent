@@ -90,29 +90,20 @@ agent:
     password-min-length: 8
     bcrypt-strength: 10
     allowed-origins: http://localhost:*,http://127.0.0.1:*,file://
-  # 意图识别漏斗：L0 配置规则 → L1 小模型 → L2 启发式（场景词只写在这里）
-  # L0 规则运行时：启动时若 MySQL 无 ACTIVE rule_set 则从下方 YAML bootstrap；之后以 DB 为准，支持反馈学习热发布
-  intent:
-    llm-enabled: true
-    min-confidence: 0.65
-    history-max-messages: 8
-    history-max-chars: 4000
-    timeout-seconds: 60
-    model-name: "qwen2.5:1.5b"
-    base-url: "http://127.0.0.1:11434/v1"
-    api-key: "ollama"
-    # classifier-system-prompt: |   # 可选覆盖；默认用代码内通用模板
+  # 任务信号：只从用户消息里提取「已经出现的事实」，不做分类、不选类别。
+  # 每条词表命中的就是命中的，可以逐条复核；下游各取所需，一处失效不牵连别处。
+  task-signals:
     rules:
-      force-full-on-web-and-file: true
+      # 语义判断（复杂任务/图配文档）的开关
       force-full-on-image-into-doc: true
-      pure-image-max-len: 40
-      question-max-len: 80
-      review-max-len: 10
+      question-max-len: 80   # 超过这个长度就不再当作短问答/短指令
+      # ── 事实词表：命中即为真，以下每一条都只描述「文本里出现了什么」 ──
       web-signals:
         - "(?i)https?://"
         - "(?i)飞书|feishu|lark|wiki"
         - "(?i)抓取|爬取|打开网页|访问(该|这个)?(链接|地址|网址)"
         - "(?i)获取.{0,12}(资料|内容|页面)|web_extract|browser"
+        - "(?i)搜索|检索|调研|搜一下|查一下"
       file-signals:
         - "(?i)\\.md\\b|markdown|md\\s*文件"
         - "(?i)写(到|入)?桌面|桌面上|文档|write_file|保存到"
@@ -143,25 +134,6 @@ agent:
         - "(?i)(生成|画).{0,40}(图|图片|结构图|架构图|流程图|插画).{0,60}(替换|写入|插入|写进|写到|放到).{0,40}(md|markdown|文档|\\.md)"
         - "(?i)(替换|写入|插入|写进|写到|放到).{0,40}(md|markdown|文档|\\.md).{0,40}(图|图片|结构图)"
         - "(?i)替换到你生成的|(生成|画).{0,40}(图|结构图|架构图).{0,40}替换"
-    tool-profiles:
-      # full 留空 = 使用 ToolRegistry 全量（含 MCP），不写死工具名
-      full: []
-      image:
-        - image_generate
-        - comfyui_status
-        - comfyui_workflows
-        - comfyui_models
-        - comfyui_execute
-        - comfyui_txt2img
-        - comfyui_img2img
-        - comfyui_check_quality
-        - comfyui_img2video
-        - todo
-        - memory
-      question:
-        - skill_list
-        - skill_view
-        - memory
   # 聊天模型预设（前端可选；空字段回退 langchain4j.open-ai.chat-model.*）
   models:
     default-preset: default
@@ -174,14 +146,33 @@ agent:
         model-name: gpt-4o-mini
         api-key: sk-S5B6jjx0B3yMvxLAojE3Y94yxOzQUj7FmZFO8UTaFWcsDyby
   chat-memory:
-    max-messages: 24
+    # 跨请求滑动窗口条数（非 token）。单轮 Loop 内由 context.max-tokens 压缩。
+    max-messages: 64
   context:
-    max-tokens: 256000
+    # 单次请求工作窗口（估算 token）。DeepSeek 1M 不填满：预留 thinking、
+    # 工具 schema、中文分词低估。75% 时压缩 → 约 384k 估算工作集。
+    max-tokens: 512000
     compress-threshold: 0.75
     # false=Loop 内硬截断不调 LLM；摘要改后台异步，避免 P99 翻倍
     llm-summary-enabled: false
+    budget:
+      enabled: true
+      chars-per-token: 2.0
+      slot-tokens:
+        identity: 2000
+        authority: 400
+        question: 800
+        reference: 300
+        memory: 6000
+        skills: 2000
+        reasoning: 1500
+        tools: 4000
+        todo: 2000
+        closing: 1500
     history:
-      question: 0
+      # 问答轮（问且无动手信号）保留的历史条数。
+      # 不能给 0：历史清空后模型看不到上一轮在谈什么，跨轮追问必然答错。
+      question: 6
       # QUESTION 指代：相关度精捞最多保留条数（非盲目最近 N）
       question-with-ref: 6
       # 指代精捞：从会话末尾向前扫描的候选池大小
@@ -194,11 +185,6 @@ agent:
       vector:
         # Milvus 集合名（backend 与 agent.memory.vector.backend 一致）
         collection: agent_session_history
-      review: 4
-      new-task: 6
-      continue: -1
-      image: -1
-      default: -1
   # local=单机不启 Redis 热存储/跨实例事件；redis=写穿热存储+任务并发+发布订阅（生产/compose）
   replica:
     mode: local
@@ -233,14 +219,21 @@ agent:
   browser:
     headless: true
   tools:
-    exec-enabled: false
+    # true=exec_command 免批（含 Ask 模式）；prod profile 仍为 false
+    exec-enabled: true
     allow-absolute-write: false
     block-private-network: true
     max-concurrency: 8
   execution:
     deadline-ms: 1800000
     max-tool-calls: 120
-    max-estimated-tokens: 240000
+    # 本轮所有 LLM 调用 input+output 之和。须大于单次工作窗口，
+    # 否则一轮肥请求就会「任务已耗尽 token 预算」。约 6～8 次满窗口调用。
+    max-estimated-tokens: 2000000
+    # 直跑循环上限（引擎封顶）。规划器节点上限仍是 planner.proposal-max-iterations。
+    max-iterations: 90
+    # delegate_task 内层循环上限
+    subagent-max-iterations: 25
   rate-limit:
     per-minute: 60
   concurrency:
@@ -265,16 +258,6 @@ agent:
     # db=多副本真相源（agent_session_planner）；file=本地 JSON；memory=仅进程内（勿用于扩容）
     storage: db
     persist-dir: ${agent.data-dir}/workspace/.planner
-    force-for-intents:
-      - NEW_TASK
-      - RESEARCH
-      - FILE_DELIVERY
-      - PUBLISHING
-      - CONTINUE_TASK
-      - MULTIMODAL_ANALYSIS
-    skip-intents:
-      - QUESTION
-      - REVIEW
     max-recoveries: 3
     proposal-batch-size: 1
     proposal-max-iterations: 8
@@ -335,6 +318,15 @@ image:
     siliconflow-api-key: cdfe3b37-673d-4830-9b27-621fd84193e1:d7706f80a383dad428e6f948b9b57e26
     fal-key:
     zhipu-api-key:
+
+# 生歌（SenseAudio）。留空时回退到环境变量 SENSEAUDIO_API_KEY。
+# 密钥不要提交进仓库，生产环境请用环境变量或密钥管理注入。
+song:
+  gen:
+    senseaudio-key: ${SENSEAUDIO_API_KEY:}
+    base-url: https://api.senseaudio.cn
+    model: sensesong
+    lyrics-provider: sensesong
 
 file:
   upload:

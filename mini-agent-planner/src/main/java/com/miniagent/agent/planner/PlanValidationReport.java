@@ -92,9 +92,10 @@ public record PlanValidationReport(List<ValidationError> errors, List<Validation
             UNPRODUCED_INPUTS("输入未被前置节点产出", true),
             BLANK_NODE_ID("节点ID为空", true),
             BLANK_NODE_NAME("节点名称为空", true),
+            UNDER_DECOMPOSED("拆解不足", true),
             GENERAL("通用错误", true),
             TOOL_SURFACE("工具表面问题", false),
-            CAPABILITY_MISMATCH("能力不匹配", false),
+            CAPABILITY_MISMATCH("能力不匹配", true),
             RESOURCE_UNAVAILABLE("资源不可用", false);
 
             private final String description;

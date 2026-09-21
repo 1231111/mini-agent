@@ -3,7 +3,7 @@ package com.miniagent.agent.todo;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.core.SessionEventCenter;
-import com.miniagent.agent.intent.TaskStep;
+import com.miniagent.agent.task.TaskStep;
 import com.miniagent.agent.permission.ConfirmPolicy;
 import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.agent.permission.PermissionMode;
@@ -209,20 +209,20 @@ public class TaskTodoStore {
         return true;
     }
 
-    public synchronized int countBatchablePending(String sessionId) {
-        int n = 0;
-        for (TodoItem it : get(sessionId)) {
-            if (it.status() == Status.completed || it.status() == Status.cancelled
-                    || it.status() == Status.blocked) continue;
-            String c = it.content() == null ? "" : it.content();
-            if (c.matches("(?s).*(写|生成|实现|模块|文件|接口|页面|文档).*")) {
-                n++;
-            }
-        }
-        return n;
+    public synchronized List<TodoItem> set(String sessionId, List<Map<String, Object>> rawItems) {
+        return write(sessionId, rawItems, true);
     }
 
-    public synchronized List<TodoItem> set(String sessionId, List<Map<String, Object>> rawItems) {
+    /**
+     * 规划器投影：状态以传入为准，不按旧条目 rank 合并，也不 promote。
+     */
+    public synchronized List<TodoItem> overwrite(
+            String sessionId, List<Map<String, Object>> rawItems) {
+        return write(sessionId, rawItems, false);
+    }
+
+    private List<TodoItem> write(
+            String sessionId, List<Map<String, Object>> rawItems, boolean mergeRanks) {
         String key = safeKey(sessionId);
         ensureLoaded(key);
         List<TodoItem> prev = todos.getOrDefault(key, Collections.emptyList());
@@ -248,42 +248,48 @@ public class TaskTodoStore {
                     id = autoId;
                 }
 
-                boolean depsSpecified = raw.containsKey("depends_on") || raw.containsKey("dependsOn");
-                List<Integer> deps = parseDependsOn(raw.getOrDefault("depends_on", raw.get("dependsOn")));
+                boolean depsSpecified = raw.containsKey("depends_on")
+                        || raw.containsKey("dependsOn");
+                List<Integer> deps = parseDependsOn(
+                        raw.getOrDefault("depends_on", raw.get("dependsOn")));
                 if (!depsSpecified && prevId != null) {
-                    deps = List.of(prevId); // 默认串行依赖上一节，防脏数据传染
+                    deps = List.of(prevId);
                 }
 
-                for (TodoItem old : prev) {
-                    if (old.id() == id && old.content().equals(content)
-                            && rank(old.status()) > rank(status)) {
-                        status = old.status();
-                        if (note.isEmpty()) {
-                            note = old.note();
+                if (mergeRanks) {
+                    for (TodoItem old : prev) {
+                        if (old.id() == id && old.content().equals(content)
+                                && rank(old.status()) > rank(status)) {
+                            status = old.status();
+                            if (note.isEmpty()) {
+                                note = old.note();
+                            }
+                            if (doneWhen.isEmpty()) {
+                                doneWhen = old.doneWhen();
+                            }
+                            if (evidence.isEmpty()) {
+                                evidence = old.evidence();
+                            }
+                            if (hash.isEmpty()) {
+                                hash = old.validationHash();
+                            }
+                            if (!depsSpecified && !old.dependsOn().isEmpty()) {
+                                deps = old.dependsOn();
+                            }
+                            break;
                         }
-                        if (doneWhen.isEmpty()) {
-                            doneWhen = old.doneWhen();
-                        }
-                        if (evidence.isEmpty()) {
-                            evidence = old.evidence();
-                        }
-                        if (hash.isEmpty()) {
-                            hash = old.validationHash();
-                        }
-                        if (!depsSpecified && !old.dependsOn().isEmpty()) {
-                            deps = old.dependsOn();
-                        }
-                        break;
                     }
                 }
 
-                items.add(new TodoItem(id, content, status, note, doneWhen, evidence, hash, deps));
+                items.add(new TodoItem(
+                        id, content, status, note, doneWhen, evidence, hash, deps));
                 prevId = id;
                 autoId = Math.max(autoId, id) + 1;
             }
         }
-        // 仅将「依赖已满足」的第一项标为 in_progress
-        promoteReadyItems(items);
+        if (mergeRanks) {
+            promoteReadyItems(items);
+        }
         todos.put(key, items);
         persist(key, items);
         return new ArrayList<>(items);
@@ -886,8 +892,8 @@ public class TaskTodoStore {
     }
 
     /**
-     * 挂起未完成活动计划；「继续」时 {@link #resumeSuspended} 恢复。
-     * DB 模式下写入 agent_session_todos.suspended_json。
+     * 释放当前活动计划：未完成则挂起（可「继续」恢复）；已终态则归档清空。
+     * 新动手轮必须走这里，否则已完成清单仍会被注入 prompt 并推到 UI。
      */
     public synchronized boolean suspendActive(String sessionId) {
         String key = safeKey(sessionId);
@@ -896,16 +902,11 @@ public class TaskTodoStore {
         if (list == null || list.isEmpty()) {
             return false;
         }
-        boolean incomplete = false;
-        for (TodoItem it : list) {
-            if (it.status() == Status.pending || it.status() == Status.in_progress
-                    || it.status() == Status.awaiting_confirm || it.status() == Status.blocked) {
-                incomplete = true;
-                break;
-            }
-        }
-        if (!incomplete) {
-            return false;
+        if (allTerminal(list)) {
+            todos.put(key, new ArrayList<>());
+            persist(key, List.of());
+            log.info("todo 已完成任务已归档 session={}", key);
+            return true;
         }
         try {
             String sus = itemsToJson(list);
@@ -918,6 +919,18 @@ public class TaskTodoStore {
             log.warn("挂起 todo 失败 {}: {}", key, e.getMessage());
             return false;
         }
+    }
+
+    private static boolean allTerminal(List<TodoItem> list) {
+        if (list == null || list.isEmpty()) {
+            return false;
+        }
+        for (TodoItem it : list) {
+            if (it.status() != Status.completed && it.status() != Status.cancelled) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** 活动计划为空时恢复挂起计划。 */

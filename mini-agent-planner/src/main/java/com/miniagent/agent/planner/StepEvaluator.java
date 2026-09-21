@@ -4,6 +4,7 @@ import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.todo.LlmJudgeTodoValidator;
 import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.agent.todo.TodoSemanticValidator;
+import com.miniagent.agent.tool.CapabilityRegistry;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -18,13 +19,28 @@ import java.util.regex.Pattern;
 @Component
 public class StepEvaluator {
 
-    private static final int NOTE_MIN_EVIDENCE = 8;
     private static final Pattern EXIT_CODE =
             Pattern.compile("exit_code\\s*=\\s*(-?\\d+)");
 
     public record EvalResult(boolean ok, String reason) {
         public static EvalResult pass() { return new EvalResult(true, ""); }
         public static EvalResult fail(String r) { return new EvalResult(false, r == null ? "" : r); }
+    }
+
+    /**
+     * 图终验：不看节点 SUCCESS 戳，重跑冻结的 doneWhen；Goal.successCriteria
+     * 只认文件名或与节点 doneWhen.criteria 对齐的评判句。
+     * ponytail: 其余开放文本要隔离评判模型，现在拒绝而不是跳过。
+     */
+    public record GraphEval(boolean ok, String nodeId, String reason) {
+        public static GraphEval pass() {
+            return new GraphEval(true, "", "");
+        }
+
+        public static GraphEval fail(String nodeId, String reason) {
+            return new GraphEval(false, nodeId == null ? "" : nodeId,
+                    reason == null ? "" : reason);
+        }
     }
 
     private final PlannerProperties properties;
@@ -50,6 +66,9 @@ public class StepEvaluator {
         if (looksLikeFileDelivery(node) && isHollowEvidence(ev)) {
             return reject("file delivery 节点不能用空洞 evidence 放行");
         }
+        if (looksLikeAcquire(node) && isHollowEvidence(ev)) {
+            return reject("获取类节点不能用空洞 evidence 放行");
+        }
         if (!dw.worldCheck() && (looksLikeToolError(ev) || looksLikeLoopAbort(ev))) {
             return reject("tool error: " + abbreviate(ev, 200));
         }
@@ -70,11 +89,8 @@ public class StepEvaluator {
             return evaluateFile(node, ev, dw.path());
         }
         if (dw.isNote()) {
-            if (StringUtils.isBlank(ev)) {
+            if (StringUtils.isBlank(ev) || isHollowEvidence(ev)) {
                 return reject("缺少 evidence");
-            }
-            if (properties.isStrictEval() && ev.length() < NOTE_MIN_EVIDENCE) {
-                return reject("evidence 过短（<" + NOTE_MIN_EVIDENCE + "）");
             }
             return EvalResult.pass();
         }
@@ -102,51 +118,111 @@ public class StepEvaluator {
         return EvalResult.pass();
     }
 
-    /** 写文件/出图/交代码节点不能靠 note_required 放行。 */
+    /** 落盘/出图由 capability 或冻结的 worldCheck 决定，不刮节点名。 */
     static boolean looksLikeFileDelivery(TaskNode node) {
         if (node == null) {
             return false;
         }
         DoneWhen dw = node.doneWhen();
-        if (dw != null && (dw.isFile() || dw.isMedia())) {
+        if (dw != null && dw.worldCheck()) {
             return true;
         }
-        if (node.outputs() != null && !node.outputs().isEmpty()) {
-            return true;
-        }
-        String cap = node.capability() == null ? "" : node.capability();
-        if (cap.equals("file_write") || cap.equals("deliver")
-                || cap.equals("image") || cap.equals("code")) {
-            return true;
-        }
-        String n = node.name() == null ? "" : node.name().toLowerCase();
-        return n.contains(".md") || n.contains(".png") || n.contains(".java")
-                || n.contains(".docx") || n.contains(".xlsx") || n.contains(".pptx")
-                || n.contains(".mmd") || n.contains(".py") || n.contains(".html")
-                || n.contains("架构图") || n.contains("流程图") || n.contains("时序图");
+        return DataflowNormalizer.needsFileAcceptance(node);
     }
 
-    /** todo 已 completed 时：strict 下仍对世界检查 / 命令 / 校验复验 */
-    public EvalResult evaluateAfterLoop(TaskNode node, boolean todoCompleted, String evidence) {
+    static boolean looksLikeAcquire(TaskNode node) {
+        return node != null && CapabilityRegistry.acquires(node.capability());
+    }
+
+    /** 循环结束后验收：不看 todo 勾选，只认证据与 doneWhen。 */
+    public EvalResult evaluateAfterLoop(TaskNode node, String evidence) {
         DoneWhen dw = node == null || node.doneWhen() == null
                 ? DoneWhen.note() : node.doneWhen();
         if (!dw.worldCheck() && looksLikeLoopAbort(evidence)) {
             return reject("loop abort: " + abbreviate(evidence, 120));
         }
-        if (todoCompleted && !properties.isStrictEval() && !looksLikeFileDelivery(node)) {
-            return EvalResult.pass();
-        }
-        if (todoCompleted && properties.isStrictEval()) {
-            if (dw.worldCheck() || dw.isJudge() || dw.isCommand() || dw.isValidation()
-                    || looksLikeFileDelivery(node)) {
-                return evaluate(node, evidence, evidence);
-            }
-            if (StringUtils.isBlank(evidence)) {
-                return reject("todo completed 但缺少 evidence");
-            }
-            return EvalResult.pass();
-        }
         return evaluate(node, evidence, evidence);
+    }
+
+    public GraphEval evaluateGraph(Goal goal, TaskGraph graph) {
+        if (graph == null || graph.isEmpty()) {
+            return GraphEval.fail("", "eval: empty graph");
+        }
+        for (TaskNode n : graph.nodes()) {
+            if (n.status() != TaskNodeStatus.SUCCESS) {
+                return GraphEval.fail(n.id(), "eval: unfinished node " + n.id());
+            }
+            if (!NodeOutputBinder.ofNode(n).complete(n)) {
+                return GraphEval.fail(n.id(), "eval: outputs 未绑定");
+            }
+            EvalResult ev = evaluate(n, n.output(), n.output());
+            if (!ev.ok()) {
+                return GraphEval.fail(n.id(), ev.reason());
+            }
+        }
+        if (goal == null || goal.successCriteria() == null) {
+            return GraphEval.pass();
+        }
+        for (String c : goal.successCriteria()) {
+            if (Goal.isPlaceholderCriterion(c)) {
+                continue;
+            }
+            String path = DataflowNormalizer.pathFromName(c);
+            if (path.isBlank()) {
+                if (!hasMatchingJudge(graph, c)) {
+                    return GraphEval.fail("", "eval: successCriteria 无法验收 " + c);
+                }
+                continue;
+            }
+            if (!hasFileDeliverable(graph, path)) {
+                return GraphEval.fail("", "eval: successCriteria 缺少产物 " + path);
+            }
+        }
+        return GraphEval.pass();
+    }
+
+    static boolean hasFileDeliverable(TaskGraph graph, String path) {
+        if (graph == null || StringUtils.isBlank(path)) {
+            return false;
+        }
+        String want = path.replace('\\', '/');
+        int slash = want.lastIndexOf('/');
+        String fileName = slash >= 0 ? want.substring(slash + 1) : want;
+        for (TaskNode n : graph.nodes()) {
+            DoneWhen dw = n.doneWhen();
+            if (dw == null || !dw.isFile() || StringUtils.isBlank(dw.path())) {
+                continue;
+            }
+            String got = dw.path().replace('\\', '/');
+            if (want.equalsIgnoreCase(got) || got.endsWith("/" + fileName)
+                    || fileName.equalsIgnoreCase(pathFileName(got))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static boolean hasMatchingJudge(TaskGraph graph, String criteria) {
+        if (graph == null || StringUtils.isBlank(criteria)) {
+            return false;
+        }
+        String want = criteria.trim();
+        for (TaskNode n : graph.nodes()) {
+            DoneWhen dw = n.doneWhen();
+            if (dw == null || StringUtils.isBlank(dw.criteria())) {
+                continue;
+            }
+            if ((dw.isJudge() || dw.isValidation())
+                    && want.equals(dw.criteria().trim())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String pathFileName(String path) {
+        int slash = path.lastIndexOf('/');
+        return slash >= 0 ? path.substring(slash + 1) : path;
     }
 
     private EvalResult judge(TaskNode node, String criteria, String evidence) {
@@ -176,20 +252,27 @@ public class StepEvaluator {
     }
 
     static EvalResult checkValidation(String evidence) {
-        if (StringUtils.isBlank(evidence))
+        if (StringUtils.isBlank(evidence)) {
             return EvalResult.fail("validation_passed 缺少 evidence");
-        String t = evidence.toLowerCase();
-        if (t.contains("build failure") || t.contains("failures!")
-                || t.contains("测试失败") || t.contains("assertionerror")
-                || t.contains("\"success\":false"))
-            return EvalResult.fail("validation_passed 未通过");
+        }
+        if (looksLikeToolError(evidence) || looksLikeLoopAbort(evidence)) {
+            return EvalResult.fail("validation_passed 命令失败");
+        }
         Matcher m = EXIT_CODE.matcher(evidence);
-        if (m.find() && Integer.parseInt(m.group(1)) != 0)
-            return EvalResult.fail("validation_passed 退出码非 0");
-        if (t.contains("build success") || t.contains("tests run")
-                || t.contains("exit_code=0") || t.contains("通过")
-                || t.contains("\"success\":true"))
+        if (m.find()) {
+            int code = Integer.parseInt(m.group(1));
+            if (code != 0) {
+                return EvalResult.fail("validation_passed 退出码 " + code);
+            }
             return EvalResult.pass();
+        }
+        String t = evidence.toLowerCase();
+        if (t.contains("\"success\":false")) {
+            return EvalResult.fail("validation_passed 未通过");
+        }
+        if (t.contains("\"success\":true")) {
+            return EvalResult.pass();
+        }
         return EvalResult.fail("validation_passed 证据无法证明校验通过");
     }
 

@@ -1,7 +1,9 @@
 package com.miniagent.agent.planner;
 
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * DAG 节点。inputs/outputs 是数据流名；output 是 SUCCESS 后的产物正文。
@@ -25,6 +27,7 @@ public record TaskNode(
         String output,
         Map<String, String> outputBindings
 ) {
+    static final String BLOCKED_PREFIX = "block:";
     public TaskNode {
         dependsOn = dependsOn == null ? List.of() : List.copyOf(dependsOn);
         inputs = inputs == null ? List.of() : List.copyOf(inputs);
@@ -84,6 +87,12 @@ public record TaskNode(
                 lastError, retryCount, output, outputBindings);
     }
 
+    public TaskNode withToolArguments(Map<String, Object> args) {
+        return new TaskNode(id, name, capability, dependsOn, inputs, outputs, status,
+                priority, doneWhen, toolHint, args, compensation, covers,
+                lastError, retryCount, output, outputBindings);
+    }
+
     public TaskNode withOutput(String out) {
         return new TaskNode(id, name, capability, dependsOn, inputs, outputs, status,
                 priority, doneWhen, toolHint, toolArguments, compensation, covers, lastError, retryCount,
@@ -94,5 +103,52 @@ public record TaskNode(
         return new TaskNode(id, name, capability, dependsOn, inputs, outputs, status,
                 priority, doneWhen, toolHint, toolArguments, compensation, covers, lastError, retryCount,
                 legacyOutput == null ? "" : legacyOutput, bindings);
+    }
+
+    TaskNode withPorts(List<String> nextInputs, List<String> nextOutputs) {
+        return new TaskNode(id, name, capability, dependsOn, nextInputs, nextOutputs, status,
+                priority, doneWhen, toolHint, toolArguments, compensation, covers, lastError,
+                retryCount, output, outputBindings);
+    }
+
+    public TaskNode withCapability(String cap) {
+        return new TaskNode(id, name, cap, dependsOn, inputs, outputs, status,
+                priority, doneWhen, toolHint, toolArguments, compensation, covers,
+                lastError, retryCount, output, outputBindings);
+    }
+
+    public TaskNode withDoneWhen(DoneWhen next) {
+        return new TaskNode(id, name, capability, dependsOn, inputs, outputs, status,
+                priority, next == null ? DoneWhen.note() : next, toolHint, toolArguments,
+                compensation, covers, lastError, retryCount, output, outputBindings);
+    }
+
+    /** REPLACE_TOOL 写入的失败工具，不是 Compiler 绑定。 */
+    public List<String> blockedTools() {
+        if (!toolHint.startsWith(BLOCKED_PREFIX)) {
+            return List.of();
+        }
+        String raw = toolHint.substring(BLOCKED_PREFIX.length()).trim();
+        if (raw.isBlank()) {
+            return List.of();
+        }
+        return List.of(raw.split(",")).stream()
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .toList();
+    }
+
+    public String blockedTool() {
+        List<String> all = blockedTools();
+        return all.isEmpty() ? "" : all.get(all.size() - 1);
+    }
+
+    public TaskNode withBlockedTool(String tool) {
+        if (tool == null || tool.isBlank()) {
+            return this;
+        }
+        Set<String> set = new LinkedHashSet<>(blockedTools());
+        set.add(tool.trim());
+        return withToolHint(BLOCKED_PREFIX + String.join(",", set));
     }
 }

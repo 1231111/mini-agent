@@ -2,6 +2,8 @@ package com.miniagent.agent.core;
 
 import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.core.TokenEstimator;
+import com.miniagent.agent.scope.TaskScopeRegistry;
+import com.miniagent.common.model.EffectiveModelContext;
 import org.springframework.beans.factory.annotation.Value;
 
 import dev.langchain4j.data.message.AiMessage;
@@ -28,7 +30,7 @@ import org.apache.commons.lang3.StringUtils;
  * 设计要点：
  *   - 5 阶段流水线：pruneOldToolResults → findTailCutIndex → generateSummary → rebuild → sanitizeOrphanedToolPairs
  *   - 按 session 隔离状态，支持多用户并发
- *   - 压缩前自动提取关键信息到中期记忆，防止信息丢失
+ *   - 压缩只服务 Loop 内 messages；记忆晋升走巩固，不写用户级 MIDTERM
  */
 @Slf4j
 @Component
@@ -39,8 +41,14 @@ public class ContextCompressor {
 
     @Autowired
     private TokenEstimator tokenEstimator;
-    @Autowired
-    private com.miniagent.memory.MemoryStore memoryStore;
+
+    /**
+     * 任务作用域解析器。压缩状态里的 {@code previousSummary} 是**上一段对话的交接摘要**，
+     * 它属于某一次交付；跨任务沿用等于把上一个任务的结论当成本轮的背景事实讲给模型听。
+     * 因此这里按作用域键隔离，而不是按 sessionId。
+     */
+    @Autowired(required = false)
+    private TaskScopeRegistry taskScopeRegistry;
 
     // ─── 阈值配置 ───
     /** 压缩触发阈值：上下文占比达到该比例即压缩，留出输出余量。可配置，默认 0.75。 */
@@ -48,19 +56,19 @@ public class ContextCompressor {
     private double compressionThreshold;
     /**
      * true：压缩热路径同步调 LLM 摘要（会拉高 P99）。
-     * false（默认）：热路径硬截断 + 占位摘要，LLM 摘要异步后台跑，供下次/中期记忆。
+     * false（默认）：热路径硬截断 + 占位摘要，LLM 摘要异步后台跑，供下次压缩使用。
      */
     @Value("${agent.context.llm-summary-enabled:false}")
     private boolean llmSummaryEnabled;
     private static final double TAIL_TOKEN_RATIO = 0.4;
     private static final int PROTECT_FIRST_N = 2;
     private static final int MIN_MESSAGES_TO_COMPRESS = 8;
-    private static final int DEFAULT_MAX_CONTEXT_TOKENS = 256000;
+    private static final int DEFAULT_MAX_CONTEXT_TOKENS = 512000;
     private static final int PROTECT_TOOL_RESULTS_TAIL = 6;
     private static final int MAX_INEFFECTIVE_COMPRESSIONS = 2;
     private static final int MAX_SUMMARY_TOKENS = 3000;
 
-    // ─── 按会话隔离的状态 ───
+    // ─── 按任务作用域隔离的状态 ───
     private static class SessionState {
         String previousSummary;
         int ineffectiveCount = 0;
@@ -79,18 +87,25 @@ public class ContextCompressor {
         currentSessionId.set(sessionId);
     }
 
-    /** 清理会话状态 */
+    /**
+     * sessionId → 任务作用域键。唯一的翻译点，{@code taskId == 0} 时与原 sessionId 相同。
+     */
+    private String scopeKey(String sessionId) {
+        return taskScopeRegistry == null ? sessionId : taskScopeRegistry.scopeKey(sessionId);
+    }
+
+    /** 清理状态（按任务作用域） */
     public void clearSession(String sessionId) {
-        sessionStates.remove(sessionId);
+        sessionStates.remove(scopeKey(sessionId));
     }
 
     private SessionState getState(String sessionId) {
-        return sessionStates.computeIfAbsent(sessionId, k -> new SessionState());
+        return sessionStates.computeIfAbsent(scopeKey(sessionId), k -> new SessionState());
     }
 
-    /** 重置会话状态（用于测试） */
+    /** 重置状态（用于测试） */
     public void resetSession(String sessionId) {
-        sessionStates.remove(sessionId);
+        sessionStates.remove(scopeKey(sessionId));
     }
 
     // ─── 阶段 1: 裁剪旧工具结果 ───
@@ -243,24 +258,18 @@ public class ContextCompressor {
         return sb.toString();
     }
 
-    // ─── 摘要 + 记忆提取（合并为单次 LLM 调用）───
+    // ─── 对话摘要（不写入记忆库）───
     private static final String SUMMARY_PREAMBLE = "你是一个上下文压缩专家。你的任务是生成简洁的交接摘要。\n" +
             "保留：关键决策、待办事项、重要数据、用户明确要求记住的内容。\n" +
             "删除：闲聊、重复信息、已完成的工具调用细节。";
 
     private static final String SUMMARY_TEMPLATE = "输出 %d 字以内的摘要，使用简洁的要点列表格式。";
 
-    private static final String MEMORY_SEPARATOR = "---MEMORY---";
-
     /**
-     * 合并摘要生成 + 记忆提取为单次 LLM 调用，节省一半压缩延迟。
-     * 输出格式：摘要部分 + "---MEMORY---" 分隔符 + 记忆提取部分。
+     * 只生成 Loop 内交接摘要。可复用事实由巩固流水线晋升，不写用户级 MIDTERM。
      */
     private String generateSummaryAndExtractMemory(List<ChatMessage> toSummarize, int summaryBudget, SessionState state) {
         String content = serializeForSummary(toSummarize);
-        String memoryPrompt = "\n\n在摘要之后，另起一行输出 " + MEMORY_SEPARATOR + "，然后提取关键信息到长期记忆（只提取将来仍有用的）：\n" +
-                "提取类别：1)用户偏好 2)重要决策 3)技术上下文 4)行动项\n" +
-                "格式：每条一行 \"类别: 内容\"。如果没有值得记忆的内容，在分隔符后输出 \"无\"。";
 
         String prompt;
         if (Objects.nonNull(state.previousSummary)) {
@@ -269,51 +278,24 @@ public class ContextCompressor {
                 "上一次摘要：\n" + state.previousSummary + "\n\n" +
                 "新的对话轮次：\n" + content + "\n\n" +
                 "更新摘要，保留仍然相关的信息，添加新的操作和状态变化。\n" +
-                String.format(SUMMARY_TEMPLATE, summaryBudget) + memoryPrompt;
+                String.format(SUMMARY_TEMPLATE, summaryBudget);
         } else {
             prompt = SUMMARY_PREAMBLE + "\n" +
                 "为以下对话生成结构化交接摘要：\n\n" + content + "\n\n" +
-                String.format(SUMMARY_TEMPLATE, summaryBudget) + memoryPrompt;
+                String.format(SUMMARY_TEMPLATE, summaryBudget);
         }
 
         try {
             List<ChatMessage> req = List.of(new UserMessage(prompt));
-            ChatResponse resp = chatModel.chat(ChatRequest.builder().messages(req).build());
-            String fullResponse = resp.aiMessage().text();
-            if (Objects.isNull(fullResponse)) {
+            // 压缩摘要属辅助调用，必须跟随本轮生效模型（用户配置），全局 Bean 仅兜底
+            ChatResponse resp = EffectiveModelContext.chatOr(chatModel)
+                    .chat(ChatRequest.builder().messages(req).build());
+            String summary = resp.aiMessage().text();
+            if (Objects.isNull(summary)) {
                 return null;
             }
-
-            // 按分隔符拆分：摘要 + 记忆
-            String summary;
-            String memoryPart = null;
-            int sepIdx = fullResponse.indexOf(MEMORY_SEPARATOR);
-            if (sepIdx >= 0) {
-                summary = fullResponse.substring(0, sepIdx).strip();
-                memoryPart = fullResponse.substring(sepIdx + MEMORY_SEPARATOR.length()).strip();
-            } else {
-                summary = fullResponse.strip();
-            }
-
-            if (Objects.nonNull(summary)) {
-                state.previousSummary = summary;
-            }
-
-            // 异步保存记忆提取结果
-            if (StringUtils.isNotBlank(memoryPart) && !memoryPart.contains("无")) {
-                try {
-                    String existing = memoryStore.getRawMidtermMemory();
-                    String newMemory = existing.isEmpty() ? memoryPart : existing + "\n" + memoryPart;
-                    if (newMemory.length() > 3000) {
-                        newMemory = newMemory.substring(newMemory.length() - 3000);
-                    }
-                    memoryStore.updateMidtermMemory(newMemory);
-                    log.info("压缩时提取记忆成功，提取 {} 字", memoryPart.length());
-                } catch (Exception e) {
-                    log.warn("压缩时保存记忆失败（不影响压缩）: {}", e.getMessage());
-                }
-            }
-
+            summary = summary.strip();
+            state.previousSummary = summary;
             return summary;
         } catch (Exception e) {
             log.error("摘要生成失败: {}", e.getMessage());
@@ -421,8 +403,11 @@ public class ContextCompressor {
                     ? state.previousSummary + "\n\n" + stub
                     : stub;
             List<ChatMessage> middleCopy = new ArrayList<>(toSummarize);
+            // 异步线程不继承 ThreadLocal：把本轮生效模型显式带进去，
+            // 否则后台摘要会回退到全局 Bean（全局 key 失效时这条链路静默失败）。
+            ChatModel inheritedModel = EffectiveModelContext.currentChat();
             CompletableFuture.runAsync(() -> {
-                try {
+                try (var ignoredModel = EffectiveModelContext.bind(inheritedModel, null)) {
                     String s = generateSummaryAndExtractMemory(middleCopy, summaryBudget, state);
                     if (StringUtils.isNotBlank(s)) {
                         state.previousSummary = s;

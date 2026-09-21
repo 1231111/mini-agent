@@ -23,7 +23,7 @@ public record ActionSpec(
         acceptance = acceptance == null ? DoneWhen.note() : acceptance;
         compensation = compensation == null ? "" : compensation;
         idempotencyKey = idempotencyKey == null ? "" : idempotencyKey;
-        timeoutSeconds = timeoutSeconds > 0 ? timeoutSeconds : 60;
+        timeoutSeconds = Math.max(0, timeoutSeconds);
         retryPolicy = retryPolicy == null ? ActionRetryPolicy.none() : retryPolicy;
         concurrencyKey = concurrencyKey == null ? "" : concurrencyKey;
     }
@@ -32,7 +32,7 @@ public record ActionSpec(
     public ActionSpec(String actionId, String taskId, String tool, Map<String, Object> arguments,
                       String expectedResult, String compensation) {
         this(actionId, taskId, tool, "", arguments, DoneWhen.parseWire(expectedResult), compensation,
-                "", 60, ActionRetryPolicy.none(), "");
+                "", 0, ActionRetryPolicy.none(), "");
     }
 
     public String expectedResult() { return acceptance.wire(); }

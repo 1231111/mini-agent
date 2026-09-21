@@ -1,6 +1,7 @@
 package com.miniagent.agent.memory.writer;
 
 import com.miniagent.common.StringUtils;
+import com.miniagent.common.model.EffectiveModelContext;
 import com.miniagent.memory.model.AgentEvent;
 import com.miniagent.memory.writer.ImportanceEvaluator;
 import dev.langchain4j.data.message.SystemMessage;
@@ -47,20 +48,21 @@ public class LlmImportanceEvaluator implements ImportanceEvaluator {
             return ruleScore;
         }
 
-        // 不确定区间才调 LLM
-        if (chatModel == null) {
+        // 不确定区间才调 LLM；模型取本轮生效的那套（用户配置），全局 Bean 仅兜底
+        ChatModel model = EffectiveModelContext.chatOr(chatModel);
+        if (model == null) {
             return ruleScore;
         }
 
         try {
-            return llmEvaluate(event);
+            return llmEvaluate(event, model);
         } catch (Exception e) {
             log.warn("LLM 重要度评估失败，回退规则分数: {}", e.getMessage());
             return ruleScore;
         }
     }
 
-    private double llmEvaluate(AgentEvent event) {
+    private double llmEvaluate(AgentEvent event, ChatModel model) {
         String prompt = """
             判断以下 Agent 事件是否值得长期记住。返回 0.0~1.0 的分数。
             高分 = 必须记住（失败经验、用户偏好、可复用方法）
@@ -85,7 +87,7 @@ public class LlmImportanceEvaluator implements ImportanceEvaluator {
             ))
             .build();
 
-        String response = chatModel.chat(request).aiMessage().text().trim();
+        String response = model.chat(request).aiMessage().text().trim();
         return parseScore(response);
     }
 

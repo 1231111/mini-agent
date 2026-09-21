@@ -771,12 +771,8 @@
             COMPRESSION:         { icon: '🗜️', label: '上下文压缩',   group: '生命周期', col: 0 },
             // 上下文加载
             CONTEXT_LOAD:        { icon: '📦', label: '加载上下文',   group: '上下文',   col: 1 },
-            // 意图识别
-            INTENT_START:        { icon: '🧭', label: '意图识别开始', group: '意图识别', col: 2 },
-            INTENT_L0:           { icon: '⚡', label: 'L0规则',       group: '意图识别', col: 2 },
-            INTENT_L1:           { icon: '🔎', label: 'L1小模型',     group: '意图识别', col: 2 },
-            INTENT_L2:           { icon: '📐', label: 'L2启发式',     group: '意图识别', col: 2 },
-            INTENT_END:          { icon: '🧭', label: '意图识别结束', group: '意图识别', col: 2 },
+            // 任务信号
+            TASK_SIGNALS:        { icon: '📡', label: '任务信号观察', group: '任务信号', col: 2 },
             // 执行计划
             TASK_PLAN:           { icon: '🗺️', label: '执行计划定案', group: '执行计划', col: 3 },
             // 规划控制
@@ -823,7 +819,7 @@
         };
 
         // 各阶段的推荐列序（用于时间线布局）
-        const STAGE_ORDER = ['生命周期','上下文','意图识别','执行计划','规划控制','任务管理','各轮目标','人机协作','模型调用','工具调用','最终结果'];
+        const STAGE_ORDER = ['生命周期','上下文','任务信号','执行计划','规划控制','任务管理','各轮目标','人机协作','模型调用','工具调用','最终结果'];
 
         // 初始化
         document.addEventListener('DOMContentLoaded', () => {
@@ -1406,7 +1402,7 @@
             const STAGE_LEVELS = {
                 '生命周期': 0,
                 '上下文': 1,
-                '意图识别': 2,
+                '任务信号': 2,
                 '执行计划': 3,
                 '规划控制': 4,
                 '任务管理': 5,
@@ -1472,7 +1468,7 @@
             const STAGE_LEVELS = {
                 '生命周期': 0,
                 '上下文': 1,
-                '意图识别': 2,
+                '任务信号': 2,
                 '执行计划': 3,
                 '规划控制': 4,
                 '任务管理': 5,

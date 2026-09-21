@@ -1173,6 +1173,15 @@ h1, h2, h3, h4 {
 .ask-deny { background: var(--surface3); color: var(--text); }
 .ask-allow { background: var(--grad-btn); color: #fff; box-shadow: 0 4px 14px rgba(52, 216, 184, .28); }
 .ask-allow:hover { filter: brightness(1.06); }
+.ask-modal .question-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: flex-start;
+    margin: 0 0 16px;
+}
+#questionModal .ask-modal { max-width: 520px; }
+#questionModalText { white-space: pre-wrap; }
 
 /* 发送按钮 */
 .send-btn {

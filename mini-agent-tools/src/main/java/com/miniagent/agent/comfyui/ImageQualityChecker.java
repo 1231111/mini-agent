@@ -7,6 +7,7 @@ import dev.langchain4j.data.message.Content;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
+import com.miniagent.common.model.EffectiveModelContext;
 import com.miniagent.config.storage.MediaStorage;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -96,7 +97,9 @@ public class ImageQualityChecker {
             contents.add(ImageContent.from(genDataUrl));
             UserMessage msg = UserMessage.from(contents);
 
-            ChatResponse resp = chatModel.chat(ChatRequest.builder().messages(List.of(msg)).build());
+            // 质检属辅助调用，跟随本轮生效模型（用户配置），全局 Bean 仅兜底
+            ChatResponse resp = EffectiveModelContext.chatOr(chatModel)
+                    .chat(ChatRequest.builder().messages(List.of(msg)).build());
             if (Objects.isNull(resp) || Objects.isNull(resp.aiMessage())) {
                 return "{\"pass\":true,\"score\":5,\"issues\":[\"质检模型调用失败\"],\"suggestion\":\"\"}";
             }
@@ -157,7 +160,9 @@ public class ImageQualityChecker {
             contents.add(ImageContent.from(dataUrl));
             UserMessage msg = UserMessage.from(contents);
 
-            ChatResponse resp = chatModel.chat(ChatRequest.builder().messages(List.of(msg)).build());
+            // 质检属辅助调用，跟随本轮生效模型（用户配置），全局 Bean 仅兜底
+            ChatResponse resp = EffectiveModelContext.chatOr(chatModel)
+                    .chat(ChatRequest.builder().messages(List.of(msg)).build());
             if (Objects.isNull(resp) || Objects.isNull(resp.aiMessage())) {
                 return "{\"pass\":true,\"score\":5,\"issues\":[\"质检模型调用失败，默认通过\"],\"suggestion\":\"\"}";
             }

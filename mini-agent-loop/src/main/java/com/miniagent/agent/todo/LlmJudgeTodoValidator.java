@@ -1,10 +1,14 @@
 package com.miniagent.agent.todo;
 
+import com.miniagent.agent.llm.DedicatedChatModel;
+import com.miniagent.common.model.EffectiveModelContext;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
+import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
@@ -27,6 +31,36 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
 
     @Autowired
     private ChatModel chatModel;
+
+    @Value("${agent.planner.judge-model-name:}")
+    private String judgeModelName;
+    @Value("${agent.planner.judge-base-url:}")
+    private String judgeBaseUrl;
+    @Value("${agent.planner.judge-api-key:}")
+    private String judgeApiKey;
+    @Value("${agent.planner.judge-timeout-seconds:60}")
+    private int judgeTimeoutSeconds;
+
+    private volatile ChatModel dedicatedJudge;
+
+    @PostConstruct
+    void initDedicatedJudge() {
+        dedicatedJudge = DedicatedChatModel.openAiOrNull(
+                judgeModelName, judgeBaseUrl, judgeApiKey, judgeTimeoutSeconds);
+        if (dedicatedJudge != null) {
+            log.info("llm_judge 专用评判模型已就绪: model={}", judgeModelName);
+        } else {
+            log.info("llm_judge 未配置专用模型，评判走主对话模型");
+        }
+    }
+
+    /**
+     * 专用评判模型优先；未配置专用模型则跟随本轮生效模型（用户自己配的那套），
+     * 全局 {@code @Primary} Bean 仅作最后兜底。
+     */
+    ChatModel resolveJudgeChat() {
+        return dedicatedJudge != null ? dedicatedJudge : EffectiveModelContext.chatOr(chatModel);
+    }
 
     @Override
     public String name() {
@@ -71,7 +105,11 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
                 """.formatted(criteria, Objects.isNull(item.content()) ? "" : item.content(), payload);
 
         try {
-            ChatResponse resp = chatModel.chat(UserMessage.from(prompt));
+            ChatModel judge = resolveJudgeChat();
+            if (judge == null) {
+                return "llm_judge 未配置评判模型";
+            }
+            ChatResponse resp = judge.chat(UserMessage.from(prompt));
             String text = Objects.isNull(resp) || Objects.isNull(resp.aiMessage()) || Objects.isNull(resp.aiMessage().text())
                     ? "" : resp.aiMessage().text().trim();
             log.info("llm_judge 原始回复: {}", text.length() > 200 ? text.substring(0, 200) + "…" : text);

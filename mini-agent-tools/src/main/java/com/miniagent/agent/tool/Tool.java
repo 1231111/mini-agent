@@ -34,6 +34,14 @@ public class Tool {
     private boolean cancellable = false;
     @Builder.Default
     private long timeoutSeconds = 60L;
+    /**
+     * 按本次参数求超时的函数（返回 0 表示回退到 {@link #timeoutSeconds}）。
+     *
+     * <p>为什么超时不能只在注册期定死：{@code exec_command} 跑 {@code git status} 和跑
+     * {@code mvnw package} 需要的预算差三个数量级。注册只有工具名，没有参数，
+     * 所以「随调用变化的超时」只能由参数来算。</p>
+     */
+    private Function<String, Long> adaptiveTimeoutSeconds;
     @Builder.Default
     private int maxRetries = 0;
     @Builder.Default

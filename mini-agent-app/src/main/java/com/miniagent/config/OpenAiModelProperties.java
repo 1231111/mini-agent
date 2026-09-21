@@ -50,6 +50,26 @@ public class OpenAiModelProperties {
     public String getChatModelName() { return chatModelName; }
     public Duration getChatTimeout() { return chatTimeout; }
 
+    /** 后台任务日志用：模型 + 网关 + key 末四位，不含完整密钥。 */
+    public String describeChatClient() {
+        return "bean=langchain4j.open-ai.chat-model, model=" + chatModelName
+                + ", baseUrl=" + chatBaseUrl
+                + ", keyHint=" + keyHint(chatApiKey);
+    }
+
+    public static String keyHint(String key) {
+        if (key == null || key.isBlank()) {
+            return "missing";
+        }
+        if ("not-configured".equals(key)) {
+            return "not-configured";
+        }
+        if (key.length() <= 8) {
+            return key.charAt(0) + "***";
+        }
+        return key.substring(0, 4) + "..." + key.substring(key.length() - 4);
+    }
+
     // === Streaming Model getters ===
     public String getStreamingApiKey() { return streamingApiKey; }
     public String getStreamingBaseUrl() { return streamingBaseUrl; }

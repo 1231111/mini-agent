@@ -7,10 +7,9 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /**
- * StateSnapshot.graph → Todo UI 投影（Todo 不再当主状态）。
+ * 图 → Todo UI 单向投影。确认/完成只写 {@link TaskGraph}。
  */
 @Component
 public class TodoStateProjector {
@@ -48,11 +47,12 @@ public class TodoStateProjector {
             m.put("status", toTodoStatus(n.status()));
             m.put("done_when", n.doneWhen().wire());
             m.put("depends_on", deps);
-            if (n.lastError() != null && !n.lastError().isBlank())
+            if (n.lastError() != null && !n.lastError().isBlank()) {
                 m.put("note", n.lastError());
+            }
             raw.add(m);
         }
-        taskTodoStore.set(sessionId, raw);
+        taskTodoStore.overwrite(sessionId, raw);
     }
 
     /** taskId(图节点) → todo 数字 id */
@@ -62,6 +62,18 @@ public class TodoStateProjector {
         }
         Integer id = todoIdMap(graph).get(taskId);
         return id == null ? 0 : id;
+    }
+
+    public String nodeIdFor(TaskGraph graph, int todoId) {
+        if (graph == null || todoId <= 0) {
+            return "";
+        }
+        for (Map.Entry<String, Integer> e : todoIdMap(graph).entrySet()) {
+            if (e.getValue() == todoId) {
+                return e.getKey();
+            }
+        }
+        return "";
     }
 
     public Map<String, Integer> todoIdMap(TaskGraph graph) {
@@ -79,18 +91,10 @@ public class TodoStateProjector {
         return idMap;
     }
 
-    /** 从 Todo 回读节点是否已 completed（执行后同步）。 */
-    public boolean isTodoCompleted(String sessionId, TaskGraph graph, String taskId) {
-        int todoId = todoIdFor(graph, taskId);
-        if (todoId <= 0 || sessionId == null) {
-            return false;
-        }
-        for (TaskTodoStore.TodoItem it : taskTodoStore.get(sessionId))
-            if (it.id() == todoId)
-                return it.status() == TaskTodoStore.Status.completed;
-        return false;
-    }
-
+    /**
+     * 模型在本步把对应 todo 标成 awaiting 时，把该信号抄到图上。
+     * 确认之后不再从 Todo 回写图。
+     */
     public boolean isTodoAwaiting(String sessionId, TaskGraph graph, String taskId) {
         int todoId = todoIdFor(graph, taskId);
         if (todoId <= 0 || sessionId == null) {
@@ -104,58 +108,34 @@ public class TodoStateProjector {
         return false;
     }
 
-    public void yieldNodeToHuman(String sessionId, TaskGraph graph, String taskId,
-                                 String note) {
-        int todoId = todoIdFor(graph, taskId);
-        Set<Integer> ids = todoId > 0 ? Set.of(todoId) : Set.of();
-        taskTodoStore.yieldToHuman(sessionId, ids, note);
+    /** 按页面 todo id 放行对应节点；无变化时返回原图。 */
+    public TaskGraph confirmByTodoId(TaskGraph graph, int todoId) {
+        String nodeId = nodeIdFor(graph, todoId);
+        return confirmNode(graph, nodeId);
     }
 
-    public boolean confirmAwaiting(String sessionId, String note) {
-        return taskTodoStore.confirmAwaiting(sessionId, note);
-    }
-
-    public String todoEvidence(String sessionId, TaskGraph graph, String taskId) {
-        int todoId = todoIdFor(graph, taskId);
-        if (todoId <= 0 || sessionId == null) {
-            return "";
-        }
-        for (TaskTodoStore.TodoItem it : taskTodoStore.get(sessionId))
-            if (it.id() == todoId)
-                return it.evidence() == null ? "" : it.evidence();
-        return "";
-    }
-
-    /**
-     * 与 Todo confirm 门禁对齐：awaiting_confirm ↔ AWAITING_CONFIRM；
-     * 已确认则从 AWAITING_CONFIRM 回到 PENDING 以便 normalize→READY。
-     */
-    public TaskGraph syncConfirmFromTodo(String sessionId, TaskGraph graph) {
-        if (sessionId == null || graph == null) {
+    /** 聊天答复：放行图上第一个 AWAITING_CONFIRM。 */
+    public TaskGraph confirmFirst(TaskGraph graph) {
+        if (graph == null) {
             return graph;
         }
-        Map<String, Integer> idMap = todoIdMap(graph);
-        Map<Integer, TaskTodoStore.Status> todoStatus = new LinkedHashMap<>();
-        for (TaskTodoStore.TodoItem it : taskTodoStore.get(sessionId))
-            todoStatus.put(it.id(), it.status());
-        List<TaskNode> next = new ArrayList<>();
         for (TaskNode n : graph.nodes()) {
-            Integer tid = idMap.get(n.id());
-            if (tid == null) {
-                next.add(n);
-                continue;
+            if (n.status() == TaskNodeStatus.AWAITING_CONFIRM) {
+                return graph.replace(n.withStatus(TaskNodeStatus.PENDING).withError(""));
             }
-            TaskTodoStore.Status ts = todoStatus.get(tid);
-            if (ts == TaskTodoStore.Status.awaiting_confirm)
-                next.add(n.withStatus(TaskNodeStatus.AWAITING_CONFIRM));
-            else if (n.status() == TaskNodeStatus.AWAITING_CONFIRM
-                    && (ts == TaskTodoStore.Status.in_progress || ts == TaskTodoStore.Status.pending
-                    || ts == TaskTodoStore.Status.completed))
-                next.add(n.withStatus(TaskNodeStatus.PENDING));
-            else
-                next.add(n);
         }
-        return new TaskGraph(next);
+        return graph;
+    }
+
+    private static TaskGraph confirmNode(TaskGraph graph, String nodeId) {
+        if (graph == null || nodeId == null || nodeId.isBlank()) {
+            return graph;
+        }
+        TaskNode n = graph.byId(nodeId);
+        if (n == null || n.status() != TaskNodeStatus.AWAITING_CONFIRM) {
+            return graph;
+        }
+        return graph.replace(n.withStatus(TaskNodeStatus.PENDING).withError(""));
     }
 
     private static String toTodoStatus(TaskNodeStatus s) {

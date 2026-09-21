@@ -2,6 +2,10 @@ package com.miniagent.agent.delegate;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.core.AgentLoop;
+import com.miniagent.agent.core.ExecutionProperties;
+import com.miniagent.agent.task.TaskPlan;
+import com.miniagent.agent.task.TaskSignals;
+import com.miniagent.agent.tool.CapabilityRegistry;
 import com.miniagent.agent.tool.Tool;
 import com.miniagent.agent.tool.ToolRegistry;
 import dev.langchain4j.model.chat.ChatModel;
@@ -36,54 +40,62 @@ public class DelegateTaskTool {
     @Autowired
     private ToolRegistry toolRegistry;
     @Autowired
+    private CapabilityRegistry capabilityRegistry;
+    @Autowired
     private AgentLoop agentLoop;
     @Autowired
     private ChatModel chatModel;
     @Autowired
     private RoleLoader roleLoader;
+    @Autowired
+    private ExecutionProperties executionProperties;
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** 子 Agent 默认可用的工具集合（读 + 调研 + 产出 + 生图）。 */
-    private static final List<String> DEFAULT_SUBAGENT_TOOLS = List.of(
-            "read_file", "list_files", "read_package", "write_file", "exec_command",
-            "search_code", "edit_file", "ast_search", "codebase_search",
-            "web_search", "web_extract", "http_get",
-            "browser_navigate", "browser_snapshot", "browser_click",
-            "browser_type", "browser_press", "browser_extract_text",
-            "browser_scroll", "browser_screenshot", "browser_evaluate",
-            "browser_close",
-            "image_generate"
-    );
-
-    private static final List<String> IMAGE_TOOLS_FOR_SUB = List.of(
-            "image_generate", "comfyui_txt2img", "comfyui_img2img", "comfyui_check_quality"
-    );
-
-    private static final int SUBAGENT_MAX_ITERATIONS = 25;
     private static final int SUMMARY_MAX_CHARS = 2000;
+    private static final String NESTED_DELEGATE = "delegate_task";
 
     @PostConstruct
     public void register() {
         toolRegistry.register(Tool.builder()
                 .name("delegate_task")
-                .description("""
-                        把一个独立子任务交给隔离的子 Agent 完成。
-                        支持角色化子Agent，通过 role 参数指定角色：
-                        - tester: 测试工程师，擅长功能验证、Bug发现、自动化测试
-                        - developer: 开发工程师，擅长代码编写、Bug修复、功能实现
-                        - pm: 产品经理，擅长需求分析、文档撰写、方案设计
-                        - designer: UI设计师，擅长界面审查、视觉验证、交互优化
-                        - security: 安全工程师，擅长安全测试、漏洞扫描、权限验证
-
-                        子 Agent 拿到的只有你提供的 goal + context，没有当前对话历史。
-                        可产出文件（写到 workspace 目录），完成后只返回一段不超过 2000 字的摘要给你，不污染主上下文。
-
-                        适合：调研一个独立问题、读取并总结资料、并行收集多个独立信息源、生成一个独立的文件产出物。
-                        不适合：不可逆的对外操作（发布、发送外部请求）、需要继续与用户交互或确认的任务。
-                        """)
+                .description(buildDescription())
                 .parameters(buildSchema())
                 .handler(this::handle)
                 .build());
+    }
+
+    /**
+     * 工具描述按 roles.yml 的实际角色表动态生成。
+     * 角色清单的唯一真实来源是配置文件——此处不再手写，避免新增角色后模型仍然看不到。
+     */
+    private String buildDescription() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("把一个独立子任务交给隔离的子 Agent 完成。\n\n");
+
+        List<RoleConfig> roles = roleLoader.getAllRoles();
+        if (Objects.nonNull(roles) && !roles.isEmpty()) {
+            sb.append("支持角色化子 Agent，用 role 参数指定（不指定则使用通用配置）：\n");
+            for (RoleConfig role : roles) {
+                if (Objects.isNull(role) || StringUtils.isBlank(role.getId())) {
+                    continue;
+                }
+                sb.append("- ").append(role.getId());
+                if (StringUtils.isNotBlank(role.getName())) {
+                    sb.append("（").append(role.getName()).append("）");
+                }
+                if (StringUtils.isNotBlank(role.getDescription())) {
+                    sb.append("：").append(role.getDescription());
+                }
+                sb.append("\n");
+            }
+            sb.append("\n");
+        }
+
+        sb.append("子 Agent 拿到的只有你提供的 goal + context，没有当前对话历史。\n");
+        sb.append("可产出文件（写到 workspace 目录），完成后只返回一段不超过 2000 字的摘要给你，不污染主上下文。\n\n");
+        sb.append("适合：调研一个独立问题、读取并总结资料、并行收集多个独立信息源、生成一个独立的文件产出物。\n");
+        sb.append("不适合：不可逆的对外操作（发布、发送外部请求）、需要继续与用户交互或确认的任务。");
+        return sb.toString();
     }
 
     private Map<String, Object> buildSchema() {
@@ -142,23 +154,7 @@ public class DelegateTaskTool {
                 systemPrompt = DEFAULT_SYSTEM_PROMPT;
             }
 
-            // 确定工具集（自定义 > 角色配置 > 默认）
-            List<String> tools;
-            if (!customTools.isEmpty()) {
-                tools = new java.util.ArrayList<>(customTools);
-            } else if (Objects.nonNull(roleConfig) && Objects.nonNull(roleConfig.getAllowedTools()) && !roleConfig.getAllowedTools().isEmpty()) {
-                tools = new java.util.ArrayList<>(roleConfig.getAllowedTools());
-            } else {
-                tools = new java.util.ArrayList<>(DEFAULT_SUBAGENT_TOOLS);
-            }
-            // 任务要求生图时自动补齐 image 工具（避免 developer 角色无 image_generate）
-            if (needsImageTools(goal, ctx)) {
-                for (String t : IMAGE_TOOLS_FOR_SUB) {
-                    if (!tools.contains(t)) {
-                        tools.add(t);
-                    }
-                }
-            }
+            List<String> tools = resolveSubagentTools(customTools, roleConfig);
 
             String userMessage = """
                     【子任务目标】
@@ -167,9 +163,6 @@ public class DelegateTaskTool {
                     【背景信息】
                     %s
                     """.formatted(goal, ctx.isEmpty() ? "（无）" : ctx);
-
-            // 强隔离：禁止嵌套派发，避免子 Agent 再开子 Agent 污染控制面
-            tools.remove("delegate_task");
 
             String roleLabel = Objects.nonNull(roleConfig) ? roleConfig.getName() : "通用";
             log.info("delegate_task 启动: role='{}', goal='{}', allowedTools={}", roleLabel, truncate(goal, 80), tools);
@@ -185,12 +178,17 @@ public class DelegateTaskTool {
             String answer;
             try (SubagentScope scope = SubagentScope.enter(subSid, roleId, false)) {
                 answer = agentLoop.run(modelForSub, systemPrompt, userMessage,
-                        java.util.List.of(), /* 不继承父对话脏历史 */ SUBAGENT_MAX_ITERATIONS, null,
-                        new com.miniagent.agent.intent.TaskPlan(
-                                com.miniagent.agent.intent.IntentType.NEW_TASK,
-                                goal, true, false, !tools.isEmpty(), tools,
+                        java.util.List.of(),
+                        executionProperties.getSubagentMaxIterations(), null,
+                        // 子代理的契约由调用方给定的 goal + 工具白名单定义，
+                        // 不能再从 goal 文本里推导信号：派出去的就是任务，不存在「轻问答」轮。
+                        new TaskPlan(
+                                goal,
+                                tools,
                                 java.util.List.of(),
-                                "subagent:" + (roleId.isEmpty() ? "general" : roleId))
+                                "subagent:" + (roleId.isEmpty() ? "general" : roleId),
+                                false,
+                                TaskSignals.NONE)
                 );
             } catch (Exception e) {
                 return error("子 Agent 执行失败: " + e.getMessage());
@@ -207,6 +205,28 @@ public class DelegateTaskTool {
             log.error("delegate_task 工具执行失败", e);
             return error("delegate_task 工具执行失败: " + e.getMessage());
         }
+    }
+
+    private List<String> resolveSubagentTools(List<String> custom, RoleConfig roleConfig) {
+        List<String> wanted;
+        if (custom != null && !custom.isEmpty()) {
+            wanted = custom;
+        } else if (roleConfig != null && roleConfig.getAllowedTools() != null
+                && !roleConfig.getAllowedTools().isEmpty()) {
+            wanted = roleConfig.getAllowedTools();
+        } else {
+            wanted = capabilityRegistry.toolsFor(CapabilityRegistry.GENERAL);
+        }
+        List<String> out = new java.util.ArrayList<>();
+        for (String t : wanted) {
+            if (t == null || t.isBlank() || NESTED_DELEGATE.equals(t)) {
+                continue;
+            }
+            if (capabilityRegistry.containsTool(t)) {
+                out.add(t);
+            }
+        }
+        return out;
     }
 
     /**
@@ -240,22 +260,6 @@ public class DelegateTaskTool {
             - 不要重复执行同样的工具调用。不要做不可逆的对外操作（发布、发送外部请求）。
             - 没把握时直接说"信息不足"，不要编造。
             """;
-
-    private static boolean needsImageTools(String goal, String ctx) {
-        String blob = ((Optional.ofNullable(goal).orElse("")) + " " + (Optional.ofNullable(ctx).orElse(""))).toLowerCase();
-        return blob.contains("image_generate")
-                || blob.contains("生图")
-                || blob.contains("生成图片")
-                || blob.contains("生成图")
-                || blob.contains("结构图")
-                || blob.contains("架构图")
-                || blob.contains("流程图")
-                || blob.contains("文生图")
-                || blob.contains("txt2img")
-                || blob.contains("img2img")
-                || blob.contains("diagram")
-                || (blob.contains("水平布局") && blob.contains("图"));
-    }
 
     @SuppressWarnings("unchecked")
     private List<String> parseTools(Object raw) {

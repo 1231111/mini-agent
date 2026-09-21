@@ -1,13 +1,22 @@
 package com.miniagent.agent.memory.lifecycle;
 
+import com.miniagent.common.SecurityUtils;
 import com.miniagent.common.StringUtils;
+import com.miniagent.common.model.EffectiveModelContext;
+import com.miniagent.config.OpenAiModelProperties;
+import com.miniagent.config.model.UserModelBinder;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.memory.entity.AgentEventEntity;
 import com.miniagent.agent.memory.entity.AgentEpisodeEntity;
 import com.miniagent.agent.memory.repository.AgentEventRepository;
 import com.miniagent.agent.memory.repository.AgentEpisodeRepository;
+import com.miniagent.memory.MemoryKeys;
+import com.miniagent.memory.MemoryManager;
+import com.miniagent.memory.MemoryStore;
 import com.miniagent.memory.lifecycle.ConsolidationService;
+import com.miniagent.memory.model.MemoryScope;
+import com.miniagent.memory.model.SemanticFact;
 import com.miniagent.memory.model.WorkingMemory;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
@@ -16,6 +25,7 @@ import dev.langchain4j.model.chat.request.ChatRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -39,6 +49,8 @@ import java.util.stream.Collectors;
 public class DefaultConsolidationService implements ConsolidationService {
 
     private static final Logger log = LoggerFactory.getLogger(DefaultConsolidationService.class);
+    private static final int FACT_SUBJECT_MAX = 256;
+    private static final int FACT_OBJECT_MAX = 512;
 
     @Autowired
     private AgentEventRepository eventRepository;
@@ -52,6 +64,21 @@ public class DefaultConsolidationService implements ConsolidationService {
     @Autowired(required = false)
     private ChatModel chatModel;
 
+    @Autowired(required = false)
+    private OpenAiModelProperties openAiModelProperties;
+
+    /**
+     * 按会话反查归属用户并绑定其模型。巩固可能跑在 {@code @Scheduled} 线程或
+     * {@code CompletableFuture} 上，两种情况都没有用户上下文，ThreadLocal 也不继承 ——
+     * 不显式绑定就会静默回退到全局 Bean，表现为「主对话正常、后台任务 401」。
+     */
+    @Autowired(required = false)
+    private UserModelBinder userModelBinder;
+
+    @Autowired(required = false)
+    @Lazy
+    private MemoryManager memoryManager;
+
     @Autowired
     private ObjectMapper objectMapper;
 
@@ -61,7 +88,22 @@ public class DefaultConsolidationService implements ConsolidationService {
         if (sessionId == null || sessionId.isBlank()) {
             return;
         }
+        // 巩固的辅助 LLM 调用必须走该会话所属用户配置的模型：本方法既可能被交互线程的
+        // CompletableFuture 调到，也可能被定时 Worker 调到，两者都不保证线程上已有模型绑定。
+        try (var ignoredModel = bindSessionModel(sessionId)) {
+            doConsolidate(sessionId);
+        }
+    }
 
+    /** 交互线程已绑过则不重复解析；解析不到归属用户时返回空绑定，随后回退全局模型。 */
+    private UserModelBinder.Binding bindSessionModel(String sessionId) {
+        if (userModelBinder == null || EffectiveModelContext.isBound()) {
+            return UserModelBinder.Binding.noop();
+        }
+        return userModelBinder.bindForSession(sessionId);
+    }
+
+    private void doConsolidate(String sessionId) {
         // 1. 先读工作记忆：它挂在 Redis TTL 上，是本流程里最易失的数据，优先抢救
         WorkingMemory workingMemory = loadWorkingMemory(sessionId);
 
@@ -79,6 +121,7 @@ public class DefaultConsolidationService implements ConsolidationService {
                     AgentEpisodeEntity carried = extractEpisode(List.of(), workingMemory);
                     if (carried != null) {
                         episodeRepository.save(carried);
+                        workingMemoryManager.touch(sessionId);
                         log.info("工作记忆结转: session={}, goal={}", sessionId, carried.getTaskSummary());
                     }
                 } catch (Exception e) {
@@ -93,6 +136,7 @@ public class DefaultConsolidationService implements ConsolidationService {
             AgentEpisodeEntity episode = extractEpisode(unprocessed, workingMemory);
             if (episode != null) {
                 episodeRepository.save(episode);
+                workingMemoryManager.touch(sessionId);
                 log.info("巩固完成: session={}, episode={}", sessionId, episode.getTaskSummary());
             }
 
@@ -182,12 +226,15 @@ public class DefaultConsolidationService implements ConsolidationService {
         String resolution = null;
         List<String> actions = new ArrayList<>();
         List<String> observations = new ArrayList<>();
+        List<String> promotedFacts = new ArrayList<>();
         boolean llmSkipped = false;
 
-        // 无事件流时不调 LLM：没有可提炼的原料
-        if (chatModel != null && !events.isEmpty()) {
+        // 无事件流时不调 LLM：没有可提炼的原料。
+        // 模型取本轮生效的那套（通常是会话所属用户配置的），全局 Bean 仅作未绑定时的兜底。
+        ChatModel model = EffectiveModelContext.chatOr(chatModel);
+        if (model != null && !events.isEmpty()) {
             try {
-                Map<String, String> extracted = llmExtract(eventSummary.toString(), outcome.name());
+                Map<String, String> extracted = llmExtract(eventSummary.toString(), outcome.name(), model);
                 if ("true".equalsIgnoreCase(extracted.get("skip"))) {
                     // 语义闸门：模型判定事件流无可复用价值，退化为纯工作记忆结转
                     log.debug("语义闸门：事件流无可复用价值，退化为工作记忆结转");
@@ -205,9 +252,18 @@ public class DefaultConsolidationService implements ConsolidationService {
                         observations = Arrays.stream(obsStr.split(";"))
                             .map(String::trim).filter(s -> !s.isEmpty()).collect(Collectors.toList());
                     }
+                    promotedFacts.addAll(splitFacts(extracted.get("facts")));
                 }
             } catch (Exception e) {
-                log.warn("LLM 提炼 Episode 失败: {}", e.getMessage());
+                // 必须如实说明这次用的是哪套模型：写死全局配置会把排查引到错误方向
+                String modelSource = EffectiveModelContext.isBound()
+                        ? "modelSource=user-config"
+                        : "modelSource=global-fallback, "
+                            + (openAiModelProperties == null
+                                ? "bean=langchain4j.open-ai.chat-model"
+                                : openAiModelProperties.describeChatClient());
+                log.warn("LLM 提炼 Episode 失败: purpose=episode-consolidate, {}, err={}",
+                        modelSource, SecurityUtils.redactSensitive(e.getMessage()));
             }
         }
 
@@ -274,9 +330,9 @@ public class DefaultConsolidationService implements ConsolidationService {
         episode.setTenantId(!events.isEmpty() ? events.get(0).getTenantId() : wm.getTenantId());
         episode.setSessionId(!events.isEmpty() ? events.get(0).getSessionId() : wm.getSessionId());
         if (wm != null) {
-            episode.setUserId(wm.getUserId());
             episode.setProjectId(wm.getProjectId());
         }
+        episode.setUserId(resolveEpisodeUserId(wm));
         episode.setTaskSummary(truncate(taskSummary, 500));
         episode.setOutcome(outcome);
         episode.setActionsJson(toJson(actions));
@@ -289,6 +345,7 @@ public class DefaultConsolidationService implements ConsolidationService {
         }
         episode.setImportance(importance);
 
+        promoteFacts(promotedFacts, episode);
         return episode;
     }
 
@@ -305,6 +362,22 @@ public class DefaultConsolidationService implements ConsolidationService {
             parts.add("失败 " + wm.getFailedTasks().size() + " 项");
         }
         return parts.isEmpty() ? "空任务" : String.join("，", parts);
+    }
+
+    /**
+     * Episode 归属用户：工作记忆优先（它是当时执行的真实归属）。
+     *
+     * <p>工作记忆挂在 Redis TTL 上，超时即蒸发；此时不能就这么把 user_id 写成 null ——
+     * 记忆检索按用户隔离，丢一次归属，这条 Episode 就再也检索不到了。所以退回本线程
+     * 已绑定的归属（{@link MemoryStore#getCurrentUser()}），它来自 consolidate 入口按
+     * sessionId 反查的用户，或交互线程已绑好的上下文。
+     */
+    private String resolveEpisodeUserId(WorkingMemory wm) {
+        if (wm != null && wm.getUserId() != null && !wm.getUserId().isBlank()) {
+            return wm.getUserId();
+        }
+        Long bound = MemoryStore.getCurrentUser();
+        return bound == null ? null : String.valueOf(bound);
     }
 
     /** 把约束与产物压缩成一行观察记录。 */
@@ -330,7 +403,7 @@ public class DefaultConsolidationService implements ConsolidationService {
             .collect(Collectors.joining(", "));
     }
 
-    private Map<String, String> llmExtract(String eventSummary, String outcome) {
+    private Map<String, String> llmExtract(String eventSummary, String outcome, ChatModel model) {
         String prompt = """
             从以下 Agent 事件流中提炼一个情景记忆。
 
@@ -358,6 +431,7 @@ public class DefaultConsolidationService implements ConsolidationService {
             actions: <动作1>;<动作2>;...
             observations: <观察1>;<观察2>;...
             resolution: <如果是失败，描述解决方案；成功则留空>
+            facts: <可跨任务复用的事实1>;<事实2>；没有则留空
             """.formatted(eventSummary, outcome);
 
         ChatRequest request = ChatRequest.builder()
@@ -367,7 +441,7 @@ public class DefaultConsolidationService implements ConsolidationService {
             ))
             .build();
 
-        String response = chatModel.chat(request).aiMessage().text();
+        String response = model.chat(request).aiMessage().text();
         return parseFields(response);
     }
 
@@ -382,6 +456,44 @@ public class DefaultConsolidationService implements ConsolidationService {
             }
         }
         return fields;
+    }
+
+    static List<String> splitFacts(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>();
+        for (String part : raw.split(";")) {
+            String trimmed = part.trim();
+            if (!trimmed.isEmpty() && !"无".equals(trimmed)) {
+                out.add(trimmed);
+            }
+        }
+        return out;
+    }
+
+    private void promoteFacts(List<String> facts, AgentEpisodeEntity episode) {
+        if (memoryManager == null || facts == null || facts.isEmpty() || episode == null) {
+            return;
+        }
+        String tenant = episode.getTenantId() != null && !episode.getTenantId().isBlank()
+                ? episode.getTenantId() : MemoryStore.effectiveTenantId();
+        String userId = episode.getUserId() != null && !episode.getUserId().isBlank()
+                ? episode.getUserId() : MemoryStore.effectiveUserIdString();
+        for (String factText : facts) {
+            try {
+                SemanticFact fact = new SemanticFact();
+                fact.setTenantId(tenant);
+                fact.setScope(MemoryScope.ofUser(tenant, userId));
+                fact.setSubject(truncate(factText, FACT_SUBJECT_MAX));
+                fact.setPredicate(MemoryKeys.PREDICATE_LEARNED);
+                fact.setObjectValue(truncate(factText, FACT_OBJECT_MAX));
+                fact.setSource(MemoryKeys.SOURCE_CONSOLIDATION);
+                memoryManager.writeFact(fact);
+            } catch (Exception e) {
+                log.debug("巩固晋升事实失败: {}", e.getMessage());
+            }
+        }
     }
 
     private String buildFallbackSummary(List<AgentEventEntity> events) {

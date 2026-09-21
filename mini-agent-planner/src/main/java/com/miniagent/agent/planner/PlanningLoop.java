@@ -5,8 +5,10 @@ import com.miniagent.agent.core.AgentStreamSink;
 import com.miniagent.agent.core.ExecutionTurnContext;
 import com.miniagent.agent.core.LoopTurnContext;
 import com.miniagent.agent.core.NodeExecutor;
-import com.miniagent.agent.intent.IntentType;
-import com.miniagent.agent.intent.TaskPlan;
+import com.miniagent.agent.task.TaskPlan;
+import com.miniagent.agent.task.TaskSignals;
+import com.miniagent.agent.tool.ToolErrorCode;
+import com.miniagent.agent.tool.ToolResult;
 import com.miniagent.agent.planner.TaskNodeStatus;
 import com.miniagent.agent.todo.HumanYield;
 import com.miniagent.agent.trace.AgentStepNode;
@@ -16,6 +18,7 @@ import com.miniagent.common.MessageConstants;
 import com.miniagent.common.RunStatus;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import org.apache.commons.lang3.StringUtils;
@@ -38,7 +41,7 @@ import java.util.stream.Collectors;
 
 /**
  * User → Compiler → Validator → Scheduler → Executor → ToolRouter → Tool
- * → StepEvaluator → Continue | Retry/Replan。
+ * → StepEvaluator → GraphEval → Continue | Retry/Replan。
  */
 @Component
 public class PlanningLoop {
@@ -60,7 +63,6 @@ public class PlanningLoop {
     private final PlannerMetrics metrics;
     private final SessionLock sessionLock;
     private final ToolSuccessStats toolSuccessStats;
-    private final TaskDecomposer taskDecomposer;
     private TraceRecorder traceRecorder;
 
     public PlanningLoop(PlannerProperties properties,
@@ -75,8 +77,7 @@ public class PlanningLoop {
                         NodeExecutor nodeExecutor,
                         PlannerMetrics metrics,
                         SessionLock sessionLock,
-                        ToolSuccessStats toolSuccessStats,
-                        TaskDecomposer taskDecomposer) {
+                        ToolSuccessStats toolSuccessStats) {
         this.properties = properties;
         this.goalCompiler = goalCompiler;
         this.planValidator = planValidator;
@@ -90,7 +91,6 @@ public class PlanningLoop {
         this.metrics = metrics;
         this.sessionLock = sessionLock;
         this.toolSuccessStats = toolSuccessStats;
-        this.taskDecomposer = taskDecomposer;
     }
 
     public void setTraceRecorder(TraceRecorder traceRecorder) {
@@ -106,38 +106,61 @@ public class PlanningLoop {
         return shouldHandle(plan, sessionId, null);
     }
 
-    /** Compatibility overload: an explicit request/intent can force the planner. */
+    /**
+     * 本轮要不要交给规划器（编译任务图 + 调度执行）。
+     *
+     * <p>判据只有三类，全部来自事实：</p>
+     * <ol>
+     *   <li>纯问答轮（问且无任何动手信号）直接不进；</li>
+     *   <li>需要结构化计划，或消息里出现 URL / 文件名（可编成可调度图）；</li>
+     *   <li>上一轮留下了未完成的图，且本轮文本确实是在接着做。</li>
+     * </ol>
+     *
+     * <p>注意第 3 条必须能真正走到。旧实现先按意图白名单短路返回，
+     * 而绝大多数意图都在该白名单里，于是「续跑」分支实际不可达 ——
+     * 用户回一句「继续」永远进不来规划器。这里不再有白名单，
+     * 恢复与否只由 {@link PlannerResumePolicy} 按文本与图当下的
+     * {@code AWAITING_CONFIRM} 状态共同判定：用户明说继续，或系统此刻确实在等用户答复。
+     * 「历史上曾经等过用户」不算理由，否则新任务会被旧图接管。</p>
+     */
     public boolean shouldHandle(TaskPlan plan, String sessionId, String requestText) {
-        if (!properties.isEnabled() || plan == null || plan.intent() == null) {
+        if (!properties.isEnabled() || plan == null) {
             return false;
         }
-        String intent = plan.intent().name();
-        boolean forced = properties.getForceForIntents().stream()
-                .anyMatch(value -> intent.equalsIgnoreCase(value));
-        if (forced) {
-            // 简单写盘/短任务：requiresStructuredPlan=false 时走 AgentLoop，避免 GoalCompiler 空转
-            return plan.requiresStructuredPlan();
+        TaskSignals signals = plan.signals();
+        if (signals.lightTurn()) {
+            return false;
         }
-        for (String skip : properties.getSkipIntents()) {
-            if (intent.equalsIgnoreCase(skip)) {
-                return false;
-            }
-        }
-        if (plan.requiresStructuredPlan()) {
+        if (plan.requiresStructuredPlan()
+                || DecompositionPolicy.hasGraphSignal(requestText, plan)) {
             return true;
         }
-        boolean awaiting = hasAwaitingGraph(sessionId);
         return stateStore.hasIncompleteGraph(sessionId)
-                && shouldResumeExisting(plan.intent(),
-                stateStore.peekResume(sessionId), awaiting, true);
+                && PlannerResumePolicy.shouldResume(
+                signals, requestText, hasAwaitingGraph(sessionId), true);
     }
 
-    static boolean shouldResumeExisting(IntentType intent, boolean peekResume,
-                                        boolean awaitingConfirm, boolean incomplete) {
-        if (!incomplete) {
+    static boolean shouldRecompileClarify(Goal goal, TaskGraph graph, String userMessage) {
+        if (StringUtils.isBlank(userMessage)
+                || HumanYield.looksLikeBareContinue(userMessage)) {
             return false;
         }
-        return intent == IntentType.CONTINUE_TASK || peekResume || awaitingConfirm;
+        if (goal != null && goal.isClarify()) {
+            return true;
+        }
+        return GoalCompiler.isClarifyGraph(graph);
+    }
+
+    static String mergeClarifyObjective(String previous, String reply) {
+        String prev = previous == null ? "" : previous.trim();
+        String next = reply == null ? "" : reply.trim();
+        if (prev.isBlank()) {
+            return next;
+        }
+        if (next.isBlank()) {
+            return prev;
+        }
+        return prev + "\n" + next;
     }
 
     public boolean isAwaitingConfirm(String sessionId) {
@@ -160,10 +183,11 @@ public class PlanningLoop {
                       String executionId,
                       Consumer<String> progress,
                       AgentStreamSink streamSink) {
-        if (!shouldHandle(taskPlan, sessionId)) {
-            if (multimodalUser != null)
+        if (!shouldHandle(taskPlan, sessionId, userMessage)) {
+            if (multimodalUser != null) {
                 return nodeExecutor.runDirectMultimodal(chat, systemPrompt, multimodalUser, history,
                         90, progress, taskPlan, streamSink);
+            }
             return nodeExecutor.runDirect(chat, systemPrompt, userMessage, history,
                     90, progress, taskPlan, streamSink);
         }
@@ -176,20 +200,37 @@ public class PlanningLoop {
                 && !existing.get().graph().allTerminalSuccess();
         boolean awaitingGraph = existing.isPresent()
                 && existing.get().graph().hasAwaitingConfirm();
-        boolean resume = shouldResumeExisting(
-                taskPlan.intent(),
-                stateStore.peekResume(sessionId),
+        boolean resume = PlannerResumePolicy.shouldResume(
+                taskPlan.signals(), userMessage,
                 awaitingGraph,
                 incompleteGraph);
-        if (resume) {
-            stateStore.clearResume(sessionId);
+        boolean clarifyRecompile = existing.isPresent()
+                && shouldRecompileClarify(
+                        existing.get().goal(), existing.get().graph(), userMessage);
+        if (clarifyRecompile) {
+            String merged = mergeClarifyObjective(
+                    existing.get().goal().objective(), userMessage);
+            TaskPlan nextPlan = taskPlan.withTaskGoal(merged);
+            compiled = compileAndValidate(chat, merged, nextPlan);
+            if (!planValidator.accept(compiled.graph(), nextPlan, compiled.goal())) {
+                log.warn("PlanningLoop 澄清后任务图仍无法验收 session={} code={}",
+                        sessionId, ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
+                return ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getMessage();
+            }
+            String execId = StringUtils.isNotBlank(executionId)
+                    ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
+            snap = stateStore.init(sessionId, execId, compiled.goal(), compiled.graph());
+            log.info("PlanningLoop 澄清后重编译 session={} nodes={} clarify={}",
+                    sessionId, compiled.graph().nodes().size(),
+                    compiled.goal().isClarify());
+        } else if (resume) {
             snap = existing.get();
             compiled = new GoalCompiler.CompileResult(snap.goal(), snap.graph(), false);
             log.info("PlanningLoop 续跑已有图 session={} version={} nodes={}",
                     sessionId, snap.version(), snap.graph().nodes().size());
 
-            // ===== CONTINUE_TASK 总结和状态检查逻辑 =====
-            if (taskPlan.intent() == IntentType.CONTINUE_TASK) {
+            // ===== 用户明确说「接着做」时的进度汇报 =====
+            if (taskPlan.signals().continueTask()) {
                 String summary = buildContinueTaskSummary(snap, userMessage);
                 if (progress != null) {
                     progress.accept(summary);
@@ -207,11 +248,20 @@ public class PlanningLoop {
 
             if (snap.graph().hasAwaitingConfirm()
                     && !HumanYield.looksLikeBareContinue(userMessage)) {
-                todoProjector.confirmAwaiting(sessionId, userMessage);
+                TaskGraph confirmed = todoProjector.confirmFirst(snap.graph());
+                if (!sameNodeStatuses(confirmed, snap.graph())) {
+                    try {
+                        snap = stateStore.commit(
+                                sessionId, snap.version(), snap.withGraph(confirmed));
+                    } catch (PlannerStateStore.VersionConflictException e) {
+                        metrics.casConflict();
+                        snap = stateStore.get(sessionId).orElse(snap);
+                    }
+                }
             }
         } else {
             compiled = compileAndValidate(chat, userMessage, taskPlan);
-            if (!planValidator.accept(compiled.graph(), taskPlan)) {
+            if (!planValidator.accept(compiled.graph(), taskPlan, compiled.goal())) {
                 log.warn("PlanningLoop 任务图验收失败 session={} code={}",
                         sessionId, ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
                 return ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getMessage();
@@ -237,8 +287,7 @@ public class PlanningLoop {
                 return StringUtils.isBlank(lastAnswer) ? msg : lastAnswer + "\n（" + msg + "）";
             }
             snap = stateStore.get(sessionId).orElse(snap);
-            TaskGraph normalized = todoProjector.syncConfirmFromTodo(sessionId, snap.graph())
-                    .normalizeForScheduling();
+            TaskGraph normalized = snap.graph().normalizeForScheduling();
             if (!sameNodeStatuses(normalized, snap.graph())) {
                 try {
                     snap = stateStore.commit(sessionId, snap.version(), snap.withGraph(normalized));
@@ -250,6 +299,32 @@ public class PlanningLoop {
                 todoProjector.project(sessionId, snap.graph());
             }
             if (snap.graph().allTerminalSuccess()) {
+                StepEvaluator.GraphEval acc = stepEvaluator.evaluateGraph(
+                        snap.goal(), snap.graph());
+                if (!acc.ok()) {
+                    log.warn("图终验失败 session={} node={} reason={}",
+                            sessionId, acc.nodeId(), acc.reason());
+                    TaskNode bad = resolveAcceptFailNode(snap.graph(), acc.nodeId());
+                    if (bad == null) {
+                        break;
+                    }
+                    TaskGraph g = snap.graph().replace(
+                            bad.withStatus(TaskNodeStatus.FAILED)
+                                    .withError(acc.reason()));
+                    FailureDiagnosis dx = recoveryEngine.diagnose(
+                            bad, diagnoseTool(bad, ""), acc.reason());
+                    try {
+                        snap = stateStore.commit(
+                                sessionId, snap.version(), snap.withGraph(g));
+                    } catch (PlannerStateStore.VersionConflictException e) {
+                        metrics.casConflict();
+                        continue;
+                    }
+                    snap = applyRecoveryOrCancel(sessionId, snap, bad, dx, bad.id(),
+                            chat, userMessage, taskPlan);
+                    todoProjector.project(sessionId, snap.graph());
+                    continue;
+                }
                 log.info("PlanningLoop 图完成 session={} version={} metrics={}",
                         sessionId, snap.version(), metrics.snapshot());
                 metrics.graphCompleted();
@@ -273,7 +348,8 @@ public class PlanningLoop {
                 if (stuck == null) {
                     break;
                 }
-                FailureDiagnosis dx = recoveryEngine.diagnose(stuck, stuck.toolHint(), "no ready nodes");
+                FailureDiagnosis dx = recoveryEngine.diagnose(
+                        stuck, diagnoseTool(stuck, ""), "no ready nodes");
                 TaskGraph before = snap.graph();
                 snap = applyRecoveryOrCancel(sessionId, snap, stuck, dx, stuck.id(),
                         chat, userMessage, taskPlan);
@@ -318,11 +394,9 @@ public class PlanningLoop {
 
             String stepUser = userMessage;
             String prior = predecessorOutputs(snap.graph(), proposal);
-            if (StringUtils.isBlank(prior) && StringUtils.isNotBlank(lastAnswer)
-                    && !StepEvaluator.looksLikeLoopAbort(lastAnswer))
-                prior = clip(lastAnswer, PRIOR_OUTPUT_CHARS);
-            if (StringUtils.isNotBlank(prior))
+            if (StringUtils.isNotBlank(prior)) {
                 stepUser = userMessage + "\n\n# 前置节点产出\n" + prior;
+            }
             StepExec step = executeProposal(chat, systemPrompt, stepUser,
                     multimodalUser, history, taskPlan, proposal, snap.graph(),
                     snap.version(), sessionId, progress, streamSink);
@@ -330,7 +404,8 @@ public class PlanningLoop {
             boolean drifted = step.drifted();
             boolean quotaAbort = isResourceQuotaAbort(step.endReason())
                     || AgentLoop.LOOP_MAX_ITERATIONS.equals(step.endReason());
-            boolean permAsk = AgentLoop.PERM_ASK.equals(step.endReason());
+            boolean humanWait = AgentLoop.PERM_ASK.equals(step.endReason())
+                    || AgentLoop.USER_QUESTION.equals(step.endReason());
 
             snap = stateStore.get(sessionId).orElse(snap);
             if (!ownsRunningProposal(snap, proposal)) {
@@ -346,23 +421,16 @@ public class PlanningLoop {
                 if (node == null) {
                     continue;
                 }
-                if (permAsk) {
+                if (humanWait) {
                     g = g.replace(node.withStatus(TaskNodeStatus.READY).withError(""));
                     continue;
                 }
-                boolean todoDone = todoProjector.isTodoCompleted(sessionId, g, action.taskId());
-                if (!todoDone) {
-                    if (HumanYield.looksLikeNeedHuman(lastAnswer)
-                            && !todoProjector.isTodoAwaiting(
-                                    sessionId, g, action.taskId())) {
-                        todoProjector.yieldNodeToHuman(
-                                sessionId, g, action.taskId(), lastAnswer);
-                    }
-                    if (todoProjector.isTodoAwaiting(sessionId, g, action.taskId())) {
-                        g = g.replace(node.withStatus(TaskNodeStatus.AWAITING_CONFIRM)
-                                .withError(clip(lastAnswer, AWAITING_HINT_CHARS)));
-                        continue;
-                    }
+                boolean awaiting = todoProjector.isTodoAwaiting(
+                        sessionId, g, action.taskId());
+                if (awaiting) {
+                    g = g.replace(node.withStatus(TaskNodeStatus.AWAITING_CONFIRM)
+                            .withError(clip(lastAnswer, AWAITING_HINT_CHARS)));
+                    continue;
                 }
                 if (drifted) {
                     anyFail = true;
@@ -370,7 +438,9 @@ public class PlanningLoop {
                     recordToolOutcome(node, false);
                     String reason = "drift:偏离子目标 " + node.name();
                     g = g.replace(node.withStatus(TaskNodeStatus.FAILED).withError(reason));
-                    FailureDiagnosis dx = recoveryEngine.diagnose(node, routeKey(node), reason);
+                    FailureDiagnosis dx = recoveryEngine.diagnose(
+                            node, diagnoseTool(node, step.lastTool()), reason,
+                            step.lastErrorCode());
                     try {
                         snap = stateStore.commit(sessionId, snap.version(), snap.withGraph(g));
                     } catch (PlannerStateStore.VersionConflictException e) {
@@ -382,17 +452,21 @@ public class PlanningLoop {
                     g = snap.graph();
                     continue;
                 }
-                String evidence = todoProjector.todoEvidence(sessionId, g, action.taskId());
-                if (StringUtils.isBlank(evidence)) {
-                    evidence = lastAnswer;
+                String judgeAnswer = node.doneWhen() != null && node.doneWhen().isJudge()
+                        ? step.text() : "";
+                NodeOutputBinder.Bound bound = NodeOutputBinder.bind(
+                        node, "", step.messages(), judgeAnswer);
+                StepEvaluator.EvalResult ev;
+                if (!bound.complete(node)) {
+                    ev = StepEvaluator.EvalResult.fail("declared outputs 未绑定");
+                } else {
+                    ev = stepEvaluator.evaluateAfterLoop(node, bound.evidence());
                 }
-                StepEvaluator.EvalResult ev = stepEvaluator.evaluateAfterLoop(
-                        node, todoDone, evidence);
                 TaskNodeStatus next = statusAfterChunk(ev.ok(), quotaAbort);
                 if (next == TaskNodeStatus.SUCCESS) {
-                    Map<String, String> bindings = outputBindings(node, evidence);
                     g = g.replace(node.withStatus(TaskNodeStatus.SUCCESS).withError("")
-                            .withOutput(clip(evidence, PRIOR_OUTPUT_CHARS), bindings));
+                            .withOutput(clip(bound.evidence(), PRIOR_OUTPUT_CHARS),
+                                    clipBindings(bound.bindings())));
                     metrics.nodeSuccess();
                     recordToolOutcome(node, true);
                     stateStore.appendEvent(sessionId, new DomainEvent(
@@ -410,7 +484,9 @@ public class PlanningLoop {
                             "ev_" + UUID.randomUUID().toString().substring(0, 8),
                             DomainEventType.NODE_FAILED, action.actionId(), action.taskId(),
                             Map.of("reason", ev.reason()), null));
-                    FailureDiagnosis dx = recoveryEngine.diagnose(node, routeKey(node), ev.reason());
+                    FailureDiagnosis dx = recoveryEngine.diagnose(
+                            node, diagnoseTool(node, step.lastTool()), ev.reason(),
+                            step.lastErrorCode());
                     StateSnapshot failedSnap = snap.withGraph(g);
                     try {
                         snap = stateStore.commit(sessionId, snap.version(), failedSnap);
@@ -436,17 +512,16 @@ public class PlanningLoop {
             }
             todoProjector.project(sessionId,
                     stateStore.get(sessionId).map(StateSnapshot::graph).orElse(g));
-            if (permAsk) {
-                stateStore.markResume(sessionId);
-                log.info("PlanningLoop 等待工具授权 session={}", sessionId);
+            if (humanWait) {
+                log.info("PlanningLoop 等待用户 session={} reason={}",
+                        sessionId, step.endReason());
                 if (StringUtils.isNotBlank(lastAnswer)) {
                     return lastAnswer;
                 }
-                return "需要你批准危险工具后才能继续。请点击弹窗中的「批准并继续」。";
+                return "需要你确认后才能继续。";
             }
             TaskGraph latest = stateStore.get(sessionId).map(StateSnapshot::graph).orElse(g);
             if (latest.hasAwaitingConfirm() || g.hasAwaitingConfirm()) {
-                stateStore.markResume(sessionId);
                 log.info("PlanningLoop 等待人工输入 session={}", sessionId);
                 if (StringUtils.isNotBlank(lastAnswer)) {
                     return lastAnswer;
@@ -488,7 +563,13 @@ public class PlanningLoop {
                 || t.startsWith("已按规划图推进任务");
     }
 
-    private record StepExec(String text, String endReason, boolean drifted) {}
+    private record StepExec(String text, String endReason, boolean drifted,
+                            String lastTool, ToolErrorCode lastErrorCode,
+                            List<ChatMessage> messages) {
+        StepExec {
+            messages = messages == null ? List.of() : List.copyOf(messages);
+        }
+    }
 
     /** 轮次用尽就续跑。file_exists 可能只是写了个开头，不能当「做完了」。 */
     static boolean shouldResumeChunk(String endReason, int chunk, int maxChunks) {
@@ -517,22 +598,15 @@ public class PlanningLoop {
                 || "TOOL_BUDGET_EXCEEDED".equals(endReason);
     }
 
-    /** Extract only declared named outputs from a tool response. */
-    static Map<String, String> outputBindings(TaskNode node, String response) {
-        if (node == null || response == null || response.isBlank()) return Map.of();
-        try {
-            com.fasterxml.jackson.databind.JsonNode root = PlannerStateJson.MAPPER.readTree(response);
-            String field = root.has("outputs") ? "outputs" : root.has("artifacts") ? "artifacts" : null;
-            if (field == null || !root.get(field).isObject()) return Map.of();
-            Map<String, String> out = new LinkedHashMap<>();
-            for (String declared : node.outputs()) {
-                com.fasterxml.jackson.databind.JsonNode value = root.get(field).get(declared);
-                if (value != null && !value.isNull()) out.put(declared, value.isValueNode() ? value.asText() : value.toString());
-            }
-            return out;
-        } catch (Exception ignored) {
+    static Map<String, String> clipBindings(Map<String, String> in) {
+        if (in == null || in.isEmpty()) {
             return Map.of();
         }
+        Map<String, String> out = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : in.entrySet()) {
+            out.put(e.getKey(), clip(e.getValue(), PRIOR_OUTPUT_CHARS));
+        }
+        return Map.copyOf(out);
     }
 
     static boolean hasUnfinishedProposalNode(TaskGraph g, ActionProposal proposal) {
@@ -656,7 +730,12 @@ public class PlanningLoop {
         }
         boolean hard = properties.isHardProposal();
         String label = StringUtils.isNotBlank(focusName) ? focusName : focusTask;
-        ProposalTurnPolicy policy = new ProposalTurnPolicy(allowed, hard, label, focusTodos);
+        int timeoutSec = properties.getActionTimeoutSeconds();
+        if (!proposal.actions().isEmpty()) {
+            timeoutSec = proposal.actions().get(0).timeoutSeconds();
+        }
+        ProposalTurnPolicy policy = new ProposalTurnPolicy(
+                allowed, hard, label, focusTodos, timeoutSec);
         LoopTurnContext.set(policy);
         List<ExecutionTurnContext.ActionBinding> bindings = proposal.actions().stream()
                 .map(a -> new ExecutionTurnContext.ActionBinding(
@@ -675,6 +754,12 @@ public class PlanningLoop {
                                 + ",\"focusTodoIds\":" + focusTodos
                                 + ",\"tools\":" + toJsonArray(allowed) + "}",
                         RunStatus.SUCCESS.name(), 0);
+            if (ActionBinder.canDirect(proposal)) {
+                StepExec bound = executeBoundAction(proposal.actions().get(0));
+                if (bound != null) {
+                    return bound;
+                }
+            }
             String focus = systemPrompt + "\n\n" + focusBlock(proposal, graph, focusTodos, hard);
             int maxIter = Math.max(2, properties.getProposalMaxIterations());
             for (String t : allowed) {
@@ -696,11 +781,32 @@ public class PlanningLoop {
                         maxIter, progress, taskPlan, streamSink);
                 chunks++;
             }
-            return new StepExec(out.text(), out.endReason(), policy.consumeDrift());
+            return new StepExec(out.text(), out.endReason(), policy.consumeDrift(),
+                    lastInvokedTool(out), out.lastErrorCode(), out.messages());
         } finally {
             ExecutionTurnContext.clear();
             LoopTurnContext.clear();
         }
+    }
+
+    private StepExec executeBoundAction(ActionSpec action) {
+        String json;
+        try {
+            json = PlannerStateJson.MAPPER.writeValueAsString(action.arguments());
+        } catch (Exception e) {
+            log.warn("绑定参数序列化失败，回退 ReAct tool={}", action.tool());
+            return null;
+        }
+        ToolResult result = nodeExecutor.executeBound(action.tool(), json);
+        String text = result == null ? "" : result.legacyText();
+        boolean ok = result != null && result.isSuccess()
+                && !StepEvaluator.looksLikeToolError(text);
+        ToolExecutionResultMessage msg = ToolExecutionResultMessage.from(
+                action.actionId(), action.tool(), text);
+        ToolErrorCode code = result == null ? ToolErrorCode.INTERNAL_ERROR : result.errorCode();
+        String end = ok ? AgentLoop.STEP_SEGMENT_DONE : RunStatus.FAILURE.name();
+        return new StepExec(ok ? AgentLoop.STEP_SEGMENT_DONE : text, end, false,
+                action.tool(), code, List.of(msg));
     }
 
     private boolean dispatchFenceValid(String sessionId, ActionProposal proposal) {
@@ -729,16 +835,22 @@ public class PlanningLoop {
         for (ActionSpec a : proposal.actions()) {
             TaskNode n = graph == null ? null : graph.byId(a.taskId());
             String cap = n != null ? n.capability() : a.tool();
-            String hint = n != null ? n.toolHint() : "";
+            List<String> blocked = n == null ? List.of() : n.blockedTools();
             sb.append("- taskId=").append(a.taskId())
                     .append(" capability=").append(cap)
                     .append(" tool=").append(a.tool())
                     .append(" arguments=").append(a.arguments())
                     .append(" acceptance=").append(a.acceptance().wire())
                     .append(" idempotencyKey=").append(a.idempotencyKey())
-                    .append(" timeoutSeconds=").append(a.timeoutSeconds());
-            if (StringUtils.isNotBlank(hint))
-                sb.append(" hint=").append(hint);
+                    .append(" timeoutSeconds=").append(a.timeoutSeconds())
+                    .append(" retryMax=").append(a.retryPolicy().maxAttempts())
+                    .append(" concurrencyKey=").append(a.concurrencyKey());
+            if (StringUtils.isNotBlank(a.compensation())) {
+                sb.append(" compensation=").append(a.compensation());
+            }
+            if (!blocked.isEmpty()) {
+                sb.append(" blockedTools=").append(blocked);
+            }
             sb.append(" expected=").append(a.expectedResult()).append('\n');
         }
         sb.append("完成后用 todo update（id∈focusTodoIds）标 completed 并附可校验 evidence。\n");
@@ -834,7 +946,7 @@ public class PlanningLoop {
         if (merged == null || merged.isEmpty()) {
             return Optional.empty();
         }
-        if (!planValidator.accept(merged, taskPlan)) {
+        if (!planValidator.accept(merged, taskPlan, compiled.goal())) {
             log.warn("运行时 LLM replan 图验收失败 session={}", sessionId);
             return Optional.empty();
         }
@@ -956,15 +1068,33 @@ public class PlanningLoop {
         return null;
     }
 
+    static TaskNode resolveAcceptFailNode(TaskGraph graph, String nodeId) {
+        if (graph == null) {
+            return null;
+        }
+        TaskNode byId = graph.byId(nodeId);
+        if (byId != null) {
+            return byId;
+        }
+        List<TaskNode> nodes = graph.nodes();
+        for (int i = nodes.size() - 1; i >= 0; i--) {
+            TaskNode n = nodes.get(i);
+            if (DataflowNormalizer.needsFileAcceptance(n)) {
+                return n;
+            }
+        }
+        return nodes.isEmpty() ? null : nodes.get(nodes.size() - 1);
+    }
+
     private GoalCompiler.CompileResult compileAndValidate(ChatModel chat,
                                                          String userMessage,
                                                          TaskPlan taskPlan) {
         // 第一次编译
         GoalCompiler.CompileResult compiled = goalCompiler.compile(chat, userMessage, taskPlan);
-        compiled = maybeDecompose(compiled, taskPlan, chat);
 
         // 结构化验证
-        PlanValidationReport report = planValidator.validate(compiled.graph(), taskPlan);
+        PlanValidationReport report = planValidator.validate(
+                compiled.graph(), taskPlan, compiled.goal());
         if (report.valid()) {
             return compiled;
         }
@@ -984,10 +1114,10 @@ public class PlanningLoop {
             // 重新编译，注入修正提示
             GoalCompiler.CompileResult replanned = goalCompiler.compileWithCorrection(
                 chat, userMessage, taskPlan, correctionPrompt);
-            replanned = maybeDecompose(replanned, taskPlan, chat);
 
             // 验证重新编译的结果
-            report = planValidator.validate(replanned.graph(), taskPlan);
+            report = planValidator.validate(
+                    replanned.graph(), taskPlan, replanned.goal());
             if (report.valid()) {
                 log.info("Replan 成功，尝试次数={}", attempt);
                 return replanned;
@@ -996,33 +1126,57 @@ public class PlanningLoop {
             log.warn("Replan 尝试 {} 仍然失败，错误数={}", attempt, report.errors().size());
         }
 
-        // 所有 replan 尝试失败，使用 fallback 模板
-        log.warn("Replan 全部失败，改用 fallback 模板，最终错误数={}", report.errors().size());
-        return goalCompiler.fallback(compiled.goal(), userMessage, taskPlan);
+        // 所有 replan 尝试失败，模板图仍须过同一道验收，不能把脏图交给调度器
+        log.warn("Replan 全部失败，改用 fallback 模板，最终错误数={}",
+                report.errors().size());
+        GoalCompiler.CompileResult fb = goalCompiler.fallback(
+                compiled.goal(), userMessage, taskPlan);
+        PlanValidationReport fbReport = planValidator.validate(
+                fb.graph(), taskPlan, fb.goal());
+        if (fbReport.valid()) {
+            return fb;
+        }
+        log.warn("fallback 仍无法验收，拒绝调度 code={} errors={}",
+                ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode(),
+                fbReport.errors().size());
+        return fb;
     }
 
-    private GoalCompiler.CompileResult maybeDecompose(GoalCompiler.CompileResult compiled,
-                                                      TaskPlan taskPlan, ChatModel chat) {
-        if (compiled == null || compiled.fromTemplate() || taskDecomposer == null) {
-            return compiled;
+    static String lastInvokedTool(AgentLoop.LoopOutcome out) {
+        if (out != null && out.toolsInvoked() != null && !out.toolsInvoked().isEmpty()) {
+            List<String> tools = out.toolsInvoked();
+            return tools.get(tools.size() - 1);
         }
-        TaskGraph next = taskDecomposer.decompose(compiled.graph(), taskPlan, chat);
-        if (next == null || next.isEmpty() || next == compiled.graph()) {
-            return compiled;
+        return lastInvokedTool(out == null ? null : out.messages());
+    }
+
+    static String lastInvokedTool(List<ChatMessage> messages) {
+        String last = "";
+        if (messages == null) {
+            return last;
         }
-        if (!planValidator.accept(next, taskPlan)) {
-            log.warn("TaskDecomposer 图验收失败，保持未分解");
-            return compiled;
+        for (ChatMessage m : messages) {
+            if (m instanceof ToolExecutionResultMessage tr
+                    && StringUtils.isNotBlank(tr.toolName())) {
+                last = tr.toolName();
+            }
         }
-        return new GoalCompiler.CompileResult(compiled.goal(), next, false);
+        return last;
+    }
+
+    static String diagnoseTool(TaskNode node, String lastTool) {
+        if (StringUtils.isNotBlank(lastTool)) {
+            return lastTool;
+        }
+        if (node != null && StringUtils.isNotBlank(node.blockedTool())) {
+            return node.blockedTool();
+        }
+        return routeKey(node);
     }
 
     private static String routeKey(TaskNode node) {
-        if (node == null) {
+        if (node == null || node.capability() == null) {
             return "";
-        }
-        if (StringUtils.isNotBlank(node.toolHint())) {
-            return node.toolHint();
         }
         return node.capability();
     }
@@ -1031,10 +1185,7 @@ public class PlanningLoop {
         if (toolSuccessStats == null || node == null) {
             return;
         }
-        String t = node.toolHint();
-        if (StringUtils.isBlank(t)) {
-            t = node.capability();
-        }
+        String t = node.capability();
         if (StringUtils.isNotBlank(t)) {
             toolSuccessStats.record(t, ok);
         }

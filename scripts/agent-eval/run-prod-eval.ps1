@@ -203,6 +203,7 @@ foreach ($c in $cases) {
         sessionId = $sessionId
         message = $msg
         permissionMode = "accept_edits"
+        confirmPolicy = "auto"
     }
     $body = $bodyObj | ConvertTo-Json -Compress
     $enc = New-Object System.Text.UTF8Encoding $false
@@ -250,7 +251,7 @@ foreach ($c in $cases) {
     $usedPlanner = $false
     $tools = New-Object System.Collections.Generic.List[string]
     $failedSteps = New-Object System.Collections.Generic.List[string]
-    $intentLayer = ""
+    $signalsStep = ""
     if ($traces) {
         foreach ($s in $traces) {
             if ($s.stepType -eq "GOAL_COMPILED") { $usedPlanner = $true }
@@ -258,7 +259,7 @@ foreach ($c in $cases) {
             if ($s.status -match "FAIL|ERROR") {
                 [void]$failedSteps.Add("$($s.stepType)/$($s.toolName)/$($s.status)")
             }
-            if ($s.stepType -eq "INTENT_END" -and $s.content) { $intentLayer = [string]$s.content }
+            if ($s.stepType -eq "TASK_SIGNALS" -and $s.content) { $signalsStep = [string]$s.content }
         }
     }
 
@@ -296,7 +297,7 @@ foreach ($c in $cases) {
         tools = $ctx.tools
         failedSteps = @($failedSteps)
         answerPreview = if ($parsed.answer.Length -gt 200) { $parsed.answer.Substring(0, 200) } else { $parsed.answer }
-        intentSnippet = if ($intentLayer.Length -gt 120) { $intentLayer.Substring(0, 120) } else { $intentLayer }
+        signalsSnippet = if ($signalsStep.Length -gt 120) { $signalsStep.Substring(0, 120) } else { $signalsStep }
         checkResults = $checkResults
         foundFiles = $ctx.foundFiles
     }

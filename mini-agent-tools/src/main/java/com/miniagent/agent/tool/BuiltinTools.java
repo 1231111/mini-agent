@@ -5,6 +5,7 @@ import com.miniagent.agent.browser.BrowserService;
 import com.miniagent.agent.comfyui.ComfyUIService;
 import com.miniagent.agent.comfyui.ImageQualityChecker;
 import com.miniagent.agent.skill.SkillStore;
+import com.miniagent.agent.song.SongGenerationService;
 import com.miniagent.agent.security.NetworkGuard;
 import com.miniagent.common.SecurityUtils;
 import com.miniagent.agent.web.WebSearchService;
@@ -25,6 +26,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.commons.lang3.StringUtils;
@@ -55,9 +58,11 @@ public class BuiltinTools {
     @Autowired
     private  ImageGenerationService imageGenerationService;
     @Autowired
+    private  SongGenerationService songGenerationService;
+    @Autowired
     private  NetworkGuard networkGuard;
 
-    @Value("${agent.tools.exec-enabled:false}")
+    @Value("${agent.tools.exec-enabled:true}")
     private boolean execEnabled;
 
     @Value("${agent.tools.allow-absolute-write:false}")
@@ -112,6 +117,7 @@ public class BuiltinTools {
         registerBrowserTools();
         registerSkillTools();
         registerImageGenerateTool();
+        registerSongGenerateTool();
         registerComfyUITools();
     }
 
@@ -137,8 +143,10 @@ public class BuiltinTools {
                     return result;
                 });
 
-        registry.register("write_file", "写入文件内容。路径写文件名即可，落在 workspace 根下，如 design.md。"
-                        + "子任务隔离目录仅在子 Agent 覆盖 workspace 时使用。"
+        registry.register("write_file",
+                "写入文件内容。新建文件用本工具；修改已存在的文件请改用 edit_file，不要用本工具重写整个文件。\n"
+                        + "路径写文件名即可，落在 workspace 根下，如 design.md。"
+                        + "子任务隔离目录仅在子 Agent 覆盖 workspace 时使用。\n"
                         + "【大文件必读】单轮输出有长度上限，超长文件（如完整的 3D 仿真 HTML、长代码）一次写不完会被截断。"
                         + "正确做法：第一次用 mode=\"overwrite\"（默认）写开头部分，之后多次用 mode=\"append\" 把剩余内容续写到同一文件，直到写完。不要试图一次塞进全部内容。",
                 WriteFileParams.class,
@@ -153,7 +161,7 @@ public class BuiltinTools {
                 ListFilesParams.class,
                 params -> listFiles(params.getPath(), params.isRecursiveOrDefault()));
 
-        registry.register("read_package", "按Java包名读取包下所有源码文件。传包名如 com.miniagent.agent.intent，自动解析路径并返回全部代码。分析项目架构时优先用这个，不要逐个 read_file。",
+        registry.register("read_package", "按Java包名读取包下所有源码文件。传包名如 com.miniagent.agent.task，自动解析路径并返回全部代码。分析项目架构时优先用这个，不要逐个 read_file。",
                 ReadPackageParams.class,
                 params -> readPackage(params.getPackageName(), params.getMaxCharsPerFileOrDefault()));
     }
@@ -174,7 +182,10 @@ public class BuiltinTools {
     // ==================== Web 搜索工具（对标 hermes-agent） ====================
 
     private void registerWebSearchTools() {
-        registry.register("web_search", "搜索网页，返回结构化的搜索结果（标题、URL、描述）。",
+        registry.register("web_search",
+                "搜索网页，返回结构化的搜索结果（标题、URL、描述）。\n"
+                        + "搜索用简洁关键词，不用完整句子（用 \"Spring Boot 事务失效\" 而不是 \"我想知道 Spring Boot 里事务为什么会失效\"）。\n"
+                        + "对结果准确性不确定时，用 web_extract 提取原文确认，不要直接拿搜索摘要下结论。",
                 WebSearchParams.class,
                 params -> webSearchService.search(params.getQuery(), params.getLimitOrDefault()));
 
@@ -457,21 +468,42 @@ public class BuiltinTools {
     }
 
     private void registerExecTool() {
-        if (!execEnabled) {
+        if (execEnabled) {
+            log.info("exec_command 已注册，全局免批（agent.tools.exec-enabled=true）");
+        } else {
             log.info("exec_command 已注册，默认需会话批准（agent.tools.exec-enabled=false）");
         }
-        registry.register("exec_command",
-                "在 workspace 目录下执行一条 shell 命令并返回输出；当前是 Windows，用 cmd / PowerShell 语法。\n"
+        // 这里刻意用完整 builder 而不是便捷注册：exec_command 需要挂「按参数算超时」的函数，
+        // 而便捷注册只能给一个注册期常量（git status 与 mvnw package 不该共用同一个预算）。
+        registry.register(Tool.builder()
+                .name("exec_command")
+                .description("在 workspace 目录下执行一条 shell 命令并返回输出；当前是 Windows，用 cmd / PowerShell 语法。\n"
                         + "什么时候用：跑构建/测试/脚本、调用命令行工具、验证刚生成的产出物能否真正运行。\n"
                         + "什么时候不要用（改用专用工具，更快也更安全）：\n"
                         + "- 读文件 → read_file；写文件 → write_file；列目录 → list_files\n"
                         + "- 搜代码 → search_code（不要用 findstr / Select-String 全库扫）\n"
                         + "- 抓网页 → web_extract；请求接口 → http_get / http_post\n"
+                        + "慢命令必须显式声明超时：默认 " + ExecCommandParams.DEFAULT_TIMEOUT_SECONDS
+                        + " 秒，上限 " + ExecCommandParams.MAX_TIMEOUT_SECONDS
+                        + " 秒（如 mvnw/npm 构建、跑测试、装依赖，请把 timeout 传到 300 以上）。\n"
+                        + "命令返回非 0 退出码不一定是失败：grep/findstr 的 1 表示没匹配到，"
+                        + "这类结果会带 [exit-note] 提示，不要重试同一条命令。\n"
+                        + "输出过长时会落盘到 workspace/_tool-output/ 并在结果里给出路径，"
+                        + "需要完整内容用 read_file 读那个文件，不要靠重跑命令看输出。\n"
                         + "危险操作（递归删除、覆盖已有文件、格式化磁盘、git 强制推送或重置）执行前必须先向用户确认。\n"
                         + "不要跑交互式命令（会挂到超时）；需要确认时改用非交互参数（如 -y / --yes）。\n"
-                        + "全局未开启时首次调用会请用户批准。",
-                ExecCommandParams.class,
-                params -> execCommand(params.getCommand()));
+                        + "全局未开启时首次调用会请用户批准。")
+                .parameters(ToolParams.generateSchema(ExecCommandParams.class))
+                .sideEffect(ToolConcurrencyPolicy.sideEffectOf("exec_command"))
+                .idempotent(ToolConcurrencyPolicy.isIdempotent("exec_command"))
+                .streamPrefetchSafe(ToolConcurrencyPolicy.isStreamPrefetchSafe("exec_command"))
+                .timeoutSeconds(ToolConcurrencyPolicy.timeoutSecondsOf("exec_command"))
+                .maxRetries(ToolConcurrencyPolicy.maxRetriesOf("exec_command"))
+                .concurrencyScope(ToolConcurrencyPolicy.concurrencyScopeOf("exec_command"))
+                .concurrencyKeyArgument(ToolConcurrencyPolicy.concurrencyKeyArgumentOf("exec_command"))
+                .adaptiveTimeoutSeconds(ExecCommandParams::outerGateSecondsOf)
+                .handler(json -> execCommand(ToolParams.fromJson(json, ExecCommandParams.class)))
+                .build());
     }
 
     // ==================== 浏览器工具 ====================
@@ -557,8 +589,12 @@ public class BuiltinTools {
 
     private void registerImageGenerateTool() {
         registry.register("image_generate",
-                "生成图片（云端多后端自动降级：ChatAnywhere/MiMo/FAL/SiliconFlow/智谱CogView）。" +
-                "不需要 ComfyUI 服务，适合快速生成概念图、插画等。英文 prompt 效果最好。",
+                "生成图片（云端多后端自动降级：ChatAnywhere/MiMo/FAL/SiliconFlow/智谱CogView）。\n" +
+                "不需要 ComfyUI 服务，适合快速生成概念图、插画等。英文 prompt 效果最好，中文也可以用。\n" +
+                "后端由工具自动选择，无需关心细节；工具直接返回可渲染的图片链接（Markdown 格式）。\n" +
+                "用户只是要看图时：原样输出图片链接，不要额外解释、不要说\"图片已生成\"。\n" +
+                "用户要求把图写进文档时：先用 todo 拆成「生图 → 定位文档 → 写入图片链接」，\n" +
+                "在主循环里串行执行 image_generate 再写文件；不要派子 Agent，也不要用 ASCII 图凑数。",
                 Map.of(
                         "prompt", Map.of("type", "string", "description", "图片描述（英文效果最好，尽量详细描述画面内容、风格、光影）", "required", true),
                         "aspect_ratio", Map.of("type", "string", "description", "比例: landscape(横版) / square(方形) / portrait(竖版)，默认 landscape")
@@ -569,6 +605,26 @@ public class BuiltinTools {
                     String ratio = (String) p.getOrDefault("aspect_ratio", "landscape");
                     return imageGenerationService.generate(prompt, ratio);
                 });
+    }
+
+    // ==================== 云端生歌（SenseAudio） ====================
+
+    /**
+     * 生歌工具：整首歌由云端产出，本地只负责提交、续查、下载落盘。
+     *
+     * <p>超时闸门在 {@code ToolConcurrencyPolicy} 里按 {@link SongGenerateParams#outerGateSeconds()}
+     * 登记。这个数字必须比工具内部的轮询预算宽 —— 外层先触发会被判成「终态未知」并中止整轮。
+     */
+    private void registerSongGenerateTool() {
+        registry.register(SongGenerateParams.TOOL_NAME,
+                "创作一整首歌（作词 + 作曲 + 演唱），走 SenseAudio 云端，约需 3 分钟。\n" +
+                "不需要 ComfyUI 或本地算力。成功后返回可直接播放的音频链接（Markdown 格式）；" +
+                "音频已由工具下载到本地，不要自己再去下载或转存。\n" +
+                "用户只是要听歌时：原样输出音频链接，不要额外解释、不要说「歌曲已生成」。\n" +
+                "若返回 status=PENDING（歌还在生成）：先告诉用户还在生成中，" +
+                "下一轮再调一次 song_generate 并把 taskId 原样传回来续查，不要重复提交。",
+                SongGenerateParams.class,
+                songGenerationService::generate);
     }
 
     // ==================== ComfyUI 工具（集成自 ClawHub skills） ====================
@@ -879,7 +935,7 @@ public class BuiltinTools {
 
     private String readPackage(String packageName, int maxChars) {
         try {
-            // 包名转路径：com.miniagent.agent.intent → src/main/java/com/miniagent/agent/intent
+            // 包名转路径：com.miniagent.agent.tool → src/main/java/com/miniagent/agent/tool
 
             String relativePath = packageName.replace('.', File.separatorChar);
             // 从项目根目录查找 src/main/java 下的包路径
@@ -1243,8 +1299,27 @@ public class BuiltinTools {
             "powershell -enc", "cmd /c echo"
     );
 
-    private String execCommand(String command) {
+    /** 单个工具结果内联给模型的字符上限；超出部分落盘，只回显末尾。 */
+    private static final int MAX_INLINE_OUTPUT_CHARS = 6000;
+
+    /** 落盘目录（在 workspace 下，read_file 直接读得到）。 */
+    private static final String TOOL_OUTPUT_DIR = "_tool-output";
+
+    /** 超时场景回显的部分输出上限：够看清停在哪一步，又不至于把上下文吃满。 */
+    private static final int MAX_TIMEOUT_PARTIAL_CHARS = 2000;
+
+    private static final DateTimeFormatter OUTPUT_STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
+
+    private String execCommand(ExecCommandParams params) {
         // 是否允许执行由 AgentLoop 会话授权闸门决定；此处只做命令安全检查。
+        String command = Objects.isNull(params) ? null : params.getCommand();
+        if (StringUtils.isBlank(command)) {
+            return "{\"error\":\"command 不能为空\"}";
+        }
+        int timeoutSeconds = params.requestedTimeoutSeconds();
+        log.info("执行命令（timeout={}s, 描述={}）: {}", timeoutSeconds,
+                Objects.isNull(params.getDescription()) ? "-" : params.getDescription(),
+                redactSensitive(command));
 
         // 第1层：危险命令黑名单检查
         String lc = command.toLowerCase().trim();
@@ -1297,8 +1372,12 @@ public class BuiltinTools {
 
             // 关键修复：异步读流 + 主线程限时等待。
             // 旧实现先 readAllBytes() 再 waitFor()，而 readAllBytes() 会阻塞到进程关闭 stdout
-            // （即进程退出）为止——对常驻/输出不止的进程永远读不到 EOF，使后面的 30s 超时形同虚设。
+            // （即进程退出）为止——对常驻/输出不止的进程永远读不到 EOF，超时形同虚设。
             // 现在用独立线程 drain 输出，主线程 waitFor(timeout)，超时即 destroyForcibly，超时真正生效。
+            //
+            // 这个预算必须【小于】外层闸门（ExecCommandParams.outerGateSeconds）：外层先触发会被
+            // 判成「终态未知」并中止整轮，而这里能给出可控终态（强杀进程 + 部分输出）。
+            // 改造前内外都是 30s，外层几乎总是先到，于是这套精细处理基本是死代码。
             final java.nio.charset.Charset cs = isWindows
                     ? java.nio.charset.Charset.forName("GBK")
                     : java.nio.charset.StandardCharsets.UTF_8;
@@ -1317,29 +1396,102 @@ public class BuiltinTools {
             drainer.setDaemon(true);
             drainer.start();
 
-            boolean finished = proc.waitFor(30, java.util.concurrent.TimeUnit.SECONDS);
+            boolean finished = proc.waitFor(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS);
             if (!finished) {
                 proc.destroyForcibly();
                 proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
                 drainer.interrupt();
                 String partial;
                 synchronized (buf) { partial = new String(buf.toByteArray(), cs); }
-                if (partial.length() > 2000) {
-                    partial = partial.substring(0, 2000) + "\n…（已截断）";
-                }
-                return "{\"error\":\"命令执行超时（30s），已强制终止。若是启动服务器/常驻进程，请改为交付文件由用户自行运行。\","
-                        + "\"partial_output\":" + jsonString(partial) + "}";
+                String persisted = persistLongOutput(command, partial);
+                String shown = truncateTail(partial, MAX_TIMEOUT_PARTIAL_CHARS);
+                return "{\"error\":\"命令执行超时（" + timeoutSeconds + "s），已强制终止，未产生后续副作用。"
+                        + "若是启动服务器/常驻进程，请改为交付文件由用户自行运行；"
+                        + "若是构建/测试类慢命令，请调大 timeout 参数（上限 "
+                        + ExecCommandParams.MAX_TIMEOUT_SECONDS + "）。\","
+                        + "\"exit_code\":-1,"
+                        + (persisted.isEmpty() ? "" : "\"partial_output_path\":" + jsonString(persisted) + ",")
+                        + "\"partial_output\":" + jsonString(shown) + "}";
             }
             drainer.join(2000); // 等读流线程把剩余输出读完
             int exitCode = proc.exitValue();
             String out;
             synchronized (buf) { out = new String(buf.toByteArray(), cs); }
-            if (out.length() > 6000) {
-                out = out.substring(0, 6000) + "\n…（已截断）";
-            }
-            return "exit_code=" + exitCode + "\n" + out;
+            return formatExecResult(command, exitCode, out);
         } catch (Exception e) {
             return "{\"error\":\"命令执行失败: " + e.getMessage() + "\"}";
+        }
+    }
+
+    /**
+     * 组装给模型看的命令结果。
+     *
+     * <p>三条约定（改造前只有第一条）：</p>
+     * <ol>
+     *   <li>{@code exit_code=N} 必须在首行 —— 规划器的 {@code command_success} 判据靠这个前缀取退出码。</li>
+     *   <li>非错误退出码（grep/findstr 的 1、find/diff 的 1）补一行 {@code [exit-note]}：
+     *       既让 {@code ToolResult.fromLegacy} 不把它读成失败，也直接告诉模型别重试同一条命令。</li>
+     *   <li>超长输出落盘并回显<b>末尾</b>：构建/测试的报错都在尾部。落盘后模型可以用 read_file 取全量，
+     *       不必重跑命令。</li>
+     * </ol>
+     */
+    private String formatExecResult(String command, int exitCode, String output) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("exit_code=").append(exitCode).append('\n');
+        if (exitCode != 0 && !CommandSemantics.isFailure(command, exitCode)) {
+            sb.append(CommandSemantics.toleratedNote(command, exitCode)).append('\n');
+        }
+        if (output.length() > MAX_INLINE_OUTPUT_CHARS) {
+            String persisted = persistLongOutput(command, output);
+            if (!persisted.isEmpty()) {
+                sb.append("[输出过长已落盘] ").append(persisted)
+                        .append("（共 ").append(output.length()).append(" 字符；下面只显示末尾 ")
+                        .append(MAX_INLINE_OUTPUT_CHARS)
+                        .append(" 字符，需要完整内容请用 read_file 读该文件，不要重跑命令）\n");
+            } else {
+                sb.append("（输出过长已截断：共 ").append(output.length()).append(" 字符，只显示末尾 ")
+                        .append(MAX_INLINE_OUTPUT_CHARS).append(" 字符）\n");
+            }
+            sb.append(truncateTail(output, MAX_INLINE_OUTPUT_CHARS));
+        } else {
+            sb.append(output);
+        }
+        return sb.toString();
+    }
+
+    /** 取末尾 N 个字符；截断说明由调用方在头部给出，这里不加噪声。 */
+    private static String truncateTail(String text, int maxChars) {
+        if (Objects.isNull(text)) {
+            return "";
+        }
+        if (text.length() <= maxChars) {
+            return text;
+        }
+        return text.substring(text.length() - maxChars);
+    }
+
+    /**
+     * 把完整输出写进 {@code workspace/_tool-output/}，返回绝对路径；失败返回空串。
+     *
+     * <p>落盘失败不让工具失败：命令本身跑成了，拿不到完整输出只是降级。
+     * 路径放在 workspace 内，是为了让 {@code read_file} 的路径解析能直接命中它。</p>
+     */
+    private String persistLongOutput(String command, String output) {
+        if (Objects.isNull(output) || output.isEmpty()) {
+            return "";
+        }
+        try {
+            Path dir = effectiveWorkspaceRoot().resolve(TOOL_OUTPUT_DIR);
+            Files.createDirectories(dir);
+            String name = OUTPUT_STAMP.format(LocalDateTime.now())
+                    + "-" + Integer.toHexString(Objects.requireNonNullElse(command, "").hashCode()) + ".log";
+            Path file = dir.resolve(name);
+            Files.writeString(file, "# command: " + command + System.lineSeparator() + output,
+                    StandardCharsets.UTF_8);
+            return file.toAbsolutePath().toString();
+        } catch (Exception e) {
+            log.warn("命令输出落盘失败，退回纯截断: {}", e.getMessage());
+            return "";
         }
     }
 

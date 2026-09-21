@@ -1,5 +1,7 @@
 package com.miniagent.agent.planner;
 
+import com.miniagent.agent.tool.CapabilityRegistry;
+import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.agent.trace.TraceRecorder;
 import com.miniagent.common.RunStatus;
@@ -26,15 +28,15 @@ public class RecoveryEngine {
     private static final String RECOVERY_KEY_PREFIX = "recovery.";
 
     private final PlannerStateStore stateStore;
-    private final ToolCapabilityIndex capabilityIndex;
+    private final CapabilityRegistry capabilityRegistry;
     private final PlannerProperties properties;
     private TraceRecorder traceRecorder;
 
     public RecoveryEngine(PlannerStateStore stateStore,
-                          ToolCapabilityIndex capabilityIndex,
+                          CapabilityRegistry capabilityRegistry,
                           PlannerProperties properties) {
         this.stateStore = stateStore;
-        this.capabilityIndex = capabilityIndex;
+        this.capabilityRegistry = capabilityRegistry;
         this.properties = properties;
     }
 
@@ -43,8 +45,16 @@ public class RecoveryEngine {
     }
 
     public FailureDiagnosis diagnose(TaskNode node, String tool, String error) {
-        FailureKind kind = classifyKind(error);
-        FailureClass fc = mapClass(kind, node == null ? 0 : node.retryCount());
+        return diagnose(node, tool, error, ToolErrorCode.NONE);
+    }
+
+    public FailureDiagnosis diagnose(TaskNode node, String tool, String error,
+                                     ToolErrorCode errorCode) {
+        FailureKind kind = classify(errorCode, error);
+        ActionRetryPolicy policy = ActionRetryPolicy.forCapability(
+                node == null ? "" : node.capability());
+        FailureClass fc = mapClass(kind, node == null ? 0 : node.retryCount(),
+                policy, errorCode);
         String fix = switch (fc) {
             case LOCAL_REPAIR -> "修正参数/纠偏后重试同一工具";
             case REPLACE_TOOL -> "更换同类能力工具";
@@ -52,6 +62,24 @@ public class RecoveryEngine {
             case REVISE_GOAL -> "修订 Goal 约束";
         };
         return new FailureDiagnosis(fc, kind, node == null ? "" : node.id(), tool, error, fix);
+    }
+
+    static FailureKind classify(ToolErrorCode code, String error) {
+        if (code != null && code != ToolErrorCode.NONE) {
+            return switch (code) {
+                case INVALID_ARGUMENT -> FailureKind.PARAM_ERROR;
+                case UNKNOWN_TOOL -> FailureKind.UNKNOWN_TOOL;
+                case PERMISSION_DENIED -> FailureKind.PERMISSION_DENIED;
+                case TIMEOUT -> FailureKind.TIMEOUT;
+                case RATE_LIMITED, DEPENDENCY_UNAVAILABLE -> FailureKind.RESOURCE_EXHAUSTED;
+                case CONFLICT -> FailureKind.CONFLICT;
+                case NOT_FOUND, EXECUTION_FAILED, INTERNAL_ERROR -> FailureKind.TOOL_ERROR;
+                case CANCELLED -> FailureKind.GENERIC;
+                case EMPTY_RESULT, OUTCOME_UNKNOWN -> FailureKind.EVAL_FAILED;
+                case NONE -> classifyKind(error);
+            };
+        }
+        return classifyKind(error);
     }
 
     static FailureKind classifyKind(String error) {
@@ -85,6 +113,14 @@ public class RecoveryEngine {
     }
 
     static FailureClass mapClass(FailureKind kind, int retryCount) {
+        return mapClass(kind, retryCount, ActionRetryPolicy.none(), ToolErrorCode.NONE);
+    }
+
+    static FailureClass mapClass(FailureKind kind, int retryCount,
+                                 ActionRetryPolicy policy, ToolErrorCode code) {
+        if (policy != null && policy.retryable(code) && policy.withinLocalAttempts(retryCount)) {
+            return FailureClass.LOCAL_REPAIR;
+        }
         return switch (kind) {
             case PARAM_ERROR, HARD_GATE -> FailureClass.LOCAL_REPAIR;
             case UNKNOWN_TOOL -> FailureClass.REPLACE_TOOL;
@@ -164,25 +200,26 @@ public class RecoveryEngine {
             case LOCAL_REPAIR -> working.replace(
                     recovering.withStatus(TaskNodeStatus.PENDING).withRetryInc());
             case REPLACE_TOOL -> {
-                String alt = alternateTool(recovering, dx.tool());
-                yield working.replace(recovering.withToolHint(alt)
-                        .withStatus(TaskNodeStatus.PENDING).withRetryInc());
+                TaskNode next = recovering.withStatus(TaskNodeStatus.PENDING)
+                        .withRetryInc();
+                if (capabilityRegistry.containsTool(dx.tool())) {
+                    next = next.withBlockedTool(dx.tool());
+                }
+                yield working.replace(next);
             }
-            case REWRITE_GRAPH -> {
-                if (recovering.doneWhen().isFile())
-                    yield working.replace(
-                            recovering.withStatus(TaskNodeStatus.PENDING).withRetryInc());
-                yield rewriteAround(working, recovering, dx);
-            }
+            case REWRITE_GRAPH -> working.replace(
+                    recovering.withStatus(TaskNodeStatus.PENDING).withRetryInc());
             case REVISE_GOAL -> working.replace(
                     recovering.withStatus(TaskNodeStatus.PENDING).withRetryInc());
         };
+        // REWRITE_GRAPH 的子图重写只走 PlanningLoop.tryLlmReplan；
+        // 这里不再拆「准备/执行」过程节点。
 
         Goal nextGoal = cur.goal();
         if (dx.failureClass() == FailureClass.REVISE_GOAL && nextGoal != null) {
             List<String> cons = new ArrayList<>(nextGoal.constraints());
             cons.add("recovery: " + abbreviate(dx.reason(), 80));
-            nextGoal = new Goal(nextGoal.goalId(), nextGoal.objective(), nextGoal.intent(),
+            nextGoal = new Goal(nextGoal.goalId(), nextGoal.objective(), nextGoal.signals(),
                     nextGoal.taskType(), nextGoal.entities(), cons, nextGoal.successCriteria());
         }
 
@@ -203,10 +240,11 @@ public class RecoveryEngine {
                             "tool", dx.tool(), "classCount", used + 1),
                     null));
             traceRecovery(sessionId, dx);
-            if (traceRecorder != null)
+            if (traceRecorder != null) {
                 traceRecorder.recordNode(sessionId, 0, AgentStepNode.STATE_COMMIT.name(),
                         "{\"version\":" + committed.version() + ",\"recovery\":true}",
                         RunStatus.SUCCESS.name(), 0);
+            }
             return Optional.of(committed);
         } catch (PlannerStateStore.VersionConflictException e) {
             stateStore.appendEvent(sessionId, new DomainEvent(
@@ -215,59 +253,6 @@ public class RecoveryEngine {
                     Map.of("expected", e.expected(), "actual", e.actual()), null));
             return Optional.empty();
         }
-    }
-
-    private String alternateTool(TaskNode node, String failed) {
-        List<String> candidates = capabilityIndex.toolsFor(node.capability());
-        for (String t : candidates)
-            if (!t.equalsIgnoreCase(failed)) {
-                return t;
-            }
-        if (!"todo".equals(failed)) {
-            return "todo";
-        }
-        return StringUtils.isBlank(failed) ? "read_file" : failed;
-    }
-
-    private TaskGraph rewriteAround(TaskGraph graph, TaskNode failed, FailureDiagnosis dx) {
-        List<TaskNode> nodes = new ArrayList<>();
-        for (TaskNode n : graph.nodes()) {
-            if (!n.id().equals(failed.id())) {
-                nodes.add(n);
-                continue;
-            }
-            String subA = failed.id() + "_a";
-            String subB = failed.id() + "_b";
-            nodes.add(new TaskNode(subA, "拆解-准备:" + failed.name(), failed.capability(),
-                    failed.dependsOn(), failed.inputs(), List.of(),
-                    TaskNodeStatus.PENDING, failed.priority() + 1,
-                    DoneWhen.note(), failed.toolHint(), dx.reason(),
-                    failed.retryCount() + 1, ""));
-            List<String> subBDeps = new ArrayList<>(failed.dependsOn());
-            subBDeps.add(subA);
-            nodes.add(new TaskNode(subB, "拆解-执行:" + failed.name(), failed.capability(),
-                    subBDeps, failed.inputs(), failed.outputs(),
-                    TaskNodeStatus.PENDING, failed.priority(),
-                    failed.doneWhen(), "", "", 0, ""));
-            nodes.add(failed.withStatus(TaskNodeStatus.CANCELLED).withError(dx.reason()));
-        }
-        String failedId = failed.id();
-        String replacement = failedId + "_b";
-        List<TaskNode> remapped = new ArrayList<>();
-        for (TaskNode n : nodes) {
-            if (n.id().equals(failedId) || n.id().endsWith("_a") || n.id().endsWith("_b")) {
-                remapped.add(n);
-                continue;
-            }
-            List<String> deps = new ArrayList<>();
-            for (String d : n.dependsOn())
-                deps.add(failedId.equals(d) ? replacement : d);
-            remapped.add(new TaskNode(n.id(), n.name(), n.capability(), deps,
-                    n.inputs(), n.outputs(), n.status(),
-                    n.priority(), n.doneWhen(), n.toolHint(), n.lastError(),
-                    n.retryCount(), n.output()));
-        }
-        return new TaskGraph(remapped);
     }
 
     private void traceRecovery(String sessionId, FailureDiagnosis dx) {

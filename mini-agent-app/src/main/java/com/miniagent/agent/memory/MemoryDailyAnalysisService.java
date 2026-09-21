@@ -3,7 +3,12 @@ package com.miniagent.agent.memory;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import com.miniagent.common.ChatRole;
+import com.miniagent.common.model.EffectiveModelContext;
+import com.miniagent.config.model.UserModelBinder;
+import com.miniagent.memory.MemoryKeys;
+import com.miniagent.memory.MemoryService;
 import com.miniagent.memory.MemoryStore;
+import com.miniagent.memory.model.MemoryReadPolicy;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatModel;
@@ -18,14 +23,7 @@ import java.util.*;
 import org.apache.commons.lang3.StringUtils;
 
 /**
- * 每天 00:00 自动分析用户对话，提取偏好写入 USER.md / MEMORY.md
- *
- * 思路：
- * - 收集所有 session 的最近对话（ChatMemory 最后10条）
- * - 调用 LLM 分析，提取用户偏好、技术领域、沟通风格
- * - 写入 MemoryStore 的 USER.md / MEMORY.md
- *
- * 也支持用户明确说"记住这个"时，由 MemoryTool(action=add) 即时写入。
+ * 每天 00:00 自动分析用户对话，提取偏好写入语义事实（用户画像）。
  */
 @Slf4j
 @Service
@@ -36,7 +34,15 @@ public class MemoryDailyAnalysisService {
     @Autowired
     private MemoryStore memoryStore;
     @Autowired
+    private MemoryService memoryService;
+    @Autowired
     private com.miniagent.config.service.DatabaseConversationStore conversationStore;
+    /**
+     * 定时任务跑在 {@code scheduling} 线程池上，没有继承任何用户上下文，
+     * 必须显式绑定该用户的模型与归属，否则画像分析会走全局 Bean。
+     */
+    @Autowired
+    private UserModelBinder userModelBinder;
 
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
@@ -81,18 +87,15 @@ public class MemoryDailyAnalysisService {
             transcript = transcript.substring(transcript.length() - 20000); // 截取最近2万字符
         }
 
-        // 设置用户上下文，使快照读取与写入都落到该用户的目录
-        MemoryStore.setCurrentUser(userId);
-        try {
+        // 绑定归属与模型：归属让快照读取与写入都落到该用户的目录，
+        // 模型让分析走该用户自己配置的那套（全局 Bean 仅在解析失败时兜底）。
+        try (var ignored = userModelBinder.bindUser(userId)) {
             String analysis = analyzeWithLLM(transcript);
             if (StringUtils.isBlank(analysis)) {
                 return 0;
             }
             writeAnalysisResults(analysis);
-            memoryStore.loadFromDisk(); // 重新加载该用户快照
             return 1;
-        } finally {
-            MemoryStore.clearCurrentUser();
         }
     }
 
@@ -132,7 +135,9 @@ public class MemoryDailyAnalysisService {
 5. 输出格式：每行一条，用 § 分隔
 
 已有记忆（可能为空）：
-""" + memoryStore.getCombinedSnapshot() + """
+""" + memoryService.retrieveForPrompt(
+                null, "用户偏好",
+                new MemoryReadPolicy(false, false, true, false, 0)) + """
 
 对话记录：
 """ + transcript + """
@@ -147,7 +152,7 @@ public class MemoryDailyAnalysisService {
                     ))
                     .build();
 
-            var response = chatModel.chat(request);
+            var response = EffectiveModelContext.chatOr(chatModel).chat(request);
             return response.aiMessage().text();
         } catch (Exception e) {
             log.error("[MemoryAnalysis] LLM 调用失败", e);
@@ -155,9 +160,8 @@ public class MemoryDailyAnalysisService {
         }
     }
 
-    /** 解析 LLM 结果，写入 USER.md */
+    /** 解析 LLM 结果，写入用户偏好事实（不重复写画像 blob）。 */
     private void writeAnalysisResults(String analysis) {
-        // 按 § 或换行分隔
         String[] lines = analysis.split("[§\n]");
         for (String line : lines) {
             String trimmed = line.trim();
@@ -165,11 +169,8 @@ public class MemoryDailyAnalysisService {
                 continue;
             }
 
-            // 去掉可能的编号前缀：1. 2. - * 等
             trimmed = trimmed.replaceFirst("^[\\d]+[.、]\\s*", "").replaceFirst("^[-*]\\s*", "");
-
-            // 写入 USER.md（通过 add，有去重）
-            memoryStore.add("user", trimmed);
+            memoryService.add(MemoryKeys.TARGET_USER, trimmed);
         }
     }
 }

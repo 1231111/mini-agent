@@ -18,15 +18,23 @@ public final class ProposalTurnPolicy implements LoopTurnPolicy {
     private final boolean hardGate;
     private final String focusLabel;
     private final Set<Integer> focusTodoIds;
+    private final int actionTimeoutSeconds;
     private final AtomicBoolean driftFlag = new AtomicBoolean(false);
     private final AtomicInteger driftCount = new AtomicInteger(0);
 
     public ProposalTurnPolicy(List<String> allowedTools, boolean hardGate,
                               String focusLabel, Set<Integer> focusTodoIds) {
+        this(allowedTools, hardGate, focusLabel, focusTodoIds, 0);
+    }
+
+    public ProposalTurnPolicy(List<String> allowedTools, boolean hardGate,
+                              String focusLabel, Set<Integer> focusTodoIds,
+                              int actionTimeoutSeconds) {
         this.allowedTools = allowedTools == null ? List.of() : List.copyOf(allowedTools);
         this.hardGate = hardGate;
         this.focusLabel = focusLabel == null ? "" : focusLabel;
         this.focusTodoIds = focusTodoIds == null ? Set.of() : Set.copyOf(focusTodoIds);
+        this.actionTimeoutSeconds = Math.max(0, actionTimeoutSeconds);
     }
 
     @Override
@@ -98,6 +106,11 @@ public final class ProposalTurnPolicy implements LoopTurnPolicy {
 
     @Override
     public boolean consumeDrift() { return driftFlag.getAndSet(false); }
+
+    @Override
+    public int actionTimeoutSeconds() {
+        return actionTimeoutSeconds;
+    }
 
     private static String err(String msg) {
         return "{\"error\":\"" + msg.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}";

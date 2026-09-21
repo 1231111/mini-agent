@@ -1,7 +1,7 @@
 package com.miniagent.agent.core;
 
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /** 会话执行控制面：取消、deadline、心跳和资源预算都在这里收敛。 */
 @Component
+@EnableConfigurationProperties(ExecutionProperties.class)
 public class ExecutionControl {
     public enum StopReason {
         NONE,
@@ -51,21 +52,27 @@ public class ExecutionControl {
     private final Optional<ExecutionSignalStore> signalStore;
     private final Optional<TenantTokenQuota> tenantTokenQuota;
 
-    public ExecutionControl(@Value("${agent.execution.deadline-ms:1800000}") long deadlineMillis,
-                            @Value("${agent.execution.max-tool-calls:120}") int maxToolCalls,
-                            @Value("${agent.execution.max-estimated-tokens:240000}") long maxEstimatedTokens) {
-        this(deadlineMillis, maxToolCalls, maxEstimatedTokens, Optional.empty(), Optional.empty());
+    public ExecutionControl(long deadlineMillis, int maxToolCalls, long maxEstimatedTokens) {
+        this(new ExecutionProperties(deadlineMillis, maxToolCalls, maxEstimatedTokens),
+                Optional.empty(), Optional.empty());
+    }
+
+    public ExecutionControl(long deadlineMillis, int maxToolCalls, long maxEstimatedTokens,
+                            Optional<ExecutionSignalStore> signalStore,
+                            Optional<TenantTokenQuota> tenantTokenQuota) {
+        this(new ExecutionProperties(deadlineMillis, maxToolCalls, maxEstimatedTokens),
+                signalStore, tenantTokenQuota);
     }
 
     @Autowired
-    public ExecutionControl(@Value("${agent.execution.deadline-ms:1800000}") long deadlineMillis,
-                            @Value("${agent.execution.max-tool-calls:120}") int maxToolCalls,
-                            @Value("${agent.execution.max-estimated-tokens:240000}") long maxEstimatedTokens,
+    public ExecutionControl(ExecutionProperties properties,
                             Optional<ExecutionSignalStore> signalStore,
                             Optional<TenantTokenQuota> tenantTokenQuota) {
-        this.deadlineMillis = Math.max(1_000L, deadlineMillis);
-        this.maxToolCalls = Math.max(1, maxToolCalls);
-        this.maxEstimatedTokens = Math.max(1_000L, maxEstimatedTokens);
+        ExecutionProperties props = properties == null
+                ? new ExecutionProperties() : properties;
+        this.deadlineMillis = Math.max(1_000L, props.getDeadlineMs());
+        this.maxToolCalls = Math.max(1, props.getMaxToolCalls());
+        this.maxEstimatedTokens = Math.max(1_000L, props.getMaxEstimatedTokens());
         this.signalStore = Objects.requireNonNullElse(signalStore, Optional.empty());
         this.tenantTokenQuota = Objects.requireNonNullElse(tenantTokenQuota, Optional.empty());
     }
