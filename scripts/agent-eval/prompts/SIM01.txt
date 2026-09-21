@@ -1,1 +1,0 @@
-请在工作区写入文件 eval_sim01_hello.txt，内容必须恰好一行：EVAL-SIM01。写完后只回复路径。

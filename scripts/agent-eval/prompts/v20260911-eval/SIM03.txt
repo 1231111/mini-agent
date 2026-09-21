@@ -1,1 +1,0 @@
-请写入 Python 文件 t20260911eval_calc.py，定义 add(a,b) 返回两数之和，并含一行注释 GEN-20260911eval-SIM03。

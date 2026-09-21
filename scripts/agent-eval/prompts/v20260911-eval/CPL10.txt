@@ -1,1 +1,0 @@
-请写 t20260911eval_checklist.md：含 5 项部署检查清单（编号列表），并创建 t20260911eval_deploy.env 含 APP_NAME=20260911eval 一行。

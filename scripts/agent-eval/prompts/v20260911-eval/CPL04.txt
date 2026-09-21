@@ -1,1 +1,0 @@
-请绘制 Mini Agent 三层架构（UI/App/LLM）Mermaid 源码 t20260911eval_arch.mmd，并用 render_diagram 导出 t20260911eval_arch.png。

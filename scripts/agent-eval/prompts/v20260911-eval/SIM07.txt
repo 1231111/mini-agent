@@ -1,1 +1,0 @@
-请写入 Markdown 文件 t20260911eval_readme.md，含一级标题 GEN-20260911eval-SIM07 和至少 3 条无序列表。

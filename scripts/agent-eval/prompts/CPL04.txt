@@ -1,1 +1,0 @@
-请画「用户-智能体-工具」三层架构图：先把 mermaid 写入 eval_cpl04_arch.mmd，再用 render_diagram 生成 eval_cpl04_arch.png。不要生成海报。完成后回复两个路径。

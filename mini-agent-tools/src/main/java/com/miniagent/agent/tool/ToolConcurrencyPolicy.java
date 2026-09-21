@@ -36,6 +36,20 @@ public final class ToolConcurrencyPolicy {
     /** 真正等待由 AgentLoop 让出；此外层超时只防止拦截失效时拖死循环。 */
     private static final long ASK_USER_TIMEOUT_SECONDS = 3600L;
 
+    /**
+     * 完全不占本地资源、但单次调用要跑几百秒的工具。
+     *
+     * <p>这类工具必须显式声明无并发约束（{@link ToolConcurrencyScope#NONE}）：
+     * 默认的 GLOBAL 会让它长期霸占 {@code ToolExecutionGuards} 那把全局互斥锁，
+     * 把别的会话里任何一个写类工具堵到撞自己的闸门 —— 而写类工具超时会被判成
+     * {@code OUTCOME_UNKNOWN} 并<b>中止整轮任务</b>。</p>
+     *
+     * <p>ComfyUI 系列（{@code comfyui_img2video} 620s、{@code comfyui_txt2img} 200s）
+     * <b>不在</b>此列：它们要抢本地同一块 GPU，串行是有意为之。</p>
+     */
+    private static final Set<String> NO_LOCAL_RESOURCE_TOOLS =
+            Set.of(SongGenerateParams.TOOL_NAME);
+
     private ToolConcurrencyPolicy() {}
 
     // ─── 参数感知的判定入口 ───
@@ -212,6 +226,14 @@ public final class ToolConcurrencyPolicy {
         }
         if (Set.of("todo", "delegate_task", "ask_user_question").contains(name)) {
             return ToolConcurrencyScope.SESSION;
+        }
+        // 长耗时的云端生成不碰任何本地共享资源：文件名带时间戳，远端任务彼此独立。
+        // 但一次调用最长要占几百秒，若按默认落到 GLOBAL，它会长时间霸占 "global" 那把互斥锁
+        // （ToolExecutionGuards 的 resourceLocks 每个条纹只有 1 个许可），把别的会话的写类工具
+        // 一起堵在锁上 —— 被堵的工具再撞到自己的闸门就是 OUTCOME_UNKNOWN 并中止整轮。
+        // 所以这类工具显式声明无并发约束，只受全局并发信号量限制。
+        if (name != null && NO_LOCAL_RESOURCE_TOOLS.contains(name)) {
+            return ToolConcurrencyScope.NONE;
         }
         if (!key.isEmpty()) {
             return ToolConcurrencyScope.ARGUMENT;

@@ -1,1 +1,0 @@
-请用 web_search 查询 JDK 21 virtual threads 要点，用中文列出恰好 3 条，每条不超过 40 字。不要写文件，不要打开浏览器。

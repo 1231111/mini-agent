@@ -1,0 +1,35 @@
+AUTH userId=23 tenantId= user=ctxmem_probe
+
+=== T1 QUESTION hello ===
+intent={"phase":"INTENT","decidedLayer":"L0","intent":"QUESTION","taskGoal":"ä½ å¥½"}
+ctx={"injectMidterm":false,"injectTodo":false,"injectMemory":false,"todoResumed":false,"intent":"QUESTION","referenceConfidence":0.0,"todoSuspended":false,"hasReference":false,"injectUser":true,"referenceCandidates":[],"referenceNegated":false,"toolGuidanceCount":3,"historyMax":0,"historyMessages":0,"injectSkills":false}
+tools=
+answer=你好！有什么可以帮你的？
+
+=== T2 remember preference ===
+intent={"phase":"INTENT","decidedLayer":"L0","intent":"FILE_DELIVERY","taskGoal":"è®°ä½è¿ä¸ªï¼æåä»£ç é»è®¤ä½¿ç¨ Java 21ãä¸è¦å»ºè®¡åï¼è°ç¨ memory å·¥å· target=user ä¿å­ååªç¨ä¸å¥è¯ç¡®è®¤ã"}
+ctx={"injectMidterm":false,"injectTodo":true,"injectMemory":true,"todoResumed":false,"intent":"FILE_DELIVERY","referenceConfidence":0.45,"todoSuspended":false,"hasReference":true,"injectUser":true,"referenceCandidates":[],"referenceNegated":false,"toolGuidanceCount":46,"historyMax":-1,"historyMessages":0,"injectSkills":true}
+tools=memory,memory
+answer=已记住：你写代码默认使用 Java 21。
+
+=== T3 NEW_TASK plan ===
+intent={"phase":"INTENT","decidedLayer":"L1","intent":"NEW_TASK","taskGoal":"çæä¸å¥è¯ç MySQL å¤ä»½ææ¯æ¹æ¡","confidence":0.75}
+ctx={"injectMidterm":false,"injectTodo":false,"injectMemory":true,"todoResumed":false,"intent":"NEW_TASK","referenceConfidence":0.0,"todoSuspended":false,"hasReference":false,"injectUser":true,"referenceCandidates":[],"referenceNegated":false,"toolGuidanceCount":46,"historyMax":6,"historyMessages":0,"injectSkills":true}
+tools=todo,todo
+answer=3. **自动化与异地存储**：用 cron/计划任务每日定时执行备份脚本，通过 `compress` 压缩后上传至对象存储（如 OSS/S3），并设置保留策略（如保留最近 7 天全量 + 30 天 binlog），确保数据可恢复性与异地容灾。
+
+=== memory files C:\Users\abc\.miniagent\memory\users\23 ===
+USER.md MISSING
+MEMORY.md MISSING
+MIDTERM.md MISSING
+
+=== assertions ===
+PASS T1 injectMemory=false
+PASS T1 injectMidterm=false
+PASS T1 greeting does not write memory
+PASS T2 called memory tool
+PASS T3 injectMidterm=false
+PASS T3 task intent injectMemory=true
+facts query skip: mysql: [Warning] Using a password on the command line interface can be insecure.
+PASS T2 no dual USER blob
+PASS T2 USER.md has no Java 21

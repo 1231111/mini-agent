@@ -1,1 +1,0 @@
-请用 write_xlsx 生成 t20260911eval_scores.xlsx，含表头 Name,Score 和一行 Alice,95。

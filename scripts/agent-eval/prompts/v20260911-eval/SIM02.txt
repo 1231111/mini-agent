@@ -1,1 +1,0 @@
-请写入 Java 文件 t20260911eval_Hello.java，类名 Hello，main 方法打印 GEN-20260911eval-SIM02。不要编译。

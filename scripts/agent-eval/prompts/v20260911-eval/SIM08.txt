@@ -1,1 +1,0 @@
-请写入 t20260911eval_greet.sh，内容为 echo GEN-20260911eval-SIM08，并确保文件以换行结尾。

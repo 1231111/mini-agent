@@ -1,1 +1,0 @@
-请用 write_docx 生成 t20260911eval_note.docx，正文至少一行：GEN-20260911eval-SIM06。

@@ -1,1 +1,0 @@
-请在工作区创建最小 Flask 示例：t20260911eval_app.py（/ 返回 Hello 20260911eval）和 t20260911eval_requirements.txt（含 Flask）。两个文件都要写。
