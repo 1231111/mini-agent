@@ -196,7 +196,7 @@ class ToolPipelineTest {
                 new ToolHookChain(List.of()),
                 new SessionPermissionStore(),
                 new InMemoryActionJournal(),
-                new ToolExecutionGuards(registry, 4),
+                new ToolExecutionGuards(registry, new AgentToolsProperties(4)),
                 registry,
                 true);
     }

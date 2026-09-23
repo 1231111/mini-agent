@@ -34,6 +34,13 @@ class ToolExecutionGuardsExecTest {
     private static final Function<Object, String> NAME_OF = c -> ((Call) c).name();
     private static final Function<Object, String> ARGS_OF = c -> ((Call) c).arguments();
 
+    /** 默认配置：并发额度 8，无 timeout-overrides。 */
+    private static AgentToolsProperties props() {
+        AgentToolsProperties properties = new AgentToolsProperties();
+        properties.setMaxConcurrency(8);
+        return properties;
+    }
+
     private static ToolRegistry registry() {
         ToolRegistry registry = new ToolRegistry();
         registry.register(Tool.builder()
@@ -41,7 +48,7 @@ class ToolExecutionGuardsExecTest {
                 .description("test exec")
                 .parameters(ToolParams.generateSchema(ExecCommandParams.class))
                 .sideEffect(ToolConcurrencyPolicy.sideEffectOf(ToolConcurrencyPolicy.EXEC_TOOL))
-                .timeoutSeconds(ToolConcurrencyPolicy.timeoutSecondsOf(ToolConcurrencyPolicy.EXEC_TOOL))
+                .executionProfile(ToolConcurrencyPolicy.profileOf(ToolConcurrencyPolicy.EXEC_TOOL))
                 .adaptiveTimeoutSeconds(ExecCommandParams::outerGateSecondsOf)
                 .handler(json -> "exit_code=0")
                 .build());
@@ -51,7 +58,7 @@ class ToolExecutionGuardsExecTest {
                 .parameters(Map.of())
                 .sideEffect(ToolSideEffect.READ_ONLY)
                 .idempotent(true)
-                .timeoutSeconds(10L)
+                .executionProfile(ToolConcurrencyPolicy.profileOf("read_file"))
                 .handler(json -> "{}")
                 .build());
         return registry;
@@ -63,7 +70,7 @@ class ToolExecutionGuardsExecTest {
 
     @Test
     void readOnlyExecBatchRunsInParallel() {
-        ToolExecutionGuards guards = new ToolExecutionGuards(registry(), 8);
+        ToolExecutionGuards guards = new ToolExecutionGuards(registry(), props());
 
         assertTrue(guards.canRunBatchInParallel(
                 execBatch("{\"command\":\"git status\"}", "{\"command\":\"git log --oneline -5\"}"),
@@ -72,7 +79,7 @@ class ToolExecutionGuardsExecTest {
 
     @Test
     void oneWritingExecCallForcesTheWholeBatchSerial() {
-        ToolExecutionGuards guards = new ToolExecutionGuards(registry(), 8);
+        ToolExecutionGuards guards = new ToolExecutionGuards(registry(), props());
 
         assertFalse(guards.canRunBatchInParallel(
                 execBatch("{\"command\":\"git status\"}", "{\"command\":\"del /q build\"}"),
@@ -81,7 +88,7 @@ class ToolExecutionGuardsExecTest {
 
     @Test
     void unknownToolForcesSerialSoErrorsSurfaceInOrder() {
-        ToolExecutionGuards guards = new ToolExecutionGuards(registry(), 8);
+        ToolExecutionGuards guards = new ToolExecutionGuards(registry(), props());
 
         assertFalse(guards.canRunBatchInParallel(
                 List.of(new Call("exec_command", "{\"command\":\"git status\"}"), new Call("nope", "{}")),
@@ -90,7 +97,7 @@ class ToolExecutionGuardsExecTest {
 
     @Test
     void singleCallNeverRunsInParallel() {
-        ToolExecutionGuards guards = new ToolExecutionGuards(registry(), 8);
+        ToolExecutionGuards guards = new ToolExecutionGuards(registry(), props());
 
         assertFalse(guards.canRunBatchInParallel(
                 execBatch("{\"command\":\"git status\"}"), NAME_OF, ARGS_OF));
@@ -98,7 +105,7 @@ class ToolExecutionGuardsExecTest {
 
     @Test
     void outerGateReadsTheTimeoutFromArguments() {
-        ToolExecutionGuards guards = new ToolExecutionGuards(registry(), 8);
+        ToolExecutionGuards guards = new ToolExecutionGuards(registry(), props());
 
         assertEquals(315L, guards.timeoutSeconds("exec_command", "{\"command\":\"mvnw package\",\"timeout\":300}"));
         assertEquals(615L, guards.timeoutSeconds("exec_command", "{\"command\":\"mvnw package\",\"timeout\":600}"));
@@ -110,7 +117,7 @@ class ToolExecutionGuardsExecTest {
     void descriptorForNonExecToolsIsPassedThroughUnchanged() {
         // 重建 record 会把 MCP 工具自己声明的 sideEffect 覆盖成默认值，那是静默回退
         ToolRegistry registry = registry();
-        ToolExecutionGuards guards = new ToolExecutionGuards(registry, 8);
+        ToolExecutionGuards guards = new ToolExecutionGuards(registry, props());
         ToolDescriptor registered = registry.getDescriptor("read_file").orElseThrow();
 
         assertEquals(registered, guards.descriptor("read_file", "{\"path\":\"a\"}"));
@@ -119,7 +126,7 @@ class ToolExecutionGuardsExecTest {
 
     @Test
     void descriptorForExecFollowsTheCommandLine() {
-        ToolExecutionGuards guards = new ToolExecutionGuards(registry(), 8);
+        ToolExecutionGuards guards = new ToolExecutionGuards(registry(), props());
 
         assertEquals(ToolSideEffect.READ_ONLY, guards.descriptor("exec_command", "{\"command\":\"ls\"}").sideEffect());
         assertEquals(ToolSideEffect.EXTERNAL_WRITE,

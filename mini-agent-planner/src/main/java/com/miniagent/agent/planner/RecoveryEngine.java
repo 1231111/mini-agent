@@ -71,7 +71,7 @@ public class RecoveryEngine {
                 case UNKNOWN_TOOL -> FailureKind.UNKNOWN_TOOL;
                 case PERMISSION_DENIED -> FailureKind.PERMISSION_DENIED;
                 case TIMEOUT -> FailureKind.TIMEOUT;
-                case RATE_LIMITED, DEPENDENCY_UNAVAILABLE -> FailureKind.RESOURCE_EXHAUSTED;
+                case RATE_LIMITED, DEPENDENCY_UNAVAILABLE, RESOURCE_BUSY -> FailureKind.RESOURCE_EXHAUSTED;
                 case CONFLICT -> FailureKind.CONFLICT;
                 case NOT_FOUND, EXECUTION_FAILED, INTERNAL_ERROR -> FailureKind.TOOL_ERROR;
                 case CANCELLED -> FailureKind.GENERIC;

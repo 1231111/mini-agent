@@ -48,10 +48,14 @@ public final class TodoSemanticValidator {
         }
 
         if ("media_delivered".equalsIgnoreCase(dw) || "media".equalsIgnoreCase(dw)) {
-            if (!IMAGE_MD.matcher(ev).find() && !IMAGE_PATH.matcher(ev).find()) {
-                return Result.fail("语义验收失败：media evidence 需含可渲染的 markdown 图片或图片 URL");
+            Path image = existingImage(ev);
+            if (image != null) {
+                return validateFile(image);
             }
-            return Result.pass(sha256(ev.getBytes(StandardCharsets.UTF_8)));
+            if (IMAGE_MD.matcher(ev).find() || IMAGE_PATH.matcher(ev).find()) {
+                return Result.pass(sha256(ev.getBytes(StandardCharsets.UTF_8)));
+            }
+            return Result.fail("语义验收失败：media evidence 需含可渲染的 markdown 图片或图片 URL");
         }
 
         // note_required / 未知：至少禁止空证据；若 evidence 像路径则顺带做文件语义检查
@@ -112,6 +116,51 @@ public final class TodoSemanticValidator {
         } catch (Exception e) {
             return Result.fail("语义验收异常: " + e.getMessage());
         }
+    }
+
+    /** 本地已生成的图片（含 render_diagram 的绝对路径和工具 JSON 里的 path）算交付。 */
+    public static boolean acceptsMediaEvidence(String evidence) {
+        if (StringUtils.isBlank(evidence)) {
+            return false;
+        }
+        if (IMAGE_MD.matcher(evidence).find() || IMAGE_PATH.matcher(evidence).find()) {
+            return true;
+        }
+        return existingImage(evidence) != null;
+    }
+
+    private static Path existingImage(String evidence) {
+        Path direct = tryResolve(evidence);
+        if (isImageFile(direct)) {
+            return direct;
+        }
+        var jsonPath = Pattern.compile("\"path\"\\s*:\\s*\"([^\"]+)\"")
+                .matcher(evidence);
+        if (jsonPath.find()) {
+            Path fromJson = tryResolve(jsonPath.group(1).replace("\\\\", "\\"));
+            if (isImageFile(fromJson)) {
+                return fromJson;
+            }
+        }
+        var bare = Pattern.compile(
+                "(?i)(?:[A-Za-z]:)?[^\\s\"']+\\.(?:png|jpe?g|webp|gif|svg)\\b")
+                .matcher(evidence);
+        if (bare.find()) {
+            Path fromText = tryResolve(bare.group());
+            if (isImageFile(fromText)) {
+                return fromText;
+            }
+        }
+        return null;
+    }
+
+    private static boolean isImageFile(Path path) {
+        if (path == null || !Files.isRegularFile(path)) {
+            return false;
+        }
+        String name = path.getFileName().toString().toLowerCase(Locale.ROOT);
+        return name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")
+                || name.endsWith(".webp") || name.endsWith(".gif") || name.endsWith(".svg");
     }
 
     private static Path resolveExisting(String doneWhenPath, String evidence) {

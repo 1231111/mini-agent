@@ -13,12 +13,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
@@ -40,8 +43,10 @@ public class FileStorageService {
     private MediaStorage mediaStorage;
     private Path baseDir;
 
-    @org.springframework.beans.factory.annotation.Value("${file.upload.max-size:52428800}")
-    private long maxUploadSizeBytes = 52_428_800L;
+    @org.springframework.beans.factory.annotation.Value("${file.upload.max-size:734003200}")
+    private long maxUploadSizeBytes = 734_003_200L;
+    @org.springframework.beans.factory.annotation.Value("${file.extract.max-bytes:52428800}")
+    private long maxExtractBytes = 52_428_800L;
 
     private static final Pattern SAFE_EXTENSION = Pattern.compile("\\.[a-z0-9]{1,10}");
 
@@ -59,6 +64,34 @@ public class FileStorageService {
             return saveFile(userId, sessionId, originalFilename, mimeType,
                     Base64.getDecoder().decode(base64Content));
         } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("Failed to save file for user {}", userId, e);
+            throw new RuntimeException("File save failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 上传落盘。按流写入，不把整个文件再编码成 Base64。
+     * 大于 {@code file.extract.max-bytes} 的文档只保存，不抽全文进上下文。
+     */
+    public FileUpload saveUploaded(Long userId, String sessionId, String originalFilename,
+                                   String mimeType, MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            throw new IllegalArgumentException("file content required");
+        }
+        long size = file.getSize();
+        if (size > maxUploadSizeBytes) {
+            throw new IllegalArgumentException("file exceeds configured size limit");
+        }
+        try {
+            Path filePath = prepareStoredPath(userId, originalFilename);
+            try (InputStream in = file.getInputStream()) {
+                Files.copy(in, filePath, StandardCopyOption.REPLACE_EXISTING);
+            }
+            return persistUpload(userId, sessionId, originalFilename, mimeType,
+                    filePath, size);
+        } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {
             log.error("Failed to save file for user {}", userId, e);
@@ -127,6 +160,49 @@ public class FileStorageService {
             log.error("Failed to save file for user {}", userId, e);
             throw new RuntimeException("File save failed: " + e.getMessage(), e);
         }
+    }
+
+    private Path prepareStoredPath(Long userId, String originalFilename) throws IOException {
+        if (userId == null || userId <= 0) {
+            throw new IllegalArgumentException("userId required");
+        }
+        if (baseDir == null) {
+            throw new IllegalStateException("file storage is not initialized");
+        }
+        Path userDir = baseDir.resolve(String.valueOf(userId)).toAbsolutePath().normalize();
+        Path storageRoot = baseDir.toAbsolutePath().normalize();
+        if (!userDir.startsWith(storageRoot)) {
+            throw new IllegalArgumentException("invalid user storage path");
+        }
+        Files.createDirectories(userDir);
+        String storedFilename = UUID.randomUUID().toString().substring(0, 8)
+                + "_" + System.currentTimeMillis() + safeExtension(originalFilename);
+        return userDir.resolve(storedFilename);
+    }
+
+    private FileUpload persistUpload(Long userId, String sessionId, String originalFilename,
+                                     String mimeType, Path filePath, long size) {
+        FileUpload fileUpload = new FileUpload();
+        fileUpload.setUserId(userId);
+        fileUpload.setOriginalFilename(originalFilename);
+        fileUpload.setStoredFilename(filePath.getFileName().toString());
+        fileUpload.setMimeType(mimeType);
+        fileUpload.setFileSize(size);
+        fileUpload.setFilePath(filePath.toAbsolutePath().toString());
+        fileUpload.setSessionId(sessionId);
+        boolean nativeMedia = MultimodalMedia.isNativeMedia(originalFilename, mimeType);
+        if (!nativeMedia && size <= maxExtractBytes) {
+            try {
+                String sidecar = uploadedDocumentService.extractAndWriteSidecar(
+                        userId, filePath, originalFilename, mimeType);
+                fileUpload.setExtractedTextPath(sidecar);
+            } catch (Exception e) {
+                log.warn("上传后文本提取失败（文件已保存）: {}", originalFilename, e);
+            }
+        } else if (!nativeMedia) {
+            log.info("文件超过提取上限，仅落盘不抽全文: {} bytes={}", originalFilename, size);
+        }
+        return fileUploadRepository.save(fileUpload);
     }
 
     /** Keep only a short, single, alphanumeric extension from a client filename. */

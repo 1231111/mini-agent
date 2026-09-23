@@ -211,6 +211,11 @@ public class ToolPipeline {
         try {
             result = toolExecutionGuards.executeGuarded(name, arguments, sessionId,
                     () -> toolRegistry.executeResult(name, arguments));
+        } catch (ToolLockTimeoutException e) {
+            // 没轮到锁 = 工具根本没跑 = 零副作用。必须是可重试的失败，
+            // 绝不能落进下面那个 EXECUTION_FAILED（更不能升级成 OUTCOME_UNKNOWN 中止整轮）。
+            log.warn("  工具 {} 未拿到锁，退让: {}", name, e.getMessage());
+            result = ToolResult.failure(ToolErrorCode.RESOURCE_BUSY, e.getMessage(), true);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             result = ToolResult.failure(ToolErrorCode.CANCELLED, "工具执行被取消", false);

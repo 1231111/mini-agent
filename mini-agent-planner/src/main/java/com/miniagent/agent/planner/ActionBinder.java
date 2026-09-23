@@ -88,7 +88,24 @@ final class ActionBinder {
         if (CAP_IMAGE.equalsIgnoreCase(cap)) {
             return false;
         }
+        if (isMediaPath(pathOf(node))) {
+            return false;
+        }
         return CapabilityRegistry.persistsArtifacts(cap);
+    }
+
+    /** 图片/矢量图不能把上一步工具 JSON 当正文写进去。 */
+    private static boolean isMediaPath(String path) {
+        if (StringUtils.isBlank(path)) {
+            return false;
+        }
+        String name = path.replace('\\', '/').toLowerCase();
+        int cut = name.indexOf('?');
+        if (cut > 0) {
+            name = name.substring(0, cut);
+        }
+        return name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")
+                || name.endsWith(".webp") || name.endsWith(".gif") || name.endsWith(".svg");
     }
 
     private static String pathOf(TaskNode node) {

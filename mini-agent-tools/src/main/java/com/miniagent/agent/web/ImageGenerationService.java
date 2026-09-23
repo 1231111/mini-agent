@@ -107,6 +107,45 @@ public class ImageGenerationService {
     @Value("${image.gen.chatanywhere-timeout-seconds:500}")
     private long chatAnywhereTimeoutSeconds;
 
+    /** 单次 image_generate 调用的内层总预算默认值（秒）：竞速段 + 降级尾巴 + 落盘都在这之内。 */
+    public static final long DEFAULT_TOTAL_BUDGET_SECONDS = 540;
+
+    /** 剩余预算低于此值不再开新一轮后端尝试（开了也必然被砍，还多花一次钱）。 */
+    private static final long MIN_ATTEMPT_REMAINING_SECONDS = 10;
+
+    /** 0 = 未配置，回退 {@link #DEFAULT_TOTAL_BUDGET_SECONDS}。 */
+    @Value("${image.gen.total-budget-seconds:0}")
+    private long configuredTotalBudgetSeconds;
+
+    /**
+     * 内层总预算（秒）：工具到点自己强杀并返回「哪些后端试过、各自什么错」（可控终态），
+     * 绝不把等待拖到外层闸门 —— 外层先触发会被判成「终态未知」并中止整轮。
+     *
+     * <p>注册期（{@code BuiltinTools.registerImageGenerateTool}）把它写进执行契约：
+     * 外层闸门 = 预算 + {@code ToolConcurrencyPolicy} REMOTE_GENERATION 档的 30s 余量。</p>
+     */
+    public long totalBudgetSeconds() {
+        return configuredTotalBudgetSeconds > 0 ? configuredTotalBudgetSeconds : DEFAULT_TOTAL_BUDGET_SECONDS;
+    }
+
+    /**
+     * 每个后端的单次等待上限（秒）。
+     *
+     * <p>竞速段与单跑段共用这一个口径 —— 改造前竞速段用静态表 {@code BACKEND_TIMEOUT_SECONDS}、
+     * 单跑段用配置敏感的 {@link #chatAnywhereWaitSeconds()}，配置调到 700s 时会出现
+     * 「单跑等 700s、竞速 510s 就被取消」的自相矛盾。</p>
+     */
+    private long backendWaitSeconds(String backend) {
+        return "chatanywhere".equals(backend)
+                ? chatAnywhereWaitSeconds()
+                : BACKEND_TIMEOUT_SECONDS.getOrDefault(backend, 120L);
+    }
+
+    /** 距内层总预算截止还剩多少整秒（永不为负）。 */
+    private static long remainingSeconds(long deadlineMs) {
+        return Math.max(0, (deadlineMs - System.currentTimeMillis()) / 1000L);
+    }
+
     @Value("${image.gen.siliconflow-api-key:#{null}}")
     private String siliconflowKey;
 
@@ -154,24 +193,37 @@ public class ImageGenerationService {
         }
 
         String lastError = "无可用后端";
+        // 内层总预算截止点：所有降级尝试都必须在它之内结束，到点工具自己收尾（可控终态）。
+        long deadlineMs = System.currentTimeMillis() + totalBudgetSeconds() * 1000L;
 
         // 前两个后端并行竞速，谁先成功用谁；都失败再串行尝试剩余
         if (chain.size() >= 2) {
-            String raced = raceBackends(chain.subList(0, 2), prompt, imageSize);
+            String raced = raceBackends(chain.subList(0, 2), prompt, imageSize, deadlineMs);
             if (Objects.nonNull(raced)) {
                 return toMarkdownImage(raced);
             }
             lastError = "并行竞速后端均失败: " + chain.get(0) + ", " + chain.get(1);
             for (int i = 2; i < chain.size(); i++) {
-                String result = tryBackend(chain.get(i), prompt, imageSize);
+                if (remainingSeconds(deadlineMs) < MIN_ATTEMPT_REMAINING_SECONDS) {
+                    lastError += "；预算（" + totalBudgetSeconds() + "s）耗尽，未再试: "
+                            + chain.subList(i, chain.size());
+                    break;
+                }
+                String result = tryBackend(chain.get(i), prompt, imageSize, deadlineMs);
                 if (Objects.nonNull(result)) {
                     return toMarkdownImage(result);
                 }
                 lastError = "后端 " + chain.get(i) + " 失败";
             }
         } else {
-            for (String backend : chain) {
-                String result = tryBackend(backend, prompt, imageSize);
+            for (int i = 0; i < chain.size(); i++) {
+                String backend = chain.get(i);
+                if (remainingSeconds(deadlineMs) < MIN_ATTEMPT_REMAINING_SECONDS) {
+                    lastError += "；预算（" + totalBudgetSeconds() + "s）耗尽，未再试: "
+                            + chain.subList(i, chain.size());
+                    break;
+                }
+                String result = tryBackend(backend, prompt, imageSize, deadlineMs);
                 if (Objects.nonNull(result)) {
                     return toMarkdownImage(result);
                 }
@@ -184,7 +236,7 @@ public class ImageGenerationService {
     }
 
     /** 并行竞速：任一成功即返回，并取消其余；全部失败返回 null */
-    private String raceBackends(List<String> backends, String prompt, String imageSize) {
+    private String raceBackends(List<String> backends, String prompt, String imageSize, long deadlineMs) {
         log.info("并行竞速后端: {}", backends);
         MemoryStore.OwnerContext owner = MemoryStore.captureOwnerContext();
         List<CompletableFuture<String>> futures = new ArrayList<>();
@@ -192,13 +244,15 @@ public class ImageGenerationService {
             futures.add(CompletableFuture.supplyAsync(
                     () -> {
                         try (var ignored = MemoryStore.bindOwnerContext(owner)) {
-                            return tryBackend(backend, prompt, imageSize);
+                            return tryBackend(backend, prompt, imageSize, deadlineMs);
                         }
                     }, BACKEND_EXECUTOR));
         }
-        long maxWait = backends.stream()
-                .mapToLong(b -> BACKEND_TIMEOUT_SECONDS.getOrDefault(b, 120L))
-                .max().orElse(120L) + 10;
+        // 竞速段整体等待与单后端等待同口径（backendWaitSeconds），再被内层总预算封顶。
+        // 改造前这里读静态表、tryBackend 读配置敏感值，口径不一致。
+        long maxWait = Math.min(backends.stream()
+                .mapToLong(this::backendWaitSeconds)
+                .max().orElse(120L) + 10, remainingSeconds(deadlineMs));
 
         long deadline = System.currentTimeMillis() + maxWait * 1000L;
         while (System.currentTimeMillis() < deadline) {
@@ -244,12 +298,14 @@ public class ImageGenerationService {
     }
 
     /** 尝试单个后端；成功返回图片 URL/markdown，失败记录熔断并返回 null */
-    private String tryBackend(String backend, String prompt, String imageSize) {
+    private String tryBackend(String backend, String prompt, String imageSize, long deadlineMs) {
         try {
             log.info("尝试后端: {}", backend);
-            long timeoutSec = "chatanywhere".equals(backend)
-                    ? chatAnywhereWaitSeconds()
-                    : BACKEND_TIMEOUT_SECONDS.getOrDefault(backend, 120L);
+            // 单次等待 = 后端自身上限与内层总预算剩余的较小值 —— 绝不越过预算截止点。
+            long timeoutSec = Math.min(backendWaitSeconds(backend), remainingSeconds(deadlineMs));
+            if (timeoutSec <= 0) {
+                return null;
+            }
             MemoryStore.OwnerContext owner = MemoryStore.captureOwnerContext();
             CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
                 try (var ignored = MemoryStore.bindOwnerContext(owner)) {

@@ -33,7 +33,6 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.core.io.UrlResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -96,12 +95,8 @@ public class MiniAgentChatPageController {
     @Autowired
     private MediaStorage mediaStorage;
 
-    @Value("${file.upload.max-size:52428800}")
+    @Value("${file.upload.max-size:734003200}")
     private long maxUploadSizeBytes;
-    @Value("${agent.multimodal.audio-max-bytes:36700160}")
-    private long audioMaxBytes;
-    @Value("${agent.multimodal.video-max-bytes:36700160}")
-    private long videoMaxBytes;
     @Autowired
     private SessionPermissionStore permissionStore;
     @Autowired
@@ -184,21 +179,14 @@ public class MiniAgentChatPageController {
                     "仅支持音频 mp3/wav/flac/m4a/ogg 与视频 mp4/mov/avi/wmv");
         }
         String mediaKind = MultimodalMedia.kindOf(originalName, contentType);
-        long sizeLimit = maxUploadSizeBytes;
-        if (MultimodalMedia.KIND_AUDIO.equals(mediaKind)) {
-            sizeLimit = Math.min(sizeLimit, audioMaxBytes);
-        }
-        else if (MultimodalMedia.KIND_VIDEO.equals(mediaKind)) {
-            sizeLimit = Math.min(sizeLimit, videoMaxBytes);
-        }
-        if (file.getSize() > sizeLimit) {
+        if (file.getSize() > maxUploadSizeBytes) {
             return ApiResponse.fail(ErrorCode.FILE_TOO_LARGE,
                     "文件过大: " + (file.getSize() / 1024 / 1024) + "MB，上限 "
-                            + (sizeLimit / 1024 / 1024) + "MB");
+                            + (maxUploadSizeBytes / 1024 / 1024) + "MB");
         }
         try {
-            String base64 = Base64.getEncoder().encodeToString(file.getBytes());
-            var saved = fileStorageService.saveFile(userId, sessionId, originalName, contentType, base64);
+            var saved = fileStorageService.saveUploaded(
+                    userId, sessionId, originalName, contentType, file);
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("filePath", saved.getFilePath());
             data.put("filename", saved.getOriginalFilename());
@@ -362,15 +350,8 @@ public class MiniAgentChatPageController {
             if (contentType == null) {
                 return ResponseEntity.status(415).body("Unsupported media type");
             }
-            UrlResource resource = new UrlResource(media.toUri());
-            return ResponseEntity.ok()
-                    .contentType(MediaType.parseMediaType(contentType))
-                    .header("X-Content-Type-Options", "nosniff")
-                    .header("Content-Security-Policy", "default-src 'none'; sandbox")
-                    .header(HttpHeaders.CONTENT_DISPOSITION,
-                            "inline; filename=\"" + filename + "\"")
-                    .header(HttpHeaders.CACHE_CONTROL, "private, max-age=300")
-                    .body(resource);
+            // Range / If-Range / 206 / 416 全在共用出口里（音频拖进度条靠它），见 MediaResponses
+            return MediaResponses.serve(media, filename, contentType, request);
         } catch (Exception e) {
             return ResponseEntity.internalServerError().body("Failed to read media");
         }
@@ -408,15 +389,8 @@ public class MiniAgentChatPageController {
             if (contentType == null) {
                 return ResponseEntity.status(415).body("Unsupported media type");
             }
-            UrlResource resource = new UrlResource(media.toUri());
-            return ResponseEntity.ok()
-                    .contentType(MediaType.parseMediaType(contentType))
-                    .header("X-Content-Type-Options", "nosniff")
-                    .header("Content-Security-Policy", "default-src 'none'; sandbox")
-                    .header(HttpHeaders.CONTENT_DISPOSITION,
-                            "inline; filename=\"" + filename + "\"")
-                    .header(HttpHeaders.CACHE_CONTROL, "private, max-age=300")
-                    .body(resource);
+            // Range / If-Range / 206 / 416 全在共用出口里（音频拖进度条靠它），见 MediaResponses
+            return MediaResponses.serve(media, filename, contentType, request);
         } catch (Exception e) {
             return ResponseEntity.internalServerError().body("Failed to read media");
         }

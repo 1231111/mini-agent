@@ -48,7 +48,7 @@ class NodeExecutorBoundTest {
                 new ToolHookChain(List.of()),
                 new SessionPermissionStore(),
                 new InMemoryActionJournal(),
-                new ToolExecutionGuards(registry, 4),
+                new ToolExecutionGuards(registry, new com.miniagent.agent.execution.AgentToolsProperties(4)),
                 registry,
                 true);
     }

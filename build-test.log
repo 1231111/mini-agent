@@ -1,0 +1,392 @@
+﻿[INFO] Scanning for projects...
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Build Order:
+[INFO] 
+[INFO] mini-agent-springboot                                              [pom]
+[INFO] mini-agent-common                                                  [jar]
+[INFO] mini-agent-memory                                                  [jar]
+[INFO] mini-agent-tools                                                   [jar]
+[INFO] mini-agent-loop                                                    [jar]
+[INFO] mini-agent-planner                                                 [jar]
+[INFO] mini-agent-app                                                     [jar]
+[INFO] 
+[INFO] ----------------< com.miniagent:mini-agent-springboot >-----------------
+[INFO] Building mini-agent-springboot 0.0.1-SNAPSHOT                      [1/7]
+[INFO]   from pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] ------------------< com.miniagent:mini-agent-common >-------------------
+[INFO] Building mini-agent-common 0.0.1-SNAPSHOT                          [2/7]
+[INFO]   from mini-agent-common\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[WARNING] 2 problems were encountered while building the effective model for org.apache.yetus:audience-annotations:jar:0.5.0 during dependency collection step for project (use -X to see details)
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ mini-agent-common ---
+[INFO] skip non existing resourceDirectory D:\AI\miniagent\mini-agent-common\src\main\resources
+[INFO] 
+[INFO] --- compiler:3.13.0:compile (default-compile) @ mini-agent-common ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ mini-agent-common ---
+[INFO] skip non existing resourceDirectory D:\AI\miniagent\mini-agent-common\src\test\resources
+[INFO] 
+[INFO] --- compiler:3.13.0:testCompile (default-testCompile) @ mini-agent-common ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ mini-agent-common ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running com.miniagent.common.model.EffectiveModelContextTest
+.\mvnw.cmd : Mockito is currently self-attaching to enable the inline-mock-make
+r. This will no longer work in future releases of the JDK. Please add Mockito a
+s an agent to your build what is described in Mockito's documentation: https://
+javadoc.io/doc/org.mockito/mockito-core/latest/org/mockito/Mockito.html#0.3
+所在位置 行:445 字符: 21
++ cd D:\AI\miniagent; .\mvnw.cmd -o test 2>&1 | Out-File -Encoding utf8 ...
++                     ~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Mockito is curr...ockito.html#0.3 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+WARNING: A Java agent has been loaded dynamically (C:\Users\abc\.m2\repository\
+net\bytebuddy\byte-buddy-agent\1.15.11\byte-buddy-agent-1.15.11.jar)
+WARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamic
+AgentLoading to hide this warning
+WARNING: If a serviceability tool is not in use, please run with -Djdk.instrume
+nt.traceUsage for more information
+WARNING: Dynamic loading of agents will be disallowed by default in a future re
+lease
+OpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader cla
+sses because bootstrap classpath has been appended
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.197 s -- in com.miniagent.common.model.EffectiveModelContextTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] 
+[INFO] ------------------< com.miniagent:mini-agent-memory >-------------------
+[INFO] Building mini-agent-memory 0.0.1-SNAPSHOT                          [3/7]
+[INFO]   from mini-agent-memory\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ mini-agent-memory ---
+[INFO] skip non existing resourceDirectory D:\AI\miniagent\mini-agent-memory\src\main\resources
+[INFO] 
+[INFO] --- compiler:3.13.0:compile (default-compile) @ mini-agent-memory ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ mini-agent-memory ---
+[INFO] skip non existing resourceDirectory D:\AI\miniagent\mini-agent-memory\src\test\resources
+[INFO] 
+[INFO] --- compiler:3.13.0:testCompile (default-testCompile) @ mini-agent-memory ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ mini-agent-memory ---
+[INFO] No tests to run.
+[INFO] 
+[INFO] -------------------< com.miniagent:mini-agent-tools >-------------------
+[INFO] Building mini-agent-tools 0.0.1-SNAPSHOT                           [4/7]
+[INFO]   from mini-agent-tools\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ mini-agent-tools ---
+[INFO] skip non existing resourceDirectory D:\AI\miniagent\mini-agent-tools\src\main\resources
+[INFO] 
+[INFO] --- compiler:3.13.0:compile (default-compile) @ mini-agent-tools ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ mini-agent-tools ---
+[INFO] skip non existing resourceDirectory D:\AI\miniagent\mini-agent-tools\src\test\resources
+[INFO] 
+[INFO] --- compiler:3.13.0:testCompile (default-testCompile) @ mini-agent-tools ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ mini-agent-tools ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running com.miniagent.agent.security.GuardedHttpClientTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.100 s -- in com.miniagent.agent.security.GuardedHttpClientTest
+[INFO] Running com.miniagent.agent.security.NetworkGuardTest
+[INFO] Tests run: 22, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.068 s -- in com.miniagent.agent.security.NetworkGuardTest
+[INFO] Running com.miniagent.agent.tool.AskUserQuestionToolTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.230 s -- in com.miniagent.agent.tool.AskUserQuestionToolTest
+[INFO] Running com.miniagent.agent.tool.CapabilityRegistryTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.017 s -- in com.miniagent.agent.tool.CapabilityRegistryTest
+[INFO] Running com.miniagent.agent.tool.CommandReadOnlyJudgeTest
+[INFO] Tests run: 15, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.016 s -- in com.miniagent.agent.tool.CommandReadOnlyJudgeTest
+[INFO] Running com.miniagent.agent.tool.CommandSemanticsTest
+[INFO] Tests run: 10, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0 s -- in com.miniagent.agent.tool.CommandSemanticsTest
+[INFO] Running com.miniagent.agent.tool.impl.ExecCommandParamsTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.045 s -- in com.miniagent.agent.tool.impl.ExecCommandParamsTest
+[INFO] Running com.miniagent.agent.tool.ShellCommandLineTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in com.miniagent.agent.tool.ShellCommandLineTest
+[INFO] Running com.miniagent.agent.tool.ToolConcurrencyPolicyExecTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in com.miniagent.agent.tool.ToolConcurrencyPolicyExecTest
+[INFO] Running com.miniagent.agent.tool.ToolResultExecContractTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0 s -- in com.miniagent.agent.tool.ToolResultExecContractTest
+[INFO] Running com.miniagent.agent.tool.ToolResultTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.015 s -- in com.miniagent.agent.tool.ToolResultTest
+[INFO] Running com.miniagent.agent.tool.WritePathTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.244 s -- in com.miniagent.agent.tool.WritePathTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 105, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] 
+[INFO] -------------------< com.miniagent:mini-agent-loop >--------------------
+[INFO] Building mini-agent-loop 0.0.1-SNAPSHOT                            [5/7]
+[INFO]   from mini-agent-loop\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ mini-agent-loop ---
+[INFO] skip non existing resourceDirectory D:\AI\miniagent\mini-agent-loop\src\main\resources
+[INFO] 
+[INFO] --- compiler:3.13.0:compile (default-compile) @ mini-agent-loop ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ mini-agent-loop ---
+[INFO] skip non existing resourceDirectory D:\AI\miniagent\mini-agent-loop\src\test\resources
+[INFO] 
+[INFO] --- compiler:3.13.0:testCompile (default-testCompile) @ mini-agent-loop ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ mini-agent-loop ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running com.miniagent.agent.context.ContextBudgetManagerTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.078 s -- in com.miniagent.agent.context.ContextBudgetManagerTest
+[INFO] Running com.miniagent.agent.context.ContextContributorConfigurationTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.033 s -- in com.miniagent.agent.context.ContextContributorConfigurationTest
+[INFO] Running com.miniagent.agent.context.ContextLoaderPolicyTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.172 s -- in com.miniagent.agent.context.ContextLoaderPolicyTest
+[INFO] Running com.miniagent.agent.context.ContextLoadPolicyTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in com.miniagent.agent.context.ContextLoadPolicyTest
+[INFO] Running com.miniagent.agent.core.ExecutionControlTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in com.miniagent.agent.core.ExecutionControlTest
+[INFO] Running com.miniagent.agent.core.ExecutionPropertiesTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in com.miniagent.agent.core.ExecutionPropertiesTest
+[INFO] Running com.miniagent.agent.core.LlmTurnTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.007 s -- in com.miniagent.agent.core.LlmTurnTest
+[INFO] Running com.miniagent.agent.core.NodeExecutorBoundTest
+10:46:06.615 [main] INFO com.miniagent.agent.tool.ToolRegistry -- 执行工具: write_file 参数: {}
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.354 s -- in com.miniagent.agent.core.NodeExecutorBoundTest
+[INFO] Running com.miniagent.agent.core.RunScopeTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in com.miniagent.agent.core.RunScopeTest
+[INFO] Running com.miniagent.agent.core.ToolResultProjectorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0 s -- in com.miniagent.agent.core.ToolResultProjectorTest
+[INFO] Running com.miniagent.agent.execution.ToolExecutionGuardsExecTest
+OpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader cla
+sses because bootstrap classpath has been appended
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.070 s -- in com.miniagent.agent.execution.ToolExecutionGuardsExecTest
+[INFO] Running com.miniagent.agent.execution.ToolPipelineTest
+10:46:06.707 [main] INFO com.miniagent.agent.tool.ToolRegistry -- 执行工具: read_file 参数: {}
+10:46:06.708 [main] INFO com.miniagent.agent.tool.ToolRegistry -- 执行工具: read_file 参数: {}
+10:46:06.711 [main] INFO com.miniagent.agent.tool.ToolRegistry -- 执行工具: write_file 参数: {}
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.013 s -- in com.miniagent.agent.execution.ToolPipelineTest
+[INFO] Running com.miniagent.agent.hook.TodoPlanStopHookTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.011 s -- in com.miniagent.agent.hook.TodoPlanStopHookTest
+[INFO] Running com.miniagent.agent.permission.PermissionPolicyTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0 s -- in com.miniagent.agent.permission.PermissionPolicyTest
+[INFO] Running com.miniagent.agent.scope.TaskScopeRegistryTest
+[INFO] Tests run: 10, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in com.miniagent.agent.scope.TaskScopeRegistryTest
+[INFO] Running com.miniagent.agent.task.TaskSignalMatcherTest
+[INFO] Tests run: 17, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.017 s -- in com.miniagent.agent.task.TaskSignalMatcherTest
+[INFO] Running com.miniagent.agent.todo.TaskTodoConfirmTest
+10:46:06.794 [main] INFO com.miniagent.agent.todo.TaskTodoStore -- todo 已挂起: session=s
+10:46:06.808 [main] INFO com.miniagent.agent.todo.TaskTodoStore -- todo 已恢复挂起计划: session=s, items=1
+10:46:06.823 [main] INFO com.miniagent.agent.todo.TaskTodoStore -- todo 已完成任务已归档 session=s
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.073 s -- in com.miniagent.agent.todo.TaskTodoConfirmTest
+[INFO] Running com.miniagent.agent.trace.FailedResultDetectionTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.010 s -- in com.miniagent.agent.trace.FailedResultDetectionTest
+[INFO] Running com.miniagent.memory.DefaultMemoryServiceTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in com.miniagent.memory.DefaultMemoryServiceTest
+[INFO] Running com.miniagent.memory.MemoryControlPlaneVerifyTest
+Standard Commons Logging discovery in action with spring-jcl: please remove commons-logging.jar from classpath in order to avoid potential conflicts
+Mockito is currently self-attaching to enable the inline-mock-maker. This will 
+no longer work in future releases of the JDK. Please add Mockito as an agent to
+ your build what is described in Mockito's documentation: https://javadoc.io/do
+c/org.mockito/mockito-core/latest/org/mockito/Mockito.html#0.3
+WARNING: A Java agent has been loaded dynamically (C:\Users\abc\.m2\repository\
+net\bytebuddy\byte-buddy-agent\1.15.11\byte-buddy-agent-1.15.11.jar)
+WARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamic
+AgentLoading to hide this warning
+WARNING: If a serviceability tool is not in use, please run with -Djdk.instrume
+nt.traceUsage for more information
+WARNING: Dynamic loading of agents will be disallowed by default in a future re
+lease
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.214 s -- in com.miniagent.memory.MemoryControlPlaneVerifyTest
+[INFO] Running com.miniagent.memory.MemoryStoreOwnerContextTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.010 s -- in com.miniagent.memory.MemoryStoreOwnerContextTest
+[INFO] Running com.miniagent.memory.MemoryStoreProductionTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.392 s -- in com.miniagent.memory.MemoryStoreProductionTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 109, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] 
+[INFO] ------------------< com.miniagent:mini-agent-planner >------------------
+[INFO] Building mini-agent-planner 0.0.1-SNAPSHOT                         [6/7]
+[INFO]   from mini-agent-planner\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ mini-agent-planner ---
+[INFO] skip non existing resourceDirectory D:\AI\miniagent\mini-agent-planner\src\main\resources
+[INFO] 
+[INFO] --- compiler:3.13.0:compile (default-compile) @ mini-agent-planner ---
+[INFO] Recompiling the module because of changed source code.
+[INFO] Compiling 40 source files with javac [debug parameters release 21] to target\classes
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ mini-agent-planner ---
+[INFO] skip non existing resourceDirectory D:\AI\miniagent\mini-agent-planner\src\test\resources
+[INFO] 
+[INFO] --- compiler:3.13.0:testCompile (default-testCompile) @ mini-agent-planner ---
+[INFO] Recompiling the module because of changed dependency.
+[INFO] Compiling 12 source files with javac [debug parameters release 21] to target\test-classes
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ mini-agent-planner ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running com.miniagent.agent.planner.ActionBinderTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.216 s -- in com.miniagent.agent.planner.ActionBinderTest
+[INFO] Running com.miniagent.agent.planner.DataflowNormalizerTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.152 s -- in com.miniagent.agent.planner.DataflowNormalizerTest
+[INFO] Running com.miniagent.agent.planner.GoalCompilerGranularityTest
+Mockito is currently self-attaching to enable the inline-mock-maker. This will 
+no longer work in future releases of the JDK. Please add Mockito as an agent to
+ your build what is described in Mockito's documentation: https://javadoc.io/do
+c/org.mockito/mockito-core/latest/org/mockito/Mockito.html#0.3
+OpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader cla
+sses because bootstrap classpath has been appended
+WARNING: A Java agent has been loaded dynamically (C:\Users\abc\.m2\repository\
+net\bytebuddy\byte-buddy-agent\1.15.11\byte-buddy-agent-1.15.11.jar)
+WARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamic
+AgentLoading to hide this warning
+WARNING: If a serviceability tool is not in use, please run with -Djdk.instrume
+nt.traceUsage for more information
+WARNING: Dynamic loading of agents will be disallowed by default in a future re
+lease
+10:46:37.971 [main] INFO com.miniagent.agent.planner.GoalCompiler -- GoalCompiler 使用模板图 nodes=1 clarify=false
+10:46:38.008 [main] WARN com.miniagent.agent.planner.GoalCompiler -- GoalCompiler LLM 拆解失败 retry=0: no
+10:46:38.009 [main] WARN com.miniagent.agent.planner.GoalCompiler -- GoalCompiler LLM 拆解失败 retry=1: no
+10:46:38.026 [main] INFO com.miniagent.agent.planner.GoalCompiler -- GoalCompiler 使用模板图 nodes=1 clarify=false
+10:46:38.026 [main] INFO com.miniagent.agent.planner.GoalCompiler -- GoalCompiler 结构确定 nodes=1 clarify=false
+10:46:38.033 [main] INFO com.miniagent.agent.planner.GoalCompiler -- GoalCompiler 使用模板图 nodes=1 clarify=false
+10:46:38.040 [main] INFO com.miniagent.agent.planner.GoalCompiler -- GoalCompiler 使用模板图 nodes=1 clarify=true
+10:46:38.046 [main] INFO com.miniagent.agent.planner.GoalCompiler -- GoalCompiler 使用模板图 nodes=1 clarify=true
+[INFO] Tests run: 17, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.291 s -- in com.miniagent.agent.planner.GoalCompilerGranularityTest
+[INFO] Running com.miniagent.agent.planner.NodeOutputBinderTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.086 s -- in com.miniagent.agent.planner.NodeOutputBinderTest
+[INFO] Running com.miniagent.agent.planner.PlannerResumePolicyTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.016 s -- in com.miniagent.agent.planner.PlannerResumePolicyTest
+[INFO] Running com.miniagent.agent.planner.PlannerStateStoreScopeTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.014 s -- in com.miniagent.agent.planner.PlannerStateStoreScopeTest
+[INFO] Running com.miniagent.agent.planner.PlanningLoopAnswerTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.012 s -- in com.miniagent.agent.planner.PlanningLoopAnswerTest
+[INFO] Running com.miniagent.agent.planner.PlanValidatorTest
+[INFO] Tests run: 15, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.024 s -- in com.miniagent.agent.planner.PlanValidatorTest
+[INFO] Running com.miniagent.agent.planner.RecoveryEngineTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.029 s -- in com.miniagent.agent.planner.RecoveryEngineTest
+[INFO] Running com.miniagent.agent.planner.StepEvaluatorTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.015 s -- in com.miniagent.agent.planner.StepEvaluatorTest
+[INFO] Running com.miniagent.agent.planner.TodoStateProjectorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.154 s -- in com.miniagent.agent.planner.TodoStateProjectorTest
+[INFO] Running com.miniagent.agent.planner.ToolRouterTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in com.miniagent.agent.planner.ToolRouterTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 94, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] 
+[INFO] --------------------< com.miniagent:mini-agent-app >--------------------
+[INFO] Building mini-agent-app 0.0.1-SNAPSHOT                             [7/7]
+[INFO]   from mini-agent-app\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ mini-agent-app ---
+[INFO] Copying 19 resources from src\main\resources to target\classes
+[INFO] 
+[INFO] --- compiler:3.13.0:compile (default-compile) @ mini-agent-app ---
+[INFO] Recompiling the module because of changed dependency.
+[INFO] Compiling 147 source files with javac [debug parameters release 21] to target\classes
+[WARNING] /D:/AI/miniagent/mini-agent-app/src/main/java/com/miniagent/web/dto/resp/UserDTO.java:[23,22] @Builder will ignore the initializing expression entirely. If you want the initializing expression to serve as default, add @Builder.Default. If it is not supposed to be settable during building, make the field final.
+[WARNING] /D:/AI/miniagent/mini-agent-app/src/main/java/com/miniagent/config/entity/User.java:[7,1] Generating equals/hashCode implementation but without a call to superclass, even though this class does not extend java.lang.Object. If this is intentional, add '@EqualsAndHashCode(callSuper=false)' to your type.
+[INFO] 
+[INFO] --- resources:3.3.1:testResources (default-testResources) @ mini-agent-app ---
+[INFO] skip non existing resourceDirectory D:\AI\miniagent\mini-agent-app\src\test\resources
+[INFO] 
+[INFO] --- compiler:3.13.0:testCompile (default-testCompile) @ mini-agent-app ---
+[INFO] Recompiling the module because of changed dependency.
+[INFO] Compiling 7 source files with javac [debug parameters release 21] to target\test-classes
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ mini-agent-app ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running com.miniagent.agent.memory.lifecycle.DefaultConsolidationServiceTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.086 s -- in com.miniagent.agent.memory.lifecycle.DefaultConsolidationServiceTest
+[INFO] Running com.miniagent.agent.memory.lifecycle.RetentionForgettingPolicyTest
+Standard Commons Logging discovery in action with spring-jcl: please remove commons-logging.jar from classpath in order to avoid potential conflicts
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.033 s -- in com.miniagent.agent.memory.lifecycle.RetentionForgettingPolicyTest
+[INFO] Running com.miniagent.agent.memory.lifecycle.WorkingMemoryManagerMergeTest
+Mockito is currently self-attaching to enable the inline-mock-maker. This will 
+no longer work in future releases of the JDK. Please add Mockito as an agent to
+ your build what is described in Mockito's documentation: https://javadoc.io/do
+c/org.mockito/mockito-core/latest/org/mockito/Mockito.html#0.3
+WARNING: A Java agent has been loaded dynamically (C:\Users\abc\.m2\repository\
+net\bytebuddy\byte-buddy-agent\1.15.11\byte-buddy-agent-1.15.11.jar)
+WARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamic
+AgentLoading to hide this warning
+WARNING: If a serviceability tool is not in use, please run with -Djdk.instrume
+nt.traceUsage for more information
+WARNING: Dynamic loading of agents will be disallowed by default in a future re
+lease
+OpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader cla
+sses because bootstrap classpath has been appended
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.530 s -- in com.miniagent.agent.memory.lifecycle.WorkingMemoryManagerMergeTest
+[INFO] Running com.miniagent.agent.memory.manager.DefaultMemoryManagerMappingTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.024 s -- in com.miniagent.agent.memory.manager.DefaultMemoryManagerMappingTest
+[INFO] Running com.miniagent.agent.memory.MemoryTaskLockTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in com.miniagent.agent.memory.MemoryTaskLockTest
+[INFO] Running com.miniagent.agent.memory.writer.MemoryToolExecutionSinkTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.083 s -- in com.miniagent.agent.memory.writer.MemoryToolExecutionSinkTest
+[INFO] Running com.miniagent.agent.memory.writer.RuleBasedMemoryWriteGateTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.019 s -- in com.miniagent.agent.memory.writer.RuleBasedMemoryWriteGateTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 24, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Summary for mini-agent-springboot 0.0.1-SNAPSHOT:
+[INFO] 
+[INFO] mini-agent-springboot .............................. SUCCESS [  0.000 s]
+[INFO] mini-agent-common .................................. SUCCESS [ 10.746 s]
+[INFO] mini-agent-memory .................................. SUCCESS [  0.175 s]
+[INFO] mini-agent-tools ................................... SUCCESS [  5.173 s]
+[INFO] mini-agent-loop .................................... SUCCESS [  7.455 s]
+[INFO] mini-agent-planner ................................. SUCCESS [ 30.259 s]
+[INFO] mini-agent-app ..................................... SUCCESS [ 46.582 s]
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  01:40 min
+[INFO] Finished at: 2026-09-22T10:47:26+08:00
+[INFO] ------------------------------------------------------------------------

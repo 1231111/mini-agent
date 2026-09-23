@@ -12,6 +12,10 @@ import java.util.Objects;
 
 /**
  * 工具抽象：一个可被 Agent 调用的外部能力。
+ *
+ * <p>执行契约（预算 / 闸门 / 锁 / 超时处置）集中在 {@link ToolExecutionProfile}，
+ * 由 {@code ToolConcurrencyPolicy.profileOf(...)} 一处声明。下面的
+ * {@code getTimeoutSeconds()} 等派生视图保持旧签名，调用方不必跟着改。</p>
  */
 @Data
 @Builder
@@ -32,26 +36,44 @@ public class Tool {
     private boolean streamPrefetchSafe = false;
     @Builder.Default
     private boolean cancellable = false;
+    /** 执行契约：预算 / 闸门 / 锁等待 / 并发范围 / 超时处置，一次声明。 */
     @Builder.Default
-    private long timeoutSeconds = 60L;
+    private ToolExecutionProfile executionProfile = ToolExecutionProfile.DEFAULT;
+
     /**
-     * 按本次参数求超时的函数（返回 0 表示回退到 {@link #timeoutSeconds}）。
+     * 按本次参数求外层闸门的函数（返回 0 或 null 表示回退到 {@link #executionProfile}）。
      *
-     * <p>为什么超时不能只在注册期定死：{@code exec_command} 跑 {@code git status} 和跑
+     * <p>为什么闸门不能只在注册期定死：{@code exec_command} 跑 {@code git status} 和跑
      * {@code mvnw package} 需要的预算差三个数量级。注册只有工具名，没有参数，
-     * 所以「随调用变化的超时」只能由参数来算。</p>
+     * 所以「随调用变化的闸门」只能由参数来算。</p>
      */
     private Function<String, Long> adaptiveTimeoutSeconds;
-    @Builder.Default
-    private int maxRetries = 0;
-    @Builder.Default
-    private ToolConcurrencyScope concurrencyScope = ToolConcurrencyScope.GLOBAL;
-    @Builder.Default
-    private String concurrencyKeyArgument = "";
     /** 执行函数：接收参数 JSON 字符串，返回结果字符串 */
     private Function<String, String> handler;
     /** 新执行器优先使用的结构化 handler；旧字符串 handler 继续兼容。 */
     private Function<String, ToolResult> resultHandler;
+
+    // ─── 派生自 executionProfile 的执行契约视图（保持旧签名） ───
+
+    /** 外层闸门秒数。随参数变化时看 {@link #adaptiveTimeoutSeconds}。 */
+    public long getTimeoutSeconds() {
+        return executionProfile.outerGateSeconds();
+    }
+
+    /** 自动重试次数。 */
+    public int getMaxRetries() {
+        return executionProfile.maxRetries();
+    }
+
+    /** 串行化范围。 */
+    public ToolConcurrencyScope getConcurrencyScope() {
+        return executionProfile.concurrencyScope();
+    }
+
+    /** {@code ARGUMENT} 范围的分锁参数键。 */
+    public String getConcurrencyKeyArgument() {
+        return executionProfile.concurrencyKeyArgument();
+    }
 
     /**
      * 执行工具调用
@@ -87,7 +109,6 @@ public class Tool {
 
     public ToolDescriptor descriptor() {
         return new ToolDescriptor(name, description, parameters, sideEffect, idempotent,
-                streamPrefetchSafe, cancellable, timeoutSeconds, maxRetries,
-                concurrencyScope, concurrencyKeyArgument);
+                streamPrefetchSafe, cancellable, executionProfile);
     }
 }

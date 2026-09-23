@@ -74,10 +74,7 @@ public class ToolRegistry {
                 .sideEffect(ToolConcurrencyPolicy.sideEffectOf(name))
                 .idempotent(ToolConcurrencyPolicy.isIdempotent(name))
                 .streamPrefetchSafe(ToolConcurrencyPolicy.isStreamPrefetchSafe(name))
-                .timeoutSeconds(ToolConcurrencyPolicy.timeoutSecondsOf(name))
-                .maxRetries(ToolConcurrencyPolicy.maxRetriesOf(name))
-                .concurrencyScope(ToolConcurrencyPolicy.concurrencyScopeOf(name))
-                .concurrencyKeyArgument(ToolConcurrencyPolicy.concurrencyKeyArgumentOf(name))
+                .executionProfile(ToolConcurrencyPolicy.profileOf(name))
                 .handler(handler)
                 .build());
     }
@@ -101,10 +98,7 @@ public class ToolRegistry {
                 .sideEffect(ToolConcurrencyPolicy.sideEffectOf(name))
                 .idempotent(ToolConcurrencyPolicy.isIdempotent(name))
                 .streamPrefetchSafe(ToolConcurrencyPolicy.isStreamPrefetchSafe(name))
-                .timeoutSeconds(ToolConcurrencyPolicy.timeoutSecondsOf(name))
-                .maxRetries(ToolConcurrencyPolicy.maxRetriesOf(name))
-                .concurrencyScope(ToolConcurrencyPolicy.concurrencyScopeOf(name))
-                .concurrencyKeyArgument(ToolConcurrencyPolicy.concurrencyKeyArgumentOf(name))
+                .executionProfile(ToolConcurrencyPolicy.profileOf(name))
                 .handler(json -> {
                     T params = ToolParams.fromJson(json, paramsClass);
                     return handler.apply(params);
@@ -148,8 +142,14 @@ public class ToolRegistry {
     /**
      * 取某次调用的超时秒数：优先用参数算出来的自适应值，没有就用注册期的静态值。
      *
-     * <p>{@code AgentLoop} 用它设外层闸门。返回的必须是<b>外层</b>预算（比工具自身宽），
-     * 否则外层先触发会把超时升级成「终态未知」。</p>
+     * <p><b>注意</b>：这是 {@link Tool#getTimeoutSeconds()} / {@code adaptiveTimeoutSeconds}
+     * 那套派生视图的读取口，<b>不在 AgentLoop 的闸门链路上</b> —— 闸门走
+     * {@code ToolExecutionGuards.descriptor(...).timeoutSeconds()}（含
+     * {@code agent.tools.timeout-overrides} 覆盖）。两条链取值可能不同，
+     * 新代码不要用这个方法。</p>
+     *
+     * <p>返回的必须是<b>外层</b>预算（比工具自身宽），否则外层先触发会把超时升级成
+     * 「终态未知」。</p>
      */
     public long timeoutSeconds(String toolName, String argumentsJson) {
         Tool tool = tools.get(toolName);

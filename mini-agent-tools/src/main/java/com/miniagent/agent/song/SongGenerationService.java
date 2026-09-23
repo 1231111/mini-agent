@@ -205,10 +205,11 @@ public class SongGenerationService {
             throws SongApiException {
         ObjectNode payload = MAPPER.createObjectNode();
         payload.put("model", songModel);
-        payload.put("style", StringUtils.defaultIfBlank(params.getStyle(), "pop"));
+        payload.put("style", effectiveStyle(params, instrumental));
         payload.put("instrumental", instrumental);
-        // 纯音乐不传歌词：接口把 lyrics 当可选字段，空串反而可能被当成"有词但空"
-        if (StringUtils.isNotBlank(lyrics)) {
+        // 纯音乐不传歌词：instrumental 与 lyrics 只有前者有意义，两个都传语义会打架；
+        // 空串 Lyrics 也可能被服务端当成"有词但空"。
+        if (StringUtils.isNotBlank(lyrics) && !instrumental) {
             payload.put("lyrics", lyrics);
         }
         if (!instrumental) {
@@ -225,6 +226,22 @@ public class SongGenerationService {
             throw new SongApiException("响应中没有 task_id：" + snippet(body));
         }
         return taskId;
+    }
+
+    /**
+     * 实际提交给接口的 {@code style}。
+     *
+     * <p>{@code music/create} 没有 {@code prompt} 字段，主题只能靠 {@code lyrics} 承载。
+     * 纯音乐没有歌词，如果再丢掉 prompt，用户给的"主题"就静默消失了 ——
+     * 所以纯音乐时把 prompt 并进 style（style 本身就是自由文本，文档示例也这么用）。
+     */
+    private static String effectiveStyle(SongGenerateParams params, boolean instrumental) {
+        String style = StringUtils.defaultIfBlank(params.getStyle(), "").trim();
+        String prompt = StringUtils.defaultIfBlank(params.getPrompt(), "").trim();
+        if (instrumental && !prompt.isEmpty()) {
+            style = style.isEmpty() ? prompt : style + ", " + prompt;
+        }
+        return style.isEmpty() ? "pop" : style;
     }
 
     private String pollSong(String taskId, long deadline) {

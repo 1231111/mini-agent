@@ -9,6 +9,8 @@ public enum ToolErrorCode {
     DEPENDENCY_UNAVAILABLE,
     TIMEOUT,
     RATE_LIMITED,
+    /** 共享资源被占用（锁没等到），稍后可安全重试 —— 与 TIMEOUT（跑过了预算）语义不同。 */
+    RESOURCE_BUSY,
     CONFLICT,
     CANCELLED,
     UNKNOWN_TOOL,

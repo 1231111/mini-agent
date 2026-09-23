@@ -373,6 +373,10 @@ public class AgentChatApplicationService {
             @Override public void onSubGoal(String text, int done, int total) {
                 eventCenter.publishSubGoal(sessionId, text, done, total);
             }
+            @Override public void onContext(int used, int limit) {
+                eventCenter.publish(sessionId, "context",
+                        "{\"used\":" + used + ",\"limit\":" + limit + "}");
+            }
         };
 
         AgentLoop.setCurrentSession(sessionId);

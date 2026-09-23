@@ -115,8 +115,12 @@ public class MultimodalMessageBuilder {
         String kind = Optional.ofNullable(ref.getKind())
                 .orElseGet(() -> MultimodalMedia.kindOf(ref.getFilename(), ref.getMimeType()));
         long limit = MultimodalMedia.KIND_VIDEO.equals(kind) ? videoMaxBytes : audioMaxBytes;
-        if (size > limit)
-            throw new IOException("媒体超过上限 " + (limit / 1024 / 1024) + "MB");
+        if (size > limit) {
+            contents.add(TextContent.from(
+                    "[媒体已保存，未送入模型：超过 " + (limit / 1024 / 1024)
+                            + "MB。请按本地路径处理] " + path));
+            return;
+        }
         byte[] bytes = Files.readAllBytes(path);
         String b64 = Base64.getEncoder().encodeToString(bytes);
         String mime = MultimodalMedia.mimeOf(ref.getFilename(), ref.getMimeType(), kind);

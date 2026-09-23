@@ -45,7 +45,7 @@ public class SongGenerateParams extends ToolParams {
      * <p>余量要覆盖「最后一次查询 + 下载整首歌 + 落盘」。外层若先触发，
      * 整个回合会被判成 {@code OUTCOME_UNKNOWN} 直接中止，见类注释。
      */
-    private static final int OUTER_GATE_MARGIN_SECONDS = 30;
+    public static final int OUTER_GATE_MARGIN_SECONDS = 30;
 
     @ToolParamSchema(
             description = "歌曲主题/风格描述，由服务端据此写词。"

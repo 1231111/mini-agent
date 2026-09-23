@@ -776,8 +776,7 @@ public class TaskTodoStore {
             return null;
         }
         if ("media_delivered".equalsIgnoreCase(dw) || "media".equalsIgnoreCase(dw)) {
-            if (ev.contains("![") || ev.contains("http://") || ev.contains("https://")
-                    || ev.contains("/generated-images/") || ev.contains("/static/images/")) {
+            if (TodoSemanticValidator.acceptsMediaEvidence(ev)) {
                 return null;
             }
             return "验收失败：done_when=media_delivered 需要 evidence 含图片 markdown/URL";

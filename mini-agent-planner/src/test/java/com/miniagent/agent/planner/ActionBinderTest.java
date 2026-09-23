@@ -56,6 +56,23 @@ class ActionBinderTest {
     }
 
     @Test
+    void imagePathDoesNotRewritePredecessorJson() {
+        TaskNode rendered = new TaskNode("n1", "渲染", "image", List.of(),
+                List.of(), List.of(), TaskNodeStatus.SUCCESS, 10,
+                DoneWhen.media(), "", "", 0, "");
+        TaskNode deliver = new TaskNode("n2", "交付图", "file_write", List.of("n1"),
+                List.of(), List.of(), TaskNodeStatus.READY, 9,
+                DoneWhen.file("agent_architecture.png"), "", "", 0, "");
+        TaskGraph g = DataflowNormalizer.wire(new TaskGraph(List.of(rendered, deliver)));
+        g = g.replace(g.byId("n1").withOutput(
+                "{\"success\":true,\"path\":\"C:/workspace/agent_architecture.png\"}"));
+        ActionProposal p = propose(g, "n2");
+        ActionSpec a = p.actions().get(0);
+        assertFalse(CapabilityRegistry.WRITE_FILE.equals(a.tool()));
+        assertFalse(ActionBinder.canDirect(p));
+    }
+
+    @Test
     void browserStaysOnCapability() {
         TaskNode n = new TaskNode("n1", "打开页面", "browser", List.of(),
                 List.of(), List.of(), TaskNodeStatus.READY, 10,

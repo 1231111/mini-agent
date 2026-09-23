@@ -30,4 +30,10 @@ public interface AgentStreamSink {
      * @param total 子目标总数
      */
     default void onSubGoal(String text, int done, int total) {}
+
+    /**
+     * 本轮请求实际占了多少上下文。{@code usedTokens} 是模型返回的 input token，
+     * {@code limitTokens} 是 {@code agent.context.max-tokens} 工作窗口，不是厂商上下文上限。
+     */
+    default void onContext(int usedTokens, int limitTokens) {}
 }

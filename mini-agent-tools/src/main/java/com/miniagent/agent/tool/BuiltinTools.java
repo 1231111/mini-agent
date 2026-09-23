@@ -497,10 +497,7 @@ public class BuiltinTools {
                 .sideEffect(ToolConcurrencyPolicy.sideEffectOf("exec_command"))
                 .idempotent(ToolConcurrencyPolicy.isIdempotent("exec_command"))
                 .streamPrefetchSafe(ToolConcurrencyPolicy.isStreamPrefetchSafe("exec_command"))
-                .timeoutSeconds(ToolConcurrencyPolicy.timeoutSecondsOf("exec_command"))
-                .maxRetries(ToolConcurrencyPolicy.maxRetriesOf("exec_command"))
-                .concurrencyScope(ToolConcurrencyPolicy.concurrencyScopeOf("exec_command"))
-                .concurrencyKeyArgument(ToolConcurrencyPolicy.concurrencyKeyArgumentOf("exec_command"))
+                .executionProfile(ToolConcurrencyPolicy.profileOf("exec_command"))
                 .adaptiveTimeoutSeconds(ExecCommandParams::outerGateSecondsOf)
                 .handler(json -> execCommand(ToolParams.fromJson(json, ExecCommandParams.class)))
                 .build());
@@ -588,23 +585,34 @@ public class BuiltinTools {
     // ==================== 云端图像生成（多后端自动降级） ====================
 
     private void registerImageGenerateTool() {
-        registry.register("image_generate",
-                "生成图片（云端多后端自动降级：ChatAnywhere/MiMo/FAL/SiliconFlow/智谱CogView）。\n" +
-                "不需要 ComfyUI 服务，适合快速生成概念图、插画等。英文 prompt 效果最好，中文也可以用。\n" +
-                "后端由工具自动选择，无需关心细节；工具直接返回可渲染的图片链接（Markdown 格式）。\n" +
-                "用户只是要看图时：原样输出图片链接，不要额外解释、不要说\"图片已生成\"。\n" +
-                "用户要求把图写进文档时：先用 todo 拆成「生图 → 定位文档 → 写入图片链接」，\n" +
-                "在主循环里串行执行 image_generate 再写文件；不要派子 Agent，也不要用 ASCII 图凑数。",
-                Map.of(
+        registry.register(Tool.builder()
+                .name("image_generate")
+                .description("生成图片（云端多后端自动降级：ChatAnywhere/MiMo/FAL/SiliconFlow/智谱CogView）。\n" +
+                        "不需要 ComfyUI 服务，适合快速生成概念图、插画等。英文 prompt 效果最好，中文也可以用。\n" +
+                        "后端由工具自动选择，无需关心细节；工具直接返回可渲染的图片链接（Markdown 格式）。\n" +
+                        "用户只是要看图时：原样输出图片链接，不要额外解释、不要说\"图片已生成\"。\n" +
+                        "用户要求把图写进文档时：先用 todo 拆成「生图 → 定位文档 → 写入图片链接」，\n" +
+                        "在主循环里串行执行 image_generate 再写文件；不要派子 Agent，也不要用 ASCII 图凑数。")
+                .parameters(Map.of(
                         "prompt", Map.of("type", "string", "description", "图片描述（英文效果最好，尽量详细描述画面内容、风格、光影）", "required", true),
                         "aspect_ratio", Map.of("type", "string", "description", "比例: landscape(横版) / square(方形) / portrait(竖版)，默认 landscape")
-                ),
-                args -> {
+                ))
+                .sideEffect(ToolConcurrencyPolicy.sideEffectOf("image_generate"))
+                .idempotent(ToolConcurrencyPolicy.isIdempotent("image_generate"))
+                .streamPrefetchSafe(ToolConcurrencyPolicy.isStreamPrefetchSafe("image_generate"))
+                // 内层预算取配置（image.gen.total-budget-seconds，工具到点自己强杀并返回可控终态），
+                // 外层闸门 = 预算 + REMOTE_GENERATION 档的 30s 余量。注册期从实际配置派生，
+                // 配置调大时闸门自动跟着走 —— 「外层 = 内层 + 余量」不变式由此机械成立，
+                // 不会再出现内层 500s / 外层 150s 的倒挂。
+                .executionProfile(ToolConcurrencyPolicy.profileOf("image_generate")
+                        .withBudget(imageGenerationService.totalBudgetSeconds()))
+                .handler(args -> {
                     Map<String, Object> p = parseJson(args);
                     String prompt = (String) p.get("prompt");
                     String ratio = (String) p.getOrDefault("aspect_ratio", "landscape");
                     return imageGenerationService.generate(prompt, ratio);
-                });
+                })
+                .build());
     }
 
     // ==================== 云端生歌（SenseAudio） ====================
@@ -907,30 +915,66 @@ public class BuiltinTools {
         currentTaskName.remove();
     }
 
+    private static final int READ_LINE_CAP = 4000;
+
     private String readFile(String path, int offset, int limit) {
         try {
             Path target = resolveReadPath(path);
             if (!Files.exists(target)) {
                 return "{\"error\":\"文件不存在: " + path + "\"}";
             }
-            List<String> lines = Files.readAllLines(target, StandardCharsets.UTF_8);
-            // offset 超出文件行数时 from 会大于 to，subList 直接抛 fromIndex > toIndex，
-            // 模型只会看到一句异常文本，不知道是自己读过了尾部
-            int from = Math.min(Math.max(0, offset - 1), lines.size());
-            int to   = Math.min(lines.size(), from + Math.max(0, limit));
-            if (from >= lines.size() && !lines.isEmpty()) {
-                return "{\"error\":\"起始行 " + offset + " 超出文件末尾，该文件共 "
-                        + lines.size() + " 行\"}";
-            }
-            List<String> slice = lines.subList(from, to);
+            int from = Math.max(1, offset);
+            int maxLines = Math.max(0, limit);
             StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < slice.size(); i++) {
-                sb.append(from + i + 1).append('|').append(slice.get(i)).append('\n');
+            int lineNo = 0;
+            int written = 0;
+            try (var reader = Files.newBufferedReader(target, StandardCharsets.UTF_8)) {
+                String line;
+                while ((line = readLineCapped(reader, READ_LINE_CAP)) != null) {
+                    lineNo++;
+                    if (lineNo < from) {
+                        continue;
+                    }
+                    if (written >= maxLines) {
+                        break;
+                    }
+                    sb.append(lineNo).append('|').append(line).append('\n');
+                    written++;
+                }
+            }
+            if (written == 0 && lineNo > 0 && from > lineNo) {
+                return "{\"error\":\"起始行 " + offset + " 超出文件末尾，该文件共 "
+                        + lineNo + " 行\"}";
+            }
+            if (written == 0 && lineNo == 0) {
+                return "";
             }
             return sb.toString();
         } catch (Exception e) {
             return "{\"error\":\"读取文件失败: " + e.getMessage() + "\"}";
         }
+    }
+
+    /** 单行超过上限就截断并丢弃本行剩余字符，避免无换行的大文件把整文件读进内存。 */
+    private static String readLineCapped(java.io.BufferedReader reader, int cap) throws java.io.IOException {
+        int ch = reader.read();
+        if (ch < 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        boolean capped = false;
+        while (ch >= 0 && ch != '\n') {
+            if (ch != '\r' && sb.length() < cap) {
+                sb.append((char) ch);
+            } else if (ch != '\r') {
+                capped = true;
+            }
+            ch = reader.read();
+        }
+        if (capped) {
+            sb.append('…');
+        }
+        return sb.toString();
     }
 
     private String readPackage(String packageName, int maxChars) {

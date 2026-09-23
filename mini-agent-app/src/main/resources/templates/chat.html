@@ -25,6 +25,9 @@
             --sidebar-rail: 52px;
             --content-w: 800px;
             --page-pad: 20px;
+            /* 机器人头像 34px + 间距 16px。任务条和输入框让出同样宽度，才和正文左右对齐 */
+            --avatar-slot: 50px;
+            --scrollbar-w: 6px;
             /* —— 深色主题（默认）：更柔和的近黑 + 更高文本对比 —— */
             --bg:            #0e0f12;   /* main canvas */
             --sidebar-bg:    #16181d;   /* left panel */
@@ -331,7 +334,7 @@
             padding: 0 var(--page-pad);
             scrollbar-gutter: stable;
         }
-        #messages::-webkit-scrollbar { width: 6px; }
+        #messages::-webkit-scrollbar { width: var(--scrollbar-w); }
         #messages::-webkit-scrollbar-track { background: transparent; }
         #messages::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }
         #messages::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-h); }
@@ -339,18 +342,19 @@
         /* ----- 顶部任务条（task pin） -----
            固定在消息区上方，显示「当前视口顶部所属的那条用户任务」。
            外层透明、不铺满：整条通栏色带视觉上像多出一条工具栏，太宽。
-           可见的只有 .task-pin-inner —— 与消息列同宽的圆角描边盒，缩在内容列里。 */
+           可见的只有 .task-pin-inner。它和输入框都让出头像列，左右缘与机器人正文对齐。 */
         .task-pin {
             flex-shrink: 0;
             display: none;
-            padding: 8px var(--page-pad) 6px;
+            /* 左边让出头像列，右边让出与消息区相同的滚动条槽，内盒才和正文同宽 */
+            padding: 8px calc(var(--page-pad) + var(--scrollbar-w)) 6px
+                     calc(var(--page-pad) + var(--avatar-slot));
             cursor: pointer;
             user-select: none;
-            scrollbar-gutter: stable;
         }
         .task-pin.show { display: block; }
         .task-pin-inner {
-            max-width: var(--content-w);
+            max-width: calc(var(--content-w) - var(--avatar-slot));
             width: 100%;
             margin: 0 auto;
             padding: 7px 14px;
@@ -497,7 +501,7 @@
             max-width: var(--content-w);
             width: 100%;
             margin: 0 auto;
-            padding: 0 0 4px;
+            padding: 0 0 4px var(--avatar-slot);
         }
         .plan-row .todo-panel {
             margin-bottom: 4px;
@@ -746,11 +750,11 @@
            ================================================================= */
         .input-wrap {
             flex-shrink: 0;
-            padding: 0 var(--page-pad) 24px;
-            scrollbar-gutter: stable;
+            padding: 0 calc(var(--page-pad) + var(--scrollbar-w)) 24px
+                     calc(var(--page-pad) + var(--avatar-slot));
         }
         .input-container {
-            max-width: var(--content-w);
+            max-width: calc(var(--content-w) - var(--avatar-slot));
             width: 100%;
             margin: 0 auto;
             position: relative;
@@ -816,6 +820,53 @@
             display: flex; align-items: center;
             justify-content: space-between;
             gap: 8px;
+        }
+        .input-right {
+            display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+        }
+        .ctx-ring {
+            position: relative;
+            width: 22px; height: 22px;
+            color: var(--text3);
+            flex-shrink: 0;
+        }
+        .ctx-ring svg { display: block; transform: rotate(-90deg); }
+        .ctx-ring .ctx-tip {
+            display: none;
+            position: absolute;
+            right: 0; bottom: 28px;
+            width: max-content;
+            padding: 8px 10px;
+            border-radius: 8px;
+            background: var(--surface);
+            border: 1px solid var(--border-strong);
+            box-shadow: var(--shadow-input);
+            color: var(--text);
+            font-size: 12px;
+            line-height: 1.45;
+            z-index: 20;
+        }
+        .ctx-ring:hover .ctx-tip { display: block; }
+        .ctx-tip .ctx-pct { font-weight: 600; }
+        .ctx-tip .ctx-num { color: var(--text3); }
+        .live-dock[hidden] { display: none; }
+        .live-dock {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+        .live-dock .think-panel { margin-bottom: 0; }
+        .live-status {
+            display: flex; align-items: center; gap: 8px;
+            font-size: 12.5px; color: var(--text2);
+            padding: 2px 2px 4px;
+        }
+        .live-status::before {
+            content: '';
+            width: 6px; height: 6px; border-radius: 50%;
+            background: var(--accent);
+            animation: thinkPulse 1.5s ease-in-out infinite;
         }
         .input-left {
             display: flex;
@@ -1110,6 +1161,12 @@
             font-weight: 600; cursor: pointer; user-select: none;
             color: var(--text2);
             padding: 2px 0;
+            /* 「停靠在输入框上方」的观感靠 sticky 而非 DOM 搬运：
+               面板归属固定在 bot-body，只让表头吸附在滚动容器顶部，
+               滚动时思考标题始终可见。滚动容器是 #messages。 */
+            position: sticky; top: 0;
+            background: var(--bg);
+            z-index: 5;
         }
         .think-panel .think-head::before {
             content: '';
@@ -1338,7 +1395,14 @@
             .sidebar { display: none; }
             :root { --page-pad: 12px; }
             .msg-inner { padding: 8px 0; }
-            .input-wrap { padding: 0 var(--page-pad) 18px; }
+            .input-wrap {
+                padding: 0 calc(var(--page-pad) + var(--scrollbar-w)) 18px
+                         calc(var(--page-pad) + var(--avatar-slot));
+            }
+            .task-pin {
+                padding-left: calc(var(--page-pad) + var(--avatar-slot));
+                padding-right: calc(var(--page-pad) + var(--scrollbar-w));
+            }
             .suggestion-grid { grid-template-columns: 1fr; }
         }
 
@@ -1473,6 +1537,9 @@
             <span id="confirmBannerText">有步骤需要确认后才能继续</span>
             <button type="button" onclick="confirmPendingTodo()">确认并继续</button>
         </div>
+            <div class="live-dock" id="liveDock" hidden>
+                <div class="live-status" id="liveStatus">思考中</div>
+            </div>
             <!-- Image preview (multi-image, rendered by JS) -->
             <div class="img-preview" id="imgPreview"></div>
             <!-- Compose box -->
@@ -1585,12 +1652,24 @@
                             </div>
                         </div>
                     </div>
+                    <div class="input-right">
+                    <div class="ctx-ring" id="ctxRing" hidden title="上下文用量">
+                        <svg viewBox="0 0 22 22" width="22" height="22" aria-hidden="true">
+                            <circle cx="11" cy="11" r="8" fill="none" stroke="currentColor"
+                                    stroke-width="2" opacity="0.28"/>
+                            <circle id="ctxArc" cx="11" cy="11" r="8" fill="none"
+                                    stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                    stroke-dasharray="0 50.27"/>
+                        </svg>
+                        <div class="ctx-tip" id="ctxTip"></div>
+                    </div>
                     <button class="send-btn" id="sendBtn" onclick="send()" title="发送 (Enter)">
                         <svg viewBox="0 0 24 24" fill="currentColor">
                             <path d="M12 4l0 16M12 4l-6 6M12 4l6 6" stroke="currentColor" stroke-width="2.5"
                                   stroke-linecap="round" fill="none"/>
                         </svg>
                     </button>
+                    </div>
                 </div>
             </div>
             <div class="input-disclaimer">Mini Agent 可能会出错，重要信息请自行核实。按 Enter 发送，Shift+Enter 换行。</div>
@@ -1862,7 +1941,7 @@ document.addEventListener('drop', e => {
     files.forEach(addFile);
 });
 
-const MEDIA_MAX_BYTES = 35 * 1024 * 1024;
+const UPLOAD_MAX_BYTES = 700 * 1024 * 1024;
 const AUDIO_EXTS = new Set(['mp3', 'wav', 'flac', 'm4a', 'ogg']);
 const VIDEO_EXTS = new Set(['mp4', 'mov', 'avi', 'wmv']);
 
@@ -1888,8 +1967,8 @@ function isNativeMediaFile(f) { return isAudioFile(f) || isVideoFile(f); }
  */
 function addFile(file) {
     // 1. 验证文件大小和格式
-    if (isNativeMediaFile(file) && file.size > MEDIA_MAX_BYTES) {
-        alert('音视频过大（上限约 35MB，MiMo Base64 限制）: ' + file.name);
+    if (file.size > UPLOAD_MAX_BYTES) {
+        alert('文件过大（上限 700MB）: ' + file.name);
         return;
     }
     if ((file.type || '').startsWith('audio/') || (file.type || '').startsWith('video/')) {
@@ -2154,7 +2233,7 @@ function handleUploadSuccessResponse(data, file, idx) {
  */
 function handleUploadErrorResponse(xhr, data, idx) {
     const msg = (data && data.message)
-        || (xhr.status === 413 ? '文件过大（上限 50MB）' : ('上传失败 HTTP ' + xhr.status));
+        || (xhr.status === 413 ? '文件过大（上限 700MB）' : ('上传失败 HTTP ' + xhr.status));
     updateFileProgress(idx, 0, 'error', msg);
 }
 
@@ -3058,7 +3137,7 @@ async function loadMoreMessages(sessionId, prepend) {
                     frag.appendChild(buildBotRow(m.content || ''));
                 }
             });
-            $msg.insertBefore(frag, $msg.firstChild);
+            insertAt($msg, frag, $msg.firstChild);
 
             // Maintain scroll position
             $msg.scrollTop = oldScroll + ($msg.scrollHeight - oldHeight);
@@ -3125,11 +3204,65 @@ function renderConvMessages(id) {
 /* =========================================================================
    STREAMING STATE & MESSAGE INJECTION
    ========================================================================= */
+/**
+ * 安全插入：ref 必须是 parent 的子节点才能当锚点，否则退回 appendChild。
+ *
+ * 这是「ref 不是 parent 子节点」那类 DOMException 的唯一收口。此前每个 ensure* 各自
+ * 写裸 insertBefore 且对锚点的归属做假设，panelEl 一旦被搬进 liveDock，
+ * ensureTimeline 就会拿 dock 的兄弟当 bot-body 的锚点，整个流式渲染当场崩掉。
+ */
+function insertAt(parent, node, ref) {
+    if (!parent || !node) return;
+    if (ref && ref.parentNode === parent) parent.insertBefore(node, ref);
+    else parent.appendChild(node);
+}
+
+/**
+ * 流结束后的收尾。
+ *
+ * think-panel 的归属固定在 bot-body，不再在 liveDock 与消息区之间搬运：
+ * 跨容器搬运是「归属动态变化」的根源，读它的人必须同时知道它此刻在哪，
+ * 而所有插入点都按「它在 bot-body」写死了。这里只清掉历史上被搬进 dock 的残留面板。
+ */
+function parkLiveThink() {
+    const dock = document.getElementById('liveDock');
+    if (!dock) return;
+    dock.querySelectorAll('.think-panel').forEach(function (p) { p.remove(); });
+}
+
 function setStreaming(on) {
     isStreaming = on;
     $send.title = on ? '追加说明 (Enter)' : '发送 (Enter)';
+    if (!on) parkLiveThink();
+    const dock = document.getElementById('liveDock');
+    if (dock) {
+        dock.hidden = !on;
+        if (on) setLiveStatus('思考中');
+    }
     onInputChange();
     refreshConfirmBanner();
+}
+
+function setLiveStatus(text) {
+    const el = document.getElementById('liveStatus');
+    if (el && el.textContent !== text) el.textContent = text;
+}
+
+function paintContext(used, limit) {
+    if (!limit || limit <= 0) return;
+    const ring = document.getElementById('ctxRing');
+    const arc = document.getElementById('ctxArc');
+    const tip = document.getElementById('ctxTip');
+    if (!ring || !arc || !tip) return;
+    const pct = Math.max(0, Math.min(100, Math.round(used * 100 / limit)));
+    const circ = 2 * Math.PI * 8;
+    arc.setAttribute('stroke-dasharray', (circ * pct / 100).toFixed(2) + ' ' + circ.toFixed(2));
+    const fmt = function (n) {
+        return n >= 1000 ? Math.round(n / 1000) + 'K' : String(n);
+    };
+    tip.innerHTML = '<div class="ctx-pct">' + pct + '% 上下文已用</div>'
+        + '<div class="ctx-num">' + fmt(used) + ' / ' + fmt(limit) + '</div>';
+    ring.hidden = false;
 }
 
 function unlockComposer() {
@@ -3315,11 +3448,9 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             clearOnce();
             timelineEl = document.createElement('div');
             timelineEl.className = 'tl-stream';
-            // 时间线在思考面板之后、答案之前
-            if (answerEl) botBody.insertBefore(timelineEl, answerEl);
-            else if (panelEl && panelEl.nextSibling)
-                botBody.insertBefore(timelineEl, panelEl.nextSibling);
-            else botBody.appendChild(timelineEl);
+            // 锚点只用链上的下一个元素（answerEl），刻意不看 panelEl：
+            // panelEl 曾被搬进 liveDock，拿它的兄弟当锚点就是跨容器插节点。
+            insertAt(botBody, timelineEl, answerEl);
         }
         /** 把当前流式正文封存为过程说明，再开新一段（不抹掉可见历史） */
         function sealAnswerToTimeline() {
@@ -3389,7 +3520,12 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             // 保留思考 / 时间线；计划已在用户提问下，不塞进 bot
             ensureAnswer();
             answerEl.innerHTML = html;
-            if (panelEl) panelEl.classList.add('done');
+            if (panelEl) {
+                // 归位到链上时间线/答案之前（与 ensurePanel 同一锚点）
+                insertAt(botBody, panelEl, timelineEl || answerEl);
+                panelEl.classList.add('done');
+                if (headLabelEl) headLabelEl.textContent = '思考过程';
+            }
             const finalHtml = botBody.innerHTML;
             bindLightbox(botBody.closest('.bot-row'));
             addMsgToConv('assistant', answer, finalHtml, null);
@@ -3409,21 +3545,27 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             const caret = document.createElement('span');
             caret.className = 'think-caret'; caret.textContent = '▼';
             headLabelEl = document.createElement('span');
-            headLabelEl.textContent = '💭 思考中…';
+            headLabelEl.textContent = '深度思考';
             head.appendChild(caret); head.appendChild(headLabelEl);
             const body = document.createElement('div');
             body.className = 'think-body';
             thinkTextEl = document.createElement('span');
             body.appendChild(thinkTextEl);
             panelEl.appendChild(head); panelEl.appendChild(body);
-            botBody.insertBefore(panelEl, botBody.firstChild);
+            // 归属固定在 bot-body：think-panel 永远是 botBody 的子节点。
+            // liveDock 只承载 live-status 那行状态，不再接面板；
+            // 「停靠在输入框上方」的观感交给 CSS（见 .think-head 的 sticky）。
+            insertAt(botBody, panelEl, timelineEl || answerEl);
+            const dock = document.getElementById('liveDock');
+            if (dock) dock.hidden = false;
         }
         function ensureAnswer() {
             if (answerEl) return;
             clearOnce();
             answerEl = document.createElement('div');
             answerEl.className = 'answer-stream md-body';
-            botBody.appendChild(answerEl);
+            // 答案永远排在链尾；走同一个收口，顺序调整只改锚点链
+            insertAt(botBody, answerEl, null);
         }
         /** 任务计划钉在用户提问与 bot 之间 */
         function paintTodo() {
@@ -3450,7 +3592,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                     if (userRow) userRow.after(planRowEl);
                     else {
                         clearOnce();
-                        botBody.insertBefore(planRowEl, botBody.firstChild);
+                        // 无用户行时退到 bot 体内，同样走收口、锚链上下一个元素
+                        insertAt(botBody, planRowEl, progressEl || panelEl || timelineEl || answerEl);
                     }
                 }
                 planRowEl.innerHTML = '';
@@ -3521,7 +3664,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             track.appendChild(progressFillEl);
             progressEl.appendChild(progressLabelEl);
             progressEl.appendChild(track);
-            botBody.insertBefore(progressEl, botBody.firstChild);
+            // 进度条排在链首：锚点取链上下一个元素，不再假设 firstChild 是谁
+            insertAt(botBody, progressEl, panelEl || timelineEl || answerEl);
         }
         function paintProgress() {
             if (todoItems && todoItems.length) return;
@@ -3549,13 +3693,17 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                         thinkTextEl.textContent = thinkText;
                     }
                     renderedThink = thinkText;
+                    const thinkBody = thinkTextEl.parentElement;
+                    if (thinkBody) thinkBody.scrollTop = thinkBody.scrollHeight;
                 }
                 if (appliedCollapsed !== thinkCollapsed) {
                     panelEl.classList.toggle('collapsed', thinkCollapsed);
                     appliedCollapsed = thinkCollapsed;
                 }
-                const label = '💭 ' + (answer ? '思考过程' : '思考中…');
-                if (headLabelEl.textContent !== label) headLabelEl.textContent = label;
+                if (headLabelEl.textContent !== '深度思考') headLabelEl.textContent = '深度思考';
+                setLiveStatus(answer ? '生成回复中' : '思考中');
+            } else if (answer) {
+                setLiveStatus('生成回复中');
             }
             if (answer) {
                 removeTyping();
@@ -3604,6 +3752,11 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             } else if (name === 'token') {
                 if (!answer && !thinkCollapsed) thinkCollapsed = true;
                 answer += data; paint();
+            } else if (name === 'context') {
+                try {
+                    const ctx = typeof data === 'string' ? JSON.parse(data) : data;
+                    paintContext(ctx.used || 0, ctx.limit || 0);
+                } catch (e) { /* 忽略坏 payload */ }
             } else if (name === 'end') {
                 // 最终定稿：只覆盖当前答案段，保留时间线
                 if (data) answer = data;
@@ -4031,14 +4184,15 @@ async function reconnectStream(sid) {
 function renderUserEchoIfNeeded(botBody, text) {
     if (!text) return;
     const botRow = botBody.closest('.bot-row');
-    if (!botRow) return;
+    // botRow 必须真的挂在 $msg 下才能当锚点（botRow 是 null 之外的同源隐患）
+    if (!botRow || botRow.parentNode !== $msg) return;
     const prev = botRow.previousElementSibling;
     if (prev && prev.classList.contains('user-row')) return; // 已有用户气泡
     const row = document.createElement('div');
     row.className = 'msg-row user-row';
     row.innerHTML = '<div class="msg-inner"><div class="user-bubble">'
         + esc(text).replace(/\n/g, '<br>') + '</div></div>';
-    $msg.insertBefore(row, botRow);
+    insertAt($msg, row, botRow);
 }
 
 function showTaskRunningHint(sid) {

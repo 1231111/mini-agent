@@ -39,7 +39,7 @@ public class ExecCommandParams extends ToolParams {
      * 而工具自己处理超时是「强杀进程 + 返回部分输出」，是可控终态。所以外层必须比内层宽，
      * 否则内部那套精细处理永远是死代码 —— 这正是改造前 30s 内外相同的后果。</p>
      */
-    private static final int OUTER_GATE_MARGIN_SECONDS = 15;
+    public static final int OUTER_GATE_MARGIN_SECONDS = 15;
 
     @ToolParamSchema(description = "要执行的命令", required = true)
     private String command;
@@ -73,6 +73,23 @@ public class ExecCommandParams extends ToolParams {
     /** 未声明超时时，整条链路的默认闸门值（注册期静态兜底，与自适应值同源，避免漂移）。 */
     public static int defaultOuterGateSeconds() {
         return DEFAULT_TIMEOUT_SECONDS + OUTER_GATE_MARGIN_SECONDS;
+    }
+
+    /**
+     * 从原始参数 JSON 求内层预算秒数；参数缺失或解析失败一律回退 {@link #DEFAULT_TIMEOUT_SECONDS}。
+     *
+     * <p>供 {@code ToolConcurrencyPolicy.profileOf(name, args)} 算随调用变化的闸门用。
+     * 回退到默认值而不是 0：闸门取到 0 会让 {@code future.get(0)} 立刻超时。</p>
+     */
+    public static long requestedTimeoutSecondsOf(String argumentsJson) {
+        if (argumentsJson == null || argumentsJson.isBlank()) {
+            return DEFAULT_TIMEOUT_SECONDS;
+        }
+        try {
+            return fromJson(argumentsJson, ExecCommandParams.class).requestedTimeoutSeconds();
+        } catch (Exception e) {
+            return DEFAULT_TIMEOUT_SECONDS;
+        }
     }
 
     /**

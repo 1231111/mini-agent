@@ -198,39 +198,9 @@ public class AgentLoop {
     /** 未在 TOOL_RESULT_LIMITS 中的工具使用此默认值 */
     private static final int DEFAULT_TOOL_RESULT_MAX = 4000;
 
-    /**
-     * 各工具的执行超时（秒）。慢工具（image_generate）给更多时间，
-     * 快工具（read_file/list_files）设短超时避免拖慢整体。
-     */
-    private static final Map<String, Long> TOOL_TIMEOUT_SECONDS = Map.ofEntries(
-            Map.entry("image_generate",     150L),
-            Map.entry("web_search",          30L),
-            Map.entry("web_extract",         30L),
-            Map.entry("http_get",            30L),
-            Map.entry("http_post",           30L),
-            Map.entry("read_file",           10L),
-            Map.entry("list_files",          10L),
-            Map.entry("write_file",          15L),
-            Map.entry("exec_command",        30L),
-            Map.entry("browser_navigate",    30L),
-            Map.entry("browser_snapshot",    15L),
-            Map.entry("browser_click",       10L),
-            Map.entry("browser_type",        10L),
-            Map.entry("browser_press",       10L),
-            Map.entry("browser_scroll",      10L),
-            Map.entry("browser_screenshot",  20L),
-            Map.entry("browser_evaluate",    15L),
-            Map.entry("browser_extract_text", 300L),
-            Map.entry("browser_close",       10L),
-            Map.entry("read_package",        15L),
-            Map.entry("comfyui_txt2img",    200L),
-            Map.entry("comfyui_img2img",    200L),
-            Map.entry("comfyui_img2video",  620L),
-            Map.entry("comfyui_tts",        140L),
-            Map.entry("comfyui_execute",     30L)
-    );
-    /** 未在 TOOL_TIMEOUT_SECONDS 中的工具使用此默认超时 */
-    private static final long DEFAULT_TOOL_TIMEOUT_SECONDS = 60L;
+    // 执行超时不再按工具名写死一张表：外层闸门走 ToolExecutionGuards.descriptor(...).timeoutSeconds()
+    // （执行契约 ToolExecutionProfile + agent.tools.timeout-overrides 覆盖）。
+    // 「慢工具多给、快工具收紧」的档位声明在 ToolConcurrencyPolicy.profileOf —— 唯一声明点。
 
     /**
      * 产生直接交付物（图片/音视频）的工具白名单。
@@ -1304,6 +1274,15 @@ public class AgentLoop {
                                 response.tokenUsage().inputTokenCount(),
                                 response.tokenUsage().outputTokenCount(), 0);
                     }
+                    if (Objects.nonNull(streamSink)) {
+                        try {
+                            streamSink.onContext(
+                                    response.tokenUsage().inputTokenCount(),
+                                    maxContextTokens);
+                        } catch (Exception ignored) {
+                            // 用量推送失败不影响本轮
+                        }
+                    }
                 }
                 return response;
             } catch (dev.langchain4j.exception.InternalServerException e) {
@@ -1630,7 +1609,8 @@ public class AgentLoop {
         } else {
             // 外层超时兜底：即使某工具内部超时逻辑失灵（如常驻进程把读流挂死），
             // 也能在此处被强制中断，绝不让单个工具拖死整个 Agent 循环。
-            // 与并行路径共用 TOOL_TIMEOUT_SECONDS 预算；给读流/清理留 10s 余量。
+            // 与并行路径共用 resolveToolTimeout 的预算（执行契约 + agent.tools.timeout-overrides 覆盖）；
+            // 给读流/清理留 10s 余量。
             long timeout = resolveToolTimeout(name, args);
             final String fName = name, fArgs = args;
             final int turn = state.currentTurn;
@@ -1708,40 +1688,28 @@ public class AgentLoop {
         return tool;
     }
 
+    /**
+     * 外层闸门超时后的处置：按工具声明的 {@code ToolTimeoutRecovery} 分派，不再按工具名 if-else。
+     *
+     * <p>改造前这里是三段硬编码分支（{@code ask_user_question} / {@code exec_command} /
+     * {@code song_generate}）加一个 {@code ToolResult.unknown} 兜底 —— 每接一个长耗时工具
+     * 都要来这儿加分支，漏掉就掉进兜底并<b>中止整轮</b>。现在处置策略是工具执行契约的一部分
+     * （见 {@code ToolConcurrencyPolicy.profileOf}），新工具声明好契约即可，AgentLoop 不用改。</p>
+     */
     private ToolResult timeoutToolResult(String name, String argumentsJson, long timeoutSeconds) {
-        if (AskUserQuestionTool.TOOL_NAME.equals(name)) {
-            return ToolResult.failure(ToolErrorCode.CANCELLED,
-                    "等待用户回答已结束，请根据用户下一条消息继续", false);
-        }
         ToolDescriptor descriptor = toolExecutionGuards.descriptor(name, argumentsJson);
         String message = "工具执行超时" + (timeoutSeconds > 0 ? "（" + timeoutSeconds + "s）" : "");
-        if (descriptor.sideEffect() == ToolSideEffect.READ_ONLY
-                || descriptor.idempotent()
-                || ToolConcurrencyPolicy.isOutcomeVerifiable(name)) {
-            String extra = ToolConcurrencyPolicy.isOutcomeVerifiable(name)
-                    ? "，页面终态未知；先 browser_snapshot 核验当前页面，再决定重试还是换策略"
-                    : "，可安全重试";
-            return ToolResult.failure(ToolErrorCode.TIMEOUT, message + extra, true);
-        }
-        if (ToolConcurrencyPolicy.EXEC_TOOL.equals(name)) {
-            // 不判「终态未知」：那会直接中止整轮（state.unknownOutcome → loopEndReason=OUTCOME_UNKNOWN），
-            // 一条卡住的构建命令不该把整条多步任务打死。这里改为可自愈的失败：
-            // 明确告诉模型进程可能还在、怎么核验、以及下次怎么调大预算。
-            return ToolResult.failure(ToolErrorCode.TIMEOUT,
-                    message + "，命令进程可能仍在后台运行。先跑一条只读命令核验"
-                            + "（如 tasklist / pgrep -a java），确认没有残留进程再重试，"
-                            + "并把 timeout 参数调大（上限 "
-                            + com.miniagent.agent.tool.impl.ExecCommandParams.MAX_TIMEOUT_SECONDS + "s）", true);
-        }
-        if (SongGenerateParams.TOOL_NAME.equals(name)) {
-            // 生歌是异步任务：超时并不意味着「副作用去向不明」——任务还在云端，
-            // 拿同一个 taskId 查一次就能确定终态。判成 OUTCOME_UNKNOWN 会因为一次慢查询
-            // 把整条多步任务打死，这里降级成可自愈的失败。
-            return ToolResult.failure(ToolErrorCode.TIMEOUT,
-                    message + "，歌曲任务仍在云端生成中。先告诉用户还在生成，"
-                            + "下一轮用响应里那个 taskId 再调一次 song_generate 续查，不要重新提交", true);
-        }
-        return ToolResult.unknown(message + "，调用可能已产生副作用；必须先核验", null);
+        return switch (descriptor.timeoutRecovery()) {
+            // 等待用户：这不是失败，是用户一直没答。转「等待用户」而不是报错。
+            case AWAIT_USER -> ToolResult.failure(ToolErrorCode.CANCELLED,
+                    "等待用户回答已结束，请根据用户下一条消息继续", false);
+            // 副作用去向不明且无法核验 —— 只能中止整轮（state.unknownOutcome → OUTCOME_UNKNOWN）。
+            case ABORT -> ToolResult.unknown(message + descriptor.recoveryHint(), null);
+            // RETRY / RESUME / VERIFY 都是可自愈的失败：不中止整轮，
+            // 把核验步骤 / 续查方式写在 recoveryHint 里告诉模型下一步怎么做。
+            default -> ToolResult.failure(ToolErrorCode.TIMEOUT,
+                    message + descriptor.recoveryHint(), true);
+        };
     }
 
     /** 格式化消息列表为可读的 trace 文本（截断长内容） */
