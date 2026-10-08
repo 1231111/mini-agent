@@ -3,6 +3,7 @@ package com.miniagent.agent.core;
 import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.core.TokenEstimator;
 import com.miniagent.agent.scope.TaskScopeRegistry;
+import com.miniagent.agent.trace.TraceRecorder;
 import com.miniagent.common.model.EffectiveModelContext;
 import org.springframework.beans.factory.annotation.Value;
 
@@ -163,6 +164,104 @@ public class ContextCompressor {
             case "browser_navigate" -> toolName + "(" + extractJsonField(arguments, "url") + ")";
             default -> toolName;
         };
+    }
+
+    /**
+     * 结构化交接摘要：把"中段到底发生了什么"压成几行可执行事实，替代原来那句"已移除 N 条消息"。
+     *
+     * <p>抽取的都是**低幻觉风险**的字段（工具名 + 参数里的路径/命令 + 结果是否失败），
+     * 不做任何语义推断：推断交给可选的 LLM 摘要（{@code llm-summary-enabled}）。</p>
+     */
+    static String buildHandoffStub(List<ChatMessage> removed) {
+        if (removed == null || removed.isEmpty()) {
+            return "【上下文压缩】中间对话为空。";
+        }
+        java.util.LinkedHashSet<String> writtenFiles = new java.util.LinkedHashSet<>();
+        java.util.LinkedHashSet<String> editedFiles = new java.util.LinkedHashSet<>();
+        java.util.LinkedHashSet<String> readFiles = new java.util.LinkedHashSet<>();
+        java.util.LinkedHashSet<String> commands = new java.util.LinkedHashSet<>();
+        java.util.LinkedHashSet<String> otherTools = new java.util.LinkedHashSet<>();
+        java.util.List<String> failures = new java.util.ArrayList<>();
+        int toolResults = 0;
+
+        // toolCallId → 工具名，用于把失败结果对回到具体调用
+        java.util.Map<String, String> callNames = new java.util.HashMap<>();
+        for (ChatMessage m : removed) {
+            if (m instanceof AiMessage ai && ai.hasToolExecutionRequests()) {
+                for (var tc : ai.toolExecutionRequests()) {
+                    callNames.put(tc.id(), tc.name());
+                }
+            }
+        }
+        for (ChatMessage m : removed) {
+            if (m instanceof AiMessage ai && ai.hasToolExecutionRequests()) {
+                for (var tc : ai.toolExecutionRequests()) {
+                    String name = tc.name();
+                    String args = tc.arguments();
+                    switch (name == null ? "" : name) {
+                        case "write_file" -> addIfPresent(writtenFiles, extractJsonField(args, "path"), 12);
+                        case "edit_file" -> addIfPresent(editedFiles, extractJsonField(args, "path"), 12);
+                        case "read_file" -> addIfPresent(readFiles, extractJsonField(args, "path"), 12);
+                        case "exec_command" -> addIfPresent(commands,
+                                truncateStr(extractJsonField(args, "command"), 80), 8);
+                        default -> addIfPresent(otherTools, summarizeToolCall(name, args), 12);
+                    }
+                }
+            } else if (m instanceof ToolExecutionResultMessage tr) {
+                toolResults++;
+                if (TraceRecorder.isFailedResult(tr.text())) {
+                    String name = callNames.getOrDefault(tr.id(), tr.toolName());
+                    failures.add("- " + name + ": " + truncateStr(firstLine(tr.text()), 120));
+                    if (failures.size() >= 5) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("【上下文压缩】已移除中间 ").append(removed.size())
+                .append(" 条消息（含 ").append(toolResults).append(" 条工具结果）。")
+                .append("以下是从中抽取的事实交接，按此继续，不要重复已完成的工作：");
+        appendList(sb, "已写入/创建的文件", writtenFiles);
+        appendList(sb, "已修改的文件", editedFiles);
+        appendList(sb, "已执行过的命令", commands);
+        appendList(sb, "读过的文件", readFiles);
+        appendList(sb, "其他已调用工具", otherTools);
+        if (!failures.isEmpty()) {
+            sb.append("\n已失败的操作（换方法，不要原样重试）：");
+            for (String f : failures) {
+                sb.append('\n').append(f);
+            }
+        }
+        sb.append("\n如需更早的细节：产出物在 workspace 下可直接 read_file；")
+                .append("完整历史见轨迹，不要凭记忆编造中段内容。");
+        return sb.toString();
+    }
+
+    private static void addIfPresent(java.util.Set<String> set, String value, int cap) {
+        if (set.size() >= cap || StringUtils.isBlank(value)) {
+            return;
+        }
+        set.add(value.trim());
+    }
+
+    private static void appendList(StringBuilder sb, String label, java.util.Collection<String> items) {
+        if (items == null || items.isEmpty()) {
+            return;
+        }
+        sb.append('\n').append(label).append("：");
+        for (String item : items) {
+            sb.append("\n- ").append(item);
+        }
+    }
+
+    private static String firstLine(String text) {
+        if (StringUtils.isBlank(text)) {
+            return "";
+        }
+        int idx = text.indexOf('\n');
+        return (idx < 0 ? text : text.substring(0, idx)).trim();
     }
 
     /** 委托给 AgentLoop 的同名方法，避免重复实现 */
@@ -387,11 +486,15 @@ public class ContextCompressor {
         log.info("压缩边界: 头部 {} + 中间 {} + 尾部 {}，llmSummary={}",
                 headEnd, toSummarize.size(), tail.size(), llmSummaryEnabled);
 
-        // 阶段 3：默认硬截断占位（不阻塞 Loop）；可选同步 LLM；否则异步摘要
+        // 阶段 3：默认硬截断（不阻塞 Loop）但要留下**结构化交接**；可选同步 LLM；否则异步摘要。
+        //
+        // 为什么不能只写一句"已移除 N 条消息"：默认配置（llm-summary-enabled=false）下，
+        // 中段的决策、写过的文件、失败过的命令会**整体消失**，只留一句占位 —— 模型于是不知道自己
+        // 已经做了什么，常见后果是重跑同一批命令（烧预算）或重新写一遍已有文件。
+        // 这里从被丢弃的消息里抽出可机读的交接信息（改了哪些文件、哪些命令失败、用过哪些工具），
+        // 成本是纯字符串处理，不引入 LLM 调用（不抬高 P99）。
         int summaryBudget = Math.min(MAX_SUMMARY_TOKENS, (int) (maxTokens * 0.05));
-        String stub = String.format(
-                "【上下文压缩】已硬截断移除中间 %d 条消息。请基于头部任务目标与最近对话继续。",
-                toSummarize.size());
+        String stub = buildHandoffStub(toSummarize);
         String summary;
         if (llmSummaryEnabled) {
             summary = generateSummaryAndExtractMemory(toSummarize, summaryBudget, state);

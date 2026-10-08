@@ -42,6 +42,10 @@ let runtimePort = 0;
 
 const READY_PREFIX = 'MINIAGENT_READY ';
 const BACKEND_START_TIMEOUT_MS = 120000;
+/** 云端账号服务。登录校验和注册页都用这个地址，环境变量或 config.json 可覆盖。 */
+const CLOUD_ACCOUNT_BASE = 'http://120.53.87.241:8081';
+const DESKTOP_LOGIN_PROTOCOL = 'miniagent';
+let pendingDesktopTicket = '';
 
 const getApiBase = () => `http://127.0.0.1:${runtimePort}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -55,16 +59,31 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * 刻意不从后端 /api/auth/cloud-status 取这个值：那条路径在 SecurityConfig.PUBLIC_PATHS
  * 里，未认证就能访问，而云端地址属于部署细节，不该从一个公开接口漏出去。
  *
- * 来源优先级：环境变量 MINIAGENT_PORTAL_URL > config.json 的 portalUrl。
- * 都没有就返回空串。云端地址由部署时填写，不写死本机。
+ * 来源优先级：环境变量 MINIAGENT_PORTAL_URL > config.json 的 portalUrl
+ * > {@link CLOUD_ACCOUNT_BASE}。
  */
 function portalUrl() {
-  const raw = process.env.MINIAGENT_PORTAL_URL !== undefined
-    ? process.env.MINIAGENT_PORTAL_URL
-    : (config.portalUrl !== undefined && config.portalUrl !== null
-      ? String(config.portalUrl)
-      : '');
+  const fromEnv = process.env.MINIAGENT_PORTAL_URL;
+  const fromConfig = config.portalUrl;
+  const raw = fromEnv !== undefined && String(fromEnv).trim() !== ''
+    ? String(fromEnv)
+    : (fromConfig !== undefined && fromConfig !== null && String(fromConfig).trim() !== ''
+      ? String(fromConfig)
+      : CLOUD_ACCOUNT_BASE);
   return raw.trim().replace(/\/+$/, '');
+}
+
+function ticketFromArgv(argv) {
+  const raw = (argv || []).find((arg) =>
+    typeof arg === 'string' && arg.startsWith(DESKTOP_LOGIN_PROTOCOL + '://'));
+  if (!raw) {
+    return '';
+  }
+  try {
+    return new URL(raw).searchParams.get('ticket') || '';
+  } catch (e) {
+    return '';
+  }
 }
 
 /**
@@ -174,6 +193,9 @@ function startBackend(rt, nonce) {
   // 系统属性只能影响 BrowserService 那一侧的检查逻辑，两边会指向不同目录。
   const env = { ...process.env };
   env.MINI_AGENT_DESKTOP_NONCE = nonce;
+  if (!env.CLOUD_AUTH_BASE_URL || !String(env.CLOUD_AUTH_BASE_URL).trim()) {
+    env.CLOUD_AUTH_BASE_URL = portalUrl();
+  }
   const bundledBrowsers = path.join(process.resourcesPath, 'browsers');
   if (app.isPackaged && fs.existsSync(bundledBrowsers)) {
     env.PLAYWRIGHT_BROWSERS_PATH = bundledBrowsers;
@@ -598,7 +620,11 @@ const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  app.on('second-instance', (_event, argv) => {
+    const ticket = ticketFromArgv(argv);
+    if (ticket) {
+      completeDesktopLogin(ticket);
+    }
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.show();
@@ -606,7 +632,58 @@ if (!hasSingleInstanceLock) {
     }
   });
 
+  if (process.defaultApp && process.argv.length >= 2) {
+    app.setAsDefaultProtocolClient(
+      DESKTOP_LOGIN_PROTOCOL, process.execPath, [path.resolve(process.argv[1])]);
+  } else {
+    app.setAsDefaultProtocolClient(DESKTOP_LOGIN_PROTOCOL);
+  }
+
   app.whenReady().then(startUp);
+}
+
+/**
+ * 云端注册页跳回 miniagent://login?ticket=... 之后，向本机后端换本地会话并进入主页。
+ */
+async function completeDesktopLogin(ticket) {
+  if (!ticket) {
+    return;
+  }
+  if (!backendReady || !runtimePort) {
+    pendingDesktopTicket = ticket;
+    return;
+  }
+  pendingDesktopTicket = '';
+  let body;
+  try {
+    const res = await fetch(`http://127.0.0.1:${runtimePort}/api/auth/desktop-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticket })
+    });
+    body = await res.json();
+  } catch (e) {
+    dialog.showErrorBox('登录失败', '连不上本机服务：' + (e.message || e));
+    return;
+  }
+  const token = body && body.data && body.data.token;
+  if (!body || !body.success || !token) {
+    dialog.showErrorBox('登录失败', (body && body.message) || '注册后自动登录失败');
+    return;
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+  mainWindow.show();
+  mainWindow.focus();
+  const script = 'try{window.MiniAuth.setToken('
+    + JSON.stringify(token)
+    + ');window.location.href="/";}catch(e){window.location.href="/login";}';
+  try {
+    await mainWindow.webContents.executeJavaScript(script);
+  } catch (e) {
+    dialog.showErrorBox('登录失败', e.message || String(e));
+  }
 }
 
 async function startUp() {
@@ -648,6 +725,11 @@ async function startUp() {
 
   if (failure) {
     dialog.showErrorBox('后端启动失败', `${failure}\n\n日志：${backendLogPath || '(未产生)'}`);
+  }
+
+  const launchTicket = pendingDesktopTicket || ticketFromArgv(process.argv);
+  if (launchTicket && backendReady) {
+    completeDesktopLogin(launchTicket);
   }
 
   app.on('activate', () => {

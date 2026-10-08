@@ -14,6 +14,7 @@ import com.miniagent.agent.memory.repository.AgentEpisodeRepository;
 import com.miniagent.memory.MemoryKeys;
 import com.miniagent.memory.MemoryManager;
 import com.miniagent.memory.MemoryStore;
+import com.miniagent.memory.SecurityScanner;
 import com.miniagent.memory.lifecycle.ConsolidationService;
 import com.miniagent.memory.model.MemoryScope;
 import com.miniagent.memory.model.SemanticFact;
@@ -333,11 +334,15 @@ public class DefaultConsolidationService implements ConsolidationService {
             episode.setProjectId(wm.getProjectId());
         }
         episode.setUserId(resolveEpisodeUserId(wm));
-        episode.setTaskSummary(truncate(taskSummary, 500));
+        // Episode 的正文由事件流/模型提炼而来（工具输出、网页正文都会进 observations），
+        // 之后会以"历史经验"注入提示。这里用 redact 而不是抛异常：
+        // 抛了会让同一批事件每轮都失败（毒消息）并连带丢掉正常的巩固结果，
+        // 而 redact 只摘掉被污染的那段文本、保留记录结构。
+        episode.setTaskSummary(truncate(SecurityScanner.redactIfUnsafe(taskSummary), 500));
         episode.setOutcome(outcome);
         episode.setActionsJson(toJson(actions));
-        episode.setObservationsJson(toJson(observations));
-        episode.setResolution(resolution);
+        episode.setObservationsJson(toJson(redactUnsafeAll(observations)));
+        episode.setResolution(SecurityScanner.redactIfUnsafe(resolution));
         // 有明确 goal 的任务，检索价值高于"从事件流猜出来的"，抬高其重要性下限
         double importance = hasFailure ? 0.8 : 0.5;
         if (wm != null && wm.getGoal() != null && !wm.getGoal().isBlank()) {
@@ -481,6 +486,14 @@ public class DefaultConsolidationService implements ConsolidationService {
         String userId = episode.getUserId() != null && !episode.getUserId().isBlank()
                 ? episode.getUserId() : MemoryStore.effectiveUserIdString();
         for (String factText : facts) {
+            // 提炼出来的"事实"会以「已知事实」注入系统提示，是提示注入最隐蔽的一条路：
+            // 让模型把一句话总结成事实就够了。命中即跳过这一条（不抛，避免毒消息轮回），
+            // DefaultMemoryManager.writeFact 里还有第二道闸门兜底。
+            String unsafe = SecurityScanner.scan(factText);
+            if (unsafe != null) {
+                log.warn("巩固晋升事实被安全扫描跳过: {}", unsafe);
+                continue;
+            }
             try {
                 SemanticFact fact = new SemanticFact();
                 fact.setTenantId(tenant);
@@ -494,6 +507,18 @@ public class DefaultConsolidationService implements ConsolidationService {
                 log.debug("巩固晋升事实失败: {}", e.getMessage());
             }
         }
+    }
+
+    /** 逐条清洗派生文本（observations 等列表），供 Episode 落库前使用。 */
+    private static List<String> redactUnsafeAll(List<String> items) {
+        if (items == null || items.isEmpty()) {
+            return items;
+        }
+        List<String> out = new ArrayList<>(items.size());
+        for (String item : items) {
+            out.add(SecurityScanner.redactIfUnsafe(item));
+        }
+        return out;
     }
 
     private String buildFallbackSummary(List<AgentEventEntity> events) {

@@ -194,10 +194,13 @@ public class AstSearchTool {
 
     private Path resolvePath(String path) {
         Path p = Path.of(path.replace('\\', '/').trim());
-        if (p.isAbsolute()) {
-            return p.normalize();
-        }
-        return Path.of(System.getProperty("user.dir")).toAbsolutePath().resolve(p).normalize();
+        Path resolved = p.isAbsolute()
+                ? p.normalize()
+                : Path.of(System.getProperty("user.dir")).toAbsolutePath().resolve(p).normalize();
+        // 与 read_file / search_code 同一套根目录约束：ast_search 能 walk 整个目录树，
+        // 不设限就等于"用结构化查询读任意目录下的 Java 源码"（含其他项目/用户的代码）。
+        PathGuard.assertAllowed(resolved, "ast_search");
+        return resolved;
     }
 
     private String err(String msg) {

@@ -74,6 +74,8 @@ public enum ErrorCode {
     MEMORY_DUPLICATE("MEMORY.01.02", "条目已存在"),
     MEMORY_LIMIT_EXCEEDED("MEMORY.01.03", "记忆容量已达上限"),
     MEMORY_NOT_FOUND("MEMORY.01.04", "未找到匹配条目"),
+    /** 记忆会作为系统提示的一部分注入后续每一轮对话，写入前必须过注入/凭据扫描。 */
+    MEMORY_CONTENT_REJECTED("MEMORY.01.05", "记忆内容被安全扫描拒绝（疑似提示注入或凭据外泄）"),
     MEMORY_WRITE_FAILED("MEMORY.02.01", "记忆写入失败"),
     MEMORY_MIDTERM_UPDATE_FAILED("MEMORY.03.01", "中期记忆更新失败"),
 

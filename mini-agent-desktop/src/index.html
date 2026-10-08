@@ -292,7 +292,8 @@
       const err = document.getElementById('loginErr');
       err.textContent = '';
       try {
-        const r = await window.electronAPI.openExternal(portalUrl + '/login');
+        const r = await window.electronAPI.openExternal(
+          portalUrl + '/login?desktop=1');
         if (!r || !r.ok) {
           err.textContent = '打不开注册页：' + ((r && r.error) || '未知原因');
         }

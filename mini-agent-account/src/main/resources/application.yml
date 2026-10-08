@@ -67,6 +67,13 @@ agent:
     password-min-length: 8
     bcrypt-strength: 10
 
+    # 浏览器自助"确认支付"入口（POST /api/portal/orders/{no}/confirm）。
+    #
+    # 默认关闭，且这是安全边界而非临时开关：该端点没有任何支付凭证校验，
+    # 打开它等于"任何登录用户都能把自己的订单标成已支付并立刻拿到额度"。
+    # 只在本地联调时临时置 true；真实到账必须由签名校验过的渠道回调完成。
+    portal-confirm-enabled: false
+
     # 服务间调用的共享密钥。会员接口只接受带 X-Account-Internal-Key 的请求。
     #
     # 为什么是"服务间密钥"而不是用户会话：本服务不签 token（见 AccountApplication 说明），

@@ -1,7 +1,9 @@
 package com.miniagent.account.web;
 
 import com.miniagent.account.entity.User;
+import com.miniagent.account.repository.UserRepository;
 import com.miniagent.account.service.AccountAuthService;
+import com.miniagent.account.service.DesktopLoginTicketStore;
 import com.miniagent.account.web.dto.AccountUserResponse;
 import com.miniagent.common.ApiResponse;
 import com.miniagent.common.ErrorCode;
@@ -28,8 +30,15 @@ public class AccountController {
 
     @Autowired
     private AccountAuthService auth;
+    @Autowired
+    private DesktopLoginTicketStore tickets;
+    @Autowired
+    private UserRepository users;
 
     public record LoginRequest(String username, String password) {
+    }
+
+    public record TicketRequest(String ticket) {
     }
 
     public record RegisterRequest(String username, String password, String displayName) {
@@ -72,5 +81,25 @@ public class AccountController {
         }
         User user = result.user();
         return ApiResponse.ok(AccountUserResponse.of(user));
+    }
+
+    /**
+     * 用网页注册换来的一次性凭证取回身份。凭证无效、过期或已用过都当登录失败。
+     */
+    @PostMapping(value = "/api/desktop-tickets/redeem",
+            consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<AccountUserResponse> redeem(
+            @RequestBody(required = false) TicketRequest req) {
+        String ticket = req == null ? null : req.ticket();
+        Long userId = tickets.consume(ticket).orElse(null);
+        if (userId == null) {
+            return ApiResponse.fail(ErrorCode.AUTH_SESSION_INVALID, "登录凭证无效或已使用");
+        }
+        return users.findById(userId)
+                .map(user -> ApiResponse.ok(AccountUserResponse.of(user)))
+                .orElseGet(() -> ApiResponse.fail(
+                        ErrorCode.AUTH_NOT_AUTHENTICATED, "请重新注册"));
     }
 }

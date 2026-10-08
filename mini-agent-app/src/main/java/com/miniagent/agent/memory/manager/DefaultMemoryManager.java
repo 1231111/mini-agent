@@ -10,7 +10,10 @@ import com.miniagent.agent.memory.lifecycle.WorkingMemoryManager;
 import com.miniagent.agent.memory.repository.*;
 import com.miniagent.agent.memory.retriever.MilvusHybridSearchEngine;
 import com.miniagent.common.embedding.SharedEmbeddingModel;
+import com.miniagent.common.ErrorCode;
+import com.miniagent.common.exception.BusinessException;
 import com.miniagent.memory.MemoryManager;
+import com.miniagent.memory.SecurityScanner;
 import com.miniagent.memory.lifecycle.ForgettingPolicy;
 import com.miniagent.memory.model.*;
 import com.miniagent.memory.retriever.ContextCompressor;
@@ -122,6 +125,7 @@ public class DefaultMemoryManager implements MemoryManager {
     @Override
     @Transactional
     public void writeMemory(MemoryEntry entry) {
+        requireSafeForPrompt(entry.getContent(), entry.getSummary(), "记忆条目");
         AgentMemoryEntryEntity entity = toEntity(entry);
         entity = entryRepository.save(entity);
         entry.setId(entity.getId());
@@ -129,6 +133,30 @@ public class DefaultMemoryManager implements MemoryManager {
         // 写入向量
         if (indexOutbox != null) {
             indexOutbox.enqueueUpsert(entity.getId());
+        }
+    }
+
+    /**
+     * 写入前的内容闸门。
+     *
+     * <p><b>为什么是硬拒绝</b>：记忆会作为系统提示的一部分注入**之后每一轮**对话。
+     * 一条被注入的记忆等于给会话装了一个持久后门 —— 而它可能来自网页正文、文件内容或
+     * 工具输出（模型"顺手"记下来），所以写入侧的每一条路径都必须过扫描，
+     * 不能只在 {@code MemoryStore.add} 那一处做（那条路径只覆盖 memory 工具的 blob 写入，
+     * REST 的 {@code /memories}、{@code /facts}、{@code /procedures} 与巩固期的 LLM 提炼
+     * 都不经过它）。</p>
+     *
+     * <p>命中即抛：调用方（REST 请求或巩固流程）需要知道"这条没写进去"，
+     * 而不是静默存一条被改写的记忆。</p>
+     */
+    private void requireSafeForPrompt(String content, String summary, String what) {
+        String reason = SecurityScanner.scan(content);
+        if (reason == null) {
+            reason = SecurityScanner.scan(summary);
+        }
+        if (reason != null) {
+            log.warn("{}被安全扫描拒绝: {}", what, reason);
+            throw new BusinessException(ErrorCode.MEMORY_CONTENT_REJECTED, what + "未写入：" + reason);
         }
     }
 
@@ -180,6 +208,8 @@ public class DefaultMemoryManager implements MemoryManager {
     }
 
     private void applyUpdate(Long id, MemoryEntry update, AgentMemoryEntryEntity entity) {
+        // 更新同样要过闸门：改一条已存在的记忆也能把注入载荷写进未来的系统提示
+        requireSafeForPrompt(update.getContent(), update.getSummary(), "记忆更新");
         if (update.getContent() != null) {
             entity.setContent(update.getContent());
         }
@@ -342,6 +372,12 @@ public class DefaultMemoryManager implements MemoryManager {
     @Override
     @Transactional
     public void writeFact(SemanticFact fact) {
+        // 事实会以"已知事实"注入提示（DefaultMemoryService 的 facts 段），同样要过闸门。
+        // 巩固期由模型从工具输出/网页内容里提炼出来的"事实"尤其危险：
+        // 攻击者只要让模型把一句话总结成事实，就能让它出现在之后每一次系统提示里。
+        requireSafeForPrompt(
+                fact.getSubject() + " " + fact.getPredicate() + " " + fact.getObjectValue(),
+                null, "语义事实");
         // 检查是否已有相同三元组
         List<AgentSemanticFactEntity> existing = factRepository.findActiveByTriple(
             fact.getTenantId(), fact.getSubject(), fact.getPredicate());
@@ -384,6 +420,10 @@ public class DefaultMemoryManager implements MemoryManager {
     @Override
     @Transactional
     public void writeProcedure(Procedure procedure) {
+        // SOP 会以"可用方法"注入提示，是"持久化指令"最容易被忽视的一条路径
+        requireSafeForPrompt(
+                procedure.getName() + " " + procedure.getDescription(),
+                null, "程序性记忆(SOP)");
         AgentProcedureEntity entity = new AgentProcedureEntity();
         entity.setTenantId(procedure.getTenantId());
         entity.setScopeType(AgentMemoryEntryEntity.ScopeType.valueOf(procedure.getScope().scopeType().name()));

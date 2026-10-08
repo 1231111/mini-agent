@@ -4,7 +4,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.miniagent.agent.security.GuardedHttpClient;
+import com.miniagent.agent.security.NetworkGuard;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -17,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import org.apache.commons.lang3.StringUtils;
 
@@ -48,6 +52,12 @@ public class WebSearchService {
 
     private static final int DEFAULT_LIMIT = 5;
     private static final int MAX_CONTENT_LENGTH = 15000; // web_extract 单页最大字符数
+
+    /** web_extract 的出网判定与传输：每跳校验 + 有界响应体。 */
+    @Autowired
+    private NetworkGuard networkGuard;
+    @Autowired
+    private GuardedHttpClient guardedHttpClient;
 
     // ========== 环境变量配置 ==========
 
@@ -111,28 +121,29 @@ public class WebSearchService {
         }
 
         try {
-            // SSRF 防护：拦截内网地址
-            URI uri = URI.create(url);
-            String host = uri.getHost();
-            if (Objects.isNull(host) || isPrivateHost(host)) {
-                return buildErrorResponse("安全拦截: URL 目标是内网地址 (" + host + ")");
+            // SSRF 防护：与 http_get/http_post 共用同一套判定（NetworkGuard 会解析 DNS
+            // 并逐个检查返回的地址），不再用"字符串前缀黑名单"——
+            // 那种写法既漏 169.254.169.254（云元数据）与 [::1]，也拦不住 DNS rebinding，
+            // 而 web_extract 属于 PLAN_SAFE 工具：最严格的只读模式下它无需任何批准即可调用。
+            String blocked = networkGuard.validateUrl(url);
+            if (Objects.nonNull(blocked)) {
+                return buildErrorResponse("安全拦截: " + blocked);
             }
 
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(uri)
-                    .header("User-Agent", "Mozilla/5.0 (compatible; MiniAgent/1.0)")
-                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                    .timeout(Duration.ofSeconds(15))
-                    .GET()
-                    .build();
-
-            HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+            // 走 GuardedHttpClient：重定向每一跳都重新过 NetworkGuard，响应体有硬上限。
+            // 原先用静态客户端 + Redirect.NORMAL，首个 URL 通过后一个 302 就能打到内网。
+            GuardedHttpClient.Response response = guardedHttpClient.get(
+                    url,
+                    Map.of("User-Agent", "Mozilla/5.0 (compatible; MiniAgent/1.0)",
+                            "Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+                    Duration.ofSeconds(15),
+                    4 * 1024 * 1024);
 
             if (response.statusCode() != 200) {
                 return buildErrorResponse("HTTP " + response.statusCode() + " - 无法访问该页面");
             }
 
-            String html = response.body();
+            String html = response.bodyText();
             String title = extractTitle(html);
             String text = htmlToText(html);
 
@@ -513,21 +524,6 @@ public class WebSearchService {
             return text.substring(0, 80).trim() + "...";
         }
         return text;
-    }
-
-    /** SSRF 防护：拦截内网/本地地址 */
-    private static boolean isPrivateHost(String host) {
-        return host.equals("localhost")
-                || host.equals("127.0.0.1")
-                || host.startsWith("10.")
-                || host.startsWith("192.168.")
-                || host.startsWith("172.16.") || host.startsWith("172.17.")
-                || host.startsWith("172.18.") || host.startsWith("172.19.")
-                || host.startsWith("172.2")   || host.startsWith("172.30.")
-                || host.startsWith("172.31.")
-                || host.equals("0.0.0.0")
-                || host.endsWith(".local")
-                || host.endsWith(".internal");
     }
 
     /** 搜索结果记录 */

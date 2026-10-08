@@ -393,9 +393,15 @@ agent:
 ```
 
 云端用 `docker compose -f docker-compose.account.yml up -d --build` 启动。
-桌面壳的注册和「账号与充值」打开 `MINIAGENT_PORTAL_URL`（或 `config.json` 的 `portalUrl`），
-与 `CLOUD_AUTH_BASE_URL` 使用同一个地址。网页在账号服务上：`/login` 注册，`/account` 查看套餐和订单。
-没配门户地址时，桌面登录页仍保留本机注册。
+桌面壳启动后端时，若环境变量 `CLOUD_AUTH_BASE_URL` 为空，则设为
+`http://120.53.87.241:8081`（`main.js` 的 `CLOUD_ACCOUNT_BASE`）。
+门户地址同样默认这个主机：环境变量 `MINIAGENT_PORTAL_URL`，否则 `config.json` 的 `portalUrl`，
+都没有才用上面的默认值。登录页没有本机注册，登录框下面的链接打开
+`{门户}/login?desktop=1`。线上账号服务目前只有 `/login`，没有 `/register`，
+所以不能把浏览器打到 `/register`（会得到 `SYSTEM.01.01`）。
+注册成功后账号服务发一张一次性凭证，浏览器跳
+`miniagent://login?ticket=...`，壳用它向本机 `POST /api/auth/desktop-login` 换本地会话并进入主页。
+`/account` 仍是套餐和订单。直接双击 jar、不经壳启动时，`CLOUD_AUTH_BASE_URL` 仍为空，登录走本机账号。
 
 **为什么要影子用户**：`SignedSessionFilter` 每个请求都要 `userRepository.findById(userId)`，
 本地没有对应行就一律 401，token 本身再合法也没用；而且

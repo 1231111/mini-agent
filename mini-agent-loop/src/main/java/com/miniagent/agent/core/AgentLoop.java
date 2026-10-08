@@ -64,6 +64,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -171,9 +172,55 @@ public class AgentLoop {
     public static StreamingChatModel getCurrentStreamingModel() { return EffectiveModelContext.currentStreaming(); }
     private static final int MAX_EXPLORATION_CALLS = 40;  // read_file + list_files + exec_command 总上限（放开：复杂任务定位文件常需多次读取）
 
-    /** 单次请求工作窗口（估算 token）。与 ContextCompressor 共用。 */
+    /** 配置的工作窗口上限（token）。与 ContextCompressor 共用；实际用哪个见 {@link #effectiveContextTokens()}。 */
     @Value("${agent.context.max-tokens:512000}")
     private int maxContextTokens;
+
+    /**
+     * 本轮实际可用的工作窗口（估算 token）。
+     *
+     * <p>取 {@code agent.context.max-tokens} 与**当前模型厂商窗口**的较小值。
+     * 只用一个全局常量是错的：配了 32k/128k 的模型时，512k 的压缩阈值永远不触发，
+     * 请求会被上游以 context-length 400 拒绝 —— 而这类 400 会被
+     * {@link #isRetriable} 之外的分支判成"不可重试"，最终用户看到的是
+     * "模型连接异常"，与真实原因（请求太长）毫无关系。</p>
+     *
+     * <p>厂商窗口未知（0）时回退到配置值，保持旧行为。</p>
+     */
+    private int effectiveContextTokens() {
+        int configured = maxContextTokens > 0 ? maxContextTokens : 512000;
+        int modelWindow = EffectiveModelContext.currentContextWindow();
+        if (modelWindow <= 0) {
+            return configured;
+        }
+        return Math.min(configured, modelWindow);
+    }
+
+    /**
+     * 工具 schema 的上下文开销估算（字节数 → 粗略 token）。
+     *
+     * <p>压缩阈值此前**只统计消息**，而每轮都会把全部工具 schema 发给模型
+     * （45+ 个工具的 JSON schema）。代码自己的首包看门狗按 400 字符/工具估算
+     * （见 {@code estimateFirstTokenTimeoutSec}），预算这边却按 0 计 ——
+     * 于是真实 prompt 比估算值大出一大截，压缩总是偏晚。</p>
+     */
+    static int toolSchemaTokenEstimate(int toolCount) {
+        if (toolCount <= 0) {
+            return 0;
+        }
+        // 400 字符/工具 ÷ 约 2.4 字符/token ≈ 167 token，取整 170
+        return toolCount * 170;
+    }
+
+    /**
+     * LLM 调用的最大重试次数（不含首次）。
+     *
+     * <p>默认 2：与 langchain4j 阻塞客户端的默认 maxRetries 对齐。注意流式客户端
+     * （{@code OpenAiStreamingChatModel}）**没有**内置重试包装，而 GUI 永远走流式，
+     * 所以这一层是流式路径唯一的重试保障。</p>
+     */
+    @Value("${agent.llm.max-retries:2}")
+    private int llmMaxRetries;
 
     /**
      * 各工具结果的上下文字符上限（按信息密度分级）。
@@ -930,7 +977,11 @@ public class AgentLoop {
                 }
 
                 int msgCountBefore = messages.size();
-                messages = contextCompressor.maybeCompress(messages, maxContextTokens, sessionId);
+                // 预算 = 模型窗口（或配置上限）− 工具 schema 开销：schema 每轮都发，
+                // 不计入的话真实 prompt 会比估算大一截，压缩永远偏晚。
+                int window = effectiveContextTokens();
+                int budget = Math.max(1000, window - toolSchemaTokenEstimate(specsForTurn.size()));
+                messages = contextCompressor.maybeCompress(messages, budget, sessionId);
                 if (Objects.nonNull(traceRecorder) && messages.size() < msgCountBefore) {
                     traceRecorder.recordCompression(sessionId, turn, msgCountBefore, messages.size(), 0, 0);
                 }
@@ -1256,73 +1307,128 @@ public class AgentLoop {
         }
         ChatRequest request = reqBuilder.build();
 
-        // 指数退避重试：临时性错误（网络抖动/超时/503）最多重试 1 次（超时类错误单次已很久）
-        int maxRetries = 1;
+        int maxRetries = Math.max(0, llmMaxRetries);
+        boolean attempted = false;
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            boolean resetBeforeCall = attempted && streamSink != null;
+            attempted = true;
             try {
                 ChatResponse response = Objects.isNull(streamSink)
                         ? chatModel.chat(request)
-                        : callLlmStreaming(request, streamSink);
-                if (Objects.nonNull(response) && Objects.nonNull(response.tokenUsage())) {
+                        : callLlmStreaming(request, streamSink, resetBeforeCall);
+                if (Objects.nonNull(response)) {
                     String sid = currentSessionId.get();
-                    if (Objects.nonNull(sid)) {
-                        TokenUsageTracker.add(sid,
-                                response.tokenUsage().inputTokenCount(),
-                                response.tokenUsage().outputTokenCount(), 0);
+                    int inputTokens = 0;
+                    int outputTokens = 0;
+                    if (Objects.nonNull(response.tokenUsage())) {
+                        Integer in = response.tokenUsage().inputTokenCount();
+                        Integer out = response.tokenUsage().outputTokenCount();
+                        inputTokens = in == null ? 0 : in;
+                        outputTokens = out == null ? 0 : out;
                     }
-                    if (Objects.nonNull(streamSink)) {
+                    if (Objects.nonNull(sid)) {
+                        TokenUsageTracker.add(sid, inputTokens, outputTokens, 0);
+                    }
+                    if (Objects.nonNull(response.tokenUsage()) && Objects.nonNull(streamSink)) {
                         try {
+                            // 前端显示"上下文已用 X%"，分母必须是**本轮真实窗口**（模型窗口或配置上限），
+                            // 否则换个 128k 模型还会按 512k 显示 5%，用户以为离上限很远。
                             streamSink.onContext(
                                     response.tokenUsage().inputTokenCount(),
-                                    maxContextTokens);
+                                    effectiveContextTokens());
                         } catch (Exception ignored) {
                             // 用量推送失败不影响本轮
                         }
                     }
                 }
                 return response;
-            } catch (dev.langchain4j.exception.InternalServerException e) {
-                // 503 通常是临时过载，值得重试
-                if (attempt < maxRetries) {
-                    long backoff = (long) Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
-                    log.warn("LLM API 503 (尝试 {}/{}): {}，{}ms 后重试", attempt + 1, maxRetries + 1, e.getMessage(), backoff);
-                    try { Thread.sleep(backoff); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                } else {
-                    log.error("LLM API 503 最终失败（已重试 {} 次）: {}", maxRetries, e.getMessage());
-                    return null;
-                }
-            } catch (java.io.IOException e) {
-                // 网络错误（closed/timeout/reset/connection refused）值得重试
-                if (attempt < maxRetries) {
-                    long backoff = (long) Math.pow(2, attempt) * 1000;
-                    log.warn("LLM API 网络错误 (尝试 {}/{}): {}，{}ms 后重试", attempt + 1, maxRetries + 1, e.getClass().getSimpleName() + ": " + e.getMessage(), backoff);
-                    try { Thread.sleep(backoff); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                } else {
-                    log.error("LLM API 网络错误最终失败（已重试 {} 次）: {}", maxRetries, e.getMessage(), e);
-                    return null;
-                }
             } catch (Exception e) {
-                // 流式 SSE 路径下，底层 IOException（连接 closed/reset、读超时等）会被 langchain4j
-                // 包成通用 LangChain4jException，绕过上面的 IOException 分支。这里按"根因是否为瞬时网络错误"
-                // 判断：是 → 走重试；否（参数/认证/格式错误）→ 不重试直接放弃。
-                if (isTransientNetworkError(e)) {
-                    if (attempt < maxRetries) {
-                        long backoff = (long) Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
-                        log.warn("LLM API 流式断连 (尝试 {}/{}): {}，{}ms 后重试",
-                                attempt + 1, maxRetries + 1, e.getClass().getSimpleName() + ": " + e.getMessage(), backoff);
-                        try { Thread.sleep(backoff); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                        continue;
-                    } else {
-                        log.error("LLM API 流式断连最终失败（已重试 {} 次）: {}", maxRetries, e.getMessage(), e);
-                        return null;
-                    }
+                if (isRetriable(e) && attempt < maxRetries) {
+                    long backoff = retryBackoffMillis(attempt);
+                    log.warn("LLM 调用可重试失败（尝试 {}/{}，{}s 后重试）: {}",
+                            attempt + 1, maxRetries + 1,
+                            String.format("%.1f", backoff / 1000.0), describe(e));
+                    sleepQuietly(backoff);
+                    continue;
                 }
-                // 其他错误（参数/认证/格式）通常不值得重试
-                log.error("LLM API 失败（不可重试）: {}", e.getMessage(), e);
+                if (isRetriable(e)) {
+                    log.error("LLM 调用重试耗尽（{} 次）: {}", maxRetries + 1, describe(e));
+                } else {
+                    log.error("LLM 调用失败（不可重试）: {}", describe(e));
+                }
                 return null;
             }
         }
         return null; // 所有重试耗尽
+    }
+
+    /**
+     * 判断异常是否值得重试 —— 按**类型**判断，不靠错误文案里的关键词。
+     *
+     * <p>此前只重试 {@code InternalServerException}(503)/{@code IOException}，其余走
+     * {@code isTransientNetworkError} 的 message 关键词匹配（closed/reset/timeout…）；
+     * 于是 429 一个关键词都不匹配，直接判成不可重试。而 Web GUI **永远走流式**，
+     * 且 langchain4j 的 {@code OpenAiStreamingChatModel} 自带重试包装（阻塞版
+     * {@code OpenAiChatModel} 有 maxRetries=2 + jitter，流式版没有）——
+     * 结果就是：一次 429 直接结束整轮，用户看到"模型连接异常"。</p>
+     *
+     * <p>结构化判据：langchain4j 的 {@link dev.langchain4j.exception.RetriableException}
+     * 是官方给的"可重试"标记（{@code RateLimitException} 继承它），再加超时与网络类异常。
+     * 不可重试的（认证失败、参数错误、内容审核）必须快速失败，重试只会浪费预算。</p>
+     */
+    static boolean isRetriable(Throwable t) {
+        for (Throwable cur = t; Objects.nonNull(cur) && cur != cur.getCause(); cur = cur.getCause()) {
+            if (cur instanceof dev.langchain4j.exception.RetriableException
+                    || cur instanceof dev.langchain4j.exception.TimeoutException
+                    || cur instanceof java.io.IOException
+                    || cur instanceof java.util.concurrent.TimeoutException) {
+                return true;
+            }
+            if (cur instanceof dev.langchain4j.exception.AuthenticationException
+                    || cur instanceof dev.langchain4j.exception.InvalidRequestException) {
+                // 认证/参数问题重试多少次都一样，且会白烧 token
+                return false;
+            }
+            String msg = cur.getMessage();
+            if (Objects.nonNull(msg)) {
+                String m = msg.toLowerCase();
+                if (m.contains("closed") || m.contains("reset")
+                        || m.contains("timeout") || m.contains("timed out")
+                        || m.contains("connection") || m.contains("broken pipe")
+                        || m.contains("eof") || m.contains("goaway")
+                        || m.contains("429") || m.contains("rate limit")
+                        || m.contains("too many requests")
+                        || m.contains("502") || m.contains("503") || m.contains("504")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** 指数退避 + 全抖动：避免多副本/多会话在同一时刻齐步重试，把恢复期的压力叠加成雪崩。 */
+    static long retryBackoffMillis(int attempt) {
+        long base = Math.min(8000L, 500L << Math.min(attempt, 4)); // 0.5s,1s,2s,4s,8s
+        long jitter = java.util.concurrent.ThreadLocalRandom.current()
+                .nextLong(base / 2 + 1);
+        return base / 2 + jitter;
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** 异常摘要：类型 + 截断后的消息，避免把整页堆栈塞进日志或用户可见文本。 */
+    private static String describe(Throwable e) {
+        String msg = Objects.requireNonNullElse(e.getMessage(), "");
+        if (msg.length() > 300) {
+            msg = msg.substring(0, 300) + "…";
+        }
+        return e.getClass().getSimpleName() + (msg.isBlank() ? "" : ": " + msg);
     }
     /**
      * 判断异常根因是否为瞬时网络错误（值得重试）。
@@ -1353,8 +1459,20 @@ public class AgentLoop {
     /**
      * 流式调用桥接：用流式模型发请求，把思考/答案增量实时推给 sink，
      * 但通过 CountDownLatch 阻塞等到 onCompleteResponse，使外层循环的顺序控制流保持不变。
+     *
+     * @param resetBeforeCall 重试时置真：先把已流出的半截正文封存进时间线，再开始新一轮。
+     *                        不重置的话，"第一次尝试的半截答案 + 重试后的完整答案"会在界面上
+     *                        拼成一段重复文本（前端的 token 事件是累加的）。
      */
-    private ChatResponse callLlmStreaming(ChatRequest request, AgentStreamSink streamSink) throws Exception {
+    private ChatResponse callLlmStreaming(ChatRequest request, AgentStreamSink streamSink,
+                                          boolean resetBeforeCall) throws Exception {
+        if (resetBeforeCall) {
+            try {
+                streamSink.onAnswerReset();
+            } catch (Exception ignored) {
+                // 重置失败不该阻断重试
+            }
+        }
         CountDownLatch latch = new CountDownLatch(1);
         AtomicReference<ChatResponse> responseRef = new AtomicReference<>();
         AtomicReference<Throwable> errorRef = new AtomicReference<>();
@@ -1489,10 +1607,12 @@ public class AgentLoop {
                                            Consumer<String> progressCallback, LoopState state) {
         Map<String, String> cachedResults = new HashMap<>();
         Map<String, ToolInvocation> invocations = new ConcurrentHashMap<>();
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-        // 整批等待时长必须跟着各调用自己的闸门走：写死 300s 会让一条声明了
-        // timeout=600 的只读命令在读结果时被当成超时，而进程其实还在跑。
-        long batchWaitSeconds = 0L;
+        // 用 ExecutorService.submit 拿到真正的 Future：cancel(true) 会**中断**工作线程，
+        // 而 CompletableFuture 的 cancel 只改状态、不打断已在运行的任务 ——
+        // 于是"报超时但工具还在跑、还在写盘"，模型重试就产生重复副作用。
+        List<Future<?>> futures = new ArrayList<>();
+        List<Long> deadlines = new ArrayList<>();
+        long batchDeadline = 0L;
 
         RunScope scope = RunScope.capture();
         final int turn = state.currentTurn;
@@ -1511,6 +1631,7 @@ public class AgentLoop {
                         toolIdOf(tc) + "|" + name,
                         state.toolResultCache.get(cacheKey));
                 futures.add(CompletableFuture.completedFuture(null));
+                deadlines.add(0L);
                 continue;
             }
 
@@ -1520,27 +1641,55 @@ public class AgentLoop {
             }
 
             long timeout = resolveToolTimeout(name, args);
-            batchWaitSeconds = Math.max(batchWaitSeconds, timeout);
             ToolRequest request = toolRequest(
                     name, args, turn, denyProbes, state, scope);
-            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeout);
+            batchDeadline = Math.max(batchDeadline, deadline);
+            futures.add(VIRTUAL_EXECUTOR.submit(() -> {
                 try (var ignored = scope.bind()) {
                     ToolInvocation invocation = toolPipeline.invoke(request);
                     if (invocation != null) {
                         invocations.put(toolIdOf(tc) + "|" + name, invocation);
                     }
                 }
-            }, VIRTUAL_EXECUTOR).orTimeout(timeout, java.util.concurrent.TimeUnit.SECONDS);
-            futures.add(future);
+            }));
+            deadlines.add(deadline);
         }
 
-        try {
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                    .get(Math.max(60L, batchWaitSeconds + 30L), java.util.concurrent.TimeUnit.SECONDS);
-        } catch (Exception e) {
-            log.warn("并行工具异常: {}，等待剩余 future 完成", e.getMessage());
-            for (CompletableFuture<Void> f : futures) {
-                try { f.get(5, java.util.concurrent.TimeUnit.SECONDS); } catch (Exception ignored) {}
+        // 按每个调用自己的截止时间等待；超时即 cancel(true) 真正中断，并记录是哪几个被取消。
+        Set<String> timedOut = new LinkedHashSet<>();
+        for (int i = 0; i < futures.size(); i++) {
+            Future<?> f = futures.get(i);
+            long deadline = deadlines.get(i);
+            if (deadline == 0L) {
+                continue; // 缓存命中，无任务
+            }
+            long remainNanos = deadline - System.nanoTime();
+            try {
+                f.get(Math.max(1L, remainNanos), TimeUnit.NANOSECONDS);
+            } catch (java.util.concurrent.TimeoutException te) {
+                f.cancel(true); // 中断工作线程；子进程由工具内的 finally 强杀
+                timedOut.add(toolNameOf(toolCalls.get(i)));
+                log.warn("  [并行] {} 超时，已请求中断（进程树由工具侧强杀）",
+                        toolNameOf(toolCalls.get(i)));
+            } catch (Exception e) {
+                log.warn("并行工具异常: {}，继续收集其余结果", e.getMessage());
+            }
+        }
+        if (!timedOut.isEmpty()) {
+            log.warn("并行批次共 {} 个调用超时: {}", timedOut.size(), timedOut);
+        }
+
+        // 给被中断的任务一点收尾时间（工具侧会在 finally 里强杀子进程），但不再无限等：
+        // 已经超时的调用不该阻塞整轮。
+        for (Future<?> f : futures) {
+            if (f.isDone()) {
+                continue;
+            }
+            try {
+                f.get(5, TimeUnit.SECONDS);
+            } catch (Exception ignored) {
+                // 仍未结束：结果按超时处理（收集阶段会给合成结果）
             }
         }
 
@@ -1627,16 +1776,20 @@ public class AgentLoop {
                     consecutiveProbeTurns(messages));
             ToolRequest request = toolRequest(
                     fName, fArgs, turn, denyProbes, state, scope);
-            CompletableFuture<ToolInvocation> future = CompletableFuture.supplyAsync(() -> {
-                try (var ignored = scope.bind()) {
-                    return toolPipeline.invoke(request);
-                }
-            }, VIRTUAL_EXECUTOR);
+            // submit 而非 supplyAsync：只有 ExecutorService 的 Future 才支持
+            // "cancel(true) 真正中断工作线程"。CompletableFuture 的 cancel 只改状态，
+            // 于是超时后工具还在跑（还在写盘），模型重试就产生重复副作用。
+            Future<ToolInvocation> future = VIRTUAL_EXECUTOR.submit(
+                    () -> {
+                        try (var ignored = scope.bind()) {
+                            return toolPipeline.invoke(request);
+                        }
+                    });
             try {
                 result = applyInvocation(future.get(timeout, TimeUnit.SECONDS), state);
             } catch (java.util.concurrent.TimeoutException te) {
                 future.cancel(true);
-                log.warn("  工具 {} 执行超时（{}s），请求取消", name, timeout);
+                log.warn("  工具 {} 执行超时（{}s），已中断工作线程（子进程由工具侧强杀进程树）", name, timeout);
                 ToolResult timeoutResult = timeoutToolResult(name, args, timeout);
                 state.noteStructuredResult(name, timeoutResult);
                 result = timeoutResult.legacyText();

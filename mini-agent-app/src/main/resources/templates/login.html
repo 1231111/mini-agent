@@ -111,6 +111,15 @@
         }
         .form-section { display: none; }
         .form-section.active { display: block; }
+        .register-link {
+            display: none;
+            margin-top: 16px;
+            text-align: center;
+            color: #10a37f;
+            font-size: 13px;
+            text-decoration: none;
+        }
+        .register-link:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
@@ -120,69 +129,33 @@
             <h1>Mini Agent</h1>
         </div>
         
-        <div class="tabs">
-            <div class="tab active" onclick="switchTab('login')">Login</div>
-            <div class="tab" onclick="switchTab('register')">Register</div>
-        </div>
-        
-        <!-- Login Form -->
         <div id="loginForm" class="form-section active">
             <div class="form-group">
-                <label>Username</label>
-                <input type="text" id="loginUsername" placeholder="Enter username" onkeydown="if(event.key==='Enter')doLogin()">
+                <label>用户名</label>
+                <input type="text" id="loginUsername" placeholder="请输入用户名"
+                       onkeydown="if(event.key==='Enter')doLogin()">
             </div>
             <div class="form-group">
-                <label>Password</label>
-                <input type="password" id="loginPassword" placeholder="Enter password" onkeydown="if(event.key==='Enter')doLogin()">
+                <label>密码</label>
+                <input type="password" id="loginPassword" placeholder="请输入密码"
+                       onkeydown="if(event.key==='Enter')doLogin()">
             </div>
             <div class="error-msg" id="loginError"></div>
-            <button class="submit-btn" onclick="doLogin()">Login</button>
-            <button type="button" class="submit-btn" id="portalRegister"
-                    style="display:none;background:#212121;border:1px solid rgba(255,255,255,.12);">
-                没有账号？去网页注册
-            </button>
-        </div>
-        
-        <!-- Register Form -->
-        <div id="registerForm" class="form-section">
-            <div class="form-group">
-                <label>Username</label>
-                <input type="text" id="regUsername" placeholder="Choose a username">
-            </div>
-            <div class="form-group">
-                <label>Password</label>
-                <input type="password" id="regPassword" placeholder="至少 8 位" minlength="8" autocomplete="new-password">
-            </div>
-            <div class="form-group">
-                <label>Display Name (optional)</label>
-                <input type="text" id="regDisplayName" placeholder="Your display name">
-            </div>
-            <div class="error-msg" id="regError"></div>
-            <button class="submit-btn" onclick="doRegister()">Register</button>
+            <button class="submit-btn" onclick="doLogin()">登录</button>
+            <a id="portalRegister" class="register-link" href="#">没有账号？去云端注册</a>
         </div>
     </div>
 
     <script src="/js/security.js"></script>
     <script>
-        function switchTab(tab) {
-            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-            document.querySelectorAll('.form-section').forEach(f => f.classList.remove('active'));
-            if (tab === 'login') {
-                document.querySelectorAll('.tab')[0].classList.add('active');
-                document.getElementById('loginForm').classList.add('active');
-            } else {
-                document.querySelectorAll('.tab')[1].classList.add('active');
-                document.getElementById('registerForm').classList.add('active');
-            }
-        }
-
         // 进入登录页即视为未登录态：清空可能残留的 token
         try { window.MiniAuth.clear(); } catch (_) {}
 
-        // 配了账号门户时，注册不在壳里做。门户地址来自 Electron，不从公开 API 读。
-        (async function hideLocalRegisterWhenPortalConfigured() {
+        // 注册只在云端网页做。地址来自 Electron，不从公开 API 读。
+        (async function wireCloudRegister() {
             const api = window.electronAPI;
-            if (!api || !api.getPortalUrl) {
+            const link = document.getElementById('portalRegister');
+            if (!api || !api.getPortalUrl || !api.openExternal) {
                 return;
             }
             let url = '';
@@ -194,18 +167,10 @@
             if (!url) {
                 return;
             }
-            const tabs = document.querySelector('.tabs');
-            if (tabs) {
-                tabs.style.display = 'none';
-            }
-            const reg = document.getElementById('registerForm');
-            if (reg) {
-                reg.remove();
-            }
-            const btn = document.getElementById('portalRegister');
-            btn.style.display = 'block';
-            btn.onclick = async function () {
-                const target = url.replace(/\/+$/, '') + '/login';
+            link.style.display = 'block';
+            link.onclick = async function (event) {
+                event.preventDefault();
+                const target = url.replace(/\/+$/, '') + '/login?desktop=1';
                 const opened = await api.openExternal(target);
                 const errEl = document.getElementById('loginError');
                 if (!opened || !opened.ok) {
@@ -223,7 +188,7 @@
             errEl.style.display = 'none';
             
             if (!username || !password) {
-                errEl.textContent = 'Please enter username and password';
+                errEl.textContent = '请输入用户名和密码';
                 errEl.style.display = 'block';
                 return;
             }
@@ -240,53 +205,11 @@
                     window.MiniAuth.setToken(token);
                     window.location.href = '/';
                 } else {
-                    errEl.textContent = data.message || 'Login failed';
+                    errEl.textContent = data.message || '登录失败';
                     errEl.style.display = 'block';
                 }
             } catch (e) {
-                errEl.textContent = 'Network error';
-                errEl.style.display = 'block';
-            }
-        }
-
-    const MIN_PASSWORD_LENGTH = 8;   // 与后端 agent.auth.password-min-length 保持一致
-
-    async function doRegister() {
-        const username = document.getElementById('regUsername').value.trim();
-        const password = document.getElementById('regPassword').value;
-        const displayName = document.getElementById('regDisplayName').value.trim();
-        const errEl = document.getElementById('regError');
-        errEl.style.display = 'none';
-
-        if (!username || !password) {
-            errEl.textContent = 'Please enter username and password';
-            errEl.style.display = 'block';
-            return;
-        }
-        // 长度先在本地拦一道，别让用户为了一个自己看不见的规则反复试
-        if (password.length < MIN_PASSWORD_LENGTH) {
-            errEl.textContent = '密码至少 ' + MIN_PASSWORD_LENGTH + ' 位，当前 ' + password.length + ' 位';
-            errEl.style.display = 'block';
-            return;
-        }
-
-        try {
-                const resp = await fetch('/api/users', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, password, displayName })
-                });
-                const data = await resp.json();
-                const token = data.data && data.data.token;
-                if (data.success && token) {
-                    window.MiniAuth.setToken(token);
-                    window.location.href = '/';
-                } else {
-                    errEl.textContent = data.message || 'Registration failed';
-                    errEl.style.display = 'block';
-                }
-            } catch (e) {
-                errEl.textContent = 'Network error';
+                errEl.textContent = '网络错误';
                 errEl.style.display = 'block';
             }
         }

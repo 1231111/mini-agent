@@ -118,6 +118,17 @@ public class CloudMembershipClient {
         });
     }
 
+    /** 上报一次 LLM 调用。账号服务按云端用户、按天累加。 */
+    public void reportUsage(long userId, long inputTokens, long outputTokens, int llmCalls) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("userId", userId);
+        body.put("inputTokens", inputTokens);
+        body.put("outputTokens", outputTokens);
+        body.put("llmCalls", llmCalls);
+        call("POST", "/api/membership/usage", body, new TypeReference<Envelope<Void>>() {
+        });
+    }
+
     // ==================== 传输与解包 ====================
 
     private <T> T call(String method, String path, Object body, TypeReference<Envelope<T>> type) {

@@ -3,12 +3,17 @@ services:
     image: mysql:8.0
     container_name: miniagent-mysql
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-mysql_root_pass}
+      # 不给默认值：仓库里能查到的口令等于没有口令。
+      # 旧写法 ${MYSQL_ROOT_PASSWORD:-mysql_root_pass} 让"照抄模板直接 up"变成
+      # 用已知口令把 root 版 MySQL 发布到公网（且启动自检只拒绝 changeme/replace-，会放过它）。
+      # ${VAR:?} 让未设置时 compose 直接报错退出，而不是静默用弱口令起来。
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 必须显式设置（不要使用仓库示例值）}
       MYSQL_DATABASE: mini_agent
       MYSQL_CHARACTER_SET_SERVER: utf8mb4
       MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
     ports:
-      - "3306:3306"
+      # 只绑回环：数据库不该对公网发布。需要远程访问请走 SSH 隧道或内网地址。
+      - "127.0.0.1:3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
@@ -25,17 +30,18 @@ services:
     image: redis:7-alpine
     container_name: miniagent-redis
     ports:
-      - "6379:6379"
+      # 同上：只绑回环，不对外发布。
+      - "127.0.0.1:6379:6379"
     # 生产档的 ProductionReadinessValidator 硬断言 REDIS_PASSWORD 非空。
     # 光在 app 侧设那个变量是自欺欺人 —— Redis 自己不校验，密码就只是一行摆设。
-    # 所以这里让 Redis 真的要求认证，密码与 app 侧同源（同一个变量名 + 同一个默认值）。
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-miniagent_redis_pass}"]
+    # 所以这里让 Redis 真的要求认证，密码与 app 侧同源；且不给默认值。
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD 必须显式设置（不要使用仓库示例值）}"]
     volumes:
       - redis-data:/data
     healthcheck:
       # 带密码后 ping 也必须认证，否则健康检查永远失败、app 永远等不到 redis healthy。
       # --no-auth-warning 只是为了不让 "Using a password with -a" 刷满日志。
-      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD:-miniagent_redis_pass}", "ping"]
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD:?}", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -61,8 +67,9 @@ services:
     image: minio/minio:RELEASE.2024-12-18T13-15-44Z
     container_name: miniagent-minio
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      # 不给 minioadmin/minioadmin：这是 MinIO 的出厂名，任何扫描器都会先试它。
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY 必须显式设置}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY 必须显式设置}
     command: minio server /minio_data --console-address ":9001"
     volumes:
       - minio-data:/minio_data
@@ -81,11 +88,12 @@ services:
     environment:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
-      MINIO_ACCESS_KEY_ID: minioadmin
-      MINIO_SECRET_ACCESS_KEY: minioadmin
+      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?}
     ports:
-      - "19530:19530"
-      - "9091:9091"
+      # 向量库不对外发布；只有 app 需要它，走 compose 内网。
+      - "127.0.0.1:19530:19530"
+      - "127.0.0.1:9091:9091"
     volumes:
       - milvus-data:/var/lib/milvus
     depends_on:
@@ -105,7 +113,8 @@ services:
       context: ./embedding-server
     container_name: miniagent-embedding
     ports:
-      - "8008:8008"
+      # 内网服务，不对外发布；需要本机调试时用 127.0.0.1:8008。
+      - "127.0.0.1:8008:8008"
     environment:
       MODEL_DIR: /models/models/IEITYuan--Yuan-embedding-2.0-zh/snapshots/master
       MODEL_NAME: Yuan-embedding-2.0-zh
@@ -151,10 +160,13 @@ services:
       # 前三项由 application-prod.yml 里的 ${DB_URL:...} 接住，同时也喂给数据源；
       # 后五项只有断言在读。命名上必须用这里的名字，不能拿 SPRING_DATASOURCE_* 代替。
       DB_URL: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
-      DB_USERNAME: root
-      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-mysql_root_pass}
+      # 应用不用 root：应用只需要 mini_agent 库的读写权限，root 会把"注错库/删库"的代价放大到整实例。
+      # 首次部署需按 README/运维手册给 DB_USERNAME 对应的账号授权；
+      # 临时沿用 root 时也必须显式设置 DB_USERNAME=root，而不是由模板替你决定。
+      DB_USERNAME: ${DB_USERNAME:?DB_USERNAME 必须显式设置（建议使用非 root 的应用账号）}
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 必须显式设置}
       # 与上面 redis 服务的 --requirepass 同源，两边不一致时会连不上 Redis。
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-miniagent_redis_pass}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD 必须显式设置}
       # 每一项都必须是精确的 HTTPS origin（不能带 path / query / 凭据）。
       # 默认 https://localhost 只为让本地自测能通过；生产必须覆盖成真实域名。
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://localhost}

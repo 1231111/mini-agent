@@ -32,11 +32,28 @@ class PermissionPolicyTest {
                 PermissionPolicy.effectiveExecPolicy(PermissionMode.ACCEPT_EDITS, ExecPolicy.BLOCK));
         assertTrue(PermissionPolicy.isExecBlocked("exec_command",
                 PermissionPolicy.effectiveExecPolicy(PermissionMode.ACCEPT_EDITS, ExecPolicy.BLOCK)));
-        // 而所有非 block 档在 ACCEPT_EDITS 下被提升成 ALLOW（保持该模式"跳过二次询问"的旧语义）
-        assertEquals(ExecPolicy.ALLOW,
+    }
+
+    @Test
+    void acceptEditsMustNotPromoteExecPolicyToAllow() {
+        // 回归锁：此前 effectiveExecPolicy 在 ACCEPT_EDITS 下把任何非 block 档提升成 ALLOW，
+        // 于是"为了不弹编辑确认"切一个模式，就顺带得到了"任意命令免批执行"。
+        // 这与 blockIsHardGateThatAcceptEditsCannotBypass 声称的语义自相矛盾，
+        // 也让 prod 默认的 ask 档形同虚设。现在 exec 策略原样返回，模式不参与提升。
+        assertEquals(ExecPolicy.ASK,
                 PermissionPolicy.effectiveExecPolicy(PermissionMode.ACCEPT_EDITS, ExecPolicy.ASK));
         assertEquals(ExecPolicy.ALLOW,
                 PermissionPolicy.effectiveExecPolicy(PermissionMode.ACCEPT_EDITS, ExecPolicy.ALLOW));
+        // 免批只能来自用户显式选择的 allow 档，不能来自会话模式
+        assertTrue(PermissionPolicy.needsSessionGrant(
+                PermissionMode.ACCEPT_EDITS, "exec_command", ExecPolicy.ASK));
+        assertFalse(PermissionPolicy.needsSessionGrant(
+                PermissionMode.ACCEPT_EDITS, "exec_command", ExecPolicy.ALLOW));
+        // 编辑类工具仍按模式的既有语义走"别问我"
+        assertFalse(PermissionPolicy.needsSessionGrant(
+                PermissionMode.ACCEPT_EDITS, "edit_file", ExecPolicy.ASK));
+        assertFalse(PermissionPolicy.needsSessionGrant(
+                PermissionMode.ACCEPT_EDITS, "http_post", ExecPolicy.ASK));
     }
 
     @Test

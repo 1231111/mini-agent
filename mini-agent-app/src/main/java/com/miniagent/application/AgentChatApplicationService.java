@@ -213,7 +213,7 @@ public class AgentChatApplicationService {
             // 记录任务开始事件
             recordEvent(sessionId, null, com.miniagent.memory.model.AgentEvent.EventType.TASK_START,
                 "user", Map.of("question", truncate(userMessage, 500)), null);
-            String answer = doExecuteAgent(
+            AgentResult agentResult = doExecuteAgent(
                     userId,
                     sessionId,
                     run,
@@ -221,6 +221,7 @@ public class AgentChatApplicationService {
                     progressEmitter,
                     imageDataUrls,
                     mediaRefs);
+            String answer = agentResult.answer();
             if (executionControl.isCancelled(sessionId)) {
                 taskRunService.markCancelled(run, "Cancelled by user");
                 recordEvent(
@@ -230,6 +231,22 @@ public class AgentChatApplicationService {
                         "executor",
                         Map.of("reason", "cancelled"),
                         com.miniagent.memory.model.AgentEvent.EventStatus.FAILED);
+                return answer;
+            }
+            PlanningLoop.RunOutcome unfinished = agentResult.unfinishedOutcome();
+            if (unfinished != null) {
+                // 「没做完」不能记为完成。
+                // 此前规划器的死锁/恢复耗尽/轮次用尽都只返回一句"已按规划图推进任务"，
+                // 这里照样 markCompleted —— 任务状态、完成率口径、以及用户对"做完了"的判断
+                // 同时失真。现在按结局分流：UNFINISHED/FAILED 记为失败并留下原因码。
+                String reason = unfinished.reason();
+                taskRunService.markFailed(run, "任务未达成目标: " + reason);
+                recordEvent(sessionId, null,
+                        com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
+                        "executor", Map.of("reason", reason),
+                        com.miniagent.memory.model.AgentEvent.EventStatus.FAILED);
+                log.warn("任务未达成目标，标记为失败: session={}, outcome={}, reason={}",
+                        sessionId, unfinished.outcome(), reason);
                 return answer;
             }
             taskRunService.markCompleted(run);
@@ -312,7 +329,29 @@ public class AgentChatApplicationService {
         return com.miniagent.common.StringUtils.truncate(s, maxLen);
     }
 
-    private String doExecuteAgent(
+    /**
+     * 一次 agent 执行的结果。
+     *
+     * <p>{@code unfinishedOutcome} 非空表示"这一轮没达成目标"（规划器死锁/恢复耗尽/轮次用尽/
+     * 任务图无法验收）—— 调用方必须据此把 run 记为失败，而不是完成。</p>
+     */
+    record AgentResult(String answer, PlanningLoop.RunOutcome unfinishedOutcome) {
+    }
+
+    /**
+     * 结局是否意味着"没达成目标"（必须记为失败）。
+     *
+     * <p>抽成独立方法是为了让这条不变式能被单测锁住：它决定任务状态与完成率口径，
+     * 一旦有人把 UNFINISHED 当成正常结束，"没做完也报成功"就会悄悄回来。
+     * {@code BLOCKED_ON_HUMAN} 不算失败 —— 它在等人，既不是完成也不是失败。</p>
+     */
+    static boolean meansUnfinished(PlanningLoop.RunOutcome outcome) {
+        return outcome != null
+                && (outcome.outcome() == PlanningLoop.Outcome.UNFINISHED
+                || outcome.outcome() == PlanningLoop.Outcome.FAILED);
+    }
+
+    private AgentResult doExecuteAgent(
             Long userId,
             String sessionId,
             TaskRunService.RunHandle run,
@@ -409,16 +448,27 @@ public class AgentChatApplicationService {
         };
 
         AgentLoop.setCurrentSession(sessionId);
-        AgentLoop.setCurrentModels(effectiveChat, models.streaming());
+        // 连窗口一起绑定：循环按"配置上限 vs 模型厂商窗口"的较小值决定何时压缩。
+        // 不带窗口时，128k 的模型也会按 512k 估算，压缩永远不触发 → 上游 400 → 误报成网络故障。
+        com.miniagent.common.model.EffectiveModelContext.set(
+                effectiveChat, models.streaming(), models.settings().contextWindowTokens());
         PermissionContext.setSession(sessionId);
         String answer;
+        // 规划器的结局：只有"没做完"会被带出去让调用方记为失败；完成与人等状态保持原语义。
+        PlanningLoop.RunOutcome unfinishedOutcome = null;
         try {
             String executionId = Objects.nonNull(traceRecorder)
                     ? traceRecorder.currentExecutionId() : null;
             if (planningLoop.shouldHandle(taskPlan, sessionId, userMessage)) {
-                answer = planningLoop.run(effectiveChat, systemPrompt, userMessage, multimodalMsg,
+                PlanningLoop.RunOutcome outcome = planningLoop.runWithOutcome(
+                        effectiveChat, systemPrompt, userMessage, multimodalMsg,
                         history, taskPlan, sessionId, run.fencingToken(), executionId,
                         progress, streamSink);
+                answer = outcome.answer();
+                if (meansUnfinished(outcome)) {
+                    unfinishedOutcome = outcome;
+                    runStatus = RunStatus.FAILURE.name();
+                }
             } else if (hasMedia) {
                 answer = agentLoop.runWithMultimodal(effectiveChat, systemPrompt, multimodalMsg, history,
                         maxIterations(), progress, taskPlan, streamSink);
@@ -457,7 +507,7 @@ public class AgentChatApplicationService {
                 StringUtils.isNotBlank(userMessage) ? userMessage : displayQuestion,
                 answer,
                 allSavedPaths.isEmpty() ? null : allSavedPaths);
-        return answer;
+        return new AgentResult(answer, unfinishedOutcome);
         } catch (Exception e) {
             runStatus = RunStatus.FAILURE.name();
             if (Objects.nonNull(traceRecorder)) {

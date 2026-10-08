@@ -43,6 +43,9 @@ public class MembershipController {
     public record PayCallbackRequest(String orderNo, String channel, String channelTxnId) {
     }
 
+    public record UsageRequest(Long userId, Long inputTokens, Long outputTokens, Integer llmCalls) {
+    }
+
     public record OrderView(Long orderId, String orderNo, Long userId, String planCode,
                             long amountCents, String currency, String status,
                             String channel, String channelTxnId, LocalDateTime paidAt) {
@@ -100,5 +103,20 @@ public class MembershipController {
         }
         return ApiResponse.ok(OrderView.of(
                 membership.markPaid(req.orderNo(), req.channel(), req.channelTxnId())));
+    }
+
+    /** 客户机上报一次 LLM 调用。一次调用一行。 */
+    @PostMapping(value = "/usage", consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<Void> usage(@RequestBody(required = false) UsageRequest req) {
+        if (req == null || req.userId() == null) {
+            throw new BusinessException(ErrorCode.MEMBER_USER_NOT_FOUND, "缺少 userId");
+        }
+        long input = req.inputTokens() == null ? 0 : req.inputTokens();
+        long output = req.outputTokens() == null ? 0 : req.outputTokens();
+        int calls = req.llmCalls() == null ? 0 : req.llmCalls();
+        membership.recordUsage(req.userId(), input, output, calls);
+        return ApiResponse.ok(null);
     }
 }

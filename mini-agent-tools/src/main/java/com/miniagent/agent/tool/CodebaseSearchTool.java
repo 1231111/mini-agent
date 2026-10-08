@@ -264,10 +264,12 @@ public class CodebaseSearchTool {
 
     private Path resolvePath(String path) {
         Path p = Path.of(path.replace('\\', '/').trim());
-        if (p.isAbsolute()) {
-            return p.normalize();
-        }
-        return Path.of(System.getProperty("user.dir")).toAbsolutePath().resolve(p).normalize();
+        Path resolved = p.isAbsolute()
+                ? p.normalize()
+                : Path.of(System.getProperty("user.dir")).toAbsolutePath().resolve(p).normalize();
+        // 同 ast_search：索引会遍历整棵树并读文件内容，必须限制在允许的根内。
+        PathGuard.assertAllowed(resolved, "codebase_search");
+        return resolved;
     }
 
     private static String truncate(String s, int max) {

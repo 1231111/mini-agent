@@ -4,6 +4,7 @@ import com.miniagent.account.entity.MembershipOrder;
 import com.miniagent.account.entity.User;
 import com.miniagent.account.repository.UserRepository;
 import com.miniagent.account.service.AccountAuthService;
+import com.miniagent.account.service.DesktopLoginTicketStore;
 import com.miniagent.account.service.MembershipService;
 import com.miniagent.account.web.dto.AccountUserResponse;
 import com.miniagent.common.ApiResponse;
@@ -12,6 +13,7 @@ import com.miniagent.common.exception.BusinessException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpSession;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -39,6 +41,8 @@ public class PortalController {
     private MembershipService membership;
     @Autowired
     private UserRepository users;
+    @Autowired
+    private DesktopLoginTicketStore tickets;
 
     public record LoginBody(String username, String password) {
     }
@@ -49,7 +53,10 @@ public class PortalController {
     public record OrderBody(String planCode) {
     }
 
-    @GetMapping({"/", "/login", "/account"})
+    public record TicketView(String ticket) {
+    }
+
+    @GetMapping({"/", "/login", "/register", "/account"})
     public String page() {
         return "forward:/portal.html";
     }
@@ -92,6 +99,17 @@ public class PortalController {
         return ApiResponse.ok(AccountUserResponse.of(user));
     }
 
+    /**
+     * 刚注册并已建立门户会话的用户，换一张给桌面客户端用的一次性凭证。
+     */
+    @PostMapping(value = "/api/portal/desktop-ticket",
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<TicketView> desktopTicket(HttpServletRequest request) {
+        User user = requireUser(request);
+        return ApiResponse.ok(new TicketView(tickets.issue(user.getId())));
+    }
+
     @PostMapping(value = "/api/portal/logout",
             produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
@@ -127,6 +145,13 @@ public class PortalController {
                         ErrorCode.MEMBER_SUBSCRIPTION_NOT_FOUND, "没有生效中的订阅"));
     }
 
+    @GetMapping(value = "/api/portal/usage", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<MembershipService.UsageView> usage(HttpServletRequest request) {
+        Long userId = requireUser(request).getId();
+        return ApiResponse.ok(membership.usageOf(userId));
+    }
+
     @GetMapping(value = "/api/portal/orders", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<List<MembershipController.OrderView>> orders(HttpServletRequest request) {
@@ -150,12 +175,28 @@ public class PortalController {
         return ApiResponse.ok(MembershipController.OrderView.of(order));
     }
 
+    /**
+     * 浏览器把订单标记为已支付。
+     *
+     * <p><b>默认关闭，且默认关闭是安全边界而不是临时开关。</b>这个端点没有任何支付凭证校验，
+     * 任何登录用户都能把自己的订单（含 pro 档）直接置为 PAID 并立刻拿到对应额度 ——
+     * 等于所有付费档免费。订单状态只能由**签名校验过的渠道回调**流转；
+     * 在真实回调接入前，这里仅在运维显式打开开关（{@code agent.account.portal-confirm-enabled=true}）
+     * 时才可用，用于本地联调。</p>
+     */
+    @Value("${agent.account.portal-confirm-enabled:false}")
+    private boolean portalConfirmEnabled;
+
     @PostMapping(value = "/api/portal/orders/{orderNo}/confirm",
             produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<MembershipController.OrderView> confirm(
             @PathVariable String orderNo, HttpServletRequest request) {
         Long userId = requireUser(request).getId();
+        if (!portalConfirmEnabled) {
+            throw new BusinessException(ErrorCode.AUTH_FORBIDDEN,
+                    "该入口已关闭：订单状态只能由支付渠道回调确认，浏览器不能自行标记已支付");
+        }
         MembershipOrder order = membership.confirmPortalPayment(userId, orderNo);
         return ApiResponse.ok(MembershipController.OrderView.of(order));
     }

@@ -81,13 +81,15 @@ curl -s http://127.0.0.1:8081/actuator/health
 | GET | `/api/membership/current?userId=` | 服务间密钥 | 某人当前生效的会员 |
 | POST | `/api/membership/orders` | 服务间密钥 | 下单，只落一条 `PENDING` 订单 |
 | POST | `/api/membership/pay-callback` | 服务间密钥 | 支付回调，**幂等** |
-| GET | `/`、`/login`、`/account` | 无 | 账号网页：注册、登录、套餐、订单 |
+| POST | `/api/membership/usage` | 服务间密钥 | 上报一次 LLM 调用。一次调用一行 |
+| GET | `/`、`/login`、`/register`、`/account` | 无 | 账号网页：注册、登录、套餐、用量、订单 |
 | POST | `/api/portal/session` | 无 | 网页登录，写浏览器会话，不返回 token |
 | POST | `/api/portal/users` | 无 | 网页注册，并写浏览器会话 |
 | POST | `/api/portal/logout` | 浏览器会话 | 退出网页 |
 | GET | `/api/portal/me` | 浏览器会话 | 当前网页登录用户 |
 | GET | `/api/portal/plans` | 浏览器会话 | 可售套餐 |
 | GET | `/api/portal/membership` | 浏览器会话 | 当前会员 |
+| GET | `/api/portal/usage` | 浏览器会话 | 今日合计，以及最近 31 天内每次上报（最多 100 条） |
 | GET | `/api/portal/orders` | 浏览器会话 | 本人订单 |
 | POST | `/api/portal/orders` | 浏览器会话 | 下单，只落 PENDING |
 | POST | `/api/portal/orders/{orderNo}/confirm` | 浏览器会话 | 本人确认到账。未接支付渠道 |
@@ -114,6 +116,14 @@ curl -s http://127.0.0.1:8081/actuator/health
 agent 侧的配额闸门 `DbTenantTokenQuota.check/consume(tenantId)` 只读这一列，它不知道会员、订单、套餐的存在——**agent 侧一行代码都不用改**，而本服务的表结构和业务语义可以任意演进。
 
 替代方案是让 agent 也认识「会员等级」然后自己按等级算配额。那样每加一个等级维度（并发数、可用模型）都要改 agent 的配额代码，而且配额在两侧各算一遍，迟早会出现「界面显示一个值、实际卡在另一个值」。
+
+### 用量明细
+
+`membership_usage_events` 每次 LLM 调用一行：`input_tokens`、`output_tokens`、`reported_at`。请求次数是行数，不按天合并。客户机每次模型调用成功后，用影子用户的 `users.external_id`（云端用户 id）异步 `POST /api/membership/usage`。本服务不读 agent 的 `tenant_daily_usage`。
+
+日切时区是 `agent.quota.zone-id`，默认 `Asia/Shanghai`，和客户机配额同一天。门户 `GET /api/portal/usage` 返回今天的合计，以及含今天在内最近 31 天的每次上报，最多 100 条，新的在前。今天的合计不受这 100 条限制。
+
+客户机没配 `ACCOUNT_INTERNAL_KEY`（或和账号服务不一致）时，上报直接跳过，门户数字停在 0。本地注册、没有 `external_id` 的用户也不会上报。
 
 ### 云端 agent 侧必须配 `shared-database: true`
 
@@ -165,6 +175,7 @@ agent:
 | --- | --- |
 | `V1__account_baseline.sql` | `tenants` / `users`，全部 `CREATE TABLE IF NOT EXISTS`，列定义是 agent 侧 V1+V2+V8 叠加后的最终形状 |
 | `V2__membership.sql` | `membership_plans` / `membership_subscriptions` / `membership_orders`，并插入 `free` / `pro` 两个种子套餐 |
+| `V3__membership_usage.sql` | `membership_usage_events`，一次 LLM 调用一行 |
 
 两点要留意：
 

@@ -5,20 +5,28 @@ import com.miniagent.account.entity.MembershipPlan;
 import com.miniagent.account.entity.MembershipSubscription;
 import com.miniagent.account.entity.Tenant;
 import com.miniagent.account.entity.User;
+import com.miniagent.account.entity.MembershipUsageEvent;
 import com.miniagent.account.repository.MembershipOrderRepository;
 import com.miniagent.account.repository.MembershipPlanRepository;
 import com.miniagent.account.repository.MembershipSubscriptionRepository;
+import com.miniagent.account.repository.MembershipUsageEventRepository;
+import com.miniagent.account.repository.UsageSum;
 import com.miniagent.account.repository.TenantRepository;
 import com.miniagent.account.repository.UserRepository;
 import com.miniagent.common.ErrorCode;
 import com.miniagent.common.exception.BusinessException;
+import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Optional;
@@ -38,12 +46,10 @@ import java.util.concurrent.ThreadLocalRandom;
  * 那样每加一个等级维度（并发数、可用模型）都要改 agent 的配额代码，
  * 而且配额在两侧各算一遍，迟早会出现"界面显示一个值、实际卡在另一个值"。
  *
- * <h3>为什么本服务不读用量</h3>
+ * <h3>用量明细</h3>
  *
- * <p>{@code tenant_daily_usage} 是 agent 的运行数据，本服务不映射它。
- * 「今日已用 X / 上限 Y」里的分子属于 agent 的职责，应由调用方组装。
- * 让账号服务去读 agent 的表，会把"账号与付费"和"运行计量"两条边界混掉，
- * 以后想把 agent 换成另一个实现时会被这张表钉住。
+ * <p>本服务不读 agent 的 {@code tenant_daily_usage}。门户上的「今日已用」来自
+ * {@code membership_usage_events}：客户机每次 LLM 调用上报一行，不按天合并。
  */
 @Service
 public class MembershipService {
@@ -52,6 +58,12 @@ public class MembershipService {
 
     /** 注册时自动建立的套餐。它是"新用户默认额度"的唯一来源，见 AccountAuthService.createPersonalTenant 的说明。 */
     public static final String FREE_PLAN_CODE = "free";
+
+    /** 门户明细最多往前看的天数，含今天。 */
+    private static final int USAGE_HISTORY_DAYS = 31;
+
+    /** 明细表最多返回的行数。今天的合计另算，不受这个上限影响。 */
+    private static final int USAGE_DETAIL_LIMIT = 100;
 
     @Autowired
     private MembershipPlanRepository plans;
@@ -63,6 +75,19 @@ public class MembershipService {
     private TenantRepository tenants;
     @Autowired
     private UserRepository users;
+    @Autowired
+    private MembershipUsageEventRepository usageEvents;
+
+    /** 与客户机配额日切同一时区，避免「云端的今天」和「本机的今天」差一天。 */
+    @Value("${agent.quota.zone-id:Asia/Shanghai}")
+    private String quotaZoneId;
+
+    private ZoneId quotaZone = ZoneId.of("Asia/Shanghai");
+
+    @PostConstruct
+    void initZone() {
+        quotaZone = ZoneId.of(quotaZoneId);
+    }
 
     /**
      * 会员视图。给调用方渲染"我的会员"用。
@@ -74,6 +99,21 @@ public class MembershipService {
     public record MembershipView(String planCode, String planName, long dailyTokenLimit,
                                  int maxConcurrentTasks, LocalDateTime expireAt,
                                  String sourceOrderNo) {
+    }
+
+    /** 一次上报。 */
+    public record UsageEventView(LocalDateTime reportedAt, String planCode, long inputTokens,
+                                 long outputTokens, long totalTokens) {
+        static UsageEventView of(MembershipUsageEvent row) {
+            long total = row.getInputTokens() + row.getOutputTokens();
+            return new UsageEventView(row.getReportedAt(), row.getPlanCode(),
+                    row.getInputTokens(), row.getOutputTokens(), total);
+        }
+    }
+
+    public record UsageView(LocalDate date, long dailyTokenLimit, long inputTokens,
+                            long outputTokens, long totalTokens, int llmCalls,
+                            List<UsageEventView> events) {
     }
 
     /** 可售套餐视图。刻意不直接序列化实体 —— 实体以后加了成本价之类的字段会静默泄露。 */
@@ -127,10 +167,64 @@ public class MembershipService {
     }
 
     /**
+     * 记一次 LLM 调用。一次调用一行。{@code userId} 是云端用户 id。
+     * 日切用 {@code agent.quota.zone-id}，默认 Asia/Shanghai。
+     */
+    @Transactional
+    public void recordUsage(Long userId, long inputTokens, long outputTokens, int llmCalls) {
+        if (userId == null || !users.existsById(userId)) {
+            throw new BusinessException(ErrorCode.MEMBER_USER_NOT_FOUND, "用户不存在");
+        }
+        long input = Math.max(0, inputTokens);
+        long output = Math.max(0, outputTokens);
+        if (input == 0 && output == 0 && llmCalls <= 0) {
+            return;
+        }
+        String planCode = current(userId).map(MembershipView::planCode).orElse("");
+        if (planCode.length() > 32) {
+            planCode = planCode.substring(0, 32);
+        }
+        MembershipUsageEvent row = new MembershipUsageEvent();
+        row.setUserId(userId);
+        row.setPlanCode(planCode);
+        row.setInputTokens(input);
+        row.setOutputTokens(output);
+        row.setReportedAt(LocalDateTime.now(quotaZone));
+        usageEvents.save(row);
+    }
+
+    /**
+     * 今天的合计，以及含今天在内最近 {@value #USAGE_HISTORY_DAYS} 天的每次上报。
+     * 明细最多 {@value #USAGE_DETAIL_LIMIT} 条，新的在前。
+     */
+    @Transactional(readOnly = true)
+    public UsageView usageOf(Long userId) {
+        LocalDate today = LocalDate.now(quotaZone);
+        LocalDateTime start = today.atStartOfDay();
+        LocalDateTime end = today.plusDays(1).atStartOfDay();
+        LocalDateTime from = today.minusDays(USAGE_HISTORY_DAYS - 1L).atStartOfDay();
+        UsageSum sum = usageEvents.sumBetween(userId, start, end);
+        long input = sum == null ? 0 : sum.inputTokens();
+        long output = sum == null ? 0 : sum.outputTokens();
+        long calls = sum == null ? 0 : sum.llmCalls();
+        List<UsageEventView> events = usageEvents
+                .findByUserIdAndReportedAtGreaterThanEqualOrderByIdDesc(
+                        userId, from, PageRequest.of(0, USAGE_DETAIL_LIMIT))
+                .stream()
+                .map(UsageEventView::of)
+                .toList();
+        long limit = current(userId).map(MembershipView::dailyTokenLimit).orElse(0L);
+        int shownCalls = calls > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) calls;
+        return new UsageView(today, limit, input, output, input + output, shownCalls, events);
+    }
+
+    /**
      * 网页门户确认到账。只允许订单本人操作。
      *
-     * <p>ponytail: 渠道名固定为 portal。接真实支付后改为渠道回调，
-     * 浏览器不能再直接把订单标成已支付。
+     * <p><b>没有任何支付凭证校验</b> —— 因此它只能在运维显式打开
+     * {@code agent.account.portal-confirm-enabled=true} 时被调用（默认关闭），
+     * 用于本地联调。真实上线的到账入口必须是签名校验过的渠道回调；
+     * 在它接入之前，把 {@code MarkPaid} 暴露给浏览器等于所有付费档免费。</p>
      */
     @Transactional
     public MembershipOrder confirmPortalPayment(Long userId, String orderNo) {

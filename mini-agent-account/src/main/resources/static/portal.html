@@ -72,6 +72,19 @@
             <button type="button" class="ghost" id="logoutBtn">退出</button>
         </div>
         <div class="card">
+            <h2 style="margin:0 0 8px;font-size:16px;">用量</h2>
+            <p class="muted" id="usageSummary">暂无用量</p>
+            <table>
+                <thead>
+                <tr>
+                    <th>时间</th><th>套餐</th><th>输入 token</th>
+                    <th>输出 token</th><th>合计</th>
+                </tr>
+                </thead>
+                <tbody id="usageDays"></tbody>
+            </table>
+        </div>
+        <div class="card">
             <h2 style="margin:0 0 8px;font-size:16px;">充值</h2>
             <p class="muted">还没有接入支付渠道。确认后按订单金额直接开通。</p>
             <div id="plans"></div>
@@ -158,6 +171,15 @@ registerForm.onsubmit = async function (event) {
         err.textContent = body.message || '注册失败';
         return;
     }
+    const fromDesktop = new URLSearchParams(location.search).get('desktop') === '1';
+    if (fromDesktop) {
+        const ticket = await call('/api/portal/desktop-ticket', { method: 'POST' });
+        if (ticket.success && ticket.data && ticket.data.ticket) {
+            location.href = 'miniagent://login?ticket='
+                + encodeURIComponent(ticket.data.ticket);
+            return;
+        }
+    }
     location.href = '/account';
 };
 
@@ -176,6 +198,27 @@ async function loadDesk() {
         ? ('当前套餐 ' + plan.data.planName + ' · 每日 '
             + plan.data.dailyTokenLimit + ' token')
         : (plan.message || '没有生效中的订阅');
+    const usage = await call('/api/portal/usage');
+    if (usage.success && usage.data) {
+        const d = usage.data;
+        document.getElementById('usageSummary').textContent =
+            '今日 ' + d.date + ' · token ' + d.totalTokens + ' / ' + d.dailyTokenLimit
+            + ' · 输入 ' + d.inputTokens + ' · 输出 ' + d.outputTokens
+            + ' · LLM 请求 ' + d.llmCalls + ' 次';
+        const usageBody = document.getElementById('usageDays');
+        usageBody.replaceChildren();
+        (d.events || []).forEach(function (row) {
+            const when = String(row.reportedAt || '').replace('T', ' ').slice(0, 19);
+            const tr = document.createElement('tr');
+            [when, row.planCode, row.inputTokens, row.outputTokens,
+                row.totalTokens].forEach(function (cell) {
+                const td = document.createElement('td');
+                td.textContent = cell;
+                tr.appendChild(td);
+            });
+            usageBody.appendChild(tr);
+        });
+    }
     const plans = await call('/api/portal/plans');
     const box = document.getElementById('plans');
     box.replaceChildren();
@@ -248,8 +291,11 @@ document.getElementById('logoutBtn').onclick = async function () {
 };
 
 const path = location.pathname.replace(/\/+$/, '') || '/';
+const fromDesktop = new URLSearchParams(location.search).get('desktop') === '1';
 if (path === '/account') {
     loadDesk();
+} else if (path === '/register' || fromDesktop) {
+    showAuth(true);
 } else {
     showAuth(false);
 }

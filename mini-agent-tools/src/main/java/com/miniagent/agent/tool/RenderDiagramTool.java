@@ -93,9 +93,9 @@ public class RenderDiagramTool {
     }
 
     private Path resolveOut(String path) {
-        return BuiltinTools.resolveWritePath(
-                BuiltinTools.effectiveWorkspaceRoot(),
-                BuiltinTools.writeTaskDir(), path, false);
+        // 走 resolveOutputPath（它带 PathGuard 越界判定），不要直接调 resolveWritePath ——
+        // 那是未加约束的内核，绕过它就等于 render_diagram 能往任意路径写文件。
+        return BuiltinTools.resolveOutputPath(path);
     }
 
     private String loadSource(String source) throws IOException {
@@ -103,15 +103,15 @@ public class RenderDiagramTool {
         if (looksLikeMermaid(trimmed) || looksLikeSvg(trimmed)) {
             return trimmed;
         }
-        Path file = BuiltinTools.resolveWritePath(
-                BuiltinTools.effectiveWorkspaceRoot(),
-                BuiltinTools.writeTaskDir(), trimmed, false);
+        Path file = BuiltinTools.resolveOutputPath(trimmed);
         if (Files.isRegularFile(file)) {
             return Files.readString(file, StandardCharsets.UTF_8);
         }
         Path fromRoot = Path.of(System.getProperty("user.dir"))
                 .toAbsolutePath().resolve(trimmed).normalize();
         if (Files.isRegularFile(fromRoot)) {
+            // 项目根在允许范围内；仍走一次判定，避免以后有人改这里时静默放宽
+            PathGuard.assertAllowed(fromRoot, "render_diagram");
             return Files.readString(fromRoot, StandardCharsets.UTF_8);
         }
         return trimmed;

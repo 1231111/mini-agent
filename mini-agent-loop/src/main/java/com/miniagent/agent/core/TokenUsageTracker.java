@@ -38,7 +38,18 @@ public class TokenUsageTracker {
         }
     }
 
+    /** 一次模型调用记完后的回调。实现方自己决定要不要异步上报。 */
+    @FunctionalInterface
+    public interface LlmCallListener {
+        void onLlmCall(String sessionId, long inputTokens, long outputTokens);
+    }
+
     private static final Map<String, UsageStats> stats = new ConcurrentHashMap<>();
+    private static volatile LlmCallListener listener;
+
+    public static void setListener(LlmCallListener next) {
+        listener = next;
+    }
 
     public static void add(String sessionId, long inputTokens, long outputTokens, int toolCalls) {
         if (Objects.isNull(sessionId)) {
@@ -55,6 +66,15 @@ public class TokenUsageTracker {
             s.addToolCall();
         }
         s.addLlmCall();
+        LlmCallListener current = listener;
+        if (current == null) {
+            return;
+        }
+        try {
+            current.onLlmCall(sessionId, inputTokens, outputTokens);
+        } catch (RuntimeException ignored) {
+            // 上报失败不能打断模型循环。
+        }
     }
 
     public static void addToolCall(String sessionId) {

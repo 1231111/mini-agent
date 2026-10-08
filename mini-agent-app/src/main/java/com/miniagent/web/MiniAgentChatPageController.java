@@ -237,6 +237,34 @@ public class MiniAgentChatPageController {
         return ApiResponse.ok(status);
     }
 
+    /**
+     * 云端网页注册成功后的自动登录。凭证由账号服务签发，用过即废。
+     */
+    @PostMapping(value = "/api/auth/desktop-login",
+            consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<UserDTO> desktopLogin(
+            @RequestBody(required = false) DesktopLoginRequest req) {
+        if (req == null || req.ticket() == null || req.ticket().isBlank()) {
+            return ApiResponse.fail(ErrorCode.AUTH_SESSION_INVALID, "登录凭证无效");
+        }
+        if (!cloudAccountService.enabled()) {
+            return ApiResponse.fail(ErrorCode.AUTH_CLOUD_NOT_CONFIGURED);
+        }
+        try {
+            User user = cloudAccountService.loginWithTicket(req.ticket());
+            return ApiResponse.ok(toUserDto(user, jwtSessionService.issueToken(user.getId())));
+        } catch (CloudAccountException e) {
+            log.warn("云端注册回跳登录失败: code={} msg={}",
+                    e.errorCode().getCode(), e.getMessage());
+            return ApiResponse.fail(e.errorCode(), e.getMessage());
+        }
+    }
+
+    public record DesktopLoginRequest(String ticket) {
+    }
+
     private static UserDTO toUserDto(User user, String token) {
         return UserDTO.builder()
                 .userId(user.getId())

@@ -94,6 +94,8 @@ public class SecurityConfig {
             // 否则用户输完密码才收到网络错误，会误以为是账号问题。
             // 这条只返回 {enabled, reachable, error}，不含云端地址等部署细节。
             "/api/auth/cloud-status",
+            // 网页注册完成后，浏览器用自定义协议把一次性凭证交回尚未登录的客户端。
+            "/api/auth/desktop-login",
             "/actuator/health",
             "/actuator/info",
             "/css/**",
@@ -207,11 +209,34 @@ public class SecurityConfig {
     }
 
     /**
-     * 配置安全响应头
+     * 安全响应头。
+     *
+     * <p>CSP 是纵深防御，不是 XSS 的修复手段：页面里有 4k 行内联 JS 与大量行内事件处理器，
+     * 所以 script-src 必须保留 'unsafe-inline'（保留它意味着行内 onerror= 仍会执行）。
+     * 真正的修复在渲染层（chat.html 的 renderMD 先转义再标记），这里补的是另一类攻击面：
+     * 禁止外域脚本被加载、禁止 object/embed/frame 注入、禁止 &lt;base&gt; 劫持相对 URL。</p>
+     *
+     * <p>img/connect 放开 https 与 data:/blob: 是因为交付物里会有远程图片与本地生成的媒体。</p>
      */
     private void configureSecurityHeaders(org.springframework.security.config.annotation.web.configurers.HeadersConfigurer<HttpSecurity> headers) {
         headers
-            .frameOptions(frameOptions -> frameOptions.sameOrigin());
+            .frameOptions(frameOptions -> frameOptions.sameOrigin())
+            .contentTypeOptions(Customizer.withDefaults())
+            .referrerPolicy(referrer -> referrer
+                    .policy(org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter
+                            .ReferrerPolicy.NO_REFERRER))
+            .contentSecurityPolicy(csp -> csp.policyDirectives(
+                    "default-src 'self'; "
+                            + "script-src 'self' 'unsafe-inline'; "
+                            + "style-src 'self' 'unsafe-inline'; "
+                            + "img-src 'self' data: blob: https:; "
+                            + "media-src 'self' data: blob: https:; "
+                            + "font-src 'self' data:; "
+                            + "connect-src 'self'; "
+                            + "object-src 'none'; "
+                            + "base-uri 'none'; "
+                            + "form-action 'self'; "
+                            + "frame-ancestors 'self'"));
     }
 
     /**

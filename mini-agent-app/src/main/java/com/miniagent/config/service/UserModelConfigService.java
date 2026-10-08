@@ -37,6 +37,9 @@ public class UserModelConfigService {
     private UserModelConfigRepository repository;
     @Autowired
     private AgentModelsProperties modelsProperties;
+    /** 模型密钥的静态加密（写入加密、读取解密）。 */
+    @Autowired
+    private com.miniagent.config.security.SecretCryptoService crypto;
 
     @Value("${langchain4j.open-ai.chat-model.api-key}")
     private String globalApiKey;
@@ -90,7 +93,11 @@ public class UserModelConfigService {
         current.put("baseUrl", eff.baseUrl());
         current.put("modelName", eff.modelName());
         current.put("hasApiKey", Objects.nonNull(eff.apiKey()) && StringUtils.isNotBlank(eff.apiKey()));
-        current.put("apiKeyMasked", maskKey(eff.apiKey()));
+        // 只脱敏"用户自己的 key"。全局/预设 key 的后四位不该回显给每个登录用户 ——
+        // 那属于平台凭据，泄露四位没有任何业务价值，却能被用来确认密钥是否被更换。
+        boolean hasOwnKey = Objects.nonNull(row) && StringUtils.isNotBlank(row.getCustomApiKey());
+        current.put("apiKeyMasked", hasOwnKey ? maskKey(eff.apiKey()) : "");
+        current.put("apiKeySource", hasOwnKey ? "user" : "global");
         current.put("customBaseUrl", Objects.isNull(row) ? "" : nullToEmpty(row.getCustomBaseUrl()));
         current.put("customModelName", Objects.isNull(row) ? "" : nullToEmpty(row.getCustomModelName()));
         current.put("hasCustomApiKey", Objects.nonNull(row) && Objects.nonNull(row.getCustomApiKey()) && StringUtils.isNotBlank(row.getCustomApiKey()));
@@ -165,7 +172,10 @@ public class UserModelConfigService {
             if ("__CLEAR__".equals(trimmed)) {
                 row.setCustomApiKey(null);
             } else if (!trimmed.isEmpty()) {
-                row.setCustomApiKey(trimmed);
+                // 静态加密：密钥属于用户凭据，明文落库等于把"读一次库"变成"拿到所有用户的模型 key"。
+                // SecretCryptoService 在未配置 MODEL_CONFIG_ENCRYPTION_KEY 时原样返回（不抛），
+                // 保持本地开发可用；prod 档由 ProductionReadinessValidator 强制要求该密钥。
+                row.setCustomApiKey(crypto.encrypt(trimmed));
             }
             // 空串：保留原 customApiKey
         }
@@ -210,10 +220,33 @@ public class UserModelConfigService {
                 modelName = row.getCustomModelName().trim();
             }
             if (notBlank(row.getCustomApiKey())) {
-                apiKey = row.getCustomApiKey().trim();
+                apiKey = decryptStoredKey(row);
             }
         }
-        return new EffectiveModelSettings(presetId, label, baseUrl, modelName, apiKey);
+        return new EffectiveModelSettings(presetId, label, baseUrl, modelName, apiKey,
+                base.contextWindowTokens());
+    }
+
+    /**
+     * 读取用户自定义 key 并解密。
+     *
+     * <p>写入侧加密、读取侧必须解密 —— 只做一半是最糟的状态：
+     * 迁移器把明文改写成 {@code enc:v1:…} 之后，读路径会把这段密文当 API key 交给
+     * LangChain4j，该用户的模型调用从此稳定 401，而日志里只看到"认证失败"。
+     * 所以这里解密失败时给出可执行的提示（换过密钥 → 让用户重新保存一次），
+     * 而不是抛一句无上下文的 IllegalStateException。</p>
+     */
+    private String decryptStoredKey(UserModelConfig row) {
+        String stored = row.getCustomApiKey().trim();
+        try {
+            return crypto.decrypt(stored).trim();
+        } catch (RuntimeException e) {
+            log.error("用户模型密钥无法解密（userId={}）。通常是 MODEL_CONFIG_ENCRYPTION_KEY 换过或丢失；"
+                    + "该用户需要重新保存一次自己的模型密钥。", row.getUserId());
+            throw new IllegalStateException(
+                    "已保存的模型密钥无法解密：请重新保存模型配置（若刚轮换过 "
+                            + "MODEL_CONFIG_ENCRYPTION_KEY，旧密钥需要有备份才能恢复）", e);
+        }
     }
 
     EffectiveModelSettings resolvePresetOnly(String presetId) {
@@ -224,7 +257,8 @@ public class UserModelConfigService {
         String baseUrl = firstNonBlank(Objects.nonNull(p) ? p.getBaseUrl() : null, globalBaseUrl);
         String modelName = firstNonBlank(Objects.nonNull(p) ? p.getModelName() : null, globalModelName);
         String apiKey = firstNonBlank(Objects.nonNull(p) ? p.getApiKey() : null, globalApiKey);
-        return new EffectiveModelSettings(pid, label, baseUrl, modelName, apiKey);
+        int window = Objects.nonNull(p) ? p.getContextWindowTokens() : 0;
+        return new EffectiveModelSettings(pid, label, baseUrl, modelName, apiKey, window);
     }
 
     static String maskKey(String key) {

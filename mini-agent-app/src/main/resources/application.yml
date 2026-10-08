@@ -166,20 +166,28 @@ agent:
     presets:
       - id: default
         label: mimo-v2.6-pro
+        # 厂商侧上下文窗口（token）。填了之后：循环按 min(此值, agent.context.max-tokens)
+        # 决定何时压缩，前端"上下文已用 X%"也按这个分母显示。
+        # 不填（0）= 未知，回退到 agent.context.max-tokens —— 但那样配小窗口模型时
+        # 压缩会永不触发，上游以 context-length 400 拒绝，用户看到的是"模型连接异常"。
+        context-window-tokens: 512000
       - id: chatanywhere
         label: ChatAnywhere
         base-url: https://api.chatanywhere.tech/v1
         model-name: gpt-4o-mini
+        # gpt-4o-mini 的真实窗口是 128k：不声明的话它会继承 512k 的压缩阈值（永远不触发）。
+        context-window-tokens: 128000
         api-key: ${CHATANYWHERE_API_KEY:}
   chat-memory:
     # 跨请求滑动窗口条数（非 token）。单轮 Loop 内由 context.max-tokens 压缩。
     max-messages: 64
   context:
-    # 单次请求工作窗口（估算 token）。DeepSeek 1M 不填满：预留 thinking、
-    # 工具 schema、中文分词低估。75% 时压缩 → 约 384k 估算工作集。
+    # 工作窗口**上限**（估算 token）。实际窗口取 min(此值, 预设的 context-window-tokens)：
+    # 这里是一个全局天花板，不是"所有模型都按这个算"。
     max-tokens: 512000
     compress-threshold: 0.75
-    # false=Loop 内硬截断不调 LLM；摘要改后台异步，避免 P99 翻倍
+    # false=Loop 内硬截断不调 LLM（但会生成结构化交接摘要：写过哪些文件/执行过哪些命令/哪些失败过）；
+    # true=热路径同步调 LLM 摘要，质量更高但 P99 会翻倍。
     llm-summary-enabled: false
     budget:
       enabled: true

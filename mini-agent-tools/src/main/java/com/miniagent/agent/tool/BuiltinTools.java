@@ -6,6 +6,7 @@ import com.miniagent.agent.comfyui.ComfyUIService;
 import com.miniagent.agent.comfyui.ImageQualityChecker;
 import com.miniagent.agent.skill.SkillStore;
 import com.miniagent.agent.song.SongGenerationService;
+import com.miniagent.agent.security.GuardedHttpClient;
 import com.miniagent.agent.security.NetworkGuard;
 import com.miniagent.common.SecurityUtils;
 import com.miniagent.agent.web.WebSearchService;
@@ -64,6 +65,16 @@ public class BuiltinTools {
     @Autowired
     private  NetworkGuard networkGuard;
 
+    /**
+     * 出网统一走这个客户端：它手动处理重定向，**每一跳**都重新过 {@link NetworkGuard}，
+     * 且限制响应体大小、跨域剥离凭证、拒绝 HTTPS→HTTP 降级。
+     *
+     * <p>不要再新建裸 {@code HttpClient + Redirect.NORMAL}：那样只校验第一个 URL，
+     * 攻击者用一个 302 就能把请求打到内网或云元数据端点（169.254.169.254）。</p>
+     */
+    @Autowired
+    private  GuardedHttpClient guardedHttpClient;
+
     @Value("${agent.tools.allow-absolute-write:false}")
     private boolean allowAbsoluteWrite;
     @Value("${agent.browser.evaluate-enabled:false}")
@@ -76,12 +87,6 @@ public class BuiltinTools {
      */
     private final ConcurrentHashMap<String, String> toolResultCache =
             new ConcurrentHashMap<>();
-
-    /** 复用连接池，避免每次 httpGet 新建客户端 */
-    private static final HttpClient HTTP = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(10))
-            .followRedirects(HttpClient.Redirect.NORMAL)
-            .build();
 
     /** 清空工具结果缓存（每条新用户消息开始时调用） */
     public void clearToolCache() {
@@ -408,8 +413,12 @@ public class BuiltinTools {
     }
 
     /**
-     * 搜索/编辑专用路径解析：与 write_file 的 workspace 限制不同，
-     * 这两个工具要能操作真实项目（绝对路径直接用），所以不强制锁进 workspace。
+     * 搜索/编辑专用路径解析。
+     *
+     * <p>与 write_file 不同，这里不要求落在 workspace（编码任务要操作真实项目源码），
+     * 但也**不是无约束**：结果必须落在 {@link PathGuard} 允许的根内。
+     * 此前这里是"绝对路径直接用"，等于把 {@code edit_file} 变成任意文件改写 ——
+     * 写一行到 {@code ~/.ssh/authorized_keys} 就是主机长期驻留。</p>
      */
     private Path resolveSearchPath(String path) {
         String normalized = path.replace('\\', '/').trim();
@@ -418,17 +427,23 @@ public class BuiltinTools {
             return resolveWorkspacePath(path);
         Path p = Path.of(normalized);
         if (p.isAbsolute()) {
-            return p.normalize();
+            return requireAllowed(p, "edit/search");
         }
         Path fromRoot = Path.of(System.getProperty("user.dir")).toAbsolutePath()
                 .resolve(normalized).normalize();
         if (Files.exists(fromRoot)) {
-            return fromRoot;
+            return requireAllowed(fromRoot, "edit/search");
         }
         // 项目根下不存在就退回 workspace：agent 自己 write_file 产出的文件落在
         // workspace 根，否则 write → edit 这条链路会断在「文件不存在」。
         Path fromWorkspace = resolveWorkspacePath(path);
-        return Files.exists(fromWorkspace) ? fromWorkspace : fromRoot;
+        return Files.exists(fromWorkspace) ? fromWorkspace : requireAllowed(fromRoot, "edit/search");
+    }
+
+    /** 统一的越界拒绝点：所有读/改/写路径都要经过它。 */
+    private static Path requireAllowed(Path candidate, String purpose) {
+        PathGuard.assertAllowed(candidate, purpose);
+        return candidate;
     }
 
     /** 把 glob（*.java、*.{ts,tsx}）转成文件名正则；null/空返回 null（不过滤）。 */
@@ -1148,13 +1163,18 @@ public class BuiltinTools {
      * {@code workspace/foo.md} → {@code {dataDir}/workspace/foo.md}。
      */
     private Path resolveWorkspacePath(String path) {
-        return resolveWritePath(effectiveWorkspaceRoot(), writeTaskDir(), path, allowAbsoluteWrite);
+        Path resolved = resolveWritePath(
+                effectiveWorkspaceRoot(), writeTaskDir(), path, allowAbsoluteWrite);
+        // 词法前缀检查挡不住 junction/符号链接（workspace 里放一个指向 C:\Users 的
+        // junction，前缀仍然"合法"而真实落点在根之外）。这里补一层真实路径判定。
+        return requireAllowed(resolved, "write");
     }
 
     /** Office/文档工具统一落盘路径（对齐 AgentDataPaths workspace，禁止 user.dir/workspace）。 */
     public static Path resolveOutputPath(String path) {
-        return resolveWritePath(
+        Path resolved = resolveWritePath(
                 effectiveWorkspaceRoot(), writeTaskDir(), path, false);
+        return requireAllowed(resolved, "write");
     }
 
     /** 主会话写根目录；仅子 Agent 的 taskOverride 才分子目录。 */
@@ -1246,14 +1266,16 @@ public class BuiltinTools {
             return resolveWorkspacePath(path);
         Path p = Path.of(normalized);
         if (p.isAbsolute()) {
-            return p.normalize();
+            // 读侧同样受限：read_file 是 PLAN_SAFE 工具，无需批准，
+            // 直通绝对路径等于把"读主机任意文件"变成默认能力。
+            return requireAllowed(p, "read");
         }
 
         // 相对项目根解析；命中真实文件/目录就用它，对齐 search_code/edit_file。
         Path fromRoot = Path.of(System.getProperty("user.dir")).toAbsolutePath()
                 .resolve(normalized).normalize();
         if (Files.exists(fromRoot)) {
-            return fromRoot;
+            return requireAllowed(fromRoot, "read");
         }
 
         // 否则退回 workspace 语义（读取自身产出物）。
@@ -1268,23 +1290,18 @@ public class BuiltinTools {
             if (Objects.nonNull(blocked)) {
                 return "{\"error\":\"" + blocked.replace("\"", "'") + "\"}";
             }
-            HttpRequest.Builder b = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(20))
-                    .header("User-Agent", "MiniAgent/1.0");
+            // 走 GuardedHttpClient：重定向每一跳都重新校验，响应体有硬上限，
+            // 跨域自动剥离授权头。原先用静态 HTTP 客户端 + Redirect.NORMAL，
+            // 一次 302 就能绕过这里的首跳校验打到内网。
+            Map<String, String> headers = new java.util.LinkedHashMap<>();
+            headers.put("User-Agent", "MiniAgent/1.0");
             if ("POST".equals(method)) {
-                String ct = StringUtils.isBlank(contentType)
-                        ? "application/json; charset=utf-8" : contentType;
-                b.header("Content-Type", ct);
-                String payload = body == null ? "" : body;
-                b.POST(HttpRequest.BodyPublishers.ofString(
-                        payload, StandardCharsets.UTF_8));
-            } else {
-                b.GET();
+                headers.put("Content-Type", StringUtils.isBlank(contentType)
+                        ? "application/json; charset=utf-8" : contentType);
             }
-            HttpResponse<String> resp = HTTP.send(
-                    b.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            String respBody = resp.body() == null ? "" : resp.body();
+            GuardedHttpClient.Response resp = guardedHttpClient.send(
+                    method, url, body, headers, Duration.ofSeconds(20), 2 * 1024 * 1024);
+            String respBody = resp.bodyText();
             if (respBody.length() > 8000) {
                 respBody = respBody.substring(0, 8000) + "\n…（已截断）";
             }
@@ -1303,8 +1320,7 @@ public class BuiltinTools {
         return SecurityUtils.redactSensitive(s);
     }
 
-    private static final java.util.regex.Pattern DANGEROUS_PATTERN = java.util.regex.Pattern.compile(
-            "(rm\\s+-rf\\s+/|rm\\s+-rf\\s+\\*|/etc/(shadow|passwd)|"
+    private static final java.util.regex.Pattern DANGEROUS_PATTERN = java.util.regex.Pattern.compile(            "(rm\\s+-rf\\s+/|rm\\s+-rf\\s+\\*|/etc/(shadow|passwd)|"
                     + "cat.*/etc/|type.*\\\\Windows\\\\|"
                     + "curl.*\\$\\(|wget.*\\$\\(|"
                     + "python.*-c.*os\\.|python.*-c.*subprocess|"
@@ -1356,6 +1372,12 @@ public class BuiltinTools {
 
     /** 超时场景回显的部分输出上限：够看清停在哪一步，又不至于把上下文吃满。 */
     private static final int MAX_TIMEOUT_PARTIAL_CHARS = 2000;
+
+    /** 单次命令捕获的子进程输出上限（1 MiB）：够诊断，且不会把堆读爆。 */
+    private static final int MAX_EXEC_CAPTURE_BYTES = 1024 * 1024;
+
+    /** 输出硬上限（16 MiB）：超过即判定失控并强杀进程树（`yes` 之类）。 */
+    private static final int MAX_EXEC_HARD_CAPTURE_BYTES = 16 * 1024 * 1024;
 
     private static final DateTimeFormatter OUTPUT_STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
 
@@ -1414,8 +1436,13 @@ public class BuiltinTools {
             pb.directory(workDirFile);
             log.info("命令执行目录: {}", workDirFile.getAbsolutePath());
 
+            // 环境变量沙箱：只继承启动进程必需的白名单变量。
+            // 默认继承整份环境时，子进程能看到 LLM_API_KEY / 数据库口令 / 云凭证，
+            // 一条 `echo %LLM_API_KEY%` 就能带走（而读环境还被判成"只读、幂等、可并行"）。
+            int dropped = ProcessEnv.sanitize(pb);
             pb.environment().put("PYTHONUTF8", "1");
             pb.environment().put("PYTHONIOENCODING", "UTF-8");
+            log.info("命令子进程环境已收敛: 丢弃 {} 个继承变量（需要放行用 agent.tools.env-passthrough）", dropped);
             pb.redirectErrorStream(true);
             Process proc = pb.start();
 
@@ -1430,16 +1457,22 @@ public class BuiltinTools {
             final java.nio.charset.Charset cs = isWindows
                     ? java.nio.charset.Charset.forName("GBK")
                     : java.nio.charset.StandardCharsets.UTF_8;
-            final java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+            // 有界捕获：旧实现把子进程输出**无上限**读进堆（截断发生在读完之后），
+            // 于是 `yes` 或一个刷屏构建就能 OutOfMemoryError —— 拖垮的是整个应用进程，
+            // 而不是只让这次调用失败。这里按上限截断：超过 MAX_CAPTURE 后继续读（必须继续读，
+            // 否则子进程会因管道写满而阻塞），但不再累积；超过 MAX_HARD_CAPTURE 直接判为
+            // 失控输出并强杀。
+            final BoundedOutputCapture capture = new BoundedOutputCapture(
+                    MAX_EXEC_CAPTURE_BYTES, MAX_EXEC_HARD_CAPTURE_BYTES);
             Thread drainer = new Thread(() -> {
                 try (var in = proc.getInputStream()) {
                     byte[] chunk = new byte[8192];
                     int n;
                     while ((n = in.read(chunk)) != -1) {
-                        synchronized (buf) { buf.write(chunk, 0, n); }
+                        capture.write(chunk, n);
                     }
                 } catch (Exception ignored) {
-                    // 进程被 destroyForcibly 时读流会抛异常，属预期，忽略
+                    // 进程被强杀时读流会抛异常，属预期，忽略
                 }
             }, "exec-cmd-drainer");
             drainer.setDaemon(true);
@@ -1447,14 +1480,13 @@ public class BuiltinTools {
 
             boolean finished = proc.waitFor(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS);
             if (!finished) {
-                proc.destroyForcibly();
+                killProcessTree(proc);
                 proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
                 drainer.interrupt();
-                String partial;
-                synchronized (buf) { partial = new String(buf.toByteArray(), cs); }
+                String partial = capture.asString(cs);
                 String persisted = persistLongOutput(command, partial);
                 String shown = truncateTail(partial, MAX_TIMEOUT_PARTIAL_CHARS);
-                return "{\"error\":\"命令执行超时（" + timeoutSeconds + "s），已强制终止，未产生后续副作用。"
+                return "{\"error\":\"命令执行超时（" + timeoutSeconds + "s），已强制终止整棵进程树，未产生后续副作用。"
                         + "若是启动服务器/常驻进程，请改为交付文件由用户自行运行；"
                         + "若是构建/测试类慢命令，请调大 timeout 参数（上限 "
                         + ExecCommandParams.MAX_TIMEOUT_SECONDS + "）。\","
@@ -1462,13 +1494,62 @@ public class BuiltinTools {
                         + (persisted.isEmpty() ? "" : "\"partial_output_path\":" + jsonString(persisted) + ",")
                         + "\"partial_output\":" + jsonString(shown) + "}";
             }
+            // 输出失控（超过硬上限）时同样强杀整棵树：这种进程几乎必然是 `yes` 之类的刷屏命令，
+            // 让它跑完只会把磁盘/内存/管道拖满。
+            if (capture.overflowed()) {
+                killProcessTree(proc);
+                log.warn("命令输出超过硬上限 {} 字节，已强杀整棵进程树: {}",
+                        MAX_EXEC_HARD_CAPTURE_BYTES, redactSensitive(truncate(command, 120)));
+            }
             drainer.join(2000); // 等读流线程把剩余输出读完
-            int exitCode = proc.exitValue();
-            String out;
-            synchronized (buf) { out = new String(buf.toByteArray(), cs); }
-            return formatExecResult(command, exitCode, out);
+            int exitCode;
+            try {
+                exitCode = proc.exitValue();
+            } catch (IllegalThreadStateException stillRunning) {
+                killProcessTree(proc);
+                proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
+                exitCode = -1;
+            }
+            String out = capture.asString(cs);
+            String formatted = formatExecResult(command, exitCode, out);
+            if (capture.truncated()) {
+                formatted += "\n[输出捕获上限] 子进程输出超过 " + MAX_EXEC_CAPTURE_BYTES
+                        + " 字节，只保留了前 " + MAX_EXEC_CAPTURE_BYTES + " 字节（共 "
+                        + capture.totalBytes() + " 字节）。请缩小命令的输出范围（如 grep/head）。";
+            }
+            return formatted;
         } catch (Exception e) {
             return "{\"error\":\"命令执行失败: " + e.getMessage() + "\"}";
+        }
+    }
+
+    /**
+     * 强杀整棵进程树。
+     *
+     * <p>{@code Process.destroyForcibly()} 只杀直接子进程：Windows 上那是 {@code cmd.exe}，
+     * 孙进程（{@code mvnw.cmd → java.exe}、{@code npm.cmd → node.exe}）会继续跑、继续写盘、
+     * 继续占端口 —— 而模型已经被告知"命令已超时终止"，于是重试时产生重复副作用。
+     * 这里先按进程树自底向上杀，再兜底杀直接子进程。</p>
+     */
+    static void killProcessTree(Process proc) {
+        if (Objects.isNull(proc)) {
+            return;
+        }
+        try {
+            proc.descendants().forEach(handle -> {
+                try {
+                    handle.destroyForcibly();
+                } catch (Exception ignored) {
+                    // 单个句柄杀不掉不影响其余
+                }
+            });
+        } catch (Exception ignored) {
+            // descendants() 在进程已退出时可能抛错
+        }
+        try {
+            proc.destroyForcibly();
+        } catch (Exception ignored) {
+            // 已退出
         }
     }
 

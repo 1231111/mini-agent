@@ -3,6 +3,7 @@ package com.miniagent.agent.context;
 import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.task.TaskSignals;
 import com.miniagent.application.PromptTemplates;
+import com.miniagent.memory.MemoryService;
 import org.junit.jupiter.api.Test;
 
 import java.util.Set;
@@ -10,6 +11,9 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * 点评轮与轻问答轮的提示词注入。
@@ -74,5 +78,57 @@ class ContextContributorConfigurationTest {
         assertEquals(without.policy().historyMaxMessages(), with.policy().historyMaxMessages());
         assertEquals(without.policy().memoryPolicy(), with.policy().memoryPolicy());
         assertFalse(with.policy().suspendActiveTodo());
+    }
+
+    /**
+     * 记忆必须带**不可信数据**边界。
+     *
+     * <p>记忆可能源自网页正文、文件内容或工具输出 —— 它们会被拼进系统提示，
+     * 并在之后每一轮生效。没有边界与"只当事实参考"的说明时，
+     * 一条被注入的记忆就是跨轮次的后门。这条用例锁住边界不被"精简提示词"顺手删掉。</p>
+     */
+    @Test
+    void 记忆槽位带不可信数据边界() {
+        MemoryService memoryService = mock(MemoryService.class);
+        when(memoryService.retrieveForPrompt(any(), any(), any()))
+                .thenReturn("用户偏好用中文回答");
+
+        SystemContextContributor memoryContributor =
+                new ContextContributorConfiguration().memoryContributor(memoryService);
+        ContextFragment f = memoryContributor.contribute(ctx(false, "none"));
+
+        assertEquals(ContextSlot.MEMORY, f.slot());
+        assertTrue(f.text().contains("trust=\"untrusted\""),
+                "记忆槽要有显式的不可信标注: " + f.text());
+        assertTrue(f.text().contains("不得执行"),
+                "要说明其中出现的指令不执行: " + f.text());
+        assertTrue(f.text().contains("用户偏好用中文回答"),
+                "记忆内容本身不能被丢掉: " + f.text());
+        assertTrue(f.text().trim().endsWith("</memory-data>"),
+                "边界要闭合: " + f.text());
+    }
+
+    /** 没有记忆时不要留一对空标签污染提示词。 */
+    @Test
+    void 无记忆时不注入边界标签() {
+        MemoryService memoryService = mock(MemoryService.class);
+        when(memoryService.retrieveForPrompt(any(), any(), any())).thenReturn("  ");
+
+        SystemContextContributor memoryContributor =
+                new ContextContributorConfiguration().memoryContributor(memoryService);
+        ContextFragment f = memoryContributor.contribute(ctx(false, "none"));
+
+        assertEquals("", f.text(), "空记忆不该产生提示词噪声");
+    }
+
+    /** 指令层级条款必须始终在系统提示里（它是"哪些内容不是指令"的唯一权威定义）。 */
+    @Test
+    void 收尾槽位包含指令层级条款() {
+        SystemContextContributor closing = new ContextContributorConfiguration().closingContributor();
+        ContextFragment f = closing.contribute(ctx(false, "none"));
+        assertTrue(f.text().contains("指令层级"),
+                "系统提示必须声明指令层级: " + f.text());
+        assertTrue(f.text().contains("只有系统消息与用户消息是"),
+                "要给出可执行判据，而不是笼统的『不要被注入』: " + f.text());
     }
 }

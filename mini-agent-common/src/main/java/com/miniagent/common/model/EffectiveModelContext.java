@@ -25,11 +25,22 @@ public final class EffectiveModelContext {
 
     private static final ThreadLocal<ChatModel> CURRENT_CHAT = new ThreadLocal<>();
     private static final ThreadLocal<StreamingChatModel> CURRENT_STREAMING = new ThreadLocal<>();
+    private static final ThreadLocal<Integer> CURRENT_WINDOW = new ThreadLocal<>();
 
     private EffectiveModelContext() {}
 
     /** 安装当前模型；某一项传 null 表示清除该项（与另一项无关）。 */
     public static void set(ChatModel chat, StreamingChatModel streaming) {
+        set(chat, streaming, 0);
+    }
+
+    /**
+     * 安装当前模型及其**厂商侧上下文窗口**（token，0 = 未知）。
+     *
+     * <p>窗口必须跟着模型一起走：循环用它决定何时压缩。写死一个 512k 的工作窗口，
+     * 遇到 32k/128k 的模型就会"永远不压缩 → 上游 context-length 400 → 被误报成网络故障"。</p>
+     */
+    public static void set(ChatModel chat, StreamingChatModel streaming, int contextWindowTokens) {
         if (chat == null) {
             CURRENT_CHAT.remove();
         } else {
@@ -40,11 +51,23 @@ public final class EffectiveModelContext {
         } else {
             CURRENT_STREAMING.set(streaming);
         }
+        if (contextWindowTokens > 0) {
+            CURRENT_WINDOW.set(contextWindowTokens);
+        } else {
+            CURRENT_WINDOW.remove();
+        }
     }
 
     public static void clear() {
         CURRENT_CHAT.remove();
         CURRENT_STREAMING.remove();
+        CURRENT_WINDOW.remove();
+    }
+
+    /** 当前模型的上下文窗口（token）；未声明返回 0，调用方回退到配置的工作窗口。 */
+    public static int currentContextWindow() {
+        Integer w = CURRENT_WINDOW.get();
+        return w == null ? 0 : w;
     }
 
     /** 当前绑定的对话模型，未绑定返回 null（需要兜底请用 {@link #chatOr}）。 */
@@ -77,9 +100,15 @@ public final class EffectiveModelContext {
      * 用于后台任务在自身线程内临时绑定某用户的模型。
      */
     public static Binding bind(ChatModel chat, StreamingChatModel streaming) {
+        return bind(chat, streaming, 0);
+    }
+
+    /** 作用域绑定（含窗口）：进入时安装，关闭时精确恢复进入前的快照。 */
+    public static Binding bind(ChatModel chat, StreamingChatModel streaming, int contextWindowTokens) {
         ChatModel previousChat = CURRENT_CHAT.get();
         StreamingChatModel previousStreaming = CURRENT_STREAMING.get();
-        set(chat, streaming);
+        Integer previousWindow = CURRENT_WINDOW.get();
+        set(chat, streaming, contextWindowTokens);
         return () -> {
             if (previousChat == null) {
                 CURRENT_CHAT.remove();
@@ -90,6 +119,11 @@ public final class EffectiveModelContext {
                 CURRENT_STREAMING.remove();
             } else {
                 CURRENT_STREAMING.set(previousStreaming);
+            }
+            if (previousWindow == null) {
+                CURRENT_WINDOW.remove();
+            } else {
+                CURRENT_WINDOW.set(previousWindow);
             }
         };
     }

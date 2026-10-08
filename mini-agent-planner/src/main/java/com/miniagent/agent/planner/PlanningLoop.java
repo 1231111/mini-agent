@@ -173,6 +173,66 @@ public class PlanningLoop {
                 .orElse(false);
     }
 
+    /**
+     * 规划运行的结局（对外可判定的语义）。
+     *
+     * <p><b>为什么需要它</b>：此前 {@code run} 只返回一个 String，于是
+     * "图死锁 / 恢复耗尽 / 外圈跑完 / 会话锁丢失" 与 "图全部验收通过" 在调用方看来完全一样 ——
+     * 上层一律 {@code markCompleted}，用户看到"已按规划图推进任务（version=…）"这种
+     * 听起来成功的句子。任务没达成却被记为完成，是生产环境里最贵的一类 bug：
+     * 既骗了用户，也让"完成率/失败率"这类指标彻底失去意义。</p>
+     *
+     * <p>调用方必须按结局决定状态：只有 {@link #COMPLETED} 才能算任务完成。</p>
+     */
+    public enum Outcome {
+        /** 图全部节点通过终验（{@code evaluateGraph} 通过）。 */
+        COMPLETED,
+        /** 卡住了：图死锁、恢复次数用尽、外圈轮次用尽、步骤未完成。 */
+        UNFINISHED,
+        /** 在等人：关键步骤需要用户确认 / 需要用户回答。这不是失败，也不能算完成。 */
+        BLOCKED_ON_HUMAN,
+        /** 运行本身出错：会话锁丢失、任务图无法验收。 */
+        FAILED
+    }
+
+    /** {@code run} 的结构化返回：答复文本 + 结局 + 机器可读的原因码。 */
+    public record RunOutcome(String answer, Outcome outcome, String reason) {
+        public RunOutcome {
+            answer = answer == null ? "" : answer;
+            reason = reason == null ? "" : reason;
+        }
+
+        public boolean goalSatisfied() {
+            return outcome == Outcome.COMPLETED;
+        }
+
+        static RunOutcome satisfied(String answer) {
+            return new RunOutcome(answer, Outcome.COMPLETED, "GRAPH_COMPLETED");
+        }
+
+        static RunOutcome direct(String answer) {
+            return new RunOutcome(answer, Outcome.COMPLETED, "DIRECT_LOOP");
+        }
+
+        static RunOutcome unfinished(String answer, String reason) {
+            return new RunOutcome(answer, Outcome.UNFINISHED, reason);
+        }
+
+        static RunOutcome blockedOnHuman(String answer, String reason) {
+            return new RunOutcome(answer, Outcome.BLOCKED_ON_HUMAN, reason);
+        }
+
+        static RunOutcome failed(String answer, String reason) {
+            return new RunOutcome(answer, Outcome.FAILED, reason);
+        }
+    }
+
+    /**
+     * 兼容入口：老的调用点只要文本。
+     *
+     * <p>新代码应当用 {@link #runWithOutcome} —— 只有拿到 {@link Outcome} 才能区分
+     * "做完了"和"卡住了"，否则又会退回"没达成也报成功"。</p>
+     */
     public String run(ChatModel chat,
                       String systemPrompt,
                       String userMessage,
@@ -184,13 +244,29 @@ public class PlanningLoop {
                       String executionId,
                       Consumer<String> progress,
                       AgentStreamSink streamSink) {
+        return runWithOutcome(chat, systemPrompt, userMessage, multimodalUser, history, taskPlan,
+                sessionId, fencingToken, executionId, progress, streamSink).answer();
+    }
+
+    public RunOutcome runWithOutcome(ChatModel chat,
+                      String systemPrompt,
+                      String userMessage,
+                      UserMessage multimodalUser,
+                      List<ChatMessage> history,
+                      TaskPlan taskPlan,
+                      String sessionId,
+                      String fencingToken,
+                      String executionId,
+                      Consumer<String> progress,
+                      AgentStreamSink streamSink) {
         if (!shouldHandle(taskPlan, sessionId, userMessage)) {
+            // 直跑路径：结局由 AgentLoop 自己判定，规划器不替它宣称完成
             if (multimodalUser != null) {
-                return nodeExecutor.runDirectMultimodal(chat, systemPrompt, multimodalUser, history,
-                        90, progress, taskPlan, streamSink);
+                return RunOutcome.direct(nodeExecutor.runDirectMultimodal(chat, systemPrompt,
+                        multimodalUser, history, 90, progress, taskPlan, streamSink));
             }
-            return nodeExecutor.runDirect(chat, systemPrompt, userMessage, history,
-                    90, progress, taskPlan, streamSink);
+            return RunOutcome.direct(nodeExecutor.runDirect(chat, systemPrompt, userMessage, history,
+                    90, progress, taskPlan, streamSink));
         }
 
         GoalCompiler.CompileResult compiled;
@@ -216,7 +292,8 @@ public class PlanningLoop {
             if (!planValidator.accept(compiled.graph(), nextPlan, compiled.goal())) {
                 log.warn("PlanningLoop 澄清后任务图仍无法验收 session={} code={}",
                         sessionId, ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
-                return ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getMessage();
+                return RunOutcome.failed(
+                        ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getMessage(), "GRAPH_INVALID");
             }
             String execId = StringUtils.isNotBlank(executionId)
                     ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
@@ -252,7 +329,8 @@ public class PlanningLoop {
             if (!planValidator.accept(compiled.graph(), taskPlan, compiled.goal())) {
                 log.warn("PlanningLoop 任务图验收失败 session={} code={}",
                         sessionId, ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
-                return ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getMessage();
+                return RunOutcome.failed(
+                        ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getMessage(), "GRAPH_INVALID");
             }
             String execId = StringUtils.isNotBlank(executionId)
                     ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
@@ -266,13 +344,16 @@ public class PlanningLoop {
 
         String lastAnswer = "";
         int rounds = 0;
+        // 只有"图全部通过终验"这一条路会把 completed 置真；其余出口都是"没做完"。
+        String unfinishedReason = "NO_READY_NODES";
         while (rounds++ < properties.getMaxOuterRounds()) {
             if (!sessionLock.renewSessionLock(sessionId, fencingToken)) {
                 log.warn("PlanningLoop 会话锁丢失，中止 session={} code={}",
                         sessionId, ErrorCode.AGENT_PLANNER_LOCK_LOST.getCode());
                 metrics.outerTimeout();
                 String msg = ErrorCode.AGENT_PLANNER_LOCK_LOST.getMessage();
-                return StringUtils.isBlank(lastAnswer) ? msg : lastAnswer + "\n（" + msg + "）";
+                String answer = StringUtils.isBlank(lastAnswer) ? msg : lastAnswer + "\n（" + msg + "）";
+                return RunOutcome.failed(answer, "SESSION_LOCK_LOST");
             }
             snap = stateStore.get(sessionId).orElse(snap);
             TaskGraph normalized = snap.graph().normalizeForScheduling();
@@ -294,6 +375,7 @@ public class PlanningLoop {
                             sessionId, acc.nodeId(), acc.reason());
                     TaskNode bad = resolveAcceptFailNode(snap.graph(), acc.nodeId());
                     if (bad == null) {
+                        unfinishedReason = "ACCEPTANCE_NODE_MISSING";
                         break;
                     }
                     TaskGraph g = snap.graph().replace(
@@ -316,7 +398,7 @@ public class PlanningLoop {
                 log.info("PlanningLoop 图完成 session={} version={} metrics={}",
                         sessionId, snap.version(), metrics.snapshot());
                 metrics.graphCompleted();
-                break;
+                return RunOutcome.satisfied(lastAnswer);
             }
             List<TaskNode> ready = graphScheduler.select(snap.graph());
             if (ready.isEmpty()) {
@@ -324,16 +406,19 @@ public class PlanningLoop {
                     log.info("PlanningLoop 等待人工 confirm session={}", sessionId);
                     String hint = firstAwaitingHint(snap.graph());
                     if (StringUtils.isNotBlank(lastAnswer)) {
-                        return lastAnswer;
+                        return RunOutcome.blockedOnHuman(lastAnswer, "AWAITING_CONFIRM");
                     }
                     if (StringUtils.isNotBlank(hint)) {
-                        return hint;
+                        return RunOutcome.blockedOnHuman(hint, "AWAITING_CONFIRM");
                     }
-                    return "关键步骤等待确认：请在页面点击「确认并继续」。";
+                    return RunOutcome.blockedOnHuman(
+                            "关键步骤等待确认：请在页面点击「确认并继续」。", "AWAITING_CONFIRM");
                 }
                 log.warn("PlanningLoop 无 ready 节点且未全部成功，尝试 REWRITE session={}", sessionId);
                 TaskNode stuck = firstNonSuccess(snap.graph());
                 if (stuck == null) {
+                    // 没有非成功节点却选不出 READY：图状态自相矛盾，不能当成完成
+                    unfinishedReason = "NO_READY_AND_NO_STUCK_NODE";
                     break;
                 }
                 FailureDiagnosis dx = recoveryEngine.diagnose(
@@ -342,6 +427,9 @@ public class PlanningLoop {
                 snap = applyRecoveryOrCancel(sessionId, snap, stuck, dx, stuck.id(),
                         chat, userMessage, taskPlan);
                 if (sameNodeStatuses(before, snap.graph())) {
+                    // 恢复动作没有改变任何节点状态 = 死锁（例如上游被写成 CANCELLED，
+                    // 后继永远拿不到解锁条件）。这正是"卡住了却报成功"的典型现场。
+                    unfinishedReason = "GRAPH_DEADLOCK";
                     break;
                 }
                 todoProjector.project(sessionId,
@@ -353,6 +441,7 @@ public class PlanningLoop {
             ActionProposal proposal = graphScheduler.propose(snap, ready,
                     properties.getProposalBatchSize());
             if (proposal.actions().isEmpty()) {
+                unfinishedReason = "EMPTY_PROPOSAL";
                 break;
             }
             for (ActionSpec a : proposal.actions()) {
@@ -504,31 +593,75 @@ public class PlanningLoop {
                 log.info("PlanningLoop 等待用户 session={} reason={}",
                         sessionId, step.endReason());
                 if (StringUtils.isNotBlank(lastAnswer)) {
-                    return lastAnswer;
+                    return RunOutcome.blockedOnHuman(lastAnswer, "HUMAN_WAIT");
                 }
-                return "需要你确认后才能继续。";
+                return RunOutcome.blockedOnHuman("需要你确认后才能继续。", "HUMAN_WAIT");
             }
             TaskGraph latest = stateStore.get(sessionId).map(StateSnapshot::graph).orElse(g);
             if (latest.hasAwaitingConfirm() || g.hasAwaitingConfirm()) {
                 log.info("PlanningLoop 等待人工输入 session={}", sessionId);
                 if (StringUtils.isNotBlank(lastAnswer)) {
-                    return lastAnswer;
+                    return RunOutcome.blockedOnHuman(lastAnswer, "AWAITING_CONFIRM");
                 }
-                return "关键步骤等待确认：请在页面点击「确认并继续」。";
+                return RunOutcome.blockedOnHuman(
+                        "关键步骤等待确认：请在页面点击「确认并继续」。", "AWAITING_CONFIRM");
             }
             if (quotaAbort && hasUnfinishedProposalNode(g, proposal)) {
                 log.info("本段未完成，节点保持 READY session={}", sessionId);
+                unfinishedReason = "QUOTA_ABORT";
                 break;
             }
         }
-        if (rounds > properties.getMaxOuterRounds())
+        if (rounds > properties.getMaxOuterRounds()) {
             metrics.outerTimeout();
+            unfinishedReason = "OUTER_ROUNDS_EXHAUSTED";
+        }
 
         if (StringUtils.isBlank(lastAnswer))
             lastAnswer = "已按规划图推进任务（version="
                     + stateStore.get(sessionId).map(StateSnapshot::version).orElse(0L)
                     + "，metrics=" + metrics.snapshot() + "）。";
-        return lastAnswer;
+        // 走到这里说明是"没做完"退出（死锁/恢复耗尽/轮次用尽/配额中止）。
+        // 绝不能把这种结果报成完成：上层会据此决定任务状态与"完成率"口径，
+        // 而用户看到的这句"已按规划图推进"听起来像成功。附带未完成节点让用户知道差在哪。
+        String pending = pendingSummary(sessionId);
+        if (StringUtils.isNotBlank(pending)) {
+            lastAnswer = lastAnswer + "\n\n⚠️ 任务未完成（" + unfinishedReason + "）。仍待处理：\n" + pending;
+        }
+        return RunOutcome.unfinished(lastAnswer, unfinishedReason);
+    }
+
+    /** 未达成目标时列出还没成功的节点，避免用户只看到一句"已推进"。 */
+    private String pendingSummary(String sessionId) {
+        try {
+            TaskGraph g = stateStore.get(sessionId).map(StateSnapshot::graph).orElse(null);
+            if (g == null || g.nodes() == null || g.nodes().isEmpty()) {
+                return "";
+            }
+            StringBuilder sb = new StringBuilder();
+            int shown = 0;
+            for (TaskNode n : g.nodes()) {
+                if (n.status() == TaskNodeStatus.SUCCESS) {
+                    continue;
+                }
+                if (shown++ >= 8) {
+                    sb.append("- …\n");
+                    break;
+                }
+                sb.append("- [").append(n.status()).append("] ")
+                        .append(StringUtils.isBlank(n.name()) ? n.id() : n.name());
+                if (StringUtils.isNotBlank(n.lastError())) {
+                    String err = n.lastError();
+                    sb.append("（").append(err.length() <= 120 ? err : err.substring(0, 120) + "…")
+                            .append("）");
+                }
+                sb.append('\n');
+            }
+            return sb.toString().trim();
+        } catch (Exception e) {
+            log.debug("汇总未完成节点失败: {}", e.getMessage());
+            return "";
+        }
     }
 
     static String keepBetterAnswer(String previous, String next) {

@@ -264,4 +264,44 @@ class MembershipServiceTest {
         // 后者会在任何按时间排序或比较的地方表现成一个很像真实日期的值
         assertThat(membership.current(user.getId()).orElseThrow().expireAt()).isNull();
     }
+
+    @Test
+    @DisplayName("还没有上报时，今日用量是 0，额度仍是当前套餐")
+    void usageOfEmptyDayShowsPlanLimit() {
+        User user = newUser("usage-empty");
+
+        MembershipService.UsageView view = membership.usageOf(user.getId());
+
+        assertThat(view.dailyTokenLimit()).isEqualTo(FREE_TOKENS);
+        assertThat(view.inputTokens()).isZero();
+        assertThat(view.outputTokens()).isZero();
+        assertThat(view.totalTokens()).isZero();
+        assertThat(view.llmCalls()).isZero();
+        assertThat(view.events()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("每次上报各记一行，今天的次数是行数")
+    void eachReportIsItsOwnRow() {
+        User user = newUser("usage-each");
+
+        membership.recordUsage(user.getId(), 10, 4, 1);
+        membership.recordUsage(user.getId(), 3, 1, 1);
+        MembershipService.UsageView view = membership.usageOf(user.getId());
+
+        assertThat(view.llmCalls()).isEqualTo(2);
+        assertThat(view.inputTokens()).isEqualTo(13);
+        assertThat(view.outputTokens()).isEqualTo(5);
+        assertThat(view.totalTokens()).isEqualTo(18);
+        assertThat(view.events()).hasSize(2);
+    }
+
+    @Test
+    @DisplayName("上报给不存在的用户时拒绝，不写用量行")
+    void recordUsageRejectsUnknownUser() {
+        assertThatThrownBy(() -> membership.recordUsage(9_999_999L, 10, 20, 1))
+                .isInstanceOf(BusinessException.class)
+                .extracting(e -> ((BusinessException) e).getErrorCode())
+                .isEqualTo(ErrorCode.MEMBER_USER_NOT_FOUND);
+    }
 }

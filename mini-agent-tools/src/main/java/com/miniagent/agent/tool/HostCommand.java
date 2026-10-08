@@ -109,7 +109,10 @@ public final class HostCommand {
         }
         Process p = null;
         try {
-            p = new ProcessBuilder(argv).redirectErrorStream(true).start();
+            ProcessBuilder pb = new ProcessBuilder(argv).redirectErrorStream(true);
+            // 与 exec_command 同一套环境沙箱：子进程不该看见 agent 的密钥。
+            ProcessEnv.sanitize(pb);
+            p = pb.start();
             // 先判超时再读输出：git 这类命令的输出远小于管道缓冲区（Windows 4KB~64KB），
             // 不会因为"子进程等我们读"而死锁；反过来若先读，超时就形同虚设。
             // 真遇到超大输出（上万行 git status），子进程会阻塞 → 命中这里的超时 →

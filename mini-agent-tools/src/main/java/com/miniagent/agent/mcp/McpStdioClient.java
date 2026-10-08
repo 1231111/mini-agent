@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.miniagent.agent.tool.ProcessEnv;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.BufferedInputStream;
@@ -54,9 +55,11 @@ public class McpStdioClient implements AutoCloseable {
             cmd.addAll(cfg.getArgs());
         }
         ProcessBuilder pb = new ProcessBuilder(cmd);
-        if (Objects.nonNull(cfg.getEnv()) && !cfg.getEnv().isEmpty()) {
-            pb.environment().putAll(cfg.getEnv());
-        }
+        // 环境沙箱：先收敛到白名单，再合并本 server 显式声明的 env。
+        // 继承整份环境意味着任意 MCP 服务（其工具由服务方定义、模型可直接调用）
+        // 都能读到 agent 的模型 key 与数据库口令；需要 token 的服务请在配置的 env 里显式声明。
+        ProcessEnv.sanitize(pb);
+        ProcessEnv.putDeclared(pb, cfg.getEnv());
         pb.redirectErrorStream(false);
         Process p = pb.start();
         McpStdioClient client = new McpStdioClient(cfg.getId(), p);

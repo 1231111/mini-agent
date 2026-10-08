@@ -183,6 +183,8 @@ agent:
     # 配了地址之后本机必须能访问它，否则谁都登不进去。
     cloud:
       base-url: ${CLOUD_AUTH_BASE_URL:}
+      # 与账号服务 ACCOUNT_INTERNAL_KEY 同值。空着时用量上报不发出，门户数字停在 0。
+      internal-key: ${ACCOUNT_INTERNAL_KEY:}
       # 超时必须显式给。默认是无限等待，而登录在启动路径上 ——
       # 云端不拒绝连接只丢包时，界面会无限转圈。
       connect-timeout-ms: 3000

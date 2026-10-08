@@ -77,4 +77,10 @@ public class CloudAccountService {
         CloudUser cloudUser = client.register(username, password, displayName);
         return shadowUsers.materialize(cloudUser);
     }
+
+    /** 网页注册完成后，用一次性凭证登录并落本地影子用户。 */
+    public User loginWithTicket(String ticket) {
+        CloudUser cloudUser = client.redeem(ticket);
+        return shadowUsers.materialize(cloudUser);
+    }
 }

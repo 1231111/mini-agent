@@ -236,6 +236,24 @@ class ToolPipelineTest {
     }
 
     @Test
+    void execAskIsNotBypassedByAcceptEditsMode() {
+        // 回归锁（管线级）：曾经 effectiveExecPolicy 在 ACCEPT_EDITS 下把 ask 提升成 allow，
+        // 于是用户在界面上选"自动编辑"就静默得到了"任意命令免批执行"。
+        // prod 档默认就是 ask，所以这条一旦回归，等于生产环境的命令审批整体失效。
+        AtomicInteger calls = new AtomicInteger();
+        Fixture fx = new Fixture("ask", execRegistry(calls));
+        PermissionContext.force("s", PermissionMode.ACCEPT_EDITS, true);
+
+        ToolInvocation inv = fx.pipeline.invoke(
+                ToolRequest.of("s", "exec_command", "{}", 0, "r1"));
+
+        assertEquals(ToolInvocation.Outcome.PERMISSION_ASK, inv.outcome(),
+                "自动编辑模式不得把 ask 档提升成免批执行");
+        assertEquals(0, calls.get(), "未获批准的命令不能执行");
+        assertTrue(fx.trace.hasNode("WAITING_FOR_HUMAN"), "ask 档必须给批准入口");
+    }
+
+    @Test
     void execAskAsksOnceThenExecutesAfterGrant() {
         AtomicInteger calls = new AtomicInteger();
         Fixture fx = new Fixture("ask", execRegistry(calls));

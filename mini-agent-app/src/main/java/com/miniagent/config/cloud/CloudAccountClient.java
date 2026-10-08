@@ -100,6 +100,13 @@ public class CloudAccountClient {
         return call("/api/users", credentials(username, password, displayName));
     }
 
+    /** 用网页注册换来的一次性凭证换身份。凭证本身就是秘密，不再带密码。 */
+    public CloudUser redeem(String ticket) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("ticket", ticket);
+        return call("/api/desktop-tickets/redeem", body);
+    }
+
     /**
      * 检查云端是否可达且健康；不可达时抛 {@link CloudAccountException}。
      *

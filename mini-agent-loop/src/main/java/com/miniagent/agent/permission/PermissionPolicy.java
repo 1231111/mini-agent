@@ -55,28 +55,17 @@ public final class PermissionPolicy {
     /**
      * 结合会话模式算出 exec_command 的最终生效策略。
      *
-     * <p>优先级刻意设计成"<b>BLOCK 是硬闸门，谁都提升不了</b>"：
-     * <ul>
-     *   <li>{@code configured=BLOCK} → 就是 BLOCK。{@link PermissionMode#ACCEPT_EDITS}
-     *       （"自动编辑 / 别问我"）也绕不过 —— 用户显式禁止执行命令，不该被一个
-     *       "别问我"的会话模式悄悄打开。</li>
-     *   <li>{@code ACCEPT_EDITS} 且不是 BLOCK → 提升为 {@link ExecPolicy#ALLOW}，
-     *       保持该模式"跳过危险工具二次询问"的既有语义。</li>
-     *   <li>其余按 {@code configured} 原样。</li>
-     * </ul>
+     * <p><b>exec 策略是用户对"模型发起的命令"的独立显式控制，会话模式不得提升它。</b>
+     * 曾经的实现让 {@link PermissionMode#ACCEPT_EDITS}（UI 文案"自动编辑"）把任何档位提升为
+     * {@link ExecPolicy#ALLOW}，于是用户为了"别弹编辑确认"切一个模式，就顺带把任意命令执行
+     * 变成了免批 —— 与本类 {@link ExecPolicy} 的注释（"ACCEPT_EDITS 的含义是'别问我'，
+     * 不是'我允许你执行命令'"）直接矛盾，也让 prod 档的 ask 形同虚设。
+     * 想免批执行命令请显式把 exec 策略切成 allow，而不是靠会话模式"顺带"获得。</p>
      *
-     * <p>{@code configured} 为 null 时兜底成 {@link ExecPolicy#ASK}（最紧的可批准档）。
-     * 正常路径上 {@code ExecPolicyService} 不会传 null，这里只是防御。
+     * <p>唯一保留的硬约束仍是：{@code configured=BLOCK} 谁都提升不了。</p>
      */
     public static ExecPolicy effectiveExecPolicy(PermissionMode mode, ExecPolicy configured) {
-        ExecPolicy p = Objects.isNull(configured) ? ExecPolicy.ASK : configured;
-        if (p == ExecPolicy.BLOCK) {
-            return ExecPolicy.BLOCK;
-        }
-        if (mode == PermissionMode.ACCEPT_EDITS) {
-            return ExecPolicy.ALLOW;
-        }
-        return p;
+        return Objects.isNull(configured) ? ExecPolicy.ASK : configured;
     }
 
     /** 该工具此刻是否被 exec 策略硬禁止（拒绝执行，不给批准入口）。 */
@@ -106,17 +95,16 @@ public final class PermissionPolicy {
             // 禁档不该有"批准一下就放行"的路。真正的拒绝在 isExecBlocked。
             return false;
         }
+        if (isExec) {
+            // exec 只认 exec 策略：ask 就必须拿到本会话 grant。
+            // 刻意不在这里看会话模式 —— ACCEPT_EDITS（"自动编辑"）跳过的是编辑类工具的二次询问，
+            // 不是"任意 shell 免批"；那个结论必须由用户显式把策略切成 allow 才能得到。
+            return exec == ExecPolicy.ASK;
+        }
         if (mode == PermissionMode.ACCEPT_EDITS) {
             return false;
         }
-        if (isExec && exec == ExecPolicy.ALLOW) {
-            return false;
-        }
         if (mode == PermissionMode.ASK && isAskDangerous(toolName)) {
-            return true;
-        }
-        if (isExec) {
-            // 走到这里只剩 ASK
             return true;
         }
         return "http_post".equals(toolName);
