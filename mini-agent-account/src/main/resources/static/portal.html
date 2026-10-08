@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MiniAgent 账号</title>
+    <style>
+        :root { color-scheme: dark; }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0; min-height: 100vh;
+            font: 14px/1.5 "Segoe UI", sans-serif;
+            background: #0e0e0e; color: #ececec;
+        }
+        main { max-width: 880px; margin: 0 auto; padding: 32px 20px 64px; }
+        h1 { font-size: 22px; margin: 0 0 4px; }
+        .muted { color: #9ca3af; }
+        .card {
+            background: #171717; border: 1px solid rgba(255,255,255,.08);
+            border-radius: 12px; padding: 16px; margin-top: 16px;
+        }
+        label { display: block; margin: 10px 0; }
+        input {
+            width: 100%; margin-top: 4px; padding: 10px 12px;
+            border-radius: 8px; border: 1px solid rgba(255,255,255,.12);
+            background: #212121; color: inherit;
+        }
+        button, .linkish {
+            border: 0; border-radius: 8px; padding: 8px 12px;
+            background: #10a37f; color: #fff; font-weight: 600; cursor: pointer;
+        }
+        button.ghost { background: transparent; border: 1px solid rgba(255,255,255,.16); }
+        .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .err { color: #f87171; min-height: 1.2em; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid rgba(255,255,255,.08); }
+        .tabs button { background: transparent; color: #9ca3af; }
+        .tabs button.on { color: #fff; background: #212121; }
+    </style>
+</head>
+<body>
+<main>
+    <h1>MiniAgent 账号</h1>
+    <p class="muted">注册、会员和充值在这里。桌面客户端只负责登录。</p>
+
+    <section id="auth" class="card" hidden>
+        <div class="tabs row">
+            <button type="button" id="tabLogin" class="on">登录</button>
+            <button type="button" id="tabRegister">注册</button>
+        </div>
+        <form id="loginForm">
+            <label>用户名<input id="loginUser" autocomplete="username"></label>
+            <label>密码<input id="loginPass" type="password" autocomplete="current-password"></label>
+            <button type="submit">登录</button>
+        </form>
+        <form id="registerForm" hidden>
+            <label>用户名<input id="regUser" autocomplete="username"></label>
+            <label>密码<input id="regPass" type="password" autocomplete="new-password"></label>
+            <label>显示名<input id="regName" autocomplete="nickname"></label>
+            <button type="submit">注册</button>
+        </form>
+        <p class="err" id="authErr"></p>
+    </section>
+
+    <section id="desk" hidden>
+        <div class="card row">
+            <div>
+                <div id="who"></div>
+                <div class="muted" id="plan"></div>
+            </div>
+            <span style="flex:1"></span>
+            <button type="button" class="ghost" id="logoutBtn">退出</button>
+        </div>
+        <div class="card">
+            <h2 style="margin:0 0 8px;font-size:16px;">充值</h2>
+            <p class="muted">还没有接入支付渠道。确认后按订单金额直接开通。</p>
+            <div id="plans"></div>
+        </div>
+        <div class="card">
+            <h2 style="margin:0 0 8px;font-size:16px;">订单</h2>
+            <table>
+                <thead>
+                <tr><th>单号</th><th>套餐</th><th>金额</th><th>状态</th><th></th></tr>
+                </thead>
+                <tbody id="orders"></tbody>
+            </table>
+        </div>
+        <p class="err" id="deskErr"></p>
+    </section>
+</main>
+<script>
+const MIN_PASSWORD_LENGTH = 12;
+const auth = document.getElementById('auth');
+const desk = document.getElementById('desk');
+const loginForm = document.getElementById('loginForm');
+const registerForm = document.getElementById('registerForm');
+
+function yuan(cents) {
+    return (Number(cents) / 100).toFixed(2) + ' 元';
+}
+
+async function call(path, options) {
+    const res = await fetch(path, Object.assign({
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' }
+    }, options || {}));
+    return res.json();
+}
+
+function showAuth(register) {
+    auth.hidden = false;
+    desk.hidden = true;
+    loginForm.hidden = !!register;
+    registerForm.hidden = !register;
+    document.getElementById('tabLogin').classList.toggle('on', !register);
+    document.getElementById('tabRegister').classList.toggle('on', !!register);
+}
+
+document.getElementById('tabLogin').onclick = function () { showAuth(false); };
+document.getElementById('tabRegister').onclick = function () { showAuth(true); };
+
+loginForm.onsubmit = async function (event) {
+    event.preventDefault();
+    const err = document.getElementById('authErr');
+    err.textContent = '';
+    const body = await call('/api/portal/session', {
+        method: 'POST',
+        body: JSON.stringify({
+            username: document.getElementById('loginUser').value.trim(),
+            password: document.getElementById('loginPass').value
+        })
+    });
+    if (!body.success) {
+        err.textContent = body.message || '登录失败';
+        return;
+    }
+    location.href = '/account';
+};
+
+registerForm.onsubmit = async function (event) {
+    event.preventDefault();
+    const err = document.getElementById('authErr');
+    err.textContent = '';
+    const password = document.getElementById('regPass').value;
+    if (password.length < MIN_PASSWORD_LENGTH) {
+        err.textContent = '密码至少 ' + MIN_PASSWORD_LENGTH + ' 位';
+        return;
+    }
+    const body = await call('/api/portal/users', {
+        method: 'POST',
+        body: JSON.stringify({
+            username: document.getElementById('regUser').value.trim(),
+            password: password,
+            displayName: document.getElementById('regName').value.trim()
+        })
+    });
+    if (!body.success) {
+        err.textContent = body.message || '注册失败';
+        return;
+    }
+    location.href = '/account';
+};
+
+async function loadDesk() {
+    const me = await call('/api/portal/me');
+    if (!me.success) {
+        location.href = '/login';
+        return;
+    }
+    auth.hidden = true;
+    desk.hidden = false;
+    document.getElementById('who').textContent =
+        (me.data.displayName || me.data.username) + ' · ' + me.data.username;
+    const plan = await call('/api/portal/membership');
+    document.getElementById('plan').textContent = plan.success
+        ? ('当前套餐 ' + plan.data.planName + ' · 每日 '
+            + plan.data.dailyTokenLimit + ' token')
+        : (plan.message || '没有生效中的订阅');
+    const plans = await call('/api/portal/plans');
+    const box = document.getElementById('plans');
+    box.replaceChildren();
+    (plans.data || []).forEach(function (item) {
+        if (item.priceCents <= 0) {
+            return;
+        }
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = item.name + ' · ' + yuan(item.priceCents);
+        btn.onclick = function () { buy(item.code); };
+        box.appendChild(btn);
+    });
+    const orders = await call('/api/portal/orders');
+    const tbody = document.getElementById('orders');
+    tbody.replaceChildren();
+    (orders.data || []).forEach(function (order) {
+        const tr = document.createElement('tr');
+        const cells = [
+            order.orderNo, order.planCode, yuan(order.amountCents), order.status
+        ];
+        cells.forEach(function (text) {
+            const td = document.createElement('td');
+            td.textContent = text;
+            tr.appendChild(td);
+        });
+        const action = document.createElement('td');
+        if (order.status === 'PENDING') {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = '确认支付';
+            btn.onclick = function () { confirmPay(order.orderNo); };
+            action.appendChild(btn);
+        }
+        tr.appendChild(action);
+        tbody.appendChild(tr);
+    });
+}
+
+async function buy(planCode) {
+    const err = document.getElementById('deskErr');
+    err.textContent = '';
+    const body = await call('/api/portal/orders', {
+        method: 'POST',
+        body: JSON.stringify({ planCode: planCode })
+    });
+    if (!body.success) {
+        err.textContent = body.message || '下单失败';
+        return;
+    }
+    await loadDesk();
+}
+
+async function confirmPay(orderNo) {
+    const err = document.getElementById('deskErr');
+    err.textContent = '';
+    const body = await call('/api/portal/orders/' + encodeURIComponent(orderNo) + '/confirm', {
+        method: 'POST'
+    });
+    if (!body.success) {
+        err.textContent = body.message || '确认失败';
+        return;
+    }
+    await loadDesk();
+}
+
+document.getElementById('logoutBtn').onclick = async function () {
+    await call('/api/portal/logout', { method: 'POST' });
+    location.href = '/login';
+};
+
+const path = location.pathname.replace(/\/+$/, '') || '/';
+if (path === '/account') {
+    loadDesk();
+} else {
+    showAuth(false);
+}
+</script>
+</body>
+</html>

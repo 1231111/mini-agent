@@ -4,6 +4,14 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>智能体动态轨迹图</title>
+    <script>
+        // 页面骨架放行（浏览器导航带不了 Authorization 头），身份判断在这里做。
+        (function () {
+            var tk = '';
+            try { tk = sessionStorage.getItem('ma_token') || ''; } catch (e) { tk = ''; }
+            if (!tk) { window.location.replace('/login'); }
+        })();
+    </script>
     <style>
         :root {
             --bg: #0e0f12;
@@ -615,7 +623,7 @@
         // 加载执行记录
         async function loadExecutions(sessionId) {
             try {
-                const resp = await fetch(`/api/traces/executions?sessionId=${sessionId}`);
+                const resp = await fetch('/api/conversations/' + encodeURIComponent(sessionId) + '/executions');
                 if (!resp.ok) return;
                 const execs = await resp.json();
                 
@@ -631,7 +639,7 @@
         // 加载轨迹数据
         async function loadTraceData(executionId) {
             try {
-                const resp = await fetch(`/api/traces?executionId=${executionId}`);
+                const resp = await fetch('/api/executions/' + encodeURIComponent(executionId) + '/steps');
                 if (!resp.ok) return;
                 const data = await resp.json();
                 

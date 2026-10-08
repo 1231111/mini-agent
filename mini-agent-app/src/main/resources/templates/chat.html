@@ -16,6 +16,22 @@
             }
         })();
     </script>
+    <!-- 认证早绑定：无 cookie 之后，浏览器导航请求带不了 Authorization 头，服务端在页面入口
+         拿不到身份信息，所以分流改在前端做——没有本地 token 就直接去登录页，
+         不再等服务端把 login 模板发回来。放在 <head> 里是为了赶在样式渲染前执行，避免闪一下聊天骨架。 -->
+    <script th:inline="none">
+        (function () {
+            var tk = '';
+            try {
+                tk = sessionStorage.getItem('ma_token') || '';
+            } catch (e) {
+                tk = '';
+            }
+            if (!tk) {
+                window.location.replace('/login');
+            }
+        })();
+    </script>
     <style>
         /* =====================================================================
            Design tokens — 明暗双主题，由 <html data-theme> 切换
@@ -318,12 +334,24 @@
         .settings-row-label { font-size: 13px; color: var(--text); }
         .settings-row-meta { font-size: 12px; color: var(--text2); }
         .settings-logout {
-            display: block; text-align: center; text-decoration: none;
+            display: block; width: 100%; text-align: center; text-decoration: none;
             padding: 8px 12px; border-radius: 8px;
             border: 1px solid var(--border); color: var(--danger);
+            background: transparent; font-family: inherit; cursor: pointer;
             font-size: 13px; font-weight: 600;
         }
         .settings-logout:hover { background: var(--danger); color: #fff; }
+        .settings-logout:disabled { opacity: .6; cursor: default; }
+        /* 与 .settings-logout 同构，只换色：那一条是"危险操作"，这一条是普通跳转。
+           两者视觉一致会让用户以为点它也会退出登录。 */
+        .settings-link {
+            display: block; width: 100%; text-align: center; text-decoration: none;
+            padding: 8px 12px; border-radius: 8px; box-sizing: border-box;
+            border: 1px solid var(--border); color: var(--text);
+            background: transparent; cursor: pointer;
+            font-size: 13px; font-weight: 600;
+        }
+        .settings-link:hover { background: var(--surface2); }
 
         /* =================================================================
            MESSAGES AREA
@@ -474,17 +502,22 @@
             padding: 10px 0;
         }
 
-        /* ---- USER message: right-side bubble ---- */
+        /* ---- USER message: 通栏气泡，与顶部任务条/输入框同宽同边界 ----
+           左让出 --avatar-slot，右缘落在消息区内容右缘；
+           宽度 = --content-w - --avatar-slot，和 .task-pin-inner / .input-container 一致。 */
         .user-row .msg-inner {
             display: flex;
             justify-content: flex-end;
+            padding-left: var(--avatar-slot);
         }
         .user-bubble {
             background: var(--user-bubble);
             border: 1px solid var(--border);
             border-radius: 18px 18px 4px 18px;
             padding: 12px 18px;
-            max-width: 85%;
+            flex: 1 1 auto;
+            min-width: 0;
+            max-width: none;
             font-size: 15px;
             line-height: 1.7;
             color: var(--text);
@@ -1597,6 +1630,31 @@
                                 </div>
                             </div>
                         </div>
+                        <!-- 终端命令执行策略（三档，运行时可切；会话级覆盖全局默认） -->
+                        <div class="perm-selector" id="execSelector">
+                            <button class="in-tool-btn perm-btn" id="execPolicyBtn"
+                                    title="终端命令执行策略" onclick="toggleExecMenu()">
+                                <span id="execPolicyLabel">执行</span>
+                            </button>
+                            <div class="perm-menu" id="execMenu">
+                                <div class="perm-item" data-exec="block"
+                                     onclick="selectExecPolicy('block')">
+                                    禁止<small>拒绝执行任何终端命令，连批准入口都没有</small>
+                                </div>
+                                <div class="perm-item" data-exec="ask"
+                                     onclick="selectExecPolicy('ask')">
+                                    需批准<small>本会话第一次执行时确认，之后记住</small>
+                                </div>
+                                <div class="perm-item" data-exec="allow"
+                                     onclick="selectExecPolicy('allow')">
+                                    放行<small>免批执行；命令级黑名单仍生效</small>
+                                </div>
+                                <div class="perm-item" data-exec="default"
+                                     onclick="selectExecPolicy('default')">
+                                    跟随全局<small id="execGlobalHint">与全局默认一致</small>
+                                </div>
+                            </div>
+                        </div>
                         <!-- 角色选择器 -->
                         <div class="role-selector" id="roleSelector">
                             <button class="in-tool-btn role-btn" id="roleBtn" title="选择角色" onclick="toggleRoleMenu()">
@@ -1769,12 +1827,36 @@
                 </button>
             </div>
         </div>
-        <a class="settings-logout" href="/api/logout">退出登录</a>
+        <button type="button" class="settings-link" style="margin-bottom:8px;"
+                onclick="openAccountPortal()">账号与充值</button>
+        <button type="button" class="settings-logout" id="logoutBtn" onclick="doLogout()">退出登录</button>
     </div>
 </div>
 
 <script src="/js/security.js"></script>
 <script th:inline="none">
+async function openAccountPortal() {
+    const api = window.electronAPI;
+    if (api && api.getPortalUrl && api.openExternal) {
+        try {
+            const url = await api.getPortalUrl();
+            if (url) {
+                const opened = await api.openExternal(
+                    url.replace(/\/+$/, '') + '/account');
+                if (!opened || !opened.ok) {
+                    alert('打不开账号页：'
+                        + ((opened && opened.error) || '未知原因'));
+                }
+                return;
+            }
+        } catch (e) {
+            alert(e.message || e);
+            return;
+        }
+    }
+    window.location.href = '/membership';
+}
+
 /* =========================================================================
    DATA LAYER — conversations persisted to localStorage
    Structure:
@@ -1835,7 +1917,6 @@ function saveConv(c) {
     saveAllConvs(a);
 }
 function delConv(id) { saveAllConvs(getAllConvs().filter(c => c.id !== id)); }
-function mkId() { return 's_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7); }
 
 /* =========================================================================
    INPUT HANDLING
@@ -1920,6 +2001,23 @@ function openSettings() {
 
 function closeSettings() {
     document.getElementById('settingsModal')?.classList.remove('show');
+}
+
+/* =========================================================================
+   LOGOUT — DELETE /api/tokens（会摘掉服务端 SSE 流），
+   点完不管后端成功与否都清本地 token 并回登录页：留着 token 也不能用，
+   Redis 里的 jti 已经没了，硬留在页面上只会在下一个请求吃 401。
+   ========================================================================= */
+async function doLogout() {
+    const btn = document.getElementById('logoutBtn');
+    if (btn) btn.disabled = true;
+    try {
+        await fetch('/api/tokens', { method: 'DELETE' });
+    } catch (err) {
+        console.warn('[Logout] request failed, clearing local token anyway', err);
+    }
+    try { window.MiniAuth.clear(); } catch (_) {}
+    window.location.replace('/login');
 }
 
 document.addEventListener('keydown', e => {
@@ -2033,83 +2131,64 @@ function updateUIAfterFileAdd() {
  * @param {number} idx - 文件在列表中的索引
  */
 function uploadFile(file, idx) {
-    // 1. 确保CSRF token存在
-    ensureCsrfToken()
-        .then(() => {
-            // 2. CSRF token就绪，执行上传
-            performFileUpload(file, idx);
+    // 1. 先拿到会话 id —— 上传要落到某个会话目录下，而 id 由服务端签发
+    ensureSessionId()
+        .then(sid => {
+            // 2. 会话 id 就绪，执行上传
+            performFileUpload(file, idx, sid);
         })
         .catch(err => {
-            // CSRF token获取失败
-            console.error('[Upload] Failed to ensure CSRF token:', err);
+            console.error('[Upload] Failed to resolve session id:', err);
             uploadingCount--;
-            updateFileProgress(idx, 0, 'error', 'CSRF token 获取失败');
+            updateFileProgress(idx, 0, 'error', '会话创建失败');
             updateSendButton();
         });
 }
 
 /**
- * 确保CSRF token cookie存在，如果不存在则从服务器获取
- * @returns {Promise<void>}
+ * 取当前会话 id。会话 id 由服务端签发（POST /api/conversations），
+ * 签发时即把 userId 写进 chat_conversations —— 此后所有归属校验都是严格判等，
+ * 不再需要「这个 id 被别人占了吗」这种猜测式放行。
+ *
+ * 一次会话只签发一次：currentId 存在就直接返回，避免每次上传/发送都新建一条空会话。
+ * @returns {Promise<string>} 会话 id
  */
-function ensureCsrfToken() {
-    return new Promise((resolve, reject) => {
-        // 1. 检查cookie中是否已有CSRF token
-        const csrfToken = getCsrfTokenFromCookie();
-        if (csrfToken) {
-            console.log('[Upload] CSRF token already exists');
-            resolve();
-            return;
-        }
-        
-        // 2. 没有token，从服务器获取
-        console.log('[Upload] No CSRF token found, fetching from /api/auth-status');
-        fetchCsrfToken()
-            .then(() => {
-                console.log('[Upload] CSRF token fetched successfully');
-                // 等待一小段时间让cookie设置
-                setTimeout(resolve, 50);
-            })
-            .catch(reject);
+async function ensureSessionId() {
+    if (currentId) {
+        return currentId;
+    }
+    const resp = await fetch('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
     });
-}
-
-/**
- * 从cookie中获取CSRF token
- * @returns {string|null} CSRF token值或null
- */
-function getCsrfTokenFromCookie() {
-    const match = document.cookie.match(/(?:^|;\s*)XSRF-TOKEN=([^;]*)/);
-    return match ? match[1] : null;
-}
-
-/**
- * 从服务器获取CSRF token
- * @returns {Promise<Response>}
- */
-function fetchCsrfToken() {
-    return fetch('/api/auth-status', {
-        credentials: 'same-origin',
-        cache: 'no-store'
-    }).then(response => {
-        if (!response.ok) {
-            throw new Error('Failed to fetch CSRF token: ' + response.status);
-        }
-        return response;
-    });
+    if (!resp.ok) {
+        throw new Error('create conversation failed: HTTP ' + resp.status);
+    }
+    const data = unwrapApiBody(await resp.json());
+    const sid = data && data.sessionId;
+    if (!sid) {
+        throw new Error('create conversation returned no sessionId');
+    }
+    currentId = sid;
+    localStorage.setItem(LS_CUR, sid);
+    renderSidebar();
+    // 新会话没有会话级覆盖，但要把"全局默认"和"最终生效"拉回来渲染按钮。
+    await refreshExecPolicyView();
+    return sid;
 }
 
 /**
  * 执行文件上传
  * @param {File} file - 要上传的文件
  * @param {number} idx - 文件在列表中的索引
+ * @param {string} sessionId - 服务端签发的会话 id
  */
-function performFileUpload(file, idx) {
+function performFileUpload(file, idx, sessionId) {
     // 1. 创建 FormData
-    const formData = createUploadFormData(file);
+    const formData = createUploadFormData(file, sessionId);
     
     // 2. 创建并配置 XMLHttpRequest
-    const xhr = createUploadXhr();
+    const xhr = createUploadXhr(sessionId);
     
     // 3. 设置请求头
     setUploadHeaders(xhr);
@@ -2124,39 +2203,27 @@ function performFileUpload(file, idx) {
 /**
  * 创建上传用的 FormData
  */
-function createUploadFormData(file) {
+function createUploadFormData(file, sessionId) {
     const fd = new FormData();
     fd.append('file', file);
-    fd.append('sessionId', currentId || 'default');
+    fd.append('sessionId', sessionId);
     return fd;
 }
 
 /**
  * 创建并配置上传用的 XMLHttpRequest
  */
-function createUploadXhr() {
+function createUploadXhr(sessionId) {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/upload');
-    xhr.withCredentials = true; // 确保发送cookies（包括CSRF token）
+    xhr.open('POST', '/api/conversations/' + encodeURIComponent(sessionId) + '/files');
     return xhr;
 }
 
 /**
- * 设置上传请求头
+ * 设置上传请求头。只带 Bearer —— cookie 与查询参数两条鉴权通路已随无状态改造移除。
  */
 function setUploadHeaders(xhr) {
-    // CSRF token
-    const csrfToken = getCsrfTokenFromCookie();
-    if (csrfToken) {
-        const token = decodeURIComponent(csrfToken);
-        xhr.setRequestHeader('X-XSRF-TOKEN', token);
-        console.log('[Upload] CSRF token attached:', token.substring(0, 10) + '...');
-    } else {
-        console.warn('[Upload] No XSRF-TOKEN cookie found');
-    }
-    
-    // JWT auth token
-    const jwtToken = sessionStorage.getItem('ma_token');
+    const jwtToken = window.MiniAuth.token();
     if (jwtToken) {
         xhr.setRequestHeader('Authorization', 'Bearer ' + jwtToken);
     }
@@ -2481,6 +2548,7 @@ function toggleRoleMenu() {
     menu.classList.toggle('show');
     document.getElementById('permMenu')?.classList.remove('show');
     document.getElementById('confirmMenu')?.classList.remove('show');
+    document.getElementById('execMenu')?.classList.remove('show');
     // 点击外部关闭
     if (menu.classList.contains('show')) {
         setTimeout(() => {
@@ -2604,7 +2672,7 @@ function applyModelConfigView(data) {
 
 async function loadModelConfig() {
     try {
-        const resp = await fetch('/api/model-config');
+        const resp = await fetch('/api/model');
         if (!resp.ok) return;
         const data = await resp.json();
         applyModelConfigView(data);
@@ -2623,7 +2691,7 @@ async function saveModelConfig() {
         apiKey: document.getElementById('modelApiKey').value
     };
     try {
-        const resp = await fetch('/api/model-config', {
+        const resp = await fetch('/api/model', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
@@ -2641,7 +2709,7 @@ async function saveModelConfig() {
 
 async function resetModelConfig() {
     try {
-        const resp = await fetch('/api/model-config', {
+        const resp = await fetch('/api/model', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ reset: true })
@@ -2670,6 +2738,7 @@ function togglePermMenu() {
     menu.classList.toggle('show');
     document.getElementById('roleMenu')?.classList.remove('show');
     document.getElementById('confirmMenu')?.classList.remove('show');
+    document.getElementById('execMenu')?.classList.remove('show');
     if (menu.classList.contains('show')) {
         setTimeout(() => document.addEventListener('click', closePermMenuOutside, { once: true }), 0);
     }
@@ -2679,6 +2748,10 @@ function closePermMenuOutside(ev) {
     if (wrap && wrap.contains(ev.target)) return;
     document.getElementById('permMenu')?.classList.remove('show');
 }
+function permissionUrl() {
+    return '/api/conversations/' + encodeURIComponent(currentId) + '/permission';
+}
+
 async function selectPermissionMode(mode) {
     permissionMode = mode || 'default';
     localStorage.setItem('mini_agent_perm_mode', permissionMode);
@@ -2691,7 +2764,7 @@ async function selectPermissionMode(mode) {
     refreshPlanBanner();
     if (currentId) {
         try {
-            await fetch('/api/permission-mode', {
+            await fetch(permissionUrl(), {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ sessionId: currentId, mode: permissionMode })
@@ -2708,7 +2781,7 @@ function refreshPlanBanner() {
 async function approvePlan() {
     if (!currentId) { alert('请先开始对话'); return; }
     try {
-        const resp = await fetch('/api/permission-mode', {
+        const resp = await fetch(permissionUrl(), {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ sessionId: currentId, action: 'approve_plan' })
@@ -2749,7 +2822,7 @@ async function grantAskTool() {
     pendingAskTool = null;
     if (!tool || !currentId) return;
     try {
-        await fetch('/api/permission-mode', {
+        await fetch(permissionUrl(), {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ sessionId: currentId, action: 'grant_ask', tool })
@@ -2825,6 +2898,7 @@ function toggleConfirmMenu() {
     menu.classList.toggle('show');
     document.getElementById('permMenu')?.classList.remove('show');
     document.getElementById('roleMenu')?.classList.remove('show');
+    document.getElementById('execMenu')?.classList.remove('show');
     if (menu.classList.contains('show')) {
         setTimeout(() => document.addEventListener('click', closeConfirmMenuOutside, { once: true }), 0);
     }
@@ -2854,7 +2928,7 @@ async function selectConfirmPolicy(policy) {
     document.getElementById('confirmMenu')?.classList.remove('show');
     if (currentId) {
         try {
-            await fetch('/api/permission-mode', {
+            await fetch(permissionUrl(), {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ sessionId: currentId, confirmPolicy: confirmPolicy })
@@ -2862,6 +2936,110 @@ async function selectConfirmPolicy(policy) {
         } catch (e) { console.warn('set confirm policy failed', e); }
     }
 }
+
+/* =========================================================================
+   EXEC POLICY（终端命令执行策略：block / ask / allow）
+   与后端 ExecPolicy 三档一一对应。'default' 表示清除会话覆盖、跟随全局默认。
+   ------------------------------------------------------------------------
+   和权限模式/确认策略不同，这一项**不能**只靠 localStorage：
+   生效值 = 会话覆盖 ?? 全局默认，而全局默认只有后端知道。
+   前端自己推会导致"全局配了 block，界面却显示放行"这种误导。
+   所以这里一律以 GET /permission 返回的视图为准。
+   ========================================================================= */
+const EXEC_LABELS = { block: '禁止', ask: '需批准', allow: '放行' };
+let execPolicyOverride = '';   // '' = 跟随全局
+let execPolicyEffective = '';
+
+function toggleExecMenu() {
+    const menu = document.getElementById('execMenu');
+    menu.classList.toggle('show');
+    document.getElementById('permMenu')?.classList.remove('show');
+    document.getElementById('confirmMenu')?.classList.remove('show');
+    document.getElementById('roleMenu')?.classList.remove('show');
+    if (menu.classList.contains('show')) {
+        setTimeout(() => document.addEventListener('click', closeExecMenuOutside, { once: true }), 0);
+    }
+}
+function closeExecMenuOutside(ev) {
+    const wrap = document.getElementById('execSelector');
+    if (wrap && wrap.contains(ev.target)) return;
+    document.getElementById('execMenu')?.classList.remove('show');
+}
+
+/** 用后端返回的 permission 视图刷新 UI。 */
+function applyExecPolicyView(v) {
+    if (!v) return;
+    execPolicyOverride = v.execPolicyOverride || '';
+    execPolicyEffective = v.execPolicyEffective || '';
+    const label = document.getElementById('execPolicyLabel');
+    if (label) {
+        const eff = EXEC_LABELS[execPolicyEffective] || execPolicyEffective || '执行';
+        // 跟随全局时加前缀，否则用户会以为"需批准"是自己在这个会话里设的
+        label.textContent = (execPolicyOverride ? eff : '跟随·' + eff);
+    }
+    const btn = document.getElementById('execPolicyBtn');
+    // 只有"禁止"才高亮：放行/需批准都算正常态，不必让按钮一直亮着
+    if (btn) btn.classList.toggle('active', execPolicyEffective === 'block');
+    const hint = document.getElementById('execGlobalHint');
+    if (hint) hint.textContent = '全局默认：' + (EXEC_LABELS[v.execPolicyGlobal] || v.execPolicyGlobal || '-');
+    document.querySelectorAll('#execMenu .perm-item').forEach(el => {
+        el.classList.toggle('active', el.dataset.exec === (execPolicyOverride || 'default'));
+    });
+}
+
+async function refreshExecPolicyView() {
+    if (!currentId) return;
+    try {
+        const resp = await fetch(permissionUrl());
+        const data = await resp.json();
+        if (data && data.code === 0 && data.data) applyExecPolicyView(data.data);
+    } catch (e) { console.warn('load exec policy failed', e); }
+}
+
+async function selectExecPolicy(value) {
+    document.getElementById('execMenu')?.classList.remove('show');
+    if (!currentId) {
+        alert('请先开始对话 —— 执行策略是按会话生效的（全局默认在配置文件里）。');
+        return;
+    }
+    try {
+        const resp = await fetch(permissionUrl(), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            // 'default' 直接透传给后端翻译成"清除覆盖"。前端不要自己翻成某一档，
+            // 否则全局默认一改，这里就会发错档位。
+            body: JSON.stringify({ sessionId: currentId, execPolicy: value })
+        });
+        const data = await resp.json();
+        if (data && data.code === 0 && data.data) {
+            applyExecPolicyView(data.data);
+        } else {
+            alert('切换失败：' + ((data && data.message) || '未知错误'));
+        }
+    } catch (e) {
+        console.warn('set exec policy failed', e);
+        alert('切换失败，请检查网络或后端日志。');
+    }
+}
+
+/**
+ * 回到"没有会话"的状态时复位执行策略按钮。
+ * 不复位的话，新开会话会顶着上一个会话的"跟随·禁止"这类标签，
+ * 而实际上新会话是全新的、还没有任何会话级覆盖。
+ */
+function resetExecPolicyView() {
+    execPolicyOverride = '';
+    execPolicyEffective = '';
+    const label = document.getElementById('execPolicyLabel');
+    if (label) label.textContent = '执行';
+    document.getElementById('execPolicyBtn')?.classList.remove('active');
+    const hint = document.getElementById('execGlobalHint');
+    if (hint) hint.textContent = '';
+    document.querySelectorAll('#execMenu .perm-item').forEach(el => {
+        el.classList.toggle('active', el.dataset.exec === 'default');
+    });
+}
+
 function syncPendingConfirm(items) {
     const waiting = (items || []).find(it =>
         String(it.status || '').toLowerCase() === 'awaiting_confirm');
@@ -2893,11 +3071,9 @@ function confirmPendingTodo() {
 async function confirmTodoAndContinue(id) {
     if (!currentId || isStreaming) return;
     try {
-        const resp = await fetch('/api/todo/confirm', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sessionId: currentId, id: id })
-        });
+        const resp = await fetch(
+            '/api/conversations/' + encodeURIComponent(currentId) + '/todos/' + encodeURIComponent(id),
+            { method: 'PATCH' });
         const body = await resp.json();
         if (!body.success) {
             alert(body.message || '确认失败');
@@ -3016,7 +3192,7 @@ function showCtxMenu(e, id) {
 
 async function delConvAndRefresh(id) {
     try {
-        await fetch('/api/conversation/delete?sessionId=' + encodeURIComponent(id), { method: 'POST' });
+        await fetch('/api/conversations/' + encodeURIComponent(id), { method: 'DELETE' });
     } catch (e) {
         console.warn('Failed to delete conversation:', e);
     }
@@ -3061,6 +3237,7 @@ function startNewChat(doFocus = true) {
     setStreaming(false);
     currentId = null;
     localStorage.removeItem(LS_CUR);
+    resetExecPolicyView();
     $msg.innerHTML = WELCOME;
     renderSidebar();
     if (doFocus) $inp.focus();
@@ -3087,7 +3264,7 @@ async function switchConv(id, force) {
     // 将会话权限模式与本地选择对齐（并刷新 Plan banner）
     if (permissionMode) {
         try {
-            await fetch('/api/permission-mode', {
+            const pResp = await fetch(permissionUrl(), {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -3096,7 +3273,16 @@ async function switchConv(id, force) {
                     confirmPolicy: confirmPolicy
                 })
             });
-        } catch (_) { /* ignore */ }
+            // 这次 PUT 不回传 execPolicy，所以不会动会话里的执行策略覆盖；
+            // 顺手拿响应里的权限视图刷新 exec 按钮，省一次 GET。
+            const pData = await pResp.json();
+            if (pData && pData.code === 0 && pData.data) applyExecPolicyView(pData.data);
+            else await refreshExecPolicyView();
+        } catch (_) {
+            await refreshExecPolicyView();
+        }
+    } else {
+        await refreshExecPolicyView();
     }
     refreshPlanBanner();
 }
@@ -3106,7 +3292,8 @@ async function loadMoreMessages(sessionId, prepend) {
 
     try {
         const page = window._msgPage || 0;
-        const resp = await fetch('/api/conversation/messages?sessionId=' + encodeURIComponent(sessionId) + '&page=' + page + '&size=20');
+        const resp = await fetch('/api/conversations/' + encodeURIComponent(sessionId)
+            + '/messages?page=' + page + '&size=20');
         if (!resp.ok) { window._msgLoading = false; return; }
         const data = await apiJson(resp) || {};
 
@@ -3277,10 +3464,11 @@ async function appendUserMessage(text, sessionId) {
     onInputChange();
     scrollToBottom(false, true);
     try {
-        const resp = await fetch('/api/chat/append-message', {
+        const resp = await fetch(
+            '/api/conversations/' + encodeURIComponent(sessionId) + '/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sessionId, message: text })
+            body: JSON.stringify({ message: text })
         });
         const data = await resp.json();
         if (!data.success) {
@@ -3294,7 +3482,7 @@ async function appendUserMessage(text, sessionId) {
 /* =========================================================================
    SEND MESSAGE
    ========================================================================= */
-function send() {
+async function send() {
     const text = $inp.value.trim();
     if (!text && selectedFiles.length === 0) return;
     if (uploadingCount > 0) { alert('文件上传中，请等待'); return; }
@@ -3306,14 +3494,19 @@ function send() {
     }
     if (isStreaming) return;
 
+    // 会话 id 由服务端签发：已有会话直接用，首次发言先建一条。
+    // 放在动 UI 之前 —— 建会话失败时不该已经把输入框清空了。
+    let sid;
+    try {
+        sid = await ensureSessionId();
+    } catch (err) {
+        console.error('[Send] ensure session failed', err);
+        alert('创建会话失败，请稍后重试');
+        return;
+    }
+
     // Hide welcome
     document.getElementById('welcomeScreen')?.remove();
-
-    // Create conversation on first message (backend auto-creates)
-    if (!currentId) {
-        currentId = mkId();
-        localStorage.setItem(LS_CUR, currentId);
-    }
 
     const imgSrcs = previewSrcs.slice();
     const fileNames = selectedFiles.filter(f => !f.type.startsWith('image/')).map(f => f.name);
@@ -3333,10 +3526,10 @@ function send() {
     setStreaming(true);
 
     // POST JSON 交互 — 替代 SSE 流式
-    sendChatPost(text, currentId, filesCopy, refsCopy, botBody);
+    sendChatPost(text, sid, filesCopy, refsCopy, botBody);
 }
 
-/** POST /chat/stream (JSON body)，读 SSE 流式响应 */
+/** POST /api/conversations/{id}/messages/stream，读 SSE 流式响应 */
 async function sendChatPost(text, sessionId, files, refs, botBody) {
     const epoch = ++streamEpoch;
     try {
@@ -3365,7 +3558,8 @@ async function sendChatPost(text, sessionId, files, refs, botBody) {
             permissionMode: permissionMode || 'default',
             confirmPolicy: confirmPolicy || 'dangerous'
         };
-        const resp = await fetch('/chat/stream', {
+        const resp = await fetch(
+            '/api/conversations/' + encodeURIComponent(sessionId) + '/messages/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
@@ -3800,7 +3994,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             // 确认后台任务还在跑，才值得重连
             let stillRunning = false;
             try {
-                const r = await fetch('/api/task-status?sessionId=' + encodeURIComponent(sessionId));
+                const r = await fetch('/api/conversations/' + encodeURIComponent(sessionId) + '/task');
                 if (r.ok) stillRunning = (await apiJson(r) || {}).running === true;
             } catch (e) { /* 探测失败按未运行处理 */ }
 
@@ -3817,7 +4011,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             // 退避后挂到 attach 端点，复用同一 botBody 续流
             await new Promise(res => setTimeout(res, 800 * (reconnectAttempt + 1)));
             try {
-                const resp = await fetch('/chat/stream/attach?sessionId=' + encodeURIComponent(sessionId));
+                const resp = await fetch('/api/conversations/' + encodeURIComponent(sessionId) + '/messages/stream');
                 if (!resp.ok || !resp.body) throw new Error('attach HTTP ' + resp.status);
                 done = true; // 交棒给重连流，避免本帧再次走收尾分支
                 await consumeStream(resp.body.getReader(), botBody, sessionId, reconnectAttempt + 1);
@@ -4129,7 +4323,7 @@ let pollingTimers = {};  // sessionId -> intervalId
 async function syncFromBackend(sid) {
     // Trigger a re-render of the conversation from backend data
     try {
-        const resp = await fetch('/api/conversation?sessionId=' + encodeURIComponent(sid));
+        const resp = await fetch('/api/conversations/' + encodeURIComponent(sid));
         if (!resp.ok) return { synced: false };
         const conv = await apiJson(resp);
         if (!conv || !conv.messages || !conv.messages.length) return { synced: false };
@@ -4142,7 +4336,7 @@ async function syncFromBackend(sid) {
 
 async function checkAndPollTask(sid) {
     try {
-        const resp = await fetch('/api/task-status?sessionId=' + encodeURIComponent(sid));
+        const resp = await fetch('/api/conversations/' + encodeURIComponent(sid) + '/task');
         if (!resp.ok) return;
         const status = await apiJson(resp) || {};
         if (status.running) {
@@ -4155,12 +4349,12 @@ async function checkAndPollTask(sid) {
 }
 
 /**
- * 重连正在运行的会话事件流：挂到 /chat/stream/attach，复用 consumeStream 渲染。
+ * 重连正在运行的会话事件流：GET .../messages/stream，复用 consumeStream 渲染。
  * 收到 gone（缓冲已驱逐）则回退轮询 + 数据库加载。
  */
 async function reconnectStream(sid) {
     try {
-        const resp = await fetch('/chat/stream/attach?sessionId=' + encodeURIComponent(sid));
+        const resp = await fetch('/api/conversations/' + encodeURIComponent(sid) + '/messages/stream');
         if (!resp.ok || !resp.body) {
             unlockComposer();
             showTaskRunningHint(sid);
@@ -4223,7 +4417,7 @@ function startPolling(sid) {
     if (pollingTimers[sid]) return; // 已在轮询
     pollingTimers[sid] = setInterval(async () => {
         try {
-            const resp = await fetch('/api/task-status?sessionId=' + encodeURIComponent(sid));
+            const resp = await fetch('/api/conversations/' + encodeURIComponent(sid) + '/task');
             const status = await apiJson(resp) || {};
             if (!status.running) {
                 stopPolling(sid);

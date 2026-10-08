@@ -20,6 +20,13 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>出图任务之前只交 .mmd 源码就停，因为工具面没有渲染器。
  * 这里走本机 {@code npx @mermaid-js/mermaid-cli}，不经过 exec_command 闸门。
+ *
+ * <p><b>注意 {@code agent.tools.exec-enabled} 管不到这里</b>：那个开关限制的是
+ * "模型发起命令行"，挡不住本工具内部自己起进程。两者要分开看（2026-09-28 明确）。
+ *
+ * <p>所以本工具自己负责可用性判断：{@code npx} 不在 PATH 上时直接返回替代方案，
+ * 见 {@link #runMmdc}。PNG 那条路在客户机上是不可用的（客户机没有 Node），
+ * 但 SVG 直出那条路不需要任何外部程序，仍然可用 —— 因此不能整体不注册这个工具。
  */
 @Slf4j
 @Component
@@ -139,14 +146,20 @@ public class RenderDiagramTool {
     }
 
     private String runMmdc(Path input, Path output) throws IOException, InterruptedException {
-        boolean win = System.getProperty("os.name", "").toLowerCase(Locale.ROOT)
-                .contains("win");
-        List<String> cmd = new ArrayList<>();
-        if (win) {
-            cmd.add("npx.cmd");
-        } else {
-            cmd.add("npx");
+        String npx = HostCommand.isWindows() ? "npx.cmd" : "npx";
+        // 先探有没有，再起进程。没有这一步的话，客户机上会抛
+        //   IOException: Cannot run program "npx.cmd": CreateProcess error=2
+        // 被 handle 的 catch 兜成 "渲染失败: ..."。会报错，但客户看不出该装什么、
+        // 也不知道还有不需要 Node 的替代路径。
+        if (!HostCommand.onPath("npx")) {
+            return "本机没有 npx（Node.js）。render_diagram 出 PNG 走的是 "
+                    + "npx -y @mermaid-js/mermaid-cli，既要有 Node 又要能联网下载该包。"
+                    + "替代做法（二选一）："
+                    + "1) 输出 SVG —— 把 source 写成 <svg>…</svg> 且 path 用 .svg，不需要任何外部程序；"
+                    + "2) 只产出 .mmd 源码文件，交给有渲染环境的一方出图。";
         }
+        List<String> cmd = new ArrayList<>();
+        cmd.add(npx);
         cmd.add("-y");
         cmd.add("@mermaid-js/mermaid-cli");
         cmd.add("-i");
@@ -164,7 +177,11 @@ public class RenderDiagramTool {
         boolean finished = proc.waitFor(RENDER_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         if (!finished) {
             proc.destroyForcibly();
-            return "mermaid-cli 超时（" + RENDER_TIMEOUT_SECONDS + "s）";
+            // 探测通过后仍超时，最常见的原因是 npx -y 正在联网下载包而网络慢/不通。
+            // 提示里带上这一点，否则客户只会看到"超时"两个字。
+            return "mermaid-cli 超时（" + RENDER_TIMEOUT_SECONDS
+                    + "s）。注意 npx -y 首次运行需要联网下载 @mermaid-js/mermaid-cli，"
+                    + "离线或网络不通时必然超时；此时可改用 <svg> 直出。";
         }
         String logText = new String(proc.getInputStream().readNBytes(800),
                 StandardCharsets.UTF_8);

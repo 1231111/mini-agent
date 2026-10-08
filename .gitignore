@@ -26,3 +26,121 @@ embedding-server/models/
 *.iml
 .DS_Store
 Thumbs.db
+
+# 本地备份（改配置前留的 .bak）与密钥文件
+# 备份绝不能留在 src/main/resources 下：Maven 会把整个 resources 目录复制进
+# target/classes 并打进 fat jar，备份里的明文密钥就跟着出厂了（实测踩过）。
+.backup-*/
+*.bak-*
+config.yml
+
+# 桌面端构建物料：都由 scripts/build-desktop.mjs 在构建期生成，且都是平台专有的，
+# 跨平台复用一定失败（Windows 版 JRE 里的 api-ms-win-core-*.dll 拿到 macOS 上就是一堆废文件）。
+#   jre/      jlink 裁出的最小 JRE，约 52MB
+#   browsers/ Playwright 浏览器，约 196MB —— 只含 chromium_headless_shell-<rev>（193MB）
+#             与 ffmpeg-<rev>（3.4MB）。构建脚本用 --only-shell 跳过了完整的 chromium
+#             包（314MB）：headless=true 时 Playwright 解析到的是 headless shell，
+#             完整包不会被加载。要留有头调试能力时加 --with-headed-chromium。
+#   ffmpeg/   Electron 专有编解码器版 ffmpeg，约 1.8MB（自带版不含 H.264/AAC）
+#   models/   内联 embedding 的 ONNX 变体 + tokenizer.json，约 315MB（int8）——
+#             由构建脚本从 .verify/onnx 与 HF 模型目录复制过来，那两处也都不入版本控制
+#   .build-tmp/  从 fat jar 里解出 Playwright 三件套时的临时目录，用完即删
+mini-agent-desktop/jre/
+mini-agent-desktop/browsers/
+mini-agent-desktop/ffmpeg/
+mini-agent-desktop/models/
+mini-agent-desktop/.build-tmp/
+
+# 嵌入式库选型的验证脚本要留（.verify/*.java、*.py、*.cmd、RESULT-*.md），
+# 但跑出来的数据库文件、日志、临时数据目录和测试夹具不进版本库。
+.verify/*.db
+.verify/*.mv.db
+.verify/*.trace.db
+.verify/*.txt
+.verify/*.log
+.verify/home-*/
+.verify/h2dir-test/
+# 探针用的 git 夹具：里面各有自己的 .git，留在外层仓库里会造成嵌套仓库混乱。
+.verify/gitprobe/
+.verify/gitprobe-empty/
+# 从 fat jar 里解出的 Playwright 运行时（.verify/extract-pw-driver.mjs 生成，88MB+）。
+# 只留那两个「怎么解、怎么测」的脚本进版本库，解出来的源码不进。
+.verify/pw-driver/pw/
+.verify/pw-driver/driver-bundle/
+.verify/pw-driver/_bundle.jar
+# 只含 headless shell 的临时 browsers 根目录（launch-test.cjs 用）
+.verify/browsers-shell-only/
+
+# 内联 embedding 的 ONNX 变体（.verify/onnx/export_onnx.py 的产出）。
+# 三档实际体积：int8 315MB / fp16 655MB / fp32 1308MB（还有 fp32 那份 1.2GB 的
+# .onnx.data 外置权重）。随时能用 `python .verify/onnx/export_onnx.py --variants`
+# 重新导出，所以不进版本库 —— 但导出前置是 HF 原始模型必须在本机。
+#
+# ⚠ 这两条是补上的：在此之前这些 .onnx/.onnx.data 没有任何规则覆盖，
+#   一次 `git add .` 就会把 2.3GB 加进仓库（git ls-files 确认过当时还没被追踪，
+#   属于侥幸没踩到）。改携带大文件时，先用 git check-ignore -v 核实一遍，
+#   别靠"应该忽略了吧"。
+.verify/onnx/*.onnx
+.verify/onnx/*.onnx.data
+# 导出脚本和基准跑出来的数字、缓存。字节数已经写进 scripts/lib/model-manifest.mjs。
+.verify/onnx/__pycache__/
+.verify/onnx/*.npz
+.verify/onnx/bench.json
+.verify/onnx/consistency.json
+.verify/onnx/local-model-out.json
+.verify/onnx/mem.txt
+.verify/onnx/manifest.json
+.verify/onnx/probe-*.json
+.verify/onnx/rank-fidelity.json
+
+# 浏览器用户目录：缓存、Cookie、登录数据。不要进公开仓库。
+.verify/execdom/
+# 本地 H2、编译产物、本机 Maven classpath 转储。
+.verify/deskhome-onnx/
+.verify/preflight-home/
+.verify/test-out/
+.verify/java-probe/cp.txt
+.verify/java-probe/cp-common.txt
+mini-agent-common/cp-common.txt
+# 标题栏检查的截图和结果文本。harness.html 仍保留。
+.verify/titlebar-dom-test/result-*.txt
+.verify/titlebar-dom-test/shot-*.png
+
+# .verify/ 下所有以 _ 开头的临时运行目录，一次覆盖三类：
+#   _models / _unpacked  物料归档的下载与解包（CI 步骤与本地验证用）
+#   _cloud / _client     云端账号联调的双实例数据目录（各自独立 H2 库，避免文件锁冲突）
+#   _edbg / _vb2 ...     打包后实例的调试用户目录（换掉单实例锁作用域用）
+# 共同点是"随时可删、删了重跑会再生成"。按前缀忽略，免得每加一个测试目录就回来改一次。
+.verify/_*/
+
+# 可发布的模型物料归档（scripts/pack-models.mjs 的产出，int8 约 196MB）。
+# 它的去处是 release asset，供四个平台 CI 下载，不进版本库。
+dist-models/
+
+# ═══════════════════════════════════════════════════════════════════════
+# ⚠ 本仓库是**公开**的（github.com/1231111/mini-agent，匿名请求返回 200）。
+#   下面三类东西一旦进来就是对所有人可见，且 git 历史很难真正清掉。
+#   2026-09-28 排查确认：根目录那 4 个 .log **已经被追踪过、也已经推上去了**。
+# ═══════════════════════════════════════════════════════════════════════
+
+# 1) 工作区记忆与探针临时输出。
+#    .workbuddy/ 里是 memory/YYYY-MM-DD.md（工作日志，含项目内部决策与安全改造记录），
+#    这不是"缓存"，但**更不是该公开的东西**。
+.workbuddy/
+_pin_verify/
+
+# 2) 运行日志。改动后 git 会把它显示为未跟踪，不会再进新的提交。
+#    已推送过的历史仍在（`git rm --cached` 只管后续），排查结论是里面没有硬密钥 ——
+#    只有 Spring 每次启动随机生成的 dev security password，以及内部模型服务 baseUrl，
+#    所以不值得为此重写公开仓库的历史。重点是别再增加。
+*.log
+
+# 3) compose 的环境变量文件。
+#    `docker compose` 会自动读取当前目录下的 .env，所以"把密钥写进 .env 而不是写进
+#    docker-compose.yml"是最自然的做法 —— 而它带来的后果是 JWT_SECRET /
+#    MODEL_CONFIG_ENCRYPTION_KEY / MYSQL_ROOT_PASSWORD / ACCOUNT_INTERNAL_KEY
+#    这些明文密钥**没有任何规则拦截**，一次 `git add .` 就进公开仓库了。
+#    .env.example（只有变量名、值是占位符）要留，所以不整目录忽略，按名字忽略。
+.env
+.env.*
+!.env.example

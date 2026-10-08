@@ -1,0 +1,56 @@
+# ============================================================
+# MiniAgent 外部配置模板
+# ============================================================
+# 用法：
+#   复制本文件到 ${MINI_AGENT_HOME:-${user.home}/.miniagent}/config.yml
+#   （Windows 默认 %USERPROFILE%\.miniagent\config.yml
+#     Linux/macOS 默认 ~/.miniagent/config.yml）
+#   然后把下面各键填上自己的值。
+#
+# 这个文件刻意放在版本库里，config.yml 本身不进版本库。
+#
+# 加载方式：application.yml 顶部
+#   spring.config.import:
+#     - optional:file:${MINI_AGENT_HOME:${user.home}/.miniagent}/config.yml
+# optional: 前缀表示文件不存在时静默跳过，应用仍能启动 ——
+# 但依赖这些密钥的功能（联网搜索、生图等）会因缺少凭证而失败。
+#
+# 排查是否加载成功：启动日志中搜索 "config.yml"，
+# 或访问 /actuator/env 查看 CHATANYWHERE_API_KEY 等键的来源。
+# ============================================================
+
+# 本地 MySQL 密码（application.yml: spring.datasource.password）
+MYSQL_PASSWORD: ''
+
+# 对话模型预设：agent.models.presets 中 chatanywhere 那一项用的 key
+CHATANYWHERE_API_KEY: ''
+
+# 联网搜索（application.yml: web.search.backend 选择用哪个）
+TAVILY_API_KEY: ''
+BING_API_KEY: ''
+GOOGLE_API_KEY: ''
+GOOGLE_CSE_ID: ''
+
+# 图像生成 / 对话模型共用的 MiMo key。
+# application.yml 的 langchain4j.open-ai.chat-model.api-key 写法是
+# ${LLM_API_KEY:${image.gen.mimo-api-key:}} —— LLM_API_KEY 优先级更高，
+# 只想让对话走另一个 key 时才需要单独填 LLM_API_KEY。
+MIMO_API_KEY: ''
+LLM_API_KEY: ''
+CHATANYWHERE_IMAGE_KEY: ''
+SILICONFLOW_API_KEY: ''
+FAL_KEY: ''
+ZHIPU_API_KEY: ''
+
+# 生歌（也可用环境变量 SENSEAUDIO_API_KEY）
+SENSEAUDIO_API_KEY: ''
+
+# JWT 签名密钥：HS256 要求 >= 32 字节。生成：
+#   python -c "import secrets,base64;print(base64.b64encode(secrets.token_bytes(48)).decode())"
+#
+# 这一行故意保持注释状态。不要留成 JWT_SECRET: ''
+# 原因：Spring 的 ${JWT_SECRET:默认值} 在「键存在但值为空串」时取的是空串，
+# 不是默认值。留一个空的 JWT_SECRET 会把 application.yml 里开发档的默认密钥
+# 覆盖掉，JwtSessionService.init() 随即拒绝启动。
+# 要用就取消注释并填值；不用就保持注释 —— 键不存在才会回退到默认值。
+# JWT_SECRET: ''

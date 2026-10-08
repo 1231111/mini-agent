@@ -9,8 +9,6 @@ import com.miniagent.memory.AgentDataPaths;
 import com.miniagent.memory.MemoryVectorIndex;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
@@ -56,16 +54,18 @@ public class VectorMemoryStore implements MemoryVectorIndex {
     @Value("${agent.memory.vector.min-score:0.4}")
     private double minScore;
 
-    // 复用 codebase 的 embedding 配置（同一套 siliconflow key/model）
-    @Value("${agent.codebase.embedding-api-key:}")
-    private String apiKey;
-    @Value("${agent.codebase.embedding-base-url:https://api.siliconflow.cn/v1}")
-    private String baseUrl;
-    @Value("${agent.codebase.embedding-model:BAAI/bge-m3}")
-    private String embeddingModelName;
+    /**
+     * embedding 统一走 SharedEmbeddingModel，由它决定后端是 remote HTTP 还是进程内 ONNX。
+     * <p>
+     * 本类以前自己 build 一个 OpenAiEmbeddingModel（和 CodebaseSearchTool 各一份），
+     * 后果是 desktop 档把 embedding 切成 local-onnx 之后，这里仍指向 HTTP，
+     * 而出厂 apiKey 为空 → {@code isEnabled()=false} → 记忆向量检索静默退化成全量注入，
+     * 日志里看不出任何异常。
+     */
+    @Autowired
+    private SharedEmbeddingModel embeddingService;
 
     private Path memoryDir;
-    private EmbeddingModel embeddingModel;
     private final Map<Long, InMemoryEmbeddingStore<TextSegment>> stores = new ConcurrentHashMap<>();
     private static final Long DEFAULT_USER = -1L;
 
@@ -74,9 +74,9 @@ public class VectorMemoryStore implements MemoryVectorIndex {
         this.memoryDir = dataPaths.memory();
     }
 
-    /** 向量检索是否可用（受配置开关与 embedding key 共同控制）。 */
+    /** 向量检索是否可用（受配置开关与 embedding 后端可用性共同控制）。 */
     public boolean isEnabled() {
-        return enabled && StringUtils.isNotBlank(apiKey);
+        return enabled && embeddingService.isEnabled();
     }
 
     /** 某用户是否已有向量索引（内存或磁盘）。用于判断是否需要首建。 */
@@ -92,18 +92,6 @@ public class VectorMemoryStore implements MemoryVectorIndex {
 
     private Path vecPath(Long userId) {
         return userDir(userId).resolve(".memory-vec.json");
-    }
-
-    private EmbeddingModel embeddingModel() {
-        if (Objects.isNull(embeddingModel)) {
-            embeddingModel = OpenAiEmbeddingModel.builder()
-                    .httpClientBuilder(SharedEmbeddingModel.http1ClientBuilder())
-                    .apiKey(apiKey)
-                    .baseUrl(baseUrl)
-                    .modelName(embeddingModelName)
-                    .build();
-        }
-        return embeddingModel;
     }
 
     /**
@@ -122,9 +110,16 @@ public class VectorMemoryStore implements MemoryVectorIndex {
                     continue;
                 }
                 try {
-                    TextSegment seg = TextSegment.from(entry);
-                    Embedding emb = embeddingModel().embed(seg).content();
-                    fresh.add(emb, seg);
+                    // 逐条而不是整批：单条编码不 padding，短条目不会为了对齐批次最长长度白算；
+                    // 且一条失败只丢一条，不会把整批记忆一起丢掉。
+                    float[] vec = embeddingService.embed(entry);
+                    if (vec.length == 0) {
+                        // embed() 拿不到向量时返回空数组。这里必须显式告警：
+                        // 否则整个索引会悄悄变空，而日志里什么都看不到。
+                        log.warn("记忆条目嵌入为空（跳过）: {}", StringUtils.abbreviate(entry, 60));
+                        continue;
+                    }
+                    fresh.add(Embedding.from(vec), TextSegment.from(entry));
                 } catch (Exception e) {
                     log.warn("记忆条目嵌入失败（跳过一条）: {}", e.getMessage());
                 }
@@ -176,9 +171,13 @@ public class VectorMemoryStore implements MemoryVectorIndex {
             if (Objects.isNull(store)) {
                 return List.of();
             }
-            Embedding q = embeddingModel().embed(query).content();
+            float[] qv = embeddingService.embed(query);
+            if (qv.length == 0) {
+                log.warn("查询向量为空，本次不做语义召回 userId={}", uid);
+                return List.of();
+            }
             EmbeddingSearchRequest req = EmbeddingSearchRequest.builder()
-                    .queryEmbedding(q)
+                    .queryEmbedding(Embedding.from(qv))
                     .maxResults(Math.max(1, topK))
                     .minScore(minScore)
                     .build();

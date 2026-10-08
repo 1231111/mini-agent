@@ -1,0 +1,315 @@
+# ============================================================
+# ApplicationConfig: desktop（桌面客户端档 / 出厂安装形态）
+# ============================================================
+# 激活方式：由 mini-agent-desktop/main.js 在启动后端时传入
+#   java -jar mini-agent-app.jar --spring.profiles.active=desktop
+#
+# 与 prod 档的区别（一句话）：prod 是 Docker Compose 形态，依赖 MySQL + Redis +
+# Milvus + 独立 embedding 服务；desktop 是单机形态，只依赖本机文件系统。
+#
+# 密钥一律来自 ${MINI_AGENT_HOME}/config.yml（由 application.yml 的
+# spring.config.import 引入），本文件里不出现任何密钥值。
+#
+# ------------------------------------------------------------
+# 尚未落地、已知会失败的路径（不要以为配好了就能用）
+# ------------------------------------------------------------
+# 1. registration-enabled 暂留 true：单机若没有账号且关闭注册，将无法登录。
+#    等"首启引导创建本地账号"落地后再改为 false。
+# 2. codebase.embedding-enabled：已从 false 改为 true，后端换成进程内 ONNX（local-onnx）。
+#    原先关掉是因为仓库自带的 embedding-server 有 2.5GB 塞不进安装包；现在用导出的
+#    int8 ONNX（329,744,186 B）在本进程内推理，不需要 sidecar、不需要外部 API。
+#    实测（.verify/onnx/consistency.json + rank-fidelity.py）：与 sentence-transformers
+#    参考实现 20 条边界样本 token ids 逐 token 一致；真实改写检索（10 条人话 query
+#    查 20 条文档）top-1 9/10、top-3 10/10、MRR 0.950 —— 与 fp32 逐项相同。
+#    仍未落地：模型文件怎么随安装包分发（打包/首启流程），见第 6 条。
+# 3. 出厂包体积大，而且 fat jar 里塞的是「全平台」二进制 —— 每个平台的安装包都
+#    背着另外几个平台的东西。按体积排，可裁的前三名（2026-09-28 实测 jar 内容）：
+#      driver-bundle-1.49.0.jar   189MB  Playwright 的 node driver，含五平台各一份
+#                                        （driver/win32_x64/node.exe 单个就 80MB）
+#      onnxruntime-1.20.0.jar      92MB  含 win-x64 / linux-x64 / linux-aarch64 /
+#                                        osx-x64 / osx-aarch64 五份 native
+#      tokenizers-0.36.0.jar       18MB  DJL，含四份 native
+#                                        （没有 osx-x86_64 —— 所以 Intel Mac 上
+#                                         内联 embedding 会静默降级成"没有语义检索"）
+#    要裁得走分平台出包（Maven profile + classifier 挑 native），不是删几个依赖的事。
+#    另外随包的浏览器与 JRE 也是每平台一份，同样不能跨平台复用（2026-09-28 实测）：
+#      browsers/                   196MB  Playwright 浏览器，只含 chromium_headless_shell-<rev> 193MB
+#                                        + ffmpeg-<rev> 3.4MB（构建脚本用 --only-shell 跳过完整包）
+#      jre/                         52MB  jlink 裁出的最小 JRE
+#    曾经这里是 510MB：Playwright 1.49 起把 Chromium 拆成 chromium（314MB）与
+#    chromium-headless-shell（193MB）两个包，选哪个由 headless 选项决定。本工程 headless 恒为 true
+#    （桌面档/prod 档写死，ProductionReadinessValidator 在 prod 下拒绝 false），所以完整包永远
+#    不会被加载，已从出厂包里去掉。需要留着有头调试能力时用 --with-headed-chromium 重新构建。
+# 4. 工具里外调宿主命令行，客户机上不一定存在（2026-09-28 已收口）：
+#      RenderDiagramTool   npx @mermaid-js/mermaid-cli —— 已加 HostCommand.onPath("npx") 守卫，
+#                          缺 Node 时返回"改用 <svg> 直出"的替代方案，不再抛 CreateProcess error=2
+#      AgentEnvironmentTool 已去掉 sh -c 包装（Windows 没有 sh，这是必挂项），
+#                          改为参数列表直接起 git；失败不再吞成空串（原来会让 is_clean 报假 true）
+#      BrowserService      主路径是随包 JRE + classpath 里的 playwright jar，
+#                          npx/mvn 是 commandOnPath 守卫后的兜底。
+#                          Chromium 现在随安装包分发（resources/browsers），位置由桌面壳
+#                          经 PLAYWRIGHT_BROWSERS_PATH 传给后端；该变量一旦设上，
+#                          BrowserService 就只检查、不再尝试联网下载 —— 离线客户机上
+#                          那条路必然失败，还会把"安装包不完整"伪装成"首次启动比较慢"
+#    仍要注意的策略分界：exec-policy 管的是"模型发起的 exec_command"，
+#    管不到上述工具内部自己起进程 —— 这两件事要分开看，别以为设了 block 就万事大吉。
+# 5. agent_token_usage 表恒空：TokenUsageTracker 是纯静态内存 Map（重启即丢），
+#    唯一写库的 DbTokenUsagePersistence 是孤儿 bean（TokenUsagePersistence 接口
+#    全项目无注入点）。/api/token-usage 读的是内存，不是库。既有接线缺失，与内嵌库无关。
+# ============================================================
+
+server:
+  # 桌面后端只服务本机 Electron 壳，禁止监听局域网网卡。
+  address: 127.0.0.1
+
+spring:
+  thymeleaf:
+    # 出厂包按只读资源处理：模板不会在运行期被改动，缓存打开减少重复解析。
+    cache: true
+
+  # 桌面档不提供 Redis，这里把 Redis 客户端整条装配链排掉。
+  #
+  # 为什么不靠代码里的 @Autowired(required = false)：Spring Boot 的
+  # RedisAutoConfiguration 只判断 redis 相关 class 在不在 classpath，
+  # 不看服务端是否可达。classpath 上有 spring-boot-starter-data-redis，
+  # 它就一定会给出一个非 null 的 StringRedisTemplate —— 于是这些判断失效：
+  #   MemoryTaskLock:55        if (redis != null) → 真 → 每次加锁先去连 Redis
+  #   WorkingMemoryManager:143 if (redisTemplate == null) → 假 → 继续走 Redis
+  # 两者都有 try/catch 兜底，但 spring.data.redis.timeout 是 3s，所以每次
+  # 都要先白等一次连接超时。排掉自动配置后 bean 真的不存在，兜底分支才会被直接命中。
+  #
+  # TraceSseHub / SessionEventCenter 不受影响：它们额外判了 isRedisMode()。
+  # 会话存储也不受影响：SessionStore 的后端由 agent.replica.mode 选，
+  # 本档是 local，走 DbSessionStore。
+  #
+  # 后果：本档下若有人把 agent.replica.mode 改成 redis，RedisSessionStore 会因
+  # 拿不到 StringRedisTemplate 而启动失败。这是刻意的 —— 配置自相矛盾就该当场报错。
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
+
+  datasource:
+    # 单机内嵌库。库文件落在用户数据目录，卸载客户端不会连带删掉聊天记录。
+    #
+    # MODE=MySQL 不是可选优化项 —— 实测（.verify/DbCompatProbe.java）证明，
+    # 去掉它之后两处 upsert（AgentTokenUsageRepository.increment /
+    # TenantDailyUsageRepository.increment）用的 ON DUPLICATE KEY UPDATE
+    # 直接语法报错，authentication 相关表也建不出来。
+    #
+    # 这里刻意不加 DATABASE_TO_LOWER / CASE_INSENSITIVE_IDENTIFIERS：
+    # 这两个参数在库文件创建时就被写进元数据，之后去掉会导致
+    #   Schema "public" not found
+    # （默认 schema 被从 PUBLIC 改名成 public，且不可改回）。
+    # 一旦出厂就这么设，将来想改配置就得给所有存量用户做数据迁移，
+    # 收益（贴近 MySQL 的 lower_case_table_names=1）不值这个代价。
+    url: jdbc:h2:file:${MINI_AGENT_HOME:${user.home}/.miniagent}/data/miniagent;MODE=MySQL
+    username: sa
+    password: ""
+    driver-class-name: org.h2.Driver
+
+  jpa:
+    hibernate:
+      # 默认档是 update：Hibernate 从实体反推 DDL 建表。
+      # 桌面档不能改成 validate —— 单机首次启动时库是空的，建表由这里承担
+      # （Flyway 只管增量，不建全量基线，见下方 flyway 段）。
+      ddl-auto: update
+    properties:
+      hibernate:
+        # 必须显式覆盖。application.yml 里写死了 MySQLDialect，
+        # 拿着 H2 连接跑 MySQL 方言的 DDL / 分页 / upsert，会生成 H2 不认的语句。
+        dialect: org.hibernate.dialect.H2Dialect
+
+  flyway:
+    # 桌面档自 1.0.1 起具备版本化升级能力。迁移链的起点与 prod 不同：
+    #
+    #   db/migration 下 V1~V8 是 MySQL 方言脚本（V5 的 SET @var := / PREPARE
+    #   用户变量在 H2 上直接语法报错，实测 Syntax error in SQL statement
+    #   "SET @has_col [*]:= 1"，MODE=MySQL 也救不了）。桌面档永远不执行它们 ——
+    #   库结构的「基线」由上面的 ddl-auto: update 从实体反推。
+    #   baseline-version: 8 是这句话的机器可读版：假定当前库结构等价于「V1~V8
+    #   已执行完」，Flyway 只负责 8 之后的增量（V9 起，Java 迁移，
+    #   在 com.miniagent.migration 包里，H2/MySQL 通用）。
+    #
+    # 为什么不干脆让 Flyway 在空库上跑全量 V1~V10：那等于每份安装包都背着 8 个
+    # MySQL 脚本的 H2 兼容性债，而它们描述的结构，实体注解本来就能生成。
+    #
+    # 空库的坑（实测 Flyway 10.20.1 + H2 2.3.232）：baseline-on-migrate 只对
+    # 「非空库且无历史表」生效；空库 migrate 会从最小版本起全跑（实测跑了 V8+V9），
+    # 新装机会先去执行 V1~V8，必炸。所以 baseline 由 DesktopFlywayConfig
+    # （@Profile("desktop") 的 FlywayMigrationStrategy）显式调用：没有历史表就先
+    # baseline() 再 migrate()，新装机、老装机走同一条路。
+    #
+    # 已知的双写残留（后续步骤要收口）：ddl-auto: update 仍会把实体注解的变化
+    # 直接应用到库里。纪律是「结构变更一律走 V9 之后的迁移，实体只负责新装机建表」，
+    # 两边不一致时以迁移为准、尽快补迁移 —— 否则又会造出 V5 那种漂移。
+    enabled: true
+    baseline-on-migrate: true
+    baseline-version: 8
+
+logging:
+  level:
+    com.miniagent: INFO
+    root: WARN
+  file:
+    # 客户端要能查问题：日志落到用户数据目录，而不是控制台。
+    # 路径写法与 application.yml 的 agent.data-dir 默认值保持一致，
+    # 不写 ${agent.data-dir} 是因为 logging 初始化早于配置属性解析。
+    name: ${MINI_AGENT_HOME:${user.home}/.miniagent}/logs/miniagent.log
+
+agent:
+  auth:
+    # 刻意不给默认值。缺失时 JwtSessionService.init() 抛 IllegalStateException
+    # 拒绝启动 —— 带上 application.yml 里那个公开的开发默认值出厂，
+    # 等于每个客户拿到同一把签名密钥，任何人可伪造 token。
+    jwt-secret: ${JWT_SECRET:}
+    jwt-exp-seconds: 604800
+    jwt-ttl-seconds: 1800
+    bcrypt-strength: 12
+    # 见文件头「尚未落地」第 3 条。
+    registration-enabled: true
+    # 显式钉死本地 origin，不吃 application.yml 里的 ${ALLOWED_ORIGINS:...}。
+    # 桌面端的 CORS 白名单不该被客户机上的一个环境变量改掉 —— 那是配置漂移，
+    # 出事时没人会想到去查环境变量。
+    allowed-origins: http://localhost:*,http://127.0.0.1:*,file://
+
+    # 云端账号服务（mini-agent-account）。配了它，登录校验走账号服务；
+    # 本地只留一个"影子用户"（users.external_id 指向云端身份），
+    # 因为 SignedSessionFilter 每个请求都要 userRepository.findById()，
+    # 本地没有对应行就一律 401。
+    #
+    # 指向云端 mini-agent-account 的地址，例如 http://203.0.113.10:8081。
+    # 留空则登录走本机账号。注册和套餐页面在账号服务上，不在桌面壳里。
+    # 配了地址之后本机必须能访问它，否则谁都登不进去。
+    cloud:
+      base-url: ${CLOUD_AUTH_BASE_URL:}
+      # 超时必须显式给。默认是无限等待，而登录在启动路径上 ——
+      # 云端不拒绝连接只丢包时，界面会无限转圈。
+      connect-timeout-ms: 3000
+      read-timeout-ms: 10000
+      # 云端角色（SYSTEM_ADMIN 等）是否同步到本地影子用户。默认 false：
+      # 云端的权限域和本机不是一回事，自动等同等于把云端提权放大到设备上。
+      adopt-role: false
+
+  # 单机：不装配 RedisReplicaConfig / RedisRateLimiter / RedisAsideStore 一族
+  # （它们都是 @ConditionalOnProperty(agent.replica.mode=redis)）。
+  # 注意这只关掉了"多副本热状态"，关不掉 JwtSessionService 里那个直接注入的
+  # StringRedisTemplate —— 见文件头第 2 条。
+  replica:
+    mode: local
+
+  # 单机：向量走 LocalSessionHistoryVectorStore + LocalHybridSearchEngine
+  # （havingValue=local, matchIfMissing=true），不需要 Milvus 与 etcd/MinIO。
+  memory:
+    storage: db
+    vector:
+      enabled: true
+      backend: local
+
+  todo:
+    storage: db
+
+  planner:
+    enabled: true
+    storage: db
+
+  # 防止出厂包里的 base-url 被改到任意地址，把 API key 送到非预期端点。
+  #
+  # 闸门执行者是 UserModelConfigService（save() 拒写 + resolve() 忽略存量值），
+  # 不是 ProductionReadinessValidator —— 后者读同一个键，但只在 prod 档运行
+  # （它还要求 ddl-auto=validate / flyway 开启 / replica.mode=redis），
+  # 客户端档一次都跑不到。曾经只有那一处读它，等于这条配置形同注释。
+  #
+  # 为什么值钱：resolve() 里 baseUrl 与 apiKey 是分别回退的。用户填自定义
+  # baseUrl、apiKey 留空 → 拿到的是出厂的全局 apiKey。不需要知道密钥内容，
+  # 改一个地址就能把出厂密钥引到任意端点。
+  models:
+    custom-base-url-enabled: false
+
+  codebase:
+    # 内联 ONNX：进程内推理，取代 embedding-server 这个 Python sidecar。
+    #
+    # 三档量化变体实测：
+    #   文件                                        字节数        建会话(Java) 短文本(~30字) 长文本(~400字)
+    #   yuan-embedding-2.0-zh.onnx                1,307,989,980    5290ms      56.00ms     291.64ms
+    #   yuan-embedding-2.0-zh.fp16.onnx             655,377,306    4883ms      70.59ms     357.80ms
+    #   yuan-embedding-2.0-zh.int8.onnx             329,744,186    4746ms      31.92ms     132.81ms
+    # （fp32 与 fp16 各带一个同名 .onnx.data 存权重，必须与 .onnx 同目录，缺了建会话时报错；
+    #   int8 是单文件，没有伴生 .data。）
+    #
+    # 两个口径不能混着看：
+    #   「建会话」是 Java 侧（出厂路径）实测，三档只差 11% —— Java ORT 有约 4.5 秒的
+    #   固定初始化开销在主导，与模型大小基本无关：同一份 int8 在 Python 侧建会话只要
+    #   0.53 秒，差 9 倍。所以"int8 建会话更快"在出厂路径上几乎不成立（11%，不是 4 倍）。
+    #   「短/长文本」是 Python 侧口径（40 次迭代、threads=8），Java 侧未测；建会话这件事
+    #   恰好说明两边不能互相推算，所以不拿它当出厂保证。
+    #
+    # 选 int8，理由是实测而不是推断：
+    #   1. 体积 329,744,186 B —— fp16 的一半、fp32 的四分之一，直接决定安装包大小
+    #   2. 召回排序没有可观测退化：10 条人话改写 query 查 20 条文档，
+    #      top-1 9/10、top-3 10/10、MRR 0.950 —— 与 fp32 逐项相同
+    #
+    # fp16 出局的原因：CPU 上 ONNX Runtime 没有原生 fp16 kernel，要多插 Cast 节点，
+    #   实测比 fp32 还慢（70.59ms vs 56.00ms），却只省一半体积 —— 两头不占。
+    #
+    # int8 已知的退化面（不是"不能用"，是"知道代价落在哪"）：
+    #   逐条 cosine 最小值 0.9811（已剔除空串与单个空格）；20 条样本互查的全序一致率
+    #   86.1%，最差一处在 s19（换行分隔）把 gold 的 top-1 挤到第 2 位。
+    #   差异集中在无实义文本（纯标点、空串、罕见字）—— 它们在检索里本来就不是有效
+    #   query，所以真实改写检索场景看不出差别。
+    #   注意 consistency.json 里 int8 的 A_pass: false 是按 threshold_cosine=0.9999 判的，
+    #   那个阈值是「ONNX 导出图 vs PyTorch 参考实现」的等价性闸门，量化模型必然过不了；
+    #   日志原文已标注：不达标的数据点（不影响闸门结论，供体积-精度权衡）: int8。
+    #
+    # 模型与 tokenizer 的位置：出厂走随包目录，开发态回退 data-dir。
+    #
+    # 桌面壳启动后端时会把安装目录下的 resources/models 通过 MINI_AGENT_MODELS_DIR
+    # 传进来（与 Chromium 用 PLAYWRIGHT_BROWSERS_PATH 是同一个模式）。开发态不起壳、
+    # 直接跑 jar 时该变量为空，就回退到 ${agent.data-dir}/models。
+    #
+    # 这种 ${A:${B}} 嵌套默认值里，B 本身仍是一个占位符，Spring 会递归解析 ——
+    # 「壳传了用壳的、没传用 data-dir」能不能成立全靠这一点，是实测过的才这么写。
+    embedding-enabled: true
+    embedding-provider: local-onnx
+    embedding-local-model: ${MINI_AGENT_MODELS_DIR:${agent.data-dir}/models}/yuan-embedding-2.0-zh.int8.onnx
+    embedding-local-tokenizer: ${MINI_AGENT_MODELS_DIR:${agent.data-dir}/models}/tokenizer.json
+    # ORT 是进程内线程池，不是请求级隔离；单机档给 4 足够，给太多会和 agent 自身抢核
+    embedding-local-threads: 4
+
+  tools:
+    # 出厂默认 ask：每个会话首次执行 exec_command 前需要用户批准。这一个值只是初始档，
+    # 用户在会话里可以随时用权限面板切成 block/ask —— 走
+    # PUT /api/conversations/{sid}/permission 的 execPolicy 字段，无需重启。
+    #
+    # 三档语义：
+    #   allow 免批 / ask 本会话弹一次批准后记住 / block 直接拒绝（连批准入口都没有，
+    #   且不受会话模式 ACCEPT_EDITS 影响 —— "自动编辑"是"别问我"，不是"我允许执行命令"）
+    #
+    # 无论哪一档，exec_command 内部那四层命令级安全过滤都照常生效：
+    # DANGEROUS_COMMANDS 黑名单 / DANGEROUS_PATTERN 正则 / containsCommandInjection /
+    # LONG_RUNNING_SERVER_PATTERN（拦截永不退出的常驻服务器命令）。
+    exec-policy: ask
+    allow-absolute-write: false
+    block-private-network: true
+    allowed-http-ports: 80,443
+    max-http-redirects: 3
+
+  browser:
+    evaluate-enabled: false
+    headless: true
+
+  rate-limit:
+    per-minute: 60
+  concurrency:
+    max-tasks-per-user: 2
+
+management:
+  endpoint:
+    health:
+      show-details: never
+  health:
+    # 必须关。RedisHealthIndicator 会去连 127.0.0.1:6379，
+    # 桌面档不提供 Redis，不关的话 /actuator/health 永远 DOWN，
+    # 而 main.js 正是靠这个端点判断后端是否就绪。
+    redis:
+      enabled: false

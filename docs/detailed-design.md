@@ -45,8 +45,8 @@ Mini Agent 是 **单进程 Spring Boot Web 应用**：浏览器打开 `http://12
 
 | 编号 | 功能点 | 落点 |
 |------|--------|------|
-| F01 | 账号登录/注册/退出，JWT Cookie + Redis 滑动 TTL | `JwtSessionService`、`/api/login` |
-| F02 | 对话页：侧栏历史、设置、SSE 流式思考与正文 | `templates/chat.html`、`POST /chat/stream` |
+| F01 | 账号登录/注册/退出，JWT（Bearer 头）+ Redis 滑动 TTL | `JwtSessionService`、`POST /api/tokens` |
+| F02 | 对话页：侧栏历史、设置、SSE 流式思考与正文 | `templates/chat.html`、`POST /api/conversations/{sessionId}/messages/stream` |
 | F03 | 任务信号：从用户原文用正则抽事实，不做意图枚举 | `TaskSignalMatcher`、`agent.task-signals.rules` |
 | F04 | 系统上下文：每一轮都装，简单问答用 LIGHT 策略，不是空上下文 | `ContextLoader`、`ContextLoadPolicy` |
 | F05 | 直跑 Agent：ReAct，上限 `agent.execution.max-iterations`（默认 **90**） | `AgentLoop` |
@@ -60,7 +60,7 @@ Mini Agent 是 **单进程 Spring Boot Web 应用**：浏览器打开 `http://12
 | F13 | 记忆：blob + 结构化；巩固异步 | `MemoryService`、`MemoryController` |
 | F14 | 会话历史窗口 `agent.chat-memory.max-messages` 默认 **64** | `ChatMemoryConfig` |
 | F15 | 轨迹落库 + `/trace` 页 + SSE `trace` | `TraceRecorder`、`agent_trace_steps` |
-| F16 | 上传文件/图片/音视频（音视频源文件约 35MB） | `/api/upload`、`agent.multimodal.*` |
+| F16 | 上传文件/图片/音视频（音视频源文件约 35MB） | `POST /api/conversations/{sessionId}/files`、`agent.multimodal.*` |
 | F17 | 租户日 token 配额、并发任务上限 | `DbTenantTokenQuota`、`max-tasks-per-user=2` |
 | F18 | 健康检查 `/actuator/health` 与 `/api/planner/health` | `HealthController` |
 
@@ -413,7 +413,7 @@ flowchart TD
 | ask | 危险工具仍出现在规格里，执行时拦截并推 `permission_ask` |
 | accept_edits | `needsSessionGrant` 恒 false，待办确认可跳过 |
 
-生产 profile 把 `exec-enabled` 设为 false。改模式：`PUT /api/permission-mode`。
+生产 profile 把 `exec-enabled` 设为 false。改模式：`PUT /api/conversations/{sessionId}/permission`。
 
 ---
 
@@ -436,13 +436,36 @@ flowchart TD
 
 ### 5.1 认证与会话
 
-1. `POST /api/login`：校验用户 → `JwtSessionService.issueToken` 写 Cookie `ma_token`，Redis 键 `session:jwt:{jti}`，TTL = `agent.auth.jwt-ttl-seconds`（默认 **1800**）。JWT `exp` 上限 `jwt-exp-seconds`（默认 7 天）。闲置超时靠 Redis TTL 刷新。
-2. 过滤器认 `Authorization: Bearer`、Cookie、或 query `access_token`（给 EventSource）。
-3. 每次鉴权刷新 Redis TTL。
-4. `GET /api/logout`：删 Redis、清 Cookie、重定向 `/`。
-5. CSRF：Cookie `XSRF-TOKEN`，写操作要头 `X-XSRF-TOKEN`。
+> **无状态改造（已落地）**：凭证只走 `Authorization: Bearer`，服务端不写任何 cookie。
+> 前端把 JWT 存 `sessionStorage`（键 `ma_token`），由 `static/js/security.js` 统一注入请求头，
+> 收到 401 即清 token 并 `location.replace('/login')`。
+>
+> 代价要写清楚：`sessionStorage` 对 XSS 可读，而 httpOnly cookie 不可读 ——
+> 这是把「防 XSS 窃取」换成了「防 CSRF」，不是单纯的增强。
 
-dev 默认 `registration-enabled=true`，`password-min-length=8`（yml 覆盖 `AuthService` 字段缺省 12）。生产关闭注册、`secure-cookie=true`。
+1. `POST /api/tokens`：校验用户 → `JwtSessionService.issueToken(userId)` 返回 JWT 明文（**不写 cookie**），
+   Redis 键 `session:jwt:{jti}` → userId，TTL = `agent.auth.jwt-ttl-seconds`（默认 **1800**）。
+   JWT `exp` 上限 `jwt-exp-seconds`（默认 7 天），与 Redis 并存时 `exp` 只是硬上限。
+2. `SignedSessionFilter` 只认 `Authorization: Bearer`。命中 Redis 则放行并写入
+   `authUserId` / `authPrincipal` request attribute；未命中且路径不在 `SecurityConfig.PUBLIC_PATHS`
+   白名单里，**filter 直接返回 401 JSON**，不放行到 MVC。
+3. 每次鉴权刷新 Redis TTL（滑动窗口，空闲 30 分钟即失效）。
+4. `DELETE /api/tokens`：删 Redis 键 + 摘掉该用户的 SSE 流，返回 `ApiResponse`；
+   清 `sessionStorage` 与跳转移交前端（服务端没有任何「浏览器自动清除」的环节可依赖）。
+5. CSRF 防护**整体关闭**。CSRF 的前提是「浏览器自动携带凭证」，而 Bearer 头只能由页面脚本显式添加，
+   跨站请求无法自动附带；再叠一层 `XSRF-TOKEN` 只会制造 403。
+
+**会话 id 由服务端签发**：`POST /api/conversations` 生成 `s_<uuid32>` 并立刻
+`conversationStore.claim(userId, sessionId, null)` —— id 与 `user_id` 同时落库，
+此后所有会话作用域接口都能用严格判等（`SessionAuthorizationService.owns`）拒绝他人。
+客户端不再自造 id：自造意味着归属记录只能等首条消息落库才出现，中间那段只能靠
+「这个 id 被别人占了吗」猜，那就是越权口子。
+
+页面入口 `GET /`、`GET /login`、`GET /trace` 一律放行骨架并返回同一套 HTML：浏览器导航请求
+带不了自定义头，服务端拿不到身份，分流只能由前端读 `sessionStorage` 后自己决定。
+
+dev 默认 `registration-enabled=true`，`password-min-length=8`（yml 覆盖 `AuthService` 字段缺省 12）。
+生产关闭注册。JWT 签名密钥为 `agent.auth.jwt-secret`（env `JWT_SECRET`，旧名 `COOKIE_SECRET` 仍可回退）。
 
 不要把 `auth_sessions` 表当成在线会话真相源。活会话在 Redis。admin `revoke-sessions` 写的是 DB 行，不会立刻踢掉 Redis JWT。
 
@@ -500,7 +523,11 @@ dev 默认 `registration-enabled=true`，`password-min-length=8`（yml 覆盖 `A
 2. `ContextLoadPolicy.forSignals`：`lightTurn` → LIGHT，`continueTask` → CONTINUE，否则 ACTION。
 3. `lightTurn` 时把历史上限改成配置 6（有指代则 `question-with-ref`，默认也是 6），指代命中则打开记忆注入。
 4. 非 LIGHT 且正在 `awaiting_confirm`：不挂起、不恢复。否则 CONTINUE 恢复挂起清单，ACTION 挂起活动清单。
-5. `TaskScopeRegistry.scopeKey`：`taskId==0` 用 `sessionId`，否则 `sessionId#taskId`。进程内 Map，重启丢失。规划图和压缩摘要按 scopeKey。对话历史整段保留，不按任务边界截断。
+5. `TaskScopeRegistry.scopeKey`：`taskId==0` 用 `sessionId`，否则
+   `sessionId#taskId`。`current_task_id`、`paused_task_id`、`scope_sequence`
+   存在 `agent_session_todos`，用该行 `version` 做 CAS；未装配持久化端口的纯单测
+   才回退进程内 Map。规划图和压缩摘要按 scopeKey。对话历史整段保留，
+   不按任务边界截断。
 6. `selectHistory`：非指代按条数从尾切，`-1` 不裁。指代走 `ContextHistorySelector`（向量 `ref-min-score=0.35`，失败回退词重叠下限 0.15，扫描池 `ref-scan-max=48`）。
 7. `ContextBuilder.build` → `LoadedContext`。
 
@@ -619,11 +646,16 @@ Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 | 规划图 | `StepEvaluator` | 单向投影 |
 | 直跑（已经过系统上下文） | 模型 `todo` + `TodoPlanStopHook` | 模型维护的清单 |
 
-`todo` action：`set` / `update` / `list` / `clear` / `reopen` / `confirm`。`done_when` 前缀与图上 `DoneWhen` 对齐。存储 `agent.todo.storage=db`（表 `agent_session_todos`）。变更后 SSE `todo`。
+`todo` action：`set` / `update` / `list` / `clear` / `reopen`。
+`done_when` 前缀与图上 `DoneWhen` 对齐。存储 `agent.todo.storage=db`
+（表 `agent_session_todos`）；同一行还保存 TaskScope 指针，清空 Todo 只清
+`active_json` / `suspended_json`，不会重置任务序号。变更后 SSE `todo`。
 
 `TodoPlanStopHook`：轻问答、本轮 `hardGate`（规划提案）、媒体已交付则放行。需要结构化计划但还没 `todo.set`，或清单还有未完成项，各最多提醒 2 次。`plannerOwned` 等于本轮 hardGate，不是「库里有图」。
 
-等人：节点可进入 `AWAITING_CONFIRM`。`POST /api/todo/confirm` 或非空用户回复把它送回 `PENDING`。用户只发「继续」且 `HumanYield.looksLikeBareContinue` 则保持等待。
+等人：节点可进入 `AWAITING_CONFIRM`。只有显式调用
+`PATCH /api/conversations/{sessionId}/todos/{id}` 才把指定节点送回 `PENDING`；
+普通聊天、质疑和补充要求都不会隐式确认。
 
 换任务：下一轮 ACTION 且有活动清单时，全终态则归档清空，未完成则挂起，「继续」用 CONTINUE 策略捞回。`awaiting_confirm` 且非 LIGHT 不挂起。NEW 边界让 `taskId` 自增，规划读新的 `sessionId#taskId`。
 
@@ -633,7 +665,7 @@ Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 
 `templates/chat.html`，样式内联。`spring.thymeleaf.cache=false` 时改 HTML 刷新即可。前端不是独立 SPA。
 
-SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `progress` `subgoal` `todo` `permission_ask` `user_question` `append_ack` `end` `error` `gone` `context`。`context` 载荷是 `{"used","limit"}`：`used` 为当次模型 input token，`limit` 为 `agent.context.max-tokens`（默认 512000），不是厂商上下文上限。轨迹流是 `trace`（`GET /api/traces/stream`）。`reset` 的处理函数在，主路径不 publish。
+SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `progress` `subgoal` `todo` `permission_ask` `user_question` `append_ack` `end` `error` `gone` `context`。`context` 载荷是 `{"used","limit"}`：`used` 为当次模型 input token，`limit` 为 `agent.context.max-tokens`（默认 512000），不是厂商上下文上限。轨迹流是 `trace`（`GET /api/conversations/{sessionId}/traces`）。`reset` 的处理函数在，主路径不 publish。
 
 `TraceRecorder` 写入 `agent_trace_steps`。页面 `GET /trace`。`isFailedResult` 用文本是否包含 `"error"` 判断失败，成功结果里若带这个子串会被误判。
 
@@ -645,17 +677,26 @@ SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `progress
 |------|------|------|
 | 账号/会话/消息/任务 | MySQL `mini_agent` | JPA |
 | JWT 滑动会话 | Redis | `session:jwt:{jti}` |
-| 规划图 / Todo | MySQL `agent_session_planner` / `agent_session_todos` | `storage=db` |
+| 规划图 / Todo / TaskScope | MySQL `agent_session_planner` / `agent_session_todos` | `storage=db`；TaskScope 用行版本 CAS |
+| 会话权限 | `agent_session_permissions` | mode、Plan 批准、Ask grant、confirm 与 exec 覆盖均用行版本 CAS |
 | 上传与生成媒体 | `{data-dir}/media` | 不用已弃用的 `file.upload.base-dir` |
 | Skills / workspace | `{data-dir}/skills`、`workspace` | |
 | 向量 | 本地 JSON 或 Milvus | `backend` 切换 |
 | 轨迹 | `agent_trace_steps` | |
 
-默认 `spring.flyway.enabled=false`，`jpa.hibernate.ddl-auto=update`。生产 profile 才启用 Flyway 且 `ddl-auto=validate`。
+默认 `spring.flyway.enabled=false`，`jpa.hibernate.ddl-auto=update`。prod 启用 Flyway
+且 `ddl-auto=validate`；desktop 也启用 Flyway，但当前仍由
+`ddl-auto=update` 为新装机生成基线结构。
 
-核心表：`tenants`、`users`、`chat_conversations`、`chat_messages`、`chat_tasks`、`file_uploads`、`user_model_config`、`agent_user_memory`、`agent_task_runs`、`agent_session_todos`、`agent_session_planner`、`agent_events`、`agent_episodes`、`agent_memory_entries`、`agent_semantic_facts`、`agent_procedures`、`agent_working_memories`、`agent_token_usage`、`tenant_daily_usage`、`agent_trace_steps`、`admin_audit_log`、`auth_sessions`。`agent_session_permissions` 表在，运行时权限在内存。V7 已删意图规则表，不要再建。
+核心表：`tenants`、`users`、`chat_conversations`、`chat_messages`、`chat_tasks`、
+`file_uploads`、`user_model_config`、`agent_user_memory`、`agent_task_runs`、
+`agent_session_todos`、`agent_session_planner`、`agent_session_permissions`、
+`agent_events`、`agent_episodes`、`agent_memory_entries`、`agent_semantic_facts`、
+`agent_procedures`、`agent_working_memories`、`agent_token_usage`、
+`tenant_daily_usage`、`agent_trace_steps`、`admin_audit_log`、`auth_sessions`。
+V7 已删意图规则表，不要再建。
 
-会话软删：`/api/conversation/delete` 标 `deleted`。日配额时区 `agent.quota.zone-id` 默认 `Asia/Shanghai`；`daily_token_limit=0` 表示不限额。备份/归档：**代码未实现**。
+会话软删：`DELETE /api/conversations/{sessionId}` 标 `deleted`。日配额时区 `agent.quota.zone-id` 默认 `Asia/Shanghai`；`daily_token_limit=0` 表示不限额。备份/归档：**代码未实现**。
 
 ---
 
@@ -675,7 +716,7 @@ SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `progress
 | 决策 | 现状 | 不要当成已完成升级 |
 |------|------|---------------------|
 | replica | `local` | 不能按多实例 SSE 去测 |
-| 权限会话 | 内存 Store | 进程重启丢失 Plan 批准 |
+| 权限会话 | DB + 本机缓存 | `agent_session_permissions.version` CAS，跨重启/副本恢复 |
 | Flyway | dev 关闭 | 表结构靠 Hibernate update |
 | 意图层 | 已删除 | 用 TaskSignals |
 
@@ -692,33 +733,54 @@ SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `progress
 
 错误码：`com.miniagent.common.ErrorCode`，格式 `模块.功能区.序号`。新错误先加枚举。
 
-**未套 ApiResponse、实现时保持原样：** `POST /chat/stream`、`GET /chat/stream/attach`、`GET /api/traces/stream`、`GET /api/traces/node-catalog`、`GET /api/planner/health`、`GET /api/planner/metrics`、`GET/PUT /api/model-config`。
+**未套 ApiResponse、实现时保持原样：** `POST /api/conversations/{sessionId}/messages/stream`、`GET` 同路径重连、`GET /api/conversations/{sessionId}/traces`、`GET /api/trace-nodes`、`GET /api/planner/health`、`GET /api/planner/metrics`、`GET/PUT /api/model`。
 
 ### 8.1 页面与认证
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
-| GET | `/` | 可选 | 未登录 login，已登录 chat |
-| POST | `/api/login` | 无 | `{username,password}` → `{user,token}` + Cookie |
-| POST | `/api/register` | 无 | 注册关闭或弱密码也返回 `AUTH.01.02` |
-| GET | `/api/logout` | 无 | 重定向 `/` |
-| GET | `/api/auth-status` | 无 | `{authenticated,...}` |
+| GET | `/` | 无（页面骨架） | 恒返回 chat HTML；前端读 `sessionStorage.ma_token`，无则跳 `/login` |
+| GET | `/login` | 无（页面骨架） | 登录页 |
+| GET | `/trace` | 无（页面骨架） | 轨迹页；数据接口仍逐个要 Bearer |
+| POST | `/api/tokens` | 无 | `{username,password}` → `ApiResponse<UserDTO>`（含 token，前端存 sessionStorage，无 cookie） |
+| POST | `/api/users` | 无 | 注册。关闭或弱密码也返回 `AUTH.01.02` |
+| DELETE | `/api/tokens` | 无 | 删 Redis 会话 + 摘掉该用户 SSE 流，返回 `ApiResponse` |
+| GET | `/api/tokens/current` | 无 | `{authenticated,...}` |
+
+静态页面骨架 `/*.html`（`agent-dynamic-trace.html` / `agent-realtime-trace.html` / `trace-visualization.html`）
+同样在 `PUBLIC_PATHS` 内 —— 它们直接映射在根路径下，不受 `/static/**` 覆盖。
+
+**浏览器探测路径**（`SecurityConfig.BROWSER_PROBE_PATHS`）不走 `PUBLIC_PATHS`，语义相反：
+白名单是「存在但免认证」，这里是「根本不存在、浏览器却会自动来问」。
+`SignedSessionFilter` 在鉴权之前直接回 **404**，`RequestCorrelationFilter` 对它们不打 INFO。
+
+| 路径 | 谁在问 |
+|------|--------|
+| `/.well-known/**` | Chromium 打开 DevTools 必发 `/.well-known/appspecific/com.chrome.devtools.json` |
+| `/robots.txt` | 爬虫、部分浏览器 |
+| `/sitemap.xml` | 同上 |
+
+回 401 是错的，代价不只是日志噪音：401 的语义是「带上凭证再来」，而服务端永远不会提供它；
+且 `static/js/security.js` 对所有同源 401 一律清 token 并跳登录页，
+任何经 `window.fetch` 发出的探测请求都会把用户踢出登录态。
+将来要真的提供 `/.well-known/security.txt` 之类，必须把它从 `BROWSER_PROBE_PATHS` 移到 `PUBLIC_PATHS`。
 
 ### 8.2 对话与会话
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/chat/stream` | 主对话，SSE。先装系统上下文再进内核 |
-| GET | `/chat/stream/attach` | 重连；无活流时事件 `gone` |
-| POST | `/api/chat/append-message` | 运行中追加用户句 |
-| POST | `/api/chat/cancel` | `ExecutionControl.cancel` |
-| GET | `/api/task-status` | `{sessionId, running}` |
+| POST | `/api/conversations` | 签发会话 id |
 | GET | `/api/conversations` | 列表 |
-| GET | `/api/conversation` | 单个 |
-| GET | `/api/conversation/messages` | `page/size`，`{tasks,hasMore}` |
-| POST | `/api/conversation/delete` | 软删 |
-| GET | `/api/token-usage` | 本会话计数 |
-| GET | `/api/token-usage/all` | 固定返回 `{}` |
+| GET | `/api/conversations/{sessionId}` | 单个；不存在时 `exists=false` |
+| DELETE | `/api/conversations/{sessionId}` | 软删 |
+| GET | `/api/conversations/{sessionId}/messages` | `page/size`，`{tasks,hasMore}` |
+| POST | `/api/conversations/{sessionId}/messages` | 运行中追加用户句 |
+| POST | `/api/conversations/{sessionId}/messages/stream` | 主对话，SSE |
+| GET | `/api/conversations/{sessionId}/messages/stream` | 重连；无活流时事件 `gone` |
+| GET | `/api/conversations/{sessionId}/task` | `{sessionId, running}` |
+| DELETE | `/api/conversations/{sessionId}/task` | 取消正在跑的任务 |
+| GET | `/api/conversations/{sessionId}/token-usage` | 本会话计数 |
+| GET | `/api/token-usage` | 固定返回 `{}` |
 
 **ChatRequest**：`message` `sessionId` `images` `files` `fileRefs` `mediaRefs` `role` `permissionMode` `confirmPolicy`。`role`：`tester/developer/pm/designer/security/ops/dba/architect/tech_writer`。
 
@@ -726,12 +788,13 @@ SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `progress
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET/PUT | `/api/permission-mode` | `action=approve_plan` 或 `grant_ask` |
-| POST | `/api/todo/confirm` | `{sessionId,id}` |
-| GET/PUT | `/api/model-config` | Key 不回显明文 |
-| GET | `/api/mcp/status` | enabled、工具数 |
-| POST | `/api/mcp/refresh` | 可选 `{serverId}` |
-| POST | `/api/upload` | multipart `file` + `sessionId` |
+| GET/PUT | `/api/conversations/{sessionId}/permission` | `action=approve_plan` 或 `grant_ask` |
+| PATCH | `/api/conversations/{sessionId}/todos/{id}` | 确认待办 |
+| GET/PUT | `/api/model` | Key 不回显明文 |
+| GET | `/api/mcp` | enabled、工具数 |
+| POST | `/api/mcp/servers` | 刷新全部 |
+| POST | `/api/mcp/servers/{serverId}` | 刷新一台 |
+| POST | `/api/conversations/{sessionId}/files` | multipart `file` |
 | GET | `/api/generated-media/{owner}/{filename}` | 属主或 SYSTEM_ADMIN |
 | GET | `/api/conversation-media/{sessionId}/{filename}` | 会话属主或管理员 |
 
@@ -740,12 +803,14 @@ SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `progress
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/trace` | 页面 |
-| GET | `/api/traces` | 步骤列表 |
-| GET | `/api/traces/executions` | 按 execution 分组 |
-| GET | `/api/traces/summary` | 汇总 |
-| GET | `/api/traces/stream` | SSE `trace` |
-| GET | `/api/traces/node-catalog` | 非 ApiResponse |
-| GET | `/api/planner/decisions` | 规划决策步 |
+| GET | `/api/conversations/{sessionId}/steps` | 该会话步骤 |
+| GET | `/api/executions/{executionId}/steps` | 该次执行步骤 |
+| GET | `/api/conversations/{sessionId}/executions` | 按 execution 分组 |
+| GET | `/api/conversations/{sessionId}/summary` | 会话汇总 |
+| GET | `/api/executions/{executionId}/summary` | 执行汇总 |
+| GET | `/api/conversations/{sessionId}/traces` | SSE `trace` |
+| GET | `/api/trace-nodes` | 非 ApiResponse |
+| GET | `/api/executions/{executionId}/decisions` | 规划决策步 |
 | GET | `/api/planner/health` | 规划子系统 |
 | GET | `/api/planner/metrics` | 计数 |
 | * | `/v1/memory/*` | 均需 JWT。事件、记忆 CRUD、context、facts、procedures、episodes、consolidate、forget、stats |
@@ -786,8 +851,8 @@ SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `progress
 
 | 类别 | 现状 |
 |------|------|
-| 认证 | JWT Cookie + Redis TTL |
-| CSRF | Cookie + Header |
+| 认证 | JWT（`Authorization: Bearer`）+ Redis 滑动 TTL；无 cookie |
+| CSRF | 不适用：凭证由页面脚本显式放进请求头，跨站请求带不上，防护整体关闭 |
 | 限流 | 每分钟次数 |
 | 租户配额 | 日 token，0=不限 |
 | 路径穿越 | 文件工具校验 |
@@ -816,7 +881,7 @@ SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `progress
 
 1. **意图分类子系统**：包已删，V7 掉表。用 `TaskSignals`。
 2. **中期记忆注入**：策略恒 false，无生产者。
-3. **`GET /api/token-usage/all`**：返回空对象。
+3. **`GET /api/token-usage`**：返回空对象。
 4. **`agent_session_permissions` 表**：运行时权限在内存。
 5. **admin 角色 HTTP 门禁**：注释写了 SYSTEM_ADMIN，`SecurityConfig` 未配。
 6. **revoke-sessions 立即失效 JWT**：未打通 Redis。
@@ -838,7 +903,7 @@ SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `progress
 
 1. 六个 Maven 模块，依赖与第 3.3 节一致。
 2. `ApiResponse` + `ErrorCode` + 全局异常转 JSON。
-3. `GET /` 与 `POST /api/login`。
+3. `GET /` 与 `POST /api/tokens`。
 
 验收：未登录 JSON 失败码为 `AUTH.02.01`。
 
@@ -846,7 +911,7 @@ SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `progress
 
 1. `ContextLoader` 先做最小系统提示：身份 + 轻问答块 + 最近历史。
 2. `AgentLoop.run` 的消息列表以 `SystemMessage(systemPrompt)` 开头，后面才是历史和用户原文。
-3. `POST /chat/stream` 推 `thinking` / `token` / `end`。
+3. `POST /api/conversations/{sessionId}/messages/stream` 推 `thinking` / `token` / `end`。
 4. 一个 `read_file`，经 `ToolPipeline`。
 5. 循环上限 90。ChatMemory 窗口 64。
 

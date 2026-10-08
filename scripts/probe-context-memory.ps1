@@ -12,7 +12,7 @@ $report = New-Object System.Collections.Generic.List[string]
 function Add-Line([string]$s) { $script:report.Add($s); Write-Host $s }
 
 function Refresh-Csrf {
-    $resp = Invoke-WebRequest "$Base/api/auth-status" -WebSession $session -UseBasicParsing -TimeoutSec 20
+    $resp = Invoke-WebRequest "$Base/api/tokens/current" -WebSession $session -UseBasicParsing -TimeoutSec 20
     $token = ($session.Cookies.GetCookies($Base) | Where-Object { $_.Name -eq "XSRF-TOKEN" } | Select-Object -First 1).Value
     if (-not $token) {
         $setCookie = $resp.Headers["Set-Cookie"]
@@ -48,7 +48,7 @@ function Send-Chat([string]$sid, [string]$msg, [string]$csrf, [string]$jwt, [int
     $log = Join-Path $env:TEMP ("probe-" + $sid + ".sse.log")
     $headers = Auth-Headers $csrf $jwt
     try {
-        Invoke-WebRequest "$Base/chat/stream" -Method Post -Body $bytes `
+        Invoke-WebRequest "$Base/api/conversations/$sid/messages/stream" -Method Post -Body $bytes `
             -Headers $headers -WebSession $session -TimeoutSec $timeoutSec `
             -OutFile $log -UseBasicParsing | Out-Null
     } catch {
@@ -57,7 +57,7 @@ function Send-Chat([string]$sid, [string]$msg, [string]$csrf, [string]$jwt, [int
     $wait = 0
     while ($wait -lt 40) {
         try {
-            $st = Invoke-RestMethod "$Base/api/task-status?sessionId=$sid" `
+            $st = Invoke-RestMethod "$Base/api/conversations/$sid/task" `
                 -Headers $headers -WebSession $session -TimeoutSec 10
             if (-not $st.data.running) { break }
         } catch { break }
@@ -76,7 +76,7 @@ function Send-Chat([string]$sid, [string]$msg, [string]$csrf, [string]$jwt, [int
     }
     $traces = $null
     try {
-        $traces = (Invoke-RestMethod "$Base/api/traces?sessionId=$sid" `
+        $traces = (Invoke-RestMethod "$Base/api/conversations/$sid/steps" `
             -Headers $headers -WebSession $session -TimeoutSec 20).data
     } catch { }
     $ctx = $null
@@ -104,19 +104,19 @@ $csrf = Refresh-Csrf
 $regBody = @{ username = $User; password = $Password; displayName = "probe" } | ConvertTo-Json -Compress
 $reg = $null
 try {
-    $reg = Invoke-RestMethod "$Base/api/register" -Method Post -Body $enc.GetBytes($regBody) `
+    $reg = Invoke-RestMethod "$Base/api/users" -Method Post -Body $enc.GetBytes($regBody) `
         -Headers (Auth-Headers $csrf $null) -WebSession $session -TimeoutSec 20
 } catch { }
 if (-not $reg -or -not $reg.success) {
     $csrf = Refresh-Csrf
     $loginBody = @{ username = $User; password = $Password } | ConvertTo-Json -Compress
-    $reg = Invoke-RestMethod "$Base/api/login" -Method Post -Body $enc.GetBytes($loginBody) `
+    $reg = Invoke-RestMethod "$Base/api/tokens" -Method Post -Body $enc.GetBytes($loginBody) `
         -Headers (Auth-Headers $csrf $null) -WebSession $session -TimeoutSec 20
 }
 if (-not $reg.success) { throw ("auth failed: " + ($reg | ConvertTo-Json -Compress)) }
 $jwt = [string]$reg.data.token
-$userId = [string]$reg.data.user.userId
-$tenantId = [string]$reg.data.user.tenantId
+$userId = [string]$reg.data.userId
+$tenantId = [string]$reg.data.tenantId
 $csrf = Refresh-Csrf
 Add-Line ("AUTH userId=" + $userId + " tenantId=" + $tenantId + " user=" + $User)
 

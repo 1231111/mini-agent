@@ -95,10 +95,27 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-test</artifactId>
+            <scope>test</scope>
+        </dependency>
         <!-- MySQL Driver -->
         <dependency>
             <groupId>com.mysql</groupId>
             <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <!-- 嵌入式数据库：桌面客户端档（profile=desktop）用。
+             为什么是 H2 而不是 SQLite，见 application-desktop.yml 文件头，
+             结论来自 .verify/DbCompatProbe.java 的实测：H2 的 MODE=MySQL 让现有
+             MySQL 方言 SQL 19/20 原样通过，只需改写 1 处多表 UPDATE；
+             且 H2 是纯 Java 实现，不带平台 native 库，和 jlink 裁出的 JRE 天然兼容。
+             实测记录：.verify/RESULT-compat.md
+             与 mysql-connector-j 并存不冲突：driver 由 spring.datasource 显式指定。 -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
             <scope>runtime</scope>
         </dependency>
         <!-- Spring Data JPA -->

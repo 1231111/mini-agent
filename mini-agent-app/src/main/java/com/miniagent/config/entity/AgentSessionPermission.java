@@ -25,6 +25,9 @@ public class AgentSessionPermission extends BaseEntity {
     @Column(name = "confirm_policy", nullable = false, length = 32)
     private String confirmPolicy;
 
+    @Column(name = "exec_policy_override", length = 16)
+    private String execPolicyOverride;
+
     @Version
     @Column(nullable = false)
     private long version;
@@ -39,5 +42,9 @@ public class AgentSessionPermission extends BaseEntity {
     public void setAskGrantsJson(String askGrantsJson) { this.askGrantsJson = askGrantsJson; }
     public String getConfirmPolicy() { return confirmPolicy; }
     public void setConfirmPolicy(String confirmPolicy) { this.confirmPolicy = confirmPolicy; }
+    public String getExecPolicyOverride() { return execPolicyOverride; }
+    public void setExecPolicyOverride(String execPolicyOverride) {
+        this.execPolicyOverride = execPolicyOverride;
+    }
     public long getVersion() { return version; }
 }

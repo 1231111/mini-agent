@@ -1,6 +1,6 @@
 {
   "name": "mini-agent-desktop",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MiniAgent Desktop - AI Agent Client",
   "main": "main.js",
   "scripts": {
@@ -21,6 +21,7 @@
   "build": {
     "appId": "com.miniagent.desktop",
     "productName": "MiniAgent",
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
     "directories": {
       "output": "dist"
     },
@@ -30,26 +31,49 @@
       "src/**/*",
       "assets/**/*"
     ],
-    "extraFiles": [
+    "afterPack": "./after-pack.cjs",
+    "extraResources": [
       {
-        "from": "ffmpeg.dll",
-        "to": "ffmpeg.dll"
+        "from": "../mini-agent-app/target/mini-agent-app-0.0.1-SNAPSHOT.jar",
+        "to": "mini-agent-app.jar"
+      },
+      {
+        "from": "jre",
+        "to": "jre"
+      },
+      {
+        "from": "browsers",
+        "to": "browsers"
+      },
+      {
+        "from": "models",
+        "to": "models"
       }
     ],
     "win": {
-      "target": "portable",
-      "icon": "assets/icon.ico",
-      "sign": false,
+      "target": [
+        "portable"
+      ],
+      "icon": "assets/icon.png",
       "signAndEditExecutable": false,
       "verifyUpdateCodeSignature": false
     },
     "mac": {
-      "target": "dmg",
-      "icon": "assets/icon.icns"
+      "target": [
+        "dmg"
+      ],
+      "icon": "assets/icon.png",
+      "category": "public.app-category.developer-tools",
+      "identity": null
     },
     "linux": {
-      "target": "AppImage",
-      "icon": "assets/icon.png"
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "assets/icon.png",
+      "category": "Development",
+      "synopsis": "MiniAgent AI Agent 桌面客户端"
     },
     "nsis": {
       "oneClick": false,

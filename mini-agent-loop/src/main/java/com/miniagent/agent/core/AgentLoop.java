@@ -23,7 +23,6 @@ import com.miniagent.agent.context.ContextContributorConfiguration;
 import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.permission.PermissionPolicy;
-import com.miniagent.agent.todo.HumanYield;
 import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.agent.tool.AskUserQuestionTool;
 import com.miniagent.agent.tool.ToolConcurrencyPolicy;
@@ -500,6 +499,7 @@ public class AgentLoop {
         volatile String userQuestionText = null;
         volatile boolean unknownOutcome = false;
         volatile String unknownOutcomeMessage = "";
+        volatile Set<String> allowedToolsForTurn = Set.of();
 
         void noteStructuredResult(String toolName, ToolResult result) {
             if (result == null || result.status() != com.miniagent.agent.tool.ToolStatus.UNKNOWN) {
@@ -588,13 +588,6 @@ public class AgentLoop {
 
         String sessionId = currentSessionId.get();
         executionControl.heartbeat(sessionId);
-        if (!state.lightQa
-                && sessionId != null
-                && taskTodoStore.hasAwaitingConfirm(sessionId)
-                && !HumanYield.looksLikeBareContinue(userTextForFilePattern)) {
-            taskTodoStore.confirmAwaiting(sessionId, userTextForFilePattern);
-            log.info("HITL 用户答复，放行 awaiting_confirm session={}", sessionId);
-        }
 
         // sub-goal 栈播种：用 TaskPlan 里已有的 steps 预填 todo（仅当该 session 还没有计划时）
         // 复用上游 executionId；仅当本循环自己创建时才在 finally end（避免子 Agent 清掉父上下文）
@@ -1075,7 +1068,9 @@ public class AgentLoop {
         names.removeIf(n -> !PermissionPolicy.allowInSpecs(mode, planOk, n));
         List<?> specs = toolRegistry.getSpecifications(names);
         specs = capBrowserProbes(specs, messages);
-        bindTurnTools(messages, specNames(specs));
+        Set<String> allowed = Set.copyOf(specNames(specs));
+        state.allowedToolsForTurn = allowed;
+        bindTurnTools(messages, allowed);
         return specs;
     }
 
@@ -1201,14 +1196,15 @@ public class AgentLoop {
         return resultForContext + "\n\n" + nudge;
     }
 
-    /** 循环侧入口：管道执行，再把副作用写回本轮状态。 */
-    private String executeToolWithHooks(String name, String args, int turn,
-                                        boolean denyProbes, LoopState state, RunScope scope) {
-        ToolRequest request = ToolRequest.of(scope, name, args, turn, state.runId);
+    /** 在循环线程冻结本次请求；工作线程不得再读取或写入 LoopState。 */
+    private ToolRequest toolRequest(String name, String args, int turn,
+                                    boolean denyProbes, LoopState state, RunScope scope) {
+        ToolRequest request = ToolRequest.of(scope, name, args, turn, state.runId)
+                .withAllowedTools(state.allowedToolsForTurn);
         if (denyProbes) {
             request = request.withProbeDeny(denyCappedBrowserProbe(name));
         }
-        return applyInvocation(toolPipeline.invoke(request), state);
+        return request;
     }
 
     private static String applyInvocation(ToolInvocation invocation, LoopState state) {
@@ -1491,7 +1487,8 @@ public class AgentLoop {
     /** 并行执行多个工具 */
     private void executeToolCallsParallel(List<?> toolCalls, List<ChatMessage> messages,
                                            Consumer<String> progressCallback, LoopState state) {
-        Map<String, String> results = new ConcurrentHashMap<>();
+        Map<String, String> cachedResults = new HashMap<>();
+        Map<String, ToolInvocation> invocations = new ConcurrentHashMap<>();
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         // 整批等待时长必须跟着各调用自己的闸门走：写死 300s 会让一条声明了
         // timeout=600 的只读命令在读结果时被当成超时，而进程其实还在跑。
@@ -1510,7 +1507,9 @@ public class AgentLoop {
             // 缓存命中
             if (isCacheableTool(name) && state.toolResultCache.containsKey(cacheKey)) {
                 log.info("  [并行缓存] {}", name);
-                results.put(toolIdOf(tc) + "|" + name, state.toolResultCache.get(cacheKey));
+                cachedResults.put(
+                        toolIdOf(tc) + "|" + name,
+                        state.toolResultCache.get(cacheKey));
                 futures.add(CompletableFuture.completedFuture(null));
                 continue;
             }
@@ -1522,11 +1521,14 @@ public class AgentLoop {
 
             long timeout = resolveToolTimeout(name, args);
             batchWaitSeconds = Math.max(batchWaitSeconds, timeout);
+            ToolRequest request = toolRequest(
+                    name, args, turn, denyProbes, state, scope);
             CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
                 try (var ignored = scope.bind()) {
-                    String r = executeToolWithHooks(
-                            name, args, turn, denyProbes, state, scope);
-                    results.put(toolIdOf(tc) + "|" + name, Optional.ofNullable(r).orElse(""));
+                    ToolInvocation invocation = toolPipeline.invoke(request);
+                    if (invocation != null) {
+                        invocations.put(toolIdOf(tc) + "|" + name, invocation);
+                    }
                 }
             }, VIRTUAL_EXECUTOR).orTimeout(timeout, java.util.concurrent.TimeUnit.SECONDS);
             futures.add(future);
@@ -1546,8 +1548,14 @@ public class AgentLoop {
         for (var tc : toolCalls) {
             String name = toolNameOf(tc);
             String args = argumentsOf(tc);
-            String result = results.getOrDefault(toolIdOf(tc) + "|" + name,
-                    timeoutToolResult(name, args, resolveToolTimeout(name, args)).legacyText());
+            String result = cachedResults.get(toolIdOf(tc) + "|" + name);
+            if (result == null) {
+                ToolInvocation invocation = invocations.get(toolIdOf(tc) + "|" + name);
+                result = invocation == null
+                        ? timeoutToolResult(
+                                name, args, resolveToolTimeout(name, args)).legacyText()
+                        : applyInvocation(invocation, state);
+            }
             state.noteStructuredResult(name, ToolResult.fromLegacy(result));
             String cacheKey = name + ":" + argumentsOf(tc);
             if (isCacheableTool(name) && ToolResult.fromLegacy(result).isSuccess() && !result.isEmpty()) {
@@ -1617,14 +1625,15 @@ public class AgentLoop {
             final RunScope scope = RunScope.capture();
             final boolean denyProbes = shouldDropBrowserProbes(
                     consecutiveProbeTurns(messages));
-            CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
+            ToolRequest request = toolRequest(
+                    fName, fArgs, turn, denyProbes, state, scope);
+            CompletableFuture<ToolInvocation> future = CompletableFuture.supplyAsync(() -> {
                 try (var ignored = scope.bind()) {
-                    return executeToolWithHooks(
-                            fName, fArgs, turn, denyProbes, state, scope);
+                    return toolPipeline.invoke(request);
                 }
             }, VIRTUAL_EXECUTOR);
             try {
-                result = future.get(timeout, TimeUnit.SECONDS);
+                result = applyInvocation(future.get(timeout, TimeUnit.SECONDS), state);
             } catch (java.util.concurrent.TimeoutException te) {
                 future.cancel(true);
                 log.warn("  工具 {} 执行超时（{}s），请求取消", name, timeout);

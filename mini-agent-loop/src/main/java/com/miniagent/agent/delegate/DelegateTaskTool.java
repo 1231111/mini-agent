@@ -1,14 +1,8 @@
 package com.miniagent.agent.delegate;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.miniagent.agent.core.AgentLoop;
-import com.miniagent.agent.core.ExecutionProperties;
-import com.miniagent.agent.task.TaskPlan;
-import com.miniagent.agent.task.TaskSignals;
-import com.miniagent.agent.tool.CapabilityRegistry;
 import com.miniagent.agent.tool.Tool;
 import com.miniagent.agent.tool.ToolRegistry;
-import dev.langchain4j.model.chat.ChatModel;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -40,19 +34,10 @@ public class DelegateTaskTool {
     @Autowired
     private ToolRegistry toolRegistry;
     @Autowired
-    private CapabilityRegistry capabilityRegistry;
-    @Autowired
-    private AgentLoop agentLoop;
-    @Autowired
-    private ChatModel chatModel;
-    @Autowired
     private RoleLoader roleLoader;
     @Autowired
-    private ExecutionProperties executionProperties;
+    private ClientMultiAgent clientMultiAgent;
     private static final ObjectMapper MAPPER = new ObjectMapper();
-
-    private static final int SUMMARY_MAX_CHARS = 2000;
-    private static final String NESTED_DELEGATE = "delegate_task";
 
     @PostConstruct
     public void register() {
@@ -115,7 +100,8 @@ public class DelegateTaskTool {
         ));
         params.put("allowed_tools", Map.of(
                 "type", "string",
-                "description", "可选 JSON 数组字符串，覆盖子 Agent 工具集合（优先级高于角色配置），例如 [\"read_file\",\"list_files\"]"
+                "description", "可选 JSON 数组字符串，只能在父任务与角色均允许的工具中收窄，"
+                        + "例如 [\"read_file\",\"list_files\"]"
         ));
         return params;
     }
@@ -130,136 +116,13 @@ public class DelegateTaskTool {
             }
 
             String roleId = String.valueOf(args.getOrDefault("role", "")).trim();
-            // 如果未指定角色，尝试从上下文获取
-            if (roleId.isEmpty()) {
-                roleId = RoleContext.getRole();
-            }
             String ctx = String.valueOf(args.getOrDefault("context", "")).trim();
-            List<String> customTools = parseTools(args.get("allowed_tools"));
-
-            // 加载角色配置
-            RoleConfig roleConfig = null;
-            if (!roleId.isEmpty()) {
-                roleConfig = roleLoader.getRole(roleId);
-                if (Objects.isNull(roleConfig)) {
-                    return error("未知角色: " + roleId + "。可用角色: " + String.join(", ", roleLoader.getRoleIds()));
-                }
-            }
-
-            // 确定系统提示词
-            String systemPrompt;
-            if (Objects.nonNull(roleConfig)) {
-                systemPrompt = buildRoleSystemPrompt(roleConfig, goal);
-            } else {
-                systemPrompt = DEFAULT_SYSTEM_PROMPT;
-            }
-
-            List<String> tools = resolveSubagentTools(customTools, roleConfig);
-
-            String userMessage = """
-                    【子任务目标】
-                    %s
-
-                    【背景信息】
-                    %s
-                    """.formatted(goal, ctx.isEmpty() ? "（无）" : ctx);
-
-            String roleLabel = Objects.nonNull(roleConfig) ? roleConfig.getName() : "通用";
-            log.info("delegate_task 启动: role='{}', goal='{}', allowedTools={}", roleLabel, truncate(goal, 80), tools);
-
-            // 子 Agent：派生 sessionId + SubagentScope 完整沙箱（消息栈仍为 fresh List.of）
-            String parentSid = AgentLoop.getCurrentSession();
-            String subSid = (StringUtils.isNotBlank(parentSid))
-                    ? parentSid + ":sub:" + Long.toHexString(System.nanoTime())
-                    : "sub_" + Long.toHexString(System.nanoTime());
-
-            ChatModel modelForSub = Optional.ofNullable(AgentLoop.getCurrentChatModel()).orElse(chatModel);
-
-            String answer;
-            try (SubagentScope scope = SubagentScope.enter(subSid, roleId, false)) {
-                answer = agentLoop.run(modelForSub, systemPrompt, userMessage,
-                        java.util.List.of(),
-                        executionProperties.getSubagentMaxIterations(), null,
-                        // 子代理的契约由调用方给定的 goal + 工具白名单定义，
-                        // 不能再从 goal 文本里推导信号：派出去的就是任务，不存在「轻问答」轮。
-                        new TaskPlan(
-                                goal,
-                                tools,
-                                java.util.List.of(),
-                                "subagent:" + (roleId.isEmpty() ? "general" : roleId),
-                                false,
-                                TaskSignals.NONE)
-                );
-            } catch (Exception e) {
-                return error("子 Agent 执行失败: " + e.getMessage());
-            }
-
-            String summary = clamp(answer, SUMMARY_MAX_CHARS);
-            return MAPPER.writeValueAsString(Map.of(
-                    "success", true,
-                    "role", roleLabel,
-                    "goal", goal,
-                    "summary", summary
-            ));
+            return clientMultiAgent.runWorker(goal, roleId, ctx, parseTools(args.get("allowed_tools")));
         } catch (Exception e) {
             log.error("delegate_task 工具执行失败", e);
             return error("delegate_task 工具执行失败: " + e.getMessage());
         }
     }
-
-    private List<String> resolveSubagentTools(List<String> custom, RoleConfig roleConfig) {
-        List<String> wanted;
-        if (custom != null && !custom.isEmpty()) {
-            wanted = custom;
-        } else if (roleConfig != null && roleConfig.getAllowedTools() != null
-                && !roleConfig.getAllowedTools().isEmpty()) {
-            wanted = roleConfig.getAllowedTools();
-        } else {
-            wanted = capabilityRegistry.toolsFor(CapabilityRegistry.GENERAL);
-        }
-        List<String> out = new java.util.ArrayList<>();
-        for (String t : wanted) {
-            if (t == null || t.isBlank() || NESTED_DELEGATE.equals(t)) {
-                continue;
-            }
-            if (capabilityRegistry.containsTool(t)) {
-                out.add(t);
-            }
-        }
-        return out;
-    }
-
-    /**
-     * 构建角色化系统提示词
-     */
-    private String buildRoleSystemPrompt(RoleConfig roleConfig, String goal) {
-        return """
-                %s
-
-                ## 当前任务
-                你正在执行以下任务：
-                %s
-
-                ## 工作要求
-                1. 严格按照你的角色职责和工作流程执行任务
-                2. 产出的文件写到 workspace 目录
-                3. 完成任务后给主 Agent 一段 ≤ 2000 字的摘要
-                4. 摘要包含：你做了什么、关键发现、产出的文件路径、是否成功
-                5. 不要重复执行同样的工具调用
-                6. 不要做不可逆的对外操作
-                7. 没把握时直接说"信息不足"，不要编造
-                """.formatted(roleConfig.getSystemPrompt(), goal);
-    }
-
-    /** 默认系统提示词（无角色时使用） */
-    private static final String DEFAULT_SYSTEM_PROMPT = """
-            你是一个被主 Agent 派发的子 Agent。
-            - 你只看到本任务的 goal 和 context，不知道主对话历史。
-            - 需要产出文件时直接用 write_file 写到 workspace 目录。
-            - 完成任务后给主 Agent 一段 ≤ 2000 字的摘要，包含：你做了什么、关键发现、产出的文件路径、引用的事实、是否成功。
-            - 不要重复执行同样的工具调用。不要做不可逆的对外操作（发布、发送外部请求）。
-            - 没把握时直接说"信息不足"，不要编造。
-            """;
 
     @SuppressWarnings("unchecked")
     private List<String> parseTools(Object raw) {
@@ -278,17 +141,6 @@ public class DelegateTaskTool {
         } catch (Exception e) {
             return List.of();
         }
-    }
-
-    private static String clamp(String s, int max) {
-        if (Objects.isNull(s)) {
-            return "";
-        }
-        return s.length() <= max ? s : s.substring(0, max) + "\n…(摘要已截断)";
-    }
-
-    private static String truncate(String s, int max) {
-        return com.miniagent.common.StringUtils.truncate(s, max);
     }
 
     private String error(String msg) {

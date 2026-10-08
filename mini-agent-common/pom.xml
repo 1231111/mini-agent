@@ -46,6 +46,20 @@
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j-http-client-jdk</artifactId>
         </dependency>
+        <!--
+          内联 embedding：进程内跑 ONNX，替代 embedding-server 这个 Python sidecar。
+          不引 langchain4j-embeddings —— 它的 OnnxEmbeddingModel 要 3 维 token 级输出
+          （javap 可见 checkcast "[[[F"），与本模型的 2 维句子向量不兼容，
+          且 Java 侧池化会丢掉图里的 Dense(1024→1792)。只借它的两个依赖。
+        -->
+        <dependency>
+            <groupId>com.microsoft.onnxruntime</groupId>
+            <artifactId>onnxruntime</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>ai.djl.huggingface</groupId>
+            <artifactId>tokenizers</artifactId>
+        </dependency>
         <dependency>
             <groupId>io.milvus</groupId>
             <artifactId>milvus-sdk-java</artifactId>

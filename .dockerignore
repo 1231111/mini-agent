@@ -1,0 +1,37 @@
+# Docker build context exclusions for the root Dockerfile.
+#
+# Without this file the context is the entire repository, and `docker build .`
+# ships it all to the daemon on every build.  The bulk is
+# mini-agent-desktop/node_modules — thousands of files that no backend image
+# ever references.
+
+# Build output: recompiled inside the image, and the agent's target/ holds a
+# ~500 MB fat jar that would be copied in only to be overwritten.
+**/target/
+
+# Desktop shell (Electron).  Not a Maven module and not copied by the
+# Dockerfile — it is packaged by scripts/build-desktop.mjs instead.
+mini-agent-desktop/
+
+# Working artefacts and scratch directories.
+*.log
+.verify/
+_pin_verify/
+scripts/
+docs/
+skills/
+_bak/
+.git/
+.gitignore
+.workbuddy/
+
+# Model weights, in case anything is ever built from the repository root.
+#
+# NOTE: this does NOT cover the embedding image.  Its build context is
+# ./embedding-server, and Docker looks for a .dockerignore *inside* the context
+# directory — it never falls back to this one.  So the weights below still get
+# shipped to the daemon when `docker compose build` runs.
+# Adding ./embedding-server/.dockerignore would cut that, but it changes what
+# the embedding image can see and is therefore a separate, verifiable change.
+embedding-server/models/
+embedding-server/**/*.safetensors

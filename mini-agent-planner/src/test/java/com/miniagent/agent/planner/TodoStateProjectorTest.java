@@ -29,25 +29,17 @@ class TodoStateProjectorTest {
     }
 
     @Test
-    void confirmByTodoIdMovesAwaitingToPending() {
-        TodoStateProjector projector = new TodoStateProjector(null);
-        TaskGraph graph = new TaskGraph(List.of(node(
-                "n1", "问用户", TaskNodeStatus.AWAITING_CONFIRM)));
-        TaskGraph next = projector.confirmByTodoId(graph, 1);
-        assertEquals(TaskNodeStatus.PENDING, next.byId("n1").status());
-        assertSame(graph, projector.confirmByTodoId(graph, 99));
-        assertSame(next, projector.confirmFirst(next));
-    }
-
-    @Test
-    void confirmFirstStopsAtFirstAwaiting() {
+    void confirmByTodoIdMovesOnlyTheExplicitNode() {
         TodoStateProjector projector = new TodoStateProjector(null);
         TaskGraph graph = new TaskGraph(List.of(
-                node("n1", "a", TaskNodeStatus.AWAITING_CONFIRM),
-                node("n2", "b", TaskNodeStatus.AWAITING_CONFIRM)));
-        TaskGraph next = projector.confirmFirst(graph);
-        assertEquals(TaskNodeStatus.PENDING, next.byId("n1").status());
-        assertEquals(TaskNodeStatus.AWAITING_CONFIRM, next.byId("n2").status());
+                node("n1", "问用户 A", TaskNodeStatus.AWAITING_CONFIRM),
+                node("n2", "问用户 B", TaskNodeStatus.AWAITING_CONFIRM)));
+        TaskGraph next = projector.confirmByTodoId(graph, 2);
+        assertEquals(
+                TaskNodeStatus.AWAITING_CONFIRM,
+                next.byId("n1").status());
+        assertEquals(TaskNodeStatus.PENDING, next.byId("n2").status());
+        assertSame(graph, projector.confirmByTodoId(graph, 99));
     }
 
     private static TaskNode node(String id, String name, TaskNodeStatus status) {

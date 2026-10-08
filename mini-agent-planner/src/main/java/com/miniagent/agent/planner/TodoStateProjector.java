@@ -114,19 +114,6 @@ public class TodoStateProjector {
         return confirmNode(graph, nodeId);
     }
 
-    /** 聊天答复：放行图上第一个 AWAITING_CONFIRM。 */
-    public TaskGraph confirmFirst(TaskGraph graph) {
-        if (graph == null) {
-            return graph;
-        }
-        for (TaskNode n : graph.nodes()) {
-            if (n.status() == TaskNodeStatus.AWAITING_CONFIRM) {
-                return graph.replace(n.withStatus(TaskNodeStatus.PENDING).withError(""));
-            }
-        }
-        return graph;
-    }
-
     private static TaskGraph confirmNode(TaskGraph graph, String nodeId) {
         if (graph == null || nodeId == null || nodeId.isBlank()) {
             return graph;

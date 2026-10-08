@@ -50,7 +50,7 @@ public class MilvusMemoryVectorIndex implements MemoryVectorIndex {
     private int topK;
     @Value("${agent.memory.vector.min-score:0.4}")
     private double minScore;
-    @Value("${agent.memory.vector.milvus.collection:agent_memory}")
+    @Value("${agent.memory.vector.milvus.blob-collection:agent_memory_blob_v1}")
     private String collection;
     @Value("${agent.memory.vector.milvus.dimension:1024}")
     private int dimension;

@@ -2,6 +2,9 @@ package com.miniagent.agent.scope;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.HashMap;
+import java.util.Map;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -162,5 +165,82 @@ class TaskScopeRegistryTest {
         assertTrue(scopeA.startsWith(sid));
         assertTrue(scopeB.startsWith(sid));
         assertEquals(scopeB, sid + "#1");
+    }
+
+    @Test
+    void 重启与跨副本后恢复当前任务和发号序列() {
+        InMemoryPersistence persistence = new InMemoryPersistence();
+        TaskScopeRegistry first = new TaskScopeRegistry(persistence);
+        String sid = "abc123";
+
+        first.resolve(sid, TaskBoundary.NEW, "prev-plan-suspended");
+        assertEquals(sid + "#1", first.scopeKey(sid));
+
+        TaskScopeRegistry second = new TaskScopeRegistry(persistence);
+        assertEquals(sid + "#1", second.scopeKey(sid));
+        second.resolve(sid, TaskBoundary.RESUME, "todo-resumed");
+        assertEquals(sid, first.scopeKey(sid));
+
+        TaskScopeRegistry restarted = new TaskScopeRegistry(persistence);
+        restarted.resolve(sid, TaskBoundary.NEW, "prev-plan-suspended");
+        assertEquals(sid + "#2", restarted.scopeKey(sid));
+    }
+
+    @Test
+    void 持久化版本冲突后重读并且不重复发号() {
+        InMemoryPersistence persistence = new InMemoryPersistence();
+        TaskScopeRegistry registry = new TaskScopeRegistry(persistence);
+        String sid = "abc123";
+        registry.scopeKey(sid);
+        persistence.conflictNextWrite();
+
+        registry.resolve(sid, TaskBoundary.NEW, "prev-plan-suspended");
+
+        assertEquals(sid + "#1", registry.scopeKey(sid));
+        assertEquals(1L, persistence.loadOrCreate(sid).sequence());
+    }
+
+    private static final class InMemoryPersistence
+            implements TaskScopePersistence {
+
+        private final Map<String, State> states = new HashMap<>();
+        private boolean conflictNextWrite;
+
+        @Override
+        public synchronized State loadOrCreate(String sessionId) {
+            return states.computeIfAbsent(
+                    sessionId, ignored -> new State(0L, null, 0L, 0L));
+        }
+
+        @Override
+        public synchronized boolean compareAndSet(
+                String sessionId, State expected, State next) {
+            State current = loadOrCreate(sessionId);
+            if (conflictNextWrite) {
+                conflictNextWrite = false;
+                states.put(
+                        sessionId,
+                        new State(
+                                current.currentTaskId(),
+                                current.pausedTaskId(),
+                                current.sequence(),
+                                current.version() + 1L));
+                return false;
+            }
+            if (!current.equals(expected)) {
+                return false;
+            }
+            states.put(sessionId, next);
+            return true;
+        }
+
+        @Override
+        public synchronized void deleteScope(String sessionId) {
+            states.remove(sessionId);
+        }
+
+        synchronized void conflictNextWrite() {
+            conflictNextWrite = true;
+        }
     }
 }

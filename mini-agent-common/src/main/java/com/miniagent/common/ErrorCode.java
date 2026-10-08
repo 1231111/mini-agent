@@ -16,9 +16,35 @@ public enum ErrorCode {
     // ==================== AUTH 认证授权 ====================
     AUTH_LOGIN_FAILED("AUTH.01.01", "登录失败"),
     AUTH_USER_EXISTS("AUTH.01.02", "用户已存在"),
+    AUTH_REGISTER_DISABLED("AUTH.01.03", "注册功能已关闭"),
+    AUTH_USERNAME_INVALID("AUTH.01.04", "用户名不合法"),
+    AUTH_PASSWORD_REQUIRED("AUTH.01.05", "密码不能为空"),
+    AUTH_PASSWORD_TOO_SHORT("AUTH.01.06", "密码长度不足"),
     AUTH_NOT_AUTHENTICATED("AUTH.02.01", "未登录"),
     AUTH_FORBIDDEN("AUTH.02.02", "无权限"),
     AUTH_SESSION_INVALID("AUTH.02.03", "会话无效"),
+
+    // 云端账号服务（agent.auth.cloud.base-url）。YY 取 03 —— 按本文件开头的约定，
+    // 03 表示"外部调用"。这一区分是必须的：前端要能分辨"密码错"（AUTH.01.01）
+    // 和"云连不上"（AUTH.03.01）—— 前者提示用户改输入，后者提示用户查网络。
+    // 混用 AUTH_LOGIN_FAILED 会让断网表现成"账号密码错误"，是最难排查的那种假象。
+    AUTH_CLOUD_UNREACHABLE("AUTH.03.01", "云端账号服务不可达"),
+    AUTH_CLOUD_REJECTED("AUTH.03.02", "云端账号服务拒绝该请求"),
+    AUTH_CLOUD_INVALID_RESPONSE("AUTH.03.03", "云端账号服务返回内容无法解析"),
+    AUTH_CLOUD_NOT_CONFIGURED("AUTH.03.04", "未配置云端账号服务"),
+
+    // ==================== MEMBER 会员与充值 ====================
+    // 归在 MEMBER 而不是复用 AUTH：AUTH 的编号空间表示"身份与权限"，
+    // 而这一组是"付费与配额"。混进去之后 AUTH.01.0x 会同时表示
+    // "用户名不合法"和"套餐不存在"，读日志的人得先在脑子里做一次分类。
+    MEMBER_PLAN_NOT_FOUND("MEMBER.01.01", "套餐不存在"),
+    MEMBER_PLAN_DISABLED("MEMBER.01.02", "套餐已下架"),
+    MEMBER_ORDER_NOT_FOUND("MEMBER.01.03", "订单不存在"),
+    MEMBER_ORDER_STATE_INVALID("MEMBER.01.04", "订单状态不允许该操作"),
+    MEMBER_USER_NOT_FOUND("MEMBER.02.01", "用户不存在"),
+    MEMBER_SUBSCRIPTION_NOT_FOUND("MEMBER.02.03", "没有生效中的订阅"),
+    MEMBER_INTERNAL_KEY_MISSING("MEMBER.02.02", "会员接口未启用"),
+    MEMBER_PAYMENT_DECLINED("MEMBER.03.01", "支付渠道拒绝了该请求"),
 
     // ==================== CHAT 对话/会话 ====================
     CHAT_MESSAGE_EMPTY("CHAT.01.01", "请输入有效内容"),

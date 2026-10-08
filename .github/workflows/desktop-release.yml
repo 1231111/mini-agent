@@ -1,0 +1,211 @@
+name: desktop-release
+
+# 四平台桌面安装包。
+#
+# 为什么必须用矩阵而不是一台机器：
+#   jlink 产出的 JRE 是平台专有的，electron-builder 的 dmg 只能在 macOS 上出、
+#   AppImage / deb 只能在 Linux 上出。任何一个平台都无法交叉产出另外三个，
+#   这不是工具选择问题，是设计使然。
+#
+# 触发方式：
+#   - 打 v* 标签（发布）
+#   - 手动触发（workflow_dispatch）—— 调试打包问题时用这个，不必打标签
+#
+# ── 模型物料从哪来（构建脚本第 5 步的输入）─────────────────────────────
+#
+#   ONNX 变体是**平台无关**的确定性产物 —— 它与 jlink 裁出的 JRE、
+#   electron-builder 出的 dmg/AppImage 完全是两类东西：后两者不能交叉产出，
+#   前者可以且应该只产一次。在四个 runner 上各跑一遍导出，等于装四遍 torch、
+#   下四遍 1.3GB 原始模型、跑四遍同样的图优化，只换来四个可能不同的结果。
+#
+#   所以出厂路径是：任一有网的机器上导出一次 → 打成归档传到本仓库的 release
+#   → 四个 runner 下载同一份字节。归档里同时含模型与 tokenizer.json，
+#   两者天然成对，不可能版本错配。
+#
+#   发布物料（一次性；**换模型时新开 tag**，例如 models-v2，不要覆盖旧 release
+#   的 asset —— 已发布的安装包要能追溯它当时用的到底是哪份物料）：
+#
+#     node scripts/pack-models.mjs --variant=int8
+#     gh release create models-v1 \
+#        dist-models/miniagent-models-int8.tar.gz \
+#        dist-models/miniagent-models-int8.tar.gz.sha256 \
+#        --title "models-v1（内联 embedding 物料）" \
+#        --notes "int8 330MB + tokenizer.json"
+#
+#   物料缺失时这里会**故意**硬失败，不产出"能装但没有语义检索"的包 ——
+#   那种包在客户机上的症状是"检索结果不准"，与"安装包少了个文件"极难联系起来。
+#   换句话说：这个步骤红是正确信号，补料（上面的两条命令）才是解法，
+#   不要用跳过的方式绕过去。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  # 物料归档所在的 release tag 与文件名。
+  # 与 scripts/pack-models.mjs 的默认输出名保持一致。
+  MODELS_RELEASE_TAG: models-v1
+  MODELS_ARCHIVE: miniagent-models-int8.tar.gz
+
+# name 里的 arch 会作为 --expect-arch 传给构建脚本，两者必须一致 ——
+# 这是让「artifact 名字」与「runner 实际架构」产生绑定关系的唯一手段。
+# 脚本里的 jlink 与 electron-builder 都只按当前机器出包，不会核对你以为在打什么架构，
+# 所以传上期望值后不一致会在第一步就被拦住，而不是产出一份名实不符的包。
+#
+# 另：artifact 名与 package.json 的 artifactName 模板
+# "${productName}-${version}-${os}-${arch}.${ext}" 对齐（os 展开为 win / mac / linux），
+# 这样从 artifact 名能直接推出里面的安装包叫什么。
+jobs:
+  desktop:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    # 单平台约 15 分钟（fat jar 3 + jlink 1 + Chromium 1 + electron-builder 5 + 上传 3），
+    # 留 3 倍余量给冷缓存和网络抖动。
+    timeout-minutes: 60
+
+    strategy:
+      # 一个平台失败不要连坐其余三个 —— 否则 macOS 签名失败会把已经打好的
+      # Windows / Linux 包一起丢掉，排查时看不到任何可用的中间产物。
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows x64
+            target: win
+            arch: x64
+            artifact: MiniAgent-win-x64
+          - os: ubuntu-latest
+            label: Linux x64
+            target: linux
+            arch: x64
+            artifact: MiniAgent-linux-x64
+          # GitHub 托管的 arm64 Linux runner。公开仓库免费；**私有仓库需要
+          # GitHub Enterprise Cloud 计划**，没有的话这一步会一直排队不报错。
+          # 替代方案：自建 arm64 runner，或用 QEMU 模拟（jlink 与 Electron 都要跑在
+          # 模拟层上，会慢很多）。
+          - os: ubuntu-24.04-arm
+            label: Linux arm64
+            target: linux
+            arch: arm64
+            artifact: MiniAgent-linux-arm64
+          # macOS 官方 runner 的架构与标签是分开的：macos-latest / macos-14 / macos-15
+          # 是 arm64（Apple Silicon），macos-15-intel / macos-14-large 才是 Intel。
+          # 本工程只用 arm64 —— 内联 embedding 的 DJL tokenizers 没有 osx-x86_64
+          # 原生库，Intel 上会静默降级。脚本会拒绝 x64，所以这里故意用 macos-latest
+          # （跟随最新，不会被退役）而不是钉死某个版本号，配合上面的 --expect-arch 兜底。
+          - os: macos-latest
+            label: macOS Apple Silicon
+            target: mac
+            arch: arm64
+            artifact: MiniAgent-mac-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show runner architecture
+        shell: bash
+        run: |
+          echo "runner: ${{ matrix.os }}"
+          echo "uname: $(uname -m)"
+          echo "node: $(node -v)"
+          echo "java: $(java -version 2>&1 | head -1)"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # AppImage 与 deb 的打包工具链不在基础镜像里。
+      # 这一步只在 Linux 上跑：macOS / Windows 没有 apt-get。
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libarchive-tools fakeroot dpkg xz-utils
+
+      # 用 gh CLI 而不是 curl：私有仓库的 release asset 匿名 URL 取不到（会 404），
+      # 而 gh 会带上 GITHUB_TOKEN 走 API，公开/私有都能用，失败信息也更清楚。
+      #
+      # 一次 --pattern 把归档与它的 .sha256 一起下下来：两者必须成对，
+      # 分两次下会出现"校验文件是新的、归档是旧的"这种更隐蔽的错配。
+      - name: Download model artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          WORK=".verify/_models"
+          rm -rf "$WORK" && mkdir -p "$WORK"
+
+          echo "从 release ${MODELS_RELEASE_TAG} 取 ${MODELS_ARCHIVE}"
+          if ! gh release download "$MODELS_RELEASE_TAG" \
+                 --repo "$GITHUB_REPOSITORY" \
+                 --pattern "${MODELS_ARCHIVE}*" \
+                 --dir "$WORK" \
+                 --clobber; then
+            echo "::error::物料下载失败：release ${MODELS_RELEASE_TAG} 里找不到 ${MODELS_ARCHIVE}"
+            echo ""
+            echo "补救（在任一有网的机器上，一次即可，四个平台共用同一份）："
+            echo "  node scripts/pack-models.mjs --variant=int8"
+            echo "  gh release create ${MODELS_RELEASE_TAG} \\"
+            echo "     dist-models/${MODELS_ARCHIVE} \\"
+            echo "     dist-models/${MODELS_ARCHIVE}.sha256 \\"
+            echo "     --title \"${MODELS_RELEASE_TAG}（内联 embedding 物料）\" --notes \"int8\""
+            echo ""
+            echo "不要用跳过的方式绕过：产出的包会缺语义检索，而症状只是'检索不准'，"
+            echo "在客户机上极难与'安装包不完整'联系起来。"
+            exit 1
+          fi
+
+          # 校验 sha256 而不是直接解开。下载被中断或被代理改写时，拿到的可能是一个
+          # HTML 错误页 —— 它有文件名、有字节数，会被一路放行到建会话那一步才失败。
+          node scripts/verify-models-archive.mjs \
+            "$WORK/${MODELS_ARCHIVE}" "$WORK/${MODELS_ARCHIVE}.sha256" --list
+
+          rm -rf .verify/onnx && mkdir -p .verify/onnx
+          # `< /dev/null` 不是多余的心眼：msys2 版 GNU tar 在 stdin 是**匿名管道**时
+          # 会启动即失败（EBUSY，stderr 全空），而 Windows runner 上的 bash 步骤
+          # 恰好会给它一个管道。本地验证时在 Node 的 spawnSync 里踩到过同一个坑
+          # （默认 stdio 的 stdin 就是 pipe，改 'ignore' 才好）。
+          # 归档路径也必须保持相对 —— GNU tar 会把 `-f D:\x.tar.gz` 里的 `D:`
+          # 当成远程主机名，报 "Cannot connect to D: resolve failed"。
+          tar -xzf "$WORK/${MODELS_ARCHIVE}" -C .verify/onnx < /dev/null
+          rm -rf "$WORK"
+          # 清单里的字节数要与实际解开的一致 —— 这一步把"归档内容错了"
+          # 和"解压出错"分开：两者都会让后面的构建期校验失败，
+          # 但在这里能看到是哪一个。
+          ls -l .verify/onnx
+          echo "已解开到 .verify/onnx："
+          ls -la .verify/onnx
+
+      - name: Build desktop package
+        # --expect-arch 让脚本校验「runner 实际架构 == 矩阵声明的架构」，
+        # 不符会在第一步就失败，不会打出一份名实不符的包。
+        run: node scripts/build-desktop.mjs --target=${{ matrix.target }} --expect-arch=${{ matrix.arch }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          # 产物名由 package.json 的 artifactName 决定，带 ${os}-${arch} 后缀，
+          # 所以这里用通配符收集 —— 不必随版本号改配置。
+          path: |
+            mini-agent-desktop/dist/*.exe
+            mini-agent-desktop/dist/*.dmg
+            mini-agent-desktop/dist/*.AppImage
+            mini-agent-desktop/dist/*.deb
+          if-no-files-found: error
+          retention-days: 14

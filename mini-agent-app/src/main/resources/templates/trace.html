@@ -7,6 +7,15 @@
     <script th:inline="none">
         (function(){try{var t=localStorage.getItem('mini_agent_theme');if(!t)t=window.matchMedia&&window.matchMedia('(prefers-color-scheme:light)').matches?'light':'dark';document.documentElement.setAttribute('data-theme',t)}catch(e){document.documentElement.setAttribute('data-theme','dark')}})();
     </script>
+    <script th:inline="none">
+        // 页面骨架由服务端无条件返回（浏览器导航带不了 Authorization 头），
+        // 身份判断只能在这儿做：没有 token 就别渲染，直接回登录页。
+        (function () {
+            var tk = '';
+            try { tk = sessionStorage.getItem('ma_token') || ''; } catch (e) { tk = ''; }
+            if (!tk) { window.location.replace('/login'); }
+        })();
+    </script>
     <style>
         :root {
             --bg: #0e0f12; --sidebar-bg: #16181d; --surface: #1e2127; --surface2: #2a2e36;
@@ -407,7 +416,7 @@ let showCoreOnly = true;
 let lastTraceIds = new Set(); // 已渲染节点 id，用于高亮新增
 let lastStepCount = 0;
 let cachedExecs = [];
-let traceEs = null;
+let traceAbort = null;
 const TRACE_PUSH_DEBOUNCE_MS = 200;
 let tracePushTimer = null;
 
@@ -486,8 +495,7 @@ async function loadExecutions() {
     if (!currentSid) return;
     try {
         const resp = await fetch(
-                '/api/traces/executions?sessionId='
-                + encodeURIComponent(currentSid));
+                '/api/conversations/' + encodeURIComponent(currentSid) + '/executions');
         if (!resp.ok) return;
         cachedExecs = await apiJson(resp) || [];
         renderExecutions(cachedExecs);
@@ -532,10 +540,10 @@ async function loadTraces(forceFull) {
     if (!currentExecId) return;
     try {
         const [tracesResp, summaryResp, statusResp] = await Promise.all([
-            fetch('/api/traces?executionId=' + encodeURIComponent(currentExecId)),
-            fetch('/api/traces/summary?executionId=' + encodeURIComponent(currentExecId)),
+            fetch('/api/executions/' + encodeURIComponent(currentExecId) + '/steps'),
+            fetch('/api/executions/' + encodeURIComponent(currentExecId) + '/summary'),
             currentSid
-                ? fetch('/api/task-status?sessionId=' + encodeURIComponent(currentSid))
+                ? fetch('/api/conversations/' + encodeURIComponent(currentSid) + '/task')
                 : Promise.resolve(null)
         ]);
         if (!tracesResp.ok) return;
@@ -1707,7 +1715,7 @@ function renderTimeline(traces, newIds) {
     </div>`;
 }
 
-/** 兜底元数据；启动时由 /api/traces/node-catalog（AgentStepNode）覆盖 */
+/** 兜底元数据；启动时由 /api/trace-nodes（AgentStepNode）覆盖 */
 const STEP_ICONS = {
     RUN_START:'🚀', RUN_END:'🏁', TASK_SIGNALS:'📡', TASK_PLAN:'🗺️',
     AGENT_LOOP_START:'🔄', AGENT_LOOP_END:'🔄', SUBAGENT_LOOP_START:'👶', SUBAGENT_LOOP_END:'👶', PLAN:'🎯',
@@ -1779,7 +1787,7 @@ function stepMeta(stepType) {
 
 async function loadNodeCatalog() {
     try {
-        const resp = await fetch('/api/traces/node-catalog');
+        const resp = await fetch('/api/trace-nodes');
         if (!resp.ok) return;
         NODE_CATALOG = await resp.json();
         NODE_CATALOG.forEach(n => {
@@ -1865,31 +1873,70 @@ function toggleAutoRefresh() {
 }
 
 function closeTracePush() {
-    if (traceEs) { traceEs.close(); traceEs = null; }
+    if (traceAbort) { traceAbort.abort(); traceAbort = null; }
     if (tracePushTimer) { clearTimeout(tracePushTimer); tracePushTimer = null; }
 }
 
 function syncTracePush() {
     closeTracePush();
     if (!autoRefreshOn || !currentSid) return;
-    // EventSource 不能自定义头，token 通过 access_token 查询参数携带（cookie 兜底也会自动发送）
-    let tk = '';
-    try { tk = sessionStorage.getItem('ma_token') || ''; } catch (_) {}
-    const traceUrl = '/api/traces/stream?sessionId=' + encodeURIComponent(currentSid)
-        + (tk ? '&access_token=' + encodeURIComponent(tk) : '');
-    const es = new EventSource(traceUrl);
-    traceEs = es;
-    es.addEventListener('trace', ev => {
-        let data = null;
-        try { data = JSON.parse(ev.data); } catch (e) { return; }
-        if (!data || data.sessionId !== currentSid) return;
-        if (tracePushTimer) clearTimeout(tracePushTimer);
-        tracePushTimer = setTimeout(async () => {
-            tracePushTimer = null;
-            await loadExecutions();
-            if (currentExecId) await loadTraces(false);
-        }, TRACE_PUSH_DEBOUNCE_MS);
-    });
+    // EventSource 不支持自定义请求头，只能把 token 塞进查询串：会进访问日志、会留在浏览器
+    // 历史里，且和别的接口两套鉴权方式。改成 fetch 读流后鉴权走 Authorization 头，与全站一致。
+    const tk = window.MiniAuth.token();
+    const ctrl = new AbortController();
+    traceAbort = ctrl;
+    openTraceStream(currentSid, tk, ctrl);
+}
+
+async function openTraceStream(sid, tk, ctrl) {
+    try {
+        const resp = await fetch('/api/conversations/' + encodeURIComponent(sid) + '/traces', {
+            headers: tk ? { 'Authorization': 'Bearer ' + tk } : {},
+            signal: ctrl.signal
+        });
+        if (!resp.ok || !resp.body) return;
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buf = '';
+        for (;;) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            buf += decoder.decode(chunk.value, { stream: true });
+            // SSE 帧之间用空行分隔（\n\n 或 \r\n\r\n），一个 chunk 里可能有多帧
+            let m;
+            while ((m = /\r?\n\r?\n/.exec(buf)) !== null) {
+                const frame = buf.slice(0, m.index);
+                buf = buf.slice(m.index + m[0].length);
+                handleTraceFrame(frame, sid);
+            }
+        }
+    } catch (err) {
+        if (err && err.name === 'AbortError') return;  // 主动关流，不是异常
+        console.warn('[Trace] stream closed', err);
+    }
+}
+
+/** 只需 event: trace 这一种帧；其余（心跳等）忽略 */
+function handleTraceFrame(frame, sid) {
+    let eventName = 'message';
+    const dataLines = [];
+    for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) {
+            eventName = line.slice(6).trim();
+        } else if (line.startsWith('data:')) {
+            dataLines.push(line.slice(5).replace(/^ /, ''));
+        }
+    }
+    if (eventName !== 'trace') return;
+    let data = null;
+    try { data = JSON.parse(dataLines.join('\n')); } catch (e) { return; }
+    if (!data || data.sessionId !== sid) return;
+    if (tracePushTimer) clearTimeout(tracePushTimer);
+    tracePushTimer = setTimeout(async () => {
+        tracePushTimer = null;
+        await loadExecutions();
+        if (currentExecId) await loadTraces(false);
+    }, TRACE_PUSH_DEBOUNCE_MS);
 }
 
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }

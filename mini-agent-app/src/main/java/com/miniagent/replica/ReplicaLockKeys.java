@@ -4,7 +4,7 @@ package com.miniagent.replica;
 public final class ReplicaLockKeys {
 
     public static final String SESSION_RUN_PREFIX = "run:session:";
-    public static final String USER_RUNNING_PREFIX = "running:user:";
+    public static final String USER_RUNNING_PREFIX = "running:user:v2:";
 
     private ReplicaLockKeys() {}
 

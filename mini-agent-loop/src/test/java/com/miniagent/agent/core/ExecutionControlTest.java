@@ -36,4 +36,22 @@ class ExecutionControlTest {
         assertEquals(ExecutionControl.StopReason.TENANT_QUOTA_EXCEEDED,
                 control.afterModelTokens("quota-session", 0));
     }
+
+    @Test
+    void childUsesParentLeaseForCancelAndToolBudget() {
+        ExecutionControl control = new ExecutionControl(60_000, 1, 10_000);
+        control.start("parent");
+        control.attach("parent:sub:1", "parent");
+
+        assertEquals(ExecutionControl.StopReason.NONE, control.beforeTool("parent"));
+        assertEquals(ExecutionControl.StopReason.TOOL_BUDGET_EXCEEDED,
+                control.beforeTool("parent:sub:1"));
+
+        ExecutionControl cancelled = new ExecutionControl(60_000, 10, 10_000);
+        cancelled.start("parent");
+        cancelled.attach("parent:sub:1", "parent");
+        cancelled.cancel("parent");
+        assertEquals(ExecutionControl.StopReason.CANCELLED,
+                cancelled.beforeTool("parent:sub:1"));
+    }
 }

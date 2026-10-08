@@ -39,6 +39,7 @@ import com.miniagent.config.repository.ChatTaskRepository;
 import com.miniagent.config.repository.UserRepository;
 import com.miniagent.config.entity.ChatTask;
 import com.miniagent.config.service.TaskRunService;
+import com.miniagent.agent.delegate.ClientMultiAgent;
 import com.miniagent.agent.delegate.RoleContext;
 import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.config.model.ModelClientFactory;
@@ -78,6 +79,8 @@ public class AgentChatApplicationService {
     private ExecutionProperties executionProperties;
     @Autowired
     private ExecutionControl executionControl;
+    @Autowired
+    private ClientMultiAgent clientMultiAgent;
     @Autowired
     private PlanningLoop planningLoop;
     @Autowired
@@ -176,25 +179,31 @@ public class AgentChatApplicationService {
         }
     }
 
-    private String executeAgentWithProgress(Long userId, String sessionId, String userMessage,
-                                            org.springframework.web.servlet.mvc.method.annotation.SseEmitter progressEmitter,
-                                            List<String> imageDataUrls,
-                                            List<MediaRef> mediaRefs) {
+    private String executeAgentWithProgress(
+            Long userId,
+            String sessionId,
+            String userMessage,
+            SseEmitter progressEmitter,
+            List<String> imageDataUrls,
+            List<MediaRef> mediaRefs) {
         Long tenantId = userRepository.findById(userId)
                 .filter(com.miniagent.config.entity.User::isEnabled)
                 .map(com.miniagent.config.entity.User::getTenantId)
                 .orElseThrow(() -> new BusinessException(ErrorCode.AUTH_SESSION_INVALID));
-        String acquireErr = taskRunService.tryStart(userId, sessionId);
-        if (Objects.nonNull(acquireErr)) {
-            throw new IllegalStateException(acquireErr);
+        TaskRunService.StartResult start = taskRunService.tryStart(userId, sessionId);
+        if (!start.accepted()) {
+            throw new IllegalStateException(start.error());
         }
-        streamingService.markRunning(sessionId);
-        MemoryStore.OwnerContext owner = new MemoryStore.OwnerContext(userId, String.valueOf(tenantId));
+        TaskRunService.RunHandle run = start.handle();
+        MemoryStore.OwnerContext owner =
+                new MemoryStore.OwnerContext(userId, String.valueOf(tenantId));
         boolean executionStarted = false;
 
         try (var ignoredOwner = MemoryStore.bindOwnerContext(owner)) {
+            streamingService.markRunning(sessionId);
             executionControl.start(sessionId, tenantId);
             executionStarted = true;
+            clientMultiAgent.open(sessionId);
             memoryStore.loadFromDisk();
             try {
                 memoryService.promoteUserBlob();
@@ -204,9 +213,26 @@ public class AgentChatApplicationService {
             // 记录任务开始事件
             recordEvent(sessionId, null, com.miniagent.memory.model.AgentEvent.EventType.TASK_START,
                 "user", Map.of("question", truncate(userMessage, 500)), null);
-            String answer = doExecuteAgent(userId, sessionId, userMessage, progressEmitter,
-                    imageDataUrls, mediaRefs);
-            taskRunService.markCompleted(userId, sessionId);
+            String answer = doExecuteAgent(
+                    userId,
+                    sessionId,
+                    run,
+                    userMessage,
+                    progressEmitter,
+                    imageDataUrls,
+                    mediaRefs);
+            if (executionControl.isCancelled(sessionId)) {
+                taskRunService.markCancelled(run, "Cancelled by user");
+                recordEvent(
+                        sessionId,
+                        null,
+                        com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
+                        "executor",
+                        Map.of("reason", "cancelled"),
+                        com.miniagent.memory.model.AgentEvent.EventStatus.FAILED);
+                return answer;
+            }
+            taskRunService.markCompleted(run);
 
             // 记录任务成功事件
             recordEvent(sessionId, null, com.miniagent.memory.model.AgentEvent.EventType.TASK_COMPLETE,
@@ -216,9 +242,9 @@ public class AgentChatApplicationService {
             return answer;
         } catch (Exception e) {
             if (executionStarted && executionControl.isCancelled(sessionId)) {
-                taskRunService.markCancelled(userId, sessionId, "Cancelled by user");
+                taskRunService.markCancelled(run, "Cancelled by user");
             } else {
-                taskRunService.markFailed(userId, sessionId, e.getMessage());
+                taskRunService.markFailed(run, e.getMessage());
             }
 
             // 记录任务失败事件
@@ -229,6 +255,7 @@ public class AgentChatApplicationService {
             throw e;
         } finally {
             if (executionStarted) {
+                clientMultiAgent.close(sessionId);
                 executionControl.finish(sessionId);
             }
             streamingService.markIdle(sessionId);
@@ -257,8 +284,6 @@ public class AgentChatApplicationService {
             throw new IllegalArgumentException("sessionId required");
         }
         executionControl.cancel(sessionId);
-        taskRunService.markCancelled(userId, sessionId, "Cancelled by user");
-        streamingService.markIdle(sessionId);
     }
 
     private void recordEvent(String sessionId, String taskId,
@@ -287,10 +312,14 @@ public class AgentChatApplicationService {
         return com.miniagent.common.StringUtils.truncate(s, maxLen);
     }
 
-    private String doExecuteAgent(Long userId, String sessionId, String userMessage,
-                                  org.springframework.web.servlet.mvc.method.annotation.SseEmitter progressEmitter,
-                                  List<String> imageDataUrls,
-                                  List<MediaRef> mediaRefs) {
+    private String doExecuteAgent(
+            Long userId,
+            String sessionId,
+            TaskRunService.RunHandle run,
+            String userMessage,
+            SseEmitter progressEmitter,
+            List<String> imageDataUrls,
+            List<MediaRef> mediaRefs) {
         List<String> images = Optional.ofNullable(imageDataUrls).orElseGet(List::of).stream()
                 .filter(StringUtils::isNotBlank).toList();
         List<MediaRef> media = Optional.ofNullable(mediaRefs).orElseGet(List::of).stream()
@@ -388,7 +417,8 @@ public class AgentChatApplicationService {
                     ? traceRecorder.currentExecutionId() : null;
             if (planningLoop.shouldHandle(taskPlan, sessionId, userMessage)) {
                 answer = planningLoop.run(effectiveChat, systemPrompt, userMessage, multimodalMsg,
-                        history, taskPlan, sessionId, executionId, progress, streamSink);
+                        history, taskPlan, sessionId, run.fencingToken(), executionId,
+                        progress, streamSink);
             } else if (hasMedia) {
                 answer = agentLoop.runWithMultimodal(effectiveChat, systemPrompt, multimodalMsg, history,
                         maxIterations(), progress, taskPlan, streamSink);
@@ -396,7 +426,9 @@ public class AgentChatApplicationService {
                 answer = agentLoop.run(effectiveChat, systemPrompt, userMessage, history,
                         maxIterations(), progress, taskPlan, streamSink);
             }
-            if (planningLoop.isAwaitingConfirm(sessionId)) {
+            if (executionControl.isCancelled(sessionId)) {
+                runStatus = RunStatus.CANCELED.name();
+            } else if (planningLoop.isAwaitingConfirm(sessionId)) {
                 runStatus = RunStatus.WAITING.name();
             }
         } finally {
@@ -486,7 +518,7 @@ public class AgentChatApplicationService {
         final List<MediaRef> finalMedia = media;
 
         SseEmitter emitter = streamingService.createStream(finalSid,
-                Optional.ofNullable(finalUserMessage).orElse(""));
+                Optional.ofNullable(finalUserMessage).orElse(""), userId);
 
         CompletableFuture.runAsync(() -> {
             try {

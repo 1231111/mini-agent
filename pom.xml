@@ -18,6 +18,7 @@
         <module>mini-agent-loop</module>
         <module>mini-agent-planner</module>
         <module>mini-agent-app</module>
+        <module>mini-agent-account</module>
     </modules>
 
     <properties>
@@ -27,6 +28,15 @@
         <spring-boot.version>3.4.5</spring-boot.version>
         <langchain4j.version>1.15.0</langchain4j.version>
         <lombok.version>1.18.40</lombok.version>
+        <!--
+          内联 embedding 用的两个件。
+          onnxruntime：跑我们导出的 ONNX 图（.verify/onnx/export_onnx.py）。
+          DJL tokenizers：HuggingFace Rust tokenizers 的 JNI 绑定 —— 与 Python 侧
+          `tokenizers` 是同一个 Rust 库，这样 token 切分才能与已验证的参考实现逐位对齐。
+          版本对齐 langchain4j-embeddings:1.15.0-beta25 的传递依赖，避免同物两版本。
+        -->
+        <onnxruntime.version>1.20.0</onnxruntime.version>
+        <djl.version>0.36.0</djl.version>
     </properties>
 
     <dependencyManagement>
@@ -44,6 +54,21 @@
                 <version>${langchain4j.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.microsoft.onnxruntime</groupId>
+                <artifactId>onnxruntime</artifactId>
+                <version>${onnxruntime.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>ai.djl.huggingface</groupId>
+                <artifactId>tokenizers</artifactId>
+                <version>${djl.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>ai.djl</groupId>
+                <artifactId>api</artifactId>
+                <version>${djl.version}</version>
             </dependency>
             <dependency>
                 <groupId>com.miniagent</groupId>

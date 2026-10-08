@@ -7,6 +7,7 @@ import com.miniagent.agent.core.SessionEventCenter;
 import com.miniagent.agent.hook.ToolHookChain;
 import com.miniagent.agent.hook.ToolHookContext;
 import com.miniagent.agent.hook.ToolPreDecision;
+import com.miniagent.agent.permission.ExecPolicyService;
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.permission.PermissionPolicy;
 import com.miniagent.agent.permission.SessionPermissionStore;
@@ -20,6 +21,7 @@ import com.miniagent.agent.tool.impl.ExecCommandParams;
 import com.miniagent.agent.trace.TraceRecorder;
 import com.miniagent.common.MessageConstants;
 import com.miniagent.common.RunStatus;
+import com.miniagent.common.permission.ExecPolicy;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,6 +37,7 @@ import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * 工具执行唯一入口。ReAct 循环与规划器绑定动作走同一条管道：
@@ -45,6 +48,7 @@ import java.util.Optional;
 public class ToolPipeline {
 
     private static final Logger log = LoggerFactory.getLogger(ToolPipeline.class);
+    private static final String BROWSER_EVALUATE = "browser_evaluate";
 
     private final ExecutionControl executionControl;
     private final ToolHookChain toolHookChain;
@@ -52,9 +56,15 @@ public class ToolPipeline {
     private final ActionJournal actionJournal;
     private final ToolExecutionGuards toolExecutionGuards;
     private final ToolRegistry toolRegistry;
-    private final boolean execEnabled;
+    /**
+     * exec_command 策略。之前这里是一个构造器注入的 {@code final boolean execEnabled} ——
+     * 启动后改不了，而用户需要在会话里随时切换，所以改成走 {@link ExecPolicyService}。
+     */
+    private final ExecPolicyService execPolicyService;
     private SessionEventCenter eventCenter;
     private TraceRecorder traceRecorder;
+    @Value("${agent.browser.evaluate-enabled:false}")
+    private boolean browserEvaluateEnabled;
 
     public ToolPipeline(
             ExecutionControl executionControl,
@@ -63,14 +73,14 @@ public class ToolPipeline {
             ActionJournal actionJournal,
             ToolExecutionGuards toolExecutionGuards,
             ToolRegistry toolRegistry,
-            @Value("${agent.tools.exec-enabled:true}") boolean execEnabled) {
+            ExecPolicyService execPolicyService) {
         this.executionControl = executionControl;
         this.toolHookChain = toolHookChain;
         this.permissionStore = permissionStore;
         this.actionJournal = actionJournal;
         this.toolExecutionGuards = toolExecutionGuards;
         this.toolRegistry = toolRegistry;
-        this.execEnabled = execEnabled;
+        this.execPolicyService = execPolicyService;
     }
 
     @Autowired(required = false)
@@ -94,6 +104,25 @@ public class ToolPipeline {
         String args = request.arguments();
         int turn = request.turn();
 
+        if (BROWSER_EVALUATE.equals(name) && !browserEvaluateEnabled) {
+            recordNode(sid, turn, "PERM_DENY",
+                    "{\"tool\":\"" + name
+                            + "\",\"reason\":\"browser_evaluate_disabled\"}",
+                    RunStatus.FAILURE.name());
+            return ToolInvocation.policyDenied(name, ToolResult.failure(
+                    ToolErrorCode.PERMISSION_DENIED,
+                    "browser_evaluate 已被配置禁止",
+                    false));
+        }
+        if (request.allowedTools() != null && !request.allowedTools().contains(name)) {
+            recordNode(sid, turn, "PERM_DENY",
+                    "{\"tool\":\"" + name + "\",\"reason\":\"tool_surface\"}",
+                    RunStatus.FAILURE.name());
+            return ToolInvocation.policyDenied(name, ToolResult.failure(
+                    ToolErrorCode.PERMISSION_DENIED,
+                    "工具不在本轮允许列表中: " + name,
+                    false));
+        }
         ExecutionControl.StopReason stop = executionControl.beforeTool(sid);
         if (stop != ExecutionControl.StopReason.NONE) {
             return ToolInvocation.controlStop(name, ToolResult.failure(
@@ -135,7 +164,23 @@ public class ToolPipeline {
                     text);
         }
         boolean granted = sid != null && permissionStore.isAskGranted(sid, name);
-        if (PermissionPolicy.needsSessionGrant(mode, name, execEnabled) && !granted) {
+
+        // exec_command 的生效策略：会话覆盖 ?? 全局默认，再计入会话模式（ACCEPT_EDITS 相当于"别问我"）。
+        ExecPolicy effectiveExec = execPolicyService.effective(sid, mode);
+
+        // BLOCK 是硬闸门，必须排在 needsSessionGrant 之前：
+        // needsSessionGrant 对 BLOCK 返回 false（禁止不该有"批准一下就放行"的路），
+        // 所以如果不在这里拦，就变成了放行 —— 这是唯一一处必须前置的判定。
+        if (PermissionPolicy.isExecBlocked(name, effectiveExec)) {
+            recordNode(sid, turn, "PERM_DENY",
+                    "{\"tool\":\"" + name + "\",\"execPolicy\":\"block\"}",
+                    RunStatus.FAILURE.name());
+            return ToolInvocation.policyDenied(name, ToolResult.fromLegacy(
+                    "{\"error\":\"exec_command 已被策略禁止（exec-policy=block）。"
+                            + "本会话或全局把终端命令执行设为禁止，且该档位不受会话模式影响。"
+                            + "要执行命令请先把策略切到 ask 或 allow。\"}"));
+        }
+        if (PermissionPolicy.needsSessionGrant(mode, name, effectiveExec) && !granted) {
             emitPermissionAsk(sid, name, args);
             recordNode(sid, turn, "WAITING_FOR_HUMAN",
                     "{\"tool\":\"" + name + "\",\"mode\":\"" + mode.wireName()
@@ -157,7 +202,14 @@ public class ToolPipeline {
         }
         String effective = (pre != null && pre.argumentsJson() != null)
                 ? pre.argumentsJson() : args;
-        ToolResult raw = executeJournaled(run, sid, name, effective, turn, request.runId());
+        ToolResult raw = executeJournaled(
+                run,
+                sid,
+                name,
+                effective,
+                turn,
+                request.runId(),
+                request.allowedTools());
         String processed = toolHookChain.after(
                 new ToolHookContext(sid, name, effective, turn, sub), raw.legacyText());
         ToolResult result = Objects.equals(processed, raw.legacyText())
@@ -167,7 +219,7 @@ public class ToolPipeline {
 
     private ToolResult executeJournaled(
             RunScope run, String sessionId, String name, String arguments,
-            int turn, String runId) {
+            int turn, String runId, Set<String> allowedTools) {
         // 必须吃参数：exec_command 的幂等性取决于命令行（只读命令可安全重试，
         // 写类命令重跑可能重复副作用）。按名字取到的永远是注册期那份保守契约。
         ToolDescriptor descriptor = toolExecutionGuards.descriptor(name, arguments);
@@ -208,7 +260,7 @@ public class ToolPipeline {
         }
 
         ToolResult result;
-        try {
+        try (var ignored = ToolCallContext.bind(allowedTools)) {
             result = toolExecutionGuards.executeGuarded(name, arguments, sessionId,
                     () -> toolRegistry.executeResult(name, arguments));
         } catch (ToolLockTimeoutException e) {

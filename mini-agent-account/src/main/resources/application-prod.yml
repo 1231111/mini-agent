@@ -1,0 +1,48 @@
+# 生产档。与云端 agent 的 prod 档最关键的差异是 registration-enabled：这里必须是 true。
+#
+# 云端 agent 的 prod 档里有 ProductionReadinessValidator，它硬断言
+# "public registration must be disabled" —— 因为那份进程的暴露面是 agent 能力本身。
+# 账号服务的暴露面只有账号域，注册是它的核心功能，不是需要关掉的东西。
+#
+# 但下面这两条强度要求与 agent 侧保持一致，不能因为"这是账号服务"就放松：
+# 密码策略是账号域的安全底线，拆分不等于降标准。
+
+server:
+  port: 8081
+
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    table: flyway_schema_history_account
+
+logging:
+  level:
+    com.miniagent: INFO
+    root: WARN
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
+agent:
+  account:
+    registration-enabled: true
+    # 与云端 agent 的 agent.auth.password-min-length 对齐（那边也是 12）。
+    # 两个入口的密码强度不一致会出现"在 A 能注册、在 B 注册失败"这种没人能解释的现象。
+    password-min-length: 12
+    bcrypt-strength: 12
+    internal-key: ${ACCOUNT_INTERNAL_KEY:}

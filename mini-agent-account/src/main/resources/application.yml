@@ -1,0 +1,76 @@
+# 账号服务默认档（本地开发/联调）。
+#
+# 与云端 agent 的关键差异只有一条：这里 registration-enabled 默认就是 true。
+# 云端 agent 的 prod 档被 ProductionReadinessValidator 硬断言必须关掉公开注册，
+# 而"注册在 web 端"需要一个能开注册的地方 —— 那个地方就是这个服务。
+# 拆分的收益正是这条：agent 侧那条安全断言一行都不用动。
+
+server:
+  port: ${ACCOUNT_SERVER_PORT:8081}
+
+spring:
+  application:
+    name: mini-agent-account
+  profiles:
+    active: dev
+
+  datasource:
+    # 本地默认连 127.0.0.1；容器里由 DB_URL 指向 mysql 服务。
+    # 与云端 agent 指向同一个库 —— 见 db/migration/V1 的说明。
+    #
+    # ═══ 为什么用户名/密码直接给默认值，而不是留空 ═══
+    # 原来写的是 ${DB_PASSWORD:${MYSQL_PASSWORD:}}，两个变量都未设时兜底值是**空字符串**。
+    # 后果不是"启动时提示缺配置"，而是连库那一刻 MySQL 报
+    #     Access denied for user 'root'@'172.19.0.1' (using password: NO)
+    # —— 报错落在握手层，指向"权限"，而真实原因是"密码变量不存在"。
+    #
+    # 更要命的是同一个服务的配置有三个入口（IDEA 运行配置 / docker compose /
+    # 命令行 java -jar），三个入口互不知道对方，于是每换一个入口就要重踩一次。
+    # 把默认值写在这里 = 一处生效、所有入口可用；IDEA 里无论点哪个运行配置都能起来。
+    #
+    # 默认值取自 docker-compose.yml 里 MYSQL_ROOT_PASSWORD 的默认值（本来就明文在
+    # compose 文件里，不是新增暴露）。它是**本地开发兜底**，不是生产凭据：
+    #   - 需要覆盖时照旧用环境变量，前缀形式 ${VAR:default} 保留了覆盖能力；
+    #   - prod 档 application-prod.yml 里是裸的 ${DB_PASSWORD}（无默认值），
+    #     且容器部署时 compose 显式注入，所以生产不走这两个默认值。
+    url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:mysql_root_pass}
+
+  jpa:
+    hibernate:
+      # validate 而不是 none：共享库场景下，本服务对 users/tenants 的理解
+      # 一旦与云端 agent 的建表结果不一致，应该在这里就炸，而不是等到写数据时才出问题。
+      ddl-auto: validate
+    open-in-view: false
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    # 与云端 agent 共用同一个库，但各管各的表，所以必须用各自的历史表。
+    # 共用一张 flyway_schema_history 的后果：两个应用会互相把对方的迁移记录
+    # 当成"缺失"或"漂移"，启动时直接报校验失败。
+    table: flyway_schema_history_account
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
+agent:
+  account:
+    registration-enabled: true
+    password-min-length: 8
+    bcrypt-strength: 10
+
+    # 服务间调用的共享密钥。会员接口只接受带 X-Account-Internal-Key 的请求。
+    #
+    # 为什么是"服务间密钥"而不是用户会话：本服务不签 token（见 AccountApplication 说明），
+    # 所以它没有"用户会话"这个概念。会员查询的鉴权由调用方完成 ——
+    # 云端 agent 或客户机本地后端先验掉用户的 token，再带这个密钥转发过来。
+    # 留空则不启用会员接口（返回 503 并在启动时 WARN），不会静默地变成无鉴权。
+    internal-key: ${ACCOUNT_INTERNAL_KEY:}

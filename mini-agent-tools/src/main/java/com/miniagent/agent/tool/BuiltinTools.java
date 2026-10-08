@@ -44,6 +44,8 @@ import com.miniagent.agent.tool.impl.*;
 @Component
 public class BuiltinTools {
 
+    private static final String BROWSER_EVALUATE = "browser_evaluate";
+
     @Autowired
     private  ToolRegistry registry;
     @Autowired
@@ -62,11 +64,10 @@ public class BuiltinTools {
     @Autowired
     private  NetworkGuard networkGuard;
 
-    @Value("${agent.tools.exec-enabled:true}")
-    private boolean execEnabled;
-
     @Value("${agent.tools.allow-absolute-write:false}")
     private boolean allowAbsoluteWrite;
+    @Value("${agent.browser.evaluate-enabled:false}")
+    private boolean browserEvaluateEnabled;
 
     /**
      * 工具结果缓存：同一用户消息内，对 read_file / list_files 的重复调用直接返回缓存。
@@ -468,11 +469,12 @@ public class BuiltinTools {
     }
 
     private void registerExecTool() {
-        if (execEnabled) {
-            log.info("exec_command 已注册，全局免批（agent.tools.exec-enabled=true）");
-        } else {
-            log.info("exec_command 已注册，默认需会话批准（agent.tools.exec-enabled=false）");
-        }
+        // 这里刻意不再读 agent.tools.exec-enabled / exec-policy 来打"免批还是需批"的日志：
+        // 策略的真正裁决点是 ExecPolicyService（mini-agent-loop），
+        // 它已经在自己启动时打过 "exec_command 策略: 全局默认 = ..."。
+        // 在 tools 模块再解析一遍配置就会出现两份解析逻辑，正是漂移的来源。
+        // 而且 tools 依赖 common、不依赖 loop（反向依赖会成环），本来就拿不到那个服务。
+        log.info("exec_command 已注册；执行策略由 ExecPolicyService 裁决（见其启动日志）");
         // 这里刻意用完整 builder 而不是便捷注册：exec_command 需要挂「按参数算超时」的函数，
         // 而便捷注册只能给一个注册期常量（git status 与 mvnw package 不该共用同一个预算）。
         registry.register(Tool.builder()
@@ -546,9 +548,12 @@ public class BuiltinTools {
                 BrowserScreenshotParams.class,
                 params -> browserService.screenshot(params.getSessionIdOrDefault()));
 
-        registry.register("browser_evaluate", "在页面中执行 JavaScript 代码",
-                BrowserEvaluateParams.class,
-                params -> browserService.evaluate(params.getSessionIdOrDefault(), params.getScript()));
+        if (browserEvaluateEnabled) {
+            registry.register(BROWSER_EVALUATE, "在页面中执行 JavaScript 代码",
+                    BrowserEvaluateParams.class,
+                    params -> browserService.evaluate(
+                            params.getSessionIdOrDefault(), params.getScript()));
+        }
 
         registry.register("browser_extract_text",
                 "抽取当前页正文并写入文件。飞书/wiki 有侧栏目录时会按目录逐章抽取，"

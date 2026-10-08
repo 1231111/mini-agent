@@ -8,5 +8,5 @@ public interface SessionLock {
     /**
      * @return false 表示锁已丢，调用方应中止
      */
-    boolean renewSessionLock(String sessionId);
+    boolean renewSessionLock(String sessionId, String fencingToken);
 }

@@ -45,6 +45,11 @@ public class SessionEventCenter {
     private static final String PENDING_USER_MSG_PREFIX = "pending-user-msg:";
 
     private final Map<String, SessionChannel> channels = new ConcurrentHashMap<>();
+    /**
+     * emitter -> 归属用户。挂载时登记，用于登出时精准摘流。
+     * 只按 sessionId 记账的话，退出登录后已建立的长连接不会被摘掉，仍会继续收到该会话的推送。
+     */
+    private final Map<SseEmitter, Long> emitterOwner = new ConcurrentHashMap<>();
     private final String instanceId = UUID.randomUUID().toString();
     private final ScheduledExecutorService cleaner =
             Executors.newSingleThreadScheduledExecutor(r -> {
@@ -184,7 +189,7 @@ public class SessionEventCenter {
         }
     }
 
-    public boolean attachClient(String sessionId, SseEmitter emitter) {
+    public boolean attachClient(String sessionId, Long userId, SseEmitter emitter) {
         SessionChannel channel = channels.get(key(sessionId));
         if (Objects.isNull(channel)) {
             return false;
@@ -216,12 +221,59 @@ public class SessionEventCenter {
             sendEvent(emitter, "error", Optional.ofNullable(channel.errorMsg).orElse("处理出错"));
             try { emitter.complete(); } catch (Exception ignored) {}
         } else {
-            emitter.onCompletion(() -> channel.clients.remove(emitter));
-            emitter.onTimeout(() -> channel.clients.remove(emitter));
-            emitter.onError(e -> channel.clients.remove(emitter));
+            if (Objects.nonNull(userId)) {
+                emitterOwner.put(emitter, userId);
+            }
+            emitter.onCompletion(() -> detachClient(channel, emitter));
+            emitter.onTimeout(() -> detachClient(channel, emitter));
+            emitter.onError(e -> detachClient(channel, emitter));
             channel.clients.add(emitter);
         }
         return true;
+    }
+
+    /** 摘掉一个 emitter：从通道列表移除，同时清掉归属登记。 */
+    private void detachClient(SessionChannel channel, SseEmitter emitter) {
+        channel.clients.remove(emitter);
+        emitterOwner.remove(emitter);
+    }
+
+    /**
+     * 摘掉某个用户挂在所有会话上的事件流 —— 登出时调用。
+     *
+     * <p>SSE 是长连接，只在建立那一次鉴权；不在登出时主动摘，这条连接会继续把该会话的
+     * 推送送给一个已经退登的页面。
+     *
+     * @return 实际摘除的连接数
+     */
+    public int detachUser(Long userId) {
+        if (Objects.isNull(userId)) {
+            return 0;
+        }
+        int removed = 0;
+        for (SessionChannel channel : channels.values()) {
+            for (SseEmitter emitter : channel.clients) {
+                if (!userId.equals(emitterOwner.get(emitter))) {
+                    continue;
+                }
+                try {
+                    emitter.send(SseEmitter.event().name("logout").data(""));
+                } catch (Exception ignored) {
+                    // 对端已断开，直接摘
+                }
+                try {
+                    emitter.complete();
+                } catch (Exception ignored) {
+                    // 同上
+                }
+                detachClient(channel, emitter);
+                removed++;
+            }
+        }
+        if (removed > 0) {
+            log.info("登出摘流 userId={} 关闭连接数={}", userId, removed);
+        }
+        return removed;
     }
 
     public void complete(String sessionId, String finalAnswer) {

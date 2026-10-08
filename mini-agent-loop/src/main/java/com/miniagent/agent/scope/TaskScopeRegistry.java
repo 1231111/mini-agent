@@ -1,6 +1,7 @@
 package com.miniagent.agent.scope;
 
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
@@ -37,18 +38,19 @@ import java.util.concurrent.ConcurrentHashMap;
  * 而由「上一交付的工作集是被挂起还是被归档」决定 —— 一个可持久化、可复核、
  * 且与用户唯一能表达「接着做」的方式（回复「继续」）自洽的事实。</p>
  *
- * <h2>已知边界</h2>
+ * <h2>恢复与多副本</h2>
  *
- * <p>作用域登记在进程内存里，重启或多副本时同会话的另一份进程会从零号任务重新开始。
- * 影响范围限于「已切过任务、且被中断」的会话：它的图会留在旧键上而新进程只读零号槽位，
- * 表现为「继续」捞得回清单但捞不回图。要闭环需要把这个登记落进已持久化的会话维度存储
- * （{@code SessionTodoPersistence.State} 加一列），属于一次带 DDL 的改动，单独做。</p>
+ * <p>应用提供 {@link TaskScopePersistence} 时，当前任务、最近离开的任务和发号序列
+ * 通过版本 CAS 写入共享存储。每次解析边界都先读取共享状态，所以重启和跨副本不会退回
+ * 零号任务。无持久化实现时才回退到进程内 Map，供纯单元测试使用。</p>
  */
 @Component
 public class TaskScopeRegistry {
 
     /** 惰性创建时使用的原因标记，便于在日志里区分「系统兜底」与「真实判定」。 */
     static final String LAZY_REASON = "lazy";
+    static final String RESTORED_REASON = "restored";
+    private static final int MAX_CAS_ATTEMPTS = 5;
 
     /**
      * 一个会话的任务指针：当前任务 + 最近离开的那个任务。
@@ -66,6 +68,7 @@ public class TaskScopeRegistry {
          * 于是新任务和某个被离开的任务撞进同一个键 —— 隔离当场失效。</p>
          */
         long seq;
+        long version;
         TaskScope current;
         /** 最近一次被离开的任务；{@link TaskBoundary#RESUME} 时与 current 互换。 */
         TaskScope paused;
@@ -73,15 +76,64 @@ public class TaskScopeRegistry {
         Holder(String sessionId) {
             this.current = TaskScope.initial(sessionId, LAZY_REASON);
         }
+
+        Holder(
+                String sessionId,
+                TaskScopePersistence.State state,
+                String currentReason) {
+            this.seq = state.sequence();
+            this.version = state.version();
+            this.current = restoredScope(
+                    sessionId, state.currentTaskId(), currentReason);
+            this.paused = state.pausedTaskId() == null
+                    ? null
+                    : restoredScope(
+                            sessionId,
+                            state.pausedTaskId(),
+                            RESTORED_REASON);
+        }
+
+        private static TaskScope restoredScope(
+                String sessionId, long taskId, String reason) {
+            return new TaskScope(
+                    sessionId, taskId, System.currentTimeMillis(), reason);
+        }
     }
 
     private final Map<String, Holder> bySession = new ConcurrentHashMap<>();
+    private final TaskScopePersistence persistence;
+
+    public TaskScopeRegistry() {
+        this(null);
+    }
+
+    @Autowired
+    public TaskScopeRegistry(
+            @Autowired(required = false) TaskScopePersistence persistence) {
+        this.persistence = persistence;
+    }
 
     private Holder holder(String sessionId) {
         if (StringUtils.isBlank(sessionId)) {
             return null;
         }
-        return bySession.computeIfAbsent(sessionId, Holder::new);
+        if (persistence == null) {
+            return bySession.computeIfAbsent(sessionId, Holder::new);
+        }
+        TaskScopePersistence.State state = persistence.loadOrCreate(sessionId);
+        return cache(sessionId, state, RESTORED_REASON);
+    }
+
+    private Holder cache(
+            String sessionId,
+            TaskScopePersistence.State state,
+            String currentReason) {
+        return bySession.compute(sessionId, (key, cached) -> {
+            if (cached != null && cached.version == state.version()) {
+                return cached;
+            }
+            return new Holder(sessionId, state, currentReason);
+        });
     }
 
     /**
@@ -103,12 +155,21 @@ public class TaskScopeRegistry {
      * @return 本轮所属的任务作用域；sessionId 为空时返回 null。
      */
     public TaskScope resolve(String sessionId, TaskBoundary boundary, String reason) {
-        Holder h = holder(sessionId);
-        if (h == null) {
+        if (StringUtils.isBlank(sessionId)) {
             return null;
         }
+        TaskBoundary effective = boundary == null ? TaskBoundary.SAME : boundary;
+        if (persistence != null) {
+            return resolvePersistent(sessionId, effective, reason);
+        }
+        return resolveInMemory(sessionId, effective, reason);
+    }
+
+    private TaskScope resolveInMemory(
+            String sessionId, TaskBoundary boundary, String reason) {
+        Holder h = holder(sessionId);
         synchronized (h) {
-            switch (boundary == null ? TaskBoundary.SAME : boundary) {
+            switch (boundary) {
                 case NEW -> {
                     h.paused = h.current;
                     // 用单调计数器发号，而不是「当前号 + 1」：RESUME 会把指针换回旧号，
@@ -133,6 +194,49 @@ public class TaskScopeRegistry {
         }
     }
 
+    private TaskScope resolvePersistent(
+            String sessionId, TaskBoundary boundary, String reason) {
+        for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
+            TaskScopePersistence.State current =
+                    persistence.loadOrCreate(sessionId);
+            TaskScopePersistence.State next = transition(current, boundary);
+            if (next == current) {
+                return cache(sessionId, current, RESTORED_REASON).current;
+            }
+            if (persistence.compareAndSet(sessionId, current, next)) {
+                return cache(sessionId, next, reason).current;
+            }
+        }
+        throw new IllegalStateException(
+                "Task scope CAS conflict after " + MAX_CAS_ATTEMPTS
+                        + " attempts for session " + sessionId);
+    }
+
+    private TaskScopePersistence.State transition(
+            TaskScopePersistence.State current, TaskBoundary boundary) {
+        return switch (boundary) {
+            case NEW -> {
+                long nextTaskId = current.sequence() + 1L;
+                yield new TaskScopePersistence.State(
+                        nextTaskId,
+                        current.currentTaskId(),
+                        nextTaskId,
+                        current.version() + 1L);
+            }
+            case RESUME -> {
+                if (current.pausedTaskId() == null) {
+                    yield current;
+                }
+                yield new TaskScopePersistence.State(
+                        current.pausedTaskId(),
+                        current.currentTaskId(),
+                        current.sequence(),
+                        current.version() + 1L);
+            }
+            case SAME -> current;
+        };
+    }
+
     /**
      * 任务级状态的 key。没有登记过作用域的会话由 {@link #current} 兜底创建，因此永不返回 null。
      */
@@ -141,16 +245,13 @@ public class TaskScopeRegistry {
         return scope == null ? sessionId : scope.scopeKey();
     }
 
-    /**
-     * 会话被删除时释放登记。
-     *
-     * <p>注意：这里只清「当前是哪个任务」的登记，
-     * <b>不清任务级状态本身</b> —— 那些状态的 key 已经是作用域键，
-     * 会话重建后会从头开始递增，天然读不到旧数据。</p>
-     */
+    /** 会话被永久删除时释放缓存及持久化的任务指针。 */
     public void forget(String sessionId) {
         if (StringUtils.isNotBlank(sessionId)) {
             bySession.remove(sessionId);
+            if (persistence != null) {
+                persistence.deleteScope(sessionId);
+            }
         }
     }
 

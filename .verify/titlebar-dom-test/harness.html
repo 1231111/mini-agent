@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>titlebar harness</title>
+<style>
+  /* 主题令牌 = chat.html 真实值。挂在 [data-theme] 上：notokens 变体不设属性 →
+     令牌整体不存在，preload 的 var(--bg,#0e0f12) 必须落到 fallback。 */
+  :root[data-theme="dark"] {
+    --bg:#0e0f12; --surface:#1e2127; --surface2:#2a2e36;
+    --border:rgba(255,255,255,.09); --text:#f3f4f6; --text2:#a8adba; --accent:#10a37f;
+  }
+  :root[data-theme="light"] {
+    --bg:#ffffff; --surface:#f4f4f5; --surface2:#e8e8ea;
+    --border:rgba(0,0,0,.1); --text:#1f2024; --text2:#5d6068; --accent:#10a37f;
+  }
+  html,body{margin:0;}
+  body{
+    background:var(--bg,#0e0f12); color:var(--text,#f3f4f6);
+    font:14px/1.6 "Segoe UI",system-ui,sans-serif;
+    padding:16px;   /* 模拟页面自带 padding，验证「叠加不覆盖」 */
+  }
+  #scroller{max-width:760px;margin:0 auto;}
+  .bubble{background:var(--surface,#1e2127);border:1px solid var(--border,rgba(255,255,255,.09));
+          border-radius:12px;padding:12px 16px;margin:12px 0;}
+  .bubble.me{background:var(--surface2,#2a2e36);}
+</style>
+</head>
+<body>
+<div id="scroller">
+  <div id="content">
+    <div class="bubble">MiniAgent 桌面客户端 — 自绘标题栏静态实测页</div>
+    <div class="bubble me">顶栏 32px：可拖拽、双击最大化、右上角最小化/最大化/关闭</div>
+    <div class="bubble">配色取自 chat.html 的设计令牌，随 data-theme 明暗切换</div>
+    <div class="bubble me">页面内容应整体让出顶部 32px，不被标题栏遮挡</div>
+  </div>
+</div>
+<script>
+
+(function () {
+  var q = new URLSearchParams(location.hash.replace(/^#/, ''));
+  window.__q = {
+    theme:    q.get('theme')    || 'dark',      // dark | light | notokens
+    platform: q.get('platform') || 'win32',     // win32 | darwin
+    state:    q.get('state')    || 'normal',    // normal | maximized | fullscreen
+    shot:     q.get('shot') === '1'
+  };
+  if (window.__q.theme !== 'notokens') {
+    document.documentElement.setAttribute('data-theme', window.__q.theme);
+  }
+  window.process = { platform: window.__q.platform };
+
+  window.__ipcLog = [];
+  window.__winState = window.__q.state === 'maximized' ? { maximized: true, fullscreen: false }
+                    : window.__q.state === 'fullscreen' ? { maximized: true, fullscreen: true }
+                    : { maximized: false, fullscreen: false };
+  window.__stateListeners = [];
+  var ipcStub = {
+    invoke: function (channel) {
+      window.__ipcLog.push('invoke:' + channel);
+      if (channel === 'win:state') return Promise.resolve(window.__winState);
+      return Promise.resolve(null);
+    },
+    on: function (channel, cb) {
+      window.__ipcLog.push('on:' + channel);
+      window.__stateListeners.push({ channel: channel, cb: cb });
+    },
+    removeListener: function () {}
+  };
+  window.require = function () {
+    return {
+      contextBridge: { exposeInMainWorld: function () {} },
+      ipcRenderer: ipcStub
+    };
+  };
+})();
+
+</script>
+<script>
+const { contextBridge, ipcRenderer } = require('electron');
+
+// 安全地暴露 API 给渲染进程
+contextBridge.exposeInMainWorld('electronAPI', {
+  // 获取后端 API 地址
+  getApiBase: () => ipcRenderer.invoke('get-api-base'),
+
+  // 配置存储
+  getConfig: (key) => ipcRenderer.invoke('get-config', key),
+  setConfig: (key, value) => ipcRenderer.invoke('set-config', key, value),
+
+  // 获取平台信息
+  getPlatform: () => ipcRenderer.invoke('get-platform'),
+
+  // 账号门户地址（注册 / 会员 / 充值）。空串 = 本机没配门户，界面应退回壳内注册。
+  getPortalUrl: () => ipcRenderer.invoke('get-portal-url'),
+
+  // 用系统浏览器打开账号门户。主进程会校验只允许 http/https。
+  openExternal: (url) => ipcRenderer.invoke('open-external', url),
+
+  // 后端就绪 / 启动失败。主进程在后端 /actuator/health 返回 UP 之后发出，
+  // 比渲染层自己盲轮询端口准确。
+  getBackendStatus: () => ipcRenderer.invoke('get-backend-status'),
+
+  onBackendReady: (callback) => {
+    const handler = (_e, payload) => callback(payload);
+    ipcRenderer.on('backend-ready', handler);
+    return () => ipcRenderer.removeListener('backend-ready', handler);
+  },
+
+  onBackendError: (callback) => {
+    const handler = (_e, payload) => callback(payload);
+    ipcRenderer.on('backend-error', handler);
+    return () => ipcRenderer.removeListener('backend-error', handler);
+  },
+
+  // 监听主进程消息
+  onRestartServer: (callback) => {
+    ipcRenderer.on('restart-server', callback);
+    return () => {
+      ipcRenderer.removeListener('restart-server', callback);
+    };
+  },
+
+  // 自绘标题栏的窗口控制（最小化 / 最大化·还原 / 关闭）与窗口状态订阅
+  windowControls: {
+    minimize: () => ipcRenderer.invoke('win:minimize'),
+    toggleMaximize: () => ipcRenderer.invoke('win:toggle-maximize'),
+    close: () => ipcRenderer.invoke('win:close'),
+    getState: () => ipcRenderer.invoke('win:state'),
+    onStateChanged: (callback) => {
+      const handler = (_e, state) => callback(state);
+      ipcRenderer.on('win:state-changed', handler);
+      return () => ipcRenderer.removeListener('win:state-changed', handler);
+    }
+  }
+});
+
+// 暴露 fetch API 的增强版本，自动添加 API 基础地址
+contextBridge.exposeInMainWorld('api', {
+  fetch: async (url, options = {}) => {
+    const apiBase = await ipcRenderer.invoke('get-api-base');
+    const fullUrl = url.startsWith('http') ? url : `${apiBase}${url}`;
+    return fetch(fullUrl, options);
+  },
+
+  // SSE 流式请求
+  fetchStream: async (url, options = {}) => {
+    const apiBase = await ipcRenderer.invoke('get-api-base');
+    const fullUrl = url.startsWith('http') ? url : `${apiBase}${url}`;
+    return fetch(fullUrl, options);
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   自绘标题栏（WorkBuddy 式窗口）
+   ═══════════════════════════════════════════════════════════════════
+   主进程已把系统标题栏/边框去掉（frame:false），这一段负责在页面里补回
+   窗口该有的功能：拖拽移动、双击最大化/还原、右上角最小化/最大化/关闭。
+
+   为什么放在 preload 而不是后端模板：主窗口加载的是后端的完整聊天 UI
+   （chat / login / membership / trace 四个页面 + 本地诊断页），放 preload
+   一份代码对所有页面生效，后端模板零改动，将来新增页面也自动带上。
+
+   配色用 CSS 变量 + fallback：chat.html 的设计令牌（--bg / --border /
+   --text2 / --surface2）会随 data-theme 明暗切换，标题栏自动跟随主题；
+   没有这些变量的页面（login 固定深色、本地诊断页）落到 fallback 深色。
+   ───────────────────────────────────────────────────────────────── */
+(function installTitlebar() {
+  const BAR_HEIGHT = 32;
+  const IS_MAC = process.platform === 'darwin';
+
+  // 直接走 ipcRenderer，不经过 window.electronAPI —— 后者是 exposeInMainWorld
+  // 挂到页面主世界的，而这里（含事件监听器）跑在 preload 的隔离上下文里，
+  // 读不到主世界的 window。
+  const winCtl = {
+    minimize: () => ipcRenderer.invoke('win:minimize'),
+    toggleMaximize: () => ipcRenderer.invoke('win:toggle-maximize'),
+    close: () => ipcRenderer.invoke('win:close'),
+    getState: () => ipcRenderer.invoke('win:state'),
+    onStateChanged: (callback) => {
+      const handler = (_e, state) => callback(state);
+      ipcRenderer.on('win:state-changed', handler);
+      return () => ipcRenderer.removeListener('win:state-changed', handler);
+    }
+  };
+
+  const SVG = {
+    // 最小化：一条横线
+    min: '<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">' +
+         '<rect x="0" y="4.5" width="10" height="1" fill="currentColor"/></svg>',
+    // 最大化：空心方框
+    max: '<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">' +
+         '<rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor"/></svg>',
+    // 还原：双方框
+    restore: '<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">' +
+             '<rect x="0.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor"/>' +
+             '<polyline points="2.5,2.5 2.5,0.5 8,0.5 8,6" fill="none" stroke="currentColor"/></svg>',
+    // 关闭：叉
+    close: '<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">' +
+           '<path d="M0.5,0.5 L9.5,9.5 M9.5,0.5 L0.5,9.5" stroke="currentColor" fill="none"/></svg>'
+  };
+
+  function install() {
+    if (!document.body || document.getElementById('ma-titlebar')) return;
+
+    const style = document.createElement('style');
+    style.textContent = [
+      '#ma-titlebar{',
+      // border-box：height 含 1px 底边框。否则 content-box 下总高 33px，
+      // 而 body 只让出 32px，边框会压住内容 1px（无头实测 height=33 抓到的）。
+      '  box-sizing:border-box;',
+      '  position:fixed;top:0;left:0;right:0;height:' + BAR_HEIGHT + 'px;',
+      '  display:flex;align-items:center;',
+      '  background:var(--bg,#0e0f12);',
+      '  border-bottom:1px solid var(--border,rgba(255,255,255,.09));',
+      '  color:var(--text2,#a8adba);',
+      '  font:12px/1 "Segoe UI",system-ui,-apple-system,sans-serif;',
+      '  user-select:none;-webkit-user-select:none;',
+      '  -webkit-app-region:drag;',
+      '  z-index:2147483647;',
+      '  padding-left:' + (IS_MAC ? 78 : 12) + 'px;',  // mac 给红绿灯让位
+      '}',
+      '#ma-titlebar .ma-tb-dot{width:8px;height:8px;border-radius:50%;',
+      '  background:var(--accent,#10a37f);margin-right:8px;flex:none;}',
+      '#ma-titlebar .ma-tb-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      '#ma-titlebar .ma-tb-btns{margin-left:auto;display:flex;height:100%;',
+      '  -webkit-app-region:no-drag;}',
+      '#ma-titlebar .ma-tb-btn{width:46px;height:100%;border:0;padding:0;',
+      '  display:flex;align-items:center;justify-content:center;',
+      '  background:transparent;color:inherit;cursor:default;}',
+      '#ma-titlebar .ma-tb-btn:hover{background:var(--surface2,#2a2e36);',
+      '  color:var(--text,#f3f4f6);}',
+      '#ma-titlebar .ma-tb-btn.ma-tb-close:hover{background:#e81123;color:#fff;}',
+      'html.ma-titlebar-hidden #ma-titlebar{display:none;}'
+    ].join('\n');
+    document.head.appendChild(style);
+
+    const bar = document.createElement('div');
+    bar.id = 'ma-titlebar';
+    bar.title = 'MiniAgent';
+    bar.innerHTML =
+      '<div class="ma-tb-dot"></div>' +
+      '<div class="ma-tb-title">Mini Agent</div>' +
+      // mac 用系统红绿灯，不画按钮
+      (IS_MAC ? '' :
+        '<div class="ma-tb-btns">' +
+          '<button class="ma-tb-btn ma-tb-min"  aria-label="最小化">' + SVG.min + '</button>' +
+          '<button class="ma-tb-btn ma-tb-max"  aria-label="最大化">' + SVG.max + '</button>' +
+          '<button class="ma-tb-btn ma-tb-close" aria-label="关闭">' + SVG.close + '</button>' +
+        '</div>');
+    document.body.appendChild(bar);
+
+    // 页面让出顶部空间。叠加在原 padding 之上（不覆盖页面自带的 padding）；
+    // border-box 是防「子元素 height:100% 叠 padding 溢出一屏」的双滚动条。
+    const cs = window.getComputedStyle(document.body);
+    const origPad = parseInt(cs.paddingTop, 10) || 0;
+    document.body.style.boxSizing = 'border-box';
+    document.body.style.paddingTop = (origPad + BAR_HEIGHT) + 'px';
+
+    // 双击标题栏空白 = 最大化/还原（Windows 原生习惯）
+    bar.addEventListener('dblclick', (e) => {
+      if (e.target.closest('.ma-tb-btn')) return;
+      winCtl.toggleMaximize();
+    });
+
+    if (!IS_MAC) {
+      const btnMin = bar.querySelector('.ma-tb-min');
+      const btnMax = bar.querySelector('.ma-tb-max');
+      const btnClose = bar.querySelector('.ma-tb-close');
+      btnMin.addEventListener('click', () => winCtl.minimize());
+      btnMax.addEventListener('click', () => winCtl.toggleMaximize());
+      btnClose.addEventListener('click', () => winCtl.close());
+
+      // 最大化 ↔ 还原图标；全屏时整个标题栏让位（与原生全屏语义一致）
+      const applyState = (state) => {
+        const maximized = !!(state && (state.maximized || state.fullscreen));
+        btnMax.innerHTML = maximized ? SVG.restore : SVG.max;
+        btnMax.setAttribute('aria-label', maximized ? '还原' : '最大化');
+        const hidden = !!(state && state.fullscreen);
+        document.documentElement.classList.toggle('ma-titlebar-hidden', hidden);
+        document.body.style.paddingTop = hidden ? '0px' : (origPad + BAR_HEIGHT) + 'px';
+      };
+      winCtl.getState().then(applyState);
+      winCtl.onStateChanged(applyState);
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', install, { once: true });
+  } else {
+    install();
+  }
+})();
+
+</script>
+<script>
+
+(function () {
+  function rgbTuple(css) {
+    var m = /rgba?\(([^)]+)\)/.exec(css || '');
+    if (!m) return null;
+    var p = m[1].split(',').map(function (s) { return parseFloat(s); });
+    return [p[0], p[1], p[2]];
+  }
+  function tupleEq(a, b) {
+    return !!a && a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
+  }
+  function hex(h) {
+    return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  }
+
+  window.addEventListener('DOMContentLoaded', function () {
+    var R = [];
+    var q = window.__q;
+    var ok = function (name, detail) { R.push('PASS | ' + name + ' | ' + detail); };
+    var bad = function (name, detail) { R.push('FAIL | ' + name + ' | ' + detail); };
+    var chk = function (cond, name, detail) { (cond ? ok : bad)(name, detail); };
+
+    var bar = document.getElementById('ma-titlebar');
+    chk(!!bar, '标题栏已注入', bar ? 'id=ma-titlebar' : '找不到 #ma-titlebar');
+    if (!bar) { window.__finish(R); return; }
+
+    chk(bar.parentElement === document.body, '标题栏挂在 body 直属（不是滚动容器内）',
+       'parent=' + (bar.parentElement ? bar.parentElement.tagName + '#' + (bar.parentElement.id || '-') : 'null'));
+
+    var scroller = document.getElementById('scroller');
+    chk(!!scroller && !scroller.contains(bar), '防回归：不在 #scroller 内（prepend 历史消息不会顶走它）',
+       'scroller.contains(bar)=' + (scroller ? scroller.contains(bar) : 'n/a'));
+
+    var rect = bar.getBoundingClientRect();
+    if (q.state !== 'fullscreen') {
+      chk(Math.abs(rect.top) < 0.5 && rect.width > 1000, '固定顶部横贯窗口', 'top=' + rect.top + ' width=' + rect.width);
+      chk(Math.abs(rect.height - 32) < 0.5, '标题栏总高 32px（含 1px 底边框，box-sizing:border-box）', 'height=' + rect.height);
+      var hit = document.elementFromPoint(200, 16);
+      chk(!!hit && (hit === bar || bar.contains(hit)), '命中测试：顶栏 16px 处点得到标题栏（z 序在页面之上）',
+         'hit=' + (hit ? hit.tagName + '.' + (hit.className || '-') : 'null'));
+    } else {
+      chk(rect.width === 0 && window.getComputedStyle(bar).display === 'none',
+         '全屏态：标题栏隐藏且零占位（不拦截点击）', 'width=' + rect.width + ' display=' + window.getComputedStyle(bar).display);
+    }
+
+    var content = document.getElementById('content');
+    if (q.state !== 'fullscreen') {
+      chk(content.getBoundingClientRect().top >= 32, '内容未被标题栏遮挡', 'content.top=' + content.getBoundingClientRect().top);
+    }
+
+    var bodyCs = window.getComputedStyle(document.body);
+    if (q.state === 'fullscreen') {
+      chk(bodyCs.paddingTop === '0px', '全屏时 body 让位归零', 'padding-top=' + bodyCs.paddingTop);
+    } else {
+      chk(bodyCs.paddingTop === '48px', 'body 让位 = 原 16 + 标题栏 32（叠加不覆盖）', 'padding-top=' + bodyCs.paddingTop);
+    }
+
+    var barCs = window.getComputedStyle(bar);
+    chk(barCs.webkitAppRegion === 'drag' || barCs.getPropertyValue('-webkit-app-region') === 'drag',
+       '标题栏是拖拽区', 'computed -webkit-app-region=' + (barCs.webkitAppRegion || barCs.getPropertyValue('-webkit-app-region') || '(空)'));
+    var btns = bar.querySelector('.ma-tb-btns');
+    if (q.platform === 'win32') {
+      var btnCs = btns ? window.getComputedStyle(btns) : null;
+      chk(!!btnCs && (btnCs.webkitAppRegion === 'no-drag' || btnCs.getPropertyValue('-webkit-app-region') === 'no-drag'),
+         '按钮区 no-drag（点了不拖窗口）',
+         'computed=' + (btnCs ? (btnCs.webkitAppRegion || btnCs.getPropertyValue('-webkit-app-region') || '(空)') : '无按钮区'));
+
+      var bMin = bar.querySelector('.ma-tb-min');
+      var bMax = bar.querySelector('.ma-tb-max');
+      var bCls = bar.querySelector('.ma-tb-close');
+      chk(!!(bMin && bMax && bCls), '右上三键齐备', 'min/max/close=' + [!!bMin, !!bMax, !!bCls]);
+      if (!(bMin && bMax && bCls)) { window.__finish(R); return; }
+      chk(bMin.getAttribute('aria-label') === '最小化' && bCls.getAttribute('aria-label') === '关闭',
+         '无障碍标签', 'min=' + bMin.getAttribute('aria-label') + ' close=' + bCls.getAttribute('aria-label'));
+
+      window.__ipcLog.length = 0;
+      bMin.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      chk(window.__ipcLog.indexOf('invoke:win:minimize') >= 0, '点最小化 → win:minimize', window.__ipcLog.join(','));
+      window.__ipcLog.length = 0;
+      bMax.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      chk(window.__ipcLog.indexOf('invoke:win:toggle-maximize') >= 0, '点最大化 → win:toggle-maximize', window.__ipcLog.join(','));
+      window.__ipcLog.length = 0;
+      bCls.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      chk(window.__ipcLog.indexOf('invoke:win:close') >= 0, '点关闭 → win:close', window.__ipcLog.join(','));
+
+      var title = bar.querySelector('.ma-tb-title');
+      window.__ipcLog.length = 0;
+      title.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+      chk(window.__ipcLog.filter(function (x) { return x === 'invoke:win:toggle-maximize'; }).length === 1,
+         '双击标题空白 → 最大化/还原', window.__ipcLog.join(','));
+      window.__ipcLog.length = 0;
+      bMin.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+      chk(window.__ipcLog.indexOf('invoke:win:toggle-maximize') < 0,
+         '双击按钮不算标题栏双击（不误触发最大化）', window.__ipcLog.join(',') || '(无调用)');
+
+      window.__ipcLog.length = 0;
+      // 已在 install() 里注册过订阅，这里只验订阅通道存在
+      chk(window.__stateListeners.some(function (l) { return l.channel === 'win:state-changed'; }),
+         '窗口状态订阅已注册（图标随最大化/全屏切换）',
+         'listeners=' + window.__stateListeners.map(function (l) { return l.channel; }).join(','));
+    } else {
+      chk(!bar.querySelector('.ma-tb-btns'), 'mac：不画按钮（用系统红绿灯）', 'btns=' + !!bar.querySelector('.ma-tb-btns'));
+      chk(barCs.paddingLeft === '78px', 'mac：左让位 78px 给红绿灯', 'padding-left=' + barCs.paddingLeft);
+    }
+
+    // 配色跟随主题（用真实 chat.html 令牌值）
+    var bg = rgbTuple(barCs.backgroundColor);
+    var fg = rgbTuple(barCs.color);
+    if (q.theme === 'light') {
+      chk(tupleEq(bg, hex('#ffffff')), '浅色主题标题栏底色跟 --bg', 'bg=' + barCs.backgroundColor + ' 期望 rgb(255,255,255)');
+      chk(tupleEq(fg, hex('#5d6068')), '浅色主题标题栏文字跟 --text2', 'color=' + barCs.color + ' 期望 rgb(93,96,104)');
+    } else if (q.theme === 'dark') {
+      chk(tupleEq(bg, hex('#0e0f12')), '深色主题标题栏底色跟 --bg', 'bg=' + barCs.backgroundColor + ' 期望 rgb(14,15,18)');
+      chk(tupleEq(fg, hex('#a8adba')), '深色主题标题栏文字跟 --text2', 'color=' + barCs.color + ' 期望 rgb(168,173,186)');
+    } else {
+      chk(tupleEq(bg, hex('#0e0f12')), '无令牌页面（login/诊断页）落到 fallback 深色', 'bg=' + barCs.backgroundColor + ' 期望 rgb(14,15,18)');
+    }
+
+    var pre = document.createElement('pre');
+    pre.id = '__result';
+    document.body.appendChild(pre);
+    if (q.shot) { pre.style.display = 'none'; }
+    var render = function () { pre.textContent = 'BEGIN\n' + R.join('\n') + '\nEND'; };
+    render();
+
+    // 异步段：getState().then(applyState) 是微任务，setTimeout + rAF 双保险只记一次
+    var done = false;
+    var finish = function () {
+      if (done) return;
+      done = true;
+      if (q.platform === 'win32') {
+        var bMax2 = bar.querySelector('.ma-tb-max');
+        if (q.state === 'maximized' || q.state === 'fullscreen') {
+          chk(bMax2.getAttribute('aria-label') === '还原' && bMax2.innerHTML.indexOf('polyline') >= 0,
+             '最大化/全屏态：按钮换「还原」图标', 'aria-label=' + bMax2.getAttribute('aria-label') + ' svg=' + (bMax2.innerHTML.indexOf('polyline') >= 0 ? 'restore' : 'max'));
+        } else {
+          chk(bMax2.getAttribute('aria-label') === '最大化' && bMax2.innerHTML.indexOf('polyline') < 0,
+             '普通态：按钮是「最大化」图标', 'aria-label=' + bMax2.getAttribute('aria-label'));
+        }
+        var hidden = document.documentElement.classList.contains('ma-titlebar-hidden');
+        if (q.state === 'fullscreen') {
+          chk(hidden && window.getComputedStyle(bar).display === 'none',
+             '全屏自动隐藏标题栏', 'ma-titlebar-hidden=' + hidden + ' display=' + window.getComputedStyle(bar).display);
+        } else {
+          chk(!hidden && window.getComputedStyle(bar).display !== 'none', '非全屏标题栏可见', 'hidden=' + hidden);
+        }
+      }
+      render();
+    };
+    setTimeout(finish, 150);
+    requestAnimationFrame(finish);
+  });
+
+  window.__finish = function (R) {
+    var pre = document.createElement('pre');
+    pre.id = '__result';
+    pre.textContent = 'BEGIN\n' + R.join('\n') + '\nEND';
+    document.body.appendChild(pre);
+    if (window.__q && window.__q.shot) { pre.style.display = 'none'; }
+  };
+})();
+
+</script>
+</body>
+</html>

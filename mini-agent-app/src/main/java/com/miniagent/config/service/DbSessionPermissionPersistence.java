@@ -2,18 +2,23 @@ package com.miniagent.config.service;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.miniagent.agent.permission.ConfirmPolicy;
+import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.permission.SessionPermissionPersistence;
 import com.miniagent.config.entity.AgentSessionPermission;
 import com.miniagent.config.repository.AgentSessionPermissionRepository;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.Optional;
+import java.time.LocalDateTime;
 import java.util.Set;
 
 @Service
 public class DbSessionPermissionPersistence implements SessionPermissionPersistence {
+
+    private static final int MAX_CREATE_ATTEMPTS = 3;
 
     @Autowired
     private AgentSessionPermissionRepository repository;
@@ -21,30 +26,69 @@ public class DbSessionPermissionPersistence implements SessionPermissionPersiste
     private ObjectMapper objectMapper;
 
     @Override
-    @Transactional(readOnly = true)
-    public Optional<State> load(String sessionId) {
-        return repository.findById(sessionId).map(entity -> new State(
-                entity.getMode(), entity.isPlanApproved(), readSet(entity.getAskGrantsJson()),
-                entity.getConfirmPolicy()));
+    public State loadOrCreate(String sessionId) {
+        for (int attempt = 0; attempt < MAX_CREATE_ATTEMPTS; attempt++) {
+            AgentSessionPermission existing =
+                    repository.findById(sessionId).orElse(null);
+            if (existing != null) {
+                return state(existing);
+            }
+            try {
+                AgentSessionPermission created = new AgentSessionPermission();
+                created.setSessionId(sessionId);
+                created.setMode(PermissionMode.DEFAULT.wireName());
+                created.setPlanApproved(false);
+                created.setAskGrantsJson("[]");
+                created.setConfirmPolicy(
+                        ConfirmPolicy.DANGEROUS.wireName());
+                return state(repository.saveAndFlush(created));
+            } catch (DataIntegrityViolationException e) {
+                AgentSessionPermission concurrent =
+                        repository.findById(sessionId).orElse(null);
+                if (concurrent != null) {
+                    return state(concurrent);
+                }
+                if (attempt == MAX_CREATE_ATTEMPTS - 1) {
+                    throw e;
+                }
+            }
+        }
+        throw new IllegalStateException(
+                "Unable to initialize permissions for session " + sessionId);
     }
 
     @Override
-    @Transactional
-    public void save(String sessionId, State state) {
-        AgentSessionPermission entity = repository.findById(sessionId)
-                .orElseGet(AgentSessionPermission::new);
-        entity.setSessionId(sessionId);
-        entity.setMode(state.mode());
-        entity.setPlanApproved(state.planApproved());
-        entity.setAskGrantsJson(writeSet(state.askGrantedTools()));
-        entity.setConfirmPolicy(state.confirmPolicy());
-        repository.save(entity);
+    public boolean compareAndSet(
+            String sessionId, State expected, State next) {
+        if (next.version() != expected.version() + 1L) {
+            throw new IllegalArgumentException(
+                    "Permission CAS must increment version by one");
+        }
+        return repository.compareAndSet(
+                sessionId,
+                expected.version(),
+                next.mode(),
+                next.planApproved(),
+                writeSet(next.askGrantedTools()),
+                next.confirmPolicy(),
+                next.execPolicyOverride(),
+                LocalDateTime.now()) == 1;
     }
 
     @Override
     @Transactional
     public void delete(String sessionId) {
         repository.deleteById(sessionId);
+    }
+
+    private State state(AgentSessionPermission entity) {
+        return new State(
+                entity.getMode(),
+                entity.isPlanApproved(),
+                readSet(entity.getAskGrantsJson()),
+                entity.getConfirmPolicy(),
+                entity.getExecPolicyOverride(),
+                entity.getVersion());
     }
 
     private Set<String> readSet(String json) {

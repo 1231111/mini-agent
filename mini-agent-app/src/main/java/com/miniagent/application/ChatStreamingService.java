@@ -50,10 +50,13 @@ public class ChatStreamingService {
     /**
      * 重连到正在运行（或刚结束仍在缓冲期）的会话流。
      * 返回已挂载的 emitter；若无活动通道，发 "gone" 让前端回退到数据库加载。
+     *
+     * @param userId 连接归属人。中枢按它登记 emitter，登出时才能精准摘掉该用户的流；
+     *               只按 sessionId 记账的话，退登后长连接会继续收推送。
      */
-    public SseEmitter attachStream(String sessionId) {
+    public SseEmitter attachStream(String sessionId, Long userId) {
         SseEmitter emitter = new SseEmitter(3600_000L);
-        boolean ok = eventCenter.attachClient(sessionId, emitter);
+        boolean ok = eventCenter.attachClient(sessionId, userId, emitter);
         if (!ok) {
             try {
                 emitter.send(SseEmitter.event().name("gone").data(""));
@@ -78,10 +81,10 @@ public class ChatStreamingService {
     }
 
     /** 创建标准 SSE emitter 并挂载到事件中枢。 */
-    public SseEmitter createStream(String sessionId, String initialMessage) {
+    public SseEmitter createStream(String sessionId, String initialMessage, Long userId) {
         SseEmitter emitter = new SseEmitter(sseTimeoutMs);
         eventCenter.start(sessionId, initialMessage);
-        eventCenter.attachClient(sessionId, emitter);
+        eventCenter.attachClient(sessionId, userId, emitter);
         return emitter;
     }
 

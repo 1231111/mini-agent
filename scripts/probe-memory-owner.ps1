@@ -9,7 +9,7 @@ $enc = New-Object System.Text.UTF8Encoding $false
 $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 
 function Refresh-Csrf {
-    $resp = Invoke-WebRequest "$Base/api/auth-status" -WebSession $session -UseBasicParsing -TimeoutSec 20
+    $resp = Invoke-WebRequest "$Base/api/tokens/current" -WebSession $session -UseBasicParsing -TimeoutSec 20
     $token = ($session.Cookies.GetCookies($Base) | Where-Object { $_.Name -eq "XSRF-TOKEN" } | Select-Object -First 1).Value
     if (-not $token) {
         $setCookie = $resp.Headers["Set-Cookie"]
@@ -33,11 +33,11 @@ function Auth-Headers([string]$csrf, [string]$jwt) {
 
 $csrf = Refresh-Csrf
 $loginBody = @{ username = $User; password = $Password } | ConvertTo-Json -Compress
-$reg = Invoke-RestMethod "$Base/api/login" -Method Post -Body $enc.GetBytes($loginBody) `
+$reg = Invoke-RestMethod "$Base/api/tokens" -Method Post -Body $enc.GetBytes($loginBody) `
     -Headers (Auth-Headers $csrf $null) -WebSession $session -TimeoutSec 20
 if (-not $reg.success) { throw "login failed" }
 $jwt = [string]$reg.data.token
-$userId = [string]$reg.data.user.userId
+$userId = [string]$reg.data.userId
 $csrf = Refresh-Csrf
 Write-Host "AUTH userId=$userId"
 
@@ -51,14 +51,14 @@ $body = @{
     confirmPolicy = "auto"
 } | ConvertTo-Json -Compress
 $log = Join-Path $env:TEMP ("probe-" + $sid + ".sse.log")
-Invoke-WebRequest "$Base/chat/stream" -Method Post -Body $enc.GetBytes($body) `
+Invoke-WebRequest "$Base/api/conversations/$sid/messages/stream" -Method Post -Body $enc.GetBytes($body) `
     -Headers (Auth-Headers $csrf $jwt) -WebSession $session -TimeoutSec 180 `
     -OutFile $log -UseBasicParsing | Out-Null
 
 $wait = 0
 while ($wait -lt 40) {
     try {
-        $st = Invoke-RestMethod "$Base/api/task-status?sessionId=$sid" `
+        $st = Invoke-RestMethod "$Base/api/conversations/$sid/task" `
             -Headers (Auth-Headers $csrf $jwt) -WebSession $session -TimeoutSec 10
         if (-not $st.data.running) { break }
     } catch { break }
@@ -66,7 +66,7 @@ while ($wait -lt 40) {
     $wait += 2
 }
 
-$traces = (Invoke-RestMethod "$Base/api/traces?sessionId=$sid" `
+$traces = (Invoke-RestMethod "$Base/api/conversations/$sid/steps" `
     -Headers (Auth-Headers $csrf $jwt) -WebSession $session -TimeoutSec 20).data
 $tools = @()
 $ctx = $null

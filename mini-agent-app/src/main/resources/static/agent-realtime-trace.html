@@ -4,6 +4,14 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>智能体实时动态轨迹图</title>
+    <script>
+        // 页面骨架放行（浏览器导航带不了 Authorization 头），身份判断在这里做。
+        (function () {
+            var tk = '';
+            try { tk = sessionStorage.getItem('ma_token') || ''; } catch (e) { tk = ''; }
+            if (!tk) { window.location.replace('/login'); }
+        })();
+    </script>
     <style>
         :root {
             --bg: #0e0f12;
@@ -719,6 +727,15 @@
             ? ''
             : 'http://localhost:8080';
 
+        // 鉴权只走 Authorization 头。跨域打开时 security.js 的自动注入会跳过（只注入同源请求），
+        // 所以这里显式构造，同源时重复设置同一个值也无害。
+        function authHeaders(extra) {
+            const tk = window.MiniAuth.token();
+            const h = Object.assign({}, extra || {});
+            if (tk) h['Authorization'] = 'Bearer ' + tk;
+            return h;
+        }
+
         // 全局变量
         let currentSession = null;
         let currentExecution = null;
@@ -837,7 +854,7 @@
         // 加载会话列表
         async function loadSessions() {
             try {
-                const resp = await fetch(API_BASE + '/api/conversations', { credentials: 'include' });
+                const resp = await fetch(API_BASE + '/api/conversations', { headers: authHeaders() });
                 if (!resp.ok) return;
                 const list = await resp.json();
                 const sessionList = document.getElementById('sessionList');
@@ -893,7 +910,7 @@
         // 加载执行记录
         async function loadExecutions(sessionId) {
             try {
-                const resp = await fetch(API_BASE + `/api/traces/executions?sessionId=${sessionId}`, { credentials: 'include' });
+                const resp = await fetch(API_BASE + '/api/conversations/' + encodeURIComponent(sessionId) + '/executions', { headers: authHeaders() });
                 if (!resp.ok) return;
                 const execs = await resp.json();
                 
@@ -910,7 +927,7 @@
         // 加载轨迹数据
         async function loadTraceData(executionId) {
             try {
-                const resp = await fetch(API_BASE + `/api/traces?executionId=${executionId}`, { credentials: 'include' });
+                const resp = await fetch(API_BASE + '/api/executions/' + encodeURIComponent(executionId) + '/steps', { headers: authHeaders() });
                 if (!resp.ok) return;
                 const data = await resp.json();
                 
@@ -925,66 +942,81 @@
             }
         }
 
-        // 连接SSE
+        // 连接推送流。EventSource 不支持自定义头，只能把 token 塞查询串（进访问日志、
+        // 留浏览器历史），改成 fetch 读流后鉴权走 Authorization 头，与全站一致。
         function connectSSE(sessionId) {
             // 断开现有连接
-            if (eventSource) {
-                eventSource.close();
-                eventSource = null;
-            }
+            disconnectSSE();
 
             if (!sessionId) {
                 updateConnectionStatus(false);
                 return;
             }
 
-            try {
-                // 获取token
-                let token = '';
-                try { token = sessionStorage.getItem('ma_token') || ''; } catch (_) {}
+            const ctrl = new AbortController();
+            eventSource = ctrl;   // 复用同一个变量承载「可中止的流」，disconnectSSE 按它关流
 
-                // 构建URL
-                const traceUrl = API_BASE + '/api/traces/stream?sessionId=' + encodeURIComponent(sessionId)
-                    + (token ? '&access_token=' + encodeURIComponent(token) : '');
+            (async () => {
+                try {
+                    const resp = await fetch(
+                        API_BASE + '/api/conversations/' + encodeURIComponent(sessionId) + '/traces',
+                        { headers: authHeaders(), signal: ctrl.signal });
+                    if (!resp.ok || !resp.body) {
+                        updateConnectionStatus(false);
+                        isConnected = false;
+                        addLog('系统', '连接SSE失败: HTTP ' + resp.status, 'error');
+                        return;
+                    }
 
-                // 创建EventSource
-                eventSource = new EventSource(traceUrl);
-                isConnected = true;
-                updateConnectionStatus(true);
+                    isConnected = true;
+                    updateConnectionStatus(true);
+                    addLog('系统', 'SSE连接已建立');
+                    addLog('系统', '连接SSE端点: ' + sessionId);
 
-                // 监听trace事件
-                eventSource.addEventListener('trace', ev => {
-                    let data = null;
-                    try { data = JSON.parse(ev.data); } catch (e) { return; }
-                    if (!data || data.sessionId !== currentSession) return;
-                    
-                    // 处理实时数据
-                    handleRealtimeData(data);
-                });
-
-                // 监听错误
-                eventSource.onerror = (e) => {
-                    console.error('SSE连接错误:', e);
-                    addLog('系统', 'SSE连接错误', 'error');
+                    const reader = resp.body.getReader();
+                    const decoder = new TextDecoder('utf-8');
+                    let buf = '';
+                    for (;;) {
+                        const chunk = await reader.read();
+                        if (chunk.done) break;
+                        buf += decoder.decode(chunk.value, { stream: true });
+                        // SSE 帧之间用空行分隔（\n\n 或 \r\n\r\n），一个 chunk 里可能多帧
+                        let m;
+                        while ((m = /\r?\n\r?\n/.exec(buf)) !== null) {
+                            const frame = buf.slice(0, m.index);
+                            buf = buf.slice(m.index + m[0].length);
+                            handleSseFrame(frame);
+                        }
+                    }
+                    // 流自然结束（服务端收流）——不是错误，只更新状态
+                    isConnected = false;
+                    updateConnectionStatus(false);
+                } catch (e) {
+                    if (e && e.name === 'AbortError') return;  // 主动关流
+                    console.error('连接SSE失败:', e);
+                    addLog('系统', '连接SSE失败: ' + e.message, 'error');
                     updateConnectionStatus(false);
                     isConnected = false;
-                };
+                }
+            })();
+        }
 
-                // 监听打开
-                eventSource.onopen = (e) => {
-                    console.log('SSE连接已建立');
-                    addLog('系统', 'SSE连接已建立');
-                    updateConnectionStatus(true);
-                    isConnected = true;
-                };
-
-                addLog('系统', '连接SSE端点: ' + sessionId);
-            } catch (e) {
-                console.error('连接SSE失败:', e);
-                addLog('系统', '连接SSE失败: ' + e.message, 'error');
-                updateConnectionStatus(false);
-                isConnected = false;
+        /** 只处理 event: trace 帧，心跳等忽略 */
+        function handleSseFrame(frame) {
+            let eventName = 'message';
+            const dataLines = [];
+            for (const line of frame.split('\n')) {
+                if (line.startsWith('event:')) {
+                    eventName = line.slice(6).trim();
+                } else if (line.startsWith('data:')) {
+                    dataLines.push(line.slice(5).replace(/^ /, ''));
+                }
             }
+            if (eventName !== 'trace') return;
+            let data = null;
+            try { data = JSON.parse(dataLines.join('\n')); } catch (e) { return; }
+            if (!data || data.sessionId !== currentSession) return;
+            handleRealtimeData(data);
         }
 
         // 处理实时数据
@@ -1085,10 +1117,10 @@
             updateStats();
         }
 
-        // 断开SSE
+        // 断开推送流
         function disconnectSSE() {
             if (eventSource) {
-                eventSource.close();
+                eventSource.abort();
                 eventSource = null;
             }
             isConnected = false;

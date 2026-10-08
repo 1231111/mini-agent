@@ -1,6 +1,7 @@
 package com.miniagent.agent.memory.controller;
 
 import com.miniagent.common.ApiResponse;
+import com.miniagent.web.dto.resp.MemoryIdDTO;
 import com.miniagent.config.entity.UserRole;
 import com.miniagent.config.security.AuthenticatedUser;
 import com.miniagent.config.security.SessionAuthorizationService;
@@ -46,12 +47,12 @@ public class MemoryController {
      * 写入一条记忆。
      */
     @PostMapping("/memories")
-    public ApiResponse<Map<String, Object>> writeMemory(@RequestBody MemoryEntry entry,
-                                                        HttpServletRequest request) {
+    public ApiResponse<MemoryIdDTO> writeMemory(@RequestBody MemoryEntry entry,
+                                                HttpServletRequest request) {
         AuthenticatedUser user = requireUser(request);
         bindMemoryToPrincipal(entry, user);
         memoryManager.writeMemory(entry);
-        return ApiResponse.ok(Map.of("id", entry.getId()));
+        return ApiResponse.ok(new MemoryIdDTO(entry.getId()));
     }
 
     /**

@@ -3,9 +3,18 @@ spring:
   thymeleaf:
     cache: true
   datasource:
-    url: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
-    username: root
-    password: mysql_root_pass
+    # 与 application.yml（默认档）用同一套变量名。这不是风格问题：
+    # ProductionReadinessValidator 断言读的是**环境变量名** DB_URL / DB_USERNAME / DB_PASSWORD，
+    # 而 Spring 的数据源绑定读的是 spring.datasource.*。只有在 yml 里显式写成 ${DB_URL:...}
+    # 时两者才指向同一个值。
+    #
+    # 原先这里把 url / username 写死、只让 password 吃 MYSQL_PASSWORD，于是
+    # compose 里设 SPRING_DATASOURCE_URL 能让数据源连上、断言却照旧报 "DB_URL is required"
+    # —— 一个配置各管一半，看着配好了实际起不来。
+    url: ${DB_URL:jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
+    username: ${DB_USERNAME:root}
+    # MYSQL_PASSWORD 是历史回退名，保留以兼容已部署环境。
+    password: ${DB_PASSWORD:${MYSQL_PASSWORD:}}
   data:
     redis:
       host: redis
@@ -24,14 +33,39 @@ logging:
 
 agent:
   auth:
-    cookie-secret: ${COOKIE_SECRET:}
+    # JWT HS256 签名密钥（旧名 cookie-secret，保留 COOKIE_SECRET 回退）
+    jwt-secret: ${JWT_SECRET:${COOKIE_SECRET:}}
     # JWT 方案：exp 上限 + Redis 滑动超时（生产可酌情缩短 ttl）
     jwt-exp-seconds: 604800
     jwt-ttl-seconds: 1800
-    secure-cookie: true
     registration-enabled: false
-    same-site: Strict
     bcrypt-strength: 12
+    # 必须与 ProductionReadinessValidator 的下限一致（它硬断言 >= 12）。
+    # 原先没写，于是继承 application.yml 的 8 —— prod 档每次启动都撞断言，
+    # 那份配置等于永远起不来。
+    password-min-length: 12
+
+    # 账号与会员由独立服务承担（mini-agent-account，compose 服务名 account:8081）。
+    #
+    # 与 registration-enabled: false 的关系，两句都要读懂才不会误判：
+    #   1. registration-enabled 管的是本服务<b>自己</b>那份落在本地库的注册逻辑
+    #      （MiniAgentChatPageController 里 cloudAccountService.enabled() 为 false 的那条分支）。
+    #      配了 base-url 之后这条分支根本走不到，所以它关着是对的；
+    #   2. "web 端能注册"这件事由账号服务的 registration-enabled 决定，那边是 true。
+    # 也就是说 ProductionReadinessValidator 那条断言一行都不用改 —— 这正是拆服务换来的收益。
+    cloud:
+      base-url: ${ACCOUNT_BASE_URL:http://account:8081}
+      # 云端 agent 与账号服务共用同一个 MySQL 库，账号行就是本机行。
+      # 置 false 会让 ShadowUserService 为每个账号再插一条影子行 —— 同一人两条记录，
+      # 且会员配额写在账号的租户上、agent 读影子行的租户，表现是"买了会员额度不变"。
+      shared-database: true
+      # 服务间密钥。账号服务侧读的是同一个环境变量名（agent.account.internal-key
+      # 在那边也是 ${ACCOUNT_INTERNAL_KEY:}），刻意统一成一个变量名：
+      # 这两处必须完全一致，用两个名字就迟早会出现"改了一个没改另一个"，
+      # 而症状只是会员页 403，看起来像权限 bug 而不是配置漏改。
+      internal-key: ${ACCOUNT_INTERNAL_KEY:}
+      connect-timeout-ms: 3000
+      read-timeout-ms: 10000
   replica:
     mode: redis
   models:
@@ -48,7 +82,9 @@ agent:
     enabled: true
     storage: db
   tools:
-    exec-enabled: false
+    # prod 不允许 allow（ProductionReadinessValidator 会在启动时拒绝）。
+    # 取值：block=禁止 / ask=需会话批准 / allow=免批。
+    exec-policy: ask
     allow-absolute-write: false
     block-private-network: true
     allowed-http-ports: 80,443

@@ -1,6 +1,7 @@
 package com.miniagent.web;
 
 import com.miniagent.common.ApiResponse;
+import com.miniagent.web.dto.resp.RevokedSessionsDTO;
 import com.miniagent.config.security.CurrentUser;
 import com.miniagent.config.service.SystemAdminService;
 import jakarta.validation.Valid;
@@ -20,8 +21,6 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.util.Map;
-
 /** System administrator governance API. SecurityConfig restricts this route to SYSTEM_ADMIN. */
 @RestController
 @RequestMapping(value = "/api/admin", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -29,6 +28,7 @@ public class SystemAdminController {
     @Autowired
     private  SystemAdminService service;
 
+    @Autowired
     private CurrentUser currentUser;
 
 
@@ -75,8 +75,8 @@ public class SystemAdminController {
     }
 
     @PostMapping("/users/{id}/revoke-sessions")
-    public ApiResponse<?> revokeSessions(@PathVariable Long id) {
-        return ApiResponse.ok(Map.of("revoked", service.revokeUserSessions(actor(), id)));
+    public ApiResponse<RevokedSessionsDTO> revokeSessions(@PathVariable Long id) {
+        return ApiResponse.ok(new RevokedSessionsDTO(service.revokeUserSessions(actor(), id)));
     }
 
     @GetMapping("/audit")

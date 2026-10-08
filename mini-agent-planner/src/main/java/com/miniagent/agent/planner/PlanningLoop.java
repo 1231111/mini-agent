@@ -180,6 +180,7 @@ public class PlanningLoop {
                       List<ChatMessage> history,
                       TaskPlan taskPlan,
                       String sessionId,
+                      String fencingToken,
                       String executionId,
                       Consumer<String> progress,
                       AgentStreamSink streamSink) {
@@ -246,19 +247,6 @@ public class PlanningLoop {
             }
             // ===========================================
 
-            if (snap.graph().hasAwaitingConfirm()
-                    && !HumanYield.looksLikeBareContinue(userMessage)) {
-                TaskGraph confirmed = todoProjector.confirmFirst(snap.graph());
-                if (!sameNodeStatuses(confirmed, snap.graph())) {
-                    try {
-                        snap = stateStore.commit(
-                                sessionId, snap.version(), snap.withGraph(confirmed));
-                    } catch (PlannerStateStore.VersionConflictException e) {
-                        metrics.casConflict();
-                        snap = stateStore.get(sessionId).orElse(snap);
-                    }
-                }
-            }
         } else {
             compiled = compileAndValidate(chat, userMessage, taskPlan);
             if (!planValidator.accept(compiled.graph(), taskPlan, compiled.goal())) {
@@ -279,7 +267,7 @@ public class PlanningLoop {
         String lastAnswer = "";
         int rounds = 0;
         while (rounds++ < properties.getMaxOuterRounds()) {
-            if (!sessionLock.renewSessionLock(sessionId)) {
+            if (!sessionLock.renewSessionLock(sessionId, fencingToken)) {
                 log.warn("PlanningLoop 会话锁丢失，中止 session={} code={}",
                         sessionId, ErrorCode.AGENT_PLANNER_LOCK_LOST.getCode());
                 metrics.outerTimeout();

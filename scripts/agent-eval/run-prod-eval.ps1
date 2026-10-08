@@ -215,7 +215,7 @@ foreach ($c in $cases) {
     $httpStatus = "DONE"
     $httpErr = ""
     try {
-        Invoke-WebRequest "$($api.Base)/chat/stream" -Method Post -Body $bodyBytes `
+        Invoke-WebRequest "$($api.Base)/api/conversations/$sessionId/messages/stream" -Method Post -Body $bodyBytes `
             -ContentType "application/json; charset=utf-8" -Headers $api.Headers -WebSession $api.Session `
             -TimeoutSec ([int]$c.timeoutSec) -OutFile $logFile -UseBasicParsing | Out-Null
     } catch {
@@ -227,7 +227,7 @@ foreach ($c in $cases) {
     $waitSec = 0
     while ($waitSec -lt 30) {
         try {
-            $st = Invoke-RestMethod "$($api.Base)/api/task-status?sessionId=$sessionId" `
+            $st = Invoke-RestMethod "$($api.Base)/api/conversations/$sessionId/task" `
                 -Headers $api.Headers -WebSession $api.Session -TimeoutSec 10
             if (-not $st.data.running) { break }
         } catch { break }
@@ -244,7 +244,7 @@ foreach ($c in $cases) {
 
     $traces = $null
     try {
-        $traces = (Invoke-RestMethod "$($api.Base)/api/traces?sessionId=$sessionId" `
+        $traces = (Invoke-RestMethod "$($api.Base)/api/conversations/$sessionId/steps" `
             -Headers $api.Headers -WebSession $api.Session -TimeoutSec 30).data
     } catch { }
 

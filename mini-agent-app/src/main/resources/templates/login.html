@@ -137,6 +137,10 @@
             </div>
             <div class="error-msg" id="loginError"></div>
             <button class="submit-btn" onclick="doLogin()">Login</button>
+            <button type="button" class="submit-btn" id="portalRegister"
+                    style="display:none;background:#212121;border:1px solid rgba(255,255,255,.12);">
+                没有账号？去网页注册
+            </button>
         </div>
         
         <!-- Register Form -->
@@ -147,7 +151,7 @@
             </div>
             <div class="form-group">
                 <label>Password</label>
-                <input type="password" id="regPassword" placeholder="Choose a password">
+                <input type="password" id="regPassword" placeholder="至少 8 位" minlength="8" autocomplete="new-password">
             </div>
             <div class="form-group">
                 <label>Display Name (optional)</label>
@@ -173,7 +177,44 @@
         }
 
         // 进入登录页即视为未登录态：清空可能残留的 token
-        try { sessionStorage.removeItem('ma_token'); } catch (_) {}
+        try { window.MiniAuth.clear(); } catch (_) {}
+
+        // 配了账号门户时，注册不在壳里做。门户地址来自 Electron，不从公开 API 读。
+        (async function hideLocalRegisterWhenPortalConfigured() {
+            const api = window.electronAPI;
+            if (!api || !api.getPortalUrl) {
+                return;
+            }
+            let url = '';
+            try {
+                url = await api.getPortalUrl();
+            } catch (e) {
+                return;
+            }
+            if (!url) {
+                return;
+            }
+            const tabs = document.querySelector('.tabs');
+            if (tabs) {
+                tabs.style.display = 'none';
+            }
+            const reg = document.getElementById('registerForm');
+            if (reg) {
+                reg.remove();
+            }
+            const btn = document.getElementById('portalRegister');
+            btn.style.display = 'block';
+            btn.onclick = async function () {
+                const target = url.replace(/\/+$/, '') + '/login';
+                const opened = await api.openExternal(target);
+                const errEl = document.getElementById('loginError');
+                if (!opened || !opened.ok) {
+                    errEl.textContent = '打不开注册页：'
+                        + ((opened && opened.error) || '未知原因');
+                    errEl.style.display = 'block';
+                }
+            };
+        })();
 
         async function doLogin() {
             const username = document.getElementById('loginUsername').value.trim();
@@ -188,14 +229,15 @@
             }
             
             try {
-                const resp = await fetch('/api/login', {
+                const resp = await fetch('/api/tokens', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ username, password })
                 });
                 const data = await resp.json();
-                if (data.success) {
-                    if (data.token) { try { sessionStorage.setItem('ma_token', data.token); } catch (_) {} }
+                const token = data.data && data.data.token;
+                if (data.success && token) {
+                    window.MiniAuth.setToken(token);
                     window.location.href = '/';
                 } else {
                     errEl.textContent = data.message || 'Login failed';
@@ -207,28 +249,37 @@
             }
         }
 
-        async function doRegister() {
-            const username = document.getElementById('regUsername').value.trim();
-            const password = document.getElementById('regPassword').value;
-            const displayName = document.getElementById('regDisplayName').value.trim();
-            const errEl = document.getElementById('regError');
-            errEl.style.display = 'none';
-            
-            if (!username || !password) {
-                errEl.textContent = 'Please enter username and password';
-                errEl.style.display = 'block';
-                return;
-            }
-            
-            try {
-                const resp = await fetch('/api/register', {
+    const MIN_PASSWORD_LENGTH = 8;   // 与后端 agent.auth.password-min-length 保持一致
+
+    async function doRegister() {
+        const username = document.getElementById('regUsername').value.trim();
+        const password = document.getElementById('regPassword').value;
+        const displayName = document.getElementById('regDisplayName').value.trim();
+        const errEl = document.getElementById('regError');
+        errEl.style.display = 'none';
+
+        if (!username || !password) {
+            errEl.textContent = 'Please enter username and password';
+            errEl.style.display = 'block';
+            return;
+        }
+        // 长度先在本地拦一道，别让用户为了一个自己看不见的规则反复试
+        if (password.length < MIN_PASSWORD_LENGTH) {
+            errEl.textContent = '密码至少 ' + MIN_PASSWORD_LENGTH + ' 位，当前 ' + password.length + ' 位';
+            errEl.style.display = 'block';
+            return;
+        }
+
+        try {
+                const resp = await fetch('/api/users', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ username, password, displayName })
                 });
                 const data = await resp.json();
-                if (data.success) {
-                    if (data.token) { try { sessionStorage.setItem('ma_token', data.token); } catch (_) {} }
+                const token = data.data && data.data.token;
+                if (data.success && token) {
+                    window.MiniAuth.setToken(token);
                     window.location.href = '/';
                 } else {
                     errEl.textContent = data.message || 'Registration failed';

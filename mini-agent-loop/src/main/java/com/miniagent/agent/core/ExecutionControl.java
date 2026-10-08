@@ -46,6 +46,8 @@ public class ExecutionControl {
     }
 
     private final Map<String, Lease> leases = new ConcurrentHashMap<>();
+    /** 子会话查预算、取消时用父会话那一份租约。 */
+    private final Map<String, String> childToParent = new ConcurrentHashMap<>();
     private final long deadlineMillis;
     private final int maxToolCalls;
     private final long maxEstimatedTokens;
@@ -75,6 +77,22 @@ public class ExecutionControl {
         this.maxEstimatedTokens = Math.max(1_000L, props.getMaxEstimatedTokens());
         this.signalStore = Objects.requireNonNullElse(signalStore, Optional.empty());
         this.tenantTokenQuota = Objects.requireNonNullElse(tenantTokenQuota, Optional.empty());
+    }
+
+    /** 子 agent 与父会话共用取消、墙钟、工具次数和 token 预算。 */
+    public void attach(String childSessionId, String parentSessionId) {
+        if (childSessionId == null || childSessionId.isBlank()
+                || parentSessionId == null || parentSessionId.isBlank()) {
+            return;
+        }
+        childToParent.put(key(childSessionId), key(parentSessionId));
+    }
+
+    public void detach(String childSessionId) {
+        if (childSessionId == null || childSessionId.isBlank()) {
+            return;
+        }
+        childToParent.remove(key(childSessionId));
     }
 
     public Lease start(String sessionId) {
@@ -112,14 +130,17 @@ public class ExecutionControl {
     }
 
     public boolean isCancelled(String sessionId) {
+        String resolved = resolve(key(sessionId));
         Lease lease = lease(sessionId);
-        return lease.cancelled.get() || signalStore.map(store -> store.isCancelled(key(sessionId))).orElse(false);
+        return lease.cancelled.get()
+                || signalStore.map(store -> store.isCancelled(resolved)).orElse(false);
     }
 
     public void heartbeat(String sessionId) {
+        String resolved = resolve(key(sessionId));
         long now = System.currentTimeMillis();
         lease(sessionId).heartbeatEpochMillis.set(now);
-        signalStore.ifPresent(store -> store.heartbeat(key(sessionId), now, signalTtlMillis()));
+        signalStore.ifPresent(store -> store.heartbeat(resolved, now, signalTtlMillis()));
     }
     public long heartbeatEpochMillis(String sessionId) { return lease(sessionId).heartbeatEpochMillis.get(); }
 
@@ -157,7 +178,14 @@ public class ExecutionControl {
                 ? StopReason.TOKEN_BUDGET_EXCEEDED : StopReason.NONE;
     }
 
-    private Lease lease(String sessionId) { return leases.computeIfAbsent(key(sessionId), ignored -> fallbackLease()); }
+    private Lease lease(String sessionId) {
+        return leases.computeIfAbsent(resolve(key(sessionId)), ignored -> fallbackLease());
+    }
+
+    private String resolve(String key) {
+        String parent = childToParent.get(key);
+        return parent == null ? key : parent;
+    }
     private Lease fallbackLease() {
         return new Lease(System.currentTimeMillis() + deadlineMillis,
                 maxToolCalls, maxEstimatedTokens, null);

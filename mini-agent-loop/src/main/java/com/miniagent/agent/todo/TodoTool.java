@@ -43,7 +43,7 @@ public class TodoTool {
                         - 默认后一步 depends_on 前一步；可显式设 depends_on:[1,2] 或 depends_on:[]（无依赖/可并行）。
                         - completed 会做存在性 + 可插拔语义校验；依赖未满足或上游 hash 失效会拒绝。
                         - 危险操作确认策略下，上线/删除等步骤会进入 awaiting_confirm，
-                          页面确认或 action=confirm 后才能执行。
+                          只能由用户在页面显式确认后执行。
                         - 缺密钥或须用户提供信息：update status=awaiting_confirm，直接向用户提问。
                         - action=reopen 回滚 completed/blocked，并级联重置下游为 pending。
                         - 工具连败会 blocked；不要编造 completed。
@@ -58,7 +58,7 @@ public class TodoTool {
         Map<String, Object> params = new LinkedHashMap<>();
         params.put("action", Map.of(
                 "type", "string",
-                "description", "操作：set / update / list / clear / reopen / confirm",
+                "description", "操作：set / update / list / clear / reopen",
                 "required", true
         ));
         params.put("items", Map.of(
@@ -168,27 +168,6 @@ public class TodoTool {
                     traceTodo("TASK_REOPEN", sid, "reopen", updated, Map.of("id", id));
                     return out;
                 }
-                case "confirm" -> {
-                    int id = resolveTodoId(sid, coercePositiveInt(args.get("id")));
-                    if (id <= 0) {
-                        return error("confirm 缺少有效 id");
-                    }
-                    String note = (String) args.get("note");
-                    String[] err = new String[1];
-                    var updated = todoStore.confirm(sid, id, Optional.ofNullable(note).orElse("CONFIRM"), err);
-                    if (Objects.isNull(updated)) {
-                        return error(Objects.nonNull(err[0]) ? err[0] : "confirm 失败");
-                    }
-                    String out = MAPPER.writeValueAsString(Map.of(
-                            "success", true,
-                            "action", "confirm",
-                            "todo", todoStore.render(sid),
-                            "stats", todoStore.stats(sid),
-                            "items", updated
-                    ));
-                    traceTodo("TASK_CONFIRM", sid, "confirm", updated, Map.of("id", id));
-                    return out;
-                }
                 case "list" -> {
                     var items = todoStore.get(sid);
                     String out = MAPPER.writeValueAsString(Map.of(
@@ -207,7 +186,9 @@ public class TodoTool {
                     return MAPPER.writeValueAsString(Map.of("success", true, "action", "clear"));
                 }
                 default -> {
-                    return error("未知 action: " + action + "（支持 set/update/list/clear/reopen/confirm）");
+                    return error(
+                            "未知 action: " + action
+                                    + "（支持 set/update/list/clear/reopen）");
                 }
             }
         } catch (Exception e) {
@@ -227,21 +208,28 @@ public class TodoTool {
             }
             var node = MAPPER.readTree(Optional.ofNullable(json).orElse("{}"));
             String action = node.path("action").asText("").trim().toLowerCase();
-            if (!"update".equals(action) && !"reopen".equals(action) && !"confirm".equals(action))
+            if (!"update".equals(action) && !"reopen".equals(action)) {
                 return json;
+            }
             int id = node.path("id").asInt(0);
             int preferred = -1;
-            for (int f : h.focusTodoIds())
+            for (int f : h.focusTodoIds()) {
                 if (hasTodo(sid, f)) {
                     preferred = f;
                     break;
                 }
-            if (preferred < 0)
+            }
+            if (preferred < 0) {
                 preferred = h.focusTodoIds().iterator().next();
-            if (id == preferred || (h.focusTodoIds().contains(id) && hasTodo(sid, id)))
+            }
+            if (id == preferred
+                    || (h.focusTodoIds().contains(id) && hasTodo(sid, id))) {
                 return json;
-            if (!(node instanceof com.fasterxml.jackson.databind.node.ObjectNode obj))
+            }
+            if (!(node instanceof
+                    com.fasterxml.jackson.databind.node.ObjectNode obj)) {
                 return json;
+            }
             obj.put("id", preferred);
             return MAPPER.writeValueAsString(obj);
         } catch (Exception e) {
@@ -257,10 +245,11 @@ public class TodoTool {
             return id;
         }
         var h = com.miniagent.agent.core.LoopTurnContext.current();
-        for (int f : h.focusTodoIds())
+        for (int f : h.focusTodoIds()) {
             if (hasTodo(sid, f)) {
                 return f;
             }
+        }
         TaskTodoStore.SubGoal sg = todoStore.currentSubGoalDetail(sid);
         if (sg != null && sg.id() > 0) {
             return sg.id();
@@ -269,10 +258,11 @@ public class TodoTool {
     }
 
     private boolean hasTodo(String sid, int id) {
-        for (TaskTodoStore.TodoItem it : todoStore.get(sid))
+        for (TaskTodoStore.TodoItem it : todoStore.get(sid)) {
             if (it.id() == id) {
                 return true;
             }
+        }
         return false;
     }
 

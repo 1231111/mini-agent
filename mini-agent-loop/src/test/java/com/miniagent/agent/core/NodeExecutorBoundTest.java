@@ -43,13 +43,14 @@ class NodeExecutorBoundTest {
     }
 
     private static ToolPipeline pipeline(ToolRegistry registry) {
+        SessionPermissionStore store = new SessionPermissionStore();
         return new ToolPipeline(
                 new ExecutionControl(60_000, 20, 10_000),
                 new ToolHookChain(List.of()),
-                new SessionPermissionStore(),
+                store,
                 new InMemoryActionJournal(),
                 new ToolExecutionGuards(registry, new com.miniagent.agent.execution.AgentToolsProperties(4)),
                 registry,
-                true);
+                new com.miniagent.agent.permission.ExecPolicyService("allow", "", store));
     }
 }

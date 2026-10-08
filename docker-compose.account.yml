@@ -1,0 +1,54 @@
+# 云端账号服务：只起 MySQL + mini-agent-account。
+# 注册、登录、套餐、订单都在这个进程里，不包含对话和工具。
+#
+#   docker compose -f docker-compose.account.yml up -d --build
+#
+# 起来之后：
+#   http://<这台机器>:8081/login     注册
+#   http://<这台机器>:8081/account   套餐与订单
+#
+# 桌面端指向同一地址：
+#   CLOUD_AUTH_BASE_URL=http://<这台机器>:8081
+#   MINIAGENT_PORTAL_URL=http://<这台机器>:8081
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-mysql_root_pass}
+      MYSQL_DATABASE: mini_agent
+      MYSQL_CHARACTER_SET_SERVER: utf8mb4
+      MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
+    volumes:
+      - account-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$${MYSQL_ROOT_PASSWORD}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  account:
+    build:
+      context: .
+      args:
+        MODULE: mini-agent-account
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      DB_URL: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
+      DB_USERNAME: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-mysql_root_pass}
+      ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8081/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+volumes:
+  account-mysql-data:

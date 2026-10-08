@@ -8,8 +8,9 @@
 # MiMo API (对话 + 图像生成)
 # MIMO_API_KEY=your_mimo_api_key
 
-# Cookie 签名密钥 (至少 32 字符)
-# COOKIE_SECRET=your_cookie_secret_at_least_32_chars
+# JWT 签名密钥 (至少 32 字符)
+# JWT_SECRET=your_jwt_secret_at_least_32_chars
+# 旧名 COOKIE_SECRET 仍可回退使用
 
 # 第三方 API (可选)
 # CHATANYWHERE_API_KEY=your_chatanywhere_key

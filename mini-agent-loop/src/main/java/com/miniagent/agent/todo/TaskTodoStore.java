@@ -349,13 +349,13 @@ public class TaskTodoStore {
             // 禁止跳过 CONFIRM：关键步不能直接从 pending 改成 in_progress
             if (status == Status.in_progress && it.status() == Status.pending && needsConfirmGate(it)) {
                 if (errorOut != null && errorOut.length > 0) {
-                    errorOut[0] = "关键步骤须先 todo(action=confirm, id=" + id + ")，不能直接 in_progress";
+                    errorOut[0] = "关键步骤须由用户在页面确认，不能直接 in_progress";
                 }
                 return null;
             }
             if (status == Status.in_progress && it.status() == Status.awaiting_confirm) {
                 if (errorOut != null && errorOut.length > 0) {
-                    errorOut[0] = "请使用 todo(action=confirm, id=" + id + ")，不要用 update 绕过确认门禁";
+                    errorOut[0] = "请等待用户在页面确认，不要用 update 绕过确认门禁";
                 }
                 return null;
             }
@@ -490,16 +490,6 @@ public class TaskTodoStore {
             errorOut[0] = "未找到 id=" + id;
         }
         return null;
-    }
-
-    /** 用户在聊天里答复密钥/确认时，放行当前 awaiting_confirm。 */
-    public synchronized boolean confirmAwaiting(String sessionId, String note) {
-        TodoItem it = awaitingConfirmItem(sessionId);
-        if (it == null) {
-            return false;
-        }
-        String[] err = new String[1];
-        return confirm(sessionId, it.id(), note, err) != null;
     }
 
     /**
@@ -1172,7 +1162,7 @@ public class TaskTodoStore {
         sb.append("\n执行原则：\n");
         sb.append("- 只聚焦依赖已满足的当前子目标；depends_on 未完成禁止推进\n");
         if (PermissionContext.confirmPolicy() != ConfirmPolicy.AUTO) {
-            sb.append("- 上线/删除等危险步进入 awaiting_confirm，须页面确认或 todo(action=confirm)\n");
+            sb.append("- 上线/删除等危险步进入 awaiting_confirm，须用户在页面确认\n");
         }
         sb.append("- completed 需存在性 + 可插拔语义校验；上游 hash 变化须先 reopen\n");
         sb.append("- 工具连败 → blocked；可用 todo(action=reopen) 回滚并级联下游\n");

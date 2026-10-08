@@ -64,6 +64,34 @@ public class BrowserService {
             "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"
     };
     private static final String PROXY_BYPASS = "localhost,127.0.0.1,::1";
+
+    /**
+     * Playwright 完整 Chromium 的版本化目录前缀。
+     *
+     * <p>目录名由 playwright-core 的 registry 拼出：{@code name.replace(/-/g, '_') + '-' + revision}
+     * （lib/server/registry/index.js 里构造 {@code dir} 的那一行），所以 chromium → {@code chromium-1148}。
+     */
+    private static final String CHROMIUM_DIR_PREFIX = "chromium-";
+
+    /**
+     * Playwright headless shell 的版本化目录前缀。
+     *
+     * <p>同一套拼接规则下 chromium-headless-shell → {@code chromium_headless_shell-1148}：
+     * 连字符被换成下划线。因此它与 {@link #CHROMIUM_DIR_PREFIX} 不会互相误匹配
+     * ——Playwright 自己的 {@code isBrowserDirectory()} 用的也是这条规则
+     * （{@code baseName.startsWith(browserName.replace(/-/g, '_') + '-')}）。
+     */
+    private static final String HEADLESS_SHELL_DIR_PREFIX = "chromium_headless_shell-";
+
+    /**
+     * 判定「主程序模块是否完整」的体积下限。
+     *
+     * <p>两类包的主模块正常都在百 MB 量级（完整包是 chrome.dll，headless shell 是
+     * headless_shell.exe），残缺或占位文件远小于此。用 10MB 作为保守下限：
+     * 只要存在性检查挡不住「文件在但内容被截断」这种残缺。
+     */
+    private static final long BROWSER_MAIN_MODULE_MIN_BYTES = 10_000_000L;
+
     private static final String EXTRACT_JS = """
             async () => {
               const maxSteps = __MAX__;
@@ -667,21 +695,44 @@ public class BrowserService {
     }
 
     /**
-     * 自动检测并安装 Chromium
-     * 调用 Playwright CLI 的 install 功能，等效于 mvn exec:java -Dexec.args="install chromium"
+     * 自动检测并安装「当前 headless 配置真正会用到的那个」Chromium 包。
+     * 走 Playwright CLI 的 install 功能，等效于 mvn exec:java -Dexec.args="install chromium"。
+     *
+     * <p><b>为什么必须区分两个包。</b>Playwright 1.49 起把 Chromium 拆成
+     * {@code chromium} 与 {@code chromium-headless-shell} 两个独立的下载物，用哪个完全由
+     * headless 选项决定 —— playwright-core 的 lib/server/chromium/chromium.js 里就一行：
+     * <pre>
+     *   getExecutableName(options) {
+     *     if (options.channel) return options.channel;
+     *     return options.headless ? 'chromium-headless-shell' : 'chromium';
+     *   }
+     * </pre>
+     * 本类只设了 headless、没设 channel，于是：
+     * <ul>
+     *   <li>{@code agent.browser.headless=true}（桌面档与 prod 档都写死 true，
+     *       且 ProductionReadinessValidator 在 prod 下会拒绝 false）→ 用 chromium-headless-shell；</li>
+     *   <li>{@code agent.browser.headless=false} → 用完整的 chromium。</li>
+     * </ul>
+     *
+     * <p><b>照旧只认 {@code chromium-} 会出事。</b>出厂安装包默认只随包分发 headless shell
+     * （完整包 314MB，headless 下永远不会被加载，构建脚本用 {@code --only-shell} 跳过），
+     * 此时 {@code chromium-<rev>} 目录本就不存在。若仍按完整包去找，会把
+     * 「headless shell 明明在位」误判成「未安装」，接着在离线客户机上打出一串误导性的
+     * 下载失败——而真正的浏览器工具其实完全可用。
      */
     private void ensureChromiumInstalled() {
         Path browsersRoot = resolveBrowsersRoot();
+        String dirPrefix = headless ? HEADLESS_SHELL_DIR_PREFIX : CHROMIUM_DIR_PREFIX;
 
-        // 检查是否有 chromium 目录（版本号因 Playwright 版本而异）
-        // 注意：仅判断目录存在不够——残缺安装（chrome.exe 在但 chrome.dll 缺失）会导致
-        // 启动时报 "Failed to load Chrome DLL ... 0x7E"。必须校验关键文件完整。
+        // 目录版本号因 Playwright 版本而异，所以按前缀扫。
+        // 注意：仅判断目录存在不够——残缺安装（完整包表现为 chrome.exe 在但 chrome.dll
+        // 缺失或截断）会导致启动时报 "Failed to load Chrome DLL ... 0x7E"。必须校验关键文件。
         boolean installed = false;
         if (Files.exists(browsersRoot)) {
             try (var stream = Files.list(browsersRoot)) {
                 installed = stream.anyMatch(p -> {
                     String n = p.getFileName().toString();
-                    return n.startsWith("chromium-") && isChromiumDirValid(p);
+                    return n.startsWith(dirPrefix) && isBrowserDirValid(p, headless);
                 });
             } catch (IOException e) {
                 // ignore
@@ -689,47 +740,116 @@ public class BrowserService {
         }
 
         if (installed) {
-            log.debug("Chromium 已安装且完整（目录 {}）", browsersRoot);
+            log.debug("浏览器已就绪（{}，目录 {}）",
+                    headless ? "chromium-headless-shell" : "chromium", browsersRoot);
             return;
         }
 
-        log.info("Chromium 未安装或安装残缺（缺 chrome.dll 等核心文件），开始重新下载（约 150MB，请耐心等待）...");
+        // 路径由外部指定（系统属性 / PLAYWRIGHT_BROWSERS_PATH）说明浏览器是随应用分发的，
+        // 这里找不到就是安装包不完整。此时再去联网下载等于把"包坏了"伪装成"首次启动慢"，
+        // 而离线客户机上那条路必然失败，用户最终看到的仍然是一句读不懂的启动错误。
+        // 直接说清原因，比偷偷下一次上百 MB 有用。
+        if (isBrowsersRootExternallyProvided()) {
+            log.error("""
+                    ═══════════════════════════════════════════
+                    随包分发的浏览器不可用：{}
+                    缺少 {} 目录 —— {}
+                    应用安装包不完整，或该目录被清理过。
+                    浏览器类工具将不可用，其余功能不受影响。
+                    修复方式：重新安装 MiniAgent。
+                    ═══════════════════════════════════════════
+                    """, browsersRoot, dirPrefix,
+                    headless
+                            ? "headless 模式所需的 headless shell"
+                            : "有头模式所需的完整 Chromium；本安装包默认只含 headless shell，"
+                                    + "把 agent.browser.headless 设回 true 即可恢复浏览器工具");
+            return;
+        }
+
+        log.info("{} 未安装或安装残缺，开始重新下载，请耐心等待 ...",
+                headless ? "Chromium headless shell" : "Chromium");
 
         tryInstallViaCommand();
     }
 
     /**
-     * 校验一个 chromium-* 目录是否是完整可用的安装。
-     * 残缺安装的典型特征：chrome.exe（启动壳，约 2-3MB）在，但 chrome.dll（主程序模块，
-     * 正常 100MB+）缺失或过小，启动时报 "Failed to load Chrome DLL ... 0x7E"。
-     * 这里只校验 Windows 的关键文件；非 Windows 平台保持宽松（只要目录在即认为有效，
-     * 交给 Playwright 自身处理）。
+     * 校验一个浏览器目录是否完整可用。
+     *
+     * <p><b>两类包的核心文件完全不同，不能共用一套判定。</b>文件名取自 playwright-core 的
+     * lib/server/registry/index.js 里 {@code EXECUTABLE_PATHS}：
+     * <table border="1">
+     *   <caption>两类包的布局差异</caption>
+     *   <tr><th>包</th><th>启动文件</th><th>主程序模块</th></tr>
+     *   <tr><td>chromium</td><td>{@code chrome-win/chrome.exe}（约 3MB）</td>
+     *       <td>{@code chrome-win/chrome.dll}（约 240MB）</td></tr>
+     *   <tr><td>chromium-headless-shell</td>
+     *       <td colspan="2">{@code chrome-win/headless_shell.exe}（约 170MB）
+     *           ——它既是启动文件也是主模块，<b>既没有 chrome.exe 也没有 chrome.dll</b></td></tr>
+     * </table>
+     * 所以「启动壳在、主模块缺失」这个残缺特征只对完整包成立；对 headless shell 而言
+     * 可执行文件本身就是主模块，按大小卡一道就够。
+     *
+     * <p>非 Windows 上刻意保持宽松（只挡住空目录）：可执行文件的命名与目录层级在不同
+     * Playwright 版本、不同发行版之间并不一致，校验写得太具体会把本来可用的安装误判成残缺，
+     * 代价是一次上百 MB 的重复下载 —— 比"漏掉一次残缺检测"严重得多。
+     *
+     * @param headlessShell 该目录是 chromium-headless-shell（true）还是完整 chromium（false）
      */
-    private static boolean isChromiumDirValid(Path chromiumDir) {
+    private static boolean isBrowserDirValid(Path dir, boolean headlessShell) {
         if (!isWindows()) {
-            return true; // 非 Windows：可执行文件命名/结构不同，不在此校验
-        }
-        Path chromeWin = chromiumDir.resolve("chrome-win");
-        Path exe = chromeWin.resolve("chrome.exe");
-        Path dll = chromeWin.resolve("chrome.dll");
-        try {
-            if (!Files.isRegularFile(exe) || !Files.isRegularFile(dll)) {
+            try (var s = Files.list(dir)) {
+                return s.findAny().isPresent();
+            } catch (IOException e) {
                 return false;
             }
-            // chrome.dll 正常上百 MB，残缺/占位文件远小于此。用 10MB 作为保守下限。
-            return Files.size(dll) > 10_000_000L;
+        }
+
+        Path chromeWin = dir.resolve("chrome-win");
+        Path main = headlessShell
+                ? chromeWin.resolve("headless_shell.exe")
+                : chromeWin.resolve("chrome.dll");
+
+        try {
+            // 完整包多一个启动壳；headless shell 没有这一层，它的 exe 就是 main。
+            if (!headlessShell && !Files.isRegularFile(chromeWin.resolve("chrome.exe"))) {
+                return false;
+            }
+            if (!Files.isRegularFile(main)) {
+                return false;
+            }
+            return Files.size(main) > BROWSER_MAIN_MODULE_MIN_BYTES;
         } catch (IOException e) {
             return false;
         }
     }
 
     /**
-     * Playwright 默认浏览器根目录：Windows 为 {@code %LOCALAPPDATA%\ms-playwright}，Linux/mac 常为 {@code ~/.cache/ms-playwright}。
+     * 解析 Playwright 的浏览器根目录。
+     *
+     * <p><b>为什么顺序是这样。</b>这个路径必须和 Playwright 自己找浏览器的路径一致 ——
+     * 不一致的后果不是"多下一份"，而是"文件明明在却报 Executable doesn't exist"，
+     * 而且从日志上看不出是哪边算错了。所以：
+     * <ol>
+     *   <li>{@code playwright.browsers.path} 系统属性 —— 显式传给本 JVM 的，优先级最高，
+     *       便于排障时临时指到别处；</li>
+     *   <li>{@code PLAYWRIGHT_BROWSERS_PATH} 环境变量 —— <b>这是 Playwright 官方认的变量</b>，
+     *       桌面壳就是靠它把后端指到随包目录（resources/browsers）；</li>
+     *   <li>各平台的默认缓存目录 —— 开发态不走前两条，落到这里。</li>
+     * </ol>
+     *
+     * <p><b>macOS 的默认目录不是 {@code ~/.cache}。</b>Playwright 在 darwin 上用的是
+     * {@code ~/Library/Caches/ms-playwright}。照搬 Linux 的约定会让两份逻辑指向不同位置：
+     * 我们去 {@code ~/.cache} 找、Playwright 去 {@code ~/Library/Caches} 找，
+     * 于是每次启动都判成"未安装"并触发一次 150MB 的重复下载。
      */
     private static Path resolveBrowsersRoot() {
         String override = System.getProperty("playwright.browsers.path");
         if (StringUtils.isNotBlank(override)) {
             return Paths.get(override);
+        }
+        String fromEnv = envBrowsersPath();
+        if (Objects.nonNull(fromEnv)) {
+            return Paths.get(fromEnv);
         }
         String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
         if (os.contains("win")) {
@@ -737,8 +857,30 @@ public class BrowserService {
             if (StringUtils.isNotBlank(local)) {
                 return Paths.get(local, "ms-playwright");
             }
+        } else if (os.contains("mac") || os.contains("darwin")) {
+            return Paths.get(System.getProperty("user.home"), "Library", "Caches", "ms-playwright");
         }
         return Paths.get(System.getProperty("user.home"), ".cache", "ms-playwright");
+    }
+
+    /**
+     * 读 {@code PLAYWRIGHT_BROWSERS_PATH} 环境变量，返回 null 表示"没设或不适用"。
+     *
+     * <p>{@code 0} 是 Playwright 的保留值，语义是"浏览器就装在当前 npm 包的 node_modules 里"，
+     * 它不是路径。当成路径用会得到工作目录下一个名叫 {@code 0} 的目录。
+     */
+    private static String envBrowsersPath() {
+        String v = System.getenv("PLAYWRIGHT_BROWSERS_PATH");
+        if (StringUtils.isBlank(v) || "0".equals(v.trim())) {
+            return null;
+        }
+        return v.trim();
+    }
+
+    /** 浏览器根目录是否由外部指定（系统属性或环境变量），而非平台默认位置。 */
+    private static boolean isBrowsersRootExternallyProvided() {
+        return StringUtils.isNotBlank(System.getProperty("playwright.browsers.path"))
+                || Objects.nonNull(envBrowsersPath());
     }
 
     private static boolean isWindows() {
@@ -761,33 +903,45 @@ public class BrowserService {
             return;
         }
 
+        // 手动指引里也要带上 --only-shell，否则用户照着敲会把 314MB 的完整包又装回来 ——
+        // 那正是本次安装要避免的东西。
+        String onlyShell = headless ? " --only-shell" : "";
         log.error("""
                 ═══════════════════════════════════════════
-                Chromium 自动安装失败。请在本机手动执行（二选一）：
+                浏览器自动安装失败。请在本机手动执行（二选一）：
 
                   1) 使用当前 JDK（推荐，注意 -cp 不要写成 -jar）：
-                     "%JAVA_HOME%\\bin\\java.exe" -cp "<playwright.jar路径>" com.microsoft.playwright.CLI install chromium
+                     "%JAVA_HOME%\\bin\\java.exe" -cp "<playwright.jar路径>" com.microsoft.playwright.CLI install chromium{}
 
-                  2) 已安装 Node 时：npx playwright install chromium
+                  2) 已安装 Node 时：npx playwright install chromium{}
 
                 下载慢或超时时可设置环境变量 PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=600000（毫秒）后重试。
                 安装完成后重启应用。
                 ═══════════════════════════════════════════
-                """);
+                """, onlyShell, onlyShell);
     }
 
+    /**
+     * install 命令的补充参数。
+     *
+     * <p>headless 时补 {@code --only-shell}：只下 headless shell（约 190MB），跳过 headless
+     * 模式下永远不会被加载的完整包（约 314MB）。理由见 {@link #ensureChromiumInstalled()}。
+     * 对出厂形态这不算"顺手省流量"式的优化 —— 装进去的是一份必然不被读取的 314MB。
+     *
+     * <p>注意 {@code --only-shell} 是 Playwright 1.49 才有的选项（本类用的就是 1.49.0）。
+     * 升级 Playwright 时若该选项被改名，这里会退化成"命令报错→走下一个兜底"，不会静默装错包。
+     */
+    private List<String> installArgsForCurrentMode() {
+        return headless ? List.of("--only-shell") : List.of();
+    }
+
+    /**
+     * 委托给 {@link com.miniagent.agent.tool.HostCommand#onPath(String)}。
+     * 这里曾有一份自己的实现；现在 RenderDiagramTool 也要做同样的探测，
+     * 两份拷贝就是两次漂移的机会，统一到一处。
+     */
     private static boolean commandOnPath(String name) {
-        try {
-            ProcessBuilder pb = isWindows()
-                    ? new ProcessBuilder("where", name)
-                    : new ProcessBuilder("which", name);
-            pb.redirectErrorStream(true);
-            Process p = pb.start();
-            boolean done = p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS);
-            return done && p.exitValue() == 0;
-        } catch (Exception e) {
-            return false;
-        }
+        return com.miniagent.agent.tool.HostCommand.onPath(name);
     }
 
     /** 使用 java -cp playwright.jar com.microsoft.playwright.CLI install chromium */
@@ -801,7 +955,8 @@ public class BrowserService {
 
             String javaExe = resolveJavaExecutable();
             log.info("找到 playwright jar: {}", playwrightJar);
-            log.info("正在通过 CLI 安装 Chromium（约 150MB，弱网请耐心等待或增大 PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT）...");
+            log.info("正在通过 CLI 安装浏览器（{}），弱网请耐心等待或增大 PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT ...",
+                    headless ? "headless shell" : "完整 Chromium");
 
             List<String> cmd = new ArrayList<>();
             cmd.add(javaExe);
@@ -810,6 +965,7 @@ public class BrowserService {
             cmd.add("com.microsoft.playwright.CLI");
             cmd.add("install");
             cmd.add("chromium");
+            cmd.addAll(installArgsForCurrentMode());
 
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
@@ -886,15 +1042,22 @@ public class BrowserService {
     /** 方式2：npx playwright install chromium */
     private boolean tryInstallViaNpx() {
         try {
-            log.info("通过 npx 安装 Chromium...");
-            ProcessBuilder pb = new ProcessBuilder("npx", "playwright", "install", "chromium");
-            pb.redirectErrorStream(true);
-            Process p = pb.start();
+            log.info("通过 npx 安装浏览器（{}）...", headless ? "headless shell" : "完整 Chromium");
 
+            List<String> cmd = new ArrayList<>(List.of("npx", "playwright", "install", "chromium"));
+            cmd.addAll(installArgsForCurrentMode());
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.redirectErrorStream(true);
+
+            // env 必须在 start() 之前设好：ProcessBuilder.start() 那一刻就把环境快照给了子进程，
+            // start() 之后再改 pb.environment() 不会传下去（这里原先是 start() 在前、设环境在后，
+            // 那句超时等于没写）。
             Map<String, String> env = pb.environment();
             if (Objects.isNull(env.get("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT"))) {
                 env.put("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT", "600000");
             }
+
+            Process p = pb.start();
 
             try (var in = p.getInputStream()) {
                 byte[] buf = new byte[4096];
@@ -913,7 +1076,7 @@ public class BrowserService {
 
             boolean done = p.waitFor(600, java.util.concurrent.TimeUnit.SECONDS);
             if (done && p.exitValue() == 0) {
-                log.info("Chromium 安装成功 (npx)");
+                log.info("浏览器安装成功 (npx)");
                 return true;
             }
         } catch (Exception e) {
@@ -925,11 +1088,11 @@ public class BrowserService {
     /** 方式3：mvn exec:java（需本机 PATH 中有 mvn） */
     private boolean tryInstallViaMaven() {
         try {
-            log.info("通过 mvn 安装 Chromium...");
+            log.info("通过 mvn 安装浏览器（{}）...", headless ? "headless shell" : "完整 Chromium");
             ProcessBuilder pb = new ProcessBuilder("mvn", "-q", "exec:java",
                     "-Dexec.mainClass=com.microsoft.playwright.CLI",
                     "-Dexec.classpathScope=compile",
-                    "-Dexec.args=install chromium");
+                    "-Dexec.args=install chromium" + (headless ? " --only-shell" : ""));
             pb.redirectErrorStream(true);
             pb.directory(new java.io.File(System.getProperty("user.dir")));
             Map<String, String> env = pb.environment();

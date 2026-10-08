@@ -3,7 +3,7 @@ services:
     image: mysql:8.0
     container_name: miniagent-mysql
     environment:
-      MYSQL_ROOT_PASSWORD: mysql_root_pass
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-mysql_root_pass}
       MYSQL_DATABASE: mini_agent
       MYSQL_CHARACTER_SET_SERVER: utf8mb4
       MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
@@ -12,7 +12,11 @@ services:
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pmysql_root_pass"]
+      # 密码必须与上面 MYSQL_ROOT_PASSWORD 同源。写死 "-pmysql_root_pass" 的话，
+      # 一旦有人用 MYSQL_ROOT_PASSWORD 覆盖了root 密码，健康检查用的还是旧密码 ——
+      # mysqladmin ping 认证失败 → 容器永远不 healthy → app 永远卡在 depends_on 上，
+      # 而日志里只会看到 mysql 反复 unhealthy，看不出是密码对不上。
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$${MYSQL_ROOT_PASSWORD}\""]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -22,11 +26,16 @@ services:
     container_name: miniagent-redis
     ports:
       - "6379:6379"
-    command: ["redis-server", "--appendonly", "yes"]
+    # 生产档的 ProductionReadinessValidator 硬断言 REDIS_PASSWORD 非空。
+    # 光在 app 侧设那个变量是自欺欺人 —— Redis 自己不校验，密码就只是一行摆设。
+    # 所以这里让 Redis 真的要求认证，密码与 app 侧同源（同一个变量名 + 同一个默认值）。
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-miniagent_redis_pass}"]
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # 带密码后 ping 也必须认证，否则健康检查永远失败、app 永远等不到 redis healthy。
+      # --no-auth-warning 只是为了不让 "Using a password with -a" 刷满日志。
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD:-miniagent_redis_pass}", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -133,8 +142,33 @@ services:
     environment:
       SPRING_PROFILES_ACTIVE: prod
       MINI_AGENT_HOME: /app/data
+
+      # ═══ 生产档断言要求显式提供的变量 ═══
+      #
+      # ProductionReadinessValidator（@Profile("prod")）在启动时硬断言这些**环境变量名**非空，
+      # 缺一个就是 "Production readiness validation failed: DB_URL is required; ..." 直接起不来。
+      #
+      # 前三项由 application-prod.yml 里的 ${DB_URL:...} 接住，同时也喂给数据源；
+      # 后五项只有断言在读。命名上必须用这里的名字，不能拿 SPRING_DATASOURCE_* 代替。
+      DB_URL: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
+      DB_USERNAME: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-mysql_root_pass}
+      # 与上面 redis 服务的 --requirepass 同源，两边不一致时会连不上 Redis。
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-miniagent_redis_pass}
+      # 每一项都必须是精确的 HTTPS origin（不能带 path / query / 凭据）。
+      # 默认 https://localhost 只为让本地自测能通过；生产必须覆盖成真实域名。
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://localhost}
+      # 32 字节 Base64。生成：openssl rand -base64 32
+      # 刻意不给默认值：默认值一旦进仓库，所有部署共用同一把密钥 —— 等于出厂即泄密。
+      # 宁可缺失时启动失败，也不要静默用一个"看起来正常"的弱密钥。
+      MODEL_CONFIG_ENCRYPTION_KEY: ${MODEL_CONFIG_ENCRYPTION_KEY:-}
+      # HS256 签名密钥，至少 32 字节。生成：openssl rand -base64 48
+      JWT_SECRET: ${JWT_SECRET:-}
+      # 对话模型凭据。断言会拦住缺失的情况 —— 否则进程起来了却无法对话，
+      # 那种故障要查很久才发现只是少配了一个 key。
+      LLM_API_KEY: ${LLM_API_KEY:-}
+
       SPRING_DATA_REDIS_HOST: redis
-      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
       AGENT_REPLICA_MODE: redis
       AGENT_MEMORY_VECTOR_BACKEND: milvus
       AGENT_MEMORY_VECTOR_MILVUS_URI: http://milvus:19530
@@ -142,6 +176,14 @@ services:
       AGENT_CODEBASE_EMBEDDING_MODEL: Yuan-embedding-2.0-zh
       AGENT_CODEBASE_EMBEDDING_API_KEY: local
       AGENT_MEMORY_VECTOR_MILVUS_DIMENSION: "1792"
+      # 账号与会员服务的地址。application-prod.yml 里的默认值就是
+      # http://account:8081，这里显式写出来是为了让 "app 依赖 account"
+      # 这件事在 compose 里看得见，而不是藏在 yml 的默认值里。
+      ACCOUNT_BASE_URL: http://account:8081
+      # 与 account 服务必须同值。两边读的是同一个环境变量名，
+      # 就是为了不出现"改了一个忘了另一个"——那种情况的症状只是会员页 403，
+      # 看起来像权限 bug，排查方向一开始就错了。
+      ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:-}
     volumes:
       - app-data:/app/data
     healthcheck:
@@ -150,6 +192,53 @@ services:
       timeout: 5s
       retries: 5
       start_period: 90s
+
+  # 账号与会员服务：登录、注册、会员等级、充值。
+  #
+  # 它和 app 是同一个 MySQL 库，但只碰 tenants / users / membership_* 这五张表。
+  # 拆出来的收益是客户端（桌面壳的本地后端）只需要连这个"只做账号"的轻量服务，
+  # 不必去连一个完整的 agent 实例 —— 后者会顺带把对话、工具执行等能力暴露出来。
+  account:
+    build:
+      context: .
+      args:
+        MODULE: mini-agent-account
+    container_name: miniagent-account
+    depends_on:
+      mysql:
+        condition: service_healthy
+      # ═══ 顺序是有要求的：agent 先、account 后 ═══
+      #
+      # account 的 V1__account_baseline.sql 用 CREATE TABLE IF NOT EXISTS 建
+      # tenants / users，而 agent 的 V2 是裸的 CREATE TABLE。两者同一个库：
+      #   agent 先   → V1..V8 建出全部业务表，account 那两条全部跳过 ✓
+      #   account 先 → agent 的 V2 撞 "table already exists"，agent 直接起不来 ✗
+      #
+      # 那条 CREATE TABLE 不能改成 IF NOT EXISTS —— 会改变已执行库的 checksum，
+      # Flyway 会报校验失败。所以顺序只能由这里表达，不是哪个先都行。
+      #
+      # 代价是 account 要等 app 的 healthcheck（start_period 90s）通过才启动，
+      # 所以 docker compose up 之后约两分钟内登录会报 AUTH.03.01（账号服务不可达）。
+      # 这是预期行为，不是故障。
+      app:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      DB_URL: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
+      DB_USERNAME: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-mysql_root_pass}
+      # 不设这一项时服务照常起，登录注册也照常可用，只有会员接口返回 503
+      # （启动日志里有一条 WARN）。这是刻意的：放行等于把一个忘了配密钥的部署
+      # 变成"所有人的会员与订单数据对任何能访问到该端口的人可见"。
+      ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8081/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
 
 volumes:
   mysql-data:

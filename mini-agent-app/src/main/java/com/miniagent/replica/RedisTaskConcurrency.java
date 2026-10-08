@@ -9,7 +9,6 @@ import org.springframework.stereotype.Component;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -25,14 +24,30 @@ public class RedisTaskConcurrency {
     private ReplicaProperties properties;
     /** 本 JVM 持有的 session → lockToken */
     private final ConcurrentHashMap<String, String> heldSessionTokens = new ConcurrentHashMap<>();
+    /** 本 JVM 持有的 session → 用户配额租约。 */
+    private final ConcurrentHashMap<String, HeldLease> heldSessionLeases =
+            new ConcurrentHashMap<>();
+
+    private record HeldLease(String fencingToken, long userId) {
+    }
 
     private static final DefaultRedisScript<Long> OCCUPY_USER_QUOTA = new DefaultRedisScript<>(
             """
-            local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
-            local max = tonumber(ARGV[1])
-            if cur >= max then return 0 end
-            redis.call('INCR', KEYS[1])
-            redis.call('EXPIRE', KEYS[1], ARGV[2])
+            redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+            if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then
+              return 0
+            end
+            redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
+            redis.call('EXPIRE', KEYS[1], ARGV[5])
+            return 1
+            """, Long.class);
+
+    private static final DefaultRedisScript<Long> RELEASE_USER_QUOTA = new DefaultRedisScript<>(
+            """
+            redis.call('ZREM', KEYS[1], ARGV[1])
+            if redis.call('ZCARD', KEYS[1]) == 0 then
+              redis.call('DEL', KEYS[1])
+            end
             return 1
             """, Long.class);
 
@@ -52,64 +67,114 @@ public class RedisTaskConcurrency {
             return 0
             """, Long.class);
 
-    public boolean tryOccupyUserQuota(long userId, int maxPerUser) {
-        Long ok = redis.execute(OCCUPY_USER_QUOTA,
-                List.of(ReplicaLockKeys.userRunningKey(userId)),
-                String.valueOf(maxPerUser),
-                String.valueOf(properties.getRunLockTtlSeconds()));
-        return ok != null && ok == 1L;
-    }
+    private static final DefaultRedisScript<Long> RENEW_LEASES_IF_OWNER =
+            new DefaultRedisScript<>(
+                    """
+                    if redis.call('GET', KEYS[1]) == ARGV[1] then
+                      redis.call('EXPIRE', KEYS[1], ARGV[2])
+                      redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
+                      redis.call('EXPIRE', KEYS[2], ARGV[2])
+                      return 1
+                    end
+                    return 0
+                    """, Long.class);
 
-    public void releaseUserQuota(long userId) {
-        String key = ReplicaLockKeys.userRunningKey(userId);
-        Long value = redis.opsForValue().decrement(key);
-        if (value != null && value <= 0)
-            redis.delete(key);
-    }
-
-    public boolean tryLockSession(String sessionId) {
-        if (sessionId == null || sessionId.isBlank()) {
+    public boolean tryOccupyUserQuota(
+            long userId, String sessionId, String fencingToken, int maxPerUser) {
+        if (sessionId == null || sessionId.isBlank()
+                || fencingToken == null || fencingToken.isBlank()
+                || !fencingToken.equals(heldSessionTokens.get(sessionId))) {
             return false;
         }
-        String token = UUID.randomUUID().toString().replace("-", "");
+        long ttlSeconds = properties.getRunLockTtlSeconds();
+        long now = System.currentTimeMillis();
+        Long ok = redis.execute(OCCUPY_USER_QUOTA,
+                List.of(ReplicaLockKeys.userRunningKey(userId)),
+                String.valueOf(now),
+                String.valueOf(now + Duration.ofSeconds(ttlSeconds).toMillis()),
+                String.valueOf(maxPerUser),
+                fencingToken,
+                String.valueOf(ttlSeconds));
+        if (ok != null && ok == 1L) {
+            heldSessionLeases.put(sessionId, new HeldLease(fencingToken, userId));
+            return true;
+        }
+        return false;
+    }
+
+    public void releaseUserQuota(
+            long userId, String sessionId, String fencingToken) {
+        if (sessionId == null || sessionId.isBlank()
+                || fencingToken == null || fencingToken.isBlank()) {
+            return;
+        }
+        heldSessionLeases.remove(sessionId, new HeldLease(fencingToken, userId));
+        redis.execute(RELEASE_USER_QUOTA,
+                List.of(ReplicaLockKeys.userRunningKey(userId)),
+                fencingToken);
+    }
+
+    public boolean tryLockSession(String sessionId, String fencingToken) {
+        if (sessionId == null || sessionId.isBlank()
+                || fencingToken == null || fencingToken.isBlank()) {
+            return false;
+        }
         Boolean ok = redis.opsForValue().setIfAbsent(
                 ReplicaLockKeys.sessionRunKey(sessionId),
-                token,
+                fencingToken,
                 Duration.ofSeconds(properties.getRunLockTtlSeconds()));
         if (Boolean.TRUE.equals(ok)) {
-            heldSessionTokens.put(sessionId, token);
+            heldSessionTokens.put(sessionId, fencingToken);
             return true;
         }
         return false;
     }
 
     /** 仅当本 JVM 仍持有该锁时续期；丢失则 false（应中止 Planner）。 */
-    public boolean renewSessionLock(String sessionId) {
-        if (sessionId == null) {
+    public boolean renewSessionLock(String sessionId, String fencingToken) {
+        if (sessionId == null || fencingToken == null || fencingToken.isBlank()) {
             return false;
         }
         String token = heldSessionTokens.get(sessionId);
-        if (token == null) {
+        if (!fencingToken.equals(token)) {
             return false;
+        }
+        long ttlSeconds = properties.getRunLockTtlSeconds();
+        HeldLease lease = heldSessionLeases.get(sessionId);
+        if (lease != null && token.equals(lease.fencingToken())) {
+            long expiresAt = System.currentTimeMillis()
+                    + Duration.ofSeconds(ttlSeconds).toMillis();
+            Long ok = redis.execute(RENEW_LEASES_IF_OWNER,
+                    List.of(
+                            ReplicaLockKeys.sessionRunKey(sessionId),
+                            ReplicaLockKeys.userRunningKey(lease.userId())),
+                    token,
+                    String.valueOf(ttlSeconds),
+                    String.valueOf(expiresAt),
+                    fencingToken);
+            return ok != null && ok == 1L;
         }
         Long ok = redis.execute(RENEW_IF_OWNER,
                 List.of(ReplicaLockKeys.sessionRunKey(sessionId)),
                 token,
-                String.valueOf(properties.getRunLockTtlSeconds()));
+                String.valueOf(ttlSeconds));
         return ok != null && ok == 1L;
     }
 
-    public void unlockSession(String sessionId) {
-        if (sessionId == null) {
+    public void unlockSession(String sessionId, String fencingToken) {
+        if (sessionId == null || fencingToken == null || fencingToken.isBlank()) {
             return;
         }
-        String token = heldSessionTokens.remove(sessionId);
-        if (token == null) {
-            redis.delete(ReplicaLockKeys.sessionRunKey(sessionId));
-            return;
-        }
+        heldSessionTokens.remove(sessionId, fencingToken);
         redis.execute(UNLOCK_IF_OWNER,
-                List.of(ReplicaLockKeys.sessionRunKey(sessionId)), token);
+                List.of(ReplicaLockKeys.sessionRunKey(sessionId)), fencingToken);
+    }
+
+    public boolean isSessionLocked(String sessionId) {
+        return sessionId != null
+                && !sessionId.isBlank()
+                && Boolean.TRUE.equals(redis.hasKey(
+                        ReplicaLockKeys.sessionRunKey(sessionId)));
     }
 
     /** 测试可见：本机是否登记了该 session 锁 */

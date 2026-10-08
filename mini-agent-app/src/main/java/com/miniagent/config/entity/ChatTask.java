@@ -3,7 +3,16 @@ package com.miniagent.config.entity;
 import jakarta.persistence.*;
 
 @Entity
-@Table(name = "chat_tasks")
+@Table(name = "chat_tasks", indexes = {
+        // 与 V5（MySQL）/ V9（Java 迁移）里的 idx_chat_task_user_deleted_session_created
+        // 是同一个索引：列顺序 (user_id, deleted, session_id, created_at) 服务
+        // 「某用户未删除的会话列表按时间倒序」这一条查询，不能调换。
+        // 实体上必须显式声明：桌面档新装机时 Flyway 先于 Hibernate 跑，那时
+        // chat_tasks 还不存在，V9 的守卫会跳过建索引 —— 新装机的索引只能由
+        // Hibernate 建表时一并建出。老装机则由 V9 补（Hibernate update 不一定可靠）。
+        @Index(name = "idx_chat_task_user_deleted_session_created",
+                columnList = "user_id, deleted, session_id, created_at")
+})
 public class ChatTask extends BaseEntity {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)

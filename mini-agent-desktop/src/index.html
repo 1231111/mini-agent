@@ -2,244 +2,417 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MiniAgent</title>
   <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-      background: #1a1a2e;
-      color: #eee;
-      overflow: hidden;
-    }
-
-    /* 加载状态 */
-    .loading-container {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      height: 100vh;
-      background: #1a1a2e;
-    }
-
-    .loading-spinner {
-      width: 60px;
-      height: 60px;
-      border: 4px solid #333;
-      border-top-color: #667eea;
-      border-radius: 50%;
-      animation: spin 1s linear infinite;
-    }
-
-    .loading-text {
-      margin-top: 24px;
-      color: #ccc;
-      font-size: 18px;
-    }
-
-    .loading-status {
-      margin-top: 12px;
-      color: #667eea;
-      font-size: 14px;
-    }
-
-    @keyframes spin {
-      to { transform: rotate(360deg); }
-    }
-
-    /* 错误状态 */
-    .error-container {
-      display: none;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      height: 100vh;
-      background: #1a1a2e;
-      padding: 40px;
-    }
-
-    .error-icon {
-      font-size: 64px;
-      margin-bottom: 24px;
-    }
-
-    .error-title {
-      font-size: 24px;
-      color: #ff5f57;
-      margin-bottom: 16px;
-    }
-
-    .error-message {
-      color: #aaa;
-      text-align: center;
-      max-width: 500px;
-      line-height: 1.8;
-      font-size: 14px;
-    }
-
-    .error-detail {
-      margin-top: 20px;
-      padding: 16px;
-      background: #16213e;
-      border-radius: 8px;
-      max-width: 500px;
-      width: 100%;
-    }
-
-    .error-detail pre {
-      color: #888;
-      font-size: 12px;
-      white-space: pre-wrap;
-      word-break: break-all;
-    }
-
-    .retry-btn {
-      margin-top: 30px;
-      padding: 14px 36px;
-      background: #667eea;
-      color: white;
-      border: none;
-      border-radius: 8px;
-      font-size: 16px;
-      cursor: pointer;
-      transition: background 0.2s;
-    }
-
-    .retry-btn:hover {
-      background: #5a6fd6;
-    }
-
-    /* iframe 容器 */
-    #app-frame {
-      width: 100%;
-      height: 100vh;
-      border: none;
-      display: none;
-    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: #14161c; color: #f3f4f6;
+      font: 14px/1.45 "Segoe UI", sans-serif; }
+    #boot, #login, #app { height: 100%; }
+    #boot, #login { display: flex; align-items: center; justify-content: center; }
+    .card { width: 320px; background: #1e2127; padding: 24px; border-radius: 12px; }
+    input, button, textarea { font: inherit; }
+    input, textarea { width: 100%; background: #0e0f12; color: #fff; border: 1px solid #333;
+      border-radius: 8px; padding: 8px 10px; }
+    button { background: #10a37f; color: #fff; border: 0; border-radius: 8px; padding: 8px 12px; cursor: pointer; }
+    button.ghost { background: #2a2e36; }
+    .err { color: #f87171; min-height: 1.2em; margin: 8px 0; white-space: pre-wrap; }
+    #cloudHint { font-size: 12px; line-height: 1.6; margin-bottom: 10px; white-space: pre-wrap; }
+    #app { display: none; grid-template-columns: 220px 1fr; }
+    aside { background: #1a1c22; padding: 12px; overflow: auto; }
+    .agent { padding: 8px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; }
+    .agent.on { background: #24312c; }
+    main { display: flex; flex-direction: column; min-width: 0; }
+    #log { flex: 1; overflow: auto; padding: 16px; white-space: pre-wrap; }
+    .row { display: flex; gap: 8px; padding: 12px; }
+    textarea { min-height: 64px; resize: vertical; }
   </style>
 </head>
 <body>
-  <!-- 加载状态 -->
-  <div class="loading-container" id="loading">
-    <div class="loading-spinner"></div>
-    <div class="loading-text">MiniAgent</div>
-    <div class="loading-status" id="loading-status">正在检测后端服务...</div>
+  <div id="boot">正在连接本机服务…</div>
+  <div id="login" style="display:none">
+    <form class="card" id="loginForm">
+      <h2 id="authTitle" style="margin:0 0 12px">登录</h2>
+      <div id="cloudHint" style="display:none"></div>
+      <input id="user" placeholder="用户名" autocomplete="username">
+      <input id="pass" type="password" placeholder="密码" style="margin-top:8px" autocomplete="current-password">
+      <input id="disp" placeholder="显示名（可留空）" style="margin-top:8px;display:none">
+      <div class="err" id="loginErr"></div>
+      <button type="submit" id="submitBtn">登录</button>
+      <button type="button" class="ghost" id="toggleMode"
+              style="margin-top:8px;width:100%">没有账号？注册一个</button>
+    </form>
   </div>
-
-  <!-- 错误状态 -->
-  <div class="error-container" id="error">
-    <div class="error-icon">⚠️</div>
-    <div class="error-title">无法连接后端服务</div>
-    <div class="error-message" id="error-message">
-      请确保 Java 后端已启动。<br>
-      启动命令：<code>mvn spring-boot:run -pl mini-agent-app</code>
-    </div>
-    <div class="error-detail" id="error-detail" style="display:none;">
-      <pre id="error-stack"></pre>
-    </div>
-    <button class="retry-btn" id="retry-btn">重新连接</button>
+  <div id="app">
+    <aside>
+      <div style="font-size:12px;color:#9ca3af;margin-bottom:8px">选择一个代理</div>
+      <div id="agents"></div>
+    </aside>
+    <main>
+      <div id="log"></div>
+      <div class="row">
+        <textarea id="task" placeholder="交给当前代理的任务"></textarea>
+        <button id="send">发送</button>
+      </div>
+    </main>
   </div>
-
-  <!-- 应用内容 -->
-  <iframe id="app-frame" allow="microphone"></iframe>
-
   <script>
-    console.log('[MiniAgent] Script loaded');
+  /* 看门狗。单独一段，和主脚本不共用作用域 —— 主脚本哪怕整体解析失败，
+     这一段的监听和定时器也照样生效。
+     它只做一件事：绝不让界面无声地停在 boot 页。
+     之所以需要它：上面那种 SyntaxError 属于解析期失败，整段脚本一行都不执行，
+     既不会 resolve 也不会 reject，界面连「本机服务没起来」都等不到。 */
+  (function () {
+    function boot() { return document.getElementById('boot'); }
+    function fail(msg) {
+      var el = boot();
+      if (!el || document.getElementById('bootWatch')) return;
+      var d = document.createElement('div');
+      d.id = 'bootWatch';
+      d.style.cssText = 'margin-top:14px;color:#f87171;font-size:12px;line-height:1.6;' +
+                        'white-space:pre-wrap;max-width:520px;text-align:left';
+      d.textContent = msg;
+      el.appendChild(d);
+      el.style.flexDirection = 'column';
+    }
+    window.addEventListener('error', function (e) {
+      fail('页面脚本出错：' + (e.message || (e.error && e.error.message) || String(e.type)) +
+           (e.filename ? '\n位置：' + e.filename + ':' + e.lineno : ''));
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      fail('页面未处理的 Promise 拒绝：' + ((e.reason && e.reason.message) || String(e.reason)));
+    });
+    setTimeout(function () {
+      var el = boot();
+      // show() 会把 boot 的 inline display 置成 none，用它判断是否已经离开 boot 页。
+      if (el && el.style.display !== 'none') {
+        fail('启动超时：20 秒内没进入登录页。\n按 F12 打开开发者工具看 Console，' +
+             '或查看数据目录下 logs/renderer.log。');
+      }
+    }, 20000);
+  })();
+  </script>
+  <script>
+  /* 整段包在 IIFE 里，不是风格偏好，是必须的。
+     preload.js 用 contextBridge.exposeInMainWorld 往主世界挂了 electronAPI 和 api
+     两个全局属性，且它们不可配置（writable:false, configurable:false）。
+     页面顶层如果再有同名声明，按 ES 规范 GlobalDeclarationInstantiation /
+     HasRestrictedGlobalProperty 判定，会出现「Identifier 'api' has already been
+     declared」这种 SyntaxError —— 而且是解析期失败，整段脚本一行都不执行：
+     界面永远停在 boot 页，连超时都不会报。
+     IIFE 让页面里所有标识符退到函数作用域，从根上消掉这类命名空间冲突。 */
+  (function () {
+    'use strict';
 
-    const loading = document.getElementById('loading');
-    const loadingStatus = document.getElementById('loading-status');
-    const error = document.getElementById('error');
-    const errorMessage = document.getElementById('error-message');
-    const errorDetail = document.getElementById('error-detail');
-    const errorStack = document.getElementById('error-stack');
-    const appFrame = document.getElementById('app-frame');
-    const retryBtn = document.getElementById('retry-btn');
+    const AGENTS = [
+      { id: '', name: '主持' },
+      { id: 'tester', name: '测试工程师' },
+      { id: 'developer', name: '开发工程师' },
+      { id: 'pm', name: '产品' },
+      { id: 'designer', name: '设计' },
+      { id: 'security', name: '安全' },
+      { id: 'ops', name: '运维' },
+      { id: 'dba', name: '数据库' },
+      { id: 'architect', name: '架构' },
+      { id: 'tech_writer', name: '文档' }
+    ];
+    let base = 'http://127.0.0.1:8080';
+    let token = '';
+    let current = AGENTS[0];
+    const sessions = {};
 
-    // 获取后端地址并加载应用
-    async function initApp() {
+    function show(id) {
+      document.getElementById('boot').style.display = id === 'boot' ? 'flex' : 'none';
+      document.getElementById('login').style.display = id === 'login' ? 'flex' : 'none';
+      const app = document.getElementById('app');
+      app.style.display = id === 'app' ? 'grid' : 'none';
+    }
+
+    function log(line) {
+      const el = document.getElementById('log');
+      el.textContent += line + '\n';
+      el.scrollTop = el.scrollHeight;
+    }
+
+    async function api(path, opt) {
+      const headers = Object.assign({ 'Content-Type': 'application/json' }, (opt && opt.headers) || {});
+      if (token) headers.Authorization = 'Bearer ' + token;
+      const res = await fetch(base + path, Object.assign({}, opt, { headers }));
+      return res;
+    }
+
+    async function waitReady() {
+      // 优先问主进程要状态：后端是主进程拉起来的，只有它知道后端是否
+      // 已经 /actuator/health = UP。渲染层自己轮询端口会被同端口的
+      // 其他进程骗到（开发机上 8080 常驻着 IDE 里的另一份实例）。
+      if (window.electronAPI && window.electronAPI.getBackendStatus) {
+        try { base = await window.electronAPI.getApiBase(); } catch (e) {}
+        const st = await window.electronAPI.getBackendStatus();
+        if (st.ready) return;
+        if (st.error) throw new Error(st.error);
+
+        return new Promise((resolve, reject) => {
+          let done = false;
+          let offOk = () => {};
+          let offErr = () => {};
+          const finish = (fn, arg) => {
+            if (done) return;
+            done = true;
+            offOk(); offErr();
+            fn(arg);
+          };
+          offOk = window.electronAPI.onBackendReady(() => finish(resolve));
+          offErr = window.electronAPI.onBackendError(
+            (p) => finish(reject, new Error(p.message || '后端启动失败'))
+          );
+          // 事件有可能在监听注册之前就发出来了，补一次查询。
+          setTimeout(async () => {
+            try {
+              const again = await window.electronAPI.getBackendStatus();
+              if (again.ready) finish(resolve);
+              else if (again.error) finish(reject, new Error(again.error));
+            } catch (e) {}
+          }, 3000);
+        });
+      }
+
+      // 非 Electron 环境（浏览器直接打开页面）的退化路径
+      for (let i = 0; i < 60; i++) {
+        try {
+          const res = await fetch(base + '/actuator/health', { signal: AbortSignal.timeout(2000) });
+          if (res.ok) return;
+        } catch (e) {}
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      throw new Error('本机服务没起来');
+    }
+
+    function renderAgents() {
+      const box = document.getElementById('agents');
+      box.innerHTML = '';
+      AGENTS.forEach(a => {
+        const div = document.createElement('div');
+        div.className = 'agent' + (a === current ? ' on' : '');
+        div.textContent = a.name;
+        div.onclick = () => { current = a; renderAgents(); log('\n—— ' + a.name + ' ——'); };
+        box.appendChild(div);
+      });
+    }
+
+    async function ensureSession() {
+      if (sessions[current.id]) return sessions[current.id];
+      const res = await api('/api/conversations', { method: 'POST', body: '{}' });
+      const body = await res.json();
+      const sid = body.data && body.data.sessionId;
+      if (!sid) throw new Error(body.message || '没有会话');
+      sessions[current.id] = sid;
+      return sid;
+    }
+
+    async function send() {
+      const task = document.getElementById('task').value.trim();
+      if (!task) return;
+      document.getElementById('send').disabled = true;
       try {
-        console.log('[MiniAgent] initApp start');
-
-        // 重置状态
-        loading.style.display = 'flex';
-        error.style.display = 'none';
-        appFrame.style.display = 'none';
-
-        loadingStatus.textContent = '正在检测后端服务...';
-
-        let apiBase = 'http://localhost:8080';
-        if (window.electronAPI) {
-          try {
-            apiBase = await window.electronAPI.getApiBase();
-            console.log('[MiniAgent] API base:', apiBase);
-          } catch (e) {
-            console.log('[MiniAgent] Failed to get API base, using default');
+        const sid = await ensureSession();
+        log('\n你 → ' + current.name + '\n' + task);
+        const res = await api('/api/conversations/' + encodeURIComponent(sid) + '/messages/stream', {
+          method: 'POST',
+          body: JSON.stringify({ message: task, sessionId: sid, role: current.id || null })
+        });
+        if (!res.ok || !res.body) {
+          log('HTTP ' + res.status);
+          return;
+        }
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        let event = 'message';
+        while (true) {
+          const step = await reader.read();
+          if (step.done) break;
+          buf += dec.decode(step.value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop();
+          for (const line of lines) {
+            if (line.startsWith('event:')) event = line.slice(6).trim();
+            else if (line.startsWith('data:')) {
+              const data = line.slice(5).trim();
+              if (event === 'token' || event === 'thinking' || event === 'progress') log(data);
+              if (event === 'end') log('\n[完成]');
+              if (event === 'error') log('\n[错误] ' + data);
+            }
           }
         }
-
-        // 等待后端启动
-        let retries = 0;
-        const maxRetries = 30;
-        let lastError = '';
-
-        while (retries < maxRetries) {
-          try {
-            loadingStatus.textContent = `正在连接后端服务... (${retries + 1}/${maxRetries})`;
-            const response = await fetch(apiBase + '/', {
-              method: 'GET',
-              signal: AbortSignal.timeout(3000)
-            });
-            console.log('[MiniAgent] Response status:', response.status);
-
-            // 只要服务有响应就认为成功
-            loadingStatus.textContent = '后端服务已就绪，正在加载...';
-            break;
-          } catch (e) {
-            lastError = e.message || e.toString();
-            console.log('[MiniAgent] Connection attempt failed:', lastError);
-          }
-
-          retries++;
-          await new Promise(r => setTimeout(r, 1000));
-        }
-
-        if (retries >= maxRetries) {
-          throw new Error('无法连接到后端服务 (http://localhost:8080)\n\n请确认：\n1. Java 后端已启动\n2. 端口 8080 未被占用\n3. 防火墙未阻止连接');
-        }
-
-        // 加载应用
-        loadingStatus.textContent = '正在加载应用...';
-        loading.style.display = 'none';
-        appFrame.src = apiBase + '/';
-        appFrame.style.display = 'block';
-        console.log('[MiniAgent] App loaded');
-
       } catch (e) {
-        console.error('[MiniAgent] Error:', e);
-        loading.style.display = 'none';
-        error.style.display = 'flex';
-        errorMessage.innerHTML = (e.message || '无法连接到后端服务').replace(/\n/g, '<br>');
-        if (e.stack) {
-          errorDetail.style.display = 'block';
-          errorStack.textContent = e.stack;
-        }
+        log(String(e.message || e));
+      } finally {
+        document.getElementById('send').disabled = false;
       }
     }
 
-    // 重试按钮
-    retryBtn.addEventListener('click', () => {
-      initApp();
-    });
+    /*
+     * 登录 / 注册两种模式共用一张卡片。
+     *
+     * 注册往哪走由 portalUrl 决定，两条路都是必须的：
+     *   配了门户地址 → 打开系统浏览器，注册在 web 端完成（账号体系的唯一归属地）
+     *   没配门户     → 退回壳内注册表单
+     *
+     * 为什么不能只留前者：单机模式（未配云端）下本地库是空的，也没有 web 端可跳，
+     * 把壳内注册一并去掉就是"首次使用无路可走"。
+     */
+    let authMode = 'login';
+    let portalUrl = '';
 
-    // 启动应用
-    console.log('[MiniAgent] Starting app...');
-    initApp();
+    function setAuthMode(mode) {
+      // 配了门户就整个关掉壳内注册：同一个功能留两个入口，出了问题分不清
+      // 走的是"跳浏览器"还是"打云端 API"。
+      if (portalUrl) mode = 'login';
+      authMode = mode;
+      const isLogin = mode === 'login';
+      document.getElementById('authTitle').textContent = isLogin ? '登录' : '注册';
+      document.getElementById('submitBtn').textContent = isLogin ? '登录' : '注册';
+      // 只在没配门户时才是"切换模式"，配了就是"打开注册页"—— 见 applyAuthEntry()。
+      if (!portalUrl) {
+        document.getElementById('toggleMode').textContent =
+          isLogin ? '没有账号？注册一个' : '已有账号？返回登录';
+      }
+      // 只在注册模式显示显示名，登录时它没有意义。
+      document.getElementById('disp').style.display = isLogin ? 'none' : 'block';
+      document.getElementById('loginErr').textContent = '';
+    }
+
+    /** 决定"没有账号"这个入口的文案。按钮点下去的行为在 toggleMode.onclick 里。 */
+    function applyAuthEntry() {
+      document.getElementById('toggleMode').textContent =
+        portalUrl ? '没有账号？去注册页' : '没有账号？注册一个';
+    }
+
+    /** 用系统浏览器打开门户注册页。失败时把原因显示在卡片上，别静默。 */
+    async function openPortal() {
+      const err = document.getElementById('loginErr');
+      err.textContent = '';
+      try {
+        const r = await window.electronAPI.openExternal(portalUrl + '/login');
+        if (!r || !r.ok) {
+          err.textContent = '打不开注册页：' + ((r && r.error) || '未知原因');
+        }
+      } catch (e) {
+        err.textContent = '打不开注册页：' + (e.message || e);
+      }
+    }
+
+    /**
+     * 把后端的错误码翻成用户能照着做的提示。
+     *
+     * 关键是把 AUTH.03.x（云端问题）和 AUTH.01.01（密码错）分开说 ——
+     * 都显示成"登录失败"的话，云端连不上时用户会一直怀疑自己密码打错了。
+     */
+    function describeAuthError(body) {
+      const code = (body && body.code) || '';
+      const message = (body && body.message) || '操作失败';
+      if (code === 'AUTH.03.01') {
+        return message + '\n云端账号服务连不上。检查网络，或确认云端地址配置正确。';
+      }
+      if (code === 'AUTH.03.02') return message;
+      if (code === 'AUTH.03.03') {
+        return message + '\n云端返回内容无法解析，可能是云端版本与本机不一致。';
+      }
+      if (code === 'AUTH.03.04') {
+        return message + '\n本机没有配置云端账号服务（agent.auth.cloud.base-url）。';
+      }
+      return message;
+    }
+
+    /** 登录页一显示就问一次云端状态：让用户在输账号之前就知道能不能登进去。 */
+    async function checkCloudStatus() {
+      const box = document.getElementById('cloudHint');
+      try {
+        const res = await api('/api/auth/cloud-status');
+        const body = await res.json();
+        const st = body && body.data;
+        if (!st) return;
+        box.style.display = 'block';
+        if (!st.enabled) {
+          box.style.color = '#9ca3af';
+          box.textContent = '本机使用本地账号（未配置云端账号服务）。';
+        } else if (!st.reachable) {
+          box.style.color = '#f87171';
+          box.textContent = '云端账号服务不可达，注册和登录都会失败。\n' + (st.error || '');
+        } else {
+          box.style.color = '#10a37f';
+          box.textContent = '云端账号服务已连接。';
+        }
+      } catch (e) {
+        // 状态查询本身失败不该挡住登录 —— 让用户照常尝试，真实错误在提交时暴露。
+        box.style.display = 'none';
+      }
+    }
+
+    document.getElementById('toggleMode').onclick = () => {
+      // 配了门户就是"跳出去"，没配才是"在卡片里切换登录/注册"。
+      if (portalUrl) {
+        openPortal();
+      } else {
+        setAuthMode(authMode === 'login' ? 'register' : 'login');
+      }
+    };
+
+    document.getElementById('loginForm').onsubmit = async (e) => {
+      e.preventDefault();
+      const err = document.getElementById('loginErr');
+      err.textContent = '';
+      const username = document.getElementById('user').value.trim();
+      const password = document.getElementById('pass').value;
+      const displayName = document.getElementById('disp').value.trim();
+
+      try {
+        const res = authMode === 'login'
+          ? await api('/api/tokens', {
+              method: 'POST',
+              body: JSON.stringify({ username, password })
+            })
+          : await api('/api/users', {
+              method: 'POST',
+              body: JSON.stringify(
+                displayName
+                  ? { username, password, displayName }
+                  : { username, password })
+            });
+
+        const body = await res.json();
+        token = body.data && body.data.token;
+        if (!token) {
+          err.textContent = describeAuthError(body);
+          return;
+        }
+        show('app');
+        renderAgents();
+        log(authMode === 'login'
+          ? '已登录。左边选一个代理，右边把任务发给它。每个代理有自己的会话。'
+          : '注册成功，已登录。左边选一个代理，右边把任务发给它。');
+      } catch (e2) {
+        // fetch 本身抛异常 = 连本机后端都没通到，与"账号密码错"完全是两回事。
+        err.textContent = '连不上本机服务：' + (e2.message || e2);
+      }
+    };
+    document.getElementById('send').onclick = send;
+
+    waitReady().then(async () => {
+      // portalUrl 必须在 setAuthMode 之前取到 —— setAuthMode 据此决定要不要关掉壳内注册。
+      // 取不到就当"没配门户"，退回壳内注册：这个调用失败不该挡住登录。
+      try {
+        portalUrl = (await window.electronAPI.getPortalUrl()) || '';
+      } catch (e) {
+        portalUrl = '';
+      }
+      applyAuthEntry();
+      setAuthMode('login');
+      show('login');
+      return checkCloudStatus();
+    }).catch(e => {
+      document.getElementById('boot').textContent = e.message;
+    });
+  })();
   </script>
 </body>
 </html>

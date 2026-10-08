@@ -106,6 +106,13 @@ public class MemoryIndexOutboxService {
      *
      * <p>改为每条一个短事务后，状态流转在解锁前就已落库，窗口消失；
      * 同时避免长事务长时间占用连接。
+     *
+     * <p><b>⚠ 由此推出的一条约束</b>：本方法无事务，所以它调用的查询**不能带悲观锁**。
+     * 曾经 {@code findTop50ByStatusAndNextAttemptAtLessThanEqualOrderByIdAsc} 上挂着
+     * {@code @Lock(PESSIMISTIC_WRITE)}，而 JPA 规定悲观锁必须在活跃事务内调用 ——
+     * 结果是每次调度都在取批那一步抛 {@code InvalidDataAccessApiUsageException:
+     * Query requires transaction be in progress}，队列一条都投不出去。
+     * 要加锁的话必须同时改造这里的事务边界，不能只改 repository。
      */
     @Scheduled(fixedDelayString = "${agent.memory.index-outbox.interval-ms:5000}")
     public void drain() {

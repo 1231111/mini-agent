@@ -1,6 +1,8 @@
 package com.miniagent.agent.todo;
 
+import com.miniagent.agent.tool.ToolRegistry;
 import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
 
@@ -48,5 +50,32 @@ class TaskTodoConfirmTest {
         assertTrue(store.hasSuspended("s"));
         assertTrue(store.resumeSuspended("s"));
         assertEquals(TaskTodoStore.Status.in_progress, store.get("s").get(0).status());
+    }
+
+    @Test
+    void modelTodoToolCannotConfirmForTheUser(
+            @org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp) {
+        TaskTodoStore store = new TaskTodoStore(tmp.toString());
+        store.set("s", List.of(java.util.Map.of(
+                "id", 1,
+                "content", "发布到生产环境",
+                "status", "awaiting_confirm")));
+        ToolRegistry registry = new ToolRegistry();
+        TodoTool tool = new TodoTool();
+        ReflectionTestUtils.setField(tool, "toolRegistry", registry);
+        ReflectionTestUtils.setField(tool, "todoStore", store);
+        tool.register();
+        TaskTodoContext.set("s");
+
+        try {
+            String result = registry.execute(
+                    "todo", "{\"action\":\"confirm\",\"id\":1}");
+            assertTrue(result.contains("未知 action"));
+            assertEquals(
+                    TaskTodoStore.Status.awaiting_confirm,
+                    store.get("s").get(0).status());
+        } finally {
+            TaskTodoContext.clear();
+        }
     }
 }

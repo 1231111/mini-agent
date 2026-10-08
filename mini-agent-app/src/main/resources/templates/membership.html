@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mini Agent - 会员中心</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+            background: #212121;
+            color: #ececec;
+            min-height: 100vh;
+            padding: 32px 20px 64px;
+        }
+        .wrap { max-width: 880px; margin: 0 auto; }
+        .head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 28px;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+        .head h1 { font-size: 22px; font-weight: 600; }
+        .head .sub { font-size: 13px; color: #8e8ea0; margin-top: 6px; }
+        .head a {
+            color: #10a37f;
+            text-decoration: none;
+            font-size: 14px;
+            border: 1px solid rgba(16,163,127,0.4);
+            padding: 7px 14px;
+            border-radius: 8px;
+            transition: background 0.2s;
+        }
+        .head a:hover { background: rgba(16,163,127,0.12); }
+
+        .card {
+            background: #2f2f2f;
+            border-radius: 14px;
+            padding: 22px 24px;
+            margin-bottom: 18px;
+            border: 1px solid rgba(255,255,255,0.06);
+        }
+        .card h2 {
+            font-size: 15px;
+            font-weight: 600;
+            color: #8e8ea0;
+            margin-bottom: 16px;
+            letter-spacing: 0.02em;
+        }
+        .current-plan {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-bottom: 18px;
+        }
+        .current-plan .name { font-size: 26px; font-weight: 700; color: #10a37f; }
+        .current-plan .badge {
+            font-size: 12px;
+            color: #10a37f;
+            border: 1px solid rgba(16,163,127,0.4);
+            border-radius: 999px;
+            padding: 2px 10px;
+        }
+        .metrics { display: flex; gap: 36px; flex-wrap: wrap; }
+        .metric .k { font-size: 12px; color: #8e8ea0; margin-bottom: 5px; }
+        .metric .v { font-size: 17px; font-weight: 600; }
+
+        .plans { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; }
+        .plan {
+            background: #212121;
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+            padding: 18px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            transition: border-color 0.2s;
+        }
+        .plan:hover { border-color: rgba(16,163,127,0.5); }
+        .plan.active { border-color: #10a37f; }
+        .plan .top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+        .plan .title { font-size: 16px; font-weight: 600; }
+        .plan .price { font-size: 20px; font-weight: 700; color: #10a37f; white-space: nowrap; }
+        .plan .price small { font-size: 12px; color: #8e8ea0; font-weight: 400; }
+        .plan ul { list-style: none; display: flex; flex-direction: column; gap: 7px; }
+        .plan li { font-size: 13px; color: #b4b4c6; display: flex; justify-content: space-between; gap: 10px; }
+        .plan li span:last-child { color: #ececec; }
+        .plan button {
+            margin-top: auto;
+            width: 100%;
+            padding: 10px;
+            background: #10a37f;
+            border: none;
+            border-radius: 8px;
+            color: #fff;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .plan button:hover:not(:disabled) { background: #0e906f; }
+        .plan button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+        .notice {
+            border-radius: 10px;
+            padding: 13px 16px;
+            font-size: 13.5px;
+            line-height: 1.65;
+            margin-bottom: 14px;
+            display: none;
+            word-break: break-word;
+        }
+        .notice.show { display: block; }
+        .notice.info { background: rgba(16,163,127,0.12); border: 1px solid rgba(16,163,127,0.35); color: #7fe0c4; }
+        .notice.warn { background: rgba(245,158,11,0.12); border: 1px solid rgba(245,158,11,0.35); color: #fbbf24; }
+        .notice.err  { background: rgba(239,68,68,0.12);  border: 1px solid rgba(239,68,68,0.35);  color: #fca5a5; }
+        .notice code {
+            background: rgba(0,0,0,0.3);
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        }
+        .muted { color: #8e8ea0; font-size: 13.5px; }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <div class="head">
+        <div>
+            <h1>会员中心</h1>
+            <div class="sub" id="whoami"></div>
+        </div>
+        <a href="/">← 返回对话</a>
+    </div>
+
+    <div class="notice" id="notice"></div>
+
+    <div class="card">
+        <h2>我的会员</h2>
+        <div id="currentBox"><div class="muted">加载中…</div></div>
+    </div>
+
+    <div class="card">
+        <h2>可开通的套餐</h2>
+        <div class="plans" id="plansBox"><div class="muted">加载中…</div></div>
+    </div>
+</div>
+
+<script src="/js/security.js"></script>
+<script>
+(function () {
+    'use strict';
+
+    var $ = function (id) { return document.getElementById(id); };
+
+    // ---------- 展示格式化 ----------
+    // 三个都是"把后端的物理量翻译成人看的字"，不改变数值本身。
+
+    /** 0 或负数表示不限量 —— 与 tenants.daily_token_limit 的语义完全一致，不做中间换算。 */
+    function fmtTokens(n) {
+        if (n === null || n === undefined) { return '—'; }
+        if (Number(n) <= 0) { return '不限量'; }
+        if (n >= 100000000) { return (n / 100000000) + ' 亿'; }
+        if (n >= 10000) { return (n / 10000) + ' 万'; }
+        return String(n);
+    }
+
+    /** 金额在库里存"分"。这里只在显示时除以 100，不参与任何计算。 */
+    function fmtPrice(cents, currency) {
+        if (cents === null || cents === undefined) { return '—'; }
+        var symbol = (!currency || currency === 'CNY') ? '¥' : (currency + ' ');
+        return symbol + (Number(cents) / 100).toFixed(2);
+    }
+
+    /** 永久用 null 表示（不是 2126 年那种"看起来像真日期的值"），所以这里也必须判 null。 */
+    function fmtExpire(t) {
+        if (!t) { return '永久有效'; }
+        return String(t).replace('T', ' ').slice(0, 16);
+    }
+
+    function fmtDuration(days) {
+        if (!days || Number(days) <= 0) { return '长期'; }
+        return Number(days) + ' 天';
+    }
+
+    // ---------- 提示条 ----------
+
+    function notice(kind, text) {
+        var el = $('notice');
+        el.className = 'notice show ' + kind;
+        el.textContent = text;
+    }
+
+    function hideNotice() {
+        $('notice').className = 'notice';
+    }
+
+    // 全部用 textContent 而不是 innerHTML：下面所有值都来自账号服务的响应，
+    // 一旦哪天后端把套餐名做成可运营配置的字段，innerHTML 就是一个注入点，
+    // 而那时的改动看起来只是"支持自定义套餐名"。
+    function el(tag, className, text) {
+        var node = document.createElement(tag);
+        if (className) { node.className = className; }
+        if (text !== undefined && text !== null) { node.textContent = String(text); }
+        return node;
+    }
+
+    // ---------- 我的会员 ----------
+
+    function renderCurrent(view) {
+        var box = $('currentBox');
+        box.textContent = '';
+
+        var plan = el('div', 'current-plan');
+        plan.appendChild(el('div', 'name', view.planName || view.planCode));
+        plan.appendChild(el('div', 'badge', '生效中'));
+        box.appendChild(plan);
+
+        var metrics = el('div', 'metrics');
+        metrics.appendChild(metric('每日 token 额度', fmtTokens(view.dailyTokenLimit)));
+        metrics.appendChild(metric('并发任务上限', view.maxConcurrentTasks > 0 ? view.maxConcurrentTasks : '不限'));
+        metrics.appendChild(metric('到期时间', fmtExpire(view.expireAt)));
+        if (view.sourceOrderNo) {
+            metrics.appendChild(metric('来源订单', view.sourceOrderNo));
+        }
+        box.appendChild(metrics);
+    }
+
+    function metric(k, v) {
+        var wrap = el('div', 'metric');
+        wrap.appendChild(el('div', 'k', k));
+        wrap.appendChild(el('div', 'v', v));
+        return wrap;
+    }
+
+    // ---------- 套餐表 ----------
+
+    function renderPlans(list, currentCode) {
+        var box = $('plansBox');
+        box.textContent = '';
+
+        if (!list || !list.length) {
+            box.appendChild(el('div', 'muted', '暂时没有可开通的套餐。'));
+            return;
+        }
+
+        list.forEach(function (p) {
+            var card = el('div', 'plan' + (p.code === currentCode ? ' active' : ''));
+
+            var top = el('div', 'top');
+            top.appendChild(el('div', 'title', p.name || p.code));
+            var price = el('div', 'price', fmtPrice(p.priceCents, p.currency));
+            price.appendChild(el('small', null, p.durationDays > 0 ? ' / ' + p.durationDays + '天' : ' / 长期'));
+            top.appendChild(price);
+            card.appendChild(top);
+
+            var ul = el('ul');
+            ul.appendChild(row('每日 token 额度', fmtTokens(p.dailyTokenLimit)));
+            ul.appendChild(row('并发任务上限', p.maxConcurrentTasks > 0 ? p.maxConcurrentTasks : '不限'));
+            ul.appendChild(row('有效期', fmtDuration(p.durationDays)));
+            card.appendChild(ul);
+
+            var btn = el('button', null, p.code === currentCode ? '当前套餐' : '开通');
+            if (p.code === currentCode) {
+                btn.disabled = true;
+            } else {
+                btn.addEventListener('click', function () { buy(p, btn); });
+            }
+            card.appendChild(btn);
+
+            box.appendChild(card);
+        });
+    }
+
+    function row(k, v) {
+        var li = el('li');
+        li.appendChild(el('span', null, k));
+        li.appendChild(el('span', null, v));
+        return li;
+    }
+
+    // ---------- 下单 ----------
+
+    function buy(plan, btn) {
+        hideNotice();
+        btn.disabled = true;
+        var original = btn.textContent;
+        btn.textContent = '提交中…';
+
+        // 请求体里只有 planCode：userId 由服务端从 Bearer token 解出来。
+        // 这里要是"顺手"带上 userId，就等于把"能查别人的会员"这件事交给了客户端自觉。
+        fetch('/api/membership/orders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ planCode: plan.code })
+        }).then(function (resp) {
+            return resp.json();
+        }).then(function (data) {
+            if (data.success && data.data) {
+                notice('info', '订单已创建：' + data.data.orderNo +
+                    '，金额 ' + fmtPrice(data.data.amountCents, data.data.currency) +
+                    '。当前状态为待支付 —— 接入支付渠道前它会一直停在这里。');
+            } else {
+                notice('err', (data.message || '下单失败') +
+                    (data.code ? '（' + data.code + '）' : ''));
+            }
+            btn.disabled = false;
+            btn.textContent = original;
+        }).catch(function (e) {
+            notice('err', '网络错误：' + (e && e.message ? e.message : e));
+            btn.disabled = false;
+            btn.textContent = original;
+        });
+    }
+
+    // ---------- 加载 ----------
+
+    function loadCurrent() {
+        return fetch('/api/membership/current').then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.success && data.data) {
+                    renderCurrent(data.data);
+                    return data.data.planCode;
+                }
+                if (data.code === 'MEMBER.02.03') {
+                    // "没有生效中的订阅"是一个正常状态，不是错误。单开一个分支渲染，
+                    // 免得它和真正的故障共用同一个提示样式，让人以为系统坏了。
+                    $('currentBox').textContent = '';
+                    $('currentBox').appendChild(
+                        el('div', 'muted', '当前没有生效中的会员。下面选一个套餐开通即可。'));
+                    return null;
+                }
+                $('currentBox').textContent = '';
+                $('currentBox').appendChild(el('div', 'muted', data.message || '读取会员信息失败'));
+                return null;
+            });
+    }
+
+    function loadPlans(currentCode) {
+        return fetch('/api/membership/plans').then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.success) {
+                    renderPlans(data.data, currentCode);
+                } else {
+                    $('plansBox').textContent = '';
+                    $('plansBox').appendChild(el('div', 'muted', data.message || '读取套餐失败'));
+                    explainPlansFailure(data);
+                }
+            });
+    }
+
+    /**
+     * 套餐读不出来时，别只丢一句"读取失败"。
+     *
+     * 这条路径上最常见的失败不是 bug，而是部署漏配了服务间密钥 ——
+     * 那种情况登录注册全部正常，只有这一页坏，看起来像"会员功能有 bug"。
+     * 把可能的配置项直接写出来，省掉一次从代码开始查的排查。
+     */
+    function explainPlansFailure(data) {
+        if (data.code === 'MEMBER.02.02') {
+            notice('warn', '会员接口未启用：agent 侧未配置 agent.auth.cloud.internal-key，' +
+                '或账号服务侧未配置 agent.account.internal-key。两者必须一致。');
+        } else if (data.code === 'AUTH.03.01' || data.code === 'AUTH.03.02') {
+            notice('warn', '连不上账号服务。请确认它已启动，且 agent.auth.cloud.base-url 指向的是它。');
+        } else if (data.code === 'AUTH.03.03') {
+            // 这条只会在共享库模式下出现：账号服务说"这个 userId 存在"，本库却查不到那一行。
+            notice('warn', 'agent 与账号服务对 users 表的理解不一致 —— ' +
+                '两者多半没指向同一个库。请核对两边的 spring.datasource.url。');
+        } else if (data.code === 'AUTH.03.04') {
+            notice('warn', '未配置账号服务地址（agent.auth.cloud.base-url 为空），会员功能不可用。');
+        }
+    }
+
+    function boot() {
+        // 页面骨架是免认证放行的（浏览器导航带不了 Authorization 头），
+        // 所以"有没有登录"只能在这里判。
+        if (!window.MiniAuth || !window.MiniAuth.token()) {
+            window.MiniAuth && window.MiniAuth.goLogin();
+            return;
+        }
+        $('whoami').textContent = 'token 已就绪 · 数据由账号服务提供';
+
+        loadCurrent()
+            .then(function (code) { return loadPlans(code); })
+            .catch(function (e) {
+                notice('err', '页面初始化失败：' + (e && e.message ? e.message : e));
+            });
+    }
+
+    boot();
+})();
+</script>
+</body>
+</html>

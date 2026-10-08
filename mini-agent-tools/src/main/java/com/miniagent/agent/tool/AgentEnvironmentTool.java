@@ -7,16 +7,14 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
 import java.lang.management.ManagementFactory;
 import java.lang.management.RuntimeMXBean;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 /**
  * 环境感知工具：动态获取运行时环境信息
@@ -29,6 +27,12 @@ public class AgentEnvironmentTool {
     private ToolRegistry toolRegistry;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    /**
+     * 单条 git 命令的超时。git 是本地命令，正常在毫秒级；
+     * 给 5 秒是留给大仓库的 {@code status}，不是留给网络。
+     */
+    private static final Duration GIT_TIMEOUT = Duration.ofSeconds(5);
 
     @PostConstruct
     public void register() {
@@ -85,70 +89,86 @@ public class AgentEnvironmentTool {
     }
 
     /**
-     * 获取Git仓库信息
+     * 获取 Git 仓库信息。
+     *
+     * <p>原实现的问题（2026-09-28 修）：
+     * <ol>
+     *   <li>命令走 {@code sh -c <整串>}，而 Windows 没有 {@code sh} —— 客户机上必然失败。
+     *       改为 {@link HostCommand#exec} 的参数列表形式，不引 shell。</li>
+     *   <li>执行失败被吞成空串，调用方拿空串当"真的没输出"：
+     *       {@code status.isEmpty()} → {@code is_clean=true}，于是向用户报告
+     *       "工作区干净"，而实际上 git 一次都没跑过。<b>假数据比报错危害大</b>。
+     *       现在改为显式回报 {@code available=false} + 失败原因。</li>
+     *   <li>{@code git status --porcelain} 是多行输出，原实现逐行 {@code append} 而不加
+     *       {@code \n}，多行被拼成一行 → {@code lines().count()} 恒为 1，
+     *       {@code modified_files_count} 一直是错的。{@link HostCommand.Exec#output()}
+     *       保留了换行，这里按行统计。</li>
+     *   <li>可用性探测不能用 {@code rev-parse --abbrev-ref HEAD} —— 它在"刚 init、
+     *       零提交"的仓库上 exit 128，会把正常空仓库误报成"git 不可用"。
+     *       改用 {@code rev-parse --is-inside-work-tree}。</li>
+     * </ol>
      */
     private Map<String, Object> getGitInfo() {
         Map<String, Object> gitInfo = new LinkedHashMap<>();
 
-        try {
-            // 获取当前分支
-            String branch = executeCommand("git rev-parse --abbrev-ref HEAD");
-            gitInfo.put("branch", branch);
+        // 可用性探测刻意用 --is-inside-work-tree 而不是 --abbrev-ref HEAD：
+        // 后者在"刚 git init、还一次都没提交"的仓库上会 exit 128
+        //   fatal: ambiguous argument 'HEAD': unknown revision
+        // 于是把一个正常的空仓库误报成"git 不可用"。--is-inside-work-tree
+        // 在任何仓库里都输出 true 并 exit 0，不在仓库里才 exit 128 —— 语义正好。
+        HostCommand.Exec probe = HostCommand.exec(GIT_TIMEOUT, "git", "rev-parse", "--is-inside-work-tree");
+        if (!probe.ok() || !"true".equalsIgnoreCase(probe.output())) {
+            gitInfo.put("available", false);
+            gitInfo.put("error", probe.ok() ? "git rev-parse --is-inside-work-tree 返回 " + probe.output()
+                    : probe.error());
+            log.debug("git 不可用: {}", gitInfo.get("error"));
+            return gitInfo;
+        }
+        gitInfo.put("available", true);
 
-            // 获取最后提交信息
-            String lastCommit = executeCommand("git log -1 --format=%H %s");
-            String[] parts = lastCommit.split(" ", 2);
+        // 分支单独取，且给一条回退链：
+        //   symbolic-ref --short HEAD  在空仓库上可用（HEAD 指向不存在的分支也能读），
+        //                              但 detached HEAD 时会失败；
+        //   rev-parse --abbrev-ref HEAD 正常仓库可用，但空仓库失败、detached 时给 "HEAD"。
+        // 两条都失败就不写 branch —— 不写比写个错的好。
+        HostCommand.Exec sym = HostCommand.exec(GIT_TIMEOUT, "git", "symbolic-ref", "--short", "HEAD");
+        if (sym.ok() && !sym.output().isEmpty()) {
+            gitInfo.put("branch", sym.output());
+        } else {
+            HostCommand.Exec abbrev = HostCommand.exec(GIT_TIMEOUT,
+                    "git", "rev-parse", "--abbrev-ref", "HEAD");
+            if (abbrev.ok() && !abbrev.output().isEmpty()) {
+                gitInfo.put("branch", abbrev.output());
+            }
+        }
+
+        HostCommand.Exec lastCommit = HostCommand.exec(GIT_TIMEOUT,
+                "git", "log", "-1", "--format=%H %s");
+        if (lastCommit.ok()) {
+            String[] parts = lastCommit.output().split(" ", 2);
             if (parts.length >= 2) {
                 gitInfo.put("last_commit_hash", parts[0]);
                 gitInfo.put("last_commit_message", parts[1]);
             }
+        }
 
-            // 获取工作区状态
-            String status = executeCommand("git status --porcelain");
-            gitInfo.put("is_clean", status.isEmpty());
-            gitInfo.put("modified_files_count", status.lines().count());
+        HostCommand.Exec status = HostCommand.exec(GIT_TIMEOUT, "git", "status", "--porcelain");
+        if (status.ok()) {
+            String out = status.output();
+            long changed = out.isEmpty() ? 0L
+                    : out.lines().filter(line -> !line.isBlank()).count();
+            gitInfo.put("is_clean", changed == 0L);
+            gitInfo.put("modified_files_count", changed);
+        }
 
-            // 获取远程仓库
-            String remote = executeCommand("git remote get-url origin");
-            if (!remote.isEmpty()) {
-                gitInfo.put("remote_url", remote);
-            }
-        } catch (Exception e) {
-            gitInfo.put("error", "获取Git信息失败: " + e.getMessage());
-            log.warn("获取Git信息失败", e);
+        // 没配 origin 时 git 会以非 0 退出并往 stderr 吐 "No such remote"。
+        // 原实现把 stderr 并进 stdout，于是那句错误文本被当成 remote_url 填了进去。
+        // 现在靠 exit code 区分：只有真正成功且非空才记。
+        HostCommand.Exec remote = HostCommand.exec(GIT_TIMEOUT, "git", "remote", "get-url", "origin");
+        if (remote.ok() && !remote.output().isEmpty()) {
+            gitInfo.put("remote_url", remote.output());
         }
 
         return gitInfo;
-    }
-
-    /**
-     * 执行shell命令并返回输出
-     */
-    private String executeCommand(String command) {
-        try {
-            Process process = new ProcessBuilder("sh", "-c", command)
-                    .redirectErrorStream(true)
-                    .start();
-
-            StringBuilder output = new StringBuilder();
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line);
-                }
-            }
-
-            boolean completed = process.waitFor(5, TimeUnit.SECONDS);
-            if (!completed) {
-                process.destroyForcibly();
-                return "";
-            }
-
-            return output.toString().trim();
-        } catch (Exception e) {
-            log.debug("执行命令失败: {}", command, e);
-            return "";
-        }
     }
 }

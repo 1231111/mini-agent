@@ -10,8 +10,6 @@ import com.github.javaparser.ast.body.MethodDeclaration;
 import com.miniagent.common.embedding.SharedEmbeddingModel;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
@@ -54,16 +52,18 @@ public class CodebaseSearchTool {
 
     @Value("${agent.codebase.embedding-enabled:false}")
     private boolean enabled;
-    @Value("${agent.codebase.embedding-api-key:}")
-    private String apiKey;
-    @Value("${agent.codebase.embedding-base-url:https://api.siliconflow.cn/v1}")
-    private String baseUrl;
-    @Value("${agent.codebase.embedding-model:BAAI/bge-m3}")
-    private String embeddingModelName;
+
+    /**
+     * embedding 统一走 SharedEmbeddingModel，由它决定后端是 remote HTTP 还是进程内 ONNX。
+     * 本类以前自己 build 一个 OpenAiEmbeddingModel，desktop 档切成 local-onnx 后
+     * 这里仍指向 HTTP 且判定条件是「apiKey 非空」，会静默失效。
+     */
+    @Autowired
+    private SharedEmbeddingModel embeddingService;
+
     @Value("${agent.codebase.index-file:${agent.data-dir:${user.home}/.miniagent}/workspace/.codebase-index.json}")
     private String indexFile;
 
-    private EmbeddingModel embeddingModel;
     private InMemoryEmbeddingStore<TextSegment> store;
     private final AtomicBoolean indexed = new AtomicBoolean(false);
     /** 已索引文件 mtime 记录，用于增量判断。 */
@@ -99,8 +99,8 @@ public class CodebaseSearchTool {
 
     @SuppressWarnings("unchecked")
     private String handle(String json) {
-        if (!enabled || StringUtils.isBlank(apiKey)) {
-            return "{\"error\":\"codebase_search 未启用（缺少 embedding key）。请改用 search_code 或 ast_search。\"}";
+        if (!enabled || !embeddingService.isEnabled()) {
+            return "{\"error\":\"codebase_search 未启用（embedding 后端不可用：agent.codebase.embedding-enabled 为 false，或所选后端未就绪）。请改用 search_code 或 ast_search。\"}";
         }
         try {
             Map<String, Object> args = MAPPER.readValue(Optional.ofNullable(json).orElse("{}"), Map.class);
@@ -123,9 +123,12 @@ public class CodebaseSearchTool {
                 return err("索引尚未就绪");
             }
 
-            Embedding queryEmbedding = embeddingModel().embed(query).content();
+            float[] qv = embeddingService.embed(query);
+            if (qv.length == 0) {
+                return err("查询向量为空（embedding 后端未就绪）");
+            }
             EmbeddingSearchRequest req = EmbeddingSearchRequest.builder()
-                    .queryEmbedding(queryEmbedding)
+                    .queryEmbedding(Embedding.from(qv))
                     .maxResults(Math.max(1, topK))
                     .minScore(0.3)
                     .build();
@@ -195,8 +198,13 @@ public class CodebaseSearchTool {
                 List<TextSegment> segs = chunkJavaFile(f, root);
                 for (TextSegment seg : segs) {
                     try {
-                        Embedding emb = embeddingModel().embed(seg).content();
-                        fresh.add(emb, seg);
+                        float[] vec = embeddingService.embed(seg.text());
+                        if (vec.length == 0) {
+                            log.warn("片段嵌入为空（跳过一段）: {}",
+                                    StringUtils.abbreviate(seg.text(), 60));
+                            continue;
+                        }
+                        fresh.add(Embedding.from(vec), seg);
                         chunks++;
                     } catch (Exception e) {
                         log.warn("嵌入失败（跳过一段）: {}", e.getMessage());
@@ -252,18 +260,6 @@ public class CodebaseSearchTool {
             } catch (Exception ignored) {}
         }
         return segs;
-    }
-
-    private EmbeddingModel embeddingModel() {
-        if (Objects.isNull(embeddingModel)) {
-            embeddingModel = OpenAiEmbeddingModel.builder()
-                    .httpClientBuilder(SharedEmbeddingModel.http1ClientBuilder())
-                    .apiKey(apiKey)
-                    .baseUrl(baseUrl)
-                    .modelName(embeddingModelName)
-                    .build();
-        }
-        return embeddingModel;
     }
 
     private Path resolvePath(String path) {
