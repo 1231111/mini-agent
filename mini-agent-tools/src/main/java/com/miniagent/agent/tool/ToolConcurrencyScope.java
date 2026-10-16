@@ -5,7 +5,7 @@ package com.miniagent.agent.tool;
  *
  * <p>改造前只有 {@link #GLOBAL} 一种「写类工具共用一把锁」，于是本地文件系统、
  * 本地 GPU、远程 API 配额这三类<b>互不相干</b>的资源被挤到同一个 {@code "global"} 键上：
- * {@code comfyui_img2video} 跑 620 秒会把 {@code write_file} 一起堵死。
+ * 长耗时的共享资源生成会把 {@code write_file} 一起堵死。
  * 现在按「实际抢的是什么资源」分开。</p>
  */
 public enum ToolConcurrencyScope {
@@ -30,7 +30,7 @@ public enum ToolConcurrencyScope {
     /**
      * 按命名的外部共享资源分锁，资源名写在 {@code ToolExecutionProfile.sharedResourceKey}。
      *
-     * <p>适用：抢同一块 GPU 的 {@code comfyui_*}（键 {@code comfyui-gpu}）、
+     * <p>适用：有配额的远程生成 API（键 {@code image-api} 等）。与 {@link #GLOBAL} 的区别在于<b>不碰本地文件系统</b>，
      * 有配额的远程生成 API。与 {@link #GLOBAL} 的区别在于<b>不碰本地文件系统</b>，
      * 所以不该跟写文件共用一把锁。</p>
      */

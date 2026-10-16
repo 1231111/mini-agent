@@ -1,5 +1,8 @@
 package com.miniagent.agent.skill;
 
+import com.miniagent.agent.tool.PathGuard;
+import com.miniagent.common.SafeSegments;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yaml.snakeyaml.Yaml;
@@ -88,8 +91,13 @@ public class SkillStore {
         if (Objects.isNull(skillDir)) {
             return null;
         }
-        Path target = skillDir.resolve(relativePath).normalize();
-        if (!target.startsWith(skillDir)) {
+        // 这里要支持多级（references/x.md），所以逐段过闸而不是整串判断：
+        // 旧实现只做词法 startsWith，挡得住 `..` 但挡不住"技能包里放一个指向外部的 junction"。
+        Path target;
+        try {
+            target = PathGuard.resolveRelative(skillDir, "skill file read", relativePath);
+        } catch (SecurityException | IllegalArgumentException e) {
+            log.warn("拒绝读取技能包内文件 {}/{}: {}", name, relativePath, e.getMessage());
             return "Error: path traversal";
         }
         if (!Files.exists(target)) {
@@ -115,11 +123,16 @@ public class SkillStore {
             return result;
         }
 
+        // 收口：category 此前是原样拼进路径的（name 有 sanitizeName 兜着，category 没有），
+        // 于是 category="..\..\Users\x" 就能把 SKILL.md 写到 skills 目录之外。
+        // 现在统一走 PathGuard.resolveInside：每段过 SafeSegments，拼完再按真实路径复核一次。
         Path skillDir;
-        if (Objects.nonNull(category) && !category.isEmpty()) {
-            skillDir = skillsDir.resolve(category).resolve(cleanName);
-        } else {
-            skillDir = skillsDir.resolve(cleanName);
+        try {
+            skillDir = PathGuard.resolveInside(skillsDir, "skill write", category, cleanName);
+        } catch (SecurityException | IllegalArgumentException e) {
+            result.put("success", false);
+            result.put("error", e.getMessage());
+            return result;
         }
 
         if (Files.exists(skillDir)) {
@@ -289,7 +302,13 @@ public class SkillStore {
     }
 
     private Path findSkillMd(String name) {
-        Path direct = skillsDir.resolve(name).resolve("SKILL.md");
+        // 名字先过段校验：`../x`、`..\x`、绝对路径这类一律当作"找不到"。
+        // 读(view)、改(edit/patch)、删(delete) 三条路都经由这里取路径，堵一处即堵三处。
+        if (!SafeSegments.isValid(name)) {
+            log.warn("技能名不合法，拒绝解析路径: {}", name);
+            return null;
+        }
+        Path direct = PathGuard.resolveInside(skillsDir, "skill read", name).resolve("SKILL.md");
         if (Files.exists(direct)) {
             return direct;
         }

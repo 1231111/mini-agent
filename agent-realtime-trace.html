@@ -940,8 +940,18 @@
 
             try {
                 // 获取token
+                // token 来源优先壳的持久存储（Electron 客户端），其次页面 web 存储。
+                //
+                // ⚠ 已断（本次未修）：下面把 token 拼进 access_token 查询参数，
+                // 但服务端那次无状态改造已经把这条通路移除了 —— JwtSessionService
+                // 只认 Authorization: Bearer 头。EventSource 加不了自定义请求头，
+                // 所以这个页面换不到能用的鉴权。要修得把 SSE 改成 fetch + ReadableStream。
                 let token = '';
-                try { token = sessionStorage.getItem('ma_token') || ''; } catch (_) {}
+                try {
+                    const b = window.desktopAuth;
+                    token = (b && typeof b.getToken === 'function') ? (b.getToken() || '')
+                        : (sessionStorage.getItem('ma_token') || '');
+                } catch (_) {}
 
                 // 构建URL
                 const traceUrl = API_BASE + '/api/traces/stream?sessionId=' + encodeURIComponent(sessionId)

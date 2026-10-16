@@ -1,6 +1,7 @@
 package com.miniagent.config.service;
 
 import com.miniagent.agent.permission.SessionPermissionPersistence;
+import com.miniagent.agent.permission.AskGrant;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.jackson.JacksonAutoConfiguration;
@@ -8,6 +9,7 @@ import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.context.annotation.Import;
 
 import java.util.Set;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -51,5 +53,19 @@ class DbSessionPermissionPersistenceTest {
         assertEquals("auto", restored.confirmPolicy());
         assertEquals("block", restored.execPolicyOverride());
         assertEquals(next.version(), restored.version());
+    }
+
+    @Test
+    void persistsExactArgumentGrantMapAndReadsItBack() {
+        SessionPermissionPersistence.State initial = persistence.loadOrCreate("s2");
+        AskGrant grant = new AskGrant("token-1", "exec_command", "digest-1",
+                System.currentTimeMillis() + 60_000L);
+        SessionPermissionPersistence.State next = new SessionPermissionPersistence.State(
+                "ask", true, Set.of("exec_command"), Map.of(grant.token(), grant),
+                "dangerous", "ask", initial.version() + 1L);
+
+        assertTrue(persistence.compareAndSet("s2", initial, next));
+        SessionPermissionPersistence.State restored = persistence.loadOrCreate("s2");
+        assertEquals(grant, restored.askGrants().get(grant.token()));
     }
 }

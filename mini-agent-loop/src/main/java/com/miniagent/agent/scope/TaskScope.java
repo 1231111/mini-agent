@@ -61,4 +61,22 @@ public record TaskScope(String sessionId, long taskId, long openedAt, String rea
     public String scopeKey() {
         return taskId == 0L ? sessionId : sessionId + SEP + taskId;
     }
+
+    /**
+     * 判断某个作用域键是否属于给定会话。
+     *
+     * <p>会话被删除（或长期空闲）时要回收「这个会话的全部任务级状态」。那些状态分散在各处
+     * Map 里、键是 {@link #scopeKey()}，而调用方只拿得到 sessionId ——
+     * 键的拼法（{@code sessionId} 还是 {@code sessionId#N}）属于这里，不该让每个
+     * 回收方各写一遍 {@code startsWith(sessionId + "#")}。判定口径只留这一处。</p>
+     */
+    public static boolean belongsTo(String scopeKey, String sessionId) {
+        if (scopeKey == null || sessionId == null) {
+            return false;
+        }
+        return scopeKey.equals(sessionId)
+                || (scopeKey.length() > sessionId.length() + 1
+                    && scopeKey.startsWith(sessionId)
+                    && scopeKey.charAt(sessionId.length()) == SEP.charAt(0));
+    }
 }

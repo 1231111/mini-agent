@@ -12,7 +12,7 @@
 
     <artifactId>mini-agent-tools</artifactId>
     <name>mini-agent-tools</name>
-    <description>工具：注册表、浏览器、MCP、ComfyUI、检索、技能</description>
+    <description>工具：注册表、浏览器、MCP、检索、技能、文档读写、媒体生成（云端生图/生歌）</description>
     <packaging>jar</packaging>
 
     <dependencies>

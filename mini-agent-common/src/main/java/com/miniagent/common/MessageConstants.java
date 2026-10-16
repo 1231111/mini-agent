@@ -55,6 +55,10 @@ public final class MessageConstants {
     public static final String TURN_TOOLS_HEADER = "# 本轮工具面";
     public static final String AGENT_LLM_NO_RESPONSE = "LLM 无响应/超时";
     public static final String AGENT_LLM_REFUSED = "模型未能给出可用答复，请换个说法再试。";
+    /** 安全网关拒答后的一轮恢复。%s 是结束原因，例如 CONTENT_FILTER。 */
+    public static final String AGENT_LLM_REFUSE_RETRY =
+            "【系统通知】上一轮回复被安全网关拒绝（%s）。不要复述拒答原文，也不要原样重发被拒内容。"
+                    + "已有搜索结果只保留标题和链接。请直接据此完成用户任务；还缺事实再换一个更窄的查询。";
     public static final String AGENT_LLM_NETWORK_RECONNECT = "【系统通知】上次模型调用遇到临时网络问题，已自动重连。请继续刚才的任务。";
     public static final String AGENT_LLM_NETWORK_FAILED = "（模型连接异常，已自动重试但仍失败，请稍后再试或联系管理员）";
     public static final String AGENT_SUBTASK_PROMPT = "\n（已收到你的补充说明，正在融入当前任务...）\n";
@@ -155,34 +159,6 @@ public final class MessageConstants {
     public static final String BROWSER_EXTRACT_EMPTY = "抽取失败: 正文过短 url=%s";
     public static final String BROWSER_EXTRACT_FAILED = "抽取失败: %s";
     public static final String BROWSER_EMPTY_PAGE = "（页面为空）";
-
-    // ==================== COMFYUI ====================
-    public static final String COMFYUI_NOT_RUNNING = "ComfyUI 未运行或无法连接 (%s)";
-    public static final String COMFYUI_NO_MODELS = "ComfyUI 中没有可用的 checkpoint 模型。请先在 ComfyUI/models/checkpoints/ 中放置模型文件。";
-    public static final String COMFYUI_GET_MODELS_FAILED = "获取模型列表失败: %s";
-    public static final String COMFYUI_SUBMIT_FAILED_NULL = "提交工作流失败，ComfyUI 可能未启动";
-    public static final String COMFYUI_SUBMIT_FAILED = "提交工作流失败: %s";
-    public static final String COMFYUI_NO_PROMPT_ID = "提交成功但未获取到 prompt_id";
-    public static final String COMFYUI_EXEC_ERROR = "ComfyUI 执行出错: %s";
-    public static final String COMFYUI_GENERATION_TIMEOUT = "图片生成超时(%d秒)，可能仍在处理中。用 comfyui_execute(action=status, prompt_id=\"%s\") 手动查询。";
-    public static final String COMFYUI_TXT2IMG_FAILED = "文生图失败: %s";
-    public static final String COMFYUI_IMG2IMG_FAILED = "图生图失败: %s";
-    public static final String COMFYUI_IMG2VIDEO_FAILED = "图生视频失败: %s";
-    public static final String COMFYUI_TTS_FAILED = "TTS 失败: %s";
-    public static final String COMFYUI_IMAGE_NOT_FOUND = "图片文件不存在: %s";
-    public static final String COMFYUI_IMAGE_UPLOADED = "图片已上传，可用于 img2img 工作流";
-    public static final String COMFYUI_UPLOAD_FAILED = "上传图片失败: %s";
-    public static final String COMFYUI_GET_WORKFLOW_FAILED = "获取工作流失败: %s";
-
-    // ==================== IMAGE QUALITY CHECKER ====================
-    public static final String IQC_IMAGE_NOT_FOUND = "生成图不存在: %s";
-    public static final String IQC_FILE_TOO_SMALL = "文件过小";
-    public static final String IQC_FILE_TOO_SMALL_MAYBE_FAILED = "文件过小，可能生成失败";
-    public static final String IQC_MODEL_CALL_FAILED = "质检模型调用失败";
-    public static final String IQC_MODEL_CALL_FAILED_DEFAULT_PASS = "质检模型调用失败，默认通过";
-    public static final String IQC_CHECK_EXCEPTION = "质检异常";
-    public static final String IQC_PROVIDE_PATH = "请提供图片路径";
-    public static final String IQC_IMAGE_FILE_NOT_FOUND = "图片文件不存在: %s";
 
     // ==================== MCP ====================
     public static final String MCP_NOT_ENABLED = "MCP 未启用";

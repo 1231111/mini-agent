@@ -2,9 +2,9 @@ package com.miniagent.agent.tool;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.browser.BrowserService;
-import com.miniagent.agent.comfyui.ComfyUIService;
-import com.miniagent.agent.comfyui.ImageQualityChecker;
 import com.miniagent.agent.skill.SkillStore;
+import com.miniagent.agent.song.LyriaMusicService;
+import com.miniagent.agent.song.MiniMaxMusicService;
 import com.miniagent.agent.song.SongGenerationService;
 import com.miniagent.agent.security.GuardedHttpClient;
 import com.miniagent.agent.security.NetworkGuard;
@@ -53,15 +53,21 @@ public class BuiltinTools {
     private  BrowserService browserService;
     @Autowired
     private  WebSearchService webSearchService;
+    /**
+     * 漏掉 {@code @Autowired} 时字段为 null，{@code skill_list} / {@code skill_view} /
+     * {@code skill_manage} 三个工具注册照常成功、调用才 NPE —— 症状是「模型说工具调用出错」，
+     * 而工具清单里明明有它。改动本类字段时逐个确认注解在位。
+     */
+    @Autowired
     private  SkillStore skillStore;
-    @Autowired
-    private  ComfyUIService comfyuiService;
-    @Autowired
-    private  ImageQualityChecker qualityChecker;
     @Autowired
     private  ImageGenerationService imageGenerationService;
     @Autowired
     private  SongGenerationService songGenerationService;
+    @Autowired
+    private  MiniMaxMusicService miniMaxMusicService;
+    @Autowired
+    private  LyriaMusicService lyriaMusicService;
     @Autowired
     private  NetworkGuard networkGuard;
 
@@ -124,7 +130,8 @@ public class BuiltinTools {
         registerSkillTools();
         registerImageGenerateTool();
         registerSongGenerateTool();
-        registerComfyUITools();
+        registerMiniMaxMusicTool();
+        registerLyriaMusicTool();
     }
 
 
@@ -235,7 +242,7 @@ public class BuiltinTools {
                 ? Path.of(System.getProperty("user.dir")).toAbsolutePath()
                 : resolveSearchPath(path);
         if (!Files.exists(root)) {
-            return "{\"error\":\"路径不存在: " + path + "\"}";
+            return errorJson(ToolErrorCode.NOT_FOUND, "路径不存在: " + path);
         }
 
         String rg = ripgrepPath();
@@ -378,7 +385,7 @@ public class BuiltinTools {
         try {
             Path target = resolveSearchPath(path);
             if (!Files.exists(target)) {
-                return "{\"error\":\"文件不存在: " + path + "（新建文件用 write_file）\"}";
+                return errorJson(ToolErrorCode.NOT_FOUND, "文件不存在: " + path + "（新建文件用 write_file）");
             }
             String content = Files.readString(target, StandardCharsets.UTF_8);
 
@@ -608,7 +615,7 @@ public class BuiltinTools {
         registry.register(Tool.builder()
                 .name("image_generate")
                 .description("生成图片（云端多后端自动降级：ChatAnywhere/MiMo/FAL/SiliconFlow/智谱CogView）。\n" +
-                        "不需要 ComfyUI 服务，适合快速生成概念图、插画等。英文 prompt 效果最好，中文也可以用。\n" +
+                        "适合快速生成概念图、插画等。英文 prompt 效果最好，中文也可以用。\n" +
                         "后端由工具自动选择，无需关心细节；工具直接返回可渲染的图片链接（Markdown 格式）。\n" +
                         "用户只是要看图时：原样输出图片链接，不要额外解释、不要说\"图片已生成\"。\n" +
                         "用户要求把图写进文档时：先用 todo 拆成「生图 → 定位文档 → 写入图片链接」，\n" +
@@ -646,7 +653,7 @@ public class BuiltinTools {
     private void registerSongGenerateTool() {
         registry.register(SongGenerateParams.TOOL_NAME,
                 "创作一整首歌（作词 + 作曲 + 演唱），走 SenseAudio 云端，约需 3 分钟。\n" +
-                "不需要 ComfyUI 或本地算力。成功后返回可直接播放的音频链接（Markdown 格式）；" +
+                "不需要本地算力。成功后返回可直接播放的音频链接（Markdown 格式）；" +
                 "音频已由工具下载到本地，不要自己再去下载或转存。\n" +
                 "用户只是要听歌时：原样输出音频链接，不要额外解释、不要说「歌曲已生成」。\n" +
                 "若返回 status=PENDING（歌还在生成）：先告诉用户还在生成中，" +
@@ -655,134 +662,26 @@ public class BuiltinTools {
                 songGenerationService::generate);
     }
 
-    // ==================== ComfyUI 工具（集成自 ClawHub skills） ====================
-
-    private void registerComfyUITools() {
-        // 1. 状态检查
-        registry.register("comfyui_status", "检查 ComfyUI 服务是否在线，返回 GPU/VRAM 等系统信息。",
-                Map.of(), args -> comfyuiService.getStatus());
-
-        // 2. 列出工作流/节点
-        registry.register("comfyui_workflows", "列出 ComfyUI 可用的节点和工作流类别。",
-                Map.of(), args -> comfyuiService.listWorkflows());
-
-        // 2.5 获取可用模型
-        registry.register("comfyui_models", "列出 ComfyUI 中已安装的 checkpoint 模型。文生图前先查看可用模型。",
-                Map.of(), args -> comfyuiService.getCheckpointModels());
-
-        // 3. 执行工作流（通用）
-        registry.register("comfyui_execute",
-                "执行 ComfyUI 工作流。三种模式：1) action=run + workflow_json → 提交；2) action=status + prompt_id → 查询；3) action=upload + image_path → 上传图片。",
-                Map.of(
-                        "action", Map.of("type", "string", "description", "操作: run / status / upload", "required", true),
-                        "workflow_json", Map.of("type", "string", "description", "ComfyUI API 格式的工作流 JSON（run 时必填）"),
-                        "prompt_id", Map.of("type", "string", "description", "任务ID（status 时必填）"),
-                        "image_path", Map.of("type", "string", "description", "本地图片路径（upload 时必填）")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    String action = (String) p.get("action");
-                    return switch (action) {
-                        case "run" -> comfyuiService.submitWorkflow((String) p.get("workflow_json"));
-                        case "status" -> comfyuiService.checkStatus((String) p.get("prompt_id"));
-                        case "upload" -> comfyuiService.uploadImage((String) p.get("image_path"));
-                        default -> "{\"error\":\"未知action: " + action + "\"}";
-                    };
-                });
-
-        // 4. 文生图快捷方式
-        registry.register("comfyui_txt2img",
-                "通过 ComfyUI 文生图。必须先调 comfyui_models 查看可用模型，根据画风选择合适的 checkpoint。提交后返回图片结果。",
-                Map.of(
-                        "prompt", Map.of("type", "string", "description", "正向提示词（英文效果更好，尽量详细描述画面内容、风格、光影）", "required", true),
-                        "negative_prompt", Map.of("type", "string", "description", "负向提示词（不想出现的元素，如 low quality, blurry, deformed 等，不填则用默认值）"),
-                        "checkpoint", Map.of("type", "string", "description", "checkpoint 模型名（必填，从 comfyui_models 返回的列表中选择，根据画风选合适的模型）"),
-                        "width", Map.of("type", "integer", "description", "宽度（默认768）"),
-                        "height", Map.of("type", "integer", "description", "高度（默认768）"),
-                        "steps", Map.of("type", "integer", "description", "采样步数（默认25，越高越细腻但越慢）"),
-                        "cfg", Map.of("type", "number", "description", "CFG引导系数（默认7.0，越高越贴近提示词但可能过拟合）"),
-                        "seed", Map.of("type", "integer", "description", "随机种子（不填则随机）")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    return comfyuiService.txt2img(
-                            (String) p.get("prompt"),
-                            (String) p.getOrDefault("negative_prompt", ""),
-                            p.containsKey("width") ? ((Number) p.get("width")).intValue() : 768,
-                            p.containsKey("height") ? ((Number) p.get("height")).intValue() : 768,
-                            (String) p.get("checkpoint"),
-                            p.containsKey("steps") ? ((Number) p.get("steps")).intValue() : 25,
-                            p.containsKey("cfg") ? ((Number) p.get("cfg")).doubleValue() : 7.0,
-                            p.containsKey("seed") ? ((Number) p.get("seed")).longValue() : null
-                    );
-                });
-
-        // 4.5 图生图（img2img）
-        registry.register("comfyui_img2img",
-                "图生图：上传参考图 + 提示词，在原图基础上重新绘制。denoise 控制变化程度（0=不变，1=完全重绘，推荐0.4~0.7）。图片路径从用户消息中获取（File saved at: 后的路径）。",
-                Map.of(
-                        "image_path", Map.of("type", "string", "description", "参考图片的本地路径（必填）", "required", true),
-                        "prompt", Map.of("type", "string", "description", "正向提示词（描述想要的效果/风格变化）", "required", true),
-                        "negative_prompt", Map.of("type", "string", "description", "负向提示词（不填用默认值）"),
-                        "checkpoint", Map.of("type", "string", "description", "checkpoint 模型名（从 comfyui_models 选）"),
-                        "denoise", Map.of("type", "number", "description", "去噪强度 0~1（默认0.6，越小越保留原图，越大变化越大）"),
-                        "steps", Map.of("type", "integer", "description", "采样步数（默认25）"),
-                        "cfg", Map.of("type", "number", "description", "CFG引导系数（默认7.0）"),
-                        "seed", Map.of("type", "integer", "description", "随机种子（不填则随机）")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    return comfyuiService.img2img(
-                            (String) p.get("image_path"),
-                            (String) p.get("prompt"),
-                            (String) p.getOrDefault("negative_prompt", ""),
-                            (String) p.get("checkpoint"),
-                            p.containsKey("denoise") ? ((Number) p.get("denoise")).doubleValue() : 0.6,
-                            p.containsKey("steps") ? ((Number) p.get("steps")).intValue() : 25,
-                            p.containsKey("cfg") ? ((Number) p.get("cfg")).doubleValue() : 7.0,
-                            p.containsKey("seed") ? ((Number) p.get("seed")).longValue() : null
-                    );
-                });
-
-        // 4.8 图片质检
-        registry.register("comfyui_check_quality",
-                "检查 AI 生成图片的质量。传入图片路径，返回质量评分和问题列表。7分及以上合格，不合格时会给出改进建议。生成图片后务必调用此工具检查质量。",
-                Map.of(
-                        "image_path", Map.of("type", "string", "description", "图片本地路径（必填）", "required", true)
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    return qualityChecker.check((String) p.get("image_path"));
-                });
-
-        // 5. 图生视频
-        registry.register("comfyui_img2video",
-                "图片转视频（LTX-2）。上传图片并生成动态视频，约5-10分钟。",
-                Map.of(
-                        "image_path", Map.of("type", "string", "description", "输入图片路径", "required", true),
-                        "movement", Map.of("type", "string", "description", "运动描述，如 gentle hair breeze")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    return comfyuiService.img2video(
-                            (String) p.get("image_path"),
-                            (String) p.getOrDefault("movement", "gentle movement"));
-                });
-
-        // 6. TTS 语音合成
-        registry.register("comfyui_tts",
-                "通过 ComfyUI Qwen-TTS 将文本转语音。",
-                Map.of(
-                        "text", Map.of("type", "string", "description", "文本", "required", true),
-                        "voice", Map.of("type", "string", "description", "语音风格")
-                ),
-                args -> {
-                    Map<String, Object> p = parseJson(args);
-                    return comfyuiService.tts(
-                            (String) p.get("text"),
-                            (String) p.get("voice"));
-                });
+    private void registerMiniMaxMusicTool() {
+        registry.register(MiniMaxMusicParams.TOOL_NAME,
+                "用 MiniMax Music 生成一首带人声（或纯音乐）的歌，同步接口，约 1～3 分钟。\n" +
+                "SenseAudio 的 song_generate 人声失败时改用本工具。\n" +
+                "有歌词就传 lyrics；没有歌词只传 prompt，服务会先写词再作曲。\n" +
+                "成功后返回可播放的 Markdown 音频链接，不要自己再下载。",
+                MiniMaxMusicParams.class,
+                miniMaxMusicService::generate);
     }
+
+    private void registerLyriaMusicTool() {
+        registry.register(LyriaMusicParams.TOOL_NAME,
+                "用 Google Lyria 3.5 生成一首带人声（或纯音乐）的完整歌曲，同步接口，约 2～4 分钟。\n" +
+                "SenseAudio 的 song_generate 人声失败时改用本工具。需要 GEMINI_API_KEY。\n" +
+                "prompt 必填，可在文案里写时长；有歌词就传 lyrics。\n" +
+                "成功后返回可播放的 Markdown 音频链接，不要自己再下载。",
+                LyriaMusicParams.class,
+                lyriaMusicService::generate);
+    }
+
 
     private void registerSkillTools() {
         // skill_list - 列出所有已安装的 skill
@@ -806,14 +705,18 @@ public class BuiltinTools {
                     String name = (String) p.get("name");
                     String filePath = (String) p.getOrDefault("file_path", "");
                     if (Objects.isNull(name)) {
-                        return "{\"error\":\"name is required\"}";
+                        return errorJson(ToolErrorCode.INVALID_ARGUMENT, "name is required");
                     }
                     if (!filePath.isEmpty()) {
                         String content = skillStore.viewSkillFile(name, filePath);
-                        return Optional.ofNullable(content).orElse("File not found: " + name + "/" + filePath);
+                        // 用 errorJson 而不是裸文本：裸文本 walks 到 fromLegacy 的最后一行 return success(rawText)，
+                        // 于是「找不到」被判成成功，失败闸门不会触发（2026-10-15 实测）。
+                        return Optional.ofNullable(content).orElse(errorJson(ToolErrorCode.NOT_FOUND,
+                                "File not found: " + name + "/" + filePath));
                     }
                     String content = skillStore.viewSkill(name);
-                    return Optional.ofNullable(content).orElse("Skill not found: " + name);
+                    return Optional.ofNullable(content).orElse(errorJson(ToolErrorCode.NOT_FOUND,
+                                "Skill not found: " + name));
                 });
 
         // skill_manage - 创建/编辑/删除 skill
@@ -941,7 +844,7 @@ public class BuiltinTools {
         try {
             Path target = resolveReadPath(path);
             if (!Files.exists(target)) {
-                return "{\"error\":\"文件不存在: " + path + "\"}";
+                return errorJson(ToolErrorCode.NOT_FOUND, "文件不存在: " + path);
             }
             int from = Math.max(1, offset);
             int maxLines = Math.max(0, limit);
@@ -1028,7 +931,7 @@ public class BuiltinTools {
             }
 
             if (!Files.isDirectory(pkgDir)) {
-                return "{\"error\":\"包不存在: " + packageName + "（已尝试解析为 " + pkgDir + "）\"}";
+                return errorJson(ToolErrorCode.NOT_FOUND, "包不存在: " + packageName + "（已尝试解析为 " + pkgDir + "）");
             }
 
             List<Path> files = Files.walk(pkgDir, 1)
@@ -1095,10 +998,10 @@ public class BuiltinTools {
                 long existing = Files.size(target);
                 long incoming = finalContent.getBytes(StandardCharsets.UTF_8).length;
                 if (existing >= KEEP_LARGE_FILE_MIN_BYTES && incoming * 2 < existing) {
-                    return "{\"error\":\"拒绝用短文本覆盖已有大文件 "
-                            + target.getFileName() + "（现有 " + existing
-                            + " 字节，本次 " + incoming
-                            + "）。请改写其他文件名，或用 mode=append。\"}";
+                    return errorJson(ToolErrorCode.CONFLICT,
+                            "拒绝用短文本覆盖已有大文件 " + target.getFileName()
+                                    + "（现有 " + existing + " 字节，本次 " + incoming
+                                    + "）。请改写其他文件名，或用 mode=append。");
                 }
                 Files.writeString(target, finalContent, StandardCharsets.UTF_8);
             } else {
@@ -1121,7 +1024,7 @@ public class BuiltinTools {
         try {
             Path target = resolveReadPath(path);
             if (!Files.exists(target)) {
-                return "{\"error\":\"目录不存在: " + path + "\"}";
+                return errorJson(ToolErrorCode.NOT_FOUND, "目录不存在: " + path);
             }
             StringBuilder sb = new StringBuilder();
             if (recursive) {
@@ -1397,20 +1300,20 @@ public class BuiltinTools {
         for (String bad : DANGEROUS_COMMANDS) {
             if (lc.contains(bad.toLowerCase())) {
                 log.warn("安全拦截 - 黑名单命中: {}", redactSensitive(command));
-                return "{\"error\":\"命令被安全策略拒绝：该命令包含危险操作。\"}";
+                return errorJson(ToolErrorCode.PERMISSION_DENIED, "命令被安全策略拒绝：该命令包含危险操作。");
             }
         }
 
         // 第2层：正则模式匹配（防止编码绕过）
         if (DANGEROUS_PATTERN.matcher(command).find()) {
             log.warn("安全拦截 - 危险模式命中: {}", redactSensitive(command));
-            return "{\"error\":\"命令被安全策略拒绝：检测到危险操作模式。\"}";
+            return errorJson(ToolErrorCode.PERMISSION_DENIED, "命令被安全策略拒绝：检测到危险操作模式。");
         }
 
         // 第3层：命令注入防护（检测链式命令）
         if (containsCommandInjection(command)) {
             log.warn("安全拦截 - 命令注入检测: {}", redactSensitive(command));
-            return "{\"error\":\"命令被安全策略拒绝：检测到可能的命令注入。\"}";
+            return errorJson(ToolErrorCode.PERMISSION_DENIED, "命令被安全策略拒绝：检测到可能的命令注入。");
         }
 
         // 第3.5层：常驻/前台服务器命令拦截。这类命令永不退出，前台跑会把工具线程挂死，
@@ -1731,5 +1634,31 @@ public class BuiltinTools {
         } catch (NumberFormatException e) {
             return defaultValue;
         }
+    }
+
+    /**
+     * 工具失败结果。**带上 errorCode，上游就不必猜**。
+     *
+     * <p>{@code ToolResult.fromLegacy} 见到 {@code errorCode} 就直接采信，见不到才拿文案刮关键字
+     * （timeout / 429 / 503）。像「安全策略拒绝」「文件不存在」这类文案里没有关键词的失败，
+     * 刮不出来就一律降级成 {@code EXECUTION_FAILED}，而上游 {@code RecoveryEngine} 据此选恢复档 ——
+     * 结果是「该换方案的被当成可重试」「该重试的被当成做不了」。</p>
+     *
+     * <p>顺带修掉一个隐患：旧写法把 message 直接拼进 JSON，
+     * 路径或命令输出里出现引号就会产出坏 JSON
+     * （{@code {"error":"路径不存在: C:\a"b.txt"}}）。</p>
+     */
+    static String errorJson(ToolErrorCode code, String message) {
+        String codeName = (code == null ? ToolErrorCode.EXECUTION_FAILED : code).name();
+        return "{\"errorCode\":\"" + codeName + "\",\"error\":\"" + jsonEscape(message) + "\"}";
+    }
+
+    /** JSON 字符串字面量转义：路径与命令输出里出现引号是常态。 */
+    static String jsonEscape(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
     }
 }

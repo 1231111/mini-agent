@@ -9,8 +9,38 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 class SessionPermissionStorePersistenceTest {
+
+    @Test
+    void askGrantIsBoundToExactArgumentsAndTokenApproval() {
+        SessionPermissionStore store = new SessionPermissionStore();
+        AskGrant pending = store.issueAskGrant("s1", "exec_command",
+                "{\"command\":\"echo ok\"}", 60_000L);
+
+        assertFalse(store.isAskGranted("s1", "exec_command",
+                "{\"command\":\"echo ok\"}"),
+                "issuing a token must not authorize before the user approves it");
+        assertTrue(store.grantAskToken("s1", pending.token()).isPresent());
+        assertTrue(store.isAskGranted("s1", "exec_command",
+                "{\"command\":\"echo ok\"}"));
+        assertFalse(store.isAskGranted("s1", "exec_command",
+                "{\"command\":\"echo no\"}"));
+        assertFalse(store.isAskGranted("s1", "write_file",
+                "{\"command\":\"echo ok\"}"));
+        assertFalse(store.grantAskToken("s1", pending.token()).isPresent(),
+                "approval tokens are single-use");
+    }
+
+    @Test
+    void mismatchedToolCannotConsumePendingToken() {
+        SessionPermissionStore store = new SessionPermissionStore();
+        AskGrant pending = store.issueAskGrant("s1", "exec_command", "{}", 60_000L);
+
+        assertTrue(store.grantAskToken("s1", pending.token(), "write_file").isEmpty());
+        assertTrue(store.grantAskToken("s1", pending.token(), "exec_command").isPresent());
+    }
 
     @Test
     void restartAndOtherReplicaReadThePersistedPermissionState() {

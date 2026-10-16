@@ -3,6 +3,7 @@ package com.miniagent.agent.memory;
 import com.miniagent.agent.skill.SkillStore;
 import com.miniagent.agent.web.MultimodalMedia;
 import com.miniagent.common.ChatRole;
+import com.miniagent.common.event.SessionEvictedEvent;
 import com.miniagent.config.service.DatabaseConversationStore;
 import com.miniagent.config.storage.MediaStorage;
 import com.miniagent.memory.AgentDataPaths;
@@ -19,6 +20,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.event.EventListener;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -34,6 +36,8 @@ public class ChatMemoryConfig {
     private int maxMessages;
 
     private final Map<String, ChatMemory> memories = new ConcurrentHashMap<>();
+    /** 最后一次取用时间：判定"这个会话还用不用得上"，是空闲回收的唯一依据。 */
+    private final Map<String, Long> lastAccess = new ConcurrentHashMap<>();
 
     @Bean
     public MemoryStore memoryStore(AgentDataPaths dataPaths,
@@ -57,6 +61,43 @@ public class ChatMemoryConfig {
 
     public List<String> getAllSessionIds() {
         return new ArrayList<>(memories.keySet());
+    }
+
+    /**
+     * 释放某个会话的进程内状态。
+     *
+     * <p><b>为什么需要它</b>：{@code memories} 只在 chatMemoryProvider 里 {@code put}，
+     * 从来没有 {@code remove} —— 桌面客户端点 × 只是隐藏到托盘、进程常年不重启，
+     * 于是每聊过一个会话就多留一份消息窗口，内存单调上涨直到被系统杀掉。</p>
+     *
+     * <p>释放是安全的：记忆窗口本来就在 chatMemoryProvider 里按需从
+     * {@code DatabaseConversationStore} 重建，丢的是缓存不是内容。</p>
+     */
+    public boolean evict(String sessionId) {
+        if (StringUtils.isBlank(sessionId)) {
+            return false;
+        }
+        String sid = sessionId.trim();
+        lastAccess.remove(sid);
+        return memories.remove(sid) != null;
+    }
+
+    /** 空闲达到 {@code ttlMillis} 的会话；没有任何活动记录的按"从未取用"处理，同样算空闲。 */
+    public List<String> idleSessions(long nowMillis, long ttlMillis) {
+        List<String> idle = new ArrayList<>();
+        for (String sid : memories.keySet()) {
+            Long last = lastAccess.get(sid);
+            if (last == null || nowMillis - last >= ttlMillis) {
+                idle.add(sid);
+            }
+        }
+        return idle;
+    }
+
+    /** 会话被删除或判定空闲时，清掉它的记忆窗口。 */
+    @EventListener
+    public void onSessionEvicted(SessionEvictedEvent event) {
+        evict(event.sessionId());
     }
 
     @Bean
@@ -93,6 +134,7 @@ public class ChatMemoryConfig {
                 }
             }
             memories.put(sid, memory);
+            lastAccess.put(sid, System.currentTimeMillis());
             return memory;
         };
     }

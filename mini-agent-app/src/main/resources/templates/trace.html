@@ -11,8 +11,14 @@
         // 页面骨架由服务端无条件返回（浏览器导航带不了 Authorization 头），
         // 身份判断只能在这儿做：没有 token 就别渲染，直接回登录页。
         (function () {
+            // 这段必须内联：它执行时 security.js 还没加载，用不了 MiniAuth。
+            // token 来源优先壳的持久存储（Electron 客户端），其次页面 web 存储。
             var tk = '';
-            try { tk = sessionStorage.getItem('ma_token') || ''; } catch (e) { tk = ''; }
+            try {
+                var b = window.desktopAuth;
+                tk = (b && typeof b.getToken === 'function') ? (b.getToken() || '')
+                    : (sessionStorage.getItem('ma_token') || '');
+            } catch (e) { tk = ''; }
             if (!tk) { window.location.replace('/login'); }
         })();
     </script>
@@ -47,7 +53,9 @@
         .sidebar {
             width: 280px; background: var(--sidebar-bg);
             display: flex; flex-direction: column;
-            flex-shrink: 0; height: 100vh;
+            /* 100% 而非 100vh：壳给 body 加 32px padding-top 放自绘标题栏，
+               用 100vh 会高出这 32px，底部被 body{overflow:hidden} 裁掉 */
+            flex-shrink: 0; height: 100%;
             border-right: 1px solid var(--border);
         }
         .sb-header {
@@ -79,7 +87,8 @@
             background: var(--accent-soft); color: var(--accent);
         }
         /* MAIN */
-        .main { flex: 1; display: flex; flex-direction: column; min-width: 0; height: 100vh; }
+        /* 同 .sidebar：100% 而非 100vh，否则壳里会多出标题栏那 32px */
+        .main { flex: 1; display: flex; flex-direction: column; min-width: 0; height: 100%; }
         .topbar {
             padding: 12px 20px; border-bottom: 1px solid var(--border);
             display: flex; align-items: center; gap: 12px; flex-shrink: 0;
@@ -1682,7 +1691,7 @@ function renderDiagnosisPanel(traces) {
     });
     const hasBrowse = pairs.some(p => p.tool === 'browser_navigate');
     const hasShot = pairs.some(p => p.tool === 'browser_screenshot');
-    const hasRealMedia = pairs.some(p => /^(image_generate|comfyui_)/.test(p.tool));
+    const hasRealMedia = pairs.some(p => /^(image_generate|song_generate)$/.test(p.tool));
     if (hasBrowse && hasShot && !hasRealMedia)
         issues.push('截图后循环被收尾：browser_screenshot 曾被当成“媒体已交付”，读网页任务会被掐断。');
     const uniq = [];

@@ -32,7 +32,7 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>改造前 {@code GLOBAL} 把本地文件系统、本地 GPU、远程 API 配额三类互不相干的资源
  * 挤到同一个 {@code "global"} 键上。现在 {@code SHARED_RESOURCE} 按命名资源分键
- * （{@code comfyui-gpu} / {@code image-api}），与本地文件系统互不干扰。</p>
+ * （如 {@code image-api}），与本地文件系统互不干扰。</p>
  *
  * <h2>外层闸门的取值顺序</h2>
  *
@@ -218,7 +218,7 @@ public class ToolExecutionGuards implements SmartInitializingSingleton {
             case GLOBAL -> "global";
             case SESSION -> "session:" + Optional.ofNullable(sessionId).orElse("anonymous");
             case ARGUMENT -> descriptor.name() + ":" + argumentValue(args, descriptor.concurrencyKeyArgument());
-            // 命名的外部共享资源：comfyui_* 抢同一块 GPU、生成 API 抢同一份配额。
+            // 命名的外部共享资源：生成 API 抢同一份配额（如 image-api）。
             // 键写在执行契约里，与本地文件系统的 "global" 键互不干扰。
             case SHARED_RESOURCE -> descriptor.sharedResourceKey();
         };

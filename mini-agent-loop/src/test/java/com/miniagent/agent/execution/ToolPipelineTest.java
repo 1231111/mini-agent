@@ -273,6 +273,19 @@ class ToolPipelineTest {
     }
 
     @Test
+    void legacyToolGrantDoesNotAuthorizeDifferentArguments() {
+        AtomicInteger calls = new AtomicInteger();
+        Fixture fx = new Fixture("ask", execRegistry(calls));
+        fx.store.grantAskTool("s", "exec_command");
+
+        ToolInvocation invocation = fx.pipeline.invoke(ToolRequest.of(
+                "s", "exec_command", "{\"command\":\"different\"}", 0, "r2"));
+
+        assertEquals(ToolInvocation.Outcome.PERMISSION_ASK, invocation.outcome());
+        assertEquals(0, calls.get(), "a compatibility grant must remain argument scoped");
+    }
+
+    @Test
     void sessionOverrideTightensGlobalAllow() {
         // 出厂 allow + 用户在某会话里切 block：这是本功能的核心用例。
         AtomicInteger calls = new AtomicInteger();

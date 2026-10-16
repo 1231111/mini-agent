@@ -13,7 +13,7 @@ public class PlanUnapprovedStopHook implements StopHook {
 
     private static final java.util.Set<String> EXEC_HINTS = java.util.Set.of(
             "write_file", "edit_file", "exec_command", "delegate_task",
-            "image_generate", "comfyui_txt2img", "comfyui_img2img"
+            "image_generate"
     );
 
     @Override

@@ -65,6 +65,8 @@ public class ToolPipeline {
     private TraceRecorder traceRecorder;
     @Value("${agent.browser.evaluate-enabled:false}")
     private boolean browserEvaluateEnabled;
+    @Value("${agent.permissions.ask-grant-ttl-seconds:300}")
+    private long askGrantTtlSeconds = 300L;
 
     public ToolPipeline(
             ExecutionControl executionControl,
@@ -163,7 +165,25 @@ public class ToolPipeline {
                     ToolResult.fromLegacy(MessageConstants.AGENT_USER_QUESTION_TOOL_PENDING),
                     text);
         }
-        boolean granted = sid != null && permissionStore.isAskGranted(sid, name);
+        boolean sub = run.subagent();
+        // Resolve hook rewrites before authorization. The digest must cover
+        // the arguments that will actually reach the registry, otherwise a
+        // rewrite hook could turn an approved invocation into another one.
+        ToolPreDecision pre = toolHookChain.before(
+                new ToolHookContext(sid, name, args, turn, sub));
+        if (pre != null && pre.deny()) {
+            recordNode(sid, turn, "HOOK_DENY",
+                    "{\"tool\":\"" + name + "\"}", RunStatus.FAILURE.name());
+            String msg = Optional.ofNullable(pre.denyMessage())
+                    .orElse("{\"error\":\"工具被 Hook 拒绝\"}");
+            return ToolInvocation.policyDenied(name, ToolResult.fromLegacy(msg));
+        }
+        String effective = (pre != null && pre.argumentsJson() != null)
+                ? pre.argumentsJson() : args;
+        // Grants are exact invocation approvals. A grant for one command or
+        // request must never become a standing approval for the tool name.
+        boolean granted = sid != null
+                && permissionStore.isAskGranted(sid, name, effective);
 
         // exec_command 的生效策略：会话覆盖 ?? 全局默认，再计入会话模式（ACCEPT_EDITS 相当于"别问我"）。
         ExecPolicy effectiveExec = execPolicyService.effective(sid, mode);
@@ -181,7 +201,10 @@ public class ToolPipeline {
                             + "要执行命令请先把策略切到 ask 或 allow。\"}"));
         }
         if (PermissionPolicy.needsSessionGrant(mode, name, effectiveExec) && !granted) {
-            emitPermissionAsk(sid, name, args);
+            var grant = permissionStore.issueAskGrant(
+                    sid, name, effective, Math.max(1L, askGrantTtlSeconds) * 1000L);
+            emitPermissionAsk(sid, name, effective, grant == null ? null : grant.token(),
+                    grant == null ? 0L : grant.expiresAtEpochMillis());
             recordNode(sid, turn, "WAITING_FOR_HUMAN",
                     "{\"tool\":\"" + name + "\",\"mode\":\"" + mode.wireName()
                             + "\",\"reason\":\"permission_ask\"}",
@@ -190,18 +213,6 @@ public class ToolPipeline {
                     MessageConstants.AGENT_PERM_ASK_TOOL_PENDING, name, name);
             return ToolInvocation.permissionAsk(name, ToolResult.fromLegacy(pending));
         }
-        boolean sub = run.subagent();
-        ToolPreDecision pre = toolHookChain.before(
-                new ToolHookContext(sid, name, args, turn, sub));
-        if (pre != null && pre.deny()) {
-            recordNode(sid, turn, "HOOK_DENY",
-                    "{\"tool\":\"" + name + "\"}", RunStatus.FAILURE.name());
-            String msg = Optional.ofNullable(pre.denyMessage())
-                    .orElse("{\"error\":\"工具被 Hook 拒绝\"}");
-            return ToolInvocation.policyDenied(name, ToolResult.fromLegacy(msg));
-        }
-        String effective = (pre != null && pre.argumentsJson() != null)
-                ? pre.argumentsJson() : args;
         ToolResult raw = executeJournaled(
                 run,
                 sid,
@@ -361,7 +372,8 @@ public class ToolPipeline {
      * 用户看不出这条命令要干什么，只能盲批。display 是工具自己给的人话说明
      * （见 {@code ExecCommandParams.displayText}），前端读不到时会退化成现在这样，不影响老客户端。</p>
      */
-    private void emitPermissionAsk(String sessionId, String tool, String argumentsJson) {
+    private void emitPermissionAsk(String sessionId, String tool, String argumentsJson,
+                                   String grantToken, long expiresAt) {
         if (eventCenter == null || StringUtils.isBlank(sessionId)
                 || StringUtils.isBlank(tool)) {
             return;
@@ -372,6 +384,13 @@ public class ToolPipeline {
         StringBuilder json = new StringBuilder("{\"tool\":\"").append(jsonEscape(tool)).append('"');
         if (!display.isBlank()) {
             json.append(",\"display\":\"").append(jsonEscape(display)).append('"');
+        }
+        if (StringUtils.isNotBlank(grantToken)) {
+            json.append(",\"grantToken\":\"").append(jsonEscape(grantToken)).append('"');
+            json.append(",\"expiresAt\":").append(expiresAt);
+            json.append(",\"argumentsDigest\":\"")
+                    .append(jsonEscape(SessionPermissionStore.argumentDigest(tool, argumentsJson)))
+                    .append('"');
         }
         json.append('}');
         eventCenter.publish(sessionId, MessageConstants.SSE_PERMISSION_ASK, json.toString());

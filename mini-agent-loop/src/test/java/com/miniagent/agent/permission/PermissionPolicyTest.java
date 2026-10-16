@@ -114,13 +114,20 @@ class PermissionPolicyTest {
         // 新键没给时回退旧键
         assertEquals(ExecPolicy.ASK, ExecPolicyService.resolveGlobal("", "false"));
         assertEquals(ExecPolicy.ALLOW, ExecPolicyService.resolveGlobal(null, "true"));
-        // 两个都没给 → 与旧代码 @Value("${agent.tools.exec-enabled:true}") 一致，即 ALLOW
-        assertEquals(ExecPolicy.ALLOW, ExecPolicyService.resolveGlobal("", ""));
+        // 两个都没给 → 安全兜底为 ASK，不能因为配置/profile 漏配而免批执行命令
+        assertEquals(ExecPolicy.ASK, ExecPolicyService.resolveGlobal("", ""));
         // 写错必须抛，不能静默降级
         org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
                 () -> ExecPolicyService.resolveGlobal("blocc", ""));
         org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
                 () -> ExecPolicyService.resolveGlobal("", "yes"));
+    }
+
+    @Test
+    void missingGlobalExecConfigurationFailsSafeToAsk() {
+        // 配置文件、profile 或外部导入缺失时都必须落到需批准，不能隐式放行。
+        assertEquals(ExecPolicy.ASK, ExecPolicyService.resolveGlobal(null, null));
+        assertEquals(ExecPolicy.ASK, ExecPolicyService.resolveGlobal("  ", "  "));
     }
 
     // ==================== 其余工具不受影响 ====================

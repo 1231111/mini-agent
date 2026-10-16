@@ -5,6 +5,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.stereotype.Component;
 
+import com.miniagent.agent.tool.impl.LyriaMusicParams;
+import com.miniagent.agent.tool.impl.MiniMaxMusicParams;
 import com.miniagent.agent.tool.impl.SongGenerateParams;
 
 import java.util.ArrayList;
@@ -69,9 +71,9 @@ public class CapabilityRegistry implements SmartInitializingSingleton {
 
     /** 媒体生成能力包（图 / 视频 / 音频统一走这里，Planner 节点按能力取工具）。 */
     private static final List<String> IMAGE = List.of(
-            "image_generate", SongGenerateParams.TOOL_NAME, "comfyui_status", "comfyui_models",
-            "comfyui_txt2img", "comfyui_img2img", "comfyui_img2video",
-            "comfyui_tts", "comfyui_check_quality", "render_diagram");
+            "image_generate", SongGenerateParams.TOOL_NAME,
+            MiniMaxMusicParams.TOOL_NAME, LyriaMusicParams.TOOL_NAME,
+            "render_diagram");
 
     private static final List<String> QA =
             List.of("skill_list", "skill_view", "skill_manage");

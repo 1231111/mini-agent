@@ -1,6 +1,7 @@
 package com.miniagent.agent.context;
 
 import com.miniagent.common.embedding.SharedEmbeddingModel;
+import com.miniagent.common.event.SessionEvictedEvent;
 import com.miniagent.memory.AgentDataPaths;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
@@ -12,6 +13,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 import java.nio.file.Files;
@@ -127,11 +129,39 @@ public class LocalSessionHistoryVectorStore implements SessionHistoryVectorStore
             return;
         }
         String sid = sessionId.trim();
-        stores.remove(sid);
-        seqs.remove(sid);
+        forgetCached(sid);
         try {
             Files.deleteIfExists(path(sid));
         } catch (Exception ignored) {}
+    }
+
+    /**
+     * 只丢掉进程内那份向量索引，磁盘上的 JSON 原样保留。
+     *
+     * <p>这是最占内存的一块：每个会话一份 {@link InMemoryEmbeddingStore}，
+     * 里面是全部历史片段的向量。它是<b>可重建</b>的 —— {@code loadOrCreate} 会从磁盘读回，
+     * 所以长时间没人用就该还回去，用户下次再打开这个会话时按需加载。</p>
+     */
+    public void forgetCached(String sessionId) {
+        if (StringUtils.isBlank(sessionId)) {
+            return;
+        }
+        String sid = sessionId.trim();
+        stores.remove(sid);
+        seqs.remove(sid);
+    }
+
+    /**
+     * 会话长期空闲时回收内存索引。
+     *
+     * <p>只订阅空闲：会话被删除时 {@code ConversationService} 已经会显式调
+     * {@link #deleteSession} 把磁盘那份也删掉，这里再删一次是重复劳动。</p>
+     */
+    @EventListener
+    public void onSessionEvicted(SessionEvictedEvent event) {
+        if (!event.isDeleted()) {
+            forgetCached(event.sessionId());
+        }
     }
 
     private InMemoryEmbeddingStore<TextSegment> loadOrCreate(String sid) {

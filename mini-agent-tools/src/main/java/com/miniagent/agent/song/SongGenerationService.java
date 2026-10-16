@@ -3,6 +3,7 @@ package com.miniagent.agent.song;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.impl.SongGenerateParams;
 import com.miniagent.config.storage.MediaStorage;
 import lombok.extern.slf4j.Slf4j;
@@ -24,7 +25,7 @@ import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * 生歌服务 —— 对标 {@code image_generate} / {@code comfyui_tts}，但走 SenseAudio 云端异步接口。
+ * 生歌服务 —— 对标 {@code image_generate}，但走 SenseAudio 云端异步接口。
  *
  * <h2>为什么要有这个类（而不是让技能自己跑脚本）</h2>
  *
@@ -62,10 +63,19 @@ public class SongGenerationService {
     private static final int DOWNLOAD_TIMEOUT_SECONDS = 60;
     /** 轮询间隔。 */
     private static final long POLL_INTERVAL_MS = 5_000L;
-    /** 歌词单独的子预算：歌词是纯文本生成，明显快于作曲，不该吃掉作曲的预算。 */
-    private static final long LYRICS_BUDGET_MS = 90_000L;
     /** 写进错误信息里的响应体上限，避免把整页 HTML 灌进模型上下文。 */
     private static final int BODY_SNIPPET_CHARS = 300;
+
+    /**
+     * SenseAudio Music 2.0 唯一可用模型（官方 enum）。
+     * 旧默认 {@code sensesong} 会 404/参数校验失败。
+     */
+    static final String DEFAULT_MODEL = "senseaudio-music-2.0-260626";
+
+    /** 官方路由：文档 https://docs.senseaudio.cn/api-reference/introduction */
+    private static final String PATH_LYRICS_CREATE = "/v1/music/lyrics/create";
+    private static final String PATH_SONG_CREATE_V2 = "/v2/music/song/create";
+    private static final String PATH_SONG_PENDING = "/v1/music/song/pending/";
 
     @Autowired
     private MediaStorage mediaStorage;
@@ -76,11 +86,8 @@ public class SongGenerationService {
     @Value("${song.gen.base-url:https://api.senseaudio.cn}")
     private String baseUrl;
 
-    @Value("${song.gen.model:sensesong}")
+    @Value("${song.gen.model:" + DEFAULT_MODEL + "}")
     private String songModel;
-
-    @Value("${song.gen.lyrics-provider:sensesong}")
-    private String lyricsProvider;
 
     /**
      * 生歌入口。返回给模型的内容只有三种形态：
@@ -92,10 +99,11 @@ public class SongGenerationService {
      */
     public String generate(SongGenerateParams params) {
         if (params == null) {
-            return errorJson("参数为空", "请带上 prompt / lyrics / taskId 之一重试");
+            return errorJson(ToolErrorCode.INVALID_ARGUMENT, "参数为空",
+                    "请带上 prompt / lyrics / taskId 之一重试");
         }
         if (StringUtils.isBlank(apiKey)) {
-            return errorJson("生歌 API Key 未配置",
+            return errorJson(ToolErrorCode.PERMISSION_DENIED, "生歌 API Key 未配置",
                     "请配置 song.gen.senseaudio-key 或环境变量 SENSEAUDIO_API_KEY 后重试；"
                             + "不要伪造结果，直接告诉用户缺少密钥");
         }
@@ -109,22 +117,23 @@ public class SongGenerationService {
 
         boolean instrumental = Boolean.TRUE.equals(params.getInstrumental());
 
-        // 2) 歌词：显式给了就用给的；纯音乐不需要歌词；否则先生成
+        // 2) 歌词：显式给了就用给的；纯音乐不需要歌词；否则走同步写词接口。
+        // 官方写词是同步接口（无 pending），旧的 lyricsTaskId 续查已无路由可查。
         String lyrics = params.getLyrics();
         if (StringUtils.isBlank(lyrics) && StringUtils.isNotBlank(params.getLyricsTaskId())) {
-            LyricsResult resumed = pollLyrics(params.getLyricsTaskId(), deadline);
-            if (resumed.isPending()) return resumed.pendingJson();
-            if (resumed.isFailed()) return resumed.errorJson();
-            lyrics = resumed.text();
+            return errorJson(ToolErrorCode.INVALID_ARGUMENT,
+                    "歌词接口已改为同步，不再支持 lyricsTaskId 续查",
+                    "请改传 lyrics（完整歌词）或 prompt（让服务端同步写词）后重试");
         }
         if (StringUtils.isBlank(lyrics) && !instrumental) {
             if (StringUtils.isBlank(params.getPrompt())) {
-                return errorJson("缺少歌词来源",
+                return errorJson(ToolErrorCode.INVALID_ARGUMENT, "缺少歌词来源",
                         "prompt / lyrics / taskId 至少给一个；纯音乐请显式传 instrumental=true");
             }
-            LyricsResult created = createLyrics(params.getPrompt(), deadline);
-            if (created.isPending()) return created.pendingJson();
-            if (created.isFailed()) return created.errorJson();
+            LyricsResult created = createLyrics(params.getPrompt(), params.getStyle());
+            if (created.isFailed()) {
+                return created.errorJson();
+            }
             lyrics = created.text();
         }
 
@@ -133,7 +142,7 @@ public class SongGenerationService {
         try {
             taskId = submitSong(params, lyrics, instrumental);
         } catch (SongApiException e) {
-            return errorJson("提交生歌任务失败", e.getMessage());
+            return errorJson(e.code(), "提交生歌任务失败", e.getMessage());
         }
         log.info("生歌已提交: task={} style={} instrumental={}", taskId,
                 StringUtils.defaultIfBlank(params.getStyle(), "pop"), instrumental);
@@ -144,121 +153,124 @@ public class SongGenerationService {
 
     // ==================== 歌词 ====================
 
-    private LyricsResult createLyrics(String prompt, long deadline) {
+    /**
+     * 同步写词：{@code POST /v1/music/lyrics/create}，直接返回 {@code data[0].text}。
+     * 官方文档明确「不需要轮询」；旧路径 {@code /v1/song/lyrics/*} 已不存在。
+     */
+    private LyricsResult createLyrics(String prompt, String style) {
         ObjectNode payload = MAPPER.createObjectNode();
+        payload.put("model", effectiveModel());
         payload.put("prompt", prompt);
-        payload.put("provider", lyricsProvider);
+        if (StringUtils.isNotBlank(style)) {
+            payload.put("style", style.trim());
+        }
+        payload.put("language", "zh");
+        payload.put("enhance_theme", true);
 
         JsonNode body;
         try {
-            body = postJson("/v1/song/lyrics/create", payload.toString());
+            body = postJson(PATH_LYRICS_CREATE, payload.toString());
         } catch (SongApiException e) {
-            return LyricsResult.failed(errorJson("歌词生成请求失败", e.getMessage()));
+            return LyricsResult.failed(errorJson(e.code(), "歌词生成请求失败", e.getMessage()));
         }
 
-        // 文档同时描述了两种返回：异步给 task_id，同步给 data。两种都要能接。
-        String taskId = textOf(body, "task_id");
-        if (StringUtils.isNotBlank(taskId) && body.path("data").isMissingNode()) {
-            return pollLyrics(taskId, Math.min(deadline, System.currentTimeMillis() + LYRICS_BUDGET_MS));
-        }
         String text = textOf(firstElement(body.path("data")), "text");
         if (StringUtils.isBlank(text)) {
-            return LyricsResult.failed(errorJson("歌词生成返回为空",
-                    "换一个更具体的 prompt 重试；原始响应 " + snippet(body)));
+            return LyricsResult.failed(errorJson(ToolErrorCode.EMPTY_RESULT, "歌词生成返回为空",
+                    "换一个更具体的 prompt 重试，或改为自带 lyrics；原始响应 "
+                            + snippet(body)));
         }
         return LyricsResult.of(text);
     }
 
-    private LyricsResult pollLyrics(String taskId, long deadline) {
-        while (true) {
-            JsonNode body;
-            try {
-                body = getJson("/v1/song/lyrics/pending/" + taskId);
-            } catch (SongApiException e) {
-                return LyricsResult.failed(errorJson("查询歌词状态失败", e.getMessage()));
-            }
-            String status = textOf(body, "status").toUpperCase(Locale.ROOT);
-            if ("SUCCESS".equals(status)) {
-                String text = textOf(firstElement(body.path("response").path("data")), "text");
-                if (StringUtils.isBlank(text)) {
-                    return LyricsResult.failed(errorJson("歌词任务成功但正文为空",
-                            "原始响应 " + snippet(body)));
-                }
-                return LyricsResult.of(text);
-            }
-            if ("FAILED".equals(status)) {
-                return LyricsResult.failed(errorJson("歌词生成失败",
-                        "换一个 prompt 重新提交；原始响应 " + snippet(body)));
-            }
-            if (System.currentTimeMillis() >= deadline) {
-                return LyricsResult.pending(pendingLyricsJson(taskId));
-            }
-            if (!sleepQuietly()) {
-                return LyricsResult.pending(pendingLyricsJson(taskId));
-            }
-        }
-    }
-
     // ==================== 作曲 ====================
 
+    /**
+     * Music 2.0：{@code POST /v2/music/song/create}。
+     * V2 不接受 V1 的 {@code instrumental}/{@code vocal_gender}/{@code title} 顶层字段，
+     * 改用 {@code mode} + {@code vocal_settings}；歌名放进 {@code prebuilt_lyrics.title}。
+     */
     private String submitSong(SongGenerateParams params, String lyrics, boolean instrumental)
             throws SongApiException {
         ObjectNode payload = MAPPER.createObjectNode();
-        payload.put("model", songModel);
-        payload.put("style", effectiveStyle(params, instrumental));
-        payload.put("instrumental", instrumental);
-        // 纯音乐不传歌词：instrumental 与 lyrics 只有前者有意义，两个都传语义会打架；
-        // 空串 Lyrics 也可能被服务端当成"有词但空"。
-        if (StringUtils.isNotBlank(lyrics) && !instrumental) {
-            payload.put("lyrics", lyrics);
-        }
-        if (!instrumental) {
-            payload.put("vocal_gender", "m".equalsIgnoreCase(
-                    StringUtils.defaultIfBlank(params.getVocal(), "f")) ? "m" : "f");
-        }
-        if (StringUtils.isNotBlank(params.getTitle())) {
-            payload.put("title", params.getTitle());
+        payload.put("model", effectiveModel());
+        payload.put("mode", instrumental ? "instrumental" : "sing");
+
+        String prompt = StringUtils.defaultIfBlank(params.getPrompt(), "").trim();
+        if (!prompt.isEmpty()) {
+            payload.put("prompt", prompt);
+        } else if (StringUtils.isNotBlank(params.getTitle())) {
+            payload.put("prompt", params.getTitle().trim());
         }
 
-        JsonNode body = postJson("/v1/song/music/create", payload.toString());
+        String style = StringUtils.defaultIfBlank(params.getStyle(), "").trim();
+        payload.put("style", style.isEmpty() ? "pop" : style);
+
+        if (StringUtils.isNotBlank(lyrics) && !instrumental) {
+            // 有歌名时走 prebuilt_lyrics，便于把 title 一并回灌；否则顶层 lyrics 即可。
+            if (StringUtils.isNotBlank(params.getTitle())) {
+                ObjectNode prebuilt = MAPPER.createObjectNode();
+                prebuilt.put("lyrics", lyrics);
+                prebuilt.put("title", params.getTitle().trim());
+                prebuilt.put("vocal_language", "zh");
+                payload.set("prebuilt_lyrics", prebuilt);
+            } else {
+                payload.put("lyrics", lyrics);
+            }
+        }
+
+        if (!instrumental) {
+            ObjectNode vocal = MAPPER.createObjectNode();
+            vocal.put("gender", vocalGender(params.getVocal()));
+            payload.set("vocal_settings", vocal);
+        }
+
+        ObjectNode audio = MAPPER.createObjectNode();
+        audio.put("format", "mp3");
+        payload.set("audio_settings", audio);
+
+        JsonNode body = postJson(PATH_SONG_CREATE_V2, payload.toString());
         String taskId = textOf(body, "task_id");
         if (StringUtils.isBlank(taskId)) {
-            throw new SongApiException("响应中没有 task_id：" + snippet(body));
+            throw new SongApiException(ToolErrorCode.EMPTY_RESULT,
+                    "响应中没有 task_id：" + snippet(body));
         }
         return taskId;
     }
 
-    /**
-     * 实际提交给接口的 {@code style}。
-     *
-     * <p>{@code music/create} 没有 {@code prompt} 字段，主题只能靠 {@code lyrics} 承载。
-     * 纯音乐没有歌词，如果再丢掉 prompt，用户给的"主题"就静默消失了 ——
-     * 所以纯音乐时把 prompt 并进 style（style 本身就是自由文本，文档示例也这么用）。
-     */
-    private static String effectiveStyle(SongGenerateParams params, boolean instrumental) {
-        String style = StringUtils.defaultIfBlank(params.getStyle(), "").trim();
-        String prompt = StringUtils.defaultIfBlank(params.getPrompt(), "").trim();
-        if (instrumental && !prompt.isEmpty()) {
-            style = style.isEmpty() ? prompt : style + ", " + prompt;
+    private String effectiveModel() {
+        String model = StringUtils.defaultIfBlank(songModel, DEFAULT_MODEL).trim();
+        // 旧配置 sensesong 已失效，静默纠正，避免再踩 404/参数错误。
+        if ("sensesong".equalsIgnoreCase(model) || model.isEmpty()) {
+            return DEFAULT_MODEL;
         }
-        return style.isEmpty() ? "pop" : style;
+        return model;
+    }
+
+    private static String vocalGender(String vocal) {
+        return "m".equalsIgnoreCase(StringUtils.defaultIfBlank(vocal, "f"))
+                ? "male" : "female";
     }
 
     private String pollSong(String taskId, long deadline) {
         while (true) {
             JsonNode body;
             try {
-                body = getJson("/v1/song/music/pending/" + taskId);
+                body = getJson(PATH_SONG_PENDING + taskId);
             } catch (SongApiException e) {
-                return errorJson("查询歌曲状态失败", e.getMessage() + "；taskId=" + taskId);
+                return errorJson(e.code(), "查询歌曲状态失败",
+                        e.getMessage() + "；taskId=" + taskId);
             }
             String status = textOf(body, "status").toUpperCase(Locale.ROOT);
             if ("SUCCESS".equals(status)) {
                 return deliverSong(taskId, body);
             }
             if ("FAILED".equals(status)) {
+                String reason = textOf(body, "fail_reason");
                 return errorJson("歌曲生成失败",
-                        "换个 prompt / style 重新提交；taskId=" + taskId + "，原始响应 " + snippet(body));
+                        (StringUtils.isNotBlank(reason) ? reason + "；" : "")
+                                + "换个 prompt / style / 自带歌词重试；taskId=" + taskId
+                                + "，原始响应 " + snippet(body));
             }
             if (System.currentTimeMillis() >= deadline) {
                 return pendingSongJson(taskId);
@@ -281,7 +293,7 @@ public class SongGenerationService {
         JsonNode song = firstElement(body.path("response").path("data"));
         String audioUrl = textOf(song, "audio_url");
         if (StringUtils.isBlank(audioUrl)) {
-            return errorJson("任务成功但没有音频地址",
+            return errorJson(ToolErrorCode.EMPTY_RESULT, "任务成功但没有音频地址",
                     "audio_url 为空；taskId=" + taskId + "，原始响应 " + snippet(body));
         }
 
@@ -297,7 +309,8 @@ public class SongGenerationService {
         try {
             url = mediaStorage.saveGenerated(audio, filename);
         } catch (IllegalStateException noOwner) {
-            return errorJson("无法落盘：缺少登录用户上下文", noOwner.getMessage());
+            return errorJson(ToolErrorCode.INTERNAL_ERROR, "无法落盘：缺少登录用户上下文",
+                    noOwner.getMessage());
         } catch (Exception e) {
             log.warn("生歌落盘失败，回退远端链接: {}", e.getMessage());
             return "![生成的歌曲](" + audioUrl + ")";
@@ -354,15 +367,18 @@ public class SongGenerationService {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
-            throw new SongApiException("网络异常：" + e.getMessage());
+            throw new SongApiException(ToolErrorCode.DEPENDENCY_UNAVAILABLE,
+                    "网络异常：" + e.getMessage());
         }
         if (response.statusCode() != 200) {
-            throw new SongApiException("HTTP " + response.statusCode() + "：" + snippet(response.body()));
+            throw new SongApiException(errorCodeFor(response.statusCode()),
+                    "HTTP " + response.statusCode() + "：" + snippet(response.body()));
         }
         try {
             return MAPPER.readTree(response.body());
         } catch (Exception e) {
-            throw new SongApiException("响应不是合法 JSON：" + snippet(response.body()));
+            throw new SongApiException(ToolErrorCode.DEPENDENCY_UNAVAILABLE,
+                    "响应不是合法 JSON：" + snippet(response.body()));
         }
     }
 
@@ -418,20 +434,42 @@ public class SongGenerationService {
         return toJson(out);
     }
 
-    private static String pendingLyricsJson(String taskId) {
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("status", "PENDING");
-        out.put("stage", "lyrics");
-        out.put("lyricsTaskId", taskId);
-        out.put("hint", "歌词仍在生成中。下一轮再调 song_generate，只传 lyricsTaskId 继续等待，不要重新提交。");
-        return toJson(out);
+    private static String errorJson(String error, String hint) {
+        return errorJson(ToolErrorCode.EXECUTION_FAILED, error, hint);
     }
 
-    private static String errorJson(String error, String hint) {
+    /**
+     * 失败结果。**带上 errorCode 是为了让上游不必猜。**
+     *
+     * <p>{@code ToolResult.fromLegacy} 见到 {@code errorCode} 就直接采信，
+     * 见不到才会拿文案去刮关键字（timeout / 429 / 503）。而刮法看不到 HTTP 状态码，
+     * 于是 429 被降级成「执行失败」，上游 {@code RecoveryEngine} 据此选错恢复档
+     * （该「等一会儿重试 / 换后端」的判成了别的），重规划方向也就跟着错。
+     * 服务层既然明确知道状态码，就该在这里说清楚。</p>
+     */
+    private static String errorJson(ToolErrorCode code, String error, String hint) {
         Map<String, Object> out = new LinkedHashMap<>();
+        out.put("errorCode", (code == null ? ToolErrorCode.EXECUTION_FAILED : code).name());
         out.put("error", error);
         out.put("hint", hint);
         return toJson(out);
+    }
+
+    /**
+     * HTTP 状态码 → 错误码。这张表直接决定上游选哪一档恢复策略：
+     * {@code RATE_LIMITED} / {@code DEPENDENCY_UNAVAILABLE} 会被判为可重试的资源类失败，
+     * {@code INVALID_ARGUMENT} 走本步修参数，{@code PERMISSION_DENIED} 则要换方案而非重试。
+     */
+    static ToolErrorCode errorCodeFor(int status) {
+        return switch (status) {
+            case 429 -> ToolErrorCode.RATE_LIMITED;
+            case 401, 403 -> ToolErrorCode.PERMISSION_DENIED;
+            case 400, 422 -> ToolErrorCode.INVALID_ARGUMENT;
+            case 404 -> ToolErrorCode.NOT_FOUND;
+            case 409 -> ToolErrorCode.CONFLICT;
+            default -> status >= 500 ? ToolErrorCode.DEPENDENCY_UNAVAILABLE
+                    : ToolErrorCode.EXECUTION_FAILED;
+        };
     }
 
     private static String toJson(Map<String, Object> out) {
@@ -442,20 +480,37 @@ public class SongGenerationService {
         }
     }
 
-    /** 歌词阶段的三态结果：拿到文本 / 待续查 / 失败。 */
-    private record LyricsResult(String text, String pendingJson, String errorJson) {
-        static LyricsResult of(String text) { return new LyricsResult(text, null, null); }
-        static LyricsResult pending(String json) { return new LyricsResult(null, json, null); }
-        static LyricsResult failed(String json) { return new LyricsResult(null, null, json); }
+    /** 歌词阶段结果：同步拿到文本，或失败。 */
+    private record LyricsResult(String text, String errorJson) {
+        static LyricsResult of(String text) {
+            return new LyricsResult(text, null);
+        }
 
-        boolean isPending() { return pendingJson != null; }
-        boolean isFailed() { return errorJson != null; }
+        static LyricsResult failed(String json) {
+            return new LyricsResult(null, json);
+        }
+
+        boolean isFailed() {
+            return errorJson != null;
+        }
     }
 
-    /** 把「网络/状态码/非 JSON」统一成一句可回给模型的话。 */
+    /**
+     * 把「网络/状态码/非 JSON」统一成一句可回给模型的话，并**带上错误码**。
+     *
+     * <p>{@code code} 是给上游 {@code RecoveryEngine} 选恢复档用的，
+     * 不是给人看的 —— 不带上它就等于让下游拿文案猜。</p>
+     */
     private static final class SongApiException extends RuntimeException {
-        SongApiException(String message) {
+        private final ToolErrorCode code;
+
+        SongApiException(ToolErrorCode code, String message) {
             super(message);
+            this.code = code == null ? ToolErrorCode.EXECUTION_FAILED : code;
+        }
+
+        ToolErrorCode code() {
+            return code;
         }
     }
 }

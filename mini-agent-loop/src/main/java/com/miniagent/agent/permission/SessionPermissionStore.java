@@ -1,21 +1,26 @@
 package com.miniagent.agent.permission;
 
+import com.miniagent.common.event.SessionEvictedEvent;
 import com.miniagent.common.permission.ExecPolicy;
 import jakarta.annotation.PostConstruct;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 import java.util.HashSet;
+import java.util.HashMap;
+import java.util.UUID;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.UnaryOperator;
 
 /**
- * 按 sessionId 保存权限模式、Plan 批准状态、Ask 一次放行集合、待办确认策略，
+ * 按 sessionId 保存权限模式、Plan 批准状态、带参数摘要和过期时间的 Ask 授权、待办确认策略，
  * 以及 exec_command 策略的会话级覆盖。
  */
 @Component
@@ -31,13 +36,26 @@ public class SessionPermissionStore {
             PermissionMode mode,
             boolean planApproved,
             Set<String> askGrantedTools,
+            Map<String, AskGrant> askGrants,
             ConfirmPolicy confirmPolicy,
             ExecPolicy execPolicyOverride
     ) {
+        /** Compatibility constructor for callers compiled against the old set-only state. */
+        public SessionPerm(
+                PermissionMode mode,
+                boolean planApproved,
+                Set<String> askGrantedTools,
+                ConfirmPolicy confirmPolicy,
+                ExecPolicy execPolicyOverride) {
+            this(mode, planApproved, askGrantedTools, Map.of(), confirmPolicy,
+                    execPolicyOverride);
+        }
+
         public SessionPerm {
             askGrantedTools = askGrantedTools == null
                     ? Set.of()
                     : Set.copyOf(askGrantedTools);
+            askGrants = askGrants == null ? Map.of() : Map.copyOf(askGrants);
         }
     }
 
@@ -45,8 +63,15 @@ public class SessionPermissionStore {
     }
 
     private static final int MAX_CAS_ATTEMPTS = 5;
+    private static final int MAX_PENDING_ASK_GRANTS = 4096;
+    private static final int MAX_APPROVED_ASK_GRANTS = 4096;
+    private static final long LEGACY_GRANT_TTL_MILLIS =
+            TimeUnit.MINUTES.toMillis(5);
 
     private final ConcurrentHashMap<String, Cached> bySession =
+            new ConcurrentHashMap<>();
+    /** Pending grants are deliberately ephemeral: a restart must require a new approval. */
+    private final ConcurrentHashMap<String, AskGrant> pendingAskGrants =
             new ConcurrentHashMap<>();
     private final SessionPermissionPersistence persistence;
 
@@ -69,7 +94,7 @@ public class SessionPermissionStore {
     private static SessionPerm defaults() {
         return new SessionPerm(
                 PermissionMode.DEFAULT, false,
-                Set.of(), ConfirmPolicy.DANGEROUS, null);
+                Set.of(), Map.of(), ConfirmPolicy.DANGEROUS, null);
     }
 
     public SessionPerm get(String sessionId) {
@@ -110,6 +135,7 @@ public class SessionPermissionStore {
                 PermissionMode.from(state.mode()),
                 state.planApproved(),
                 state.askGrantedTools(),
+                state.askGrants(),
                 ConfirmPolicy.from(state.confirmPolicy()),
                 execPolicy);
     }
@@ -120,6 +146,7 @@ public class SessionPermissionStore {
                 permission.mode().wireName(),
                 permission.planApproved(),
                 permission.askGrantedTools(),
+                permission.askGrants(),
                 permission.confirmPolicy().wireName(),
                 Optional.ofNullable(permission.execPolicyOverride())
                         .map(ExecPolicy::wireName)
@@ -184,6 +211,7 @@ public class SessionPermissionStore {
                     mode,
                     approved,
                     grants,
+                    old.askGrants(),
                     policy,
                     old.execPolicyOverride());
         });
@@ -195,7 +223,8 @@ public class SessionPermissionStore {
         }
         update(sessionId, base -> {
             return new SessionPerm(
-                    base.mode(), base.planApproved(), base.askGrantedTools(), policy,
+                    base.mode(), base.planApproved(), base.askGrantedTools(),
+                    base.askGrants(), policy,
                     base.execPolicyOverride());
         });
     }
@@ -213,12 +242,15 @@ public class SessionPermissionStore {
         }
         update(sessionId, base -> {
             Set<String> grants = new HashSet<>(base.askGrantedTools());
+            Map<String, AskGrant> askGrants = new HashMap<>(base.askGrants());
             if (policy != ExecPolicy.ALLOW) {
                 // 收紧：丢掉旧的 exec 批准，逼它重新问一次
                 grants.remove(PermissionPolicy.EXEC_TOOL);
+                askGrants.values().removeIf(g -> PermissionPolicy.EXEC_TOOL.equals(g.toolName()));
             }
             return new SessionPerm(
-                    base.mode(), base.planApproved(), grants, base.confirmPolicy(), policy);
+                    base.mode(), base.planApproved(), grants, askGrants,
+                    base.confirmPolicy(), policy);
         });
     }
 
@@ -248,6 +280,7 @@ public class SessionPermissionStore {
                     mode,
                     true,
                     grants,
+                    old.askGrants(),
                     policy,
                     old.execPolicyOverride());
         });
@@ -265,16 +298,137 @@ public class SessionPermissionStore {
         if (Objects.isNull(sessionId) || StringUtils.isBlank(toolName)) {
             return;
         }
+        // Legacy callers do not provide an approval token or arguments. Keep
+        // the old method source-compatible, but bind it to the only legacy
+        // argument shape ({}) and a short TTL. The execution pipeline never
+        // treats the old tool-name set as an authorization.
+        String token = newToken();
+        AskGrant grant = new AskGrant(token, toolName.trim(),
+                argumentDigest(toolName.trim(), "{}"),
+                System.currentTimeMillis() + LEGACY_GRANT_TTL_MILLIS);
         update(sessionId, old -> {
             Set<String> grants = new HashSet<>(old.askGrantedTools());
             grants.add(toolName.trim());
+            Map<String, AskGrant> askGrants = new HashMap<>(old.askGrants());
+            askGrants.put(token, grant);
             return new SessionPerm(
                     old.mode(),
                     old.planApproved(),
                     grants,
+                    askGrants,
                     old.confirmPolicy(),
                     old.execPolicyOverride());
         });
+    }
+
+    /**
+     * Issues an opaque, short-lived token for the exact invocation shown to
+     * the user. It remains pending until {@link #grantAskToken} is called.
+     */
+    public AskGrant issueAskGrant(String sessionId, String toolName,
+                                  String arguments, long ttlMillis) {
+        if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(toolName)) {
+            return null;
+        }
+        long ttl = Math.max(1_000L, ttlMillis);
+        String digest = argumentDigest(toolName, arguments);
+        long now = System.currentTimeMillis();
+        // Reuse a still-pending approval for the same exact invocation. This
+        // avoids an unbounded token stream while an SSE client is reconnecting.
+        for (Map.Entry<String, AskGrant> entry : pendingAskGrants.entrySet()) {
+            if (entry.getKey().startsWith(sessionId + "\u0000")
+                    && !entry.getValue().expired(now)
+                    && entry.getValue().toolName().equals(toolName.trim())
+                    && entry.getValue().argumentsDigest().equals(digest)) {
+                return entry.getValue();
+            }
+        }
+        AskGrant grant = new AskGrant(
+                newToken(), toolName.trim(), digest, now + ttl);
+        pendingAskGrants.entrySet().removeIf(e -> e.getValue().expired(now));
+        if (pendingAskGrants.size() >= MAX_PENDING_ASK_GRANTS) {
+            // Capacity is a safety bound, not an authorization decision. Drop
+            // one pending entry; the user can request it again and receive a
+            // fresh token.
+            var iterator = pendingAskGrants.keySet().iterator();
+            if (iterator.hasNext()) {
+                pendingAskGrants.remove(iterator.next());
+            }
+        }
+        pendingAskGrants.put(pendingKey(sessionId, grant.token()), grant);
+        return grant;
+    }
+
+    /**
+     * Converts a pending token into an approved exact-argument grant. A token
+     * is single-use; expired or cross-session tokens are rejected.
+     */
+    public Optional<AskGrant> grantAskToken(String sessionId, String token) {
+        return grantAskToken(sessionId, token, null);
+    }
+
+    /** Same as {@link #grantAskToken(String, String)} with an optional UI tool consistency check. */
+    public Optional<AskGrant> grantAskToken(String sessionId, String token,
+                                            String expectedTool) {
+        if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(token)) {
+            return Optional.empty();
+        }
+        String key = pendingKey(sessionId, token.trim());
+        AskGrant candidate = pendingAskGrants.get(key);
+        if (candidate == null || candidate.expired(System.currentTimeMillis())
+                || (StringUtils.isNotBlank(expectedTool)
+                && !candidate.toolName().equals(expectedTool.trim()))) {
+            return Optional.empty();
+        }
+        // remove(key,value) prevents two concurrent approvals from both
+        // converting the same pending token.
+        if (!pendingAskGrants.remove(key, candidate)) {
+            return Optional.empty();
+        }
+        AskGrant pending = candidate;
+        update(sessionId, old -> {
+            Set<String> names = new HashSet<>(old.askGrantedTools());
+            names.add(pending.toolName());
+            Map<String, AskGrant> approved = new HashMap<>(old.askGrants());
+            long now = System.currentTimeMillis();
+            approved.entrySet().removeIf(e -> e.getValue().expired(now));
+            if (approved.size() >= MAX_APPROVED_ASK_GRANTS) {
+                var iterator = approved.keySet().iterator();
+                if (iterator.hasNext()) {
+                    approved.remove(iterator.next());
+                }
+            }
+            approved.put(pending.token(), pending);
+            return new SessionPerm(old.mode(), old.planApproved(), names, approved,
+                    old.confirmPolicy(), old.execPolicyOverride());
+        });
+        return Optional.of(pending);
+    }
+
+    /** Exact tool + argument authorization used by ToolPipeline. */
+    public boolean isAskGranted(String sessionId, String toolName, String arguments) {
+        if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(toolName)) {
+            return false;
+        }
+        SessionPerm permission = get(sessionId);
+        String digest = argumentDigest(toolName, arguments);
+        long now = System.currentTimeMillis();
+        return permission.askGrants().values().stream()
+                .filter(g -> !g.expired(now))
+                .anyMatch(g -> g.toolName().equals(toolName.trim())
+                        && g.argumentsDigest().equals(digest));
+    }
+
+    /** Optional token-aware form for API and audit callers. */
+    public boolean isAskGranted(String sessionId, String toolName, String arguments,
+                                String token) {
+        if (StringUtils.isBlank(token)) {
+            return false;
+        }
+        AskGrant grant = get(sessionId).askGrants().get(token.trim());
+        return grant != null && !grant.expired(System.currentTimeMillis())
+                && grant.toolName().equals(toolName == null ? "" : toolName.trim())
+                && grant.argumentsDigest().equals(argumentDigest(toolName, arguments));
     }
 
     public boolean isAskGranted(String sessionId, String toolName) {
@@ -282,6 +436,27 @@ public class SessionPermissionStore {
             return false;
         }
         return get(sessionId).askGrantedTools().contains(toolName);
+    }
+
+    /** Digest shared with ToolPipeline and the approval audit path. */
+    public static String argumentDigest(String toolName, String arguments) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            String canonical = Objects.requireNonNullElse(toolName, "").trim()
+                    + "\n" + Objects.requireNonNullElse(arguments, "");
+            return java.util.HexFormat.of().formatHex(
+                    md.digest(canonical.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
+    }
+
+    private static String newToken() {
+        return UUID.randomUUID().toString() + UUID.randomUUID();
+    }
+
+    private static String pendingKey(String sessionId, String token) {
+        return sessionId + "\u0000" + token;
     }
 
     /**
@@ -304,6 +479,14 @@ public class SessionPermissionStore {
         view.put("planApproved", p.planApproved());
         view.put("planActive", p.mode() == PermissionMode.PLAN && !p.planApproved());
         view.put("askGrantedTools", Set.copyOf(p.askGrantedTools()));
+        long now = System.currentTimeMillis();
+        view.put("askGrants", p.askGrants().values().stream()
+                .filter(g -> !g.expired(now))
+                .map(g -> Map.of(
+                        "tool", g.toolName(),
+                        "argumentsDigest", g.argumentsDigest(),
+                        "expiresAt", g.expiresAtEpochMillis()))
+                .toList());
         view.put("confirmPolicy", policy.wireName());
         view.put("confirmPolicyLabel", policy.labelZh());
         // 空串 = 跟随全局默认，不是"策略为空"。前端据此显示"跟随全局"。
@@ -318,6 +501,33 @@ public class SessionPermissionStore {
             if (persistence != null) {
                 persistence.delete(sessionId);
             }
+        }
+    }
+
+    /**
+     * 只丢进程内缓存的权限快照，保留持久化的那份。
+     *
+     * <p>用于「会话长期空闲」：权限里有用户明确点过「本会话一直允许」的授权集合，
+     * 那不是缓存而是用户的意图。指针不能在这里删 —— 用户回来继续用同一个会话时
+     * 被要求重新授权，属于功能退化。没有持久化实现时才退化成纯内存删（那份本来就是唯一副本）。</p>
+     */
+    public void forgetCached(String sessionId) {
+        if (StringUtils.isNotBlank(sessionId)) {
+            bySession.remove(sessionId);
+        }
+    }
+
+    /**
+     * 会话被删除或判定空闲时回收。
+     *
+     * <p>删除是不可逆的，连持久化授权一起丢；空闲只丢进程内快照。</p>
+     */
+    @EventListener
+    public void onSessionEvicted(SessionEvictedEvent event) {
+        if (event.isDeleted()) {
+            clear(event.sessionId());
+        } else {
+            forgetCached(event.sessionId());
         }
     }
 }

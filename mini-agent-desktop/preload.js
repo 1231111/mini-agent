@@ -34,6 +34,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('backend-error', handler);
   },
 
+  // 仙鹤炸开播完。主进程等到这一下再把窗口撑开并载入聊天页。
+  bootBurstDone: () => ipcRenderer.send('boot:burst-done'),
+  bootReveal: () => ipcRenderer.send('boot:reveal'),
+
+  // 启动进度（阶段 + 已用时间）。主进程每秒钟推一次，启动画面据此显示
+  // 「已用 N 秒」和当前阶段 —— 后端加载向量模型那几秒是完全静默的，
+  // 没有这个心跳，界面看起来就是卡死。
+  onBootStage: (callback) => {
+    const handler = (_e, payload) => callback(payload);
+    ipcRenderer.on('boot-stage', handler);
+    return () => ipcRenderer.removeListener('boot-stage', handler);
+  },
+
   // 监听主进程消息
   onRestartServer: (callback) => {
     ipcRenderer.on('restart-server', callback);
@@ -56,6 +69,56 @@ contextBridge.exposeInMainWorld('electronAPI', {
   }
 });
 
+/* ═══════════════════════════════════════════════════════════════════
+   登录状态（token）的持久存储
+
+   值本身由主进程落盘（main.js 的 readStoredToken / writeStoredToken，
+   文件是 userData/session.json），这里只做桥。
+
+   为什么不让页面直接存 localStorage：renderer 开着 contextIsolation 且
+   nodeIntegration:false，读不到主进程那份文件；而 localStorage 里的副本会在
+   磁盘上一直留到 token 过期，页面被注入一次就等于长期交出凭证。
+   走这里之后，页面能拿到的只有本次运行内存里的值。
+
+   为什么不用 fs 直接读：Electron 20 起 renderer sandbox 默认开启，
+   preload 在 sandbox 下只能拿到受限的 electron 模块，没有 fs。
+   所以初始值走 sendSync 问主进程要。
+
+   为什么初始值必须同步拿到：chat.html 首屏第一段内联脚本（在 <head> 里，
+   早于 security.js 加载）就要用它决定跳不跳登录页，异步的 invoke 赶不上。
+
+   为什么叫 desktopAuth：main.js 里记过一次真实事故 —— preload 挂的全局名
+   （当时的 api）跟页面顶层声明重名，导致整段脚本解析期直接失败、界面永远停在
+   boot 页。所以这里刻意避开 api / electronAPI 这两个已有名字。
+   ═══════════════════════════════════════════════════════════════════ */
+
+let authToken = '';
+try {
+  authToken = ipcRenderer.sendSync('auth:read-token') || '';
+} catch (e) {
+  // 主进程没起来 / handler 未注册。按未登录处理，页面会跳登录页。
+  authToken = '';
+}
+
+contextBridge.exposeInMainWorld('desktopAuth', {
+  /** 同步返回当前 token。每个同源请求都会调它，签名不能是 async。 */
+  getToken: () => authToken,
+
+  hasToken: () => !!authToken,
+
+  /** 登录成功后写入。主进程负责落盘，页面无需等待。 */
+  setToken: (token) => {
+    authToken = typeof token === 'string' ? token : '';
+    ipcRenderer.send('auth:write-token', authToken);
+  },
+
+  /** 登出 / 凭证失效后清除。传空串让主进程删文件，不必再加一个 IPC 通道。 */
+  clear: () => {
+    authToken = '';
+    ipcRenderer.send('auth:write-token', '');
+  }
+});
+
 // 暴露 fetch API 的增强版本，自动添加 API 基础地址
 contextBridge.exposeInMainWorld('api', {
   fetch: async (url, options = {}) => {
@@ -72,23 +135,27 @@ contextBridge.exposeInMainWorld('api', {
   }
 });
 
-/* ═══════════════════════════════════════════════════════════════════
-   自绘标题栏（WorkBuddy 式窗口）
-   ═══════════════════════════════════════════════════════════════════
-   主进程已把系统标题栏/边框去掉（frame:false），这一段负责在页面里补回
-   窗口该有的功能：拖拽移动、双击最大化/还原、右上角最小化/最大化/关闭。
-
-   为什么放在 preload 而不是后端模板：主窗口加载的是后端的完整聊天 UI
-   （chat / login / membership / trace 四个页面 + 本地诊断页），放 preload
-   一份代码对所有页面生效，后端模板零改动，将来新增页面也自动带上。
-
-   配色用 CSS 变量 + fallback：chat.html 的设计令牌（--bg / --border /
-   --text2 / --surface2）会随 data-theme 明暗切换，标题栏自动跟随主题；
-   没有这些变量的页面（login 固定深色、本地诊断页）落到 fallback 深色。
-   ───────────────────────────────────────────────────────────────── */
+/* Windows 不画标题栏。macOS 只补红绿灯旁边的拖拽区。 */
 (function installTitlebar() {
+  // Windows 不再画这条栏（名字、绿点、最小化/最大化/关闭都不要）。
+  // 关闭：Alt+F4 缩到托盘，托盘菜单里退出。拖动：按住侧栏或登录页的名字。
+  if (process.platform !== 'darwin') {
+    const drag = document.createElement('style');
+    drag.textContent = '.sb-logo,.logo{-webkit-app-region:drag;}';
+    const mount = () => {
+      if (!document.head || document.getElementById('ma-drag-style')) return;
+      drag.id = 'ma-drag-style';
+      document.head.appendChild(drag);
+    };
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', mount, { once: true });
+    } else {
+      mount();
+    }
+    return;
+  }
   const BAR_HEIGHT = 32;
-  const IS_MAC = process.platform === 'darwin';
+  const IS_MAC = true;
 
   // 直接走 ipcRenderer，不经过 window.electronAPI —— 后者是 exposeInMainWorld
   // 挂到页面主世界的，而这里（含事件监听器）跑在 preload 的隔离上下文里，
@@ -141,9 +208,6 @@ contextBridge.exposeInMainWorld('api', {
       '  z-index:2147483647;',
       '  padding-left:' + (IS_MAC ? 78 : 12) + 'px;',  // mac 给红绿灯让位
       '}',
-      '#ma-titlebar .ma-tb-dot{width:8px;height:8px;border-radius:50%;',
-      '  background:var(--accent,#10a37f);margin-right:8px;flex:none;}',
-      '#ma-titlebar .ma-tb-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '#ma-titlebar .ma-tb-btns{margin-left:auto;display:flex;height:100%;',
       '  -webkit-app-region:no-drag;}',
       '#ma-titlebar .ma-tb-btn{width:46px;height:100%;border:0;padding:0;',
@@ -160,9 +224,7 @@ contextBridge.exposeInMainWorld('api', {
     bar.id = 'ma-titlebar';
     bar.title = 'MiniAgent';
     bar.innerHTML =
-      '<div class="ma-tb-dot"></div>' +
-      '<div class="ma-tb-title">Mini Agent</div>' +
-      // mac 用系统红绿灯，不画按钮
+      // mac 用系统红绿灯，不画按钮。不写产品名：侧栏和登录页已经有。
       (IS_MAC ? '' :
         '<div class="ma-tb-btns">' +
           '<button class="ma-tb-btn ma-tb-min"  aria-label="最小化">' + SVG.min + '</button>' +

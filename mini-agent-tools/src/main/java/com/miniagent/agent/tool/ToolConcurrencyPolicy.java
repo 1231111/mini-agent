@@ -3,6 +3,8 @@ package com.miniagent.agent.tool;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.tool.impl.ExecCommandParams;
+import com.miniagent.agent.tool.impl.LyriaMusicParams;
+import com.miniagent.agent.tool.impl.MiniMaxMusicParams;
 import com.miniagent.agent.tool.impl.SongGenerateParams;
 
 import java.util.Set;
@@ -43,8 +45,7 @@ public final class ToolConcurrencyPolicy {
     private static final Set<String> READ_ONLY = Set.of(
             "skill_list", "skill_view", "read_file", "list_files", "read_package",
             "search_code", "ast_search", "codebase_search", "web_search", "web_extract",
-            "http_get", "browser_snapshot", "comfyui_status", "comfyui_workflows",
-            "comfyui_models", "ask_user_question");
+            "http_get", "browser_snapshot", "ask_user_question");
 
     /** 写进本地状态但能靠一次只读观察核验终态的工具，超时后共用这句提示。 */
     private static final String VERIFY_LOCAL_HINT =
@@ -134,11 +135,6 @@ public final class ToolConcurrencyPolicy {
             30, 0, 10, ToolConcurrencyScope.SESSION, "", "",
             ToolTimeoutRecovery.VERIFY, VERIFY_BROWSER_HINT, 0);
 
-    /** 远程生成、抢本地同一块 GPU（ComfyUI 系列）：与本地文件系统<b>不</b>共用锁。 */
-    private static final ToolExecutionProfile COMFYUI_GPU = new ToolExecutionProfile(
-            200, 0, 10, ToolConcurrencyScope.SHARED_RESOURCE, "", "comfyui-gpu",
-            ToolTimeoutRecovery.VERIFY,
-            "，生成任务可能仍在本地 GPU 上跑；先 comfyui_status 核验，不要重复提交", 0);
 
     /**
      * 远程生成、抢远程生成 API 配额：与本地文件系统<b>不</b>共用锁。
@@ -197,6 +193,22 @@ public final class ToolConcurrencyPolicy {
                     + "下一轮用响应里那个续查令牌再调一次 " + SongGenerateParams.TOOL_NAME
                     + " 续查，不要重新提交", 0);
 
+    /** MiniMax 音乐是同步长请求，超时后远端可能已扣费，不要立刻重提。 */
+    private static final ToolExecutionProfile MINIMAX_MUSIC = new ToolExecutionProfile(
+            MiniMaxMusicParams.BUDGET_SECONDS,
+            MiniMaxMusicParams.OUTER_GATE_MARGIN_SECONDS,
+            2, ToolConcurrencyScope.SHARED_RESOURCE, "", "minimax-music",
+            ToolTimeoutRecovery.VERIFY,
+            "，请求可能已在 MiniMax 计费。等一会儿再重试，不要立刻用相同参数再提交", 0);
+
+    /** Lyria 是同步长请求，超时后远端可能已计费，不要立刻重提。 */
+    private static final ToolExecutionProfile LYRIA_MUSIC = new ToolExecutionProfile(
+            LyriaMusicParams.BUDGET_SECONDS,
+            LyriaMusicParams.OUTER_GATE_MARGIN_SECONDS,
+            2, ToolConcurrencyScope.SHARED_RESOURCE, "", "lyria-music",
+            ToolTimeoutRecovery.VERIFY,
+            "，请求可能已在 Gemini 计费。等一会儿再重试，不要立刻用相同参数再提交", 0);
+
     /** 等待用户回答：真正的等待由 AgentLoop 让出，超时只是防止拦截失效。 */
     private static final ToolExecutionProfile AWAIT_USER = new ToolExecutionProfile(
             3600, 0, 3, ToolConcurrencyScope.SESSION, "", "",
@@ -220,8 +232,7 @@ public final class ToolConcurrencyPolicy {
         }
         return switch (name) {
             // ── 只读 ──
-            case "skill_list", "skill_view", "comfyui_status", "comfyui_workflows",
-                 "comfyui_models" -> READ_FREE.withBudget(60);
+            case "skill_list", "skill_view" -> READ_FREE.withBudget(60);
             case "read_file", "list_files" -> READ_BY_PATH.withBudget(10);
             case "read_package" -> READ_BY_PATH.withBudget(15);
             case "search_code", "ast_search", "codebase_search" -> READ_BY_PATH;
@@ -243,14 +254,12 @@ public final class ToolConcurrencyPolicy {
 
             // ── 远程生成 ──
             case "image_generate" -> REMOTE_GENERATION;
-            case "comfyui_tts" -> COMFYUI_GPU.withBudget(140);
-            case "comfyui_txt2img", "comfyui_img2img" -> COMFYUI_GPU;
-            case "comfyui_img2video" -> COMFYUI_GPU.withBudget(620);
-            case "comfyui_execute" -> COMFYUI_GPU.withBudget(30);
             case "tavily_extract" -> READ_BY_URL.withBudget(60);
 
             // ── 异步任务 ──
             case SongGenerateParams.TOOL_NAME -> ASYNC_TASK;
+            case MiniMaxMusicParams.TOOL_NAME -> MINIMAX_MUSIC;
+            case LyriaMusicParams.TOOL_NAME -> LYRIA_MUSIC;
 
             // ── 等待用户 ──
             case "ask_user_question" -> AWAIT_USER;

@@ -4,6 +4,7 @@ import com.miniagent.config.entity.AgentTraceStep;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import java.util.List;
+import java.time.LocalDateTime;
 
 public interface AgentTraceStepRepository extends JpaRepository<AgentTraceStep, Long> {
     List<AgentTraceStep> findBySessionIdOrderByTurnIndexAscIdAsc(String sessionId);
@@ -25,4 +26,12 @@ public interface AgentTraceStepRepository extends JpaRepository<AgentTraceStep, 
     @Query("SELECT s.stepType, s.toolName, s.durationMs FROM AgentTraceStep s WHERE s.executionId = :executionId AND s.durationMs > 0 ORDER BY s.durationMs DESC")
     List<Object[]> slowestStepsByExecutionId(String executionId);
     void deleteBySessionId(String sessionId);
+
+    /**
+     * Bound trace storage by age. Trace rows are operational evidence rather
+     * than the durable conversation record, so retention is intentionally
+     * enforced at the database boundary instead of relying on application
+     * memory or an unbounded log file.
+     */
+    long deleteByCreatedAtBefore(LocalDateTime cutoff);
 }

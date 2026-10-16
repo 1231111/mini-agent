@@ -1,14 +1,17 @@
 package com.miniagent.agent.tool;
 
 import com.miniagent.agent.tool.impl.EditDocumentParams;
+import com.miniagent.common.io.AtomicFiles;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.xwpf.usermodel.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -80,10 +83,7 @@ public class EditDocumentTool {
      * 编辑Word文档
      */
     private String editDocx(Path path, EditDocumentParams params) {
-        try {
-            FileInputStream fis = new FileInputStream(path.toFile());
-            XWPFDocument document = new XWPFDocument(fis);
-            fis.close();
+        try (XWPFDocument document = openDocx(path)) {
             
             boolean modified = false;
             
@@ -119,10 +119,10 @@ public class EditDocumentTool {
             }
             
             if (modified) {
-                // 保存修改
-                FileOutputStream fos = new FileOutputStream(path.toFile());
-                document.write(fos);
-                fos.close();
+                // 原子替换：先写同目录临时文件、再整体移动覆盖。
+                // 旧实现是 new FileOutputStream(path)——它先把目标截断，中途失败就是
+                // "原文档已空、新内容没写进去"，用户文档当场丢失且无法回滚。
+                AtomicFiles.write(path, document::write);
                 
                 return String.format(
                         "{\"success\":true,\"path\":\"%s\",\"message\":\"文档修改成功\"}",
@@ -134,6 +134,13 @@ public class EditDocumentTool {
             
         } catch (Exception e) {
             return "{\"success\":false,\"error\":\"Word文档编辑失败: " + e.getMessage() + "\"}";
+        }
+    }
+
+    /** 打开 docx；POI 构造时整体读入，所以输入流读完即可关闭（交给 try-with-resources）。 */
+    private static XWPFDocument openDocx(Path path) throws IOException {
+        try (InputStream in = Files.newInputStream(path)) {
+            return new XWPFDocument(in);
         }
     }
 
@@ -318,7 +325,9 @@ public class EditDocumentTool {
                 }
             }
             
-            java.nio.file.Files.writeString(path, content, java.nio.charset.StandardCharsets.UTF_8);
+            // 同样走原子替换：Files.writeString 默认先截断，写一半失败会留下半个文件。
+            final byte[] payload = content.getBytes(StandardCharsets.UTF_8);
+            AtomicFiles.write(path, out -> out.write(payload));
             
             return String.format(
                     "{\"success\":true,\"path\":\"%s\",\"message\":\"文本文件修改成功\"}",

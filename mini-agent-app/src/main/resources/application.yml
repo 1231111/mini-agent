@@ -9,8 +9,8 @@ spring:
     cache: false   # 开发期关闭模板缓存：改完 .html 刷新页面即可生效，无需重启
   servlet:
     multipart:
-      max-file-size: 700MB
-      max-request-size: 710MB
+      max-file-size: 1000MB
+      max-request-size: 1000MB
       enabled: true
   application:
     name: mini-agent-springboot
@@ -246,6 +246,11 @@ agent:
         dimension: 1792
   sse:
     timeout-ms: 1800000
+  observability:
+    # 轨迹用于运行期排障和审计查询；聊天内容、任务状态和批准记录仍由各自
+    # 的持久化表负责。定期按时间清理，避免高频 token/工具轨迹无限增长。
+    trace-retention-days: 30
+    trace-cleanup-interval-ms: 21600000
   codebase:
     embedding-enabled: true
     # remote    = OpenAI 兼容 HTTP（下面的 base-url）；local-onnx = 进程内跑 ONNX 图，
@@ -272,11 +277,15 @@ agent:
     index-file: ${agent.data-dir}/workspace/.codebase-index.json
   browser:
     headless: true
+  permissions:
+    # Ask approvals are exact tool+argument grants and expire automatically.
+    ask-grant-ttl-seconds: 300
   tools:
-    # 出厂默认执行策略，三档：block=禁止 / ask=需会话批准 / allow=免批。
+    # 默认执行策略，三档：block=禁止 / ask=需会话批准 / allow=免批。
+    # 安全基线是 ask：配置缺失或 profile 漏激活时，exec_command 仍需用户批准。
     # 会话内可用 PUT /api/conversations/{sid}/permission 的 execPolicy 字段覆盖（default 表示跟随这里）。
     # 命令级安全过滤（黑名单 / 危险模式 / 注入检测 / 常驻服务器拦截）不受本档位影响，永远生效。
-    exec-policy: allow
+    exec-policy: ask
     allow-absolute-write: false
     block-private-network: true
     # 同时执行的工具调用数上限
@@ -324,6 +333,11 @@ agent:
     # 同一节点配额用尽后接着同一份 messages 再跑，最多这么多段
     proposal-max-chunks: 6
     compiler-retry: 1
+    # 任务拆解的判据来源。true=模型判：「要动手」的消息都进规划器，拆不拆/拆几刀
+    # 由规划模型决定，词表只留入口净化（默认）。false=词表判：按 requiresStructuredPlan
+    # 决定要不要进规划器，且模板优先出图、结构确定就不叫模型（旧行为，留作回退）。
+    # 代价：模型判每次动手多消耗一次规划模型调用（失败按 compiler-retry 重试）。
+    model-decides-decomposition: true
     max-outer-rounds: 24
     hard-proposal: true
     strict-eval: true
@@ -348,6 +362,9 @@ agent:
     #     transport: stdio
     #     command: npx
     #     args: ["-y", "@modelcontextprotocol/server-filesystem", "./workspace"]
+    #     # MCP 进程是不可信边界：单帧与等待中的请求都有限额。
+    #     max-frame-bytes: 8388608
+    #     request-timeout-seconds: 120
 
 logging:
   level:
@@ -388,8 +405,26 @@ song:
   gen:
     senseaudio-key: ${SENSEAUDIO_API_KEY:}
     base-url: https://api.senseaudio.cn
-    model: sensesong
-    lyrics-provider: sensesong
+    # Music 2.0 唯一可用模型（docs.senseaudio.cn）；旧值 sensesong 会 404
+    model: senseaudio-music-2.0-260626
+
+# MiniMax 音乐（国内 https://api.minimax.cn ）。密钥是开放平台接口密钥，
+# 不是小米 MiMo 的 MIMO_API_KEY。文档：
+# https://platform.minimaxi.com/docs/api-reference/music-generation
+minimax:
+  music:
+    api-key: ${MINIMAX_API_KEY:}
+    base-url: https://api.minimax.cn
+    model: music-3.0
+
+# Google Lyria 3.5（Gemini Interactions API）。密钥是 AI Studio 的 GEMINI_API_KEY，
+# 不是 Custom Search 的 GOOGLE_API_KEY。文档：
+# https://ai.google.dev/gemini-api/docs/music-generation
+lyria:
+  music:
+    api-key: ${GEMINI_API_KEY:}
+    base-url: https://generativelanguage.googleapis.com
+    model: lyria-3.5
 
 file:
   upload:
@@ -401,9 +436,3 @@ file:
     max-inline-chars: 80000      # 单文件提取后内联截断
     max-context-chars: 120000    # 多附件合计注入上下文预算
     sidecar-threshold-chars: 20000  # 超过则写 .extracted.txt 侧车
-
-comfyui:
-  host: 127.0.0.1
-  port: 8188
-  quality-check:
-    enabled: true

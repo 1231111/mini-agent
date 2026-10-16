@@ -26,10 +26,11 @@ public class ExecPolicyService {
     /**
      * 配置里两个键都没给时的兜底。
      *
-     * <p>刻意与旧代码 {@code @Value("${agent.tools.exec-enabled:true}")} 的语义一致（即 ALLOW），
-     * 否则"没写配置"的档位会悄悄变严，那些没显式配过的环境（含本地开发）行为会变。
+     * <p>默认必须是需批准，而不是免批。配置缺失、profile 漏激活或外部配置导入失败
+     * 都不应把模型发起的 {@code exec_command} 变成无审批的宿主命令执行；用户仍可
+     * 通过会话批准继续执行，或显式配置 {@code allow}（仅适用于受信环境）。
      */
-    private static final ExecPolicy FALLBACK = ExecPolicy.ALLOW;
+    private static final ExecPolicy FALLBACK = ExecPolicy.ASK;
 
     private final ExecPolicy globalDefault;
     private final SessionPermissionStore store;

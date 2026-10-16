@@ -70,7 +70,7 @@ public record ToolDescriptor(
         return executionProfile.concurrencyKeyArgument();
     }
 
-    /** {@code SHARED_RESOURCE} 范围的共享资源名（如 {@code comfyui-gpu}）。 */
+    /** {@code SHARED_RESOURCE} 范围的共享资源名（如 {@code image-api}）。 */
     public String sharedResourceKey() {
         return executionProfile.sharedResourceKey();
     }

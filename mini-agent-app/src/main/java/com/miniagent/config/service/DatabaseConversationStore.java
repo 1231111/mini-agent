@@ -5,6 +5,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.common.ChatRole;
+import com.miniagent.common.MessageConstants;
 import com.miniagent.config.entity.ChatConversation;
 import com.miniagent.config.entity.ChatMessage;
 import com.miniagent.config.repository.ChatConversationRepository;
@@ -81,6 +82,32 @@ public class DatabaseConversationStore {
     }
 
     /** DB title 列 length=255；超长用户消息（整库 schema）必须截断 */
+    /**
+     * 用**第一条真实用户消息**给会话定标题。
+     *
+     * <p>控制语（前端拼的「【系统】已批准…」「【系统】继续执行已确认的步骤 #N…」）
+     * 在后端也是 {@code role=user} 存库的 —— 那是对的，它要驱动下一轮对话 ——
+     * 但它们不是用户说的话，不该拿来当标题。此前判据是「第几条 user 消息」，
+     * 于是首条即控制语时标题就成了那句批注（2026-10-15 实测存在这样的会话），
+     * 而且后续真实的用户消息因为计数已 >1 永远补不上标题。</p>
+     *
+     * <p>所以两件事都要改：控制语不参与触发；计数也只数真实用户消息。</p>
+     */
+    private void applyAutoTitle(ChatConversation conv, String id, String role, String content) {
+        if (!ChatRole.USER.getValue().equals(role)
+                || MessageConstants.isSystemControlMessage(content)) {
+            return;
+        }
+        long realUserMsgs = messageRepo.findByConversationIdOrderByTimestampAsc(id).stream()
+                .filter(m -> ChatRole.USER.getValue().equals(m.getRole()))
+                .filter(m -> !MessageConstants.isSystemControlMessage(m.getContent()))
+                .count();
+        if (realUserMsgs == 1) {
+            conv.setTitle(truncateTitle(
+                    content.length() > 40 ? content.substring(0, 40) + "..." : content));
+        }
+    }
+
     static String truncateTitle(String title) {
         if (StringUtils.isBlank(title)) {
             return "New Chat";
@@ -150,14 +177,8 @@ public class DatabaseConversationStore {
 
             long now = Instant.now().toEpochMilli();
             conv.setUpdatedAt(now);
-            // Auto title from first user message
-            if (ChatRole.USER.getValue().equals(role)) {
-                long userMsgCount = messageRepo.findByConversationIdOrderByTimestampAsc(id)
-                        .stream().filter(m -> ChatRole.USER.getValue().equals(m.getRole())).count();
-                if (userMsgCount == 1) {
-                    conv.setTitle(truncateTitle(content.length() > 40 ? content.substring(0, 40) + "..." : content));
-                }
-            }
+            // Auto title from first *real* user message
+            applyAutoTitle(conv, id, role, content);
             conversationRepo.save(conv);
         });
     }
@@ -182,13 +203,7 @@ public class DatabaseConversationStore {
 
             long now = Instant.now().toEpochMilli();
             conv.setUpdatedAt(now);
-            if (ChatRole.USER.getValue().equals(role)) {
-                long userMsgCount = messageRepo.findByConversationIdOrderByTimestampAsc(id)
-                        .stream().filter(m -> ChatRole.USER.getValue().equals(m.getRole())).count();
-                if (userMsgCount == 1) {
-                    conv.setTitle(truncateTitle(content.length() > 40 ? content.substring(0, 40) + "..." : content));
-                }
-            }
+            applyAutoTitle(conv, id, role, content);
             conversationRepo.save(conv);
         });
     }

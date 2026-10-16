@@ -2,8 +2,10 @@ package com.miniagent.agent.core;
 
 import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.core.TokenEstimator;
+import com.miniagent.agent.scope.TaskScope;
 import com.miniagent.agent.scope.TaskScopeRegistry;
 import com.miniagent.agent.trace.TraceRecorder;
+import com.miniagent.common.event.SessionEvictedEvent;
 import com.miniagent.common.model.EffectiveModelContext;
 import org.springframework.beans.factory.annotation.Value;
 
@@ -18,6 +20,7 @@ import dev.langchain4j.model.chat.response.ChatResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
@@ -98,6 +101,35 @@ public class ContextCompressor {
     /** 清理状态（按任务作用域） */
     public void clearSession(String sessionId) {
         sessionStates.remove(scopeKey(sessionId));
+    }
+
+    /**
+     * 会话离场时回收它的<b>全部</b>压缩状态。
+     *
+     * <p>不能只调 {@link #clearSession} —— 那个方法按「当前任务作用域」删一个键，
+     * 而 {@code taskId ≥ 1} 的旧任务留下的 {@code sessionId#N} 键没人删，照样常驻。
+     * 这里按会话前缀整片回收。</p>
+     *
+     * <p>回收是安全的：压缩状态只是「上一段对话的交接摘要 + 冷却计数」，
+     * 丢了下一轮重新按需生成，不影响已持久化的对话历史。</p>
+     */
+    public void evictSession(String sessionId) {
+        if (StringUtils.isBlank(sessionId)) {
+            return;
+        }
+        String sid = sessionId.trim();
+        sessionStates.keySet().removeIf(k -> TaskScope.belongsTo(k, sid));
+        // 只在本线程刚好就在跑这个会话时清。事件是同步派发的，
+        // 若当前线程正在服务另一个会话，无条件 remove 会把别人的上下文标记抹掉。
+        if (sid.equals(currentSessionId.get())) {
+            currentSessionId.remove();
+        }
+    }
+
+    /** 会话被删除或判定空闲时，清掉它的压缩状态。 */
+    @EventListener
+    public void onSessionEvicted(SessionEvictedEvent event) {
+        evictSession(event.sessionId());
     }
 
     private SessionState getState(String sessionId) {

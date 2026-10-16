@@ -485,7 +485,7 @@ A: 看 `~/.miniagent/logs/backend.log`。启动失败时弹窗里也会带上最
 A: 不用管。后端让操作系统分配随机空闲端口，只监听 `127.0.0.1`；
 壳通过本次子进程的 READY nonce 获取端口，不会复用其他本机服务。
 
-**Q: 双击后界面一直停在"正在连接本机服务…"，后端日志却是正常的？**
+**Q: 双击后界面一直停在"正在启动本地服务"，后端日志却是正常的？**
 A: 看 `~/.miniagent/logs/renderer.log`（新加的文件）。渲染层的报错默认只进 F12
 控制台，客户机上没人按 F12，所以壳现在会把 `console-message` /
 `preload-error` / `did-fail-load` / `render-process-gone` 统一落盘。
@@ -501,6 +501,9 @@ A: 看 `~/.miniagent/logs/renderer.log`（新加的文件）。渲染层的报�
 - **这是解析期失败，整段脚本一行都不执行** —— 所以既不会 resolve 也不会 reject，
   `waitReady().then(...).catch(...)` 的 catch 永远不跑，界面连"后端没起来"都等不到。
 
+（触发它的那段顶层 `async function api` 连同整套壳内简化聊天页，已于 2026-10-09 删除，
+见下文。但**陷阱本身没有消失**，任何新加的脚本都可能再撞一次，第 2 条仍然成立。）
+
 两个反直觉的点：
 
 1. **`node --check` 查不出来。** 把内联脚本抽出来做静态语法检查会返回 OK，
@@ -511,11 +514,18 @@ A: 看 `~/.miniagent/logs/renderer.log`（新加的文件）。渲染层的报�
 所以页面脚本**整体包在 IIFE 里**（见 `src/index.html`），让页面所有标识符退到函数作用域，
 从结构上不可能再和 `contextBridge` 的全局名冲突。改名只是把地雷挪到下一个名字上。
 
+**2026-10-09 清理**：`src/index.html` 里那套"壳内自带一份简化聊天页"的实现
+（`AGENTS` 常量 / `#login` 卡片 / `#app` 双栏 / `send()` / `waitReady()`，
+实测占 14540 字节）已整段删除，该文件现在只剩**启动画面 + 看门狗**一段脚本
+（21843 → 7303 字节）。删而不是留，是因为它和后端自带的完整 UI 重复实现同一件事，
+留着只会持续制造"哪个页面才是真的登录页"这类混淆。
+
 配套两层兜底，都已落地：
 
-- 页面里有一段**独立**的看门狗 `<script>`（不与主脚本共用作用域、也不放在主脚本之后，
-  所以主脚本整体解析失败时它照样执行）：`error` / `unhandledrejection` 监听 +
-  20 秒定时器。它保证**绝不会无声地停在启动页**，而是把错误原文写进界面。
+- 页面里有一段**独立**的看门狗 `<script>`（自己一个 IIFE、不向全局挂任何标识符，
+  所以将来新增的脚本哪怕整体解析失败、它照样执行）：`error` / `unhandledrejection`
+  监听 + 30 秒定时器（比壳自己的启动超时 120 秒短，为了更早暴露问题）。
+  它保证**绝不会无声地停在启动页**，而是把错误原文写进界面。
 - 壳侧把渲染层报错写进 `logs/renderer.log`。
 
 **Q: 为什么双击 exe 没有安装过程？**
@@ -543,7 +553,8 @@ node scripts/desktop-cdp-inspect.mjs "JSON.stringify({
   hasElectronAPI: !!window.electronAPI,
   page: document.getElementById('messages') ? 'chat' :
     document.getElementById('loginForm') ? 'login' :
-    document.getElementById('boot') ? 'backend-error' : 'unknown'
+    document.getElementById('bootWatch') ? 'boot-error' :
+    document.getElementById('bootStage') ? 'boot' : 'unknown'
 })"
 ```
 

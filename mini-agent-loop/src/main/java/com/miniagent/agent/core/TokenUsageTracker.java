@@ -1,5 +1,7 @@
 package com.miniagent.agent.core;
 
+import com.miniagent.common.event.SessionEvictedEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -94,5 +96,14 @@ public class TokenUsageTracker {
 
     public static void clear(String sessionId) {
         stats.remove(sessionId);
+    }
+
+    /**
+     * 会话离场时回收该会话的用量统计 —— 否则 {@code stats} 只增不减
+     * （{@link #clear} 此前没有任何生产调用者），会话越多占得越多。
+     */
+    @EventListener
+    public void onSessionEvicted(SessionEvictedEvent event) {
+        clear(event.sessionId());
     }
 }

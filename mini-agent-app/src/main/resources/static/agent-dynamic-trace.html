@@ -7,8 +7,14 @@
     <script>
         // 页面骨架放行（浏览器导航带不了 Authorization 头），身份判断在这里做。
         (function () {
+            // 这段必须内联：它执行时 security.js 还没加载，用不了 MiniAuth。
+            // token 来源优先壳的持久存储（Electron 客户端），其次页面 web 存储。
             var tk = '';
-            try { tk = sessionStorage.getItem('ma_token') || ''; } catch (e) { tk = ''; }
+            try {
+                var b = window.desktopAuth;
+                tk = (b && typeof b.getToken === 'function') ? (b.getToken() || '')
+                    : (sessionStorage.getItem('ma_token') || '');
+            } catch (e) { tk = ''; }
             if (!tk) { window.location.replace('/login'); }
         })();
     </script>

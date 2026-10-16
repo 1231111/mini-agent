@@ -21,9 +21,13 @@
          不再等服务端把 login 模板发回来。放在 <head> 里是为了赶在样式渲染前执行，避免闪一下聊天骨架。 -->
     <script th:inline="none">
         (function () {
+            // 这段必须内联在 <head> 最前面：它执行时 security.js 还没加载，用不了 MiniAuth。
+            // token 来源优先壳的持久存储（Electron 客户端），其次页面 web 存储。
             var tk = '';
             try {
-                tk = sessionStorage.getItem('ma_token') || '';
+                var b = window.desktopAuth;
+                tk = (b && typeof b.getToken === 'function') ? (b.getToken() || '')
+                    : (sessionStorage.getItem('ma_token') || '');
             } catch (e) {
                 tk = '';
             }
@@ -122,7 +126,8 @@
             display: flex;
             flex-direction: column;
             flex-shrink: 0;
-            height: 100vh;
+            /* 用 100%（body 的内容高度）。Windows 壳已不再加标题栏占位。 */
+            height: 100%;
             overflow: hidden;
             transition: width .2s ease;
         }
@@ -248,7 +253,8 @@
            ================================================================= */
         .main {
             flex: 1; display: flex; flex-direction: column;
-            min-width: 0; min-height: 0; height: 100vh;
+            /* 同 .sidebar：用 100% 而非 100vh，否则壳里会比 body 的 content 高度多出标题栏那 32px */
+            min-width: 0; min-height: 0; height: 100%;
         }
 
         .model-menu-title {
@@ -505,6 +511,26 @@
         /* ---- USER message: 通栏气泡，与顶部任务条/输入框同宽同边界 ----
            左让出 --avatar-slot，右缘落在消息区内容右缘；
            宽度 = --content-w - --avatar-slot，和 .task-pin-inner / .input-container 一致。 */
+        /* 系统控制语提示条：居中灰字，形态刻意弱于正文 —— 它不是对话内容，
+           只是「上一步被放行了」的告知。class 刻意不叫 .user-row：
+           .user-row 被顶部任务条的滚动锚点逻辑 querySelectorAll 抓走。 */
+        .sys-row {
+            display: flex;
+            justify-content: center;
+            margin: 8px 0;
+        }
+        .sys-note {
+            max-width: 86%;
+            padding: 4px 12px;
+            border-radius: 10px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            color: var(--text3);
+            font-size: 12px;
+            line-height: 1.6;
+            text-align: center;
+            word-break: break-word;
+        }
         .user-row .msg-inner {
             display: flex;
             justify-content: flex-end;
@@ -1176,70 +1202,62 @@
         }
         @keyframes fadeIn { from{opacity:0} to{opacity:1} }
 
-        /* 思考 / 活动面板：实时展示模型思考与工具规划，让等待变可见 */
+        /* 思考折叠条在本轮气泡最上方：思考 → 工具时间线 → 正文（对齐常见 Agent UI）。 */
         .think-panel {
-            background: var(--bg);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 10px 14px;
-            margin-bottom: 14px;
-            font-size: 12.5px;
-            line-height: 1.65;
+            width: fit-content;
+            max-width: 100%;
+            /* 位次在气泡最底，所以留白开在上方与前文分隔（原先在顶部时是下方留白）。 */
+            margin: 10px 0 0;
+            font-size: 13px;
+            line-height: 1.75;
             color: var(--text3);
-            animation: thinkFadeIn .35s ease;
+            animation: thinkFadeIn .3s ease;
         }
-        @keyframes thinkFadeIn { from{opacity:0;transform:translateY(-4px)} to{opacity:1;transform:translateY(0)} }
+        @keyframes thinkFadeIn { from{opacity:0;transform:translateY(-2px)} to{opacity:1;transform:translateY(0)} }
         .think-panel .think-head {
+            width: max-content; max-width: 100%;
             display: flex; align-items: center; gap: 8px;
-            font-weight: 600; cursor: pointer; user-select: none;
-            color: var(--text2);
-            padding: 2px 0;
-            /* 「停靠在输入框上方」的观感靠 sticky 而非 DOM 搬运：
-               面板归属固定在 bot-body，只让表头吸附在滚动容器顶部，
-               滚动时思考标题始终可见。滚动容器是 #messages。 */
-            position: sticky; top: 0;
-            background: var(--bg);
-            z-index: 5;
+            cursor: pointer; user-select: none;
+            color: var(--text3);
+            padding: 1px 0;
+            outline: none;
         }
+        .think-panel .think-head:hover,
+        .think-panel .think-head:hover .think-caret { color: var(--text2); }
         .think-panel .think-head::before {
             content: '';
-            width: 6px; height: 6px;
+            width: 6px; height: 6px; flex-shrink: 0;
             border-radius: 50%;
             background: var(--accent);
             animation: thinkPulse 1.5s ease-in-out infinite;
         }
-        .think-panel.done .think-head::before {
-            animation: none;
-            opacity: .4;
-        }
+        .think-panel.done .think-head::before { animation: none; opacity: .4; }
         @keyframes thinkPulse { 0%,100%{opacity:.4;transform:scale(.8)} 50%{opacity:1;transform:scale(1.2)} }
-        .think-panel .think-head .think-caret {
-            transition: transform .25s ease; font-size: 9px;
+        /* 箭头默认隐形，hover 或已展开时才显形（WorkBuddy 的 _mfArrow_ 同款） */
+        .think-panel .think-caret {
+            flex-shrink: 0; font-size: 9px;
             color: var(--text3);
+            opacity: 0;
+            transition: transform .2s ease, opacity .16s ease;
         }
+        .think-panel .think-head:hover .think-caret,
+        .think-panel:not(.collapsed) .think-caret { opacity: 1; }
         .think-panel.collapsed .think-caret { transform: rotate(-90deg); }
+        .think-panel .think-label {
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
         .think-panel.collapsed .think-body { display: none; }
-        .think-panel.done { opacity: .55; }
         .think-panel .think-body {
-            margin-top: 8px;
-            padding-top: 8px;
+            margin-top: 6px;
             white-space: pre-wrap;
             overflow-wrap: anywhere;
             word-break: break-word;
             max-height: 420px;
             overflow-y: auto;
             overscroll-behavior: contain;
-            font-size: 12px;
-            line-height: 1.7;
+            font-size: 12.5px;
+            line-height: 1.75;
             color: var(--text3);
-        }
-        .think-panel .think-act {
-            color: var(--accent); margin-top: 6px;
-            font-size: 12px; font-weight: 500;
-            display: flex; align-items: center; gap: 4px;
-        }
-        .think-panel .think-act::before {
-            content: '⚡'; font-size: 11px;
         }
 
         /* 过程时间线：中间正文 + 工具活动按序落盘，不整段抹掉 */
@@ -1395,6 +1413,10 @@
             opacity: 0.35;
             text-decoration: line-through;
         }
+        /* 思考不落进「任务计划」也不落进 sub-goal 进度条：那一栏只放计划本身。
+           思考一律走 .think-panel，位次在本轮气泡**最底部**（见 ensurePanel 的不变式）：
+           工具时间线 → 正文 → 深度思考，对齐 WorkBuddy。
+           曾在 todo 的 li 里挂过 .step-think，会让计划卡片里长出「思考」，已删除。 */
         /* 无 todo 时回退：旧 sub-goal 单行进度 */
         .subgoal-bar {
             margin-bottom: 14px;
@@ -1869,6 +1891,41 @@ const LS_THEME = 'mini_agent_theme';
 const MAX_CONVS     = 60;
 const MAX_MSG_CHARS = 8000;
 
+/**
+ * 系统控制语前缀。**必须与后端 MessageConstants.SYSTEM_MESSAGE_PREFIX 逐字一致。**
+ *
+ * 后端 isSystemControlMessage 只认前缀、不看语义地决定「这一轮要不要提任务信号」，
+ * 所以两者一旦不一致就会静默失效 —— 控制语被当成用户任务照常走规划器。
+ * 2026-10-15 实测：「确认并继续」按钮拼的那条漏了前缀，后端收到
+ * 「继续执行已确认的步骤 #1，请继续。」后给出
+ * TASK_SIGNALS={"signals":"complex,action,continue"} 并真拉出 {"nodes":4} 任务图
+ * （「执行」命中 task-action-signals、「步骤」命中 complex-signals、「继续」命中 continue-signals）。
+ * 前端无法 import Java 常量，所以这里靠这一行注释 + 拼装点全部走本常量来维持一致：
+ * **新增任何前端拼的控制语，一律 SYS_PREFIX + 正文，不要写字面量。**
+ */
+const SYS_PREFIX = '【系统】';
+
+/**
+ * **显示层**判据：凡以「【系统」开头的都是系统拼进会话的消息，不装成用户气泡。
+ *
+ * 为什么比 SYS_PREFIX 宽：后端另有一类 `【系统通知】…`
+ * （`AGENT_LLM_NETWORK_RECONNECT`、`AGENT_LLM_REFUSE_RETRY` 等，网络重连与安全网关拒答后的一轮恢复），
+ * 它们同样是系统拼的、同样不该显示成用户输入。但两个前缀第 4 个字符就分岔了
+ * （`【系统】` 是 `】`，`【系统通知】` 是 `通`），所以后端的
+ * `isSystemControlMessage` **不认**它们。
+ *
+ * **显示判据与语义判据在这里刻意不同，两边各有明确职责**：
+ * 语义层（后端 `isSystemControlMessage`）决定「这一轮要不要提任务信号」，必须与后端逐字一致，
+ * 多认一个词就可能让真实用户消息漏掉任务信号；
+ * 显示层只回答「这条是不是用户打的字」，宽一点更对 —— 漏判的后果是把系统消息画成用户气泡。
+ */
+const SYS_TEXT_PREFIX = '【系统';
+
+/** 是否系统拼进会话的消息（显示层判据，见 SYS_TEXT_PREFIX 的说明）。 */
+function isSystemAuthoredText(text) {
+    return typeof text === 'string' && text.trimStart().startsWith(SYS_TEXT_PREFIX);
+}
+
 /** 解包统一 ApiResponse：有 success+data 时取 data，否则原样返回。 */
 async function apiJson(resp) {
     const body = await resp.json();
@@ -1897,8 +1954,15 @@ let permissionMode = localStorage.getItem('mini_agent_perm_mode') || 'default';
 let confirmPolicy = localStorage.getItem('mini_agent_confirm_policy') || 'dangerous';
 let pendingTodoConfirm = null;
 let pendingAskTool = null;
+let pendingAskGrantToken = null;
 let isStreaming  = false;
 let streamEpoch  = 0;
+// 本 turn 的起止时间戳，只给思考折叠条的表头文案用（「已处理 12s」/「已完成 12s」）。
+// 口径对齐 WorkBuddy 的 turnDurationMs：那次是「本 turn 最后一条 assistant 的
+// finishTime 减去最后一条 user 的 createTime」，这里退化成「进入流式态 → 定稿」，
+// 因为我们没有逐条消息的 createTime/finishTime 字段。
+let turnStartedAt  = 0;
+let turnFinishedAt = 0;
 const SCROLL_BOTTOM_PX = 80;
 let stickToBottom = true;
 
@@ -2796,8 +2860,9 @@ async function approvePlan() {
         alert('批准失败: ' + e.message);
     }
 }
-function showAskModal(tool, display) {
+function showAskModal(tool, display, grantToken) {
     pendingAskTool = tool;
+    pendingAskGrantToken = grantToken || null;
     const labels = {
         exec_command: '终端命令执行',
         http_post: '发送 HTTP POST 请求'
@@ -2808,24 +2873,28 @@ function showAskModal(tool, display) {
     const detail = display ? '本次调用：' + display + '。' : '';
     document.getElementById('askModalText').textContent =
         'Agent 需要「' + label + '」才能继续当前步骤。' + detail
-        + '批准后本会话可再次使用该能力。'
+        + '批准仅适用于这次完全相同的调用，并会在短时间后过期。'
         + '（点批准，不要只点步骤里的「确认并继续」。）';
     document.getElementById('askModal').classList.add('show');
 }
 function denyAskTool() {
     pendingAskTool = null;
+    pendingAskGrantToken = null;
     document.getElementById('askModal').classList.remove('show');
 }
 async function grantAskTool() {
     const tool = pendingAskTool;
+    const grantToken = pendingAskGrantToken;
     document.getElementById('askModal').classList.remove('show');
     pendingAskTool = null;
-    if (!tool || !currentId) return;
+    pendingAskGrantToken = null;
+    if (!tool || !grantToken || !currentId) return;
     try {
         await fetch(permissionUrl(), {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sessionId: currentId, action: 'grant_ask', tool })
+            body: JSON.stringify({ sessionId: currentId, action: 'grant_ask', tool,
+                grantToken })
         });
     } catch (e) {
         console.warn(e);
@@ -2838,7 +2907,7 @@ async function grantAskTool() {
     if (isStreaming) return;
     await new Promise(r => setTimeout(r, 200));
     if (isStreaming) return;
-    const text = '【系统】已批准「' + tool + '」，请继续执行。';
+    const text = SYS_PREFIX + '已批准「' + tool + '」，请继续执行。';
     document.getElementById('welcomeScreen')?.remove();
     renderUserMsg(text, null, 0, []);
     addMsgToConv('user', text, null, null);
@@ -3081,7 +3150,7 @@ async function confirmTodoAndContinue(id) {
         }
         pendingTodoConfirm = null;
         refreshConfirmBanner();
-        const text = '继续执行已确认的步骤 #' + id + '，请继续。';
+        const text = SYS_PREFIX + '继续执行已确认的步骤 #' + id + '，请继续。';
         document.getElementById('welcomeScreen')?.remove();
         renderUserMsg(text, null, 0, []);
         addMsgToConv('user', text, null, null);
@@ -3418,6 +3487,9 @@ function parkLiveThink() {
 }
 
 function setStreaming(on) {
+    // 起算点只打一次：从「非流式」切进「流式」时才重置，
+    // 这样中途重连（再次进 consumeStream）不会把计时清零。
+    if (on && !isStreaming) { turnStartedAt = Date.now(); turnFinishedAt = 0; }
     isStreaming = on;
     $send.title = on ? '追加说明 (Enter)' : '发送 (Enter)';
     if (!on) parkLiveThink();
@@ -3433,6 +3505,21 @@ function setStreaming(on) {
 function setLiveStatus(text) {
     const el = document.getElementById('liveStatus');
     if (el && el.textContent !== text) el.textContent = text;
+}
+
+/**
+ * 时长文案。口径沿用 WorkBuddy 的 bln()：
+ * 满 1 小时 →「Nh Nm」，满 1 分钟 →「Nm Ss」，否则 →「Ns」。
+ */
+function fmtDuration(ms) {
+    if (!(ms > 0)) return '0s';
+    const total = Math.floor(ms / 1000);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return m > 0 ? h + 'h' + m + 'm' : h + 'h';
+    if (m > 0) return s > 0 ? m + 'm' + s + 's' : m + 'm';
+    return s + 's';
 }
 
 function paintContext(used, limit) {
@@ -3593,6 +3680,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         const decoder = new TextDecoder('utf-8');
         let buffer = '', answer = '', done = false;
         let thinkText = '', thinkCollapsed = false;
+        // 本 turn 是否由失败/取消收尾，只影响折叠条的「已取消 / 已完成」用词
+        let turnCancelled = false;
         const MAX_THINK_CHARS = 12000;
         const MAX_TL_ROWS = 40;
         let thinkPaintTimer = null;
@@ -3637,14 +3726,18 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 .replace(/&/g, '&amp;').replace(/</g, '&lt;')
                 .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
         }
+
+        // 思考不按 step 归组，也不进「任务计划」卡片 —— 见 .think-panel 的注释。
+
         function ensureTimeline() {
             if (timelineEl) return;
             clearOnce();
             timelineEl = document.createElement('div');
             timelineEl.className = 'tl-stream';
-            // 锚点只用链上的下一个元素（answerEl），刻意不看 panelEl：
-            // panelEl 曾被搬进 liveDock，拿它的兄弟当锚点就是跨容器插节点。
-            insertAt(botBody, timelineEl, answerEl);
+            // 位次不变式：panelEl 永远是 bot-body 的最后一个子节点，其余元素插到它前面。
+            // 顺序：进度 → 时间线 → 答案 → 思考（思考钉底，对齐 WorkBuddy）。
+            // ref 必须落在 botBody 里，否则 insertAt 会静默降级成 append 跑到思考后面去。
+            insertAt(botBody, timelineEl, answerEl || panelEl);
         }
         /** 把当前流式正文封存为过程说明，再开新一段（不抹掉可见历史） */
         function sealAnswerToTimeline() {
@@ -3704,8 +3797,10 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 }, 120);
             }
         }
-        function finish(html) {
+        function finish(html, cancelled) {
             if (done) return; done = true;
+            turnFinishedAt = Date.now();
+            turnCancelled = !!cancelled;
             if (answerPaintTimer) {
                 clearTimeout(answerPaintTimer);
                 answerPaintTimer = null;
@@ -3715,10 +3810,12 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             ensureAnswer();
             answerEl.innerHTML = html;
             if (panelEl) {
-                // 归位到链上时间线/答案之前（与 ensurePanel 同一锚点）
-                insertAt(botBody, panelEl, timelineEl || answerEl);
-                panelEl.classList.add('done');
-                if (headLabelEl) headLabelEl.textContent = '思考过程';
+                // 定稿后收起，并重新钉到气泡最底（进度 → 时间线 → 正文 → 思考）
+                insertAt(botBody, panelEl, null);
+                panelEl.classList.add('done', 'collapsed');
+                thinkCollapsed = true;
+                appliedCollapsed = true;
+                paintThinkHead();
             }
             const finalHtml = botBody.innerHTML;
             bindLightbox(botBody.closest('.bot-row'));
@@ -3726,6 +3823,23 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             setStreaming(false); onInputChange(); scrollToBottom();
             stopPolling(sessionId);
             removeTaskRunningHint();
+        }
+
+        /**
+         * 折叠条表头文案：流式中「深度思考 · 已处理 Ns」，定稿后「深度思考 · 已完成 Ns」。
+         * 两个措辞沿用 WorkBuddy 的 streamingDuration.label 与
+         * metaFold.turnCompletedWithDuration；失败收尾时用「已取消」。
+         */
+        function thinkHeadText() {
+            if (!turnStartedAt) return '深度思考';
+            const span = fmtDuration((turnFinishedAt || Date.now()) - turnStartedAt);
+            const state = turnFinishedAt ? (turnCancelled ? '已取消 ' : '已完成 ') : '已处理 ';
+            return '深度思考 · ' + state + span;
+        }
+        function paintThinkHead() {
+            if (!headLabelEl) return;
+            const t = thinkHeadText();
+            if (headLabelEl.textContent !== t) headLabelEl.textContent = t;
         }
 
         function ensurePanel() {
@@ -3736,30 +3850,33 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             const head = document.createElement('div');
             head.className = 'think-head';
             head.onclick = function () { panelEl.classList.toggle('collapsed'); };
+            headLabelEl = document.createElement('span');
+            headLabelEl.className = 'think-label';
+            headLabelEl.textContent = '深度思考';
             const caret = document.createElement('span');
             caret.className = 'think-caret'; caret.textContent = '▼';
-            headLabelEl = document.createElement('span');
-            headLabelEl.textContent = '深度思考';
-            head.appendChild(caret); head.appendChild(headLabelEl);
+            head.appendChild(headLabelEl); head.appendChild(caret);
             const body = document.createElement('div');
             body.className = 'think-body';
             thinkTextEl = document.createElement('span');
             body.appendChild(thinkTextEl);
             panelEl.appendChild(head); panelEl.appendChild(body);
-            // 归属固定在 bot-body：think-panel 永远是 botBody 的子节点。
-            // liveDock 只承载 live-status 那行状态，不再接面板；
-            // 「停靠在输入框上方」的观感交给 CSS（见 .think-head 的 sticky）。
-            insertAt(botBody, panelEl, timelineEl || answerEl);
+            // 钉在 bot-body 最底：工具时间线与正文都在它上面（WorkBuddy 的位次）。
+            // 不变式：panelEl 是 botBody 的最后一个子节点，其余元素插到它前面。
+            // 别改回插到 progressEl/timelineEl/answerEl 前面 —— 那样流式期间思考
+            // 会落到 .tl-stream 之上（实测 DOM: think-panel, tl-stream, answer-stream）。
+            insertAt(botBody, panelEl, null);
+            // 有思考面板后不再用底部 liveDock 重复挂「思考中」
             const dock = document.getElementById('liveDock');
-            if (dock) dock.hidden = false;
+            if (dock) dock.hidden = true;
         }
         function ensureAnswer() {
             if (answerEl) return;
             clearOnce();
             answerEl = document.createElement('div');
             answerEl.className = 'answer-stream md-body';
-            // 答案永远排在链尾；走同一个收口，顺序调整只改锚点链
-            insertAt(botBody, answerEl, null);
+            // 答案插到思考条前面：思考恒在链尾，正文在它之上。
+            insertAt(botBody, answerEl, panelEl);
         }
         /** 任务计划钉在用户提问与 bot 之间 */
         function paintTodo() {
@@ -3787,7 +3904,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                     else {
                         clearOnce();
                         // 无用户行时退到 bot 体内，同样走收口、锚链上下一个元素
-                        insertAt(botBody, planRowEl, progressEl || panelEl || timelineEl || answerEl);
+                        insertAt(botBody, planRowEl, progressEl || timelineEl || answerEl || panelEl);
                     }
                 }
                 planRowEl.innerHTML = '';
@@ -3858,8 +3975,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             track.appendChild(progressFillEl);
             progressEl.appendChild(progressLabelEl);
             progressEl.appendChild(track);
-            // 进度条排在链首：锚点取链上下一个元素，不再假设 firstChild 是谁
-            insertAt(botBody, progressEl, panelEl || timelineEl || answerEl);
+            // 进度条在时间线/答案/思考之前
+            insertAt(botBody, progressEl, timelineEl || answerEl || panelEl);
         }
         function paintProgress() {
             if (todoItems && todoItems.length) return;
@@ -3877,6 +3994,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             if (t) t.remove();
         }
         function paint() {
+            // 思考只有一条出口：.think-panel，钉在本轮气泡最上方。
+            // 与「任务计划」卡片、sub-goal 进度条无关，那两处只放计划本身。
             if (thinkText) {
                 ensurePanel();
                 if (thinkText !== renderedThink) {
@@ -3894,8 +4013,10 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                     panelEl.classList.toggle('collapsed', thinkCollapsed);
                     appliedCollapsed = thinkCollapsed;
                 }
-                if (headLabelEl.textContent !== '深度思考') headLabelEl.textContent = '深度思考';
-                setLiveStatus(answer ? '生成回复中' : '思考中');
+                paintThinkHead();
+                // 思考面板已表达状态，关掉底部重复的「思考中」
+                const dock = document.getElementById('liveDock');
+                if (dock) dock.hidden = true;
             } else if (answer) {
                 setLiveStatus('生成回复中');
             }
@@ -3956,7 +4077,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 if (data) answer = data;
                 finish(renderMD(answer));
             } else if (name === 'error') {
-                finish(renderMD('❌ ' + (data || '服务处理出错')));
+                // 失败/取消收尾：折叠条表头用「已取消 Ns」而不是「已完成 Ns」
+                finish(renderMD('❌ ' + (data || '服务处理出错')), true);
             } else if (name === 'user') {
                 renderUserEchoIfNeeded(botBody, data);
             } else if (name === 'gone') {
@@ -3965,7 +4087,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 try {
                     const payload = typeof data === 'string' ? JSON.parse(data) : data;
                     const tool = payload && (payload.tool || payload.name);
-                    if (tool) showAskModal(tool);
+                    if (tool) showAskModal(tool, payload.display || '', payload.grantToken || '');
                 } catch (_) {
                     if (data) showAskModal(String(data));
                 }
@@ -4087,6 +4209,14 @@ function addMsgToConv(role, text, html, imgSrc) {
    MESSAGE DOM BUILDERS
    ========================================================================= */
 function renderUserMsg(text, imgSrc, imgCount = imgSrc ? 1 : 0, fileNames = [], isInject = false) {
+    // 系统控制语（前端自己拼、当用户消息发回后端的那几条）不装成用户气泡：
+    // 它不是用户打的字。装成气泡有两个后果 —— 用户以为「系统批注成了我的输入」，
+    // 以及 row.dataset.task 会让顶部任务条把它读成任务标题。
+    // 放在这里收口，是因为「发送时」与「历史重载时」两条路径都过这个函数。
+    if (isSystemAuthoredText(text)) {
+        renderSystemNote(text);
+        return;
+    }
     const row = document.createElement('div');
     row.className = 'msg-row user-row';
     row.dataset.task = text || '';   // 顶部任务条读这里，避免从 DOM 反推被图片/附件污染
@@ -4101,6 +4231,18 @@ function renderUserMsg(text, imgSrc, imgCount = imgSrc ? 1 : 0, fileNames = [], 
                 ${injectBadge}${text ? esc(text).replace(/\n/g, '<br>') : ''}
             </div>
         </div>`;
+    $msg.appendChild(row);
+}
+
+/**
+ * 系统控制语提示条：居中灰字，不占用户气泡、不设 dataset.task。
+ *
+ * 形态刻意弱于正文：它不是对话内容，只是「上一步被放行了」这件事的告知。
+ */
+function renderSystemNote(text) {
+    const row = document.createElement('div');
+    row.className = 'msg-row sys-row';
+    row.innerHTML = `<div class="sys-note">${esc(text || '')}</div>`;
     $msg.appendChild(row);
 }
 

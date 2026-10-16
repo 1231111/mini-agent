@@ -1,7 +1,9 @@
 package com.miniagent.agent.scope;
 
+import com.miniagent.common.event.SessionEvictedEvent;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
@@ -252,6 +254,34 @@ public class TaskScopeRegistry {
             if (persistence != null) {
                 persistence.deleteScope(sessionId);
             }
+        }
+    }
+
+    /**
+     * 只释放进程内缓存，保留持久化的任务指针。
+     *
+     * <p>用于「会话长期空闲」：进程内对象该还回去，但用户走开回来点开这个会话时
+     * 仍应停在离开时的那个任务上（还能说「继续」）。指针一旦在这里删掉，
+     * 用户回来就被当成全新会话，上一任务变成不可达 —— 那是功能退化，不是回收。</p>
+     */
+    public void forgetCached(String sessionId) {
+        if (StringUtils.isNotBlank(sessionId)) {
+            bySession.remove(sessionId);
+        }
+    }
+
+    /**
+     * 会话被删除或判定空闲时回收。
+     *
+     * <p>删除与空闲的处置<b>刻意不同</b>：删除是不可逆的，连持久化指针一起丢；
+     * 空闲只是内存回收，任务指针必须留着，否则用户回来说「继续」会找不到上一任务。</p>
+     */
+    @EventListener
+    public void onSessionEvicted(SessionEvictedEvent event) {
+        if (event.isDeleted()) {
+            forget(event.sessionId());
+        } else {
+            forgetCached(event.sessionId());
         }
     }
 

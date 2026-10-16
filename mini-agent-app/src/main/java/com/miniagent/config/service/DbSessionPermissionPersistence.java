@@ -3,6 +3,7 @@ package com.miniagent.config.service;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.permission.ConfirmPolicy;
+import com.miniagent.agent.permission.AskGrant;
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.permission.SessionPermissionPersistence;
 import com.miniagent.config.entity.AgentSessionPermission;
@@ -13,6 +14,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.Map;
 import java.util.Set;
 
 @Service
@@ -69,7 +71,7 @@ public class DbSessionPermissionPersistence implements SessionPermissionPersiste
                 expected.version(),
                 next.mode(),
                 next.planApproved(),
-                writeSet(next.askGrantedTools()),
+                writeGrants(next.askGrantedTools(), next.askGrants()),
                 next.confirmPolicy(),
                 next.execPolicyOverride(),
                 LocalDateTime.now()) == 1;
@@ -82,31 +84,52 @@ public class DbSessionPermissionPersistence implements SessionPermissionPersiste
     }
 
     private State state(AgentSessionPermission entity) {
+        GrantData grants = readGrants(entity.getAskGrantsJson());
         return new State(
                 entity.getMode(),
                 entity.isPlanApproved(),
-                readSet(entity.getAskGrantsJson()),
+                grants.toolNames(),
+                grants.grants(),
                 entity.getConfirmPolicy(),
                 entity.getExecPolicyOverride(),
                 entity.getVersion());
     }
 
-    private Set<String> readSet(String json) {
+    private GrantData readGrants(String json) {
         if (json == null || json.isBlank()) {
-            return Set.of();
+            return new GrantData(Set.of(), Map.of());
         }
         try {
-            return objectMapper.readValue(json, new TypeReference<Set<String>>() {});
+            String trimmed = json.trim();
+            if (trimmed.startsWith("{")) {
+                Map<String, AskGrant> grants = objectMapper.readValue(
+                        trimmed, new TypeReference<Map<String, AskGrant>>() {});
+                Set<String> names = grants.values().stream()
+                        .map(AskGrant::toolName).collect(java.util.stream.Collectors.toUnmodifiableSet());
+                return new GrantData(names, grants);
+            }
+            // Existing installations stored a JSON array of tool names. Keep
+            // it visible for compatibility, but the execution pipeline does
+            // not consider names alone to be authorization.
+            Set<String> names = objectMapper.readValue(
+                    trimmed, new TypeReference<Set<String>>() {});
+            return new GrantData(names, Map.of());
         } catch (Exception e) {
             throw new IllegalStateException("Invalid permission grants JSON", e);
         }
     }
 
-    private String writeSet(Set<String> values) {
+    private String writeGrants(Set<String> names, Map<String, AskGrant> grants) {
         try {
-            return objectMapper.writeValueAsString(values == null ? Set.of() : values);
+            if (grants != null && !grants.isEmpty()) {
+                return objectMapper.writeValueAsString(grants);
+            }
+            return objectMapper.writeValueAsString(names == null ? Set.of() : names);
         } catch (Exception e) {
             throw new IllegalStateException("Cannot persist permission grants", e);
         }
+    }
+
+    private record GrantData(Set<String> toolNames, Map<String, AskGrant> grants) {
     }
 }

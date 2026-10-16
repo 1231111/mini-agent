@@ -30,11 +30,28 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
     }
 
     public static ToolResult failure(ToolErrorCode code, String message, boolean retriable) {
+        return failure(code, message, retriable, null);
+    }
+
+    /**
+     * @param rawTextOverride 保留调用方的原始结果文本；传 {@code null} 时按 {@code message} 重建
+     *                        （兼容老调用方）。**能传原文就必须传原文。**
+     *
+     * <p>重建会把服务层附带的额外字段静默丢掉。实测（2026-10-15）：
+     * {@code SongGenerationService} 返回 {@code {"error":"歌词生成请求失败","hint":"HTTP 400：<响应体前 300 字>"}}，
+     * 旧实现只取 {@code error} 重建，于是模型只看得到「歌词生成请求失败」——
+     * 服务端到底说了什么全没了，用户连着几轮问「为什么没有具体错误码」的答案就在这里。
+     * 连带地 {@link #classifyLegacyFailure} 拿不到状态码，把 429 / 503 也判成不可重试。</p>
+     */
+    public static ToolResult failure(ToolErrorCode code, String message, boolean retriable,
+                                     String rawTextOverride) {
         ToolErrorCode actual = code == null ? ToolErrorCode.INTERNAL_ERROR : code;
         ToolStatus status = actual == ToolErrorCode.TIMEOUT ? ToolStatus.TIMEOUT
                 : actual == ToolErrorCode.CANCELLED ? ToolStatus.CANCELLED : ToolStatus.FAILED;
         String msg = Objects.requireNonNullElse(message, "工具执行失败");
-        String raw = "{\"success\":false,\"status\":\"" + status.name().toLowerCase(Locale.ROOT)
+        String raw = rawTextOverride != null && !rawTextOverride.isBlank()
+                ? rawTextOverride
+                : "{\"success\":false,\"status\":\"" + status.name().toLowerCase(Locale.ROOT)
                 + "\",\"errorCode\":\"" + actual + "\",\"error\":\""
                 + msg.replace("\\", "\\\\").replace("\"", "'") + "\",\"retriable\":" + retriable + "}";
         return new ToolResult(status, actual, msg, data(raw), retriable, "", raw);
@@ -80,17 +97,33 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
                     return unknown(node.path("error").asText("工具结果未知"), rawText);
                 }
                 if ("timeout".equals(status)) {
-                    return failure(ToolErrorCode.TIMEOUT, node.path("error").asText("工具超时"), true);
+                    return failure(ToolErrorCode.TIMEOUT, node.path("error").asText("工具超时"), true,
+                            rawText);
                 }
                 if ("cancelled".equals(status) || "canceled".equals(status)) {
-                    return failure(ToolErrorCode.CANCELLED, node.path("error").asText("工具已取消"), false);
+                    return failure(ToolErrorCode.CANCELLED, node.path("error").asText("工具已取消"), false,
+                            rawText);
                 }
                 if (failed) {
-                    String message = node.path("error").asText("工具执行失败");
+                    String err = node.path("error").asText("工具执行失败");
+                    // 服务层常把「为什么失败」放进伴生字段：SongGenerationService 用 hint 装
+                    // "HTTP <码>：<响应体前 300 字>"，别的工具有用 detail / message 的。
+                    // 只读 error 会把它整段丢掉；而且 classifyLegacyFailure 少了状态码
+                    // 就认不出 429 / 503，retriable 恒 false。
+                    String detail = node.path("hint").asText("");
+                    if (detail.isBlank()) {
+                        detail = node.path("detail").asText("");
+                    }
+                    if (detail.isBlank()) {
+                        detail = node.path("message").asText("");
+                    }
+                    String message = detail.isBlank() ? err : err + "；" + detail;
                     ToolErrorCode code = node.has("errorCode")
                             ? parseErrorCode(node.path("errorCode").asText(""))
                             : classifyLegacyFailure(message);
-                    return failure(code, message, isRetriable(code));
+                    // 传原文而不是重建：重建会丢掉这一层不认识的任何字段，
+                    // 服务层以后再加 detail / retryAfter / upstreamTraceId 也一样会没。
+                    return failure(code, message, isRetriable(code), rawText);
                 }
                 return success(rawText);
             }

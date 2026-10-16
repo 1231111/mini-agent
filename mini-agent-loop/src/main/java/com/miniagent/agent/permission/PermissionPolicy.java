@@ -32,7 +32,6 @@ public final class PermissionPolicy {
             "write_file", "edit_file",
             "browser_click", "browser_type", "browser_press", "browser_scroll",
             "browser_evaluate", "browser_extract_text",
-            "comfyui_execute", "comfyui_txt2img", "comfyui_img2img", "comfyui_img2video", "comfyui_tts",
             SongGenerateParams.TOOL_NAME,
             "delegate_task"
     );

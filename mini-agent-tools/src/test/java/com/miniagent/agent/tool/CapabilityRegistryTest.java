@@ -90,15 +90,20 @@ class CapabilityRegistryTest {
     }
 
     @Test
-    void imagePackIncludesTtsAndStatus() {
+    void imagePackCoversCloudMediaTools() {
         Set<String> registered = Set.of(
-                "image_generate", "comfyui_status", "comfyui_tts",
-                "comfyui_img2video", "write_file", "web_search");
+                "image_generate", "song_generate", "minimax_music", "lyria_music",
+                "render_diagram",
+                "write_file", "web_search");
         Set<String> hit = pack(registered, "image");
-        assertTrue(hit.contains("comfyui_tts"));
-        assertTrue(hit.contains("comfyui_status"));
-        assertTrue(hit.contains("comfyui_img2video"));
         assertTrue(hit.contains("image_generate"));
+        assertTrue(hit.contains("song_generate"));
+        assertTrue(hit.contains("minimax_music"));
+        assertTrue(hit.contains("lyria_music"));
+        assertTrue(hit.contains("render_diagram"));
+        // image 包刻意带 write_file / edit_file：媒体产物要落盘或写进文档
+        // （见 CapabilityRegistry.PACKS 的 "image" 条目 = IMAGE + 这两个）。
+        assertTrue(hit.contains("write_file"));
         assertFalse(hit.contains("web_search"));
     }
 

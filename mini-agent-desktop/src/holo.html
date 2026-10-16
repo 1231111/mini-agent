@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>MiniAgent Holo</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: transparent;
+    font-family: "Segoe UI", sans-serif;
+    user-select: none;
+  }
+  header {
+    position: absolute;
+    top: 8px;
+    left: 18px;
+    right: 18px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: rgba(140, 235, 255, 0.9);
+    font-size: 12px;
+    letter-spacing: 0.22em;
+    -webkit-app-region: drag;
+    z-index: 2;
+  }
+  button {
+    -webkit-app-region: no-drag;
+    width: 28px;
+    height: 28px;
+    border: 1px solid rgba(120, 220, 255, 0.45);
+    border-radius: 50%;
+    background: rgba(8, 24, 36, 0.35);
+    color: #bff6ff;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+  .scan {
+    pointer-events: none;
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(
+      to bottom,
+      rgba(80, 220, 255, 0.045) 0px,
+      rgba(80, 220, 255, 0.045) 1px,
+      transparent 1px,
+      transparent 4px
+    );
+    mix-blend-mode: screen;
+  }
+</style>
+</head>
+<body>
+<header>
+  <span>MINIAGENT · HOLO</span>
+  <button type="button" onclick="window.close()" title="关闭">×</button>
+</header>
+<canvas id="c"></canvas>
+<div class="scan"></div>
+<script src="holo-scene.js"></script>
+</body>
+</html>

@@ -171,9 +171,6 @@ public class ContextContributorConfiguration {
         if (toolNames.contains("browser_navigate")) {
             parts.add(PromptTemplates.BROWSER_GUIDANCE);
         }
-        if (toolNames.contains("comfyui_status")) {
-            parts.add(PromptTemplates.COMFYUI_GUIDANCE);
-        }
         if (!graphOwned && (toolNames.contains("todo") || toolNames.contains("delegate_task"))) {
             parts.add(PromptTemplates.PLANNING_GUIDANCE);
         }

@@ -6,6 +6,7 @@ import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.task.TaskSignals;
 import com.miniagent.agent.task.TaskStep;
 import com.miniagent.agent.llm.DedicatedChatModel;
+import com.miniagent.agent.skill.SkillStore;
 import com.miniagent.agent.tool.CapabilityRegistry;
 import com.miniagent.common.model.EffectiveModelContext;
 import dev.langchain4j.data.message.SystemMessage;
@@ -16,6 +17,7 @@ import jakarta.annotation.PostConstruct;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -24,6 +26,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 /**
  * Task Compiler：NL + 任务信号 → Goal + TaskGraph。只产出图，不验收。
@@ -45,10 +48,13 @@ public class GoalCompiler {
     static final String CLARIFY_HINT = "请补充：交付文件名或数据来源（URL）";
 
     /**
-     * 编译器系统提示。节点 capability 禁止 general；词表见
-     * {@link com.miniagent.agent.tool.CapabilityRegistry#PLANNER_CAPABILITIES}。
+     * 编译器系统提示。词表由 {@link #capabilityVocabulary()} 从
+     * {@link com.miniagent.agent.tool.CapabilityRegistry#PLANNER_CAPABILITIES} 注入，
+     * 这里不再写第二份 —— 同一份事实写两处，漂移只是时间问题
+     * （2026-10-15 实测：系统提示里 image 只被解释成「架构图/流程图」，
+     * 模型遇到「写一首歌」就只能标 file_write，生歌工具被提案闸门裁在门外）。
      */
-    private static final String COMPILER_SYSTEM = """
+    private static final String COMPILER_SYSTEM_TEMPLATE = """
             你是任务图编译器。把用户目标编译成可执行、可验收、无环的 DAG。
             只输出 JSON。不执行任务，不编造工具，不预写失败重试路径。
 
@@ -111,13 +117,18 @@ public class GoalCompiler {
             successCriteria 只填可验收项：workspace 相对文件名，或与某节点
             doneWhen.criteria 完全相同的评判句。禁止「完成 objective 且可验收」。
 
-            capability 取值：file_read / file_write / web / code / image / browser /
-            shell / research / deliver / plan。禁止 general：调度器无法从它判断
+            capability 取值：{CAPS}。禁止 general：调度器无法从它判断
             工具面和验收，归不了类就拆成有明确能力的节点。
             读表格/已有文件用 file_read；写文档、报告落盘用 file_write；
-            写代码/改代码用 code；
-            架构图/流程图用 image：先产出 .mmd 再渲染 .png，不要只交 Mermaid 源码；
-            最终交付物用 deliver；跑命令、编译、测试用 shell。
+            写代码/改代码用 code；跑命令、编译、测试用 shell；
+            最终交付物用 deliver。
+            image 是**媒体生成**能力，覆盖图片、音频、视频、架构图/流程图：
+            生成图片/插画、创作歌曲或配乐、把已有图片改风格、以及架构图，
+            一律用 image。不要因为「要出一首歌」就退化成 file_write 去写
+            一个歌词文件 —— 那只交付了文本，不是用户要的音频；
+            只有用户明确说「只要歌词文本、不要音频」时才用 file_write。
+            架构图/流程图用 image 时：先产出 .mmd 再渲染 .png，不要只交 Mermaid 源码；
+            生成媒体产物（图片/音频/视频）的节点，doneWhen.type 用 media_delivered。
             涉及网页的任务按用户真实动作拆：要整篇正文（飞书/wiki 等长文）就用
             browser 一次抽全再落盘；要点击、填表、读取局部字段，就拆成打开页面 →
             看结构 → 交互，不要一律套「抽正文写文档」。
@@ -157,8 +168,74 @@ public class GoalCompiler {
             priority 为 0~100 的整数，越大越优先，只影响同批 READY 调度。
             """;
 
+    /**
+     * 给模型看的 capability 词表。
+     *
+     * <p>取自 {@link CapabilityRegistry#PLANNER_CAPABILITIES}（唯一事实源）并去掉
+     * {@code general} —— 那是对模型禁用的，做兜底出口用，不能出现在词表里。</p>
+     */
+    static String capabilityVocabulary() {
+        return CapabilityRegistry.PLANNER_CAPABILITIES.stream()
+                .filter(c -> !CapabilityRegistry.GENERAL.equalsIgnoreCase(c))
+                .collect(Collectors.joining(" / "));
+    }
+
+    /** 词表在装配期注入：PACKS 加了能力而提示词没跟上，正是这次生歌用不上的直接原因。 */
+    static String compilerSystem() {
+        return COMPILER_SYSTEM_TEMPLATE.replace("{CAPS}", capabilityVocabulary());
+    }
+
     private final PlannerProperties properties;
     private volatile ChatModel dedicatedPlanner;
+
+    /**
+     * skill 摘要来源，喂给规划模型看。
+     *
+     * <p><b>为什么规划器也要看 skill</b>：它只拿到用户消息时，不知道系统里存在
+     * 「生歌技能」，于是给写歌任务挑了个只能写文件的 capability，提案闸门再把
+     * {@code song_generate} 裁掉 —— 模型从头到尾没见过这个工具。执行阶段的模型
+     * 也能看到 skill 摘要，但那时节点 capability 已经定死，摘要救不了它。</p>
+     *
+     * <p>用 {@code required = false} 的显式注解而不是裸字段：planner 单测不装配
+     * skill 时应退化成「不看技能」。裸字段漏注解的后果是字段永远为 null 而
+     * 工具照样注册成功，只在调用时才炸（{@code BuiltinTools.skillStore} 就是这样
+     * 变成三个空壳工具的）。</p>
+     */
+    @Autowired(required = false)
+    private SkillStore skillStore;
+
+    /** skill 摘要给规划模型的字符上限：词表之外还要留预算给任务描述。 */
+    private static final int SKILL_DIGEST_MAX = 1200;
+
+    /** 装配/测试用：显式指定 skill 来源。生产走 {@code @Autowired(required=false)}。 */
+    void attachSkillStore(SkillStore store) {
+        this.skillStore = store;
+    }
+
+    /**
+     * 把可用技能拼进规划模型的输入。摘要为空（没装 skill / 单测未装配）就返回空串，
+     * 不改变原有行为。
+     */
+    String skillDigest() {
+        if (skillStore == null) {
+            return "";
+        }
+        String summary;
+        try {
+            summary = skillStore.getSkillListSummary();
+        } catch (Exception e) {
+            log.warn("读取 skill 摘要失败，按无技能继续拆解: {}", e.getMessage());
+            return "";
+        }
+        if (StringUtils.isBlank(summary)) {
+            return "";
+        }
+        if (summary.length() > SKILL_DIGEST_MAX) {
+            summary = summary.substring(0, SKILL_DIGEST_MAX) + "\n（技能清单已截断）";
+        }
+        return "\n本轮可用技能：若用户目标命中某技能，该步骤的 capability 必须选到"
+                + "它所依赖的能力类别，不要退化成只能写文件：\n" + summary;
+    }
 
     public GoalCompiler(PlannerProperties properties) {
         this.properties = properties;
@@ -230,44 +307,124 @@ public class GoalCompiler {
         String user = "用户消息:\n" + userMessage
                 + "\n\n命中信号:" + signalsOf(plan)
                 + "\n任务目标:" + (plan == null ? "" : plan.taskGoal())
+                + skillDigest()
                 + "\n\n**修正要求**:\n" + correctionPrompt
                 + "\n\n请根据上述修正要求重新生成任务图。";
 
         var response = chat.chat(ChatRequest.builder()
-                .messages(List.of(new SystemMessage(COMPILER_SYSTEM), UserMessage.from(user)))
+                .messages(List.of(new SystemMessage(compilerSystem()), UserMessage.from(user)))
                 .build());
         String text = response.aiMessage() == null ? "" : response.aiMessage().text();
         try {
-            return parseCompilation(text, goalFromPlan(userMessage, plan));
+            ParsedCompilation parsed = parseCompilation(text, goalFromPlan(userMessage, plan));
+            if (parsed == null || parsed.graph() == null || parsed.graph().isEmpty()) {
+                // 空图是最难定位的一类失败：模型回的是**合法 JSON 但没有可用的 nodes 数组**，
+                // 所以既不抛异常、也没有任何痕迹 —— 外部只看得到一句「使用模板图」。
+                // 这段原文此前完全不落盘（agent_trace_steps 里 CONTEXT_LOAD → GOAL_COMPILED
+                // 之间本来就是空白），于是「为什么退回模板」只能靠猜。
+                log.warn("GoalCompiler 模型返回空图，原文前 400 字: {}", abbreviate(text, 400));
+            }
+            return parsed;
         } catch (Exception e) {
-            throw new IllegalStateException("parse graph failed: " + e.getMessage(), e);
+            throw new IllegalStateException("parse graph failed: " + e.getMessage()
+                    + " | 原文前 300 字: " + abbreviate(text, 300), e);
         }
     }
 
+    /**
+     * 编译本轮任务图。
+     *
+     * <p>谁来决定拆几刀，取决于 {@code agent.planner.model-decides-decomposition}：</p>
+     * <ul>
+     *   <li>{@code true}（默认）：先叫规划模型编图，拿不到非空图才退回模板图。
+     *       模板只兜底，不再抢在模型前面定案。</li>
+     *   <li>{@code false}：先用 {@link DecompositionPolicy} 的结构信号套模板图，
+     *       {@link #structureDeterminate} 判定结构确定就直接定案，规划模型一次都不调。</li>
+     * </ul>
+     *
+     * <p>两种模式都先算好模板图 {@code structured} —— 它是规划模型不可用或编不出图时
+     * 唯一的退路，所以必须先有。</p>
+     */
     public CompileResult compile(ChatModel chat, String userMessage, TaskPlan plan) {
         Goal base = goalFromPlan(userMessage, plan);
         CompileResult structured = fallback(base, userMessage, plan);
+
+        if (properties.isModelDecidesDecomposition()) {
+            CompileResult byLlm = tryLlmCompile(chat, userMessage, plan);
+            return byLlm != null ? byLlm : structured;
+        }
+
         if (structureDeterminate(structured.graph(), userMessage, plan)) {
             log.info("GoalCompiler 结构确定 nodes={} clarify={}",
                     structured.graph().nodes().size(), structured.goal().isClarify());
             return structured;
         }
+        CompileResult byLlm = tryLlmCompile(chat, userMessage, plan);
+        return byLlm != null ? byLlm : structured;
+    }
+
+    /**
+     * 叫规划模型编一张图。
+     *
+     * @return 拿到非空图时返回编译结果；规划模型不可用、本轮不该叫模型，
+     *         或按 {@code compilerRetry} 重试完仍无产出时返回 {@code null}，
+     *         由调用方决定退回模板图。
+     */
+    private CompileResult tryLlmCompile(ChatModel chat, String userMessage, TaskPlan plan) {
         ChatModel planner = resolvePlannerChat(chat);
-        if (planner != null && (plan == null || plan.requiresStructuredPlan())) {
-            int retries = Math.max(0, properties.getCompilerRetry());
-            for (int i = 0; i <= retries; i++) {
-                try {
-                    ParsedCompilation parsed = compileWithLlm(planner, userMessage, plan);
-                    if (parsed != null && parsed.graph() != null && !parsed.graph().isEmpty()) {
-                        return new CompileResult(
-                                parsed.goal(), markPending(parsed.graph()), false);
-                    }
-                } catch (Exception e) {
-                    log.warn("GoalCompiler LLM 拆解失败 retry={}: {}", i, e.getMessage());
+        // 下面三条 return null 的路径原先全是静默的，而它们各自对应完全不同的处置方式。
+        // 2026-10-15 实测：同一条消息三次全部 template=true，日志里只有一行「使用模板图」，
+        // 分不清是「没有模型」「判据不成立」还是「模型回空图」，只能逐条排除 —— 都留痕就不用再猜。
+        if (planner == null) {
+            log.warn("GoalCompiler 跳过 LLM 拆解：无可用规划模型（传入 chat={}，专用模型={}）",
+                    chat == null ? "null" : chat.getClass().getSimpleName(),
+                    dedicatedPlanner == null ? "未配置" : "已配置");
+            return null;
+        }
+        if (!shouldAskModel(plan)) {
+            log.info("GoalCompiler 跳过 LLM 拆解：判据不成立 modelDecides={}，signals={}",
+                    properties.isModelDecidesDecomposition(),
+                    plan == null ? "plan=null" : plan.signals().describe());
+            return null;
+        }
+        int retries = Math.max(0, properties.getCompilerRetry());
+        for (int i = 0; i <= retries; i++) {
+            long t0 = System.currentTimeMillis();
+            try {
+                ParsedCompilation parsed = compileWithLlm(planner, userMessage, plan);
+                long ms = System.currentTimeMillis() - t0;
+                if (parsed != null && parsed.graph() != null && !parsed.graph().isEmpty()) {
+                    log.info("GoalCompiler LLM 拆解成功 retry={} nodes={} 耗时={}ms 模型={}",
+                            i, parsed.graph().nodes().size(), ms,
+                            planner.getClass().getSimpleName());
+                    return new CompileResult(
+                            parsed.goal(), markPending(parsed.graph()), false);
                 }
+                log.warn("GoalCompiler LLM 拆解得到空图 retry={} 耗时={}ms（原文见上一条 warn）",
+                        i, ms);
+            } catch (Exception e) {
+                log.warn("GoalCompiler LLM 拆解失败 retry={} 耗时={}ms: {}",
+                        i, System.currentTimeMillis() - t0, e.getMessage());
             }
         }
-        return structured;
+        return null;
+    }
+
+    /**
+     * 本轮要不要把拆解交给规划模型。
+     *
+     * <p>模型判模式看的是「这轮要不要动手」（{@link TaskSignals#actionBearing()}）——
+     * 只要是动手的活，拆不拆、拆几刀一律由模型回答；
+     * 词表判模式看的是 {@code TaskPlan#requiresStructuredPlan()}，
+     * 那个布尔才是「这轮是不是结构化任务」。</p>
+     */
+    private boolean shouldAskModel(TaskPlan plan) {
+        if (plan == null) {
+            return false;
+        }
+        return properties.isModelDecidesDecomposition()
+                ? plan.signals().actionBearing()
+                : plan.requiresStructuredPlan();
     }
 
     public CompileResult fallback(Goal base, String userMessage, TaskPlan plan) {
@@ -304,20 +461,27 @@ public class GoalCompiler {
         String user = "用户消息:\n" + userMessage
                 + "\n\n命中信号:" + signalsOf(plan)
                 + "\n任务目标:" + (plan == null ? "" : plan.taskGoal())
-                + "\n可用能力: file_read / file_write / web / code / image / browser"
-                + " / shell / research / deliver / plan"
-                + "\n禁止 general。"
                 + "\n若同时要获取资料并保存文件，至少拆成获取 + 写入两个节点。"
                 + "\n若同时要读取表格并统计，至少拆成读取 + 计算两个节点。"
-                + "\n不要把打开/读取/解析同一文件拆成多个节点。";
+                + "\n不要把打开/读取/解析同一文件拆成多个节点。"
+                + skillDigest();
         var response = chat.chat(ChatRequest.builder()
-                .messages(List.of(new SystemMessage(COMPILER_SYSTEM), UserMessage.from(user)))
+                .messages(List.of(new SystemMessage(compilerSystem()), UserMessage.from(user)))
                 .build());
         String text = response.aiMessage() == null ? "" : response.aiMessage().text();
         try {
-            return parseCompilation(text, goalFromPlan(userMessage, plan));
+            ParsedCompilation parsed = parseCompilation(text, goalFromPlan(userMessage, plan));
+            if (parsed == null || parsed.graph() == null || parsed.graph().isEmpty()) {
+                // 空图是最难定位的一类失败：模型回的是**合法 JSON 但没有可用的 nodes 数组**，
+                // 所以既不抛异常、也没有任何痕迹 —— 外部只看得到一句「使用模板图」。
+                // 这段原文此前完全不落盘（agent_trace_steps 里 CONTEXT_LOAD → GOAL_COMPILED
+                // 之间本来就是空白），于是「为什么退回模板」只能靠猜。
+                log.warn("GoalCompiler 模型返回空图，原文前 400 字: {}", abbreviate(text, 400));
+            }
+            return parsed;
         } catch (Exception e) {
-            throw new IllegalStateException("parse graph failed: " + e.getMessage(), e);
+            throw new IllegalStateException("parse graph failed: " + e.getMessage()
+                    + " | 原文前 300 字: " + abbreviate(text, 300), e);
         }
     }
 

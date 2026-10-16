@@ -200,9 +200,14 @@ public class AgentChatApplicationService {
         boolean executionStarted = false;
 
         try (var ignoredOwner = MemoryStore.bindOwnerContext(owner)) {
-            streamingService.markRunning(sessionId);
             executionControl.start(sessionId, tenantId);
             executionStarted = true;
+            // Install the execution lease before publishing the running state.
+            // A client can disconnect between taskRunService.tryStart and this
+            // point; ChatStreamingService then delivers the deferred cancellation
+            // to the real lease instead of losing it when start() replaces a
+            // fallback lease.
+            streamingService.markRunning(sessionId);
             clientMultiAgent.open(sessionId);
             memoryStore.loadFromDisk();
             try {
@@ -275,7 +280,13 @@ public class AgentChatApplicationService {
                 clientMultiAgent.close(sessionId);
                 executionControl.finish(sessionId);
             }
-            streamingService.markIdle(sessionId);
+            // For SSE runs the outer async wrapper publishes the terminal event
+            // before releasing the ChatStreamingService reservation. Releasing it
+            // here would let a rapid second request replace the channel between
+            // this finally block and eventCenter.complete/error.
+            if (progressEmitter == null) {
+                streamingService.markIdle(sessionId);
+            }
             TaskTodoContext.clear();
 
             // 巩固走后台，避免挡住 SSE end（PERM_ASK 批准后续跑会等流结束）
@@ -577,10 +588,13 @@ public class AgentChatApplicationService {
                 }
                 String answer = executeAgentWithProgress(
                         userId, finalSid, finalUserMessage, emitter, finalImages, finalMedia);
+                streamingService.markCompleting(finalSid);
                 streamingService.getEventCenter().complete(finalSid, Optional.ofNullable(answer).orElse(""));
             } catch (Exception e) {
+                streamingService.markCompleting(finalSid);
                 streamingService.getEventCenter().error(finalSid, MessageConstants.CHAT_PROCESSING_ERROR + e.getMessage());
             } finally {
+                streamingService.markIdle(finalSid);
                 RoleContext.clear();
             }
         });

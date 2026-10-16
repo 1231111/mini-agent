@@ -1,16 +1,13 @@
 package com.miniagent.common;
 
-import java.util.regex.Pattern;
-
 /** Validation shared by database, cache, SSE and filesystem session namespaces. */
 public final class SessionIds {
-
-    private static final Pattern SAFE = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,99}");
 
     private SessionIds() {}
 
     public static boolean isValid(String sessionId) {
-        return sessionId != null && SAFE.matcher(sessionId).matches();
+        // 规则集中在 SafeSegments（同一套字符集也被文件名/目录名复用），这里只保留会话语义。
+        return SafeSegments.isValid(sessionId);
     }
 
     public static String requireValid(String sessionId) {

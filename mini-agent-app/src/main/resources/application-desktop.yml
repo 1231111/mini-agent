@@ -61,8 +61,12 @@
 server:
   # 桌面后端只服务本机 Electron 壳，禁止监听局域网网卡。
   address: 127.0.0.1
+  shutdown: graceful
 
 spring:
+  lifecycle:
+    # 退出桌面后先排空在途任务，避免工具调用完成但任务状态尚未落盘。
+    timeout-per-shutdown-phase: 15s
   thymeleaf:
     # 出厂包按只读资源处理：模板不会在运行期被改动，缓存打开减少重复解析。
     cache: true
@@ -159,12 +163,17 @@ logging:
 
 agent:
   auth:
-    # 刻意不给默认值。缺失时 JwtSessionService.init() 抛 IllegalStateException
-    # 拒绝启动 —— 带上 application.yml 里那个公开的开发默认值出厂，
-    # 等于每个客户拿到同一把签名密钥，任何人可伪造 token。
+    # 不提供仓库默认值。Electron 壳会在每次安装首次启动时生成并持久化
+    # 一把独立的 JWT_SECRET；直接运行 jar 时若没有显式环境变量则拒绝启动。
     jwt-secret: ${JWT_SECRET:}
     jwt-exp-seconds: 604800
-    jwt-ttl-seconds: 1800
+    # 会话空闲超时 —— 这才是「登录能管多久」的真正开关（jwt-exp-seconds 只是硬上限，
+    # 见 JwtSessionService:113 写 exp、:116 建会话、:139 每次鉴权续期）。
+    # 桌面是单机形态：没有第二个用户、没有 Redis，用户要的就是「登一次管七天」，
+    # 所以这里与 jwt-exp-seconds 取齐 —— 会话最长不超过 JWT 自身的 exp，
+    # 两者相等即等于「JWT 到期前一直有效」。
+    # 想让客户端闲置一段时间自动登出，把这个值调小即可（单位秒，例如 1800 = 30 分钟）。
+    jwt-ttl-seconds: 604800
     bcrypt-strength: 12
     # 见文件头「尚未落地」第 3 条。
     registration-enabled: true
@@ -280,6 +289,7 @@ agent:
 
   tools:
     # 出厂默认 ask：每个会话首次执行 exec_command 前需要用户批准。这一个值只是初始档，
+    # 与 ExecPolicyService 的缺省兜底一致；配置漏配时也不能静默升级为 allow。
     # 用户在会话里可以随时用权限面板切成 block/ask —— 走
     # PUT /api/conversations/{sid}/permission 的 execPolicy 字段，无需重启。
     #

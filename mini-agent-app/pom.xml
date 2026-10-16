@@ -169,6 +169,14 @@
                 <version>${spring-boot.version}</version>
                 <configuration>
                     <mainClass>com.miniagent.MiniAgentSpringbootApplication</mainClass>
+                    <!-- Playwright 从 classpath 取 driver/node。嵌进 fat jar 后 getResource 为 null，
+                         浏览器工具全部 Failed to create driver。启动时把这个包解出来。 -->
+                    <requiresUnpack>
+                        <dependency>
+                            <groupId>com.microsoft.playwright</groupId>
+                            <artifactId>driver-bundle</artifactId>
+                        </dependency>
+                    </requiresUnpack>
                 </configuration>
                 <executions>
                     <execution>

@@ -70,7 +70,11 @@ public class StepEvaluator {
             return reject("获取类节点不能用空洞 evidence 放行");
         }
         if (!dw.worldCheck() && (looksLikeToolError(ev) || looksLikeLoopAbort(ev))) {
-            return reject("tool error: " + abbreviate(ev, 200));
+            // 400 而不是 200：这条 reason 会被 RecoveryEngine 装进 FailureDiagnosis.reason，
+            // 再原样拼进 tryLlmReplan 的重规划提示词 —— 它是模型唯一能看到的失败细节。
+            // 200 字刚好卡掉服务端返回里靠后的关键字段（SongGenerationService 的
+            // hint 自带 300 字响应体片段，加上 error 文案就超过 200 了）。
+            return reject("tool error: " + abbreviate(ev, 400));
         }
 
         if (dw.isJudge()) {

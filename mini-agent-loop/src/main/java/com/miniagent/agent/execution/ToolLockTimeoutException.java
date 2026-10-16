@@ -9,7 +9,7 @@ package com.miniagent.agent.execution;
  * <h2>为什么必须有这个异常</h2>
  *
  * <p>改造前锁等待是 {@code Semaphore.acquire()}，<b>无限阻塞</b>。于是长耗时工具
- * （{@code comfyui_img2video} 跑 620 秒）持锁期间，别的会话里任何一个写类工具都只能
+ * （例如长耗时的媒体生成）持锁期间，别的会话里任何一个写类工具都只能
  * 一路阻塞到撞自己的外层闸门 —— 而写类工具超时会被判成「终态未知」（{@code OUTCOME_UNKNOWN}）
  * 并<b>中止整轮任务</b>。一次慢生成就能把毫不相干的多步任务成批打死。</p>
  *

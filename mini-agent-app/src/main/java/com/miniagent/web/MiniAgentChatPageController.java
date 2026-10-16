@@ -1075,7 +1075,28 @@ public class MiniAgentChatPageController {
         }
         if ("grant_ask".equalsIgnoreCase(action)) {
             String tool = Objects.isNull(body.get("tool")) ? "" : String.valueOf(body.get("tool"));
-            permissionStore.grantAskTool(sessionId, tool);
+            Object rawGrantToken = body.get("grantToken");
+            if (rawGrantToken == null) {
+                // `token` was used by an early preview client; retaining the
+                // alias does not relax authorization because it is still
+                // validated against the pending exact-invocation grant.
+                rawGrantToken = body.get("token");
+            }
+            String grantToken = Objects.isNull(rawGrantToken)
+                    ? "" : String.valueOf(rawGrantToken);
+            // A tool name alone is deliberately insufficient. Older clients
+            // may still send the action, but the server requires the opaque
+            // token emitted for the exact invocation in permission_ask.
+            if (StringUtils.isBlank(grantToken)) {
+                return ApiResponse.fail(ErrorCode.CONFIG_INVALID,
+                        "grantToken required; approval must be bound to the displayed invocation");
+            }
+            var approved = permissionStore.grantAskToken(sessionId, grantToken, tool);
+            if (approved.isEmpty()) {
+                return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN,
+                        "grantToken 无效、已过期或不属于本会话");
+            }
+            tool = approved.get().toolName();
             eventCenter.appendUserMessage(sessionId,
                     com.miniagent.common.MessageConstants.SYSTEM_MESSAGE_PREFIX
                             + "用户已批准工具 " + tool + "，请继续。");

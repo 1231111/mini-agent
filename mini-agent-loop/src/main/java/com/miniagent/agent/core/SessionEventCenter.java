@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.miniagent.replica.ReplicaProperties;
+import jakarta.annotation.PreDestroy;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
@@ -16,6 +17,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -43,6 +45,7 @@ public class SessionEventCenter {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String SSE_PREFIX = "sse:";
     private static final String PENDING_USER_MSG_PREFIX = "pending-user-msg:";
+    private static final Duration PENDING_USER_MSG_TTL = Duration.ofHours(2);
 
     private final Map<String, SessionChannel> channels = new ConcurrentHashMap<>();
     /**
@@ -69,6 +72,12 @@ public class SessionEventCenter {
         cleaner.scheduleWithFixedDelay(this::removeExpiredChannels, 60, 60, TimeUnit.SECONDS);
     }
 
+    /** Stop the cleaner on context shutdown/reload so old application contexts do not retain it. */
+    @PreDestroy
+    void shutdown() {
+        cleaner.shutdownNow();
+    }
+
     @PostConstruct
     void subscribeRedis() {
         if (!redisMode() || redisListener == null) {
@@ -85,6 +94,28 @@ public class SessionEventCenter {
     enum Status { running, done, error }
 
     static final class SessionChannel {
+        /**
+         * think / answer 两个缓冲的锁。
+         *
+         * <p>写入方是 agent loop 线程（{@link #applyEvent}）与 Redis 监听线程
+         * （{@link #onRedisMessage} 的 start 分支），读取方是 HTTP 线程
+         * （{@link #attachClient} 的重连重放）。裸 StringBuilder 在这几条线程间并发时，
+         * append 与 toString / setLength 会交错，最轻的表现是字符丢漏
+         * （"given a closing conditions" 会变成 "ivennaraclosingconaitons"）。
+         *
+         * <p>更重的一条是「读 length() → delete」，实测抛的是
+         * {@code java.lang.ArrayIndexOutOfBoundsException: arraycopy: last destination index
+         * 1800 out of bounds for byte[1614]}（出在 {@code AbstractStringBuilder.delete} 的
+         * {@code System.arraycopy}）。成因是并发的 append 各自在
+         * {@code ensureCapacityInternal} 里替换 value 数组，后写的一次用更小的数组覆盖了
+         * 更大的，而 {@code delete} 仍按读到的大 count 去 copy；读端的 {@code toString()}
+         * 同理可能抛 StringIndexOutOfBoundsException。该异常在 sendEvent 里被吞掉之后，
+         * 会连带把刚重连成功的客户端当成死连接摘掉。
+         *
+         * <p>因此 append、setLength、以及「读长度 → 裁剪」这三类都必须持本锁，
+         * 且读端取快照下发，不能边遍历边读。
+         */
+        final Object bufferLock = new Object();
         volatile Status status = Status.running;
         volatile String sessionId;
         volatile String userMessage = "";
@@ -189,6 +220,13 @@ public class SessionEventCenter {
         }
     }
 
+    /** 在 bufferLock 保护下取缓冲快照；空缓冲返回空串（避免下发空事件）。 */
+    private static String snapshot(SessionChannel channel, StringBuilder buffer) {
+        synchronized (channel.bufferLock) {
+            return buffer.length() > 0 ? buffer.toString() : "";
+        }
+    }
+
     public boolean attachClient(String sessionId, Long userId, SseEmitter emitter) {
         SessionChannel channel = channels.get(key(sessionId));
         if (Objects.isNull(channel)) {
@@ -198,8 +236,9 @@ public class SessionEventCenter {
         if (Objects.nonNull(channel.userMessage) && !channel.userMessage.isEmpty()) {
             sendEvent(emitter, "user", channel.userMessage);
         }
-        if (channel.think.length() > 0) {
-            sendEvent(emitter, "thinking", channel.think.toString());
+        String thinkSnapshot = snapshot(channel, channel.think);
+        if (!thinkSnapshot.isEmpty()) {
+            sendEvent(emitter, "thinking", thinkSnapshot);
         }
         if (Objects.nonNull(channel.progress) && !channel.progress.isEmpty()) {
             sendEvent(emitter, "progress", channel.progress);
@@ -210,8 +249,9 @@ public class SessionEventCenter {
             sendEvent(emitter, "subgoal", subgoalPayload(
                     channel.subgoalText, channel.subgoalDone, channel.subgoalTotal));
         }
-        if (channel.answer.length() > 0) {
-            sendEvent(emitter, "token", channel.answer.toString());
+        String answerSnapshot = snapshot(channel, channel.answer);
+        if (!answerSnapshot.isEmpty()) {
+            sendEvent(emitter, "token", answerSnapshot);
         }
 
         if (channel.status == Status.done) {
@@ -289,6 +329,7 @@ public class SessionEventCenter {
             try { client.complete(); } catch (Exception ignored) {}
         }
         channel.clients.clear();
+        clearPendingUserMessages(key(sessionId));
         publishToOtherInstances(key(sessionId), "complete", "end", channel.finalAnswer);
     }
 
@@ -305,6 +346,7 @@ public class SessionEventCenter {
             try { client.complete(); } catch (Exception ignored) {}
         }
         channel.clients.clear();
+        clearPendingUserMessages(key(sessionId));
         publishToOtherInstances(key(sessionId), "error", "error", channel.errorMsg);
     }
 
@@ -312,13 +354,24 @@ public class SessionEventCenter {
     public boolean appendUserMessage(String sessionId, String message) {
         String k = key(sessionId);
         if (redisMode()) {
+            // Do not create an orphan Redis list for a completed or unknown
+            // session. The start event is published before the worker accepts
+            // appended messages, so a missing/non-running channel is a real
+            // stale-client signal rather than an invitation to queue forever.
+            SessionChannel channel = channels.get(k);
+            if (channel == null || channel.status != Status.running) {
+                return false;
+            }
             try {
-                redis.opsForList().leftPush(PENDING_USER_MSG_PREFIX + k, message);
-                SessionChannel channel = channels.get(k);
+                String queueKey = PENDING_USER_MSG_PREFIX + k;
+                redis.opsForList().leftPush(queueKey, message);
+                // A worker restart must not leave user input in Redis forever.
+                // The deadline/lease is at most two hours in the default
+                // profile, so this TTL covers a live run while bounding stale
+                // queues after a crash.
+                redis.expire(queueKey, PENDING_USER_MSG_TTL);
                 String ack = message.length() > 50 ? message.substring(0, 50) + "..." : message;
-                if (channel != null && channel.status == Status.running) {
-                    sendToLocalClients(channel, "append_ack", ack);
-                }
+                sendToLocalClients(channel, "append_ack", ack);
                 publishToOtherInstances(k, "event", "append_ack", ack);
                 log.info("用户追加消息入队(redis): sessionId={}, length={}", sessionId, message.length());
                 return true;
@@ -361,6 +414,19 @@ public class SessionEventCenter {
             result.add(msg);
         }
         return result;
+    }
+
+    private void clearPendingUserMessages(String sessionId) {
+        if (!redisMode()) {
+            return;
+        }
+        try {
+            redis.delete(PENDING_USER_MSG_PREFIX + sessionId);
+        } catch (Exception e) {
+            // Completion/error delivery must remain local even if Redis is
+            // already unavailable during shutdown or failover.
+            log.debug("清理 Redis 追加消息队列失败 session={}: {}", sessionId, e.getMessage());
+        }
     }
 
     private void publishToOtherInstances(String sessionId, String type, String name, Object data) {
@@ -415,8 +481,10 @@ public class SessionEventCenter {
                 case "start" -> {
                     channel.status = Status.running;
                     channel.userMessage = String.valueOf(data);
-                    channel.think.setLength(0);
-                    channel.answer.setLength(0);
+                    synchronized (channel.bufferLock) {
+                        channel.think.setLength(0);
+                        channel.answer.setLength(0);
+                    }
                     channel.doneAt = 0L;
                     sendToLocalClients(channel, "user", channel.userMessage);
                 }
@@ -429,6 +497,7 @@ public class SessionEventCenter {
                         try { client.complete(); } catch (Exception ignored) {}
                     }
                     channel.clients.clear();
+                    clearPendingUserMessages(sessionId);
                 }
                 case "error" -> {
                     channel.errorMsg = String.valueOf(data);
@@ -439,6 +508,7 @@ public class SessionEventCenter {
                         try { client.complete(); } catch (Exception ignored) {}
                     }
                     channel.clients.clear();
+                    clearPendingUserMessages(sessionId);
                 }
                 default -> {
                     if ("subgoal".equals(name) && data instanceof Map<?, ?> map) {
@@ -464,12 +534,20 @@ public class SessionEventCenter {
     private static void applyEvent(SessionChannel channel, String name, String text) {
         switch (name) {
             case "thinking" -> {
-                channel.think.append(text);
-                int max = THINK_BUFFER_MAX_CHARS;
-                if (channel.think.length() > max)
-                    channel.think.delete(0, channel.think.length() - max);
+                // append 与「读 length() → delete」必须在同一把锁内：否则并发 append 会让
+                // 裁剪右端点越过数组末尾，抛 StringIndexOutOfBoundsException。
+                synchronized (channel.bufferLock) {
+                    channel.think.append(text);
+                    int max = THINK_BUFFER_MAX_CHARS;
+                    if (channel.think.length() > max)
+                        channel.think.delete(0, channel.think.length() - max);
+                }
             }
-            case "token" -> channel.answer.append(text);
+            case "token" -> {
+                synchronized (channel.bufferLock) {
+                    channel.answer.append(text);
+                }
+            }
             // seal/reset：正文留给前端归档进时间线；服务端缓冲保留供重连，不再抹掉
             case "reset", "seal" -> { }
             case "progress" -> channel.progress = text;

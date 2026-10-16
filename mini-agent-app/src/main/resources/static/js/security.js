@@ -19,10 +19,27 @@
         return url.origin === window.location.origin ? url.pathname : url.origin + url.pathname;
     }
 
-    // JWT 由登录接口返回后存入 sessionStorage，这里读取并附带到同源请求头。
+    // 凭证来源按优先级取：
+    //   1. 壳提供的持久存储（Electron 客户端）—— 跨重启保留，磁盘副本在页面之外
+    //   2. 页面 web 存储（直接用浏览器打开本机后端时的开发态）
     // 服务端只认 Authorization: Bearer —— cookie 与 access_token 查询参数两条通路已随
     // 无状态改造移除，所以这里不再注入 X-XSRF-TOKEN，也不再读任何 cookie。
+    function shellBridge() {
+        try {
+            var b = window.desktopAuth;
+            return (b && typeof b.getToken === 'function') ? b : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
     function authToken() {
+        const b = shellBridge();
+        if (b) {
+            try {
+                return b.getToken() || '';
+            } catch (_) { /* 桥异常则退到 web 存储 */ }
+        }
         try {
             return sessionStorage.getItem('ma_token') || '';
         } catch (_) {
@@ -30,7 +47,27 @@
         }
     }
 
+    // 壳可用时只写壳，不再往 sessionStorage 塞一份 ——
+    // 同一份凭证少一处能被页面脚本读到的落点。
+    function setAuthToken(tk) {
+        const v = tk || '';
+        const b = shellBridge();
+        if (b && typeof b.setToken === 'function') {
+            try {
+                b.setToken(v);
+                return;
+            } catch (_) { /* 落壳失败则退到 web 存储，至少本次会话可用 */ }
+        }
+        try { sessionStorage.setItem('ma_token', v); } catch (_) {}
+    }
+
+    // 清除两边都做：旧版本往 sessionStorage 写过，升级上来的用户那份残留不清掉，
+    // 下次打开又会被当成已登录。
     function clearAuthToken() {
+        const b = shellBridge();
+        if (b && typeof b.clear === 'function') {
+            try { b.clear(); } catch (_) {}
+        }
         try { sessionStorage.removeItem('ma_token'); } catch (_) {}
     }
 
@@ -59,9 +96,7 @@
     window.MiniAuth = {
         loginPath: LOGIN_PATH,
         token: authToken,
-        setToken: function (tk) {
-            try { sessionStorage.setItem('ma_token', tk || ''); } catch (_) {}
-        },
+        setToken: setAuthToken,
         clear: clearAuthToken,
         goLogin: function () {
             redirecting = true;

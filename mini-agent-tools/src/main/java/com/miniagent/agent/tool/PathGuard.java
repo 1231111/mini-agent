@@ -1,5 +1,7 @@
 package com.miniagent.agent.tool;
 
+import com.miniagent.common.SafeSegments;
+
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -156,6 +158,58 @@ public final class PathGuard {
             }
         }
         return absolute;
+    }
+
+    /**
+     * 把若干段拼到 {@code root} 下，并保证结果仍在 {@code root} 内。
+     *
+     * <p><b>与 {@link #isAllowed} 的分工</b>：{@code isAllowed} 回答"哪些根可以访问"
+     * （工作区、数据根、项目根一律放行，比较宽）；而像 skills 目录这类东西有自己的边界，
+     * 需要"只允许在这一个根里面"这种更严的判定 —— 否则 {@code ../../} 一拼就写到别处去了。</p>
+     *
+     * <p><b>两道防线</b>：每一段先过 {@link SafeSegments}（拒绝 {@code .}/{@code ..}、
+     * 路径分隔符、绝对路径），拼完再按<b>真实路径</b>比较一次（挡住通过 junction/符号链接
+     * 逃出根目录）。两道都跑，是因为"没写死分隔符"不等于"拼出来一定在根里"。</p>
+     *
+     * @param segments 允许传 null 或空串，表示这一段省略（例如技能没有分类）
+     */
+    public static Path resolveInside(Path root, String purpose, String... segments) {
+        if (root == null) {
+            throw new SecurityException("目录根未配置，拒绝访问（" + purpose + "）");
+        }
+        Path base = root.toAbsolutePath().normalize();
+        Path candidate = base;
+        for (String segment : segments) {
+            if (segment == null || segment.isEmpty()) {
+                continue;
+            }
+            SafeSegments.requireValid(segment, "路径段");
+            candidate = candidate.resolve(segment);
+        }
+        Path realCandidate = realPathOfNearestExisting(candidate);
+        if (!realCandidate.startsWith(realPathOfNearestExisting(base))) {
+            throw new SecurityException("拒绝越出目录的路径（" + purpose + "）："
+                    + candidate + "，允许范围: " + base);
+        }
+        return candidate.normalize();
+    }
+
+    /**
+     * 解析"根目录下的相对子路径"，允许多级（例如 {@code references/spec.md}）。
+     *
+     * <p>与 {@link #resolveInside} 的分工：那个只接受单段（每段是一个目录名或文件名），
+     * 这个接受用 {@code /} 或 {@code \} 分隔的多级相对路径，但会**逐段**过
+     * {@link SafeSegments} —— 所以 {@code ..}、盘符、路径回退都进不来，
+     * 同时保留了"技能包里读 references/ 子文件"这个正当能力。</p>
+     */
+    public static Path resolveRelative(Path root, String purpose, String relativePath) {
+        if (root == null) {
+            throw new SecurityException("目录根未配置，拒绝访问（" + purpose + "）");
+        }
+        if (relativePath == null || relativePath.isBlank()) {
+            throw new IllegalArgumentException("相对路径不能为空");
+        }
+        return resolveInside(root, purpose, relativePath.trim().split("[/\\\\]+"));
     }
 
     /** 供测试重置放行清单。 */

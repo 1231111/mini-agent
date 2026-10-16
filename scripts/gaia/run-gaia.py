@@ -387,6 +387,11 @@ def run(cases: list[dict], client: AgentClient, args) -> dict:
 
 
 def main() -> int:
+    # Windows 控制台默认 GBK。答案里的中文一旦 print 失败，会被上面的 except 记成这题出错。
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(errors="backslashreplace")
     ap = argparse.ArgumentParser(description="一键跑 GAIA 并判分")
     ap.add_argument("--cases", default=str(DEFAULT_CASES), help="用例文件（cases-gaia-*.json）")
     ap.add_argument("--out", default=str(DEFAULT_REPORT), help="报告输出前缀（不加扩展名）")

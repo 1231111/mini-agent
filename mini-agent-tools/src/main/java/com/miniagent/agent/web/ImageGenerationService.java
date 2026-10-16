@@ -3,6 +3,7 @@ package com.miniagent.agent.web;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.config.storage.MediaStorage;
 import com.miniagent.memory.MemoryStore;
 import lombok.extern.slf4j.Slf4j;
@@ -173,7 +174,7 @@ public class ImageGenerationService {
      */
     public String generate(String prompt, String aspectRatio) {
         if (StringUtils.isBlank(prompt)) {
-            return errorJson("prompt 不能为空");
+            return errorJson(ToolErrorCode.INVALID_ARGUMENT, "prompt 不能为空");
         }
         if (StringUtils.isBlank(aspectRatio)) {
             aspectRatio = "landscape";
@@ -198,22 +199,24 @@ public class ImageGenerationService {
 
         // 前两个后端并行竞速，谁先成功用谁；都失败再串行尝试剩余
         if (chain.size() >= 2) {
-            String raced = raceBackends(chain.subList(0, 2), prompt, imageSize, deadlineMs);
-            if (Objects.nonNull(raced)) {
-                return toMarkdownImage(raced);
+            BackendAttempt raced = raceBackends(chain.subList(0, 2), prompt, imageSize, deadlineMs);
+            if (raced.isOk()) {
+                return toMarkdownImage(raced.url());
             }
-            lastError = "并行竞速后端均失败: " + chain.get(0) + ", " + chain.get(1);
+            lastError = "并行竞速失败（" + raced.error() + "）";
             for (int i = 2; i < chain.size(); i++) {
                 if (remainingSeconds(deadlineMs) < MIN_ATTEMPT_REMAINING_SECONDS) {
                     lastError += "；预算（" + totalBudgetSeconds() + "s）耗尽，未再试: "
                             + chain.subList(i, chain.size());
                     break;
                 }
-                String result = tryBackend(chain.get(i), prompt, imageSize, deadlineMs);
-                if (Objects.nonNull(result)) {
-                    return toMarkdownImage(result);
+                BackendAttempt attempt = tryBackend(chain.get(i), prompt, imageSize, deadlineMs);
+                if (attempt.isOk()) {
+                    return toMarkdownImage(attempt.url());
                 }
-                lastError = "后端 " + chain.get(i) + " 失败";
+                // 累积而不是覆盖：模型要看到「每一个后端各自为什么不行」，
+                // 才可能判断是换后端、改 prompt 还是等一会儿再来。
+                lastError += "；" + attempt.describe(chain.get(i));
             }
         } else {
             for (int i = 0; i < chain.size(); i++) {
@@ -223,23 +226,26 @@ public class ImageGenerationService {
                             + chain.subList(i, chain.size());
                     break;
                 }
-                String result = tryBackend(backend, prompt, imageSize, deadlineMs);
-                if (Objects.nonNull(result)) {
-                    return toMarkdownImage(result);
+                BackendAttempt attempt = tryBackend(backend, prompt, imageSize, deadlineMs);
+                if (attempt.isOk()) {
+                    return toMarkdownImage(attempt.url());
                 }
-                lastError = "后端 " + backend + " 失败";
+                lastError += "；" + attempt.describe(backend);
             }
         }
 
         log.error("所有图像生成后端均失败: {}", lastError);
-        return errorJson("所有后端均失败: " + lastError);
+        // 所有后端都打不通属于依赖侧不可用 —— 显式声明可重试，
+        // 否则上游会把它当成「这任务做不了」而放弃改 prompt / 换方案。
+        return errorJson(ToolErrorCode.DEPENDENCY_UNAVAILABLE, "所有后端均失败: " + lastError);
     }
 
-    /** 并行竞速：任一成功即返回，并取消其余；全部失败返回 null */
-    private String raceBackends(List<String> backends, String prompt, String imageSize, long deadlineMs) {
+    /** 并行竞速：任一成功即返回其尝试结果；全部失败返回聚合了各方原因的失败结果 */
+    private BackendAttempt raceBackends(List<String> backends, String prompt, String imageSize, long deadlineMs) {
         log.info("并行竞速后端: {}", backends);
         MemoryStore.OwnerContext owner = MemoryStore.captureOwnerContext();
-        List<CompletableFuture<String>> futures = new ArrayList<>();
+        List<String> names = new ArrayList<>(backends);
+        List<CompletableFuture<BackendAttempt>> futures = new ArrayList<>();
         for (String backend : backends) {
             futures.add(CompletableFuture.supplyAsync(
                     () -> {
@@ -257,15 +263,15 @@ public class ImageGenerationService {
         long deadline = System.currentTimeMillis() + maxWait * 1000L;
         while (System.currentTimeMillis() < deadline) {
             boolean allDone = true;
-            for (CompletableFuture<String> f : futures) {
+            for (CompletableFuture<BackendAttempt> f : futures) {
                 if (!f.isDone()) {
                     allDone = false;
                     continue;
                 }
                 try {
-                    String r = f.getNow(null);
-                    if (StringUtils.isNotBlank(r)) {
-                        for (CompletableFuture<String> other : futures) {
+                    BackendAttempt r = f.getNow(null);
+                    if (r != null && r.isOk()) {
+                        for (CompletableFuture<BackendAttempt> other : futures) {
                             if (other != f) {
                                 other.cancel(true);
                             }
@@ -282,10 +288,29 @@ public class ImageGenerationService {
                 break;
             }
         }
-        for (CompletableFuture<String> f : futures) {
+        // 取消前先把已拿到结果的原因摘出来：cancel 之后 getNow 会抛 CancellationException，
+        // 那时再取就只剩「未完成」三个字了。
+        StringBuilder err = new StringBuilder();
+        for (int i = 0; i < futures.size(); i++) {
+            CompletableFuture<BackendAttempt> f = futures.get(i);
+            String why;
+            try {
+                BackendAttempt r = f.getNow(null);
+                why = r == null ? "尚未返回（竞速窗口内未完成）" : r.error();
+            } catch (java.util.concurrent.CancellationException ce) {
+                why = "尚未返回（竞速窗口内未完成）";
+            } catch (Exception e) {
+                why = e.getClass().getSimpleName();
+            }
+            if (err.length() > 0) {
+                err.append("；");
+            }
+            err.append(names.get(i)).append("：").append(why);
+        }
+        for (CompletableFuture<BackendAttempt> f : futures) {
             f.cancel(true);
         }
-        return null;
+        return BackendAttempt.fail(err.toString());
     }
 
     /** ChatAnywhere 实际等待秒数（2CA 慢模型用加长超时） */
@@ -297,14 +322,41 @@ public class ImageGenerationService {
         return Math.max(configured, 120L);
     }
 
-    /** 尝试单个后端；成功返回图片 URL/markdown，失败记录熔断并返回 null */
-    private String tryBackend(String backend, String prompt, String imageSize, long deadlineMs) {
+    /**
+     * 单后端尝试结果。**失败必须带上可读原因** —— 它要一路带到最终错误里给模型看。
+     *
+     * <p>此前 {@code tryBackend} 失败只 {@code return null}，原因写进日志就没了，
+     * 于是聚合出来的错误长成「所有后端均失败: 后端 siliconflow 失败」——
+     * 模型既不知道是超时、限流、鉴权还是响应格式不对，也就无从据此改方案
+     * （用户看到的正是这句，2026-10-15）。</p>
+     */
+    private record BackendAttempt(String url, String error) {
+        static BackendAttempt ok(String url) {
+            return new BackendAttempt(url, "");
+        }
+
+        static BackendAttempt fail(String error) {
+            return new BackendAttempt("", StringUtils.isBlank(error) ? "未知原因" : error);
+        }
+
+        boolean isOk() {
+            return StringUtils.isNotBlank(url);
+        }
+
+        /** 聚合用的一行描述：{@code 后端名：原因}。 */
+        String describe(String backend) {
+            return error.isEmpty() ? backend : backend + "：" + error;
+        }
+    }
+
+    /** 尝试单个后端；失败记录熔断并把原因带出去 */
+    private BackendAttempt tryBackend(String backend, String prompt, String imageSize, long deadlineMs) {
         try {
             log.info("尝试后端: {}", backend);
             // 单次等待 = 后端自身上限与内层总预算剩余的较小值 —— 绝不越过预算截止点。
             long timeoutSec = Math.min(backendWaitSeconds(backend), remainingSeconds(deadlineMs));
             if (timeoutSec <= 0) {
-                return null;
+                return BackendAttempt.fail("内层预算已耗尽，未发起请求");
             }
             MemoryStore.OwnerContext owner = MemoryStore.captureOwnerContext();
             CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
@@ -317,14 +369,14 @@ public class ImageGenerationService {
             String imageUrl = future.get(timeoutSec, TimeUnit.SECONDS);
             if (StringUtils.isNotBlank(imageUrl)) {
                 recordSuccess(backend);
-                return imageUrl;
+                return BackendAttempt.ok(imageUrl);
             }
             log.warn("后端 {} 未返回图片，尝试下一个", backend);
             recordFailure(backend);
-            return null;
+            return BackendAttempt.fail("请求成功但没有拿到图片地址");
         } catch (java.util.concurrent.CancellationException e) {
             log.info("后端 {} 竞速取消（另一后端已先返回）", backend);
-            return null;
+            return BackendAttempt.fail("竞速被取消（另一后端已先返回）");
         } catch (Exception e) {
             Throwable root = e;
             while (Objects.nonNull(root.getCause()) && root.getCause() != root) {
@@ -333,10 +385,11 @@ public class ImageGenerationService {
             String detail = Optional.ofNullable(root.getMessage()).orElse(e.getMessage());
             log.warn("后端 {} 异常，尝试下一个: {}", backend, detail);
             recordFailure(backend);
-            return null;
+            // 这句 return 是本次修复的重点：detail 以前只进日志，
+            // 最终错误里只剩「后端 X 失败」。
+            return BackendAttempt.fail(detail);
         }
     }
-
     /**
      * 安全解析生图 API 响应：先校验 HTTP/Content-Type/正文形态，再解析 JSON。
      * 对方返回 HTML 错误页时给出可读错误，而不是 Jackson JsonParseException。
@@ -988,14 +1041,27 @@ public class ImageGenerationService {
         }
     }
 
-    private static String errorJson(String message) {
+    static String errorJson(String message) {
+        return errorJson(ToolErrorCode.EXECUTION_FAILED, message);
+    }
+
+    /**
+     * 失败结果，**带 errorCode**。
+     *
+     * <p>{@code ToolResult.fromLegacy} 见到 {@code errorCode} 就直接采信，见不到才拿文案刮关键字。
+     * 产错方既然知道原因类型，就该说清楚 —— 上游 {@code RecoveryEngine} 据此选恢复档。</p>
+     */
+    static String errorJson(ToolErrorCode code, String message) {
+        String codeName = (code == null ? ToolErrorCode.EXECUTION_FAILED : code).name();
         try {
             ObjectNode root = MAPPER.createObjectNode();
             root.put("success", false);
+            root.put("errorCode", codeName);
             root.put("error", message);
             return MAPPER.writeValueAsString(root);
         } catch (Exception e) {
-            return "{\"success\":false,\"error\":\"" + message.replace("\"", "\\\"") + "\"}";
+            return "{\"success\":false,\"errorCode\":\"" + codeName
+                    + "\",\"error\":\"" + message.replace("\"", "\\\"") + "\"}";
         }
     }
 }

@@ -41,6 +41,10 @@ public class McpProperties {
         /** stdio | http（http 预留） */
         private String transport = "stdio";
         private String url;
+        /** Maximum JSON-RPC frame accepted from this process. */
+        private int maxFrameBytes = 8 * 1024 * 1024;
+        /** Upper bound for a tools/list or tools/call response wait. */
+        private int requestTimeoutSeconds = 120;
 
         public String getId() { return id; }
         public void setId(String id) { this.id = id; }
@@ -54,5 +58,11 @@ public class McpProperties {
         public void setTransport(String transport) { this.transport = transport; }
         public String getUrl() { return url; }
         public void setUrl(String url) { this.url = url; }
+        public int getMaxFrameBytes() { return maxFrameBytes; }
+        public void setMaxFrameBytes(int maxFrameBytes) { this.maxFrameBytes = maxFrameBytes; }
+        public int getRequestTimeoutSeconds() { return requestTimeoutSeconds; }
+        public void setRequestTimeoutSeconds(int requestTimeoutSeconds) {
+            this.requestTimeoutSeconds = requestTimeoutSeconds;
+        }
     }
 }

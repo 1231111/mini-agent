@@ -78,8 +78,8 @@ public class SongGenerateParams extends ToolParams {
     private String taskId;
 
     @ToolParamSchema(
-            description = "续查已提交的歌词任务：只查状态、不重新提交。"
-                    + "上一轮返回 status=PENDING 且 stage=lyrics 时用它继续")
+            description = "已废弃：SenseAudio 写词是同步接口，不再有 lyrics pending。"
+                    + "若仍传入会返回参数错误，请改传 lyrics 或 prompt")
     private String lyricsTaskId;
 
     /** 外层闸门应给的秒数（注册期静态值，供 {@code ToolConcurrencyPolicy} 与注册一起取用）。 */

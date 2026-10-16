@@ -155,15 +155,81 @@ class GoalCompilerGranularityTest {
         assertEquals("flow.png", g.byId("n2").doneWhen().path());
     }
 
+    /**
+     * 模型判（默认档）下，「要动手」就该让规划模型上场 —— 哪怕词表认为这轮
+     * 不需要结构化计划。单文件短指令正是最容易被词表漏掉的一类：
+     * 它 requiresStructuredPlan=false，但确实是一次动手。
+     */
     @Test
-    void compileSimpleFileDoesNotCallLlm() {
+    void modelModeAsksModelForSimpleFileTurn() {
         ChatModel chat = mock(ChatModel.class);
+        when(chat.chat(any(ChatRequest.class))).thenThrow(new RuntimeException("no"));
         String msg = "写一个 hello.txt";
         TaskPlan plan = TaskPlan.of(msg, false, TaskSignals.parse("file,simpleFile"));
         GoalCompiler.CompileResult r = compiler.compile(chat, msg, plan);
+        verify(chat, atLeastOnce()).chat(any(ChatRequest.class));
+        assertTrue(r.fromTemplate());
+        assertEquals("file_write", r.graph().byId("n1").capability());
+    }
+
+    /** 同上一条，只是换一句话：词表判 false、但本轮是要动手的。 */
+    @Test
+    void modelModeAsksModelWhenStructuredPlanFlagIsFalse() {
+        ChatModel chat = mock(ChatModel.class);
+        when(chat.chat(any(ChatRequest.class))).thenThrow(new RuntimeException("no"));
+        String msg = "调研一下竞品方案";
+        TaskPlan plan = TaskPlan.of(msg, false, TaskSignals.parse("web"));
+        compiler.compile(chat, msg, plan);
+        verify(chat, atLeastOnce()).chat(any(ChatRequest.class));
+    }
+
+    /** 词表判档（旧行为）下，requiresStructuredPlan=false 仍然一次都不叫模型。 */
+    @Test
+    void lexiconModeSkipsLlmForSimpleFile() {
+        PlannerProperties props = new PlannerProperties();
+        props.setModelDecidesDecomposition(false);
+        GoalCompiler lexicon = new GoalCompiler(props);
+        ChatModel chat = mock(ChatModel.class);
+        String msg = "写一个 hello.txt";
+        TaskPlan plan = TaskPlan.of(msg, false, TaskSignals.parse("file,simpleFile"));
+        GoalCompiler.CompileResult r = lexicon.compile(chat, msg, plan);
         assertTrue(r.fromTemplate());
         assertEquals("file_write", r.graph().byId("n1").capability());
         verifyNoInteractions(chat);
+    }
+
+    /**
+     * 词表判档的模板优先：模板已把结构定死 → 规划模型一次都不该被调。
+     * 与模型判档跑同一句话、同一个 plan，只差一个开关。
+     */
+    @Test
+    void lexiconModeSkipsLlmWhenTemplateIsDeterminate() {
+        PlannerProperties props = new PlannerProperties();
+        props.setModelDecidesDecomposition(false);
+        GoalCompiler lexicon = new GoalCompiler(props);
+        ChatModel chat = mock(ChatModel.class);
+        String msg = "写一个 hello.txt";
+        TaskPlan plan = TaskPlan.of(msg, true, TaskSignals.parse("file,simpleFile"));
+        assertTrue(GoalCompiler.structureDeterminate(
+                compiler.templateGraph(msg, plan), msg, plan));
+        GoalCompiler.CompileResult r = lexicon.compile(chat, msg, plan);
+        assertTrue(r.fromTemplate());
+        verifyNoInteractions(chat);
+    }
+
+    /** 模型判档：模板同样定死了结构，模型仍必须被叫到，编不出来才退回模板图。 */
+    @Test
+    void modelModeCallsLlmEvenWhenTemplateIsDeterminate() {
+        ChatModel chat = mock(ChatModel.class);
+        when(chat.chat(any(ChatRequest.class))).thenThrow(new RuntimeException("no"));
+        String msg = "写一个 hello.txt";
+        TaskPlan plan = TaskPlan.of(msg, true, TaskSignals.parse("file,simpleFile"));
+        assertTrue(GoalCompiler.structureDeterminate(
+                compiler.templateGraph(msg, plan), msg, plan));
+        GoalCompiler.CompileResult r = compiler.compile(chat, msg, plan);
+        verify(chat, atLeastOnce()).chat(any(ChatRequest.class));
+        assertTrue(r.fromTemplate());
+        assertEquals("file_write", r.graph().byId("n1").capability());
     }
 
     @Test

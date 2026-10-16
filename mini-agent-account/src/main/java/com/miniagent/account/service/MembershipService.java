@@ -322,14 +322,26 @@ public class MembershipService {
      * <p>旧订阅置为 {@code SUPERSEDED} 而不是删除：升级与续费的历史是账单的依据，
      * 删掉之后"这个人上个月买过什么"就再也查不出来了，而对账恰恰是几个月后的事。
      *
-     * <p><b>调用方必须已在事务内</b>：这里既有多次写，又在最后加锁改 tenant，
-     * 拆成多个事务会出现"订阅是新档、配额还是旧档"的中间态，而那个中间态
-     * 恰好就是 agent 读配额的时刻。
+     * <p><b>调用方必须已在事务内</b>：这里先锁住 tenant 行，再完成订阅切换和
+     * 配额写入。拆成多个事务会出现"订阅是新档、配额还是旧档"的中间态，而那个
+     * 中间态恰好就是 agent 读配额的时刻。
      */
     @Transactional
     public MembershipSubscription applyPlan(Long userId, Long tenantId, MembershipPlan plan,
                                            String sourceOrderNo) {
         LocalDateTime now = LocalDateTime.now();
+
+        /*
+         * The tenant row is the serialization point for all plan changes belonging
+         * to that tenant.  It must be locked before reading ACTIVE subscriptions:
+         * otherwise two concurrent transactions can both observe the same old
+         * subscription, both mark it SUPERSEDED, and both insert a new ACTIVE row.
+         * Keeping the lock for the whole transaction also makes the quota write and
+         * the subscription transition one atomic state change to agent callers.
+         */
+        Tenant tenant = tenants.findByIdForUpdate(tenantId)
+                .orElseThrow(() -> new IllegalStateException(
+                        "租户 " + tenantId + " 不存在，无法写入配额上限（用户 " + userId + "）"));
 
         List<MembershipSubscription> active = subscriptions
                 .findByUserIdAndStatus(userId, MembershipSubscription.Status.ACTIVE);
@@ -352,9 +364,6 @@ public class MembershipService {
 
         // 这一步是"会员等级 → agent 认识的东西"的全部内容。
         // agent 侧的 DbTenantTokenQuota 只读这一列，它不知道会员、订单、套餐的存在。
-        Tenant tenant = tenants.findByIdForUpdate(tenantId)
-                .orElseThrow(() -> new IllegalStateException(
-                        "租户 " + tenantId + " 不存在，无法写入配额上限（用户 " + userId + "）"));
         tenant.setDailyTokenLimit(plan.getDailyTokenLimit());
 
         log.info("会员生效 userId={} tenantId={} plan={} dailyTokenLimit={} expireAt={} 替换掉的旧订阅={} 条",

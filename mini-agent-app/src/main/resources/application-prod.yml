@@ -1,5 +1,9 @@
 # Docker / 生产覆盖：MySQL + Redis + Milvus
 spring:
+  lifecycle:
+    # 先停止接收新请求，再给在途 agent run / SSE 一个确定的排空窗口。
+    # 没有 graceful shutdown 时滚动发布会直接掐断工具调用和数据库状态提交。
+    timeout-per-shutdown-phase: 30s
   thymeleaf:
     cache: true
   datasource:
@@ -25,6 +29,9 @@ spring:
   jpa:
     hibernate:
       ddl-auto: validate
+
+server:
+  shutdown: graceful
 
 logging:
   level:
@@ -100,7 +107,18 @@ agent:
 management:
   endpoint:
     health:
+      probes:
+        enabled: true
       show-details: never
+      group:
+        readiness:
+          include: readinessState,db,redis
+        liveness:
+          include: livenessState
   health:
+    readinessstate:
+      enabled: true
+    livenessstate:
+      enabled: true
     redis:
       enabled: true

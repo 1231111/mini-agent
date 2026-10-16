@@ -133,13 +133,14 @@ class PathGuardTest {
 
     /** 建目录链接：优先符号链接，Windows 上退化为 junction（无需管理员权限）。 */
     private static boolean createDirectoryLink(Path link, Path target) {
-        try {
-            Files.createSymbolicLink(link, target);
+        if (trySymbolicLink(link, target)) {
             return true;
-        } catch (IOException | UnsupportedOperationException | SecurityException e) {
-            if (!WINDOWS) {
-                return false;
-            }
+        }
+        // 上面那次可能留下一个"看起来建成了"的普通空目录（见 isWorkingLink 的说明），
+        // 同名会让后面的 mklink 直接失败，所以先清掉。
+        deleteQuietly(link);
+        if (!WINDOWS) {
+            return false;
         }
         try {
             Process p = new ProcessBuilder("cmd", "/c", "mklink", "/J",
@@ -149,8 +150,37 @@ class PathGuardTest {
             if (!p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS) || p.exitValue() != 0) {
                 return false;
             }
-            return Files.exists(link);
+            return isWorkingLink(link, target);
         } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static boolean trySymbolicLink(Path link, Path target) {
+        try {
+            Files.createSymbolicLink(link, target);
+            return isWorkingLink(link, target);
+        } catch (IOException | UnsupportedOperationException | SecurityException e) {
+            return false;
+        }
+    }
+
+    /**
+     * 链接真的指向目标才算建成。
+     *
+     * <p><b>光看 {@code createSymbolicLink} 有没有抛异常是不够的</b>：实测在部分 Windows 环境
+     * （未开启开发者模式/非管理员）下，它既不报错也不建链接 —— 落盘的是一个<b>普通空目录</b>，
+     * {@code isSymbolicLink} 为 false、{@code toRealPath()} 返回自身、目录里也没有目标的子文件。
+     * 于是这条用例会静默退化：{@code viaLink} 变成"工作区内一个尚不存在的普通路径"，
+     * 而那种路径 {@code isAllowed} 返回 true <b>本来就是对的</b> ——
+     * 断言失败报的是"逃逸没被拦住"，真因却是"链接压根没建成"，把排查带偏。</p>
+     *
+     * <p>所以判据取"解析出的真实路径等于目标本身"，不成立就交给 junction 兜底。</p>
+     */
+    private static boolean isWorkingLink(Path link, Path target) {
+        try {
+            return Files.exists(link) && link.toRealPath().equals(target.toRealPath());
+        } catch (IOException e) {
             return false;
         }
     }

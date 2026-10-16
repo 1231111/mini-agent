@@ -109,15 +109,26 @@ public class PlanningLoop {
     /**
      * 本轮要不要交给规划器（编译任务图 + 调度执行）。
      *
-     * <p>判据只有三类，全部来自事实：</p>
+     * <p>判据按 {@code agent.planner.model-decides-decomposition} 分两档：</p>
+     * <ul>
+     *   <li>{@code true}（默认）：命中任何「要动手」信号就进
+     *       —— 拆不拆、拆几刀交给规划模型，词表不再裁定粒度；</li>
+     *   <li>{@code false}：仍按 {@code TaskPlan#requiresStructuredPlan()} 的词表判据进
+     *       —— 这是旧行为。</li>
+     * </ul>
+     *
+     * <p>两档共同保留两条与「拆解粒度」无关的判据：</p>
      * <ol>
-     *   <li>纯问答轮（问且无任何动手信号）直接不进；</li>
-     *   <li>需要结构化计划，或消息里出现 URL / 文件名（可编成可调度图）；</li>
-     *   <li>上一轮留下了未完成的图，且本轮文本确实是在接着做。</li>
+     *   <li>纯问答轮（问且无任何动手信号）直接不进 —— 防止上一轮的旧图劫持本轮；
+     *       系统控制语在入口已被净化成无信号，因此同样落在这条上；</li>
+     *   <li>消息里出现 URL / 文件名（{@link DecompositionPolicy#hasGraphSignal}）
+     *       也进 —— 这类文本天然可编成可调度图。它是前一条的**加宽**，
+     *       不会把任何该进的轮挤出去，所以两档都留着。</li>
      * </ol>
      *
-     * <p>注意第 3 条必须能真正走到。旧实现先按意图白名单短路返回，
-     * 而绝大多数意图都在该白名单里，于是「续跑」分支实际不可达 ——
+     * <p>第三条判据与上面互不影响：上一轮留下了未完成的图，且本轮文本确实是在接着做。
+     * 注意它必须能真正走到 —— 旧实现先按意图白名单短路返回，
+     * 而绝大多数意图都在该白名单里，于是「续跑」分支实际不可达，
      * 用户回一句「继续」永远进不来规划器。这里不再有白名单，
      * 恢复与否只由 {@link PlannerResumePolicy} 按文本与图当下的
      * {@code AWAITING_CONFIRM} 状态共同判定：用户明说继续，或系统此刻确实在等用户答复。
@@ -127,17 +138,44 @@ public class PlanningLoop {
         if (!properties.isEnabled() || plan == null) {
             return false;
         }
-        TaskSignals signals = plan.signals();
-        if (signals.lightTurn()) {
-            return false;
-        }
-        if (plan.requiresStructuredPlan()
-                || DecompositionPolicy.hasGraphSignal(requestText, plan)) {
+        if (wantsPlanning(plan, requestText, properties.isModelDecidesDecomposition())) {
             return true;
         }
         return stateStore.hasIncompleteGraph(sessionId)
                 && PlannerResumePolicy.shouldResume(
-                signals, requestText, hasAwaitingGraph(sessionId), true);
+                plan.signals(), requestText, hasAwaitingGraph(sessionId), true);
+    }
+
+    /**
+     * 「要不要进规划器」的纯函数核：不含会话状态、不读配置。
+     *
+     * <p>拆出来是为了让两档判据可以被单测直接覆盖 ——
+     * {@link #shouldHandle} 需要 13 个协作方，装配不起；这一段只依赖入参。</p>
+     *
+     * @param modelDecides {@code true} 时按「要不要动手」判，{@code false} 时按词表判
+     */
+    static boolean wantsPlanning(TaskPlan plan, String requestText, boolean modelDecides) {
+        if (plan == null) {
+            return false;
+        }
+        TaskSignals signals = plan.signals();
+        if (signals.lightTurn()) {
+            return false;
+        }
+        if (modelDecides ? signals.actionBearing() : plan.requiresStructuredPlan()) {
+            return true;
+        }
+        return DecompositionPolicy.hasGraphSignal(requestText, plan);
+    }
+
+    /**
+     * 判断外层调度循环是否因达到硬上限而退出。
+     *
+     * <p>循环使用 {@code rounds++ < max}，因此达到上限时计数器恰好等于
+     * {@code max}；把这里单独抽成纯函数，避免边界条件再次退化成不可达分支。</p>
+     */
+    static boolean outerRoundsExhausted(int rounds, int maxRounds) {
+        return maxRounds > 0 && rounds >= maxRounds;
     }
 
     static boolean shouldRecompileClarify(Goal goal, TaskGraph graph, String userMessage) {
@@ -612,7 +650,10 @@ public class PlanningLoop {
                 break;
             }
         }
-        if (rounds > properties.getMaxOuterRounds()) {
+        // `rounds++ < max` leaves rounds exactly equal to max when the loop
+        // exits because the hard limit was reached.  Using `>` made this
+        // branch unreachable, which hid the real terminal reason and metric.
+        if (outerRoundsExhausted(rounds, properties.getMaxOuterRounds())) {
             metrics.outerTimeout();
             unfinishedReason = "OUTER_ROUNDS_EXHAUSTED";
         }
@@ -1048,6 +1089,10 @@ public class PlanningLoop {
                 + " capability=" + node.capability()
                 + " tool=" + dx.tool()
                 + "\n失败原因: " + dx.reason()
+                // 把诊断出的处置建议交给模型。此前只用于选分支（规则恢复 vs 重规划），
+                // 模型这边只看到「失败原因」，得自己重推一遍该修参数、换工具还是改目标 ——
+                // 而失败分类正是这里做的判断（RecoveryEngine.classify），模型重推纯属重复劳动且会跑偏。
+                + "\n建议处置: " + dx.suggestedFix()
                 + "\n请重新规划未完成部分，不要重复已成功节点。"
                 + " 产出文件的步骤必须 doneWhen.type=file_exists 且 path 非空。";
         GoalCompiler.CompileResult compiled;

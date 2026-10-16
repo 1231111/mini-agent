@@ -45,7 +45,7 @@ import java.util.Objects;
  * @param lockWaitSeconds          资源锁等待上限（秒）：到点退让，绝不无限阻塞
  * @param concurrencyScope         串行化范围：抢哪一类资源
  * @param concurrencyKeyArgument   {@code ARGUMENT} 范围的分锁参数键
- * @param sharedResourceKey        {@code SHARED_RESOURCE} 范围的共享资源名（如 {@code comfyui-gpu}）
+ * @param sharedResourceKey        {@code SHARED_RESOURCE} 范围的共享资源名（如 {@code image-api}）
  * @param timeoutRecovery          外层闸门超时后的处置策略
  * @param recoveryHint             超时后给模型的人话提示（含核验步骤 / 续查方式）
  * @param maxRetries               自动重试次数（&gt; 0 时工具必须幂等）

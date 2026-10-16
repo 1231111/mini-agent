@@ -1,13 +1,69 @@
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog, shell, screen } = require('electron');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
 
+/** 只弹出全息浮层或仙鹤启动页，不拉后端、不占正式客户端的单实例锁。 */
+const holoPreview = process.argv.includes('--holo-preview');
+const cranePreview = process.argv.includes('--crane-preview');
+if (holoPreview || cranePreview) {
+  const previewHome = holoPreview ? 'miniagent-holo-preview' : 'miniagent-crane-preview';
+  app.setPath('userData', path.join(app.getPath('temp'), previewHome));
+}
+
 /* ─────────────────────────── 配置 ─────────────────────────── */
 
 const configPath = path.join(app.getPath('userData'), 'config.json');
+
+/**
+ * 本地登录状态（token 原文）的落盘位置。
+ *
+ * <p>为什么必须落一份原文：服务端存的只是 token 的 SHA-256 摘要
+ * （DbSessionStore 存 SessionKeys.digest(token)），摘要不可逆 ——
+ * 服务端只能回答「你递来的这串还算不算数」，还不出原文。
+ * 所以「关掉客户端再打开，带着上次的 token 去校验」这个动作，
+ * 要求 token 原文在本地有一份能跨重启读到的副本。
+ *
+ * <p>为什么不放页面的 localStorage：renderer 开着 contextIsolation 且
+ * nodeIntegration:false，读不到这个文件；而 localStorage 里的副本会在磁盘上
+ * 一直留到 token 过期为止，页面被注入一次就等于把凭证长期交出去。
+ * 放壳侧之后，页面只能通过 preload 拿到本次运行内存里的值。
+ *
+ * <p>放 userData 而不是 MINI_AGENT_HOME（后端数据目录）：这是壳自己的状态，
+ * 跟后端的记忆 / 媒体 / skills 不是一类东西，不该混在一起。
+ */
+const authPath = path.join(app.getPath('userData'), 'session.json');
+const jwtSecretPath = path.join(app.getPath('userData'), 'jwt-secret');
+
+/**
+ * Desktop deployments do not have a secret-management service.  Generate one
+ * per installation and persist it outside the repository so every customer has
+ * a different signing key while restarts keep existing sessions valid.
+ */
+function ensureDesktopJwtSecret() {
+  const configured = process.env.JWT_SECRET;
+  if (configured && configured.trim().length >= 32) {
+    return configured.trim();
+  }
+  try {
+    if (fs.existsSync(jwtSecretPath)) {
+      const stored = fs.readFileSync(jwtSecretPath, 'utf8').trim();
+      if (stored.length >= 32) {
+        return stored;
+      }
+    }
+    const generated = crypto.randomBytes(48).toString('base64url');
+    const tmp = jwtSecretPath + '.tmp';
+    fs.mkdirSync(path.dirname(jwtSecretPath), { recursive: true });
+    fs.writeFileSync(tmp, generated + '\n', { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tmp, jwtSecretPath);
+    return generated;
+  } catch (e) {
+    throw new Error('无法创建桌面会话签名密钥：' + e.message);
+  }
+}
 
 function loadConfig() {
   try {
@@ -26,6 +82,44 @@ function saveConfig(c) {
     fs.writeFileSync(configPath, JSON.stringify(c, null, 2), 'utf8');
   } catch (e) {
     console.error('Failed to save config:', e);
+  }
+}
+
+/**
+ * 读本地登录状态。任何异常一律按「没登录」处理 ——
+ * 一个坏掉的文件不该让客户端打不开，用户重登一次即可覆盖。
+ */
+function readStoredToken() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+    return parsed && typeof parsed.token === 'string' ? parsed.token : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+/**
+ * 写本地登录状态。
+ *
+ * <p>先写 .tmp 再 rename：writeFileSync 是「先截断、再写入」，
+ * 中途掉电或被任务管理器杀掉会留下半个 JSON，下次启动读不出来 ——
+ * 用户看到的现象是「明明登录过，又让我登一次」，且很难联想到是写坏了。
+ * rename 在同一分区内是原子的：要么还是旧内容，要么已经是新内容。
+ */
+function writeStoredToken(token) {
+  const payload = JSON.stringify({ token, savedAt: new Date().toISOString() });
+  const tmp = authPath + '.tmp';
+  fs.mkdirSync(path.dirname(authPath), { recursive: true });
+  fs.writeFileSync(tmp, payload, { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(tmp, authPath);
+}
+
+/** 登出：删掉本地登录状态。删不到也算成功 —— 登出本身是幂等的。 */
+function clearStoredToken() {
+  try {
+    fs.unlinkSync(authPath);
+  } catch (e) {
+    // 文件本来就不存在。这不是错误。
   }
 }
 
@@ -193,6 +287,10 @@ function startBackend(rt, nonce) {
   // 系统属性只能影响 BrowserService 那一侧的检查逻辑，两边会指向不同目录。
   const env = { ...process.env };
   env.MINI_AGENT_DESKTOP_NONCE = nonce;
+  // application-desktop.yml intentionally has no shared fallback secret.
+  // Supplying a per-install key here prevents clean machines from either
+  // failing to boot or falling back to a repository-known signing key.
+  env.JWT_SECRET = ensureDesktopJwtSecret();
   if (!env.CLOUD_AUTH_BASE_URL || !String(env.CLOUD_AUTH_BASE_URL).trim()) {
     env.CLOUD_AUTH_BASE_URL = portalUrl();
   }
@@ -335,6 +433,50 @@ async function waitForBackend(port, timeoutMs = 120000) {
   throw new Error(`后端在 ${Math.round(timeoutMs / 1000)} 秒内没有就绪`);
 }
 
+/* ─────────────────────── 启动进度上报 ─────────────────────── */
+
+/** 启动开始时刻。启动画面上那个「已用 N 秒」就是现在减它。 */
+let bootStartedAt = Date.now();
+/** 当前阶段。心跳只带它出去，不改变它。 */
+let bootStage = 'spawn';
+/** 仙鹤投影阶段窗口还没撑开，这时的尺寸不能写进用户的窗口记忆。 */
+let bootPresenting = false;
+/** 炸开之后要恢复的聊天窗口尺寸。在缩成投影舞台之前记下来。 */
+let launchBounds = null;
+
+const BOOT_STAGE_W = 860;
+const BOOT_STAGE_H = 700;
+/** 页面没把炸开播完时，主进程最多再等这么久就直接开聊天页。 */
+const BOOT_BURST_WAIT_MS = 2500;
+const BOOT_EXPAND_MS = 420;
+
+/**
+ * 把启动进度推给启动画面（src/index.html 里的 #boot）。
+ *
+ * <p>只报主进程<b>确切知道</b>的事实，不去猜后端内部走到哪一步 ——
+ * 猜就得匹配后端日志文案，那边改一个词这里就失效。真要细粒度阶段，
+ * 应该让后端自己打结构化标记（像 {@code MINIAGENT_READY} 那样），
+ * 而不是在这里读它的中文日志。
+ *
+ * @param stage   阶段标识；不传表示"只刷新已用时间"（心跳走这个分支）
+ * @param message 给用户看的一句话；不传则沿用当前阶段的文案
+ */
+function pushBootStage(stage, message) {
+  if (stage) bootStage = stage;
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+  try {
+    mainWindow.webContents.send('boot-stage', {
+      stage: bootStage,
+      message: message || '',
+      elapsedMs: Date.now() - bootStartedAt
+    });
+  } catch (e) {
+    // 窗口刚创建、渲染进程还没起来时会走到这里。丢一次进度不影响功能。
+  }
+}
+
 /* ─────────────────────────── 窗口 ─────────────────────────── */
 
 /**
@@ -365,10 +507,102 @@ function applyApplicationMenu() {
   }
 }
 
+function stageBounds() {
+  const area = screen.getPrimaryDisplay().workArea;
+  return {
+    x: Math.round(area.x + (area.width - BOOT_STAGE_W) / 2),
+    y: Math.round(area.y + (area.height - BOOT_STAGE_H) / 2),
+    width: BOOT_STAGE_W,
+    height: BOOT_STAGE_H
+  };
+}
+
+function rememberLaunchBounds(saved) {
+  const area = screen.getPrimaryDisplay().workArea;
+  const width = Math.max(800, Math.min(saved.width || 1200, area.width));
+  const height = Math.max(600, Math.min(saved.height || 800, area.height));
+  const x = Number.isFinite(saved.x)
+    ? saved.x
+    : Math.round(area.x + (area.width - width) / 2);
+  const y = Number.isFinite(saved.y)
+    ? saved.y
+    : Math.round(area.y + (area.height - height) / 2);
+  launchBounds = { x: x, y: y, width: width, height: height };
+}
+
+function waitForCraneBurst() {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, BOOT_BURST_WAIT_MS);
+    ipcMain.once('boot:burst-done', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+function animateBounds(to, ms) {
+  const from = mainWindow.getBounds();
+  const start = Date.now();
+  return new Promise((resolve) => {
+    const timer = setInterval(() => {
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        clearInterval(timer);
+        resolve();
+        return;
+      }
+      const t = Math.min(1, (Date.now() - start) / ms);
+      const e = 1 - Math.pow(1 - t, 3);
+      mainWindow.setBounds({
+        x: Math.round(from.x + (to.x - from.x) * e),
+        y: Math.round(from.y + (to.y - from.y) * e),
+        width: Math.round(from.width + (to.width - from.width) * e),
+        height: Math.round(from.height + (to.height - from.height) * e)
+      });
+      if (t >= 1) {
+        clearInterval(timer);
+        resolve();
+      }
+    }, 16);
+  });
+}
+
+function revealAppChrome() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+  mainWindow.setIgnoreMouseEvents(false);
+  if (process.platform !== 'darwin') {
+    mainWindow.setAlwaysOnTop(false);
+    mainWindow.setSkipTaskbar(false);
+  }
+}
+
+async function openAppAfterBurst() {
+  const burst = waitForCraneBurst();
+  pushBootStage('ready', '服务已就绪');
+  await burst;
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+  revealAppChrome();
+  if (launchBounds) {
+    await animateBounds(launchBounds, BOOT_EXPAND_MS);
+  }
+  bootPresenting = false;
+  await mainWindow.loadURL(`${getApiBase()}/`);
+}
+
 function createWindow() {
-  const bounds = config.windowBounds || { width: 1200, height: 800 };
+  const saved = config.windowBounds || { width: 1200, height: 800 };
+  rememberLaunchBounds(saved);
+  const bounds = backendReady ? launchBounds : stageBounds();
+  if (!backendReady) {
+    bootPresenting = true;
+  }
 
   mainWindow = new BrowserWindow({
+    x: bounds.x,
+    y: bounds.y,
     width: bounds.width,
     height: bounds.height,
     minWidth: 800,
@@ -380,14 +614,21 @@ function createWindow() {
       nodeIntegration: false,
       webSecurity: true
     },
-    // WorkBuddy 式窗口：去掉系统标题栏与边框，标题栏由 preload 在页面里自绘
-    // （拖拽区 + 双击最大化 + 右上角最小化/最大化/关闭），视觉上与页面融为一体。
+    // Windows 无系统标题栏，也不再自绘那一条（没有最小化/最大化/关闭）。
     // macOS 不去框：红绿灯是平台惯例，hiddenInset 只收掉标题栏文字、保留红绿灯，
-    // 页面同样让出顶部空间（preload 按平台处理）。
+    // 页面让出顶部空间（preload 按平台处理）。
     ...(process.platform === 'darwin'
-      ? { frame: true, titleBarStyle: 'hiddenInset' }
-      : { frame: false }),
-    backgroundColor: '#0e0f12',
+      ? { frame: true, titleBarStyle: 'hiddenInset', backgroundColor: '#0e0f12' }
+      : bootPresenting
+        ? {
+            frame: false,
+            transparent: true,
+            hasShadow: false,
+            thickFrame: false,
+            backgroundColor: '#00000000',
+            skipTaskbar: true
+          }
+        : { frame: false, backgroundColor: '#0e0f12' }),
     show: false
   });
 
@@ -437,6 +678,10 @@ function createWindow() {
   }
 
   mainWindow.once('ready-to-show', () => {
+    if (bootPresenting && process.platform !== 'darwin') {
+      mainWindow.setAlwaysOnTop(true, 'screen-saver');
+      mainWindow.setIgnoreMouseEvents(true, { forward: true });
+    }
     mainWindow.show();
   });
 
@@ -475,10 +720,50 @@ function createWindow() {
 }
 
 function saveWindowBounds() {
+  if (bootPresenting) {
+    return;
+  }
   if (mainWindow && !mainWindow.isDestroyed()) {
     config.windowBounds = mainWindow.getBounds();
     saveConfig(config);
   }
+}
+
+let holoWindow = null;
+
+function createHoloWindow() {
+  if (holoWindow && !holoWindow.isDestroyed()) {
+    holoWindow.show();
+    holoWindow.focus();
+    return;
+  }
+  const area = screen.getPrimaryDisplay().workArea;
+  const width = 860;
+  const height = 740;
+  holoWindow = new BrowserWindow({
+    width,
+    height,
+    x: Math.round(area.x + (area.width - width) / 2),
+    y: Math.round(area.y + area.height - height - 24),
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: false,
+    hasShadow: false,
+    thickFrame: false,
+    backgroundColor: '#00000000',
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
+    }
+  });
+  holoWindow.setAlwaysOnTop(true, 'screen-saver');
+  holoWindow.loadFile(path.join(__dirname, 'src', 'holo.html'));
+  holoWindow.on('closed', () => {
+    holoWindow = null;
+  });
 }
 
 function createTray() {
@@ -507,6 +792,7 @@ function createTray() {
 
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: '显示窗口', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } },
+    { label: '全息视图', click: () => createHoloWindow() },
     { type: 'separator' },
     { label: '退出', click: () => { app.isQuitting = true; app.quit(); } }
   ]));
@@ -517,6 +803,39 @@ function createTray() {
 }
 
 /* ────────────────────────── IPC ────────────────────────── */
+
+/**
+ * 本地登录状态的读写通道（preload 的 desktopAuth 桥接到这里）。
+ *
+ * <p>读为什么用 sendSync（同步阻塞主进程）而不是 invoke：
+ * preload 必须在页面<b>任何</b>脚本之前就拿到 token —— chat.html 首屏第一段内联脚本
+ * 就要用它决定跳不跳登录页，而 ipcRenderer.invoke 是异步的，赶不上那一次判断。
+ * 同步读一个几 KB 的文件，代价远小于「先渲染出聊天界面、再闪回登录页」。
+ *
+ * <p>写为什么用 send（不等回执）：页面紧接着就要跳转，等一次磁盘 IO 的回执
+ * 没有意义；写失败也不该阻断登录 —— 本次运行内存里仍然有 token，
+ * 只是关掉客户端之后需要重登。
+ */
+ipcMain.on('auth:read-token', (event) => {
+  try {
+    event.returnValue = readStoredToken();
+  } catch (e) {
+    event.returnValue = '';
+  }
+});
+
+ipcMain.on('auth:write-token', (event, token) => {
+  try {
+    if (typeof token === 'string' && token) {
+      writeStoredToken(token);
+    } else {
+      // 空串 = 登出，或凭证已失效被前端清掉。两种都该把本地那份删掉。
+      clearStoredToken();
+    }
+  } catch (e) {
+    console.error('[auth] 写入本地登录状态失败:', e && e.message ? e.message : e);
+  }
+});
 
 ipcMain.handle('get-api-base', () => getApiBase());
 
@@ -591,6 +910,10 @@ ipcMain.handle('win:toggle-maximize', () => {
  * 「隐藏到托盘」的既有逻辑（见 createWindow 里的 close 处理），窗口控制按钮
  * 必须与标题栏行为一致，不能另立一套退出语义。
  */
+ipcMain.on('boot:reveal', () => {
+  revealAppChrome();
+});
+
 ipcMain.handle('win:close', () => {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
 });
@@ -674,21 +997,79 @@ async function completeDesktopLogin(ticket) {
   if (!mainWindow || mainWindow.isDestroyed()) {
     return;
   }
+
+  // 先落盘、再进主页 —— 顺序不能反。
+  // 页面重新加载时 preload 会同步读出这份 token，首屏那段「没有 token 就跳登录页」
+  // 的判断才过得去；先跳转再落盘的话，页面会立刻被弹回登录页。
+  try {
+    writeStoredToken(token);
+  } catch (e) {
+    // 落盘失败不阻断本次登录：内存里仍有 token，本次能正常用，
+    // 只是关掉客户端后需要重新登录。这件事必须让用户知道，否则会被当成 bug。
+    dialog.showErrorBox('登录状态保存失败',
+      '本次可以正常使用，但关掉客户端后需要重新登录：\n' + (e.message || e));
+  }
+
   mainWindow.show();
   mainWindow.focus();
-  const script = 'try{window.MiniAuth.setToken('
-    + JSON.stringify(token)
-    + ');window.location.href="/";}catch(e){window.location.href="/login";}';
+
+  // 走 loadURL 而不是 executeJavaScript 往页面里塞 token：
+  // token 的真相源已经是磁盘那份，页面加载时由 preload 自己读出来，
+  // 少一条「把凭证注入页面」的通路。
   try {
-    await mainWindow.webContents.executeJavaScript(script);
+    await mainWindow.loadURL(`${getApiBase()}/`);
   } catch (e) {
     dialog.showErrorBox('登录失败', e.message || String(e));
   }
 }
 
 async function startUp() {
+  if (holoPreview) {
+    createHoloWindow();
+    return;
+  }
+  if (cranePreview) {
+    createWindow();
+    return;
+  }
   const rt = resolveRuntime();
   let failure = null;
+
+  bootStartedAt = Date.now();
+  bootStage = 'spawn';
+
+  /* 先把窗口开出来，再去拉后端 —— 这个顺序是本次改动的全部意义。
+     后端冷启动实测 15.9 秒（Java 到 Spring 容器就绪），其中本地向量模型占了 5.1 秒。
+     这些时间如果落在 createWindow 之前，用户桌面在这十几秒里什么都没有：
+     双击图标后毫无动静，会以为没点中而再双击一次（触发 second-instance）。
+     窗口先起、页面里显示启动进度，用户至少知道"它在动"。 */
+  createWindow();
+  createTray();
+
+  /* did-finish-load 必须在 createWindow 之后、任何 await 之前注册。
+     loadFile 是异步的，而下面要等十几秒后端；等它走完再注册，
+     启动画面那次 did-finish-load 早就过去了 —— 进度一次都推不进去。 */
+  mainWindow.webContents.on('did-finish-load', () => {
+    if (backendReady) {
+      mainWindow.webContents.send('backend-ready', { port: runtimePort, apiBase: getApiBase() });
+    } else if (failure) {
+      mainWindow.webContents.send('backend-error', {
+        message: failure,
+        logPath: backendLogPath
+      });
+      // 只给一个短状态。具体原因由下面的 backend-error 诊断显示，
+      // 这里再写一遍就成了同一句话上下两行各说一次。
+      pushBootStage('failed', '启动失败');
+    } else {
+      // 还在启动中：把当前阶段和已用时间补推一次（首次推送通常早于页面就绪）。
+      pushBootStage();
+    }
+  });
+
+  /* 每秒一次心跳。不用「后端有没有输出」当作活着 —— 加载向量模型那 5 秒里
+     后端 stdout 是完全静默的，正好会让用户以为卡死了。
+     定时器驱动，页面上秒数就一直在走。 */
+  const heartbeat = setInterval(() => pushBootStage(), 1000);
 
   try {
     if (!rt.jar) {
@@ -699,29 +1080,38 @@ async function startUp() {
       );
     }
 
+    pushBootStage('spawn', '正在启动本地服务');
     const nonce = crypto.randomBytes(32).toString('hex');
     runtimePort = await startBackend(rt, nonce);
+    pushBootStage('booting', '本地服务启动中，正在加载本地模型');
     await waitForBackend(runtimePort, BACKEND_START_TIMEOUT_MS);
     backendReady = true;
   } catch (e) {
     failure = e.message;
     backendFailure = failure;
+  } finally {
+    clearInterval(heartbeat);
   }
 
-  // 无论成败都开窗口：失败时窗口里给出可读原因，比静默退出有用。
-  createWindow();
-  createTray();
-
-  mainWindow.webContents.once('did-finish-load', () => {
-    if (backendReady) {
-      mainWindow.webContents.send('backend-ready', { port: runtimePort, apiBase: getApiBase() });
-    } else if (failure) {
-      mainWindow.webContents.send('backend-error', {
-        message: failure,
-        logPath: backendLogPath
-      });
+  if (backendReady) {
+    // 先等仙鹤炸开，再把投影舞台撑成聊天窗口并载入后端页面。
+    try {
+      await openAppAfterBurst();
+    } catch (e) {
+      failure = e.message;
+      backendFailure = failure;
+      backendReady = false;
+      bootPresenting = false;
+      pushBootStage('failed', '打不开界面：' + failure);
     }
-  });
+  } else {
+    revealAppChrome();
+    if (bootPresenting && mainWindow && !mainWindow.isDestroyed() && launchBounds) {
+      mainWindow.setBounds(launchBounds);
+    }
+    bootPresenting = false;
+    pushBootStage('failed', failure);
+  }
 
   if (failure) {
     dialog.showErrorBox('后端启动失败', `${failure}\n\n日志：${backendLogPath || '(未产生)'}`);

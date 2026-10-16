@@ -19,6 +19,7 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.Objects;
 import java.util.Optional;
@@ -31,16 +32,29 @@ import org.apache.commons.lang3.StringUtils;
 public class McpStdioClient implements AutoCloseable {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final int DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024;
+    private static final int MAX_HEADER_BYTES = 16 * 1024;
+    private static final int MAX_PENDING_REQUESTS = 256;
 
     private final String serverId;
     private final Process process;
+    private final int maxFrameBytes;
+    private final int requestTimeoutSeconds;
     private final AtomicLong nextId = new AtomicLong(1);
     private final ConcurrentHashMap<Long, CompletableFuture<JsonNode>> pending = new ConcurrentHashMap<>();
     private volatile boolean closed;
 
     public McpStdioClient(String serverId, Process process) {
+        this(serverId, process, DEFAULT_MAX_FRAME_BYTES, 120);
+    }
+
+    public McpStdioClient(String serverId, Process process,
+                          int maxFrameBytes, int requestTimeoutSeconds) {
         this.serverId = serverId;
         this.process = process;
+        this.maxFrameBytes = Math.max(64 * 1024,
+                Math.min(64 * 1024 * 1024, maxFrameBytes));
+        this.requestTimeoutSeconds = Math.max(1, Math.min(600, requestTimeoutSeconds));
         Thread.ofVirtual().name("mcp-stdio-" + serverId).start(this::readLoop);
         Thread.ofVirtual().name("mcp-stderr-" + serverId).start(this::drainStderr);
     }
@@ -62,9 +76,15 @@ public class McpStdioClient implements AutoCloseable {
         ProcessEnv.putDeclared(pb, cfg.getEnv());
         pb.redirectErrorStream(false);
         Process p = pb.start();
-        McpStdioClient client = new McpStdioClient(cfg.getId(), p);
-        client.initialize();
-        return client;
+        McpStdioClient client = new McpStdioClient(cfg.getId(), p,
+                cfg.getMaxFrameBytes(), cfg.getRequestTimeoutSeconds());
+        try {
+            client.initialize();
+            return client;
+        } catch (Exception e) {
+            client.close();
+            throw e;
+        }
     }
 
     private void initialize() throws Exception {
@@ -75,12 +95,13 @@ public class McpStdioClient implements AutoCloseable {
         clientInfo.put("name", "miniagent");
         clientInfo.put("version", "0.1");
         params.set("clientInfo", clientInfo);
-        request("initialize", params).get(30, TimeUnit.SECONDS);
+        await(request("initialize", params), Math.min(30, requestTimeoutSeconds));
         notify("notifications/initialized", MAPPER.createObjectNode());
     }
 
     public List<McpToolDef> listTools() throws Exception {
-        JsonNode result = request("tools/list", MAPPER.createObjectNode()).get(30, TimeUnit.SECONDS);
+        JsonNode result = await(request("tools/list", MAPPER.createObjectNode()),
+                Math.min(30, requestTimeoutSeconds));
         List<McpToolDef> out = new ArrayList<>();
         JsonNode tools = Objects.isNull(result) ? null : result.get("tools");
         if (Objects.isNull(tools) || !tools.isArray()) {
@@ -110,8 +131,21 @@ public class McpStdioClient implements AutoCloseable {
             argsNode = MAPPER.createObjectNode();
         }
         params.set("arguments", argsNode);
-        JsonNode result = request("tools/call", params).get(120, TimeUnit.SECONDS);
+        JsonNode result = await(request("tools/call", params), requestTimeoutSeconds);
         return formatCallResult(result);
+    }
+
+    private JsonNode await(CompletableFuture<JsonNode> future, int timeoutSeconds)
+            throws Exception {
+        try {
+            return future.get(timeoutSeconds, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            // A timed-out request must leave the pending map immediately. A
+            // dead or malicious server must not retain one future per call.
+            pending.values().remove(future);
+            future.cancel(true);
+            throw e;
+        }
     }
 
     private String formatCallResult(JsonNode result) throws Exception {
@@ -147,6 +181,12 @@ public class McpStdioClient implements AutoCloseable {
     }
 
     private CompletableFuture<JsonNode> request(String method, JsonNode params) throws Exception {
+        if (closed) {
+            throw new IllegalStateException("MCP 连接已关闭");
+        }
+        if (pending.size() >= MAX_PENDING_REQUESTS) {
+            throw new IllegalStateException("MCP pending 请求超过上限");
+        }
         long id = nextId.getAndIncrement();
         CompletableFuture<JsonNode> fut = new CompletableFuture<>();
         pending.put(id, fut);
@@ -157,7 +197,13 @@ public class McpStdioClient implements AutoCloseable {
         if (Objects.nonNull(params)) {
             msg.set("params", params);
         }
-        writeFrame(msg);
+        try {
+            writeFrame(msg);
+        } catch (Exception e) {
+            pending.remove(id, fut);
+            fut.completeExceptionally(e);
+            throw e;
+        }
         return fut;
     }
 
@@ -213,6 +259,9 @@ public class McpStdioClient implements AutoCloseable {
                 lineBuf.reset();
                 if (line.isEmpty()) {
                     if (contentLength >= 0) {
+                        if (contentLength > maxFrameBytes) {
+                            throw new IllegalStateException("MCP frame 超过上限: " + contentLength);
+                        }
                         byte[] body = in.readNBytes(contentLength);
                         if (body.length < contentLength) {
                             return null;
@@ -222,14 +271,30 @@ public class McpStdioClient implements AutoCloseable {
                     continue;
                 }
                 if (line.regionMatches(true, 0, "Content-Length:", 0, 15)) {
-                    contentLength = Integer.parseInt(line.substring(15).trim());
+                    if (line.length() > MAX_HEADER_BYTES) {
+                        throw new IllegalStateException("MCP header 超过上限");
+                    }
+                    try {
+                        contentLength = Integer.parseInt(line.substring(15).trim());
+                    } catch (NumberFormatException e) {
+                        throw new IllegalStateException("非法 MCP Content-Length", e);
+                    }
+                    if (contentLength < 0 || contentLength > maxFrameBytes) {
+                        throw new IllegalStateException("MCP frame 超过上限: " + contentLength);
+                    }
                     continue;
                 }
                 if (line.startsWith("{")) {
+                    if (line.getBytes(StandardCharsets.UTF_8).length > maxFrameBytes) {
+                        throw new IllegalStateException("MCP NDJSON frame 超过上限");
+                    }
                     return MAPPER.readTree(line);
                 }
                 // 其它头忽略
             } else {
+                if (lineBuf.size() >= maxFrameBytes + MAX_HEADER_BYTES) {
+                    throw new IllegalStateException("MCP frame/header 超过上限");
+                }
                 lineBuf.write(b);
             }
         }

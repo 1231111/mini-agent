@@ -168,8 +168,9 @@ services:
       # 与上面 redis 服务的 --requirepass 同源，两边不一致时会连不上 Redis。
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD 必须显式设置}
       # 每一项都必须是精确的 HTTPS origin（不能带 path / query / 凭据）。
-      # 默认 https://localhost 只为让本地自测能通过；生产必须覆盖成真实域名。
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://localhost}
+      # 不提供 localhost 兜底：公网部署必须明确声明浏览器来源，避免忘记配置时
+      # 让一个看似正常但错误的 CORS 白名单进入生产。
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS 必须显式设置为 HTTPS origin}
       # 32 字节 Base64。生成：openssl rand -base64 32
       # 刻意不给默认值：默认值一旦进仓库，所有部署共用同一把密钥 —— 等于出厂即泄密。
       # 宁可缺失时启动失败，也不要静默用一个"看起来正常"的弱密钥。
@@ -195,7 +196,7 @@ services:
       # 与 account 服务必须同值。两边读的是同一个环境变量名，
       # 就是为了不出现"改了一个忘了另一个"——那种情况的症状只是会员页 403，
       # 看起来像权限 bug，排查方向一开始就错了。
-      ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:-}
+      ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:?ACCOUNT_INTERNAL_KEY 必须显式设置}
     volumes:
       - app-data:/app/data
     healthcheck:
@@ -240,11 +241,10 @@ services:
       SPRING_PROFILES_ACTIVE: prod
       DB_URL: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
       DB_USERNAME: root
-      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-mysql_root_pass}
-      # 不设这一项时服务照常起，登录注册也照常可用，只有会员接口返回 503
-      # （启动日志里有一条 WARN）。这是刻意的：放行等于把一个忘了配密钥的部署
-      # 变成"所有人的会员与订单数据对任何能访问到该端口的人可见"。
-      ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:-}
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 必须显式设置（不要使用仓库示例值）}
+      # 服务间密钥必须显式设置；缺失时拒绝启动，避免部署看似健康但会员
+      # 端点退化为未认证的故障路径。
+      ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:?ACCOUNT_INTERNAL_KEY 必须显式设置}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8081/actuator/health"]
       interval: 15s

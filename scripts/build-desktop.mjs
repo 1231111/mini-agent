@@ -478,11 +478,52 @@ function resolveJdk() {
 
 /* ───────────────────────── 步骤 1：fat jar ───────────────────────── */
 
+/**
+ * Windows 上 spring-boot:repackage 要把已有 jar 改名为 .jar.original。
+ * java -jar 打开着这个文件时改名会失败。只结束命令行里带这个 jar 的 java。
+ */
+function releaseRunningJar() {
+  if (!IS_WIN) {
+    return;
+  }
+  const needle = path.basename(JAR_PATH).replace(/'/g, "''");
+  // 语句必须换行。拼成一行时 PowerShell 把两条赋值看成语法错误，占用检查被跳过。
+  const command = [
+    `$needle = '${needle}'`,
+    "$names = @('java.exe','javaw.exe')",
+    'Get-CimInstance Win32_Process | Where-Object {',
+    '  $names -contains $_.Name -and $_.CommandLine -and',
+    '  $_.CommandLine.Contains($needle)',
+    '} | ForEach-Object {',
+    '  Write-Output $_.ProcessId',
+    '  Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue',
+    '}'
+  ].join('\n');
+  const encoded = Buffer.from(command, 'utf16le').toString('base64');
+  const r = spawnSync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+    { encoding: 'utf8' }
+  );
+  if (r.error || r.status !== 0) {
+    const detail = r.error ? r.error.message : (r.stderr || r.stdout || '').trim();
+    log(`      未能检查 jar 占用：${detail}`);
+    return;
+  }
+  const ids = (r.stdout || '').trim().split(/\s+/).filter(Boolean);
+  if (ids.length === 0) {
+    return;
+  }
+  log(`      已结束占用 jar 的 java 进程: ${ids.join(', ')}`);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+}
+
 function stepJar(skip) {
   step(1, '打包 fat jar');
   if (skip) {
     log('      已跳过（--skip-jar）');
   } else {
+    releaseRunningJar();
     run(mvnwPath(), ['-q', 'package', '-pl', 'mini-agent-app', '-am', '-DskipTests']);
   }
   if (!fs.existsSync(JAR_PATH)) {

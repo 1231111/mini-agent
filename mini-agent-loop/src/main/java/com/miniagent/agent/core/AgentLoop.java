@@ -171,6 +171,13 @@ public class AgentLoop {
     public static ChatModel getCurrentChatModel() { return EffectiveModelContext.currentChat(); }
     public static StreamingChatModel getCurrentStreamingModel() { return EffectiveModelContext.currentStreaming(); }
     private static final int MAX_EXPLORATION_CALLS = 40;  // read_file + list_files + exec_command 总上限（放开：复杂任务定位文件常需多次读取）
+    /** 非规划任务的网页/HTTP/浏览器调用上限。到顶后收掉这类工具，避免检索螺旋把每一轮推理都再跑一遍。 */
+    static final int RETRIEVAL_CALL_CAP = 8;
+    /** 安全网关拒答只再试一轮。同一份长摘要重发会再次被拒。 */
+    private static final int REFUSE_RECOVERY_CAP = 1;
+    private static final int STREAM_POLL_SEC = 15;
+    /** 首包之后收尾上限。思考模型会持续吐增量，不能把这一段写成一次不可打断的长等。 */
+    private static final int STREAM_FINISH_SEC = 600;
 
     /** 配置的工作窗口上限（token）。与 ContextCompressor 共用；实际用哪个见 {@link #effectiveContextTokens()}。 */
     @Value("${agent.context.max-tokens:512000}")
@@ -257,11 +264,7 @@ public class AgentLoop {
      */
     private static final Set<String> MEDIA_TOOLS = Set.of(
             "image_generate",
-            SongGenerateParams.TOOL_NAME,
-            "comfyui_txt2img",
-            "comfyui_img2img",
-            "comfyui_img2video",
-            "comfyui_tts"
+            SongGenerateParams.TOOL_NAME
     );
 
     /** 会真正落盘的工具。 */
@@ -524,6 +527,8 @@ public class AgentLoop {
         /** 硬闸门拒绝次数，按工具名计：闸门拒的是工具本身，换参数重试永远过不去 */
         final Map<String, Integer> gateDenyCounter = new java.util.concurrent.ConcurrentHashMap<>();
         int explorationCount = 0;
+        int retrievalCalls = 0;
+        boolean retrievalClosedNote = false;
         int consecutiveFailures = 0;  // 连续同类工具失败计数
         String lastFailedTool = null; // 上次失败的工具名
         SystemMessage currentSubGoalMsg = null; // 框架注入的「当前子目标」可刷新指针消息
@@ -531,6 +536,7 @@ public class AgentLoop {
         int lastSubGoalDone = 0;
         int lastSubGoalTotal = 0;
         int llmFailureCount = 0;  // 连续 LLM 调用失败计数（用于降级策略）
+        int refuseRecoveries = 0; // 安全网关拒答后的续写次数
         int lengthTruncationCount = 0; // 连续输出被长度上限截断计数（用于分块续写引导/兜底终止）
         /** 主循环结束原因，finally 打在 AGENT_LOOP_END（勿另写 LOOP_END） */
         String loopEndReason = "DONE";
@@ -835,6 +841,20 @@ public class AgentLoop {
             LlmTurn llmTurn = LlmTurn.classify(response);
             if (llmTurn.status() == LlmTurn.Status.REFUSED
                     || llmTurn.status() == LlmTurn.Status.EMPTY) {
+                if (llmTurn.status() == LlmTurn.Status.REFUSED
+                        && state.refuseRecoveries < REFUSE_RECOVERY_CAP) {
+                    state.refuseRecoveries++;
+                    ToolResultProjector.compactTrailingSearches(messages);
+                    if (Objects.nonNull(streamSink)) {
+                        streamSink.onAnswerReset();
+                    }
+                    String kind = llmTurn.refuseKind() == null
+                            ? "REFUSED" : llmTurn.refuseKind();
+                    messages.add(new SystemMessage(String.format(
+                            MessageConstants.AGENT_LLM_REFUSE_RETRY, kind)));
+                    log.warn("模型回合被拒，收起搜索结果后继续: refuseKind={}", kind);
+                    continue;
+                }
                 Optional<String> projected = ToolResultProjector.project(messages);
                 if (projected.isPresent()) {
                     return finishProjected(
@@ -957,9 +977,8 @@ public class AgentLoop {
                     boolean hasNonOutputTool = toolCalls.stream()
                             .anyMatch(tc -> {
                                 String name = toolNameOf(tc);
-                                return !"comfyui_txt2img".equals(name)
-                                        && !"comfyui_img2img".equals(name)
-                                        && !"comfyui_check_quality".equals(name);
+                                return !"image_generate".equals(name)
+                                        && !SongGenerateParams.TOOL_NAME.equals(name);
                             });
                     if (hasNonOutputTool) {
                         state.mediaReminderSent = true;
@@ -1113,6 +1132,17 @@ public class AgentLoop {
             names.remove("list_files");
             names.remove("exec_command");
             names.remove("read_package");
+        }
+        if (closeRetrieval(state.requiresStructuredPlan, state.retrievalCalls)) {
+            int before = names.size();
+            names.removeIf(AgentLoop::isRetrievalTool);
+            if (names.size() != before && !state.retrievalClosedNote) {
+                messages.add(new SystemMessage(
+                        "【检索已够】网页搜索、页面提取、浏览器和 HTTP 本轮不再提供。"
+                                + "根据已经拿到的材料直接回答，不要再检索。"));
+                state.retrievalClosedNote = true;
+                log.info("检索调用已达 {} 次，关闭网页/HTTP/浏览器工具", state.retrievalCalls);
+            }
         }
         PermissionMode mode = PermissionContext.mode();
         boolean planOk = PermissionContext.planApproved();
@@ -1343,6 +1373,10 @@ public class AgentLoop {
                 }
                 return response;
             } catch (Exception e) {
+                if (e instanceof java.util.concurrent.CancellationException) {
+                    log.info("LLM 调用已取消: {}", describe(e));
+                    return null;
+                }
                 if (isRetriable(e) && attempt < maxRetries) {
                     long backoff = retryBackoffMillis(attempt);
                     log.warn("LLM 调用可重试失败（尝试 {}/{}，{}s 后重试）: {}",
@@ -1517,27 +1551,7 @@ public class AgentLoop {
             }
         });
 
-        // 分段等待：每 15s 打日志，避免看起来像卡死；首包超时后再判失败
-        long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(firstTokenTimeoutSec);
-        while (!latch.await(15, TimeUnit.SECONDS)) {
-            if (receivedAny.get()) {
-                // 已有思考/答案流入，再给最多 10 分钟收尾（大 SQL 生成）
-                if (!latch.await(600, TimeUnit.SECONDS)) {
-                    throw new java.util.concurrent.TimeoutException(
-                            "流式 LLM 调用超时（已收到部分输出但未完成）");
-                }
-                break;
-            }
-            long remainSec = TimeUnit.NANOSECONDS.toSeconds(deadlineNs - System.nanoTime());
-            if (remainSec <= 0) {
-                throw new java.util.concurrent.TimeoutException(
-                        "流式 LLM 首包超时（" + firstTokenTimeoutSec + "s 内无任何增量）");
-            }
-            log.info("仍在等待 LLM 首包响应… 约剩余 {}s", remainSec);
-            try {
-                streamSink.onThinking("\n（模型处理中，长文档/建表任务首包可能较慢，请稍候…）\n");
-            } catch (Exception ignored) {}
-        }
+        awaitStream(latch, receivedAny, streamSink, firstTokenTimeoutSec);
         Throwable err = errorRef.get();
         if (Objects.nonNull(err)) {
             if (err instanceof Exception ex) {
@@ -1546,6 +1560,66 @@ public class AgentLoop {
             throw new RuntimeException(err);
         }
         return responseRef.get();
+    }
+
+    /**
+     * 每 {@link #STREAM_POLL_SEC} 秒看一次取消。
+     * 停止接口在模型返回前就生效；此前首包之后是一次 600 秒的等待，取消要等模型自己说完。
+     */
+    private void awaitStream(CountDownLatch latch,
+                             java.util.concurrent.atomic.AtomicBoolean receivedAny,
+                             AgentStreamSink streamSink,
+                             long firstTokenTimeoutSec) throws Exception {
+        long firstDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(firstTokenTimeoutSec);
+        long finishDeadline = 0L;
+        while (!latch.await(STREAM_POLL_SEC, TimeUnit.SECONDS)) {
+            if (clientCancelled()) {
+                throw new java.util.concurrent.CancellationException("客户端已断开");
+            }
+            if (receivedAny.get()) {
+                if (finishDeadline == 0L) {
+                    finishDeadline = System.nanoTime()
+                            + TimeUnit.SECONDS.toNanos(STREAM_FINISH_SEC);
+                }
+                if (System.nanoTime() >= finishDeadline) {
+                    throw new java.util.concurrent.TimeoutException(
+                            "流式 LLM 调用超时（已收到部分输出但未完成）");
+                }
+                continue;
+            }
+            long remainSec = TimeUnit.NANOSECONDS.toSeconds(firstDeadline - System.nanoTime());
+            if (remainSec <= 0) {
+                throw new java.util.concurrent.TimeoutException(
+                        "流式 LLM 首包超时（" + firstTokenTimeoutSec + "s 内无任何增量）");
+            }
+            log.info("仍在等待 LLM 首包响应… 约剩余 {}s", remainSec);
+            try {
+                streamSink.onThinking("\n（模型处理中，长文档/建表任务首包可能较慢，请稍候…）\n");
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private boolean clientCancelled() {
+        String sid = currentSessionId.get();
+        return sid != null && executionControl != null && executionControl.isCancelled(sid);
+    }
+
+    /** 网页搜索、抓取、浏览器。命令执行不算：写代码的任务会合法地多次跑命令。 */
+    static boolean isRetrievalTool(String name) {
+        if (name == null || name.isEmpty()) {
+            return false;
+        }
+        return "web_search".equals(name)
+                || "web_extract".equals(name)
+                || "http_get".equals(name)
+                || "http_post".equals(name)
+                || name.startsWith("browser_");
+    }
+
+    /** 规划图自己控步数。直跑检索到顶就收口，避免 90 轮上限形同没有。 */
+    static boolean closeRetrieval(boolean requiresStructuredPlan, int retrievalCalls) {
+        return !requiresStructuredPlan && retrievalCalls >= RETRIEVAL_CALL_CAP;
     }
 
     /** 按请求体大小估计首包等待：思考模型 + 超长 schema 需要更久 */
@@ -2015,6 +2089,9 @@ public class AgentLoop {
         state.lastErrorCode = ToolResult.fromLegacy(result).errorCode();
         if ("read_file".equals(toolName) || "list_files".equals(toolName)
                 || "exec_command".equals(toolName)) state.explorationCount++;
+        if (isRetrievalTool(toolName)) {
+            state.retrievalCalls++;
+        }
         if ("read_package".equals(toolName)) {
             state.explorationCount += 3;
         }
@@ -2302,7 +2379,7 @@ public class AgentLoop {
         }
         // 已是 markdown
         if (result.startsWith("![") && result.contains("](")) return result;
-        // JSON 中提取 markdown_images 字段（ComfyUI 旧格式兼容）
+        // JSON 中提取 markdown_images 字段（历史返回格式兼容）
         if (result.contains("\"markdown_images\"")) {
             String extracted = extractJsonField(result, "markdown_images");
             if (Objects.nonNull(extracted) && extracted.startsWith("![")) {
@@ -2331,7 +2408,7 @@ public class AgentLoop {
         if (result.contains("截图已保存") || result.contains("saved screenshot")) {
             return true;
         }
-        // ComfyUI 文生图/图生图：{"status":"success",...,"markdown_images":"![...](...)"}
+        // 媒体生成的返回体：{"status":"success",...,"markdown_images":"![...](...)"}
         if (result.contains("\"status\":\"success\"")
                 && (result.contains("markdown_images") || result.contains("\"images\""))) return true;
         // 兜底：JSON 里 success=true 且带 image

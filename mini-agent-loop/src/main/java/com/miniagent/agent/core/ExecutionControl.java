@@ -1,7 +1,9 @@
 package com.miniagent.agent.core;
 
+import com.miniagent.common.event.SessionEvictedEvent;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
@@ -121,6 +123,36 @@ public class ExecutionControl {
         String key = key(sessionId);
         leases.remove(key);
         signalStore.ifPresent(store -> store.finish(key));
+    }
+
+    /**
+     * 回收一个会话的执行面状态：本地租约、子会话映射，以及（删除场景下）跨进程信号。
+     *
+     * <p>{@code childToParent} 是双向可达的：既要删「以它为子」的条目，也要删
+     * 「以它为父」的条目 —— 只删一边，子会话取消时仍会找到一条指向已删父会话的悬空记录。</p>
+     */
+    public void evict(String sessionId, boolean dropSignals) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        String key = key(sessionId);
+        leases.remove(key);
+        childToParent.remove(key);
+        childToParent.entrySet().removeIf(e -> key.equals(e.getValue()));
+        if (dropSignals) {
+            signalStore.ifPresent(store -> store.finish(key));
+        }
+    }
+
+    /**
+     * 会话被删除或判定空闲时回收执行面状态。
+     *
+     * <p>删除是不可逆的，连跨进程信号一起清；空闲只丢掉进程内的租约与子会话映射 ——
+     * 信号可能仍属于另一个副本上正在跑的一轮，不该由本副本替它判定结束。</p>
+     */
+    @EventListener
+    public void onSessionEvicted(SessionEvictedEvent event) {
+        evict(event.sessionId(), event.isDeleted());
     }
 
     public void cancel(String sessionId) {

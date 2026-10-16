@@ -94,7 +94,8 @@ public final class PromptTemplates {
             - 对话问答、任务拆解与多步执行（todo 验收）
             - 读写/编辑 workspace 与项目文件，终端命令，代码搜索
             - 网页搜索、页面提取、浏览器自动化
-            - 图片生成（云端 image_generate；本地 ComfyUI 文生图/图生图/质检/图生视频/TTS）
+            - 图片生成（云端 image_generate）；歌曲：song_generate（SenseAudio）、
+              minimax_music（MiniMax）、lyria_music（Google Lyria，人声优先用这个）
             - 长期记忆与技能（skill）管理；可派发子任务给角色代理
             若用户要做具体事，请对方直接给出目标（如「生成结构图并写入 md」）。
             """;
@@ -195,34 +196,6 @@ public final class PromptTemplates {
             无目录的单页：snapshot 后 browser_extract_text。
             不要并行调用多个 browser_*。
             点不动就换 by=css / by=text，不要编造工具名。
-            """;
-
-    public static final String COMFYUI_GUIDANCE = """
-            图片生成工具使用流程：
-            1. comfyui_status 检查 ComfyUI 是否在线
-            2. 如果 ComfyUI 不在线，立即改用 image_generate 工具（云端多后端自动降级，无需本地服务）
-            3. comfyui_models 查看可用模型（每个模型带风格标签）
-            4. 根据用户要求的画风选择合适的 checkpoint 模型
-            5. comfyui_txt2img(prompt=..., checkpoint="选中的模型名") 生图
-            6. 生成后调 comfyui_check_quality 检查图片质量（7分以上合格）
-            7. 不合格时根据建议调整提示词重新生成（最多重试2次）
-
-            重要：
-            - 不要跳过 comfyui_models，必须根据画风选模型，不要用默认模型。
-            - 图片生成工具会直接返回可渲染的图片链接（markdown格式），你只需原样输出给用户即可。
-            - 不要添加额外解释，不要说"图片已生成"，直接输出图片链接。
-            - 如果 ComfyUI 未启动或连接失败，必须立即改用 image_generate 工具，不要要求用户手动启动 ComfyUI。
-
-            当用户上传了图片时：
-            - 图片路径会在消息中以 [用户上传了 N 张图片] 格式提供
-            - 如果用户要分析/描述图片 → 直接看图回答，不需要调工具
-            - 如果用户要"根据图片生成/参照图片画/改成XX风格" → 用 comfyui_img2img，传入图片路径
-            - comfyui_img2img 参数：image_path=路径, prompt=想要的风格, denoise=变化程度(0.3~0.7)
-            - denoise 越小越保留原图，越大变化越大
-
-            中文提示词可以直接用，ComfyUI 支持中英文。
-            图生视频用 comfyui_img2video，TTS 用 comfyui_tts，
-            要一整首歌（作词+作曲+演唱）用 song_generate（云端约 3 分钟，返回可播放的音频链接）。
             """;
 
     public static final String PLANNING_GUIDANCE = """
