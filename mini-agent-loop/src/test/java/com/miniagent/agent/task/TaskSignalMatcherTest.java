@@ -92,6 +92,21 @@ class TaskSignalMatcherTest {
         String q = "帮我搜索今日 AI 技术最新动态";
         assertTrue(signals.needsWeb(q));
         assertFalse(signals.simpleFileDelivery(q));
+        assertFalse(signals.explicitFileDelivery(q));
+    }
+
+
+    @Test
+    void fileDeliveryRequiresAnExplicitOutputRequest() {
+        assertTrue(signals.explicitFileDelivery("搜索今日 AI 技术并整理成 ai_news.md"));
+        assertTrue(signals.explicitFileDelivery("请把结果保存为报告 report.docx"));
+        assertFalse(signals.explicitFileDelivery("读取 report.pdf 并总结要点"));
+        assertFalse(signals.explicitFileDelivery("写一首歌曲并实现真人唱歌"));
+    }    @Test
+    void diagnosticSignalOnlyMatchesFailureSemantics() {
+        assertTrue(signals.of("分析 SenseAudio HTTP 400 报错并给出解决方案").diagnostic());
+        assertTrue(signals.of("定位 error code 429 的失败原因").diagnostic());
+        assertFalse(signals.of("分析 sales.xlsx 各月销售额").diagnostic());
     }
 
     @Test

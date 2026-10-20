@@ -34,6 +34,12 @@ public class TaskSignalMatcher {
                     + "|xlsx|xls|csv|docx|doc|pptx|ppt|pdf|png|jpe?g|zip)\\b",
             Pattern.CASE_INSENSITIVE);
 
+    /** 错误诊断事实：只有出现故障/错误语义才进入诊断任务图。 */
+    private static final Pattern DIAGNOSTIC_VERB = Pattern.compile(
+            "(?i)(错误码|错误代码|报错|报错信息|异常|故障|失败原因|失败信息|错误原因|"
+                    + "诊断|故障定位|排查错误|定位问题|为何失败|为什么失败|error\\s*code|"
+                    + "error|exception|failure|diagnos|debug|troubleshoot)");
+
     /** 读取/分析已有内容的动词。 */
     private static final Pattern READ_VERB = Pattern.compile(
             "(?i)(读取|读一下|读读|解析|分析|统计|汇总|提取|抽取|审阅|检查|梳理|总结|看一下|看看"
@@ -43,6 +49,28 @@ public class TaskSignalMatcher {
     private static final Pattern WRITE_VERB = Pattern.compile(
             "(?i)(生成|创建|新建|写入|写出|写到|导出|保存|产出|整理成|输出|做一份|写一份|做一个|写一个"
                     + "|write|create|generate|export|save|produce)");
+
+    /**
+     * 明确要求把结果交付为文件的目标词。单独出现「pdf/文档」只表示输入
+     * 可能是文件；只有与输出动作组合，或明确点名输出路径，才允许规划器
+     * 生成 file_write/file_exists 节点。
+     */
+    private static final Pattern FILE_DELIVERY_TARGET = Pattern.compile(
+            "(?i)(文件|文档|报告|markdown|md|sql|代码|脚本|"
+                    + "[\\w一-龥 .-]+\\.(txt|md|markdown|java|py|json|xml|yaml|yml|toml|"
+                    + "properties|conf|log|html|css|js|tsx?|go|rs|sh|bat|ps1|sql|ipynb|mmd|"
+                    + "svg|xlsx|xls|csv|docx|doc|pptx|ppt|pdf|png|jpe?g|zip)\\b)");
+
+    /** 明确落盘/导出动作；「写一首歌」没有文件目标，不会命中交付信号。 */
+    private static final Pattern FILE_DELIVERY_ACTION = Pattern.compile(
+            "(?i)(保存|导出|写入|写出|写到|写成|输出到|输出为|落盘|落地|另存|"
+                    + "生成|创建|新建|产出|整理成|做一份|写一份|做一个|写一个|"
+                    + "save|export|write|create|generate|produce)");
+
+    /** 读取请求本身不能因为带有文件名而变成文件写入。 */
+    private static final Pattern READ_ONLY_REQUEST = Pattern.compile(
+            "(?i)(读取|读一下|读读|解析|分析|统计|汇总|提取|抽取|审阅|检查|梳理|总结|"
+                    + "看一下|看看|read|parse|analyze|analyse|inspect|review|summarize|extract)");
 
     /** 多文件/多产物表述：出现这些词就不是「单个文件短指令」。 */
     private static final Pattern MULTI_ARTIFACT = Pattern.compile(
@@ -111,7 +139,9 @@ public class TaskSignalMatcher {
                 complex(t),
                 taskAction(t),
                 continueTask(t),
-                looksLikePublish(t));
+                looksLikePublish(t),
+                explicitFileDelivery(t),
+                diagnostic(t));
     }
 
     public boolean needsWeb(String text) {
@@ -128,6 +158,26 @@ public class TaskSignalMatcher {
      */
     public boolean needsFiles(String text) {
         return any(file, text) || mentionsFile(text);
+    }
+
+    /**
+     * 返回用户是否明确要求文件交付。此信号与 {@link #needsFiles(String)} 分开：
+     * 「读取 report.pdf」需要文件输入，但绝不应让规划器凭空增加 file_write。
+     */
+    public boolean explicitFileDelivery(String text) {
+        if (StringUtils.isBlank(text)) {
+            return false;
+        }
+        String t = text.trim();
+        boolean readOnly = READ_ONLY_REQUEST.matcher(t).find()
+                && !WRITE_VERB.matcher(t).find();
+        if (readOnly) {
+            return false;
+        }
+        // 路径/扩展名本身是明确交付目标，但仍需有输出动作，避免把输入文件名
+        // （如「打开 test.pdf」）当成写出路径。
+        return FILE_DELIVERY_ACTION.matcher(t).find()
+                && FILE_DELIVERY_TARGET.matcher(t).find();
     }
 
     /** 消息里出现了带扩展名的文件名。 */
@@ -163,6 +213,10 @@ public class TaskSignalMatcher {
 
     public boolean taskAction(String text) {
         return any(taskAction, text);
+    }
+
+    public boolean diagnostic(String text) {
+        return text != null && DIAGNOSTIC_VERB.matcher(text).find();
     }
 
     public boolean continueTask(String text) {

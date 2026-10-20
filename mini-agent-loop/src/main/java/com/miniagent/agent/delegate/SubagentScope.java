@@ -39,9 +39,9 @@ public final class SubagentScope implements AutoCloseable {
     }
 
     /**
-     * 取更严的权限模式。排序：PLAN &lt; ASK &lt; DEFAULT &lt; ACCEPT_EDITS
-     * （PLAN 只读探索，ASK 危险工具需批准，DEFAULT 正常执行面，ACCEPT_EDITS 免二次询问）。
-     * 未知/空值一律按 DEFAULT 处理，保证不会因为"认不出来"而放宽。
+     * 取更严的权限模式。排序：READ_ONLY &lt; PLAN &lt; ASK &lt; DEFAULT &lt; ACCEPT_EDITS
+     * （READ_ONLY 只读不动手，PLAN 只读探索，ASK 危险工具需批准，DEFAULT 正常执行面，
+     * ACCEPT_EDITS 免二次询问）。未知/空值一律按 DEFAULT 处理，保证不会因为"认不出来"而放宽。
      */
     static PermissionMode stricter(PermissionMode parent, PermissionMode fallback) {
         PermissionMode base = fallback == null ? PermissionMode.DEFAULT : fallback;
@@ -53,10 +53,11 @@ public final class SubagentScope implements AutoCloseable {
 
     private static int rank(PermissionMode mode) {
         return switch (mode) {
-            case PLAN -> 0;
-            case ASK -> 1;
-            case DEFAULT -> 2;
-            case ACCEPT_EDITS -> 3;
+            case READ_ONLY -> 0;
+            case PLAN -> 1;
+            case ASK -> 2;
+            case DEFAULT -> 3;
+            case ACCEPT_EDITS -> 4;
         };
     }
 

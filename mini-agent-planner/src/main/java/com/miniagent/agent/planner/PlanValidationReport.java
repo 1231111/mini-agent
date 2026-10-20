@@ -96,7 +96,9 @@ public record PlanValidationReport(List<ValidationError> errors, List<Validation
             GENERAL("通用错误", true),
             TOOL_SURFACE("工具表面问题", false),
             CAPABILITY_MISMATCH("能力不匹配", true),
-            RESOURCE_UNAVAILABLE("资源不可用", false);
+            RESOURCE_UNAVAILABLE("资源不可用", false),
+            UNREQUESTED_FILE_DELIVERY("未请求文件交付", true),
+            GOAL_GRAPH_MISMATCH("目标与任务图语义不一致", true);
 
             private final String description;
             private final boolean fatal;

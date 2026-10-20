@@ -154,4 +154,41 @@ class PermissionPolicyTest {
         assertTrue(PermissionPolicy.allowInSpecs(
                 PermissionMode.PLAN, false, "read_file"));
     }
+
+    // ==================== READ_ONLY 只读档（对应 WorkBuddy 的 Ask） ====================
+
+    @Test
+    void readOnlyModeHidesWriteAndExecFromSpecsEvenWhenApproved() {
+        // 只读模式不认「计划已批准」——写/执行工具永远进不了 specs。
+        assertFalse(PermissionPolicy.allowInSpecs(
+                PermissionMode.READ_ONLY, true, "write_file"));
+        assertFalse(PermissionPolicy.allowInSpecs(
+                PermissionMode.READ_ONLY, true, "edit_file"));
+        assertFalse(PermissionPolicy.allowInSpecs(
+                PermissionMode.READ_ONLY, true, "exec_command"));
+        assertFalse(PermissionPolicy.allowInSpecs(
+                PermissionMode.READ_ONLY, true, "http_post"));
+    }
+
+    @Test
+    void readOnlyModeStillAllowsReadOnlyWhitelist() {
+        // 只读白名单（PLAN_SAFE_TOOLS）在只读模式下仍然可用。
+        assertTrue(PermissionPolicy.allowInSpecs(
+                PermissionMode.READ_ONLY, false, "read_file"));
+        assertTrue(PermissionPolicy.allowInSpecs(
+                PermissionMode.READ_ONLY, false, "list_files"));
+        assertTrue(PermissionPolicy.allowInSpecs(
+                PermissionMode.READ_ONLY, false, "web_search"));
+        assertTrue(PermissionPolicy.allowInSpecs(
+                PermissionMode.READ_ONLY, false, "todo"));
+    }
+
+    @Test
+    void readOnlyModeRequiresGrantForLeakedDangerousTools() {
+        // 防御性兜底：万一写/执行工具绕过 specs 直接到了执行侧，仍须授权（等于拒绝）。
+        assertTrue(PermissionPolicy.needsSessionGrant(
+                PermissionMode.READ_ONLY, "write_file", ExecPolicy.ALLOW));
+        assertTrue(PermissionPolicy.needsSessionGrant(
+                PermissionMode.READ_ONLY, "exec_command", ExecPolicy.ALLOW));
+    }
 }

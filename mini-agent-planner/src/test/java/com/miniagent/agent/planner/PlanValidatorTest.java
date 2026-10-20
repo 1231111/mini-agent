@@ -16,34 +16,6 @@ class PlanValidatorTest {
     private final PlanValidator validator = new PlanValidator();
 
     @Test
-    void fetchAndSaveMustSplit() {
-        TaskPlan plan = structured("查 OpenAI API 写入 api.md");
-        TaskGraph g = new GoalCompiler(new PlannerProperties())
-                .templateGraph("查 OpenAI API 写入 api.md",
-                        TaskPlan.of("查 OpenAI API 写入 api.md", true,
-                                TaskSignals.parse("web,file")));
-        assertEquals(2, g.nodes().size());
-        assertTrue(validator.validate(g, plan).valid());
-    }
-
-    @Test
-    void readAndAnalyzeMustSplit() {
-        String msg = "分析 test.xlsx 各月数据";
-        TaskPlan plan = TaskPlan.of(msg, true, TaskSignals.parse("file,read"));
-        TaskGraph g = new GoalCompiler(new PlannerProperties()).templateGraph(msg, plan);
-        assertEquals(2, g.nodes().size());
-        assertTrue(validator.validate(g, plan).valid());
-    }
-
-    @Test
-    void parsePdfStaysAtomic() {
-        String msg = "读取 test.pdf";
-        TaskGraph g = new GoalCompiler(new PlannerProperties()).templateGraph(msg,
-                TaskPlan.of(msg, false, TaskSignals.parse("file,read")));
-        assertEquals(1, g.nodes().size());
-    }
-
-    @Test
     void rejectsSingleCompoundNode() {
         TaskPlan plan = structured("帮我查一下 OpenAI 最新 API 文档，然后保存成 Markdown");
         TaskGraph g = new TaskGraph(List.of(
@@ -122,13 +94,6 @@ class PlanValidatorTest {
     }
 
     @Test
-    void fetchWriteTemplateValidates() {
-        TaskPlan plan = structured("https://example.com 写入学习资料");
-        TaskGraph g = DataflowNormalizer.normalize(GoalCompiler.fetchWriteTemplate());
-        assertTrue(validator.validate(g, plan).valid());
-    }
-
-    @Test
     void doesNotSplitOnNodeNameKeywords() {
         TaskPlan plan = structured("获取资料原文");
         TaskGraph g = new TaskGraph(List.of(
@@ -159,6 +124,72 @@ class PlanValidatorTest {
         assertFalse(report.valid());
         assertEquals(1, report.countByType(
                 PlanValidationReport.ValidationError.Type.UNDER_DECOMPOSED));
+    }
+
+    @Test
+    void rejectsDiagnosticGoalWithResearchNotesGraph() {
+        TaskPlan plan = TaskPlan.of("分析 SenseAudio HTTP 400 报错并给出解决方案", true,
+                TaskSignals.parse("diagnostic,web"));
+        TaskGraph g = DataflowNormalizer.normalize(new TaskGraph(List.of(
+                node("n1", "获取资料原文", "web"),
+                node("n2", "整理并写入 notes.md", "file_write", List.of("n1")))));
+
+        PlanValidationReport report = validator.validate(g, plan);
+
+        assertFalse(report.valid());
+        assertEquals(1, report.countByType(
+                PlanValidationReport.ValidationError.Type.GOAL_GRAPH_MISMATCH));
+    }
+
+    @Test
+    void rejectsDiagnosticSignalWithoutDiagnosticNodeEvenWhenGraphIsStructurallyValid() {
+        TaskPlan plan = TaskPlan.of("定位错误码 429 的失败原因", true,
+                TaskSignals.parse("diagnostic"));
+        TaskGraph g = new TaskGraph(List.of(
+                node("n1", "读取错误证据", "file_read"),
+                node("n2", "输出普通总结", "deliver", List.of("n1"))));
+
+        PlanValidationReport report = validator.validate(g, plan);
+
+        assertFalse(report.valid());
+        assertEquals(1, report.countByType(
+                PlanValidationReport.ValidationError.Type.GOAL_GRAPH_MISMATCH));
+    }
+
+    @Test
+    void rejectsFileDeliveryWhenUserOnlyAskedToSearch() {
+        TaskPlan plan = TaskPlan.of("帮我搜索今日 AI 技术最新动态", true,
+                TaskSignals.parse("web"));
+        TaskGraph g = DataflowNormalizer.normalize(new TaskGraph(List.of(
+                node("n1", "搜索今日 AI 技术", "web"),
+                node("n2", "写入 ai_news_today.md", "file_write", List.of("n1")))));
+        PlanValidationReport report = validator.validate(g, plan);
+        assertFalse(report.valid());
+        assertEquals(1, report.countByType(
+                PlanValidationReport.ValidationError.Type.UNREQUESTED_FILE_DELIVERY));
+    }
+
+    @Test
+    void acceptsFileDeliveryWhenUserExplicitlyRequestsReport() {
+        TaskPlan plan = TaskPlan.of("搜索今日 AI 技术并整理成 ai_news_today.md", true,
+                TaskSignals.parse("web,file,fileDelivery"));
+        TaskGraph g = DataflowNormalizer.normalize(new TaskGraph(List.of(
+                node("n1", "搜索今日 AI 技术", "web"),
+                node("n2", "写入 ai_news_today.md", "file_write", List.of("n1")))));
+        assertTrue(validator.validate(g, plan).valid());
+    }
+
+    @Test
+    void readingExistingFileDoesNotAuthorizeFileWrite() {
+        TaskPlan plan = TaskPlan.of("读取 report.pdf 并总结要点", true,
+                TaskSignals.parse("file,read"));
+        TaskGraph g = new TaskGraph(List.of(
+                node("n1", "读取 report.pdf", "file_read"),
+                node("n2", "写入 summary.md", "file_write", List.of("n1"))));
+        PlanValidationReport report = validator.validate(g, plan);
+        assertFalse(report.valid());
+        assertEquals(1, report.countByType(
+                PlanValidationReport.ValidationError.Type.UNREQUESTED_FILE_DELIVERY));
     }
 
     @Test

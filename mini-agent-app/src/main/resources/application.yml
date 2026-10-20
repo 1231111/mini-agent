@@ -333,11 +333,6 @@ agent:
     # 同一节点配额用尽后接着同一份 messages 再跑，最多这么多段
     proposal-max-chunks: 6
     compiler-retry: 1
-    # 任务拆解的判据来源。true=模型判：「要动手」的消息都进规划器，拆不拆/拆几刀
-    # 由规划模型决定，词表只留入口净化（默认）。false=词表判：按 requiresStructuredPlan
-    # 决定要不要进规划器，且模板优先出图、结构确定就不叫模型（旧行为，留作回退）。
-    # 代价：模型判每次动手多消耗一次规划模型调用（失败按 compiler-retry 重试）。
-    model-decides-decomposition: true
     max-outer-rounds: 24
     hard-proposal: true
     strict-eval: true

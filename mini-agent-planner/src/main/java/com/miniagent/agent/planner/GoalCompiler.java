@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.task.TaskSignals;
-import com.miniagent.agent.task.TaskStep;
 import com.miniagent.agent.llm.DedicatedChatModel;
 import com.miniagent.agent.skill.SkillStore;
 import com.miniagent.agent.tool.CapabilityRegistry;
@@ -23,8 +22,8 @@ import org.springframework.stereotype.Component;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -36,15 +35,7 @@ public class GoalCompiler {
 
     private static final Logger log = LoggerFactory.getLogger(GoalCompiler.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    static final String ARTIFACT_SOURCE = "source_text";
-    static final String ARTIFACT_NOTES = "notes_md";
-    static final String NOTES_FILE = "notes.md";
-    static final String DIAGRAM_MMD = "architecture.mmd";
-    static final String DIAGRAM_PNG = "architecture.png";
-    static final String ARTIFACT_TABLE = "table_data";
-    static final String ARTIFACT_STATS = "stats";
     static final String CAP_PLAN = "plan";
-    static final String CAP_WEB = "web";
     static final String CLARIFY_HINT = "请补充：交付文件名或数据来源（URL）";
 
     /**
@@ -105,9 +96,19 @@ public class GoalCompiler {
               "taskType": "图表生成/文档生成/代码生成/...",
               "objective": "...",
               "constraints": ["..."],
-              "successCriteria": ["notes.md"],
-              "entities": {"k": "v"},
-              "nodes": [
+            "successCriteria": ["notes.md"],
+            "intent": {
+              "objective": "用户最终目标",
+              "deliverables": [{"name":"交付物", "type":"file|media|answer|action", "path":"", "required":true}],
+              "inputs": [{"name":"输入材料", "source":"用户消息/附件/网页/文件", "required":true}],
+              "constraints": ["必须遵守的限制"],
+              "exclusions": ["明确禁止或不需要的操作"],
+              "acceptanceCriteria": ["可验证的完成条件"],
+              "needsClarification": false,
+              "clarificationQuestion": ""
+            },
+            "entities": {"k": "v"},
+            "nodes": [
                 {"id": "n1", "name": "...", "capability": "...",
                  "dependsOn": [], "inputs": [], "outputs": [], "priority": 50,
                  "doneWhen": {"type": "note_required", "path": "", "criteria": ""}}
@@ -137,6 +138,14 @@ public class GoalCompiler {
             file_exists 填 path，可加 criteria 做内容验收。
             llm_judge、validation_passed 可填 criteria。
             command_success 要求 evidence 含 exit_code=0。
+
+            【不要放大用户请求】
+            交付物必须能在用户原文里找到依据。用户没有明确要求保存、导出、写入文件，
+            也没有给出输出路径时：禁止生成 file_write 节点，禁止把「整理成某文件」
+            写进 objective / deliverables / successCriteria。这类请求的交付物是
+            对话内的回答（deliverable type=answer），不是落盘文件。
+            例：用户说「搜索今日 AI 技术最新动态」→ 一个 web 节点 + note_required，
+            不要在目标里追加「并整理成 Markdown 简报文件」。
 
             【节点粒度】
             Node = 单一主要产出、单一主要能力、可独立执行/重试/验收的原子任务。
@@ -262,8 +271,52 @@ public class GoalCompiler {
         return dedicatedPlanner != null ? dedicatedPlanner : EffectiveModelContext.chatOr(fallback);
     }
 
-    public record CompileResult(Goal goal, TaskGraph graph, boolean fromTemplate) {}
-    public record ParsedCompilation(Goal goal, TaskGraph graph) {}
+    public enum CompilationSource {
+        MODEL,
+        /** 续跑：图来自已持久化快照，本轮没有重新调用规划模型。 */
+        RESUMED,
+        MODEL_UNAVAILABLE,
+        MODEL_EMPTY,
+        MODEL_ERROR,
+        VALIDATION_ERROR
+    }
+
+    public record CompileResult(Goal goal, TaskGraph graph, boolean degradedCompilation,
+                                CompilationSource source, String fallbackReason,
+                                TaskIntent intent) {
+        public CompileResult {
+            source = source == null
+                    ? (degradedCompilation ? CompilationSource.MODEL_ERROR : CompilationSource.MODEL)
+                    : source;
+            fallbackReason = fallbackReason == null ? "" : fallbackReason;
+            intent = intent == null ? TaskIntent.fromGoal(goal) : intent;
+        }
+
+        public CompileResult(Goal goal, TaskGraph graph, boolean degradedCompilation,
+                             CompilationSource source, String fallbackReason) {
+            this(goal, graph, degradedCompilation, source, fallbackReason, TaskIntent.fromGoal(goal));
+        }
+
+        public CompileResult(Goal goal, TaskGraph graph, boolean degradedCompilation) {
+            this(goal, graph, degradedCompilation,
+                    degradedCompilation ? CompilationSource.MODEL_ERROR : CompilationSource.MODEL,
+                    "", TaskIntent.fromGoal(goal));
+        }
+
+        public boolean degraded() {
+            return degradedCompilation || source == CompilationSource.MODEL_UNAVAILABLE
+                    || source == CompilationSource.MODEL_EMPTY
+                    || source == CompilationSource.MODEL_ERROR
+                    || source == CompilationSource.VALIDATION_ERROR;
+        }
+    }
+    public record ParsedCompilation(Goal goal, TaskGraph graph, TaskIntent intent) {
+        public ParsedCompilation(Goal goal, TaskGraph graph) {
+            this(goal, graph, TaskIntent.fromGoal(goal));
+        }
+    }
+    private record LlmCompileAttempt(CompileResult result, CompilationSource source,
+                                     String failureReason) {}
 
     /**
      * 带修正提示的编译方法，用于 replan 闭环
@@ -283,16 +336,22 @@ public class GoalCompiler {
             try {
                 ParsedCompilation parsed = compileWithLlmAndCorrection(
                     planner, userMessage, plan, correctionPrompt);
+                parsed = alignWithRequest(parsed, plan);
                 if (parsed != null && parsed.graph() != null && !parsed.graph().isEmpty()) {
-                    return new CompileResult(parsed.goal(), markPending(parsed.graph()), false);
+                    return new CompileResult(parsed.goal(), markPending(parsed.graph()), false,
+                            CompilationSource.MODEL, "", parsed.intent());
                 }
+                log.warn("GoalCompiler 带修正的 LLM 编译得到空图");
             } catch (Exception e) {
                 log.warn("GoalCompiler 带修正的 LLM 编译失败: {}", e.getMessage());
             }
         }
 
-        // 如果修正编译失败，使用 fallback
-        return fallback(base, userMessage, plan);
+        // 修正编译失败时返回空图，不构造规则猜测的任务图。
+        // 规则猜测的图不是模型对本次请求的理解，
+        // 用它继续执行等于把「结构合法」当成「语义正确」，正是分项执行出错的来源。
+        return failedCompile(base, CompilationSource.MODEL_ERROR,
+                "MODEL_ERROR: correction compile returned no valid graph");
     }
 
     /**
@@ -319,9 +378,9 @@ public class GoalCompiler {
             ParsedCompilation parsed = parseCompilation(text, goalFromPlan(userMessage, plan));
             if (parsed == null || parsed.graph() == null || parsed.graph().isEmpty()) {
                 // 空图是最难定位的一类失败：模型回的是**合法 JSON 但没有可用的 nodes 数组**，
-                // 所以既不抛异常、也没有任何痕迹 —— 外部只看得到一句「使用模板图」。
+                // 所以既不抛异常、也没有任何痕迹 —— 外部只能看到一次空结果。
                 // 这段原文此前完全不落盘（agent_trace_steps 里 CONTEXT_LOAD → GOAL_COMPILED
-                // 之间本来就是空白），于是「为什么退回模板」只能靠猜。
+                // 之间本来就是空白），于是「为什么返回空图」只能靠猜。
                 log.warn("GoalCompiler 模型返回空图，原文前 400 字: {}", abbreviate(text, 400));
             }
             return parsed;
@@ -332,112 +391,170 @@ public class GoalCompiler {
     }
 
     /**
-     * 编译本轮任务图。
-     *
-     * <p>谁来决定拆几刀，取决于 {@code agent.planner.model-decides-decomposition}：</p>
-     * <ul>
-     *   <li>{@code true}（默认）：先叫规划模型编图，拿不到非空图才退回模板图。
-     *       模板只兜底，不再抢在模型前面定案。</li>
-     *   <li>{@code false}：先用 {@link DecompositionPolicy} 的结构信号套模板图，
-     *       {@link #structureDeterminate} 判定结构确定就直接定案，规划模型一次都不调。</li>
-     * </ul>
-     *
-     * <p>两种模式都先算好模板图 {@code structured} —— 它是规划模型不可用或编不出图时
-     * 唯一的退路，所以必须先有。</p>
+     * 编译本轮任务图。只有用户显式进入 Plan mode 时调用；拆解只由规划模型完成。
      */
     public CompileResult compile(ChatModel chat, String userMessage, TaskPlan plan) {
         Goal base = goalFromPlan(userMessage, plan);
-        CompileResult structured = fallback(base, userMessage, plan);
 
-        if (properties.isModelDecidesDecomposition()) {
-            CompileResult byLlm = tryLlmCompile(chat, userMessage, plan);
-            return byLlm != null ? byLlm : structured;
+        // 一律交给 LLM 拆解。规则穷举猜结构不参与运行路径：
+        // 它把「结构合法」当成「语义正确」，是分项任务出错的主要来源。
+        LlmCompileAttempt attempt = tryLlmCompile(chat, userMessage, plan);
+        if (attempt.result() != null) {
+            return attempt.result();
         }
-
-        if (structureDeterminate(structured.graph(), userMessage, plan)) {
-            log.info("GoalCompiler 结构确定 nodes={} clarify={}",
-                    structured.graph().nodes().size(), structured.goal().isClarify());
-            return structured;
-        }
-        CompileResult byLlm = tryLlmCompile(chat, userMessage, plan);
-        return byLlm != null ? byLlm : structured;
+        return failedCompile(base, attempt.source(), attempt.failureReason());
     }
 
-    /**
-     * 叫规划模型编一张图。
-     *
-     * @return 拿到非空图时返回编译结果；规划模型不可用、本轮不该叫模型，
-     *         或按 {@code compilerRetry} 重试完仍无产出时返回 {@code null}，
-     *         由调用方决定退回模板图。
-     */
-    private CompileResult tryLlmCompile(ChatModel chat, String userMessage, TaskPlan plan) {
+    /** 叫规划模型编一张图，并返回失败原因。 */
+    private LlmCompileAttempt tryLlmCompile(ChatModel chat, String userMessage, TaskPlan plan) {
         ChatModel planner = resolvePlannerChat(chat);
-        // 下面三条 return null 的路径原先全是静默的，而它们各自对应完全不同的处置方式。
-        // 2026-10-15 实测：同一条消息三次全部 template=true，日志里只有一行「使用模板图」，
-        // 分不清是「没有模型」「判据不成立」还是「模型回空图」，只能逐条排除 —— 都留痕就不用再猜。
+        // 无可用规划模型时直接失败。进入规划器意味着用户显式选择了 Plan mode，
+        // 任务拆解只能由 LLM 完成，没有模板兜底。
         if (planner == null) {
             log.warn("GoalCompiler 跳过 LLM 拆解：无可用规划模型（传入 chat={}，专用模型={}）",
                     chat == null ? "null" : chat.getClass().getSimpleName(),
                     dedicatedPlanner == null ? "未配置" : "已配置");
-            return null;
-        }
-        if (!shouldAskModel(plan)) {
-            log.info("GoalCompiler 跳过 LLM 拆解：判据不成立 modelDecides={}，signals={}",
-                    properties.isModelDecidesDecomposition(),
-                    plan == null ? "plan=null" : plan.signals().describe());
-            return null;
+            return new LlmCompileAttempt(null, CompilationSource.MODEL_UNAVAILABLE,
+                    "NO_PLANNER_MODEL");
         }
         int retries = Math.max(0, properties.getCompilerRetry());
+        boolean modelError = false;
+        String lastError = "";
         for (int i = 0; i <= retries; i++) {
             long t0 = System.currentTimeMillis();
             try {
                 ParsedCompilation parsed = compileWithLlm(planner, userMessage, plan);
+                parsed = alignWithRequest(parsed, plan);
                 long ms = System.currentTimeMillis() - t0;
                 if (parsed != null && parsed.graph() != null && !parsed.graph().isEmpty()) {
                     log.info("GoalCompiler LLM 拆解成功 retry={} nodes={} 耗时={}ms 模型={}",
                             i, parsed.graph().nodes().size(), ms,
                             planner.getClass().getSimpleName());
-                    return new CompileResult(
-                            parsed.goal(), markPending(parsed.graph()), false);
+                    return new LlmCompileAttempt(new CompileResult(
+                            parsed.goal(), markPending(parsed.graph()), false,
+                            CompilationSource.MODEL, "", parsed.intent()), CompilationSource.MODEL, "");
                 }
                 log.warn("GoalCompiler LLM 拆解得到空图 retry={} 耗时={}ms（原文见上一条 warn）",
                         i, ms);
             } catch (Exception e) {
+                modelError = true;
+                lastError = abbreviate(e.getMessage(), 180);
                 log.warn("GoalCompiler LLM 拆解失败 retry={} 耗时={}ms: {}",
                         i, System.currentTimeMillis() - t0, e.getMessage());
             }
         }
-        return null;
+        return new LlmCompileAttempt(null,
+                modelError ? CompilationSource.MODEL_ERROR
+                        : CompilationSource.MODEL_EMPTY,
+                modelError ? "MODEL_ERROR:" + lastError : "MODEL_EMPTY_OR_INVALID_GRAPH");
+    }
+
+    /** 规划模型不可用 / 空图 / 解析失败时返回空图结果，由调用方处理规划失败。 */
+    private CompileResult failedCompile(Goal base, CompilationSource source, String reason) {
+        return new CompileResult(base, new TaskGraph(List.of()), true, source, reason);
     }
 
     /**
-     * 本轮要不要把拆解交给规划模型。
+     * 把模型产出的目标与用户原文的授权对齐。
      *
-     * <p>模型判模式看的是「这轮要不要动手」（{@link TaskSignals#actionBearing()}）——
-     * 只要是动手的活，拆不拆、拆几刀一律由模型回答；
-     * 词表判模式看的是 {@code TaskPlan#requiresStructuredPlan()}，
-     * 那个布尔才是「这轮是不是结构化任务」。</p>
+     * <p>用户没有要求文件交付时，{@link PlanValidator} 会拒绝整张图 —— 这条硬约束是对的，
+     * 但它只拒绝了图：模型仍把「产出某个文件」写进了 objective 与 deliverables。
+     * 两者一旦不一致，重规划会来回摇摆（实测 2 → 1 → 4 个错误），
+     * 失败审批还会把这个被放大的目标带进审批卡，用户看到的就是
+     * 「目标是写文件、计划只有一步搜索」。</p>
+     *
+     * <p>因此在进校验之前先对齐：去掉未授权的落盘节点、文件交付物与文件验收项，
+     * 目标文本回退到用户原文。这是一次有日志的纠正，不是静默改写。</p>
      */
-    private boolean shouldAskModel(TaskPlan plan) {
-        if (plan == null) {
-            return false;
+    ParsedCompilation alignWithRequest(ParsedCompilation parsed, TaskPlan plan) {
+        if (parsed == null || parsed.graph() == null || plan == null
+                || PlanValidator.fileDeliveryRequested(plan)) {
+            return parsed;
         }
-        return properties.isModelDecidesDecomposition()
-                ? plan.signals().actionBearing()
-                : plan.requiresStructuredPlan();
+        boolean graphDirty = parsed.graph().nodes().stream()
+                .anyMatch(PlanValidator::isFileDeliveryNode);
+        boolean intentDirty = parsed.intent().deliverables().stream()
+                .anyMatch(GoalCompiler::isPersistDeliverable);
+        boolean objectiveDirty = PlanValidator.claimsFileDelivery(parsed.goal().objective())
+                || PlanValidator.claimsFileDelivery(parsed.intent().objective());
+        if (!graphDirty && !intentDirty && !objectiveDirty) {
+            return parsed;
+        }
+        TaskGraph graph = graphDirty ? dropPersistNodes(parsed.graph()) : parsed.graph();
+        String userGoal = StringUtils.trimToEmpty(plan.taskGoal());
+        String objective = objectiveDirty && StringUtils.isNotBlank(userGoal)
+                ? userGoal : parsed.goal().objective();
+        Goal goal = new Goal(parsed.goal().goalId(), objective, parsed.goal().signals(),
+                parsed.goal().taskType(), parsed.goal().entities(), parsed.goal().constraints(),
+                checkableCriteria(dropUnauthorizedFileCriteria(
+                        parsed.goal().successCriteria(), graph), objective, graph));
+        TaskIntent source = parsed.intent();
+        TaskIntent intent = new TaskIntent(objective,
+                source.deliverables().stream()
+                        .filter(d -> !isPersistDeliverable(d)).toList(),
+                source.inputs(), source.constraints(), source.exclusions(),
+                dropUnauthorizedFileCriteria(source.acceptanceCriteria(), graph),
+                source.needsClarification(), source.clarificationQuestion());
+        log.warn("GoalCompiler 纠正未授权的文件交付 droppedNodes={} objectiveAligned={}",
+                parsed.graph().nodes().size() - graph.nodes().size(), objectiveDirty);
+        return new ParsedCompilation(goal, graph, intent);
     }
 
-    public CompileResult fallback(Goal base, String userMessage, TaskPlan plan) {
-        Goal raw = base != null ? base : goalFromPlan(userMessage, plan);
-        TaskGraph graph = markPending(templateGraph(userMessage, plan));
-        String taskType = isClarifyGraph(graph)
-                ? Goal.TASK_TYPE_CLARIFY : raw.taskType();
-        Goal goal = new Goal(raw.goalId(), raw.objective(), raw.signals(), taskType,
-                raw.entities(), raw.constraints(),
-                checkableCriteria(List.of(), raw.objective(), graph));
-        log.info("GoalCompiler 使用模板图 nodes={} clarify={}",
-                graph.nodes().size(), goal.isClarify());
-        return new CompileResult(goal, graph, true);
+    /** 去掉落盘节点，并修补依赖与输入引用，避免留下指向已删节点的悬空边。 */
+    private static TaskGraph dropPersistNodes(TaskGraph graph) {
+        Set<String> droppedIds = new LinkedHashSet<>();
+        Set<String> droppedOutputs = new LinkedHashSet<>();
+        for (TaskNode n : graph.nodes()) {
+            if (PlanValidator.isFileDeliveryNode(n)) {
+                droppedIds.add(n.id());
+                droppedOutputs.addAll(n.outputs());
+            }
+        }
+        if (droppedIds.isEmpty()) {
+            return graph;
+        }
+        List<TaskNode> kept = new ArrayList<>();
+        for (TaskNode n : graph.nodes()) {
+            if (droppedIds.contains(n.id())) {
+                continue;
+            }
+            List<String> deps = new ArrayList<>();
+            Set<String> liveOutputs = new LinkedHashSet<>();
+            for (String d : n.dependsOn()) {
+                if (droppedIds.contains(d)) {
+                    continue;
+                }
+                deps.add(d);
+                TaskNode dep = graph.byId(d);
+                if (dep != null) {
+                    liveOutputs.addAll(dep.outputs());
+                }
+            }
+            List<String> inputs = n.inputs().stream()
+                    .filter(in -> !droppedOutputs.contains(in) || liveOutputs.contains(in))
+                    .toList();
+            kept.add(new TaskNode(n.id(), n.name(), n.capability(), deps, inputs, n.outputs(),
+                    n.status(), n.priority(), n.doneWhen(), n.toolHint(), n.toolArguments(),
+                    n.compensation(), n.covers(), n.lastError(), n.retryCount(), n.output(),
+                    n.outputBindings()));
+        }
+        return new TaskGraph(kept);
+    }
+
+    private static boolean isPersistDeliverable(TaskIntent.Deliverable d) {
+        String type = d.type() == null ? "" : d.type().trim().toLowerCase(java.util.Locale.ROOT);
+        return StringUtils.isNotBlank(d.path()) || "file".equals(type) || "media".equals(type);
+    }
+
+    private static boolean isUnauthorizedFileCriterion(String criterion, TaskGraph graph) {
+        String path = DataflowNormalizer.pathFromName(criterion);
+        return StringUtils.isNotBlank(path) && !StepEvaluator.hasFileDeliverable(graph, path);
+    }
+
+    private static List<String> dropUnauthorizedFileCriteria(List<String> criteria, TaskGraph graph) {
+        return criteria == null ? List.of() : criteria.stream()
+                .filter(c -> !isUnauthorizedFileCriterion(c, graph))
+                .toList();
     }
 
     private Goal goalFromPlan(String userMessage, TaskPlan plan) {
@@ -473,9 +590,9 @@ public class GoalCompiler {
             ParsedCompilation parsed = parseCompilation(text, goalFromPlan(userMessage, plan));
             if (parsed == null || parsed.graph() == null || parsed.graph().isEmpty()) {
                 // 空图是最难定位的一类失败：模型回的是**合法 JSON 但没有可用的 nodes 数组**，
-                // 所以既不抛异常、也没有任何痕迹 —— 外部只看得到一句「使用模板图」。
+                // 所以既不抛异常、也没有任何痕迹 —— 外部只能看到一次空结果。
                 // 这段原文此前完全不落盘（agent_trace_steps 里 CONTEXT_LOAD → GOAL_COMPILED
-                // 之间本来就是空白），于是「为什么退回模板」只能靠猜。
+                // 之间本来就是空白），于是「为什么返回空图」只能靠猜。
                 log.warn("GoalCompiler 模型返回空图，原文前 400 字: {}", abbreviate(text, 400));
             }
             return parsed;
@@ -548,7 +665,67 @@ public class GoalCompiler {
         }
         Goal goal = new Goal(seed.goalId(), objective, signals, taskType, entities,
                 constraints, checkableCriteria(criteria, objective, graph));
-        return new ParsedCompilation(goal, graph);
+        TaskIntent intent = parseIntent(root.get("intent"), goal, graph);
+        return new ParsedCompilation(goal, graph, intent);
+    }
+
+    private TaskIntent parseIntent(JsonNode node, Goal goal, TaskGraph graph) {
+        if (node == null || !node.isObject()) {
+            return intentFromGoalAndGraph(goal, graph);
+        }
+        List<TaskIntent.Deliverable> deliverables = new ArrayList<>();
+        JsonNode ds = node.get("deliverables");
+        if (ds != null && ds.isArray()) {
+            for (JsonNode d : ds) {
+                if (d != null && d.isObject()) {
+                    deliverables.add(new TaskIntent.Deliverable(
+                            textOr(d, "name", ""), textOr(d, "type", ""),
+                            textOr(d, "path", ""), !d.has("required") || d.get("required").asBoolean(true)));
+                }
+            }
+        }
+        List<TaskIntent.Input> inputs = new ArrayList<>();
+        JsonNode ins = node.get("inputs");
+        if (ins != null && ins.isArray()) {
+            for (JsonNode in : ins) {
+                if (in != null && in.isObject()) {
+                    inputs.add(new TaskIntent.Input(
+                            textOr(in, "name", ""), textOr(in, "source", ""),
+                            !in.has("required") || in.get("required").asBoolean(true)));
+                }
+            }
+        }
+        List<String> constraints = stringList(node, "constraints");
+        if (constraints.isEmpty()) constraints = goal.constraints();
+        List<String> criteria = stringList(node, "acceptanceCriteria");
+        if (criteria.isEmpty()) criteria = goal.successCriteria();
+        return new TaskIntent(textOr(node, "objective", goal.objective()), deliverables, inputs,
+                constraints, stringList(node, "exclusions"), criteria,
+                node.path("needsClarification").asBoolean(false),
+                textOr(node, "clarificationQuestion", ""));
+    }
+
+    private static TaskIntent intentFromGoalAndGraph(Goal goal, TaskGraph graph) {
+        List<TaskIntent.Deliverable> deliverables = new ArrayList<>();
+        List<TaskIntent.Input> inputs = new ArrayList<>();
+        if (graph != null) {
+            for (TaskNode node : graph.nodes()) {
+                if (node.doneWhen() != null && (node.doneWhen().isFile() || node.doneWhen().isMedia())) {
+                    String type = node.doneWhen().isFile() ? "file" : "media";
+                    deliverables.add(new TaskIntent.Deliverable(
+                            node.name(), type, node.doneWhen().path(), true));
+                }
+                if (node.capability() != null && (node.capability().contains("read")
+                        || node.capability().equals("web") || node.capability().equals("research"))) {
+                    inputs.add(new TaskIntent.Input(node.name(), node.capability(), true));
+                }
+            }
+        }
+        return new TaskIntent(goal == null ? "" : goal.objective(), deliverables, inputs,
+                goal == null ? List.of() : goal.constraints(), List.of(),
+                goal == null ? List.of() : goal.successCriteria(),
+                goal != null && goal.isClarify(),
+                goal != null && goal.isClarify() ? "请补充完成任务所需的信息。" : "");
     }
 
     /**
@@ -580,179 +757,6 @@ public class GoalCompiler {
         return List.copyOf(out);
     }
 
-    TaskGraph templateGraph(String userMessage, TaskPlan plan) {
-        String blob = DecompositionPolicy.blob(userMessage, plan);
-        String path = DecompositionPolicy.firstPath(blob);
-        String url = DecompositionPolicy.firstUrl(blob);
-        if (DecompositionPolicy.looksLikeDiagram(userMessage, plan)) {
-            return DataflowNormalizer.normalize(diagramTemplate(path));
-        }
-        if (DecompositionPolicy.fetchWrite(userMessage, plan)) {
-            return DataflowNormalizer.normalize(fetchWriteTemplate(path, url));
-        }
-        if (DecompositionPolicy.readThenAnalyze(userMessage, plan)) {
-            return DataflowNormalizer.normalize(readAnalyzeTemplate(path));
-        }
-        if (DecompositionPolicy.researchThenFile(userMessage, plan)) {
-            return DataflowNormalizer.normalize(researchThenFileTemplate(path, url));
-        }
-        List<TaskNode> nodes = new ArrayList<>();
-        if (plan != null && plan.steps() != null && !plan.steps().isEmpty()) {
-            String prev = null;
-            int i = 0;
-            for (TaskStep step : plan.steps()) {
-                if (step == null || StringUtils.isBlank(step.goal())) {
-                    continue;
-                }
-                i++;
-                String id = "n" + i;
-                List<String> deps = prev == null ? List.of() : List.of(prev);
-                String cap = inferFromPlan(plan);
-                nodes.add(new TaskNode(id, step.goal().trim(), cap, deps,
-                        List.of(), List.of(), TaskNodeStatus.PENDING, 10 - i,
-                        DoneWhen.note(), "", "", 0, ""));
-                prev = id;
-            }
-        }
-        if (nodes.isEmpty()) {
-            String raw = plan != null && StringUtils.isNotBlank(plan.taskGoal())
-                    ? plan.taskGoal() : userMessage;
-            String name = abbreviate(raw, 40);
-            if (StringUtils.isBlank(name)) {
-                name = "执行任务";
-            }
-            if (!path.isBlank() && !name.contains(path)) {
-                name = abbreviate(name + " " + path, 40);
-            }
-            String cap = inferFromPlan(plan);
-            if (!url.isBlank() && (StringUtils.isBlank(cap)
-                    || CapabilityRegistry.GENERAL.equals(cap))) {
-                cap = CAP_WEB;
-            }
-            TaskNode n1 = new TaskNode("n1", name, cap, List.of(), List.of(), List.of(),
-                    TaskNodeStatus.PENDING, 10, DoneWhen.note(), "", "", 0, "");
-            n1 = withUrlArg(n1, url);
-            nodes.add(n1);
-        }
-        return schedulableOrClarify(
-                DataflowNormalizer.normalize(new TaskGraph(nodes)));
-    }
-
-    static TaskGraph diagramTemplate() {
-        return diagramTemplate("");
-    }
-
-    static TaskGraph diagramTemplate(String path) {
-        String mmd = DIAGRAM_MMD;
-        String png = DIAGRAM_PNG;
-        if (StringUtils.isNotBlank(path)) {
-            String p = path.trim();
-            int dot = p.lastIndexOf('.');
-            String stem = dot > 0 ? p.substring(0, dot) : p;
-            String lower = p.toLowerCase(Locale.ROOT);
-            if (lower.endsWith(".mmd")) {
-                mmd = p;
-                png = stem + ".png";
-            } else if (lower.endsWith(".png")) {
-                png = p;
-                mmd = stem + ".mmd";
-            }
-        }
-        return new TaskGraph(List.of(
-                new TaskNode("n1",
-                        "把架构写成 Mermaid 写入 " + mmd,
-                        "image", List.of(), List.of(), List.of("diagram_mmd"),
-                        TaskNodeStatus.PENDING, 10,
-                        DoneWhen.file(mmd), "", "", 0, ""),
-                new TaskNode("n2",
-                        "把 " + mmd + " 渲染成 " + png,
-                        "image", List.of("n1"), List.of("diagram_mmd"), List.of("diagram_png"),
-                        TaskNodeStatus.PENDING, 9,
-                        DoneWhen.file(png), "", "", 0, "")));
-    }
-
-    static TaskGraph researchThenFileTemplate() {
-        return researchThenFileTemplate("", "");
-    }
-
-    static TaskGraph researchThenFileTemplate(String path) {
-        return researchThenFileTemplate(path, "");
-    }
-
-    static TaskGraph researchThenFileTemplate(String path, String url) {
-        String file = persistPath(path);
-        TaskNode n1 = new TaskNode("n1", "获取资料原文",
-                "web", List.of(), List.of(), List.of(ARTIFACT_SOURCE),
-                TaskNodeStatus.PENDING, 10,
-                DoneWhen.note(), "", "", 0, "");
-        n1 = withUrlArg(n1, url);
-        return new TaskGraph(List.of(
-                n1,
-                new TaskNode("n2", "整理并写入 " + file,
-                        "file_write", List.of("n1"), List.of(ARTIFACT_SOURCE),
-                        List.of(ARTIFACT_NOTES), TaskNodeStatus.PENDING, 9,
-                        DoneWhen.file(file), "", "", 0, "")));
-    }
-
-    static TaskGraph readAnalyzeTemplate() {
-        return readAnalyzeTemplate("");
-    }
-
-    static TaskGraph readAnalyzeTemplate(String path) {
-        String table = StringUtils.isBlank(path) ? "表格" : path;
-        TaskNode n1 = new TaskNode("n1", "读取 " + table,
-                "file_read", List.of(), List.of(), List.of(ARTIFACT_TABLE),
-                TaskNodeStatus.PENDING, 10,
-                DoneWhen.note(), "", "", 0, "");
-        if (DecompositionPolicy.isSpreadsheet(path)) {
-            n1 = n1.withToolArguments(Map.of(ActionBinder.ARG_PATH, path.trim()));
-        }
-        return new TaskGraph(List.of(
-                n1,
-                new TaskNode("n2", "统计每个月销售额",
-                        "code", List.of("n1"), List.of(ARTIFACT_TABLE),
-                        List.of(ARTIFACT_STATS), TaskNodeStatus.PENDING, 9,
-                        DoneWhen.judge("统计覆盖各月销售额"), "", "", 0, "")));
-    }
-
-    static TaskGraph fetchWriteTemplate() {
-        return fetchWriteTemplate("", "");
-    }
-
-    static TaskGraph fetchWriteTemplate(String path) {
-        return fetchWriteTemplate(path, "");
-    }
-
-    static TaskGraph fetchWriteTemplate(String path, String url) {
-        String file = persistPath(path);
-        TaskNode n1 = new TaskNode("n1",
-                "打开页面抽取全部章节",
-                "browser", List.of(), List.of(), List.of(ARTIFACT_SOURCE),
-                TaskNodeStatus.PENDING, 10,
-                DoneWhen.note(),
-                "", "", 0, "");
-        n1 = withUrlArg(n1, url);
-        return new TaskGraph(List.of(
-                n1,
-                new TaskNode("n2", "按真实章节写入 " + file,
-                        "file_write", List.of("n1"), List.of(ARTIFACT_SOURCE),
-                        List.of(ARTIFACT_NOTES), TaskNodeStatus.PENDING, 9,
-                        DoneWhen.file(file), "", "", 0, ""),
-                new TaskNode("n3", "对照临时文件校验学习文档是否写全",
-                        "deliver", List.of("n1", "n2"),
-                        List.of(ARTIFACT_SOURCE, ARTIFACT_NOTES), List.of(),
-                        TaskNodeStatus.PENDING, 8,
-                        DoneWhen.judge("学习文档须覆盖临时文件全部章节且无大段缺失"),
-                        "", "", 0, "")));
-    }
-
-    private static TaskNode withUrlArg(TaskNode node, String url) {
-        if (node == null || StringUtils.isBlank(url)) {
-            return node;
-        }
-        return node.withToolArguments(Map.of(ActionBinder.ARG_URL, url.trim()));
-    }
-
     static TaskGraph clarifyGraph() {
         return new TaskGraph(List.of(
                 new TaskNode("n1", CLARIFY_HINT, CAP_PLAN, List.of(), List.of(),
@@ -767,90 +771,6 @@ public class GoalCompiler {
         TaskNode n = graph.nodes().get(0);
         return n.status() == TaskNodeStatus.AWAITING_CONFIRM
                 && CAP_PLAN.equalsIgnoreCase(n.capability());
-    }
-
-    /**
-     * 结构已经能编出可调度图时不再问 LLM。
-     * 澄清图除外：缺参时仍让模型先试，失败再澄清。
-     */
-    static boolean structureDeterminate(TaskGraph graph, String userMessage, TaskPlan plan) {
-        if (graph == null || graph.isEmpty() || isClarifyGraph(graph)) {
-            return false;
-        }
-        if (DecompositionPolicy.fetchWrite(userMessage, plan)
-                || DecompositionPolicy.readThenAnalyze(userMessage, plan)
-                || DecompositionPolicy.researchThenFile(userMessage, plan)
-                || DecompositionPolicy.looksLikeDiagram(userMessage, plan)) {
-            return true;
-        }
-        if (graph.nodes().size() != 1) {
-            return false;
-        }
-        TaskNode n = graph.nodes().get(0);
-        DoneWhen dw = n.doneWhen();
-        if (dw != null && (dw.isFile() || dw.isMedia())) {
-            return true;
-        }
-        String blob = DecompositionPolicy.blob(userMessage, plan);
-        return CAP_WEB.equalsIgnoreCase(n.capability())
-                && !DecompositionPolicy.firstUrl(blob).isBlank();
-    }
-
-    private static String persistPath(String path) {
-        return StringUtils.isBlank(path) ? NOTES_FILE : path.trim();
-    }
-
-    private static TaskGraph schedulableOrClarify(TaskGraph graph) {
-        if (graph == null || graph.isEmpty() || hasUnschedulable(graph)) {
-            return clarifyGraph();
-        }
-        return graph;
-    }
-
-    private static boolean hasUnschedulable(TaskGraph graph) {
-        for (TaskNode n : graph.nodes()) {
-            String cap = n.capability() == null ? "" : n.capability();
-            if (!PlanValidator.schedulableCapability(cap)) {
-                return true;
-            }
-            if (DataflowNormalizer.needsFileAcceptance(n) && n.doneWhen().isNote()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * 兜底节点的 capability 只看命中的事实信号，不刮步骤名、不读类别。
-     * 空/general 再由 {@link DataflowNormalizer#inferCapability} 看 doneWhen。
-     *
-     * <p>取信号的顺序 = 从「最终交付物」往「中间动作」退：
-     * 要先出图就归 image，要对线上做动作就归 web，要落盘就归 file_write，
-     * 只是取资料归 research，纯问答归 qa，其余交给 doneWhen 兜底。
-     * 一个节点同时命中多个时，交付物那一侧优先 —— 调度器需要的是
-     * 「这一步最终要交什么」，不是「它顺便查了什么」。</p>
-     */
-    static String inferFromPlan(TaskPlan plan) {
-        if (plan == null) {
-            return CapabilityRegistry.GENERAL;
-        }
-        TaskSignals s = plan.signals();
-        if (s.diagram() || (s.pureImage() && !s.needsFiles())) {
-            return "image";
-        }
-        if (s.publish()) {
-            return CAP_WEB;
-        }
-        if (s.needsFiles()) {
-            return "file_write";
-        }
-        if (s.needsWeb()) {
-            return "research";
-        }
-        if (s.lightTurn()) {
-            return "qa";
-        }
-        return CapabilityRegistry.GENERAL;
     }
 
     private static List<String> stringList(JsonNode n, String field) {

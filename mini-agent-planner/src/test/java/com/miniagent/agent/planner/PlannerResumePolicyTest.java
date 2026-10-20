@@ -54,6 +54,24 @@ class PlannerResumePolicyTest {
     }
 
     @Test
+    void 计划待审批时明确批准可以接管() {
+        assertTrue(PlannerResumePolicy.shouldResume(ACTION, "开始", false, true, true));
+        assertTrue(PlannerResumePolicy.shouldResume(ACTION, "批准", false, true, true));
+        assertTrue(PlannerResumePolicy.shouldResume(ACTION, "按这个来", false, true, true));
+    }
+
+    @Test
+    void 计划待审批时带任务词的句子不算批准() {
+        assertFalse(PlannerResumePolicy.shouldResume(ACTION, "开始做另一个任务", false, true, true));
+        assertFalse(PlannerResumePolicy.shouldResume(ACTION, "开始生成标书", false, true, true));
+    }
+
+    @Test
+    void 没有待审批计划时_开始_不接管旧图() {
+        assertFalse(PlannerResumePolicy.shouldResume(ACTION, "开始", false, true, false));
+    }
+
+    @Test
     void 没在等问题时短答复不接管_这是被删掉的那条污染通路() {
         // 旧实现：会话里曾经等过用户 → resumeRequested 恒真 → 这句「好的」会接管旧图。
         // 现在接管前提是「此刻有悬而未决的问题」，历史上等过不算。

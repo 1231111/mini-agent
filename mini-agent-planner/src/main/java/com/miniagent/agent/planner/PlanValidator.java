@@ -10,6 +10,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * TaskGraph 结构验收：无环、id 唯一、依赖存在、inputs 由前置 outputs 产出。
@@ -17,6 +18,23 @@ import java.util.Set;
  */
 @Component
 public class PlanValidator {
+
+    /** 用户明确提出文件交付时才允许规划器落盘。 */
+    private static final Pattern FILE_OUTPUT_ACTION = Pattern.compile(
+            "(?i)(保存|导出|写入|写出|写到|写成|输出到|输出为|落盘|落地|另存|"
+                    + "生成|创建|新建|产出|整理成|做一份|写一份|做一个|写一个|"
+                    + "save|export|write|create|generate|produce)");
+    private static final Pattern FILE_OUTPUT_TARGET = Pattern.compile(
+            "(?i)(文件|文档|报告|资料|markdown|md|sql|代码|脚本|"
+                    + "[\\w一-龥 .-]+\\.(txt|md|markdown|java|py|json|xml|yaml|yml|toml|"
+                    + "properties|conf|log|html|css|js|tsx?|go|rs|sh|bat|ps1|sql|ipynb|mmd|"
+                    + "svg|xlsx|xls|csv|docx|doc|pptx|ppt|pdf|png|jpe?g|zip)\\b)");
+    private static final Pattern READ_ONLY_ACTION = Pattern.compile(
+            "(?i)(读取|读一下|读读|解析|分析|统计|汇总|提取|抽取|审阅|检查|梳理|总结|"
+                    + "看一下|看看|read|parse|analyze|analyse|inspect|review|summarize|extract)");
+    private static final Pattern UNAMBIGUOUS_SAVE_ACTION = Pattern.compile(
+            "(?i)(保存|导出|写入|写出|写到|写成|输出到|输出为|落盘|落地|另存|"
+                    + "save|export)");
 
     /**
      * 向后兼容的接受方法，返回 boolean
@@ -63,8 +81,9 @@ public class PlanValidator {
             ));
         }
 
-        // 3. 检查节点属性
-        boolean structured = plan != null && plan.requiresStructuredPlan();
+        // 3. 检查节点属性。调用本校验器即表示该图将交给调度器，必须严格检查。
+        boolean structured = true;
+        boolean fileDeliveryAllowed = fileDeliveryRequested(plan);
         Set<String> ids = new HashSet<>();
         for (TaskNode n : g.nodes()) {
             // 检查节点ID和名称
@@ -102,6 +121,17 @@ public class PlanValidator {
                     n.id(),
                     "节点完成条件无效: " + n.id(),
                     "检查 doneWhen 配置"
+                ));
+            }
+
+            // 规划模型可能凭经验擅自追加「写入文件」步骤。文件交付必须有
+            // 用户原文证据；否则直接拒绝整张图，避免把搜索/问答变成隐式落盘。
+            if (plan != null && !fileDeliveryAllowed && isFileDeliveryNode(n)) {
+                errors.add(new PlanValidationReport.ValidationError(
+                        PlanValidationReport.ValidationError.Type.UNREQUESTED_FILE_DELIVERY,
+                        n.id(),
+                        "用户未要求文件交付，却生成了文件落盘节点: " + n.name(),
+                        "删除 file_write/file_exists；仅在用户明确要求保存、导出、写入文档/报告或给出输出路径时保留"
                 ));
             }
 
@@ -168,10 +198,9 @@ public class PlanValidator {
             }
         }
 
-        if (structured) {
-            addAcquirePersistEdgeError(g, errors);
-            addGoalFileErrors(g, goal, errors);
-        }
+        addAcquirePersistEdgeError(g, errors);
+        addGoalFileErrors(g, goal, errors);
+        addGoalGraphSemanticErrors(g, plan, errors);
 
         // 4. 添加性能警告（非致命）
         if (g.nodes().size() > 10) {
@@ -204,6 +233,49 @@ public class PlanValidator {
         }
         return CapabilityRegistry.persistsArtifacts(n.capability())
                 || persistAcceptance(n.doneWhen());
+    }
+
+    static boolean isFileDeliveryNode(TaskNode n) {
+        if (n == null) {
+            return false;
+        }
+        String cap = n.capability() == null ? "" : n.capability().trim();
+        return "file_write".equalsIgnoreCase(cap)
+                || (n.doneWhen() != null && n.doneWhen().isFile());
+    }
+
+    /**
+     * 读取/分析已有文件只表示输入，不是输出授权。plan 为空时保留旧 API
+     * 行为；运行时 TaskPlan 总是非空，因而会受到硬约束保护。
+     */
+    static boolean fileDeliveryRequested(TaskPlan plan) {
+        if (plan == null) {
+            return true;
+        }
+        return claimsFileDelivery(plan.taskGoal());
+    }
+
+    /**
+     * 一段文本本身是否在要求文件交付。用户原文与模型改写的 objective 共用这一条判据，
+     * 避免「校验按原文、目标按改写」两套口径互相打架。
+     */
+    static boolean claimsFileDelivery(String text) {
+        String t = text == null ? "" : text.trim();
+        if (t.isBlank()) {
+            return false;
+        }
+        boolean readOnly = READ_ONLY_ACTION.matcher(t).find()
+                && !FILE_OUTPUT_ACTION.matcher(t).find();
+        if (readOnly) {
+            return false;
+        }
+        if (!FILE_OUTPUT_ACTION.matcher(t).find()) {
+            return false;
+        }
+        // 保存/导出/写入本身已经是文件交付指令；生成/创建/写一个等动作
+        // 仍要求明确目标，避免「写一首歌」被误当成落盘任务。
+        return FILE_OUTPUT_TARGET.matcher(t).find()
+                || UNAMBIGUOUS_SAVE_ACTION.matcher(t).find();
     }
 
     /**
@@ -243,6 +315,37 @@ public class PlanValidator {
                 "图中同时有获取和落盘，但没有 dependsOn 边",
                 "落盘节点必须依赖获取节点，例如 web → file_write"
         ));
+    }
+
+    static void addGoalGraphSemanticErrors(TaskGraph g, TaskPlan plan,
+            List<PlanValidationReport.ValidationError> errors) {
+        if (plan == null || !plan.signals().diagnostic()) {
+            return;
+        }
+        boolean hasDiagnosis = g.nodes().stream().anyMatch(n -> {
+            String text = (n.name() + " " + n.capability()).toLowerCase(Locale.ROOT);
+            // “错误/报错/故障”只描述证据或问题对象，不代表节点已经完成分析。
+            // 必须出现明确的诊断动作，避免 file_read 节点“读取错误证据”绕过语义验收。
+            return text.contains("诊断") || text.contains("定位") || text.contains("分析")
+                    || text.contains("根因") || text.contains("原因分析")
+                    || text.contains("root cause") || text.contains("diagnos")
+                    || text.contains("debug");
+        });
+        boolean hasEvidence = g.nodes().stream().anyMatch(n -> {
+            String capability = n.capability() == null ? "" : n.capability().toLowerCase(Locale.ROOT);
+            String text = n.name() == null ? "" : n.name().toLowerCase(Locale.ROOT);
+            return capability.contains("file_read") || capability.contains("web")
+                    || capability.contains("browser") || capability.contains("code")
+                    || text.contains("日志") || text.contains("响应");
+        });
+        if (!hasDiagnosis || !hasEvidence) {
+            errors.add(new PlanValidationReport.ValidationError(
+                    PlanValidationReport.ValidationError.Type.GOAL_GRAPH_MISMATCH,
+                    null,
+                    "用户目标包含错误诊断语义，但任务图没有证据获取和诊断节点",
+                    "必须先获取或整理错误证据，再分析错误码/根因，最后给出修复和验证步骤"
+            ));
+        }
     }
 
     static void addGoalFileErrors(TaskGraph g, Goal goal,

@@ -32,6 +32,11 @@ import java.util.concurrent.ConcurrentHashMap;
 @Component
 public class PlannerStateStore {
 
+    /** 计划审批状态存放在 StateSnapshot.execution 的这个键下。 */
+    public static final String EXECUTION_PLAN_APPROVAL = "planApproval";
+    public static final String PLAN_APPROVAL_PENDING = "pending";
+    public static final String PLAN_APPROVAL_APPROVED = "approved";
+
     public static final class VersionConflictException extends RuntimeException {
         private final long expected;
         private final long actual;
@@ -93,11 +98,33 @@ public class PlannerStateStore {
         return Optional.ofNullable(memory.get(k));
     }
 
+    /** 当前是否有整图计划等待用户批准。 */
+    public boolean hasPendingPlanApproval(String sessionId) {
+        return get(sessionId)
+                .map(s -> PLAN_APPROVAL_PENDING.equals(
+                        s.execution().get(EXECUTION_PLAN_APPROVAL)))
+                .orElse(false);
+    }
+
     public StateSnapshot init(String sessionId, String executionId, Goal goal, TaskGraph graph) {
+        return init(sessionId, executionId, goal, graph, TaskIntent.fromGoal(goal),
+                GoalCompiler.CompilationSource.RESUMED, false);
+    }
+
+    public StateSnapshot init(String sessionId, String executionId, Goal goal, TaskGraph graph,
+                              TaskIntent intent) {
+        return init(sessionId, executionId, goal, graph, intent,
+                GoalCompiler.CompilationSource.RESUMED, false);
+    }
+
+    public StateSnapshot init(String sessionId, String executionId, Goal goal, TaskGraph graph,
+                              TaskIntent intent, GoalCompiler.CompilationSource source,
+                              boolean degraded) {
         String k = key(sessionId);
         StateSnapshot snap = new StateSnapshot(
                 1L, k, executionId, goal, graph,
-                Map.of(), Map.of(), List.of(), 0, PlanRevision.initial("initial_compile"));
+                Map.of(), Map.of(), List.of(), 0, PlanRevision.initial("initial_compile"),
+                intent, source, degraded);
         DomainEvent ev = new DomainEvent(
                 "ev_" + UUID.randomUUID().toString().substring(0, 8),
                 DomainEventType.GRAPH_COMPILED, null, null,
@@ -191,11 +218,12 @@ public class PlannerStateStore {
                 next.execution(),
                 next.environment(),
                 next.knowledgeRefs(),
-                next.recoveryCount(), revision);
+                next.recoveryCount(), revision, next.intent(), next.compilationSource(), next.degraded());
     }
 
     private static boolean samePlanSemantics(StateSnapshot left, StateSnapshot right) {
         return Objects.equals(left.goal(), right.goal())
+                && Objects.equals(left.intent(), right.intent())
                 && sameGraphSemantics(left.graph(), right.graph());
     }
 

@@ -531,6 +531,34 @@
             text-align: center;
             word-break: break-word;
         }
+        /* 「补充」消息的投递状态。
+           为什么必须有它：appendUserMessage 是**先画消息再发请求**的乐观更新，
+           而失败路径原先只 console.warn —— 消息早已显示在界面上、和成功的长得一模一样，
+           用户于是只能猜「它到底进没进上下文」。实测那条补充确实入队了，
+           但被一个 481 秒的 LLM 调用挡在注入点之外，等了 5 分半才生效，
+           全程界面没有任何提示（2026-10-16）。 */
+        .inject-status {
+            display: flex;
+            justify-content: flex-end;
+            padding-left: var(--avatar-slot);
+            margin-top: 3px;
+            font-size: 11px;
+            line-height: 1.5;
+            color: var(--text3);
+            transition: color .15s;
+        }
+        .inject-status::before {
+            content: '';
+            width: 5px; height: 5px;
+            border-radius: 50%;
+            background: currentColor;
+            margin-right: 5px;
+            flex-shrink: 0;
+            align-self: center;
+            opacity: .6;
+        }
+        .inject-status.sending::before { animation: thinkPulse 1.5s ease-in-out infinite; }
+        .inject-status.failed { color: var(--danger); }
         .user-row .msg-inner {
             display: flex;
             justify-content: flex-end;
@@ -562,6 +590,45 @@
             margin: 0 auto;
             padding: 0 0 4px var(--avatar-slot);
         }
+        /* 规则计划确认卡：贴在输入框正上方，形态与「需要用户选择的框」一致 ——
+           标题一行、说明一行、下面每条选项是一整行可点区域（序号 + 文案 + 右箭头），
+           推荐项带底色。不放消息流：那里在长回答之后，要往上翻才看得到，
+           而「确认」是下一步动作，应该和输入框在一起。 */
+        .plan-confirm-card {
+            display: none;
+            margin: 0 0 8px; padding: 12px 14px;
+            border-radius: 14px; font-size: 13px; color: var(--text);
+            max-width: 100%; box-sizing: border-box;
+            background: var(--surface); border: 1px solid var(--border);
+            box-shadow: 0 2px 10px rgba(0, 0, 0, .12);
+        }
+        .plan-confirm-card.show { display: block; }
+        .plan-confirm-head {
+            display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+        }
+        .plan-confirm-title { font-weight: 600; color: var(--heading); font-size: 14px; }
+        .plan-confirm-hint { color: var(--text2); font-size: 12px; }
+        .plan-confirm-opts { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+        .plan-confirm-opt {
+            display: flex; align-items: center; gap: 10px; width: 100%;
+            padding: 8px 10px; border: 1px solid transparent; border-radius: 10px;
+            background: transparent; color: var(--text);
+            font: inherit; text-align: left; cursor: pointer;
+        }
+        .plan-confirm-opt:hover { background: var(--surface2); }
+        .plan-confirm-opt:disabled { opacity: .55; cursor: default; }
+        .plan-confirm-opt .num {
+            flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
+            width: 20px; height: 20px; border-radius: 6px;
+            background: var(--surface2); color: var(--text2);
+            font-size: 12px; font-variant-numeric: tabular-nums;
+        }
+        .plan-confirm-opt .label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .plan-confirm-opt .go { margin-left: auto; color: var(--text2); flex-shrink: 0; }
+        .plan-confirm-opt.primary { background: var(--accent-soft); }
+        .plan-confirm-opt.primary:hover { background: var(--accent-soft); filter: brightness(1.06); }
+        .plan-confirm-opt.primary .num { background: var(--accent); color: #fff; }
+        .plan-confirm-opt.primary .label { font-weight: 600; }
         .plan-row .todo-panel {
             margin-bottom: 4px;
             position: sticky;
@@ -822,29 +889,65 @@
         /* Image preview strip (multi-image) */
         .img-thumb {
             display: flex; align-items: center; gap: 8px;
-            padding: 4px 8px; border: 1px solid var(--border);
+            padding: 6px 8px; border: 1px solid var(--border);
             border-radius: 10px; background: var(--surface2);
+            /* 固定基准宽 + 允许收窄：三张卡片宽度才一致。
+               原先是 max-width:220 而没有基准宽，宽度随文件名长短浮动，
+               一排看过去参差不齐。 */
+            flex: 0 1 220px;
+            min-width: 170px;
             max-width: 220px;
+            /* 兜底：万一以后有人在卡片里塞了不收缩的东西，也别让它溢出到容器外 */
+            overflow: hidden;
         }
         .img-thumb img { width: 32px; height: 32px; object-fit: cover; border-radius: 6px; flex-shrink: 0; }
-        .img-thumb .img-fname { flex: 1; font-size: 12px; color: var(--text2);
-            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        /* 文件类型徽章。原先写在内联 style 里，底色用的是 --surface2，
+           和 .img-thumb 自己的底色是同一个值 —— 于是徽章没有边界，
+           看上去只是文件名前面多了「DOCX」几个字。这里换成 --surface 加描边。 */
+        .img-thumb .thumb-badge {
+            width: 32px; height: 32px; flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            font-size: 10px; font-weight: 500;
+            color: var(--text2);
+            letter-spacing: .3px;
+        }
+        .img-thumb .img-fname {
+            /* display:block 是必需的：它是 <span>，父级是 display:block 的中间层，
+               于是 flex:1 不生效，而且 overflow:hidden / text-overflow:ellipsis
+               在 inline 元素上**根本不起作用** —— 文字直接溢出卡片，
+               把 .img-preview 的 scrollWidth 撑爆（实测 781 > 748），
+               表现就是「卡片被右边裁掉一截」。 */
+            display: block;
+            flex: 1; min-width: 0;
+            font-size: 12px; color: var(--text2);
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
         .img-thumb .rm-img {
             width: 22px; height: 22px;
             display: flex; align-items: center; justify-content: center;
             border: none; background: none; color: var(--text3);
             border-radius: 6px; cursor: pointer; transition: all .12s;
+            flex-shrink: 0;
         }
         .img-thumb .rm-img:hover { background: rgba(0,0,0,.2); color: var(--danger); }
         .img-preview {
             display: none;
-            align-items: center; gap: 8px;
+            align-items: stretch; gap: 8px;
+            /* 换行而不是横向滚动。原先是 overflow-x:auto，但浮层滚动条在多数系统上
+               不显示，用户看到的就是「第三张被裁掉了、也不知道右边还有」——
+               结果只能猜。改成换行，一屏看全，超两行再纵向滚。 */
+            flex-wrap: wrap;
+            max-height: 128px;
+            overflow-y: auto;
+            overflow-x: hidden;
             padding: 8px 14px;
             background: var(--surface);
             border: 1px solid var(--border);
             border-radius: 14px 14px 0 0;
             border-bottom: none;
-            overflow-x: auto;
         }
         .img-preview.active { display: flex; }
 
@@ -1468,6 +1571,15 @@
             border-radius: 3px;
             overflow: hidden;
             margin-top: 4px;
+            transition: height .18s ease, margin-top .18s ease, opacity .18s ease;
+        }
+        /* 上传完成后进度条不再有信息量（100% 是常量），收掉它 ——
+           否则「一条满格绿线」和「一行绿字已上传」在说同一件事，
+           而卡片里真正要看的文件名只有一行。 */
+        .upload-progress:has(> .upload-progress-bar.done) {
+            height: 0;
+            margin-top: 0;
+            opacity: 0;
         }
         .upload-progress-bar {
             height: 100%;
@@ -1488,9 +1600,10 @@
             background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.3) 50%, transparent 100%);
             animation: progressSweep 1.2s ease-in-out infinite;
         }
+        /* 完成态去掉外发光：它是结束状态，不需要再抓注意力，
+           而卡片本身很小，一圈 glow 会让整排卡片显脏。 */
         .upload-progress-bar.done {
             background: var(--accent);
-            box-shadow: 0 0 6px rgba(16,163,127,0.5);
         }
         .upload-progress-bar.done::after { display: none; }
         @keyframes progressShimmer {
@@ -1506,6 +1619,18 @@
             color: var(--text2);
             margin-top: 2px;
             transition: color 0.3s;
+        }
+        /* 终态用一枚同色小圆点打头，代替「一整行纯色字」——
+           状态是次要信息，圆点把「这是个状态」和「它是什么」分开。 */
+        .upload-status.done::before,
+        .upload-status.error::before {
+            content: '';
+            display: inline-block;
+            width: 5px; height: 5px;
+            border-radius: 50%;
+            background: currentColor;
+            margin-right: 5px;
+            vertical-align: middle;
         }
         .upload-status.error { color: var(--danger); }
         .upload-status.done { color: var(--accent); }
@@ -1594,6 +1719,26 @@
         </div>
             <div class="live-dock" id="liveDock" hidden>
                 <div class="live-status" id="liveStatus">思考中</div>
+            </div>
+            <!-- 规则计划确认卡：与「需要用户选择的框」同一形态；
+                 文案只说结论，目标与步骤在上方正文里已经列过 -->
+            <div class="plan-confirm-card" id="planConfirm">
+                <div class="plan-confirm-head">
+                    <span class="plan-confirm-title">规则计划需要确认</span>
+                    <span class="plan-confirm-hint" id="planConfirmHint">规划模型未返回可用任务图，已改用规则计划</span>
+                </div>
+                <div class="plan-confirm-opts">
+                    <button type="button" class="plan-confirm-opt primary" onclick="confirmPlanApproval()">
+                        <span class="num">1</span>
+                        <span class="label">按此计划开始</span>
+                        <span class="go">&rarr;</span>
+                    </button>
+                    <button type="button" class="plan-confirm-opt" onclick="adjustPlanApproval()">
+                        <span class="num">2</span>
+                        <span class="label">调整计划：在输入框说明要改哪里</span>
+                        <span class="go">&rarr;</span>
+                    </button>
+                </div>
             </div>
             <!-- Image preview (multi-image, rendered by JS) -->
             <div class="img-preview" id="imgPreview"></div>
@@ -2428,7 +2573,7 @@ function renderImgPreview() {
             const progressId = 'file-progress-' + i;
             const isUploaded = uploadedFileRefs[i] != null;
             item.innerHTML = `
-                <div style="width:32px;height:32px;display:flex;align-items:center;justify-content:center;background:var(--surface2);border-radius:6px;font-size:10px;font-weight:700;color:var(--text2)">${esc(badge)}</div>
+                <div class="thumb-badge">${esc(badge)}</div>
                 <div style="flex:1;min-width:0">
                     <span class="img-fname" title="${escA(f.name)}">${esc(f.name)}</span>
                     <div id="${progressId}">
@@ -3137,6 +3282,34 @@ function confirmPendingTodo() {
     if (!pendingTodoConfirm) return;
     confirmTodoAndContinue(pendingTodoConfirm.id);
 }
+
+/**
+ * 批准规则计划：走和手动输入「开始」**完全相同**的路径 ——
+ * 消息进入正常聊天接口，后端的审批判定照旧生效，不开旁路。
+ * 草稿先挪开，批准后还回输入框，避免用户已经打了一半的话被吞掉。
+ */
+function confirmPlanApproval() {
+    const banner = document.getElementById('planConfirm');
+    if (banner) banner.classList.remove('show');
+    const draft = $inp.value;
+    fillInput('开始');
+    send();
+    if (draft.trim()) {
+        setTimeout(() => {
+            if (!$inp.value.trim()) {
+                $inp.value = draft;
+                onInputChange();
+            }
+        }, 0);
+    }
+}
+
+/** 调整计划：收起确认条，把光标交回输入框，让用户直接说改什么。 */
+function adjustPlanApproval() {
+    const banner = document.getElementById('planConfirm');
+    if (banner) banner.classList.remove('show');
+    $inp.focus();
+}
 async function confirmTodoAndContinue(id) {
     if (!currentId || isStreaming) return;
     try {
@@ -3544,8 +3717,20 @@ function unlockComposer() {
     removeTaskRunningHint();
 }
 
+/**
+ * 追加消息（流式期间用户补充）。
+ *
+ * 这是**乐观更新**：先把消息画到界面上、再发请求。所以投递结果必须回写到那条消息下面 ——
+ * 否则失败时界面上留下一条和成功一模一样的消息，用户只能猜「它到底进没进上下文」。
+ *
+ * 另外「成功」只代表**入队成功**。真正的注入发生在 AgentLoop 的轮次边界
+ * （`takePendingUserMessages`，每轮开头取一次），若当前那一轮 LLM 调用很久，
+ * 生效可能晚上几分钟（实测有一条等了 5 分半）。所以提示语要说清「当前步骤结束后生效」，
+ * 不能让用户以为已经生效了。
+ */
 async function appendUserMessage(text, sessionId) {
-    renderUserMsg(text, null, 0, [], true);
+    const row = renderUserMsg(text, null, 0, [], true);
+    const status = setInjectStatus(row, 'sending', '发送中…');
     $inp.value = '';
     $inp.style.height = 'auto';
     onInputChange();
@@ -3557,13 +3742,29 @@ async function appendUserMessage(text, sessionId) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ message: text })
         });
-        const data = await resp.json();
-        if (!data.success) {
-            console.warn('append-message failed:', data);
+        const data = await resp.json().catch(() => null);
+        if (data && data.success) {
+            setInjectStatus(status, 'ok', '已加入，将在当前步骤结束后生效');
+        } else {
+            const why = (data && (data.message || data.error)) || ('HTTP ' + resp.status);
+            setInjectStatus(status, 'failed', '未送达：' + why + '。请直接重新发送。');
         }
     } catch (e) {
-        console.warn('append-message error:', e);
+        setInjectStatus(status, 'failed', '未送达（网络异常）。请直接重新发送。');
     }
+}
+
+/** 在一条用户消息下方挂投递状态；已有则原地改写。返回该元素以便后续更新。 */
+function setInjectStatus(row, cls, text) {
+    if (!row || !row.appendChild) return null;
+    let el = row.querySelector('.inject-status');
+    if (!el) {
+        el = document.createElement('div');
+        row.appendChild(el);
+    }
+    el.className = 'inject-status ' + cls;
+    el.textContent = text;
+    return el;
 }
 
 /* =========================================================================
@@ -3573,6 +3774,9 @@ async function send() {
     const text = $inp.value.trim();
     if (!text && selectedFiles.length === 0) return;
     if (uploadingCount > 0) { alert('文件上传中，请等待'); return; }
+    // 发出任何消息（包括批准）都算离开「待确认」状态：确认条只是当轮的动作入口。
+    const planCard = document.getElementById('planConfirm');
+    if (planCard) planCard.classList.remove('show');
 
     // 执行中追加模式：agent 正在运行时，发送追加消息
     if (isStreaming && currentId && text) {
@@ -4032,6 +4236,41 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             }
         }
 
+        /**
+         * 规则计划待确认：把确认条亮在输入框正上方，不再往消息流里插卡片。
+         *
+         * 为什么不放消息里：审批轮的正文本体就很长（目标 / 步骤 / 回复「开始」），
+         * 卡片接在它下面等于把同一件事说两遍，而且它随消息一起滚走，
+         * 用户得往上翻才能点。确认是「下一步动作」，所以放在输入框上方，
+         * 与「需要用户选择的框」同一位置、同一种形态（标题 + 编号选项）。
+         */
+        function showPlanApproval(data) {
+            let payload = data;
+            if (typeof payload === 'string') {
+                try { payload = JSON.parse(payload); } catch (_) { payload = {}; }
+            }
+            if (!payload || payload.required !== true) return;
+            const card = document.getElementById('planConfirm');
+            const hint = document.getElementById('planConfirmHint');
+            if (!card) return;
+            // 不重复正文列过的目标与步骤，只说为什么会出现这张卡
+            if (hint) {
+                hint.textContent = payload.reason === 'PLAN_APPROVAL_REQUIRED'
+                    ? '规划模型未返回可用任务图，已改用规则计划'
+                    : '本轮计划需要你确认后才能执行';
+            }
+            card.classList.add('show');
+            // 审批轮常常没有任何 token，收尾会清空气泡；这里只是把输入区交还给用户
+            removeTyping();
+            $inp.focus();
+        }
+
+        /** 隐藏确认卡。发任何消息（含批准）都算离开这个待确认状态。 */
+        function hidePlanApproval() {
+            const card = document.getElementById('planConfirm');
+            if (card) card.classList.remove('show');
+        }
+
         function onEvent(name, data) {
             if (name === 'thinking') {
                 if (thinkCollapsed && !answer) thinkCollapsed = false;
@@ -4099,7 +4338,15 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                     showUserQuestionModal({ question: String(data || ''), options: [] });
                 }
             } else if (name === 'session') { /* 忽略 */
-            } else if (name === 'append_ack') { /* 已在 appendUserMessage 处理 */ }
+            } else if (name === 'plan_approval') {
+                // 规则计划需要用户确认：由后端在 PLAN_APPROVAL_REQUIRED 时发出。
+                // 必须在这里接上 —— showPlanApproval 只定义、不接事件，卡片永远不会出现。
+                showPlanApproval(data);
+            } else if (name === 'append_ack') {
+                // 入队回执。这里**有意不处理**：同一次追加还有 POST /messages 的 JSON 响应，
+                // 那份带得到 success/failure 与失败原因，状态由 appendUserMessage 统一写。
+                // 两处都写会互相覆盖 —— ack 只证明「入队成功」，失败路径它根本不发。
+            }
         }
 
         /**
@@ -4215,7 +4462,7 @@ function renderUserMsg(text, imgSrc, imgCount = imgSrc ? 1 : 0, fileNames = [], 
     // 放在这里收口，是因为「发送时」与「历史重载时」两条路径都过这个函数。
     if (isSystemAuthoredText(text)) {
         renderSystemNote(text);
-        return;
+        return null;
     }
     const row = document.createElement('div');
     row.className = 'msg-row user-row';
@@ -4232,6 +4479,7 @@ function renderUserMsg(text, imgSrc, imgCount = imgSrc ? 1 : 0, fileNames = [], 
             </div>
         </div>`;
     $msg.appendChild(row);
+    return row;
 }
 
 /**

@@ -346,7 +346,11 @@ public class AgentChatApplicationService {
      * <p>{@code unfinishedOutcome} 非空表示"这一轮没达成目标"（规划器死锁/恢复耗尽/轮次用尽/
      * 任务图无法验收）—— 调用方必须据此把 run 记为失败，而不是完成。</p>
      */
-    record AgentResult(String answer, PlanningLoop.RunOutcome unfinishedOutcome) {
+    record AgentResult(String answer, PlanningLoop.RunOutcome unfinishedOutcome,
+                       boolean planApprovalRequired) {
+        AgentResult(String answer, PlanningLoop.RunOutcome unfinishedOutcome) {
+            this(answer, unfinishedOutcome, false);
+        }
     }
 
     /**
@@ -467,6 +471,7 @@ public class AgentChatApplicationService {
         String answer;
         // 规划器的结局：只有"没做完"会被带出去让调用方记为失败；完成与人等状态保持原语义。
         PlanningLoop.RunOutcome unfinishedOutcome = null;
+        boolean planApprovalRequired = false;
         try {
             String executionId = Objects.nonNull(traceRecorder)
                     ? traceRecorder.currentExecutionId() : null;
@@ -476,6 +481,11 @@ public class AgentChatApplicationService {
                         history, taskPlan, sessionId, run.fencingToken(), executionId,
                         progress, streamSink);
                 answer = outcome.answer();
+                planApprovalRequired = "PLAN_APPROVAL_REQUIRED".equals(outcome.reason());
+                if (planApprovalRequired && progressEmitter != null) {
+                    eventCenter.publish(sessionId, "plan_approval",
+                            Map.of("required", true, "reason", outcome.reason()));
+                }
                 if (meansUnfinished(outcome)) {
                     unfinishedOutcome = outcome;
                     runStatus = RunStatus.FAILURE.name();
@@ -518,7 +528,7 @@ public class AgentChatApplicationService {
                 StringUtils.isNotBlank(userMessage) ? userMessage : displayQuestion,
                 answer,
                 allSavedPaths.isEmpty() ? null : allSavedPaths);
-        return new AgentResult(answer, unfinishedOutcome);
+        return new AgentResult(answer, unfinishedOutcome, planApprovalRequired);
         } catch (Exception e) {
             runStatus = RunStatus.FAILURE.name();
             if (Objects.nonNull(traceRecorder)) {

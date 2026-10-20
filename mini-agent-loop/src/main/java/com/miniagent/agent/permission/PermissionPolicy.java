@@ -90,6 +90,13 @@ public final class PermissionPolicy {
         boolean isExec = EXEC_TOOL.equals(toolName);
         ExecPolicy exec = Objects.isNull(effectiveExecPolicy) ? ExecPolicy.ASK : effectiveExecPolicy;
 
+        if (mode == PermissionMode.READ_ONLY) {
+            // 只读模式兜底：任何写/执行/副作用工具（含未进 specs 的漏网之鱼）一律需授权，
+            // 而这类工具本就不该在 specs 里，因此走到这里等于拒绝执行。
+            // 必须放在 isExec 分支之前 —— exec_command 也会走到这里，不能被 isExec 的
+            // 「exec 策略是 ALLOW 就不需要 grant」截胡（只读模式下 exec 策略再松也不放行）。
+            return isExec || isAskDangerous(toolName) || "http_post".equals(toolName);
+        }
         if (isExec && exec == ExecPolicy.BLOCK) {
             // 禁档不该有"批准一下就放行"的路。真正的拒绝在 isExecBlocked。
             return false;
@@ -112,10 +119,15 @@ public final class PermissionPolicy {
     /**
      * 当前是否允许将该工具放进本轮 specs。
      * Ask 的「未授权危险工具」仍会出现在 specs 中（让模型能发起），执行时再拦截并推前端确认。
+     * READ_ONLY（只读不动手）则更严格：写/执行/副作用工具根本不放进 specs，
+     * 模型从一开始就看不到它们，只能走只读白名单（{@link #PLAN_SAFE_TOOLS}）。
      */
     public static boolean allowInSpecs(PermissionMode mode, boolean planApproved, String toolName) {
         if (Objects.isNull(toolName)) {
             return false;
+        }
+        if (mode == PermissionMode.READ_ONLY) {
+            return isPlanSafe(toolName);
         }
         if (mode == PermissionMode.PLAN && !planApproved) {
             return isPlanSafe(toolName);

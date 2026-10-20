@@ -27,11 +27,39 @@ public record TaskSignals(
         boolean complex,
         boolean taskAction,
         boolean continueTask,
-        boolean publish
+        boolean publish,
+        boolean explicitFileDelivery,
+        boolean diagnostic
 ) {
 
+    /**
+     * Backwards-compatible constructor for persisted/tests that predate the
+     * explicit file-delivery signal.  A file mention (for example
+     * {@code report.pdf} in a read request) is deliberately not treated as a
+     * request to write a file.
+     */
+    public TaskSignals(boolean needsWeb, boolean needsFiles, boolean readsFile,
+                       boolean diagram, boolean pureImage, boolean imageIntoDoc,
+                       boolean simpleFile, boolean question, boolean complex,
+                       boolean taskAction, boolean continueTask, boolean publish) {
+        this(needsWeb, needsFiles, readsFile, diagram, pureImage, imageIntoDoc,
+                simpleFile, question, complex, taskAction, continueTask, publish,
+                false, false);
+    }
+
+    public TaskSignals(boolean needsWeb, boolean needsFiles, boolean readsFile,
+                       boolean diagram, boolean pureImage, boolean imageIntoDoc,
+                       boolean simpleFile, boolean question, boolean complex,
+                       boolean taskAction, boolean continueTask, boolean publish,
+                       boolean explicitFileDelivery) {
+        this(needsWeb, needsFiles, readsFile, diagram, pureImage, imageIntoDoc,
+                simpleFile, question, complex, taskAction, continueTask, publish,
+                explicitFileDelivery, false);
+    }
+
     public static final TaskSignals NONE = new TaskSignals(
-            false, false, false, false, false, false, false, false, false, false, false, false);
+            false, false, false, false, false, false, false, false, false, false, false, false,
+            false, false);
 
     /**
      * 命中了任何「要动手」的信号。
@@ -50,7 +78,7 @@ public record TaskSignals(
      */
     public boolean actionBearing() {
         return needsWeb || needsFiles || diagram || pureImage || imageIntoDoc
-                || simpleFile || complex || taskAction || publish;
+                || simpleFile || complex || taskAction || publish || diagnostic;
     }
 
     /**
@@ -71,6 +99,9 @@ public record TaskSignals(
         }
         if (needsFiles) {
             out.add("file");
+        }
+        if (explicitFileDelivery) {
+            out.add("fileDelivery");
         }
         if (readsFile) {
             out.add("read");
@@ -101,6 +132,9 @@ public record TaskSignals(
         }
         if (publish) {
             out.add("publish");
+        }
+        if (diagnostic) {
+            out.add("diagnostic");
         }
         return List.copyOf(out);
     }
@@ -133,6 +167,8 @@ public record TaskSignals(
         boolean action = false;
         boolean cont = false;
         boolean publish = false;
+        boolean fileDelivery = false;
+        boolean diagnostic = false;
         for (String raw : described.split(",")) {
             String name = raw.trim().toLowerCase(Locale.ROOT);
             switch (name) {
@@ -148,10 +184,12 @@ public record TaskSignals(
                 case "action" -> action = true;
                 case "continue" -> cont = true;
                 case "publish" -> publish = true;
+                case "filedelivery", "explicitfiledelivery" -> fileDelivery = true;
+                case "diagnostic", "diagnose" -> diagnostic = true;
                 default -> { }
             }
         }
         return new TaskSignals(web, file, read, diagram, pureImage, imageIntoDoc,
-                simpleFile, question, complex, action, cont, publish);
+                simpleFile, question, complex, action, cont, publish, fileDelivery, diagnostic);
     }
 }

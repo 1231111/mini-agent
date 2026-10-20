@@ -10,6 +10,8 @@ import com.miniagent.agent.task.TaskSignals;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.ToolResult;
 import com.miniagent.agent.planner.TaskNodeStatus;
+import com.miniagent.agent.permission.PermissionContext;
+import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.todo.HumanYield;
 import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.agent.trace.TraceRecorder;
@@ -53,6 +55,7 @@ public class PlanningLoop {
     private final PlannerProperties properties;
     private final GoalCompiler goalCompiler;
     private final PlanValidator planValidator;
+    private final IntentGraphValidator intentGraphValidator = new IntentGraphValidator();
     private final PlannerStateStore stateStore;
     private final GraphScheduler graphScheduler;
     private final ToolRouter toolRouter;
@@ -107,65 +110,21 @@ public class PlanningLoop {
     }
 
     /**
-     * 本轮要不要交给规划器（编译任务图 + 调度执行）。
+     * 本轮是否进入规划器。
      *
-     * <p>判据按 {@code agent.planner.model-decides-decomposition} 分两档：</p>
-     * <ul>
-     *   <li>{@code true}（默认）：命中任何「要动手」信号就进
-     *       —— 拆不拆、拆几刀交给规划模型，词表不再裁定粒度；</li>
-     *   <li>{@code false}：仍按 {@code TaskPlan#requiresStructuredPlan()} 的词表判据进
-     *       —— 这是旧行为。</li>
-     * </ul>
+     * <p>默认 Agent 路径对齐 WorkBuddy：不先用词表判断「简单任务/复杂任务」，
+     * 每条消息直接交给 AgentLoop，由 LLM 自己决定回答、调用工具、反问或委派。
+     * 只有用户显式把会话切到 {@link PermissionMode#PLAN}，才进入
+     * GoalCompiler → PlanValidator → GraphScheduler 这条计划执行链。</p>
      *
-     * <p>两档共同保留两条与「拆解粒度」无关的判据：</p>
-     * <ol>
-     *   <li>纯问答轮（问且无任何动手信号）直接不进 —— 防止上一轮的旧图劫持本轮；
-     *       系统控制语在入口已被净化成无信号，因此同样落在这条上；</li>
-     *   <li>消息里出现 URL / 文件名（{@link DecompositionPolicy#hasGraphSignal}）
-     *       也进 —— 这类文本天然可编成可调度图。它是前一条的**加宽**，
-     *       不会把任何该进的轮挤出去，所以两档都留着。</li>
-     * </ol>
-     *
-     * <p>第三条判据与上面互不影响：上一轮留下了未完成的图，且本轮文本确实是在接着做。
-     * 注意它必须能真正走到 —— 旧实现先按意图白名单短路返回，
-     * 而绝大多数意图都在该白名单里，于是「续跑」分支实际不可达，
-     * 用户回一句「继续」永远进不来规划器。这里不再有白名单，
-     * 恢复与否只由 {@link PlannerResumePolicy} 按文本与图当下的
-     * {@code AWAITING_CONFIRM} 状态共同判定：用户明说继续，或系统此刻确实在等用户答复。
-     * 「历史上曾经等过用户」不算理由，否则新任务会被旧图接管。</p>
+     * <p>默认 Agent 模式不因为历史上有未完成图、用户说「继续」或消息命中某个
+     * 任务信号而重新进入规划器；这些消息仍交给 AgentLoop，让 LLM 结合会话历史自行处理。
+     * 规划器只由显式 {@link PermissionMode#PLAN} 模式打开。</p>
      */
     public boolean shouldHandle(TaskPlan plan, String sessionId, String requestText) {
-        if (!properties.isEnabled() || plan == null) {
-            return false;
-        }
-        if (wantsPlanning(plan, requestText, properties.isModelDecidesDecomposition())) {
-            return true;
-        }
-        return stateStore.hasIncompleteGraph(sessionId)
-                && PlannerResumePolicy.shouldResume(
-                plan.signals(), requestText, hasAwaitingGraph(sessionId), true);
-    }
-
-    /**
-     * 「要不要进规划器」的纯函数核：不含会话状态、不读配置。
-     *
-     * <p>拆出来是为了让两档判据可以被单测直接覆盖 ——
-     * {@link #shouldHandle} 需要 13 个协作方，装配不起；这一段只依赖入参。</p>
-     *
-     * @param modelDecides {@code true} 时按「要不要动手」判，{@code false} 时按词表判
-     */
-    static boolean wantsPlanning(TaskPlan plan, String requestText, boolean modelDecides) {
-        if (plan == null) {
-            return false;
-        }
-        TaskSignals signals = plan.signals();
-        if (signals.lightTurn()) {
-            return false;
-        }
-        if (modelDecides ? signals.actionBearing() : plan.requiresStructuredPlan()) {
-            return true;
-        }
-        return DecompositionPolicy.hasGraphSignal(requestText, plan);
+        return properties.isEnabled()
+                && plan != null
+                && PermissionContext.mode() == PermissionMode.PLAN;
     }
 
     /**
@@ -202,7 +161,7 @@ public class PlanningLoop {
     }
 
     public boolean isAwaitingConfirm(String sessionId) {
-        return hasAwaitingGraph(sessionId);
+        return hasAwaitingGraph(sessionId) || stateStore.hasPendingPlanApproval(sessionId);
     }
 
     private boolean hasAwaitingGraph(String sessionId) {
@@ -233,11 +192,15 @@ public class PlanningLoop {
         FAILED
     }
 
-    /** {@code run} 的结构化返回：答复文本 + 结局 + 机器可读的原因码。 */
-    public record RunOutcome(String answer, Outcome outcome, String reason) {
+    /** {@code run} 的结构化返回：答复文本 + 结局 + 机器可读的原因码 + 是否模板降级。 */
+    public record RunOutcome(String answer, Outcome outcome, String reason, boolean degraded) {
         public RunOutcome {
             answer = answer == null ? "" : answer;
             reason = reason == null ? "" : reason;
+        }
+
+        public RunOutcome(String answer, Outcome outcome, String reason) {
+            this(answer, outcome, reason, false);
         }
 
         public boolean goalSatisfied() {
@@ -245,7 +208,12 @@ public class PlanningLoop {
         }
 
         static RunOutcome satisfied(String answer) {
-            return new RunOutcome(answer, Outcome.COMPLETED, "GRAPH_COMPLETED");
+            return satisfied(answer, false);
+        }
+
+        static RunOutcome satisfied(String answer, boolean degraded) {
+            return new RunOutcome(answer, Outcome.COMPLETED,
+                    degraded ? "GRAPH_COMPLETED_DEGRADED" : "GRAPH_COMPLETED", degraded);
         }
 
         static RunOutcome direct(String answer) {
@@ -315,33 +283,60 @@ public class PlanningLoop {
                 && !existing.get().graph().allTerminalSuccess();
         boolean awaitingGraph = existing.isPresent()
                 && existing.get().graph().hasAwaitingConfirm();
+        boolean awaitingPlanApproval = existing.isPresent()
+                && PlannerStateStore.PLAN_APPROVAL_PENDING.equals(
+                        existing.get().execution().get(
+                                PlannerStateStore.EXECUTION_PLAN_APPROVAL));
         boolean resume = PlannerResumePolicy.shouldResume(
                 taskPlan.signals(), userMessage,
                 awaitingGraph,
-                incompleteGraph);
+                incompleteGraph,
+                awaitingPlanApproval);
         boolean clarifyRecompile = existing.isPresent()
                 && shouldRecompileClarify(
                         existing.get().goal(), existing.get().graph(), userMessage);
+        // 计划还在等批准时，非批准答复视为对计划的调整要求：
+        // 必须带着原目标重编译，不能只拿这句话当新任务，否则原任务直接丢失。
+        boolean planRevision = awaitingPlanApproval
+                && !isPlanApprovalReply(userMessage)
+                && !PlannerResumePolicy.isClearlyNewTopic(
+                        userMessage == null ? "" : userMessage.trim());
         if (clarifyRecompile) {
             String merged = mergeClarifyObjective(
                     existing.get().goal().objective(), userMessage);
             TaskPlan nextPlan = taskPlan.withTaskGoal(merged);
             compiled = compileAndValidate(chat, merged, nextPlan);
             if (!planValidator.accept(compiled.graph(), nextPlan, compiled.goal())) {
-                log.warn("PlanningLoop 澄清后任务图仍无法验收 session={} code={}",
+                // 同上：澄清后图仍编不出来，降级直跑（合并后的目标进直跑消息，历史仍在），
+                // 不报「任务图未通过验收」。
+                log.warn("PlanningLoop 澄清后任务图仍无法验收，降级直跑 session={} code={}",
                         sessionId, ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
-                return RunOutcome.failed(
-                        ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getMessage(), "GRAPH_INVALID");
+                return directFallback(chat, systemPrompt, merged, multimodalUser,
+                        history, nextPlan, progress, streamSink);
             }
             String execId = StringUtils.isNotBlank(executionId)
                     ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
-            snap = stateStore.init(sessionId, execId, compiled.goal(), compiled.graph());
+            snap = stateStore.init(sessionId, execId, compiled.goal(), compiled.graph(),
+                    compiled.intent(), compiled.source(), compiled.degraded());
             log.info("PlanningLoop 澄清后重编译 session={} nodes={} clarify={}",
                     sessionId, compiled.graph().nodes().size(),
                     compiled.goal().isClarify());
+        } else if (planRevision) {
+            String merged = mergeClarifyObjective(
+                    existing.get().goal().objective(), userMessage);
+            TaskPlan nextPlan = taskPlan.withTaskGoal(merged);
+            compiled = compileAndValidate(chat, merged, nextPlan);
+            String execId = StringUtils.isNotBlank(executionId)
+                    ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
+            // 重编译后是全新快照，审批状态自动回到未批准，会再次停下等确认。
+            snap = stateStore.init(sessionId, execId, compiled.goal(), compiled.graph(),
+                    compiled.intent(), compiled.source(), compiled.degraded());
+            log.info("PlanningLoop 按审批意见重编译 session={} nodes={}",
+                    sessionId, compiled.graph().nodes().size());
         } else if (resume) {
             snap = existing.get();
-            compiled = new GoalCompiler.CompileResult(snap.goal(), snap.graph(), false);
+            compiled = new GoalCompiler.CompileResult(snap.goal(), snap.graph(), snap.degraded(),
+                    snap.compilationSource(), "", snap.intent());
             log.info("PlanningLoop 续跑已有图 session={} version={} nodes={}",
                     sessionId, snap.version(), snap.graph().nodes().size());
 
@@ -365,20 +360,62 @@ public class PlanningLoop {
         } else {
             compiled = compileAndValidate(chat, userMessage, taskPlan);
             if (!planValidator.accept(compiled.graph(), taskPlan, compiled.goal())) {
-                log.warn("PlanningLoop 任务图验收失败 session={} code={}",
+                // 规划模型没产出可用图 ≠ 任务失败。对齐 WorkBuddy：没有「图没编出来就拒活」的硬门，
+                // 编译/验收失败一律降级直跑 —— 交给 AgentLoop 让模型自主选工具完成请求，
+                // 而不是回一句「任务图未通过验收，无法调度」。这是切换到 AgentLoop 的直跑路径，
+                // 直跑是另一条正确路径：模型看得到历史与全部工具面，自己决定怎么干。
+                log.warn("PlanningLoop 任务图验收失败，降级直跑 session={} code={}",
                         sessionId, ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
-                return RunOutcome.failed(
-                        ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getMessage(), "GRAPH_INVALID");
+                return directFallback(chat, systemPrompt, userMessage, multimodalUser,
+                        history, taskPlan, progress, streamSink);
             }
             String execId = StringUtils.isNotBlank(executionId)
                     ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
-            snap = stateStore.init(sessionId, execId, compiled.goal(), compiled.graph());
+            snap = stateStore.init(sessionId, execId, compiled.goal(), compiled.graph(),
+                    compiled.intent(), compiled.source(), compiled.degraded());
         }
         todoProjector.project(sessionId, snap.graph());
         trace(sessionId, AgentStepNode.GOAL_COMPILED,
                 "{\"goalId\":\"" + compiled.goal().goalId()
                         + "\",\"nodes\":" + compiled.graph().nodes().size()
-                        + ",\"template\":" + compiled.fromTemplate() + "}");
+                        + ",\"degradedCompilation\":" + compiled.degradedCompilation()
+                        + ",\"source\":\"" + jsonEscape(compiled.source().name()) + "\""
+                        + ",\"fallbackReason\":\"" + jsonEscape(compiled.fallbackReason()) + "\""
+                        + ",\"intent\":" + intentJson(compiled.intent()) + "}");
+
+        if (compiled.intent().needsClarification()) {
+            String question = StringUtils.isBlank(compiled.intent().clarificationQuestion())
+                    ? "请补充完成任务所需的信息。"
+                    : compiled.intent().clarificationQuestion();
+            return RunOutcome.blockedOnHuman(question, "INTENT_NEEDS_CLARIFICATION");
+        }
+
+        // 规则图不是模型对本次请求的理解。降级时必须先让人确认整图，
+        // 否则「结构合法」就被当成了「语义正确」。
+        switch (planApprovalAction(compiled.degraded(),
+                properties.isPlanApprovalOnDegraded(), isPlanApproved(snap), userMessage)) {
+            case BLOCK -> {
+                snap = markPlanApproval(sessionId, snap,
+                        PlannerStateStore.PLAN_APPROVAL_PENDING);
+                return RunOutcome.blockedOnHuman(planApprovalPrompt(compiled),
+                        "PLAN_APPROVAL_REQUIRED");
+            }
+            case APPROVE -> {
+                snap = markPlanApproval(sessionId, snap,
+                        PlannerStateStore.PLAN_APPROVAL_APPROVED);
+                log.info("计划审批通过 session={} source={}", sessionId, compiled.source());
+            }
+            case NONE -> { }
+        }
+
+        if (compiled.degraded()) {
+            log.warn("PlanningLoop 使用降级编译结果执行 session={} source={} reason={}",
+                    sessionId, compiled.source(), compiled.fallbackReason());
+            if (progress != null) {
+                progress.accept("规划模型未返回有效任务图，本轮使用降级编译结果；"
+                        + "完成情况可能弱于模型规划，可在 trace 的 GOAL_COMPILED 查看 source。");
+            }
+        }
 
         String lastAnswer = "";
         int rounds = 0;
@@ -436,7 +473,15 @@ public class PlanningLoop {
                 log.info("PlanningLoop 图完成 session={} version={} metrics={}",
                         sessionId, snap.version(), metrics.snapshot());
                 metrics.graphCompleted();
-                return RunOutcome.satisfied(lastAnswer);
+                // A node-level AgentLoop deliberately returns STEP_SEGMENT_DONE when the
+                // proposal's focus todo is complete.  That marker is useful for the
+                // scheduler, but it is not a user-facing answer.  If every node ended
+                // that way (bound actions are another common case), lastAnswer is empty
+                // after keepBetterAnswer filters the marker.  Never let a successful
+                // graph leak an empty SSE `end` event; derive a concrete summary from
+                // the persisted node outputs instead.
+                return RunOutcome.satisfied(buildCompletedAnswer(lastAnswer, snap.graph()),
+                        compiled.degraded());
             }
             List<TaskNode> ready = graphScheduler.select(snap.graph());
             if (ready.isEmpty()) {
@@ -721,8 +766,55 @@ public class PlanningLoop {
         }
         String t = text.trim();
         return t.equals(AgentLoop.STEP_SEGMENT_DONE)
+                || t.startsWith("本步已完成")
                 || t.equals("本步已完成")
                 || t.startsWith("已按规划图推进任务");
+    }
+
+    /**
+     * Turn a graph-level success into text that can safely be shown to the user.
+     *
+     * <p>{@link AgentLoop#STEP_SEGMENT_DONE} is an execution marker, not a final
+     * answer.  Usually a later model turn supplies a prose answer, but a plan made
+     * entirely of direct/bound actions has no such turn.  In that case the graph's
+     * accepted node outputs are the only durable evidence we have, so expose a
+     * bounded, labelled summary instead of returning an empty string.</p>
+     */
+    static String buildCompletedAnswer(String lastAnswer, TaskGraph graph) {
+        if (StringUtils.isNotBlank(lastAnswer) && !isStubStepAnswer(lastAnswer)) {
+            return lastAnswer.trim();
+        }
+
+        StringBuilder summary = new StringBuilder("任务已完成。");
+        boolean hasEvidence = false;
+        if (graph != null && graph.nodes() != null) {
+            for (TaskNode node : graph.nodes()) {
+                if (node == null || node.status() != TaskNodeStatus.SUCCESS) {
+                    continue;
+                }
+                String name = StringUtils.isBlank(node.name()) ? node.id() : node.name();
+                DoneWhen doneWhen = node.doneWhen() == null ? DoneWhen.note() : node.doneWhen();
+                if (doneWhen.isFile() && StringUtils.isNotBlank(doneWhen.path())) {
+                    summary.append("\n- ").append(name).append("：已生成 ")
+                            .append(doneWhen.path());
+                    hasEvidence = true;
+                    continue;
+                }
+                String output = node.output() == null ? "" : node.output().trim();
+                if (StringUtils.isBlank(output) || StepEvaluator.isHollowEvidence(output)) {
+                    summary.append("\n- ").append(name).append("：已完成");
+                    hasEvidence = true;
+                    continue;
+                }
+                summary.append("\n- ").append(name).append("：")
+                        .append(clip(output, PRIOR_OUTPUT_CHARS));
+                hasEvidence = true;
+            }
+        }
+        if (!hasEvidence) {
+            summary.append("\n已完成所有规划步骤，但步骤没有返回可展示的摘要。");
+        }
+        return summary.toString();
     }
 
     private record StepExec(String text, String endReason, boolean drifted,
@@ -998,6 +1090,10 @@ public class PlanningLoop {
             TaskNode n = graph == null ? null : graph.byId(a.taskId());
             String cap = n != null ? n.capability() : a.tool();
             List<String> blocked = n == null ? List.of() : n.blockedTools();
+            if (n != null && StringUtils.isNotBlank(n.lastError())) {
+                sb.append("上一轮失败上下文（必须先处理，不要盲重试）：")
+                        .append(n.lastError()).append('\n');
+            }
             sb.append("- taskId=").append(a.taskId())
                     .append(" capability=").append(cap)
                     .append(" tool=").append(a.tool())
@@ -1017,6 +1113,121 @@ public class PlanningLoop {
         }
         sb.append("完成后用 todo update（id∈focusTodoIds）标 completed 并附可校验 evidence。\n");
         return sb.toString();
+    }
+
+    /** 整图审批的状态机：不介入 / 拦下等人 / 放行。 */
+    enum PlanApprovalAction { NONE, BLOCK, APPROVE }
+
+    static PlanApprovalAction planApprovalAction(boolean degraded, boolean enabled,
+                                                 boolean approved, String userMessage) {
+        if (!needsPlanApproval(degraded, enabled) || approved) {
+            return PlanApprovalAction.NONE;
+        }
+        return isPlanApprovalReply(userMessage)
+                ? PlanApprovalAction.APPROVE : PlanApprovalAction.BLOCK;
+    }
+
+    static boolean needsPlanApproval(boolean degraded, boolean enabled) {
+        return enabled && degraded;
+    }
+
+    static boolean isPlanApprovalReply(String userMessage) {
+        return HumanYield.looksLikePlanApproval(userMessage);
+    }
+
+    private static boolean isPlanApproved(StateSnapshot snap) {
+        return snap != null && PlannerStateStore.PLAN_APPROVAL_APPROVED.equals(
+                snap.execution().get(PlannerStateStore.EXECUTION_PLAN_APPROVAL));
+    }
+
+    private StateSnapshot markPlanApproval(String sessionId, StateSnapshot snap, String state) {
+        if (snap == null) {
+            return null;
+        }
+        if (state.equals(snap.execution().get(PlannerStateStore.EXECUTION_PLAN_APPROVAL))) {
+            return snap;
+        }
+        Map<String, Object> exec = new HashMap<>(snap.execution());
+        exec.put(PlannerStateStore.EXECUTION_PLAN_APPROVAL, state);
+        try {
+            return stateStore.commit(sessionId, snap.version(), snap.withExecution(exec));
+        } catch (PlannerStateStore.VersionConflictException e) {
+            metrics.casConflict();
+            return stateStore.get(sessionId).orElse(snap);
+        }
+    }
+
+    private static String planApprovalPrompt(GoalCompiler.CompileResult compiled) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("任务图已生成，但本轮使用的是降级编译结果（规划模型未返回有效任务图），")
+                .append("执行前需要你确认。\n\n");
+        sb.append("目标：").append(compiled.goal().objective()).append('\n');
+        List<TaskNode> nodes = compiled.graph().nodes();
+        sb.append("步骤：\n");
+        int limit = Math.min(nodes.size(), 8);
+        for (int i = 0; i < limit; i++) {
+            TaskNode n = nodes.get(i);
+            sb.append(i + 1).append(". ").append(n.name());
+            if (!n.dependsOn().isEmpty()) {
+                sb.append("（依赖 ").append(String.join(",", n.dependsOn())).append("）");
+            }
+            sb.append('\n');
+        }
+        if (nodes.size() > limit) {
+            sb.append("… 共 ").append(nodes.size()).append(" 个节点\n");
+        }
+        TaskIntent intent = compiled.intent();
+        if (!intent.deliverables().isEmpty()) {
+            sb.append("交付物：").append(intent.deliverables().stream()
+                    .map(d -> StringUtils.isBlank(d.path()) ? d.name() : d.path())
+                    .collect(Collectors.joining("、"))).append('\n');
+        }
+        if (!intent.exclusions().isEmpty()) {
+            sb.append("不做：").append(String.join("、", intent.exclusions())).append('\n');
+        }
+        sb.append("\n回复「开始」按此计划执行；要调整请直接说明要求。");
+        return sb.toString();
+    }
+
+    private static String intentJson(TaskIntent intent) {
+        if (intent == null) {
+            return "null";
+        }
+        String deliverables = intent.deliverables().stream()
+                .map(d -> "{\"name\":\"" + jsonEscape(d.name()) + "\",\"type\":\""
+                        + jsonEscape(d.type()) + "\",\"path\":\"" + jsonEscape(d.path())
+                        + "\",\"required\":" + d.required() + "}")
+                .collect(Collectors.joining(",", "[", "]"));
+        String inputs = intent.inputs().stream()
+                .map(i -> "{\"name\":\"" + jsonEscape(i.name()) + "\",\"source\":\""
+                        + jsonEscape(i.source()) + "\",\"required\":" + i.required() + "}")
+                .collect(Collectors.joining(",", "[", "]"));
+        return "{\"objective\":\"" + jsonEscape(intent.objective())
+                + "\",\"deliverables\":" + deliverables
+                + ",\"inputs\":" + inputs
+                + ",\"constraints\":" + stringArrayJson(intent.constraints())
+                + ",\"exclusions\":" + stringArrayJson(intent.exclusions())
+                + ",\"acceptanceCriteria\":" + stringArrayJson(intent.acceptanceCriteria())
+                + ",\"needsClarification\":" + intent.needsClarification()
+                + ",\"clarificationQuestion\":\"" + jsonEscape(intent.clarificationQuestion()) + "\"}";
+    }
+
+    private static String stringArrayJson(List<String> values) {
+        if (values == null) {
+            return "[]";
+        }
+        return values.stream().map(value -> "\"" + jsonEscape(value) + "\"")
+                .collect(Collectors.joining(",", "[", "]"));
+    }
+
+    private static String jsonEscape(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n");
     }
 
     private static String toJsonArray(List<String> tools) {
@@ -1103,7 +1314,7 @@ public class PlanningLoop {
             log.warn("运行时 LLM replan 失败: {}", e.getMessage());
             return Optional.empty();
         }
-        if (compiled == null || compiled.fromTemplate()
+        if (compiled == null || compiled.degradedCompilation()
                 || compiled.graph() == null || compiled.graph().isEmpty()) {
             return Optional.empty();
         }
@@ -1112,15 +1323,17 @@ public class PlanningLoop {
         if (merged == null || merged.isEmpty()) {
             return Optional.empty();
         }
-        if (!planValidator.accept(merged, taskPlan, compiled.goal())) {
-            log.warn("运行时 LLM replan 图验收失败 session={}", sessionId);
+        if (!mergeValidationReports(
+                planValidator.validate(merged, taskPlan, compiled.goal()),
+                intentGraphValidator.validate(compiled.intent(), merged)).valid()) {
+            log.warn("运行时 LLM replan 图验收失败（结构或意图）session={}", sessionId);
             return Optional.empty();
         }
         Goal nextGoal = compiled.goal() != null ? compiled.goal() : snap.goal();
         Map<String, Object> exec = new HashMap<>(snap.execution());
         exec.put("recovery." + dx.failureClass().name(), used + 1);
         exec.put("lastFailureKind", dx.kind().name());
-        StateSnapshot patched = snap.revisePlan(merged, nextGoal,
+        StateSnapshot patched = snap.revisePlan(merged, nextGoal, compiled.intent(),
                         "llm_replan_" + dx.failureClass().name().toLowerCase())
                 .withExecution(exec).withRecoveryInc();
         try {
@@ -1252,6 +1465,19 @@ public class PlanningLoop {
         return nodes.isEmpty() ? null : nodes.get(nodes.size() - 1);
     }
 
+    /** 编译/验收失败后的直跑降级：多模态走多模态直跑，否则走文本直跑。结局由 AgentLoop 自己判定。 */
+    private RunOutcome directFallback(ChatModel chat, String systemPrompt, String userMessage,
+                                      UserMessage multimodalUser, List<ChatMessage> history,
+                                      TaskPlan taskPlan, Consumer<String> progress,
+                                      AgentStreamSink streamSink) {
+        if (multimodalUser != null) {
+            return RunOutcome.direct(nodeExecutor.runDirectMultimodal(chat, systemPrompt,
+                    multimodalUser, history, 90, progress, taskPlan, streamSink));
+        }
+        return RunOutcome.direct(nodeExecutor.runDirect(chat, systemPrompt, userMessage, history,
+                90, progress, taskPlan, streamSink));
+    }
+
     private GoalCompiler.CompileResult compileAndValidate(ChatModel chat,
                                                          String userMessage,
                                                          TaskPlan taskPlan) {
@@ -1259,15 +1485,18 @@ public class PlanningLoop {
         GoalCompiler.CompileResult compiled = goalCompiler.compile(chat, userMessage, taskPlan);
 
         // 结构化验证
-        PlanValidationReport report = planValidator.validate(
-                compiled.graph(), taskPlan, compiled.goal());
+        PlanValidationReport report = mergeValidationReports(
+                planValidator.validate(compiled.graph(), taskPlan, compiled.goal()),
+                intentGraphValidator.validate(compiled.intent(), compiled.graph()));
         if (report.valid()) {
             return compiled;
         }
 
-        // 验证失败，进入 replan 闭环
+        // 保留第一次拒绝原因。后面即使 replan 失败，也必须能从
+        // GOAL_COMPILED 看出「模型产图但未通过验收」，不能退化成无原因 TEMPLATE。
+        String initialValidation = report.summary();
         log.info("PlanValidator 拒绝，进入 replan 闭环，错误数={}", report.errors().size());
-        log.debug("验证报告: {}", report.summary());
+        log.debug("验证报告: {}", initialValidation);
 
         // 尝试 replan，最多重试 maxReplanRetries 次
         int maxReplanRetries = Math.max(0, properties.getMaxReplanRetries());
@@ -1282,8 +1511,9 @@ public class PlanningLoop {
                 chat, userMessage, taskPlan, correctionPrompt);
 
             // 验证重新编译的结果
-            report = planValidator.validate(
-                    replanned.graph(), taskPlan, replanned.goal());
+            report = mergeValidationReports(
+                    planValidator.validate(replanned.graph(), taskPlan, replanned.goal()),
+                    intentGraphValidator.validate(replanned.intent(), replanned.graph()));
             if (report.valid()) {
                 log.info("Replan 成功，尝试次数={}", attempt);
                 return replanned;
@@ -1292,20 +1522,31 @@ public class PlanningLoop {
             log.warn("Replan 尝试 {} 仍然失败，错误数={}", attempt, report.errors().size());
         }
 
-        // 所有 replan 尝试失败，模板图仍须过同一道验收，不能把脏图交给调度器
-        log.warn("Replan 全部失败，改用 fallback 模板，最终错误数={}",
-                report.errors().size());
-        GoalCompiler.CompileResult fb = goalCompiler.fallback(
-                compiled.goal(), userMessage, taskPlan);
-        PlanValidationReport fbReport = planValidator.validate(
-                fb.graph(), taskPlan, fb.goal());
-        if (fbReport.valid()) {
-            return fb;
+        // 所有 replan 尝试失败。不再构造规则猜测图：
+        // 不是模型对本次请求的理解，继续执行等于把「结构合法」当成「语义正确」，
+        // 正是分项任务出错的主要来源。这里返回空图结果，调用方据此拒绝调度。
+        String fallbackReason = "PLAN_VALIDATION_FAILED: initial=" + clip(initialValidation, 1800)
+                + "; finalReplan=" + clip(report.summary(), 1800);
+        log.warn("Replan 全部失败，拒绝调度（不降级模板）code={} errors={}",
+                ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode(), report.errors().size());
+        return new GoalCompiler.CompileResult(compiled.goal(), new TaskGraph(List.of()), true,
+                GoalCompiler.CompilationSource.VALIDATION_ERROR, fallbackReason,
+                compiled.intent());
+    }
+
+    private static PlanValidationReport mergeValidationReports(PlanValidationReport first,
+                                                                PlanValidationReport second) {
+        List<PlanValidationReport.ValidationError> errors = new ArrayList<>();
+        List<PlanValidationReport.ValidationWarning> warnings = new ArrayList<>();
+        if (first != null) {
+            errors.addAll(first.errors());
+            warnings.addAll(first.warnings());
         }
-        log.warn("fallback 仍无法验收，拒绝调度 code={} errors={}",
-                ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode(),
-                fbReport.errors().size());
-        return fb;
+        if (second != null) {
+            errors.addAll(second.errors());
+            warnings.addAll(second.warnings());
+        }
+        return new PlanValidationReport(errors, warnings);
     }
 
     static String lastInvokedTool(AgentLoop.LoopOutcome out) {

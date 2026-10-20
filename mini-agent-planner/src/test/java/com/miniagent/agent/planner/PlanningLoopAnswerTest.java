@@ -1,7 +1,6 @@
 package com.miniagent.agent.planner;
 
 import com.miniagent.agent.core.AgentLoop;
-import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.task.TaskSignals;
 import com.miniagent.agent.tool.ToolErrorCode;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
@@ -25,6 +24,29 @@ class PlanningLoopAnswerTest {
     void realAnswerReplacesPrevious() {
         String kept = PlanningLoop.keepBetterAnswer("旧", "OpenJDK");
         assertEquals("OpenJDK", kept);
+    }
+
+    @Test
+    void graphSuccessNeverReturnsStepMarkerOrEmptyAnswer() {
+        TaskNode search = new TaskNode("n1", "搜索 AI 动态", "web_search", List.of(),
+                List.of(), List.of(), TaskNodeStatus.SUCCESS, 10,
+                DoneWhen.note(), "", "", 0,
+                "{\"success\":true,\"data\":{\"web\":[{\"title\":\"AI News\"}]}}");
+        String answer = PlanningLoop.buildCompletedAnswer(
+                AgentLoop.STEP_SEGMENT_DONE, new TaskGraph(List.of(search)));
+        assertTrue(answer.startsWith("任务已完成。"));
+        assertTrue(answer.contains("搜索 AI 动态"));
+        assertTrue(answer.contains("AI News"));
+        assertFalse(answer.contains(AgentLoop.STEP_SEGMENT_DONE));
+    }
+
+    @Test
+    void graphSuccessWithFileOutputReportsArtifact() {
+        TaskNode file = new TaskNode("n1", "整理动态", "file_write", List.of(),
+                List.of(), List.of(), TaskNodeStatus.SUCCESS, 10,
+                DoneWhen.file("ai-news.md"), "", "", 0, "ai-news.md");
+        String answer = PlanningLoop.buildCompletedAnswer("", new TaskGraph(List.of(file)));
+        assertEquals("任务已完成。\n- 整理动态：已生成 ai-news.md", answer);
     }
 
     @Test
@@ -69,20 +91,4 @@ class PlanningLoopAnswerTest {
                 PlanningLoop.mergeClarifyObjective("做点什么", "写一个 hello.txt"));
     }
 
-    /**
-     * 要不要编任务图，看的是「消息里有没有文件名或 URL」这个事实，
-     * 不是「这轮属于哪一类」。只有联网需求、没有落盘路径时不该编图 ——
-     * 那种一步就能做完。
-     */
-    @Test
-    void pathOrUrlDrivesGraphNotWebAlone() {
-        String msg = "写一个 hello.txt";
-        assertTrue(DecompositionPolicy.hasGraphSignal(msg,
-                TaskPlan.of(msg, false, TaskSignals.parse("file,simpleFile"))));
-
-        String news = "搜索今日新闻";
-        TaskPlan webOnly = TaskPlan.of(news, false, TaskSignals.parse("web"));
-        assertFalse(DecompositionPolicy.hasGraphSignal(news, webOnly));
-        assertFalse(webOnly.requiresStructuredPlan());
-    }
 }

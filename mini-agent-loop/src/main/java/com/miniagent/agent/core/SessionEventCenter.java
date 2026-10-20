@@ -122,6 +122,7 @@ public class SessionEventCenter {
         final StringBuilder think = new StringBuilder();
         final StringBuilder answer = new StringBuilder();
         volatile String progress = "";
+        volatile Object planApproval = null;
         volatile String subgoalText = "";
         volatile int subgoalDone = 0;
         volatile int subgoalTotal = 0;
@@ -155,6 +156,12 @@ public class SessionEventCenter {
     public void publish(String sessionId, String name, Object data) {
         SessionChannel channel = channels.get(key(sessionId));
         if (Objects.isNull(channel)) {
+            return;
+        }
+        if ("plan_approval".equals(name)) {
+            channel.planApproval = data;
+            sendToLocalClients(channel, name, data);
+            publishToOtherInstances(key(sessionId), "event", name, data);
             return;
         }
         String text = Objects.isNull(data) ? "" : String.valueOf(data);
@@ -242,6 +249,9 @@ public class SessionEventCenter {
         }
         if (Objects.nonNull(channel.progress) && !channel.progress.isEmpty()) {
             sendEvent(emitter, "progress", channel.progress);
+        }
+        if (channel.planApproval != null) {
+            sendEvent(emitter, "plan_approval", channel.planApproval);
         }
         if (channel.todoItems != null && !channel.todoItems.isEmpty()) {
             sendEvent(emitter, "todo", todoPayload(channel.todoItems));
@@ -511,7 +521,9 @@ public class SessionEventCenter {
                     clearPendingUserMessages(sessionId);
                 }
                 default -> {
-                    if ("subgoal".equals(name) && data instanceof Map<?, ?> map) {
+                    if ("plan_approval".equals(name)) {
+                        channel.planApproval = data;
+                    } else if ("subgoal".equals(name) && data instanceof Map<?, ?> map) {
                         Object text = map.get("text");
                         channel.subgoalText = text == null ? "" : String.valueOf(text);
                         channel.subgoalDone = toInt(map.get("done"));
@@ -532,6 +544,14 @@ public class SessionEventCenter {
     }
 
     private static void applyEvent(SessionChannel channel, String name, String text) {
+        if ("plan_approval".equals(name)) {
+            try {
+                channel.planApproval = JSON.readValue(text, Object.class);
+            } catch (Exception ignored) {
+                channel.planApproval = Map.of("required", true);
+            }
+            return;
+        }
         switch (name) {
             case "thinking" -> {
                 // append 与「读 length() → delete」必须在同一把锁内：否则并发 append 会让

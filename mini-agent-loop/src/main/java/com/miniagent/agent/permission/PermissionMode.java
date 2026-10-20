@@ -11,13 +11,16 @@ import org.apache.commons.lang3.StringUtils;
  *   <li>{@link #PLAN} — 只读探索 + 写 todo；须批准计划后才放行写/执行类工具</li>
  *   <li>{@link #ACCEPT_EDITS} — 自动编辑：跳过危险工具二次询问，也跳过 todo 危险步确认闸</li>
  *   <li>{@link #ASK} — 危险工具须前端确认一次后才放行</li>
+ *   <li>{@link #READ_ONLY} — 只读不动手：仅放行只读白名单（{@code PLAN_SAFE_TOOLS}），
+ *       禁止一切写/执行/副作用工具。对应 WorkBuddy 的 Ask 模式「只聊不动手」。</li>
  * </ul>
  */
 public enum PermissionMode {
     DEFAULT,
     PLAN,
     ACCEPT_EDITS,
-    ASK;
+    ASK,
+    READ_ONLY;
 
     public static PermissionMode from(String raw) {
         if (StringUtils.isBlank(raw)) {
@@ -28,6 +31,7 @@ public enum PermissionMode {
             case "plan" -> PLAN;
             case "accept_edits", "acceptedits", "accept" -> ACCEPT_EDITS;
             case "ask", "dont_ask_false" -> ASK;
+            case "read_only", "readonly", "read" -> READ_ONLY;
             case "default", "normal" -> DEFAULT;
             default -> DEFAULT;
         };
@@ -39,6 +43,7 @@ public enum PermissionMode {
             case PLAN -> "plan";
             case ACCEPT_EDITS -> "accept_edits";
             case ASK -> "ask";
+            case READ_ONLY -> "read_only";
         };
     }
 
@@ -48,6 +53,7 @@ public enum PermissionMode {
             case PLAN -> "Plan 模式";
             case ACCEPT_EDITS -> "自动编辑";
             case ASK -> "危险操作询问";
+            case READ_ONLY -> "只读";
         };
     }
 }

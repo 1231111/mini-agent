@@ -193,7 +193,10 @@ public class RecoveryEngine {
             return Optional.empty();
         }
 
-        TaskNode recovering = node.withStatus(TaskNodeStatus.RECOVERING).withError(dx.reason());
+        String recoveryContext = "上一轮失败: " + abbreviate(dx.reason(), 600)
+                + "\n建议处置: " + dx.suggestedFix();
+        TaskNode recovering = node.withStatus(TaskNodeStatus.RECOVERING)
+                .withError(recoveryContext);
         TaskGraph working = cur.graph().replace(recovering);
 
         TaskGraph nextGraph = switch (dx.failureClass()) {

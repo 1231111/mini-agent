@@ -1,6 +1,7 @@
 package com.miniagent.agent.planner;
 
 import com.miniagent.agent.task.TaskSignals;
+import com.miniagent.agent.todo.HumanYield;
 
 import java.util.Locale;
 import java.util.regex.Pattern;
@@ -69,6 +70,18 @@ public final class PlannerResumePolicy {
      */
     public static boolean shouldResume(TaskSignals signals, String userMessage,
                                        boolean awaitingConfirm, boolean incomplete) {
+        return shouldResume(signals, userMessage, awaitingConfirm, incomplete, false);
+    }
+
+    /**
+     * @param awaitingPlanApproval 整图计划正在等用户批准。它不是节点级
+     *                             {@code AWAITING_CONFIRM}，但同样属于「此刻在等人」，
+     *                             否则用户回一句「开始」会被当成新任务重新规划，
+     *                             审批永远走不出去。
+     */
+    public static boolean shouldResume(TaskSignals signals, String userMessage,
+                                       boolean awaitingConfirm, boolean incomplete,
+                                       boolean awaitingPlanApproval) {
         if (!incomplete) {
             return false;
         }
@@ -80,6 +93,9 @@ public final class PlannerResumePolicy {
         String text = normalize(userMessage);
         if (isClearlyNewTopic(text)) {
             return false;
+        }
+        if (awaitingPlanApproval && HumanYield.looksLikePlanApproval(text)) {
+            return true;
         }
         // 命中续跑词表，或文本本身是明确的续跑/授权语句
         if (s.continueTask() || isExplicitContinuation(text)) {
