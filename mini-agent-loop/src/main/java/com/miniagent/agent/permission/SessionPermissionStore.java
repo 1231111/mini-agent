@@ -8,6 +8,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.HashMap;
 import java.util.UUID;
@@ -73,7 +74,12 @@ public class SessionPermissionStore {
     /** Pending grants are deliberately ephemeral: a restart must require a new approval. */
     private final ConcurrentHashMap<String, AskGrant> pendingAskGrants =
             new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ApprovedAsk> approvedAskWaiters =
+            new ConcurrentHashMap<>();
     private final SessionPermissionPersistence persistence;
+
+    public record ApprovedAsk(AskGrant grant, boolean resumeAttached, boolean approved) {
+    }
 
     public SessionPermissionStore() {
         this(null);
@@ -324,39 +330,211 @@ public class SessionPermissionStore {
     /**
      * Issues an opaque, short-lived token for the exact invocation shown to
      * the user. It remains pending until {@link #grantAskToken} is called.
+     *
+     * <p>Pending token 和它的 waiter 状态必须在同一把锁里建立。拆成两次独立 put 的话，
+     * 执行线程可能正好落在两次 put 中间：{@code attachAskResume} 看不到 waiter，
+     * 这次调用就被静默降级成「不等待」，用户点批准时也不存在可唤醒的调用点 ——
+     * 表现正是「已经批了还在弹」。所以这里从查重、清理、限容到写入全部收进
+     * {@code synchronized (approvedAskWaiters)}。</p>
      */
     public AskGrant issueAskGrant(String sessionId, String toolName,
                                   String arguments, long ttlMillis) {
         if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(toolName)) {
             return null;
         }
-        long ttl = Math.max(1_000L, ttlMillis);
-        String digest = argumentDigest(toolName, arguments);
+        String tool = toolName.trim();
+        String digest = argumentDigest(tool, arguments);
         long now = System.currentTimeMillis();
-        // Reuse a still-pending approval for the same exact invocation. This
-        // avoids an unbounded token stream while an SSE client is reconnecting.
+        String prefix = sessionId + "\u0000";
+        synchronized (approvedAskWaiters) {
+            // Reuse a still-pending approval for the same exact invocation. This
+            // avoids an unbounded token stream while an SSE client is reconnecting.
+            for (Map.Entry<String, AskGrant> entry : pendingAskGrants.entrySet()) {
+                AskGrant existing = entry.getValue();
+                if (entry.getKey().startsWith(prefix)
+                        && !existing.expired(now)
+                        && existing.toolName().equals(tool)
+                        && existing.argumentsDigest().equals(digest)) {
+                    return existing;
+                }
+            }
+            purgeExpiredLocked(now);
+            if (pendingAskGrants.size() >= MAX_PENDING_ASK_GRANTS) {
+                // Capacity is a safety bound, not an authorization decision. Drop
+                // one pending entry; the user can request it again and receive a
+                // fresh token. 它的 waiter 必须一起丢：只丢 token 会让等待线程
+                // 挂到 TTL 结束才醒，看起来像卡死。
+                evictOnePendingLocked();
+            }
+            AskGrant grant = new AskGrant(
+                    newToken(), tool, digest, now + Math.max(1_000L, ttlMillis));
+            String key = pendingKey(sessionId, grant.token());
+            approvedAskWaiters.put(key, new ApprovedAsk(grant, false, false));
+            pendingAskGrants.put(key, grant);
+            return grant;
+        }
+    }
+
+    /** Caller must hold the {@code approvedAskWaiters} monitor. */
+    private void purgeExpiredLocked(long now) {
         for (Map.Entry<String, AskGrant> entry : pendingAskGrants.entrySet()) {
-            if (entry.getKey().startsWith(sessionId + "\u0000")
-                    && !entry.getValue().expired(now)
-                    && entry.getValue().toolName().equals(toolName.trim())
-                    && entry.getValue().argumentsDigest().equals(digest)) {
-                return entry.getValue();
+            if (!entry.getValue().expired(now)) {
+                continue;
+            }
+            if (pendingAskGrants.remove(entry.getKey(), entry.getValue())) {
+                approvedAskWaiters.remove(entry.getKey());
             }
         }
-        AskGrant grant = new AskGrant(
-                newToken(), toolName.trim(), digest, now + ttl);
-        pendingAskGrants.entrySet().removeIf(e -> e.getValue().expired(now));
-        if (pendingAskGrants.size() >= MAX_PENDING_ASK_GRANTS) {
-            // Capacity is a safety bound, not an authorization decision. Drop
-            // one pending entry; the user can request it again and receive a
-            // fresh token.
-            var iterator = pendingAskGrants.keySet().iterator();
-            if (iterator.hasNext()) {
-                pendingAskGrants.remove(iterator.next());
+        // 已批准但还没被等待线程取走的 waiter 不能因为 pending 已被移除就清掉 ——
+        // grantAskToken(requireResume) 正是「先移 pending、再留 approved waiter」。
+        // 这里只回收彻底过期的那些，它们本来也只会让等待方拿到 empty。
+        approvedAskWaiters.entrySet().removeIf(
+                e -> e.getValue().grant().expired(now));
+    }
+
+    /** Caller must hold the {@code approvedAskWaiters} monitor. */
+    private void evictOnePendingLocked() {
+        var iterator = pendingAskGrants.keySet().iterator();
+        if (!iterator.hasNext()) {
+            return;
+        }
+        String victim = iterator.next();
+        AskGrant evicted = pendingAskGrants.remove(victim);
+        if (evicted != null) {
+            approvedAskWaiters.remove(victim);
+            approvedAskWaiters.notifyAll();
+        }
+    }
+
+    /**
+     * Bind a live AgentLoop wait point to the exact single-use grant.
+     *
+     * <p>只有「仍未批准、未过期、尚未被别的线程绑定」的 pending token 才能绑定。
+     * 重复绑定直接失败，避免同一个 token 唤醒两条工具调用。</p>
+     */
+    public boolean attachAskResume(String sessionId, String token) {
+        if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(token)) {
+            return false;
+        }
+        String key = pendingKey(sessionId, token.trim());
+        long now = System.currentTimeMillis();
+        synchronized (approvedAskWaiters) {
+            ApprovedAsk waiting = approvedAskWaiters.get(key);
+            if (waiting == null) {
+                return false;
+            }
+            if (waiting.grant().expired(now)) {
+                pendingAskGrants.remove(key, waiting.grant());
+                approvedAskWaiters.remove(key, waiting);
+                approvedAskWaiters.notifyAll();
+                return false;
+            }
+            // 已批准（pending 已被移走）或已被别的线程绑定：本次调用不参与等待，
+            // 但绝不能清掉那条待批准状态 —— 那是另一次调用的、或即将被执行的状态。
+            if (waiting.approved() || waiting.resumeAttached()
+                    || !pendingAskGrants.containsKey(key)) {
+                return false;
+            }
+            approvedAskWaiters.put(key, new ApprovedAsk(waiting.grant(), true, false));
+            return true;
+        }
+    }
+
+    /** 供管线自检/测试观察：该 token 当前是否有一条已绑定且未过期的等待调用。 */
+    public boolean hasAttachedAskResume(String sessionId, String token) {
+        if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(token)) {
+            return false;
+        }
+        ApprovedAsk waiting = approvedAskWaiters.get(pendingKey(sessionId, token.trim()));
+        return waiting != null && waiting.resumeAttached()
+                && !waiting.approved()
+                && !waiting.grant().expired(System.currentTimeMillis());
+    }
+
+    /**
+     * Wait for explicit approval; interruption is propagated so task cancellation remains effective.
+     *
+     * <p>返回 empty 的三种原因都必须是终态：等待窗口到期、token 过期、被拒绝/被清理。
+     * 三种情况都要把 pending token 一起摘掉，否则 token 还能被后到的批准消费，
+     * 于是用户在已经超时的弹窗上再点一次「批准」仍然返回成功。</p>
+     */
+    public Optional<AskGrant> awaitAskApproval(String sessionId, String token, long timeoutMillis)
+            throws InterruptedException {
+        if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(token)) {
+            return Optional.empty();
+        }
+        String key = pendingKey(sessionId, token.trim());
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(1L, timeoutMillis));
+        synchronized (approvedAskWaiters) {
+            while (true) {
+                ApprovedAsk waiting = approvedAskWaiters.get(key);
+                if (waiting == null) {
+                    return Optional.empty();
+                }
+                long now = System.currentTimeMillis();
+                if (waiting.grant().expired(now)) {
+                    abandonLocked(key, waiting);
+                    return Optional.empty();
+                }
+                if (waiting.approved()) {
+                    approvedAskWaiters.remove(key, waiting);
+                    return Optional.of(waiting.grant());
+                }
+                long remain = deadline - System.nanoTime();
+                if (remain <= 0L) {
+                    abandonLocked(key, waiting);
+                    return Optional.empty();
+                }
+                try {
+                    TimeUnit.NANOSECONDS.timedWait(approvedAskWaiters, remain);
+                } catch (InterruptedException e) {
+                    // 取消/中断也是终态：不清理的话，用户稍后批准会命中一条
+                    // 已经没有线程在等的 waiter，看起来像「批了没反应」。
+                    abandonLocked(key, waiting);
+                    throw e;
+                }
             }
         }
-        pendingAskGrants.put(pendingKey(sessionId, grant.token()), grant);
-        return grant;
+    }
+
+    /** Caller must hold the {@code approvedAskWaiters} monitor. */
+    private void abandonLocked(String key, ApprovedAsk waiting) {
+        pendingAskGrants.remove(key, waiting.grant());
+        approvedAskWaiters.remove(key, waiting);
+        approvedAskWaiters.notifyAll();
+    }
+
+    /**
+     * Rejects a pending invocation and wakes its live execution thread.
+     *
+     * <p>不要求 {@code resumeAttached}：没有等待线程时也要把 pending token 摘掉，
+     * 否则这一次拒绝等于没拒绝 —— token 仍然可以被后到的批准消费。</p>
+     */
+    public boolean denyAskToken(String sessionId, String token, String expectedTool) {
+        if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(token)) {
+            return false;
+        }
+        String key = pendingKey(sessionId, token.trim());
+        long now = System.currentTimeMillis();
+        synchronized (approvedAskWaiters) {
+            AskGrant grant = pendingAskGrants.get(key);
+            if (grant == null || grant.expired(now)) {
+                pendingAskGrants.remove(key);
+                approvedAskWaiters.remove(key);
+                approvedAskWaiters.notifyAll();
+                return false;
+            }
+            if (StringUtils.isNotBlank(expectedTool)
+                    && !grant.toolName().equals(expectedTool.trim())) {
+                return false;
+            }
+            if (!pendingAskGrants.remove(key, grant)) {
+                return false;
+            }
+            approvedAskWaiters.remove(key);
+            approvedAskWaiters.notifyAll();
+            return true;
+        }
     }
 
     /**
@@ -364,45 +542,133 @@ public class SessionPermissionStore {
      * is single-use; expired or cross-session tokens are rejected.
      */
     public Optional<AskGrant> grantAskToken(String sessionId, String token) {
-        return grantAskToken(sessionId, token, null);
+        return grantAskToken(sessionId, token, null, false);
     }
 
     /** Same as {@link #grantAskToken(String, String)} with an optional UI tool consistency check. */
     public Optional<AskGrant> grantAskToken(String sessionId, String token,
                                             String expectedTool) {
+        return grantAskToken(sessionId, token, expectedTool, false);
+    }
+
+    /** Approves only a token that is still bound to a live execution waiting point. */
+    public Optional<AskGrant> grantAskTokenForResume(String sessionId, String token,
+                                                      String expectedTool) {
+        return grantAskToken(sessionId, token, expectedTool, true);
+    }
+
+    /**
+     * 把本会话里所有仍在等待的审批点一次性放行，返回放行条数。
+     *
+     * <p>给「任务跑到一半，用户把自动编辑和自动确认都打开了」用。已经弹给用户的
+     * permission_ask 是一个**已经发起**的等待点，它不会因为后续步骤改成全自动而消失 ——
+     * 那个工具线程还阻塞在 {@link #awaitAskApproval} 里，前端弹窗也还亮着。
+     * 不在这里放行的话，用户看到的仍然是「明明开了全自动，还卡在授权弹窗上」。</p>
+     *
+     * <p>放行只影响这些**已经存在的**等待点：摘掉 pending token，把 waiter 标成已批准，
+     * 由原线程继续执行；不写持久化 grant，也不影响后续调用 —— 后续调用由
+     * {@code PermissionPolicy.isFullAuto} 直接判定免批，根本不会再走到这里。</p>
+     */
+    public int releasePendingAsks(String sessionId) {
+        if (StringUtils.isBlank(sessionId)) {
+            return 0;
+        }
+        String prefix = sessionId + "\u0000";
+        long now = System.currentTimeMillis();
+        int released = 0;
+        synchronized (approvedAskWaiters) {
+            for (Map.Entry<String, ApprovedAsk> entry
+                    : new ArrayList<>(approvedAskWaiters.entrySet())) {
+                String key = entry.getKey();
+                if (!key.startsWith(prefix)) {
+                    continue;
+                }
+                ApprovedAsk waiting = entry.getValue();
+                if (waiting.approved()) {
+                    continue;
+                }
+                if (waiting.grant().expired(now)) {
+                    abandonLocked(key, waiting);
+                    continue;
+                }
+                pendingAskGrants.remove(key, waiting.grant());
+                approvedAskWaiters.put(key,
+                        new ApprovedAsk(waiting.grant(), waiting.resumeAttached(), true));
+                released++;
+            }
+            if (released > 0) {
+                approvedAskWaiters.notifyAll();
+            }
+        }
+        return released;
+    }
+
+    private Optional<AskGrant> grantAskToken(String sessionId, String token,
+                                              String expectedTool, boolean requireResume) {
         if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(token)) {
             return Optional.empty();
         }
         String key = pendingKey(sessionId, token.trim());
-        AskGrant candidate = pendingAskGrants.get(key);
-        if (candidate == null || candidate.expired(System.currentTimeMillis())
-                || (StringUtils.isNotBlank(expectedTool)
-                && !candidate.toolName().equals(expectedTool.trim()))) {
-            return Optional.empty();
-        }
-        // remove(key,value) prevents two concurrent approvals from both
-        // converting the same pending token.
-        if (!pendingAskGrants.remove(key, candidate)) {
-            return Optional.empty();
-        }
-        AskGrant pending = candidate;
-        update(sessionId, old -> {
-            Set<String> names = new HashSet<>(old.askGrantedTools());
-            names.add(pending.toolName());
-            Map<String, AskGrant> approved = new HashMap<>(old.askGrants());
+        AskGrant approved;
+        boolean persist;
+        synchronized (approvedAskWaiters) {
+            AskGrant candidate = pendingAskGrants.get(key);
+            ApprovedAsk waiter = approvedAskWaiters.get(key);
             long now = System.currentTimeMillis();
-            approved.entrySet().removeIf(e -> e.getValue().expired(now));
-            if (approved.size() >= MAX_APPROVED_ASK_GRANTS) {
-                var iterator = approved.keySet().iterator();
-                if (iterator.hasNext()) {
-                    approved.remove(iterator.next());
+            if (candidate == null || candidate.expired(now)) {
+                // 过期/已消费的 token 顺手清干净，避免 waiter 残留到 TTL 之后。
+                if (candidate != null) {
+                    pendingAskGrants.remove(key, candidate);
+                    approvedAskWaiters.remove(key);
+                    approvedAskWaiters.notifyAll();
                 }
+                return Optional.empty();
             }
-            approved.put(pending.token(), pending);
-            return new SessionPerm(old.mode(), old.planApproved(), names, approved,
-                    old.confirmPolicy(), old.execPolicyOverride());
-        });
-        return Optional.of(pending);
+            if (StringUtils.isNotBlank(expectedTool)
+                    && !candidate.toolName().equals(expectedTool.trim())) {
+                return Optional.empty();
+            }
+            boolean attached = waiter != null && waiter.resumeAttached() && !waiter.approved();
+            if (requireResume && !attached) {
+                return Optional.empty();
+            }
+            // remove(key,value) prevents two concurrent approvals from both
+            // converting the same pending token.
+            if (!pendingAskGrants.remove(key, candidate)) {
+                return Optional.empty();
+            }
+            approved = candidate;
+            persist = !attached;
+            if (attached) {
+                // 原调用还活着：唤醒它、由它在原线程继续执行。
+                // 这条路径刻意不写持久化 grant —— 一次点击只授权这一次执行，
+                // 否则 token 被重放就等于该参数组合被永久放行。
+                approvedAskWaiters.put(key, new ApprovedAsk(candidate, true, true));
+            } else {
+                approvedAskWaiters.remove(key);
+            }
+            approvedAskWaiters.notifyAll();
+        }
+        if (persist) {
+            AskGrant pending = approved;
+            update(sessionId, old -> {
+                Set<String> names = new HashSet<>(old.askGrantedTools());
+                names.add(pending.toolName());
+                Map<String, AskGrant> persisted = new HashMap<>(old.askGrants());
+                long now = System.currentTimeMillis();
+                persisted.entrySet().removeIf(e -> e.getValue().expired(now));
+                if (persisted.size() >= MAX_APPROVED_ASK_GRANTS) {
+                    var iterator = persisted.keySet().iterator();
+                    if (iterator.hasNext()) {
+                        persisted.remove(iterator.next());
+                    }
+                }
+                persisted.put(pending.token(), pending);
+                return new SessionPerm(old.mode(), old.planApproved(), names, persisted,
+                        old.confirmPolicy(), old.execPolicyOverride());
+            });
+        }
+        return Optional.of(approved);
     }
 
     /** Exact tool + argument authorization used by ToolPipeline. */
@@ -498,6 +764,12 @@ public class SessionPermissionStore {
     public void clear(String sessionId) {
         if (Objects.nonNull(sessionId)) {
             bySession.remove(sessionId);
+            String prefix = sessionId + "\u0000";
+            pendingAskGrants.keySet().removeIf(key -> key.startsWith(prefix));
+            approvedAskWaiters.keySet().removeIf(key -> key.startsWith(prefix));
+            synchronized (approvedAskWaiters) {
+                approvedAskWaiters.notifyAll();
+            }
             if (persistence != null) {
                 persistence.delete(sessionId);
             }

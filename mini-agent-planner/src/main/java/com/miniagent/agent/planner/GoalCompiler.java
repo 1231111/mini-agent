@@ -3,7 +3,6 @@ package com.miniagent.agent.planner;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.task.TaskPlan;
-import com.miniagent.agent.task.TaskSignals;
 import com.miniagent.agent.llm.DedicatedChatModel;
 import com.miniagent.agent.skill.SkillStore;
 import com.miniagent.agent.tool.CapabilityRegistry;
@@ -364,7 +363,6 @@ public class GoalCompiler {
         }
 
         String user = "用户消息:\n" + userMessage
-                + "\n\n命中信号:" + signalsOf(plan)
                 + "\n任务目标:" + (plan == null ? "" : plan.taskGoal())
                 + skillDigest()
                 + "\n\n**修正要求**:\n" + correctionPrompt
@@ -562,13 +560,8 @@ public class GoalCompiler {
                 ? plan.taskGoal() : (userMessage == null ? "" : userMessage);
         return new Goal(
                 "goal_" + UUID.randomUUID().toString().substring(0, 8),
-                objective, signalsOf(plan), Map.of(), List.of(),
+                objective, "", Map.of(), List.of(),
                 checkableCriteria(List.of(), objective, null));
-    }
-
-    /** 命中信号清单，只作提示与审计；判断逻辑一律直接读 {@link TaskSignals} 的字段。 */
-    private static String signalsOf(TaskPlan plan) {
-        return plan == null ? TaskSignals.NONE.describe() : plan.signals().describe();
     }
 
     private ParsedCompilation compileWithLlm(ChatModel chat, String userMessage, TaskPlan plan) {
@@ -576,7 +569,6 @@ public class GoalCompiler {
             return null;
         }
         String user = "用户消息:\n" + userMessage
-                + "\n\n命中信号:" + signalsOf(plan)
                 + "\n任务目标:" + (plan == null ? "" : plan.taskGoal())
                 + "\n若同时要获取资料并保存文件，至少拆成获取 + 写入两个节点。"
                 + "\n若同时要读取表格并统计，至少拆成读取 + 计算两个节点。"
@@ -648,7 +640,7 @@ public class GoalCompiler {
         TaskGraph graph = parseGraph(text);
         Goal seed = base == null
                 ? new Goal("goal_" + UUID.randomUUID().toString().substring(0, 8), "",
-                TaskSignals.NONE.describe(), null, Map.of(), List.of(), List.of())
+                "", null, Map.of(), List.of(), List.of())
                 : base;
         String objective = textOr(root, "objective", seed.objective());
         String signals = textOr(root, "signals", seed.signals());

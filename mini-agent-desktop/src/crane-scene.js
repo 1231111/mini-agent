@@ -1,10 +1,11 @@
 /* 启动页上的丹顶鹤（飞行姿态）。
+   轨迹受相机视锥约束，启动结束时留在画面内渐隐。
    全程用 three.js 基础几何体生成，不依赖外部模型文件：
      - 躯干：球体顶点按尾端收窄，避免「一个球加一个盒子」的玩偶感
      - 脖颈：沿 CatmullRom 曲线扫出的渐细管（真实鹤飞行时颈部前伸成 S 形）
      - 翅膀：三层羽片（覆羽 / 次级飞羽 / 初级飞羽），每片带下垂、收尖和扭转
      - 腿：飞行时向后伸直，细长渐细
-   路径是随机改航向，不是固定椭圆。window.craneScene.burst() 收势后炸开。 */
+   路径缓慢环绕并受视锥约束。window.craneScene.burst() 原位淡出。 */
 (function () {
   var canvas = document.getElementById('c');
   if (!canvas || !window.THREE) {
@@ -23,11 +24,11 @@
   var camera = new THREE.PerspectiveCamera(38, 1, 0.1, 40);
   camera.position.set(0, 0.35, 9.2);
 
-  scene.add(new THREE.HemisphereLight(0xf2fbff, 0x22303e, 1.15));
-  var key = new THREE.DirectionalLight(0xffffff, 1.45);
+  scene.add(new THREE.HemisphereLight(0xf8fcff, 0x313b48, 1.25));
+  var key = new THREE.DirectionalLight(0xffffff, 1.28);
   key.position.set(3.5, 6, 4);
   scene.add(key);
-  var rim = new THREE.DirectionalLight(0x9ae7ff, 0.55);
+  var rim = new THREE.DirectionalLight(0xc4d8e6, 0.42);
   rim.position.set(-4, 2, -3);
   scene.add(rim);
   /* 腹部补光：相机基本与鹤同高，近侧翼看到的全是翼下表面。
@@ -41,17 +42,17 @@
   scene.add(sideFill);
 
   var white = new THREE.MeshStandardMaterial({
-    color: 0xfbfdff, roughness: 0.62, metalness: 0.0, side: THREE.DoubleSide
+    color: 0xf4f8fa, roughness: 0.72, metalness: 0.0, side: THREE.DoubleSide, transparent: true
   });
   var whiteDim = new THREE.MeshStandardMaterial({
-    color: 0xe6edf4, roughness: 0.7, metalness: 0.0, side: THREE.DoubleSide
+    color: 0xe6edf4, roughness: 0.7, metalness: 0.0, side: THREE.DoubleSide, transparent: true
   });
   var black = new THREE.MeshStandardMaterial({
-    color: 0x14181d, roughness: 0.68, metalness: 0.02, side: THREE.DoubleSide
+    color: 0x14181d, roughness: 0.68, metalness: 0.02, side: THREE.DoubleSide, transparent: true
   });
-  var red = new THREE.MeshStandardMaterial({ color: 0xc41f2b, roughness: 0.42, metalness: 0.05 });
-  var beakMat = new THREE.MeshStandardMaterial({ color: 0x7c8a6b, roughness: 0.5, metalness: 0.06 });
-  var legMat = new THREE.MeshStandardMaterial({ color: 0x22282c, roughness: 0.6, metalness: 0.05 });
+  var red = new THREE.MeshStandardMaterial({ color: 0xc41f2b, roughness: 0.42, metalness: 0.05, transparent: true });
+  var beakMat = new THREE.MeshStandardMaterial({ color: 0x7c8a6b, roughness: 0.5, metalness: 0.06, transparent: true });
+  var legMat = new THREE.MeshStandardMaterial({ color: 0x22282c, roughness: 0.6, metalness: 0.05, transparent: true });
 
   /** 沿曲线扫出的渐细管：TubeGeometry 半径恒定，做不出鹤颈由粗到细的过渡。 */
   function taperedTube(curve, segments, radial, radiusFn) {
@@ -141,12 +142,12 @@
 
   /** 翼面材质：颜色由顶点色给出（翼根白、后缘与翼尖转黑），比拿两块材质拼接不出缝。 */
   var wingMat = new THREE.MeshStandardMaterial({
-    vertexColors: true, roughness: 0.66, metalness: 0.0, side: THREE.DoubleSide
+    vertexColors: true, roughness: 0.66, metalness: 0.0, side: THREE.DoubleSide, transparent: true
   });
 
   /** 体表羽片材质：比翼面稍暖一点，靠明暗差把羽毛的层次显出来。 */
   var plumageMat = new THREE.MeshStandardMaterial({
-    color: 0xf4f8fc, roughness: 0.78, metalness: 0.0, side: THREE.DoubleSide
+    color: 0xf4f8fc, roughness: 0.78, metalness: 0.0, side: THREE.DoubleSide, transparent: true
   });
 
   /**
@@ -290,24 +291,22 @@
     upper.name = 'upper';
     root.add(upper);
 
-    // 翼臂（肩→腕）：弦长由 0.62 收到 0.46。
-    // tipBlack 必须留 0：翼臂末端若先转灰，会和手部（从纯白起步）在腕关节拼出一条灰带。
-    var arm = new THREE.Mesh(wingPanel(0.85, 0.62, 0.46, {
-      leSweep: 0.05, camber: 0.055, dihedral: 0.03, tipBlack: 0
+    // 翼臂（肩→腕）：控制翼展，不让翼面把身体压成一条细线。
+    // 适当增加弦长和拱度，画面中能看到完整翼面，而不是两片薄长板。
+    var arm = new THREE.Mesh(wingPanel(0.56, 0.74, 0.54, {
+      leSweep: 0.04, camber: 0.10, dihedral: 0.13, droop: 0.02, tipBlack: 0
     }), wingMat);
     upper.add(arm);
 
     var lower = new THREE.Group();
     lower.name = 'lower';
-    lower.position.x = 0.85;
+    lower.position.x = 0.56;
     upper.add(lower);
 
-    // 手部（腕→翼尖）：弦长 0.46 → 0.16，前缘后掠；黑色由腕到翼尖单调加深。
-    // camber / dihedral / leStart 必须和翼臂末端对齐，否则腕关节会出现一道台阶阴影
-    // （第一版就是：翼臂末端抬到 0.060，手部起点只有 0.040，交界处一条灰带）。
-    var hand = new THREE.Mesh(wingPanel(0.75, 0.46, 0.16, {
-      leStart: -0.05, leSweep: 0.22,
-      camber: 0.03, dihedral: 0.03, droop: 0.03, tipBlack: 1
+    // 手部（腕→翼尖）：弦长 0.52 → 0.20，前缘后掠并自然下垂。
+    var hand = new THREE.Mesh(wingPanel(0.46, 0.54, 0.22, {
+      leStart: -0.05, leSweep: 0.18,
+      camber: 0.07, dihedral: 0.11, droop: 0.045, tipBlack: 1
     }), wingMat);
     lower.add(hand);
 
@@ -319,7 +318,7 @@
     for (i = 0; i < 9; i++) {
       var pt = i / 8;
       var f = addFeather(lower, {
-        len: 0.36 + pt * 0.34 + (i % 2) * 0.03,
+        len: 0.24 + pt * 0.22 + (i % 2) * 0.02,
         width: 0.1 + (i % 3) * 0.014, mat: black,
         x: 0.46 + pt * 0.26, y: -0.008, z: 0.02,
         sweep: -Math.PI / 2 + 0.12 + pt * 0.3,
@@ -335,7 +334,7 @@
   }
 
   function makeBody() {
-    var geo = new THREE.SphereGeometry(0.30, 32, 24);
+    var geo = new THREE.SphereGeometry(0.40, 32, 24);
     var p = geo.attributes.position;
     var v = new THREE.Vector3();
     var i;
@@ -344,9 +343,9 @@
       var t = (v.z / 0.30 + 1) * 0.5;        // 0=胸部（-Z），1=尾部（+Z）
       var taper = 1 - 0.55 * t;              // 尾端收窄：胸部最宽，向后收到尾根
       // 鹤的躯干很窄：宽约 0.37、高约 0.35，长 1.05（旧版宽高都到 0.68，侧看像条鱼）
-      v.x *= 0.50 * taper + 0.12;
-      v.y *= 0.44 * taper + 0.14;
-      v.z *= 1.75;
+      v.x *= 0.58 * taper + 0.15;
+      v.y *= 0.55 * taper + 0.17;
+      v.z *= 1.72;
       // 胸部略上提，模仿飞行时的龙骨突出
       v.y += 0.02 * Math.max(0, 1 - Math.abs(v.z + 0.15) * 3);
       p.setXYZ(i, v.x, v.y, v.z);
@@ -360,53 +359,64 @@
 
     // 飞行姿态：颈前伸，S 形。控制点自胸部向头部收拢。
     var curve = new THREE.CatmullRomCurve3([
-      new THREE.Vector3(0, 0.05, -0.34),
-      new THREE.Vector3(0, 0.095, -0.60),
-      new THREE.Vector3(0, 0.065, -0.86),
-      new THREE.Vector3(0, 0.05, -1.04)
+      new THREE.Vector3(0, 0.16, -0.36),
+      new THREE.Vector3(0, 0.24, -0.60),
+      new THREE.Vector3(0, 0.22, -0.82),
+      new THREE.Vector3(0, 0.19, -0.96)
+    ]);
+    // 丹顶鹤的颈部不是整段黑色：下颈与胸部相接是白色，上半段才是黑色。
+    // 两段曲线略微重叠，避免飞行姿态变化时在颜色交界处露出缝隙。
+    var throatCurve = new THREE.CatmullRomCurve3([
+      curve.getPointAt(0), curve.getPointAt(0.38), curve.getPointAt(0.53)
+    ]);
+    var throat = new THREE.Mesh(
+      taperedTube(throatCurve, 14, 14, function (t) { return 0.098 - 0.022 * t; }),
+      white
+    );
+    g.add(throat);
+    var neckCurve = new THREE.CatmullRomCurve3([
+      curve.getPointAt(0.45), curve.getPointAt(0.7), curve.getPointAt(1)
     ]);
     var neck = new THREE.Mesh(
-      taperedTube(curve, 24, 14, function (t) {
-        return 0.062 - 0.026 * Math.pow(t, 0.85);
-      }),
+      taperedTube(neckCurve, 16, 14, function (t) { return 0.092 - 0.032 * t; }),
       black
     );
     g.add(neck);
 
     var head = new THREE.Group();
-    head.position.set(0, 0.05, -1.08);
+    head.position.set(0, 0.19, -1.00);
 
-    var skull = new THREE.Mesh(new THREE.SphereGeometry(0.062, 24, 18), white);
-    skull.scale.set(0.92, 0.88, 1.16);
+    var skull = new THREE.Mesh(new THREE.SphereGeometry(0.11, 24, 18), white);
+    skull.scale.set(0.98, 0.92, 1.22);
     head.add(skull);
 
     // 丹顶：真实位置在头顶偏后，扁平一块，不是一个小球
-    var crown = new THREE.Mesh(new THREE.SphereGeometry(0.05, 20, 14), red);
-    crown.scale.set(0.92, 0.34, 1.05);
-    crown.position.set(0, 0.044, 0.01);
+    var crown = new THREE.Mesh(new THREE.SphereGeometry(0.092, 20, 14), red);
+    crown.scale.set(0.98, 0.36, 1.08);
+    crown.position.set(0, 0.082, 0.01);
     head.add(crown);
 
     // 眼周裸皮（深色），让头部不是一个纯白球
-    var mask = new THREE.Mesh(new THREE.SphereGeometry(0.055, 18, 12), black);
-    mask.scale.set(0.72, 0.42, 0.55);
-    mask.position.set(0, -0.005, -0.03);
+    var mask = new THREE.Mesh(new THREE.SphereGeometry(0.088, 18, 12), black);
+    mask.scale.set(0.76, 0.44, 0.62);
+    mask.position.set(0, -0.006, -0.035);
     head.add(mask);
 
     var beak = new THREE.Mesh(
       taperedTube(new THREE.CatmullRomCurve3([
-        new THREE.Vector3(0, 0, -0.04),
-        new THREE.Vector3(0, -0.008, -0.22),
-        new THREE.Vector3(0, -0.026, -0.4)
+        new THREE.Vector3(0, 0, -0.055),
+        new THREE.Vector3(0, -0.008, -0.25),
+        new THREE.Vector3(0, -0.032, -0.46)
       ]), 10, 8, function (t) {
-        return 0.021 * (1 - 0.92 * t);
+        return 0.024 * (1 - 0.92 * t);
       }),
       beakMat
     );
     head.add(beak);
 
-    var eyeGeo = new THREE.SphereGeometry(0.0115, 10, 10);
+    var eyeGeo = new THREE.SphereGeometry(0.017, 10, 10);
     var eyeL = new THREE.Mesh(eyeGeo, black);
-    eyeL.position.set(0.033, 0.018, -0.046);
+    eyeL.position.set(0.045, 0.026, -0.060);
     var eyeR = eyeL.clone();
     eyeR.position.x = -0.033;
     head.add(eyeL);
@@ -473,8 +483,9 @@
 
     var wingL = makeWing(1);
     var wingR = makeWing(-1);
-    wingL.position.set(0.07, 0.12, -0.02);
-    wingR.position.set(-0.07, 0.12, -0.02);
+    // 翼根抬高并向后错开，露出黑颈、头部和白色胸部轮廓。
+    wingL.position.set(0.07, 0.25, 0.16);
+    wingR.position.set(-0.07, 0.25, 0.16);
     // 负缩放做镜像；羽片材质是 DoubleSide，背面光照由 gl_FrontFacing 处理
     wingR.scale.x = -1;
     g.add(wingL);
@@ -523,13 +534,13 @@
   camera.add(flash);
   scene.add(camera);
 
-  /* 出生点与第一段航线是刻意选的：相机固定在 (0,0.35,9.2) 朝 -Z，
-     如果鹤沿 +X 平飞（旧版就是这样），翼展正好指向相机、翼面永远只有一条线。
-     让它斜着朝画面深处飞（约 48°），前几秒就能看到完整翼展。 */
-  var pos = new THREE.Vector3(-4.0, 0.55, 2.6);
-  var vel = new THREE.Vector3(1.4, -0.1, -1.55);
-  var target = new THREE.Vector3(0.5, -0.2, -2.0);
-  var speed = 2.1;
+  /* 鹤只在相机可视区中段缓慢环绕。相机竖向视野会随窗口比例改变，
+     动态边界在 steer() 中按当前相机视锥计算，并扣除翼展安全余量。 */
+  var pos = new THREE.Vector3(-0.25, 0.72, 0.2);
+  var vel = new THREE.Vector3(0.22, -0.02, -0.35);
+  var target = new THREE.Vector3(0.25, 0.72, -0.35);
+  var speed = 0.58;
+  var orbitPhase = 0;
   var glide = 0;
   var flapPhase = 0;
   var bursting = false;
@@ -538,25 +549,32 @@
   var frozen = false;
   var BURST_MS = 1400;
   var clock = new THREE.Clock();
-  var ahead = new THREE.Vector3();
   var desired = new THREE.Vector3();
-  var up = new THREE.Vector3(0, 1, 0);
   var bank = 0;
 
+  function viewHalfExtents(z) {
+    var depth = camera.position.z - z;
+    var halfHeight = Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5)) * depth;
+    return { x: halfHeight * camera.aspect, y: halfHeight };
+  }
+
+  function modelHalfExtents() {
+    // 插画动画不做真实 3D 转向，Box3 在根组上与实际旋转尺寸一致。
+    crane.updateMatrixWorld(true);
+    var bounds = new THREE.Box3().setFromObject(crane);
+    var size = bounds.getSize(new THREE.Vector3());
+    return { x: size.x * 0.5, y: size.y * 0.5 };
+  }
+
   function pickTarget() {
-    var choice = target;
-    var n;
-    for (n = 0; n < 8; n++) {
-      choice = new THREE.Vector3(
-        (Math.random() * 2 - 1) * 5.1,
-        (Math.random() * 2 - 1) * 2.15,
-        -2.4 + Math.random() * 5.2
-      );
-      if (choice.distanceTo(pos) > 3.2) {
-        return choice;
-      }
-    }
-    return choice;
+    var half = viewHalfExtents(-0.4);
+    var marginX = Math.min(2.2, half.x * 0.58);
+    var marginY = Math.min(1.8, half.y * 0.58);
+    return new THREE.Vector3(
+      (Math.random() * 2 - 1) * Math.max(0.2, half.x - marginX),
+      (Math.random() * 2 - 1) * Math.max(0.15, half.y - marginY),
+      -0.85 + Math.random() * 0.9
+    );
   }
 
   function resize() {
@@ -569,64 +587,66 @@
     camera.updateProjectionMatrix();
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setSize(w, h, false);
+    crane.updateMatrixWorld(true);
+    var bounds = new THREE.Box3().setFromObject(crane);
+    var size = bounds.getSize(new THREE.Vector3());
+    var half = viewHalfExtents(0.2);
+    var fitX = (half.x - 0.12) / Math.max(0.01, size.x * 0.5);
+    var fitY = (half.y * 0.82 - 0.12) / Math.max(0.01, size.y * 0.5);
+    crane.scale.setScalar(THREE.MathUtils.clamp(Math.min(1.32, fitX, fitY), 0.34, 1.32));
   }
   window.addEventListener('resize', resize);
   resize();
 
   function steer(dt) {
-    if (!bursting && pos.distanceTo(target) < 0.85) {
-      target = pickTarget();
-    }
-    if (bursting) {
-      desired.copy(target).sub(pos);
-      if (desired.lengthSq() < 1e-4) {
-        return;
+    var half = viewHalfExtents(pos.z);
+    var bounds = modelHalfExtents();
+    var safety = 0.12;
+    var limitX = Math.max(0, half.x - bounds.x - safety);
+    var limitY = Math.max(0, half.y - bounds.y - safety);
+
+    if (!bursting) {
+      orbitPhase += dt * 0.32;
+      var orbitX = Math.cos(orbitPhase) * limitX * 0.48;
+      var orbitY = limitY * 0.36 + Math.sin(orbitPhase * 1.35) * limitY * 0.2;
+      if (pos.distanceTo(target) < 0.3) {
+        target = pickTarget();
       }
-      desired.normalize().multiplyScalar(4.2);
-      desired.sub(vel);
-      var burstTurn = 6 * dt;
-      if (desired.length() > burstTurn) {
-        desired.setLength(burstTurn);
-      }
-      vel.add(desired);
-      if (vel.length() > 4.6) {
-        vel.setLength(4.6);
-      }
-      pos.addScaledVector(vel, dt);
-      return;
+      target.x = THREE.MathUtils.clamp(target.x, -limitX * 0.6, limitX * 0.6);
+      target.y = THREE.MathUtils.clamp(target.y, -limitY * 0.6, limitY * 0.6);
+      target.z = -0.35 + Math.sin(orbitPhase * 0.7) * 0.38;
+      target.x = THREE.MathUtils.lerp(target.x, orbitX, 0.025);
+      target.y = THREE.MathUtils.lerp(target.y, orbitY, 0.025);
     }
-    if (Math.abs(pos.x) > 5.4) {
-      target.x = -Math.sign(pos.x) * 2.2;
-    }
-    if (Math.abs(pos.y) > 2.35) {
-      target.y = -Math.sign(pos.y) * 0.6;
-    }
-    if (pos.z > 3.4 || pos.z < -2.8) {
-      target.z = pos.z > 0 ? -1.2 : 1.4;
-    }
+
     desired.copy(target).sub(pos);
-    if (desired.lengthSq() < 1e-4) {
-      return;
-    }
-    desired.normalize().multiplyScalar(speed);
+    if (desired.lengthSq() < 1e-4) return;
+    desired.normalize().multiplyScalar(bursting ? 0.42 : speed);
     desired.sub(vel);
-    var maxTurn = 2.4 * dt;
-    if (desired.length() > maxTurn) {
-      desired.setLength(maxTurn);
-    }
-    var fx = vel.x;
-    var fz = vel.z;
-    var tx = target.x - pos.x;
-    var tz = target.z - pos.z;
-    bank = THREE.MathUtils.clamp(-(fx * tz - fz * tx) * 0.08, -0.65, 0.65);
+    var maxTurn = (bursting ? 1.8 : 1.25) * dt;
+    if (desired.length() > maxTurn) desired.setLength(maxTurn);
+    var fx = vel.x, fz = vel.z;
+    var tx = target.x - pos.x, tz = target.z - pos.z;
+    bank = THREE.MathUtils.clamp(-(fx * tz - fz * tx) * 0.12, -0.28, 0.28);
     vel.add(desired);
-    if (vel.length() > speed) {
-      vel.setLength(speed);
-    }
-    if (vel.x * vel.x + vel.z * vel.z < 0.35) {
-      vel.x += 0.4;
-    }
+    var maxSpeed = bursting ? 0.55 : speed;
+    if (vel.length() > maxSpeed) vel.setLength(maxSpeed);
     pos.addScaledVector(vel, dt);
+
+    // 用真实视锥而非固定世界坐标限位；较宽余量覆盖翼展与转弯侧倾。
+    half = viewHalfExtents(pos.z);
+    bounds = modelHalfExtents();
+    limitX = Math.max(0, half.x - bounds.x - safety);
+    limitY = Math.max(0, half.y - bounds.y - safety);
+    var clampedX = THREE.MathUtils.clamp(pos.x, -limitX, limitX);
+    var clampedY = THREE.MathUtils.clamp(pos.y, -limitY, limitY);
+    if (clampedX !== pos.x || clampedY !== pos.y) {
+      pos.x = clampedX;
+      pos.y = clampedY;
+      vel.x *= 0.35;
+      vel.y *= 0.35;
+    }
+    pos.z = THREE.MathUtils.clamp(pos.z, -0.6, 0.45);
   }
 
   /**
@@ -645,9 +665,9 @@
     for (w = 0; w < wings.length; w++) {
       var upper = wings[w].userData.upper;
       var lower = wings[w].userData.lower;
-      upper.rotation.z = 0.04 + beat * amp;
+      upper.rotation.z = 0.12 + beat * amp;
       upper.rotation.y = beat * 0.06;
-      lower.rotation.z = 0.02 + lag * amp * 0.4;
+      lower.rotation.z = 0.08 + lag * amp * 0.4;
       // -0.12 是洗流扭转（washout）：外翼前缘略微下压，翼面因此不是纯平面。
       // 顺带解决一个纯几何问题 —— 相机沿 -Z 看、翼弦也朝 +Z 时，
       // 翼面法线与视线垂直，不带扭转就永远只剩一条线。
@@ -669,29 +689,31 @@
     var u = 0;
     if (bursting) {
       u = Math.min(1, (now - burstAt) / BURST_MS);
-      target.set(0, 0.15, 5.5);
-    } else if (glide <= 0 && !reduced && Math.random() < dt * 0.12) {
-      glide = 0.45 + Math.random() * 0.9;
-      speed = 1.45 + Math.random() * 1.35;
-    }
-    if (glide > 0) {
-      glide -= dt;
+      target.set(0.35, -0.08, -0.2);
     }
     steer(dt);
     crane.position.copy(pos);
-    ahead.copy(pos).add(vel);
-    crane.up.copy(up);
     crane.position.y += Math.sin(flapPhase) * 0.035;
-    crane.lookAt(ahead);
+    // 只按水平航向转向。lookAt(ahead) 会把整个模型俯仰到速度向量上；
+    // 垂直速度稍大时，固定镜头就会看到鹤的正面/背面，身体竖起、翼展横铺。
+    // 这里保持机身近似水平，仅保留小幅侧倾，避免轨迹改变时姿态翻转。
+    crane.rotation.set(0, Math.atan2(vel.x, Math.max(0.08, Math.abs(vel.z))), 0);
     crane.rotateZ(bank);
 
-    /* 振幅不能大：从侧面看，翼面一抬就被透视压成两片竖刀片。
-       0.72 时腕部累计约 52°，在启动页那种近侧视角里已经不是「鸟」了。 */
-    var amp = reduced ? 0.1 : (glide > 0 ? 0.1 : 0.42);
+    // 收尾时只淡出，不加速冲向镜头，鹤始终留在启动画布的安全区内。
+    var fade = bursting ? 1 - THREE.MathUtils.smoothstep(u, 0.35, 1) : 1;
+    crane.visible = fade > 0.005;
     if (bursting) {
-      amp = 0.1 * (1 - u);
+      crane.traverse(function (part) {
+        if (!part.material) return;
+        var materials = Array.isArray(part.material) ? part.material : [part.material];
+        for (var m = 0; m < materials.length; m++) {
+          materials[m].opacity = fade;
+        }
+      });
     }
-    flapPhase += dt * (reduced ? 2 : 11);
+    var amp = reduced ? 0.08 : (bursting ? 0.16 * (1 - u) : 0.18);
+    flapPhase += dt * (reduced ? 1.5 : 5.2);
     flapWings(amp);
 
     if (u > 0.42) {
@@ -734,7 +756,7 @@
       stop: function () { frozen = true; },
       flap: function (phase, amp) {
         flapPhase = phase;
-        flapWings(amp == null ? 0.72 : amp);
+        flapWings(amp == null ? 0.24 : amp);
       },
       level: function (bankRad) {
         crane.rotation.set(0, 0, 0);

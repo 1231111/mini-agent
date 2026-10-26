@@ -7,6 +7,8 @@ import com.miniagent.agent.core.LoopTurnPolicy;
 import com.miniagent.agent.core.RunScope;
 import com.miniagent.agent.hook.ToolHookChain;
 import com.miniagent.agent.permission.ExecPolicyService;
+import com.miniagent.agent.permission.AskGrant;
+import com.miniagent.agent.permission.ConfirmPolicy;
 import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.permission.SessionPermissionStore;
@@ -38,6 +40,8 @@ class ToolPipelineTest {
         LoopTurnContext.clear();
         ExecutionTurnContext.clear();
         PermissionContext.clear();
+        // 本类有两条用例临时绑定存储：清掉，避免静态状态串到同模块其他用例。
+        PermissionContext.bindStore(null);
     }
 
     @Test
@@ -270,6 +274,186 @@ class ToolPipelineTest {
                 ToolRequest.of("s", "exec_command", "{}", 0, "r2"));
         assertEquals(ToolInvocation.Outcome.EXECUTED, second.outcome());
         assertEquals(1, calls.get());
+    }
+
+    /**
+     * 真实链路：用户点两个开关 → 值落进会话存储 → 管道按存储现场取值 → 不产生授权入口。
+     *
+     * <p>为什么必须补这一条：{@link #fullAutoExecutesWithoutAnyPermissionAsk} 用
+     * {@code PermissionContext.force} 直接塞了一份权限快照，**绕过了存储这一段**。
+     * 只要存储的读、写或枚举解析有一处坏掉，force 版本照样全绿，而真实用户点完开关
+     * 仍然会被弹窗拦住 —— 那正是"明明开了自动还在问"的成因。这条用例走的是主链路：
+     * {@code setMode}/{@code setConfirmPolicy} 写入，{@code setSession} 绑定，
+     * {@code RunScope.capture()} 每次现场读，不借助任何强制值。</p>
+     *
+     * <p>同时把全局 exec 策略设成 {@code ask}（线上默认值，见 application.yml），
+     * 也就是说：这不是靠把 exec 提到 allow 才免问的，而是全自动本身绕过授权入口。</p>
+     */
+    @Test
+    void bothSwitchesThroughSessionStoreSkipApprovalOnRealPath() {
+        AtomicInteger calls = new AtomicInteger();
+        Fixture fx = new Fixture("ask", execRegistry(calls));
+        // 页面上两次 PUT：先点「自动编辑」，再点「自动确认」
+        fx.store.setMode("s", PermissionMode.ACCEPT_EDITS);
+        fx.store.setConfirmPolicy("s", ConfirmPolicy.AUTO);
+        PermissionContext.bindStore(fx.store);
+        // 主链路用 setSession，不是 force：每一轮 capture() 现场读存储
+        PermissionContext.setSession("s");
+
+        ToolInvocation inv = fx.pipeline.invoke(
+                ToolRequest.of("s", "exec_command", "{\"command\":\"echo hi\"}", 0, "r1")
+                        .withApprovalWait());
+
+        assertEquals(ToolInvocation.Outcome.EXECUTED, inv.outcome(),
+                "存储里两个开关都开着，管道必须直接执行");
+        assertEquals(1, calls.get(), "工具真的进入了执行阶段");
+        assertFalse(fx.trace.hasNode("WAITING_FOR_HUMAN"), "不得产生任何批准入口");
+        assertTrue(fx.trace.hasNode("PERM_AUTO"), "要留全自动放行轨迹，便于和本来免授权的调用区分");
+    }
+
+    /**
+     * 反例：存储里**只**有「自动编辑」，全局 exec 策略仍是 ask → 仍然要问。
+     *
+     * <p>与上一条成对存在。只证明"开了就放行"是不够的 —— 那可能只是把授权整个关掉了；
+     * 这条证明开关组合是必要条件，单开自动编辑不会顺带放开终端命令。</p>
+     */
+    @Test
+    void acceptEditsAloneThroughStoreStillAsks() {
+        AtomicInteger calls = new AtomicInteger();
+        Fixture fx = new Fixture("ask", execRegistry(calls));
+        fx.store.setMode("s", PermissionMode.ACCEPT_EDITS);
+        fx.store.setConfirmPolicy("s", ConfirmPolicy.DANGEROUS);
+        PermissionContext.bindStore(fx.store);
+        PermissionContext.setSession("s");
+
+        // 注意：这里**不**加 withApprovalWait()。预期就是「要问」，
+        // 带上它就是真的挂到审批 TTL 结束，一条反例会把测试套件拖住五分钟。
+        ToolInvocation inv = fx.pipeline.invoke(
+                ToolRequest.of("s", "exec_command", "{\"command\":\"echo hi\"}", 0, "r1"));
+
+        assertEquals(ToolInvocation.Outcome.PERMISSION_ASK, inv.outcome(),
+                "只开自动编辑时，终端命令仍须用户批准");
+        assertEquals(0, calls.get(), "未批准前不得执行");
+        assertFalse(fx.trace.hasNode("PERM_AUTO"), "不是全自动，不应记全自动放行");
+    }
+
+    @Test
+    void fullAutoExecutesWithoutAnyPermissionAsk() {
+        AtomicInteger calls = new AtomicInteger();
+        Fixture fx = new Fixture("ask", execRegistry(calls));
+        // 用户明确打开「自动编辑 + 自动确认」
+        PermissionContext.force("s", PermissionMode.ACCEPT_EDITS, ConfirmPolicy.AUTO, true);
+
+        ToolInvocation inv = fx.pipeline.invoke(
+                ToolRequest.of("s", "exec_command", "{\"command\":\"echo hi\"}", 0, "r1")
+                        .withApprovalWait());
+
+        assertEquals(ToolInvocation.Outcome.EXECUTED, inv.outcome());
+        assertEquals(1, calls.get());
+        assertFalse(fx.trace.hasNode("WAITING_FOR_HUMAN"), "全自动不应产生批准入口");
+        assertTrue(fx.trace.hasNode("PERM_AUTO"),
+                "必须留下「被全自动放行」的轨迹，否则事后无法与本来就免授权的调用区分");
+    }
+
+    @Test
+    void switchingToFullAutoMidTaskStopsFurtherAsks() {
+        AtomicInteger calls = new AtomicInteger();
+        Fixture fx = new Fixture("ask", execRegistry(calls));
+
+        // 任务进行中：默认模式 + 危险确认 → 第一步仍要批准
+        ToolInvocation first = fx.pipeline.invoke(
+                ToolRequest.of("s", "exec_command", "{\"command\":\"echo 1\"}", 0, "r1"));
+        assertEquals(ToolInvocation.Outcome.PERMISSION_ASK, first.outcome());
+        assertEquals(0, calls.get());
+
+        // 用户不改任务、只把两个开关打开
+        PermissionContext.force("s", PermissionMode.ACCEPT_EDITS, ConfirmPolicy.AUTO, true);
+
+        ToolInvocation second = fx.pipeline.invoke(
+                ToolRequest.of("s", "exec_command", "{\"command\":\"echo 2\"}", 0, "r2")
+                        .withApprovalWait());
+        assertEquals(ToolInvocation.Outcome.EXECUTED, second.outcome(),
+                "切换之后后续步骤不得再询问");
+        assertEquals(1, calls.get());
+    }
+
+    @Test
+    void fullAutoDoesNotBypassExecBlock() {
+        AtomicInteger calls = new AtomicInteger();
+        Fixture fx = new Fixture("block", execRegistry(calls));
+        PermissionContext.force("s", PermissionMode.ACCEPT_EDITS, ConfirmPolicy.AUTO, true);
+
+        ToolInvocation inv = fx.pipeline.invoke(
+                ToolRequest.of("s", "exec_command", "{}", 0, "r1").withApprovalWait());
+
+        assertEquals(ToolInvocation.Outcome.POLICY_DENIED, inv.outcome(),
+                "全自动是「不询问」，不是「允许执行」；禁止档仍是硬拒绝");
+        assertEquals(0, calls.get());
+        assertTrue(fx.trace.hasNode("PERM_DENY"));
+    }
+
+    @Test
+    void autoConfirmAloneKeepsAskingForExec() {
+        AtomicInteger calls = new AtomicInteger();
+        Fixture fx = new Fixture("ask", execRegistry(calls));
+        // 只开「自动确认」，没开「自动编辑」
+        PermissionContext.force("s", PermissionMode.DEFAULT, ConfirmPolicy.AUTO, true);
+
+        ToolInvocation inv = fx.pipeline.invoke(
+                ToolRequest.of("s", "exec_command", "{}", 0, "r1"));
+
+        assertEquals(ToolInvocation.Outcome.PERMISSION_ASK, inv.outcome());
+        assertEquals(0, calls.get());
+    }
+
+    @Test
+    void approvalResumesTheOriginalInvocationExactlyOnce() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        Fixture fx = new Fixture("ask", execRegistry(calls));
+        String args = "{\"command\":\"echo one\"}";
+        AskGrant grant = fx.store.issueAskGrant("s", "exec_command", args, 30_000L);
+        AtomicReference<ToolInvocation> result = new AtomicReference<>();
+        Thread worker = new Thread(() -> result.set(fx.pipeline.invoke(
+                ToolRequest.of("s", "exec_command", args, 0, "r1")
+                        .withApprovalWait())));
+        worker.start();
+        long deadline = System.currentTimeMillis() + 2_000L;
+        while (!fx.store.hasAttachedAskResume("s", grant.token())
+                && System.currentTimeMillis() < deadline) {
+            Thread.yield();
+        }
+        assertTrue(fx.store.hasAttachedAskResume("s", grant.token()));
+        assertTrue(fx.store.grantAskTokenForResume("s", grant.token(), "exec_command").isPresent());
+        worker.join(2_000L);
+
+        assertFalse(worker.isAlive(), "原调用应在批准后完成");
+        assertEquals(ToolInvocation.Outcome.EXECUTED, result.get().outcome());
+        assertEquals(1, calls.get());
+        assertFalse(fx.store.isAskGranted("s", "exec_command", "{\"command\":\"echo one\"}"),
+                "单次续跑批准不能持久化为可重放 grant");
+    }
+
+    @Test
+    void denyingApprovalWakesOriginalInvocationWithoutExecuting() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        Fixture fx = new Fixture("ask", execRegistry(calls));
+        AskGrant grant = fx.store.issueAskGrant("s", "exec_command", "{}", 30_000L);
+        AtomicReference<ToolInvocation> result = new AtomicReference<>();
+        Thread worker = new Thread(() -> result.set(fx.pipeline.invoke(
+                ToolRequest.of("s", "exec_command", "{}", 0, "r1").withApprovalWait())));
+        worker.start();
+        long deadline = System.currentTimeMillis() + 2_000L;
+        while (!fx.store.hasAttachedAskResume("s", grant.token())
+                && System.currentTimeMillis() < deadline) {
+            Thread.yield();
+        }
+        assertTrue(fx.store.hasAttachedAskResume("s", grant.token()));
+        assertTrue(fx.store.denyAskToken("s", grant.token(), "exec_command"));
+        worker.join(2_000L);
+
+        assertFalse(worker.isAlive(), "拒绝应結束原调用的等待");
+        assertEquals(ToolInvocation.Outcome.PERMISSION_DENIED, result.get().outcome());
+        assertEquals(0, calls.get());
     }
 
     @Test

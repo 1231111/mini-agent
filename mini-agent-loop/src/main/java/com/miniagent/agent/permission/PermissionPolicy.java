@@ -73,17 +73,42 @@ public final class PermissionPolicy {
     }
 
     /**
+     * 是否处于「全自动」：**自动编辑（{@link PermissionMode#ACCEPT_EDITS}）+ 自动确认（{@link ConfirmPolicy#AUTO}）同时开启**。
+     *
+     * <p>这是产品规则，不是性能优化：用户把这两个开关都打开，表达的是「这条任务我不要被打断」，
+     * 因此后续任何一步都不应再弹授权框，包括运行中切换设置之后的步骤。
+     * 判定必须集中在这里 —— 散落到各个工具里写一遍，就会出现「某些工具还问、某些不问」的
+     * 半实现状态，用户看到的就是同一个开关在不同步骤上行为不一致。</p>
+     *
+     * <p>两个开关单独开启都<b>不</b>构成全自动：
+     * 只开「自动编辑」只跳过编辑类工具的二次询问；只开「自动确认」只跳过待办危险步确认。
+     * 这一点由 {@code acceptEditsMustNotPromoteExecPolicyToAllow} 等回归锁守着。</p>
+     *
+     * <p>全自动也<b>不</b>越过这些硬约束：
+     * <ul>
+     *   <li>{@code exec-policy=block}：由 {@link #isExecBlocked} 在调用方先行拒绝，没有批准入口；</li>
+     *   <li>{@link PermissionMode#READ_ONLY}：只读白名单之外一律要授权（枚举上也不可能同时是 ACCEPT_EDITS）；</li>
+     *   <li>命令级黑名单 / 危险模式 / 注入检测：在 {@code ToolExecutionGuards} 里，与授权档位无关，永远生效。</li>
+     * </ul>
+     */
+    public static boolean isFullAuto(PermissionMode mode, ConfirmPolicy confirmPolicy) {
+        return mode == PermissionMode.ACCEPT_EDITS
+                && (confirmPolicy == null ? ConfirmPolicy.DANGEROUS : confirmPolicy) == ConfirmPolicy.AUTO;
+    }
+
+    /**
      * 执行前是否必须有本会话 grant。
      *
-     * <p>传进来的必须是 {@link #effectiveExecPolicy} 的结果（已经计入会话模式），
-     * 不要传原始配置值 —— 否则 ACCEPT_EDITS 的提升会失效。
+     * <p>传进来的 {@code effectiveExecPolicy} 必须是 {@link #effectiveExecPolicy} 的结果
+     * （已经计入会话模式），不要传原始配置值。</p>
      *
      * <p>BLOCK 不在这里处理：它的语义是"直接拒绝"，不是"弹批准"。
      * 调用方必须先问 {@link #isExecBlocked}（见 {@code ToolPipeline}）。
-     * 这里返回 false 只是"不产生批准入口"，不代表放行。
+     * 这里返回 false 只是"不产生批准入口"，不代表放行。</p>
      */
     public static boolean needsSessionGrant(
-            PermissionMode mode, String toolName, ExecPolicy effectiveExecPolicy) {
+            PermissionMode mode, String toolName, ExecPolicy effectiveExecPolicy,
+            ConfirmPolicy confirmPolicy) {
         if (Objects.isNull(toolName)) {
             return false;
         }
@@ -101,10 +126,16 @@ public final class PermissionPolicy {
             // 禁档不该有"批准一下就放行"的路。真正的拒绝在 isExecBlocked。
             return false;
         }
+        if (isFullAuto(mode, confirmPolicy)) {
+            // 全自动：不再产生任何授权入口（含 exec 的 ask 档、http_post、MCP 工具）。
+            // 放在 BLOCK 判定之后：禁止档已经在前置闸门被拒，不该因为该分支被误读成放行。
+            return false;
+        }
         if (isExec) {
             // exec 只认 exec 策略：ask 就必须拿到本会话 grant。
-            // 刻意不在这里看会话模式 —— ACCEPT_EDITS（"自动编辑"）跳过的是编辑类工具的二次询问，
-            // 不是"任意 shell 免批"；那个结论必须由用户显式把策略切成 allow 才能得到。
+            // 刻意不在这里看会话模式 —— ACCEPT_EDITS（"自动编辑"）单独开启时跳过的是
+            // 编辑类工具的二次询问，不是"任意 shell 免批"；免批只能来自
+            // 「自动编辑 + 自动确认」的组合（isFullAuto）或显式 allow 档。
             return exec == ExecPolicy.ASK;
         }
         if (mode == PermissionMode.ACCEPT_EDITS) {

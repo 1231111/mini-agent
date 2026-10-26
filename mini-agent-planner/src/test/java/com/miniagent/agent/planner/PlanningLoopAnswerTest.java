@@ -1,7 +1,6 @@
 package com.miniagent.agent.planner;
 
 import com.miniagent.agent.core.AgentLoop;
-import com.miniagent.agent.task.TaskSignals;
 import com.miniagent.agent.tool.ToolErrorCode;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import org.junit.jupiter.api.Test;
@@ -82,7 +81,7 @@ class PlanningLoopAnswerTest {
 
     @Test
     void clarifyReplyRecompiles() {
-        Goal goal = new Goal("g1", "做点什么", TaskSignals.NONE.describe(),
+        Goal goal = new Goal("g1", "做点什么", "",
                 Goal.TASK_TYPE_CLARIFY, Map.of(), List.of(), List.of());
         TaskGraph graph = GoalCompiler.clarifyGraph();
         assertTrue(PlanningLoop.shouldRecompileClarify(goal, graph, "写一个 hello.txt"));

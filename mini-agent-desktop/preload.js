@@ -135,11 +135,12 @@ contextBridge.exposeInMainWorld('api', {
   }
 });
 
-/* Windows 不画标题栏。macOS 只补红绿灯旁边的拖拽区。 */
+/* 完整客户端显示平台标题栏；启动投影页通过 html.ma-boot-stage 暂时隐藏自绘栏。 */
 (function installTitlebar() {
-  // Windows 不再画这条栏（名字、绿点、最小化/最大化/关闭都不要）。
-  // 关闭：Alt+F4 缩到托盘，托盘菜单里退出。拖动：按住侧栏或登录页的名字。
-  if (process.platform !== 'darwin') {
+  const IS_MAC = process.platform === 'darwin';
+  const bootStage = location.protocol === 'file:' &&
+    /\/src\/index\.html$/i.test(decodeURIComponent(location.pathname));
+  if (!IS_MAC) {
     const drag = document.createElement('style');
     drag.textContent = '.sb-logo,.logo{-webkit-app-region:drag;}';
     const mount = () => {
@@ -152,10 +153,8 @@ contextBridge.exposeInMainWorld('api', {
     } else {
       mount();
     }
-    return;
   }
   const BAR_HEIGHT = 32;
-  const IS_MAC = true;
 
   // 直接走 ipcRenderer，不经过 window.electronAPI —— 后者是 exposeInMainWorld
   // 挂到页面主世界的，而这里（含事件监听器）跑在 preload 的隔离上下文里，
@@ -208,6 +207,7 @@ contextBridge.exposeInMainWorld('api', {
       '  z-index:2147483647;',
       '  padding-left:' + (IS_MAC ? 78 : 12) + 'px;',  // mac 给红绿灯让位
       '}',
+      '#ma-titlebar .ma-tb-brand{padding-left:12px;font-weight:600;letter-spacing:.02em;}',
       '#ma-titlebar .ma-tb-btns{margin-left:auto;display:flex;height:100%;',
       '  -webkit-app-region:no-drag;}',
       '#ma-titlebar .ma-tb-btn{width:46px;height:100%;border:0;padding:0;',
@@ -216,9 +216,14 @@ contextBridge.exposeInMainWorld('api', {
       '#ma-titlebar .ma-tb-btn:hover{background:var(--surface2,#2a2e36);',
       '  color:var(--text,#f3f4f6);}',
       '#ma-titlebar .ma-tb-btn.ma-tb-close:hover{background:#e81123;color:#fff;}',
-      'html.ma-titlebar-hidden #ma-titlebar{display:none;}'
+      'html.ma-titlebar-hidden #ma-titlebar{display:none;}',
+      'html.ma-boot-stage #ma-titlebar{display:none;}',
+      'html.ma-boot-stage body{padding-top:0!important;}'
     ].join('\n');
     document.head.appendChild(style);
+    if (bootStage) {
+      document.documentElement.classList.add('ma-boot-stage');
+    }
 
     const bar = document.createElement('div');
     bar.id = 'ma-titlebar';
@@ -226,6 +231,7 @@ contextBridge.exposeInMainWorld('api', {
     bar.innerHTML =
       // mac 用系统红绿灯，不画按钮。不写产品名：侧栏和登录页已经有。
       (IS_MAC ? '' :
+        '<div class="ma-tb-brand">MiniAgent</div>' +
         '<div class="ma-tb-btns">' +
           '<button class="ma-tb-btn ma-tb-min"  aria-label="最小化">' + SVG.min + '</button>' +
           '<button class="ma-tb-btn ma-tb-max"  aria-label="最大化">' + SVG.max + '</button>' +
@@ -238,7 +244,7 @@ contextBridge.exposeInMainWorld('api', {
     const cs = window.getComputedStyle(document.body);
     const origPad = parseInt(cs.paddingTop, 10) || 0;
     document.body.style.boxSizing = 'border-box';
-    document.body.style.paddingTop = (origPad + BAR_HEIGHT) + 'px';
+    document.body.style.paddingTop = bootStage ? '0px' : (origPad + BAR_HEIGHT) + 'px';
 
     // 双击标题栏空白 = 最大化/还原（Windows 原生习惯）
     bar.addEventListener('dblclick', (e) => {
@@ -261,7 +267,7 @@ contextBridge.exposeInMainWorld('api', {
         btnMax.setAttribute('aria-label', maximized ? '还原' : '最大化');
         const hidden = !!(state && state.fullscreen);
         document.documentElement.classList.toggle('ma-titlebar-hidden', hidden);
-        document.body.style.paddingTop = hidden ? '0px' : (origPad + BAR_HEIGHT) + 'px';
+        document.body.style.paddingTop = hidden || bootStage ? '0px' : (origPad + BAR_HEIGHT) + 'px';
       };
       winCtl.getState().then(applyState);
       winCtl.onStateChanged(applyState);

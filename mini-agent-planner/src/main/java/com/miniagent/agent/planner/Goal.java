@@ -4,11 +4,11 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 结构化目标：任务信号下游、TaskGraph 上游。
+ * 结构化目标：TaskGraph 的上游。
  *
- * <p>{@code signals} 是本轮从用户消息里观察到的事实清单（逗号分隔），
- * 由 {@link com.miniagent.agent.task.TaskSignals#describe()} 产出，只作审计与提示用，
- * 不参与任何分支判断 —— 需要判断的地方都直接读对应的那个信号。</p>
+ * <p>{@code signals} 是历史遗留的审计字段。任务信号层已在 2026-10-22 删除，
+ * 新编译结果这里恒为空串；保留字段是为了让已持久化的旧快照仍能反序列化。
+ * 它不参与任何分支判断。</p>
  */
 public record Goal(
         String goalId,

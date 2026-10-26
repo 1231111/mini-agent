@@ -2,8 +2,6 @@ package com.miniagent.agent.hook;
 
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.task.TaskPlan;
-import com.miniagent.agent.task.TaskSignals;
-import com.miniagent.common.ErrorCode;
 import com.miniagent.common.MessageConstants;
 import org.junit.jupiter.api.Test;
 
@@ -18,38 +16,27 @@ class TodoPlanStopHookTest {
 
     @Test
     void plannerOwnedDoesNotDemandTodoSet() {
-        StopDecision d = hook.evaluate(ctx(false, true, false, false, 0, 0));
-        assertTrue(d.isProceed());
-    }
-
-    @Test
-    void directMissingPlanBlocks() {
-        StopDecision d = hook.evaluate(ctx(true, false, false, false, 0, 0));
-        assertEquals(StopDecision.Action.BLOCK_RETRY, d.action());
-        assertEquals(ErrorCode.TODO_STOP_MISSING_PLAN.getCode(), d.reason());
-        assertEquals(MessageConstants.STOP_NEED_TODO_PLAN, d.message());
-    }
-
-    @Test
-    void directMissingPlanGivesUpAfterNudges() {
-        StopDecision d = hook.evaluate(ctx(true, false, false, false,
-                TodoPlanStopHook.MAX_NUDGES, 0));
+        StopDecision d = hook.evaluate(ctx(true, false, false, 0));
         assertTrue(d.isProceed());
     }
 
     @Test
     void directIncompleteBlocks() {
-        StopDecision d = hook.evaluate(ctx(false, false, true, true, 0, 0));
+        StopDecision d = hook.evaluate(ctx(false, true, true, 0));
         assertEquals(StopDecision.Action.BLOCK_RETRY, d.action());
-        assertEquals(ErrorCode.TODO_STOP_INCOMPLETE.getCode(), d.reason());
+        assertEquals(com.miniagent.common.ErrorCode.TODO_STOP_INCOMPLETE.getCode(), d.reason());
     }
 
     @Test
-    void lightQaIgnoresLeftoverTodos() {
-        StopContext c = new StopContext(
-                "s", "你好", 0, 8, Set.of(), false, false, false, false,
-                PermissionMode.DEFAULT, true, true, false, true, true, 0, 0, "todo");
-        assertTrue(hook.evaluate(c).isProceed());
+    void directIncompleteGivesUpAfterNudges() {
+        StopDecision d = hook.evaluate(ctx(false, true, true, TodoPlanStopHook.MAX_NUDGES));
+        assertTrue(d.isProceed());
+    }
+
+    /** 模型不建计划就收尾，不再被拦：是否拆解由模型自己决定。 */
+    @Test
+    void missingPlanIsNoLongerBlocked() {
+        assertTrue(hook.evaluate(ctx(false, false, false, 0)).isProceed());
     }
 
     @Test
@@ -64,20 +51,20 @@ class TodoPlanStopHookTest {
 
     @Test
     void graphOwnedPromptDoesNotAskTodoSet() {
-        TaskPlan plan = TaskPlan.of("写报告", true, TaskSignals.parse("file"));
+        TaskPlan plan = TaskPlan.of("写报告");
         String owned = plan.toPromptBlock(true);
         String direct = plan.toPromptBlock(false);
         assertTrue(owned.contains(MessageConstants.TASK_GRAPH_OWNED));
+        assertTrue(direct.contains("直接执行用户目标"));
         assertTrue(!owned.contains("仅清单为空时才"));
-        assertTrue(direct.contains("仅清单为空时才"));
+        assertTrue(!direct.contains("仅清单为空时才"));
     }
 
-    private static StopContext ctx(boolean structured, boolean plannerOwned,
-                                   boolean hasPlan, boolean runnable,
-                                   int missingNudges, int incompleteNudges) {
+    private static StopContext ctx(boolean plannerOwned, boolean hasPlan,
+                                   boolean runnable, int incompleteNudges) {
         return new StopContext(
-                "s", "done", 0, 8, Set.of(), false, false, structured, false,
-                PermissionMode.DEFAULT, true, false, plannerOwned, hasPlan, runnable,
-                missingNudges, incompleteNudges, "list");
+                "s", "done", 0, 8, Set.of(), false, false, false,
+                PermissionMode.DEFAULT, true, plannerOwned, hasPlan, runnable,
+                incompleteNudges, "list");
     }
 }

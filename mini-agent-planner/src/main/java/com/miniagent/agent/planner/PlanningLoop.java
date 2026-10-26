@@ -6,7 +6,6 @@ import com.miniagent.agent.core.ExecutionTurnContext;
 import com.miniagent.agent.core.LoopTurnContext;
 import com.miniagent.agent.core.NodeExecutor;
 import com.miniagent.agent.task.TaskPlan;
-import com.miniagent.agent.task.TaskSignals;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.ToolResult;
 import com.miniagent.agent.planner.TaskNodeStatus;
@@ -38,7 +37,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 /**
@@ -248,10 +246,9 @@ public class PlanningLoop {
                       String sessionId,
                       String fencingToken,
                       String executionId,
-                      Consumer<String> progress,
                       AgentStreamSink streamSink) {
         return runWithOutcome(chat, systemPrompt, userMessage, multimodalUser, history, taskPlan,
-                sessionId, fencingToken, executionId, progress, streamSink).answer();
+                sessionId, fencingToken, executionId, streamSink).answer();
     }
 
     public RunOutcome runWithOutcome(ChatModel chat,
@@ -263,16 +260,15 @@ public class PlanningLoop {
                       String sessionId,
                       String fencingToken,
                       String executionId,
-                      Consumer<String> progress,
                       AgentStreamSink streamSink) {
         if (!shouldHandle(taskPlan, sessionId, userMessage)) {
             // 直跑路径：结局由 AgentLoop 自己判定，规划器不替它宣称完成
             if (multimodalUser != null) {
                 return RunOutcome.direct(nodeExecutor.runDirectMultimodal(chat, systemPrompt,
-                        multimodalUser, history, 90, progress, taskPlan, streamSink));
+                        multimodalUser, history, 90, taskPlan, streamSink));
             }
             return RunOutcome.direct(nodeExecutor.runDirect(chat, systemPrompt, userMessage, history,
-                    90, progress, taskPlan, streamSink));
+                    90, taskPlan, streamSink));
         }
 
         GoalCompiler.CompileResult compiled;
@@ -288,7 +284,7 @@ public class PlanningLoop {
                         existing.get().execution().get(
                                 PlannerStateStore.EXECUTION_PLAN_APPROVAL));
         boolean resume = PlannerResumePolicy.shouldResume(
-                taskPlan.signals(), userMessage,
+                userMessage,
                 awaitingGraph,
                 incompleteGraph,
                 awaitingPlanApproval);
@@ -312,7 +308,7 @@ public class PlanningLoop {
                 log.warn("PlanningLoop 澄清后任务图仍无法验收，降级直跑 session={} code={}",
                         sessionId, ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
                 return directFallback(chat, systemPrompt, merged, multimodalUser,
-                        history, nextPlan, progress, streamSink);
+                        history, nextPlan, streamSink);
             }
             String execId = StringUtils.isNotBlank(executionId)
                     ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
@@ -340,20 +336,15 @@ public class PlanningLoop {
             log.info("PlanningLoop 续跑已有图 session={} version={} nodes={}",
                     sessionId, snap.version(), snap.graph().nodes().size());
 
-            // ===== 用户明确说「接着做」时的进度汇报 =====
-            if (taskPlan.signals().continueTask()) {
-                String summary = buildContinueTaskSummary(snap, userMessage);
-                if (progress != null) {
-                    progress.accept(summary);
-                }
-                // 检查上一个任务的状态
-                String statusCheck = checkPreviousTaskStatus(snap);
-                if (statusCheck != null) {
-                    log.info("PlanningLoop 上一个任务状态检查: {}", statusCheck);
-                    if (progress != null) {
-                        progress.accept(statusCheck);
-                    }
-                }
+            // ===== 续跑已有图时的进度汇报 =====
+            // 走到这里就说明本轮被判定为续跑，不再额外看「用户是否说了继续」。
+            // 汇报只进日志与 trace：对话区不再展示执行过程，用户看 todo 条与最终答案。
+            String summary = buildContinueTaskSummary(snap, userMessage);
+            log.info("PlanningLoop 续跑汇报: {}", summary);
+            // 检查上一个任务的状态
+            String statusCheck = checkPreviousTaskStatus(snap);
+            if (statusCheck != null) {
+                log.info("PlanningLoop 上一个任务状态检查: {}", statusCheck);
             }
             // ===========================================
 
@@ -367,7 +358,7 @@ public class PlanningLoop {
                 log.warn("PlanningLoop 任务图验收失败，降级直跑 session={} code={}",
                         sessionId, ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
                 return directFallback(chat, systemPrompt, userMessage, multimodalUser,
-                        history, taskPlan, progress, streamSink);
+                        history, taskPlan, streamSink);
             }
             String execId = StringUtils.isNotBlank(executionId)
                     ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
@@ -411,10 +402,6 @@ public class PlanningLoop {
         if (compiled.degraded()) {
             log.warn("PlanningLoop 使用降级编译结果执行 session={} source={} reason={}",
                     sessionId, compiled.source(), compiled.fallbackReason());
-            if (progress != null) {
-                progress.accept("规划模型未返回有效任务图，本轮使用降级编译结果；"
-                        + "完成情况可能弱于模型规划，可在 trace 的 GOAL_COMPILED 查看 source。");
-            }
         }
 
         String lastAnswer = "";
@@ -559,7 +546,7 @@ public class PlanningLoop {
             }
             StepExec step = executeProposal(chat, systemPrompt, stepUser,
                     multimodalUser, history, taskPlan, proposal, snap.graph(),
-                    snap.version(), sessionId, progress, streamSink);
+                    snap.version(), sessionId, streamSink);
             lastAnswer = keepBetterAnswer(lastAnswer, step.text());
             boolean drifted = step.drifted();
             boolean quotaAbort = isResourceQuotaAbort(step.endReason())
@@ -848,7 +835,6 @@ public class PlanningLoop {
     static boolean isResourceQuotaAbort(String endReason) {
         return AgentLoop.RESOURCE_QUOTA_EXCEEDED.equals(endReason)
                 || "TENANT_QUOTA_EXCEEDED".equals(endReason)
-                || "TOKEN_BUDGET_EXCEEDED".equals(endReason)
                 || "TOOL_BUDGET_EXCEEDED".equals(endReason);
     }
 
@@ -963,7 +949,6 @@ public class PlanningLoop {
                                      TaskGraph graph,
                                      long dispatchStateVersion,
                                      String sessionId,
-                                     Consumer<String> progress,
                                      AgentStreamSink streamSink) {
         List<String> allowed = toolRouter.allowedFor(
                 proposal, graph, properties.isHardProposal());
@@ -1024,7 +1009,7 @@ public class PlanningLoop {
             }
             AgentLoop.LoopOutcome out;
             out = nodeExecutor.execute(chat, focus, userMessage, multimodalUser,
-                    history, maxIter, progress, taskPlan, streamSink);
+                    history, maxIter, taskPlan, streamSink);
             int chunks = 1;
             int maxChunks = Math.max(1, properties.getProposalMaxChunks());
             while (shouldResumeChunk(out.endReason(), chunks, maxChunks)) {
@@ -1032,7 +1017,7 @@ public class PlanningLoop {
                 ArrayList<ChatMessage> live = new ArrayList<>(out.messages());
                 live.add(new SystemMessage(MessageConstants.PLANNER_CONTINUE_HINT));
                 out = nodeExecutor.continueNode(chat, live, userMessage,
-                        maxIter, progress, taskPlan, streamSink);
+                        maxIter, taskPlan, streamSink);
                 chunks++;
             }
             return new StepExec(out.text(), out.endReason(), policy.consumeDrift(),
@@ -1468,14 +1453,14 @@ public class PlanningLoop {
     /** 编译/验收失败后的直跑降级：多模态走多模态直跑，否则走文本直跑。结局由 AgentLoop 自己判定。 */
     private RunOutcome directFallback(ChatModel chat, String systemPrompt, String userMessage,
                                       UserMessage multimodalUser, List<ChatMessage> history,
-                                      TaskPlan taskPlan, Consumer<String> progress,
+                                      TaskPlan taskPlan,
                                       AgentStreamSink streamSink) {
         if (multimodalUser != null) {
             return RunOutcome.direct(nodeExecutor.runDirectMultimodal(chat, systemPrompt,
-                    multimodalUser, history, 90, progress, taskPlan, streamSink));
+                    multimodalUser, history, 90, taskPlan, streamSink));
         }
         return RunOutcome.direct(nodeExecutor.runDirect(chat, systemPrompt, userMessage, history,
-                90, progress, taskPlan, streamSink));
+                90, taskPlan, streamSink));
     }
 
     private GoalCompiler.CompileResult compileAndValidate(ChatModel chat,

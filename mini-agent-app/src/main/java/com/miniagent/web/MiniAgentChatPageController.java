@@ -20,6 +20,7 @@ import com.miniagent.config.service.UserModelConfigService;
 import com.miniagent.config.storage.MediaStorage;
 import com.miniagent.agent.permission.ConfirmPolicy;
 import com.miniagent.agent.permission.PermissionMode;
+import com.miniagent.agent.permission.PermissionPolicy;
 import com.miniagent.agent.permission.SessionPermissionStore;
 import com.miniagent.agent.planner.PlannerStateStore;
 import com.miniagent.agent.planner.StateSnapshot;
@@ -51,9 +52,11 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.core.io.UrlResource;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -68,6 +71,7 @@ import org.springframework.web.multipart.MultipartFile;
 import com.miniagent.agent.web.UploadedDocumentService;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -119,6 +123,8 @@ public class MiniAgentChatPageController {
     private  com.miniagent.agent.trace.TraceSseHub traceSseHub;
     @Autowired
     private  com.miniagent.agent.core.SessionEventCenter eventCenter;
+    @Autowired
+    private  com.miniagent.agent.todo.TaskTodoStore taskTodoStore;
     @Autowired
     private  JwtSessionService jwtSessionService;
     @Autowired
@@ -469,6 +475,7 @@ public class MiniAgentChatPageController {
                 permissionStore.setConfirmPolicy(
                         sessionId, ConfirmPolicy.from(req.getConfirmPolicy()));
             }
+            releaseAsksWhenFullAuto(sessionId);
         }
         List<String> images = Objects.isNull(req.getImages()) ? List.of() : req.getImages();
         List<FileAttachment> files = Objects.isNull(req.getFiles()) ? List.of() : req.getFiles();
@@ -567,6 +574,156 @@ public class MiniAgentChatPageController {
         }
     }
 
+    /**
+     * 工作区图片的受控读端点。
+     *
+     * <h2>为什么需要它</h2>
+     *
+     * <p>{@code write_file} 的相对路径落在 {@code workspace/}，而工作区<b>没有任何静态资源映射</b>
+     * （{@code /api/generated-media/**} 只服务 {@code media/generated/<owner>/}，见
+     * {@link MediaStorage#generatedRoot()}）。所以"模型手写一张 SVG 存成文件"这条降级路
+     * 以前是完全看不见的：文件确实写成功了，对话里只剩一段文本 —— 图必然裂。
+     *
+     * <h2>边界</h2>
+     *
+     * <ul>
+     *   <li>只认工作区<b>根目录下的扁平文件名</b>：解析后父目录必须就是根（{@link Path#getParent()}
+     *       精确相等），{@code ../} 与子目录一律 404，端点不能被用来遍历目录树。</li>
+     *   <li>只放行图片类：{@link #approvedInlineMediaType} 判定结果必须 {@code startsWith("image/")}，
+     *       工作区里的 md / java / 配置文本一律 415。</li>
+     *   <li>必须登录（{@code anyRequest().authenticated()}），响应仍走 {@link MediaResponses}，
+     *       自带 {@code X-Content-Type-Options: nosniff} 与
+     *       {@code Content-Security-Policy: default-src 'none'; sandbox}。</li>
+     * </ul>
+     *
+     * <p><b>已知取舍：</b>工作区是单实例共享目录，没有 owner 维度，登录用户之间能互读对方工作区里的
+     * 图片。这是 {@code write_file} 的落点决定的现状；本端点只把"图片"这一小类放开，不扩大到全文。
+     */
+    @GetMapping("/api/workspace-media/{filename}")
+    @ResponseBody
+    public ResponseEntity<?> serveWorkspaceMedia(@PathVariable("filename") String filename,
+                                                 HttpServletRequest request) {
+        Object rawPrincipal = request == null ? null
+                : request.getAttribute(JwtSessionService.ATTR_PRINCIPAL);
+        if (!(rawPrincipal instanceof AuthenticatedUser)) {
+            return ResponseEntity.status(401).body("Authentication required");
+        }
+        if (!safeFlatFileName(filename)) {
+            return ResponseEntity.badRequest().body("Illegal path");
+        }
+        try {
+            Path media = resolveWorkspaceMedia(mediaStorage.workspaceDir(), filename);
+            if (Objects.isNull(media)) {
+                return ResponseEntity.notFound().build();
+            }
+            String contentType = approvedInlineMediaType(filename, media);
+            if (contentType == null || !contentType.startsWith("image/")) {
+                return ResponseEntity.status(415).body("Unsupported media type");
+            }
+            return MediaResponses.serve(media, filename, contentType, request);
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError().body("Failed to read media");
+        }
+    }
+
+    /**
+     * 登录后下载工作区根目录下的生成文件。
+     *
+     * <p>只接受扁平文件名，拒绝目录遍历、隐藏文件和越出工作区根的符号链接；
+     * 不限制扩展名，因为模型可以生成 docx、xlsx、pdf、html 等交付物。
+     * 响应使用 attachment，浏览器导航会触发保存而非把内容当页面打开。
+     */
+    @GetMapping("/api/workspace-download/{filename}")
+    @ResponseBody
+    public ResponseEntity<?> downloadWorkspaceFile(@PathVariable("filename") String filename,
+                                                   HttpServletRequest request) {
+        Object rawPrincipal = request == null ? null
+                : request.getAttribute(JwtSessionService.ATTR_PRINCIPAL);
+        if (!(rawPrincipal instanceof AuthenticatedUser)) {
+            return ResponseEntity.status(401).body("Authentication required");
+        }
+        if (!safeFlatFileName(filename)) {
+            return ResponseEntity.badRequest().body("Illegal path");
+        }
+        try {
+            Path file = resolveWorkspaceDownload(mediaStorage.workspaceDir(), filename);
+            if (file == null) {
+                return ResponseEntity.notFound().build();
+            }
+            long size = Files.size(file);
+            String contentType = Optional.ofNullable(Files.probeContentType(file))
+                    .orElse(MediaType.APPLICATION_OCTET_STREAM_VALUE);
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.parseMediaType(contentType));
+            headers.setContentLength(size);
+            headers.setContentDisposition(ContentDisposition.attachment()
+                    .filename(filename, StandardCharsets.UTF_8)
+                    .build());
+            headers.set("X-Content-Type-Options", "nosniff");
+            headers.set(HttpHeaders.CACHE_CONTROL, "private, no-store");
+            return ResponseEntity.ok().headers(headers).body(new UrlResource(file.toUri()));
+        } catch (Exception e) {
+            log.warn("工作区文件下载失败 filename={}", filename, e);
+            return ResponseEntity.internalServerError().body("Failed to read file");
+        }
+    }
+
+    /**
+     * 工作区文件名 → 图片文件；不满足图片白名单就返回 null。
+     */
+    static Path resolveWorkspaceMedia(Path workspaceRoot, String filename) {
+        Path media = resolveWorkspaceDownload(workspaceRoot, filename);
+        if (media == null) {
+            return null;
+        }
+        try {
+            return approvedInlineMediaType(filename, media) != null ? media : null;
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 工作区文件名 → 真实文件；不满足"根目录下的普通文件"就返回 null。
+     * realpath 校验会拒绝符号链接指向根目录外的文件。
+     */
+    static Path resolveWorkspaceDownload(Path workspaceRoot, String filename) {
+        if (Objects.isNull(workspaceRoot) || !safeFlatFileName(filename)) {
+            return null;
+        }
+        Path root = workspaceRoot.toAbsolutePath().normalize();
+        Path media = root.resolve(filename).normalize();
+        if (!root.equals(media.getParent()) || !Files.isRegularFile(media)) {
+            return null;
+        }
+        try {
+            if (!root.toRealPath().equals(media.toRealPath().getParent())) {
+                return null;
+            }
+        } catch (Exception e) {
+            return null;
+        }
+        return media;
+    }
+
+    /**
+     * 工作区文件名：允许中文（模型常按内容起名，如 {@code 秋日不打烊-封面.svg}），
+     * 但禁止路径分隔符、{@code ..}、控制字符与隐藏文件。
+     * 越界由 {@code 父目录 == 根目录} 精确比对兜底，不依赖这里。
+     */
+    private static boolean safeFlatFileName(String value) {
+        if (value == null || value.isBlank() || value.length() > 180) {
+            return false;
+        }
+        if (value.contains("..") || value.charAt(0) == '.') {
+            return false;
+        }
+        if (value.indexOf('/') >= 0 || value.indexOf('\\') >= 0) {
+            return false;
+        }
+        return value.chars().noneMatch(c -> c < 0x20);
+    }
+
     private static boolean safePathSegment(String value) {
         return value != null && !value.isBlank()
                 && value.length() <= 180
@@ -574,18 +731,32 @@ public class MiniAgentChatPageController {
                 && !value.contains("..");
     }
 
-    private static String approvedInlineMediaType(String filename, Path file) throws java.io.IOException {
+    /**
+     * 允许在对话区内联展示的媒体类型白名单。
+     *
+     * <p>{@code svg} 是 2026-10-22 加进来的：图片后端不可用时模型会降级成"手写 &lt;svg&gt; 存成文件"
+     * （日志实证 {@code write_file -> workspace/cyberpunk_city_night.svg}），不放行它就永远只有裂图。
+     * 风险面已被两层收住：{@link MediaResponses} 对每个响应下发
+     * {@code X-Content-Type-Options: nosniff} 与 {@code Content-Security-Policy: default-src 'none'; sandbox}
+     * —— {@code <img>} 上下文本来就不执行 SVG 里的脚本，直接打开 URL 也会被 sandbox 和 default-src 拦掉。
+     *
+     * <p>SVG 的系统 MIME 映射在不同机器上不一致（{@code image/svg+xml} / {@code text/plain} /
+     * {@code application/xml}，取决于注册表），所以对 svg 只看扩展名、不信
+     * {@link Files#probeContentType}：信它就等于在没装 SVG 关联的机器上随机 415。
+     */
+    static String approvedInlineMediaType(String filename, Path file) throws java.io.IOException {
         String lower = filename.toLowerCase(Locale.ROOT);
         String expected = lower.endsWith(".png") ? "image/png"
                 : lower.endsWith(".jpg") || lower.endsWith(".jpeg") ? "image/jpeg"
                 : lower.endsWith(".gif") ? "image/gif"
                 : lower.endsWith(".webp") ? "image/webp"
+                : lower.endsWith(".svg") ? "image/svg+xml"
                 : lower.endsWith(".mp3") ? "audio/mpeg"
                 : lower.endsWith(".wav") ? "audio/wav"
                 : lower.endsWith(".mp4") ? "video/mp4"
                 : null;
-        if (expected == null) {
-            return null;
+        if (expected == null || "image/svg+xml".equals(expected)) {
+            return expected;
         }
         String probed = Files.probeContentType(file);
         return probed == null || expected.equalsIgnoreCase(probed) ? expected : null;
@@ -1073,6 +1244,15 @@ public class MiniAgentChatPageController {
                             + "用户已批准 Plan，请按 todo 开始执行写操作与交付。");
             return ApiResponse.ok(permissionView(sessionId));
         }
+        if ("deny_ask".equalsIgnoreCase(action)) {
+            String tool = Objects.isNull(body.get("tool")) ? "" : String.valueOf(body.get("tool"));
+            String token = Objects.isNull(body.get("grantToken")) ? "" : String.valueOf(body.get("grantToken"));
+            if (!permissionStore.denyAskToken(sessionId, token, tool)) {
+                return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN,
+                        "grantToken 无效、已过期或无活动等待调用");
+            }
+            return ApiResponse.ok(permissionView(sessionId));
+        }
         if ("grant_ask".equalsIgnoreCase(action)) {
             String tool = Objects.isNull(body.get("tool")) ? "" : String.valueOf(body.get("tool"));
             Object rawGrantToken = body.get("grantToken");
@@ -1091,15 +1271,11 @@ public class MiniAgentChatPageController {
                 return ApiResponse.fail(ErrorCode.CONFIG_INVALID,
                         "grantToken required; approval must be bound to the displayed invocation");
             }
-            var approved = permissionStore.grantAskToken(sessionId, grantToken, tool);
+            var approved = permissionStore.grantAskTokenForResume(sessionId, grantToken, tool);
             if (approved.isEmpty()) {
                 return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN,
-                        "grantToken 无效、已过期或不属于本会话");
+                        "grantToken 无效、已过期、无活动等待调用或不属于本会话");
             }
-            tool = approved.get().toolName();
-            eventCenter.appendUserMessage(sessionId,
-                    com.miniagent.common.MessageConstants.SYSTEM_MESSAGE_PREFIX
-                            + "用户已批准工具 " + tool + "，请继续。");
             return ApiResponse.ok(permissionView(sessionId));
         }
 
@@ -1138,7 +1314,46 @@ public class MiniAgentChatPageController {
             // 一个字段都没传的请求保持原有行为：回到 default 模式。
             permissionStore.setMode(sessionId, PermissionMode.from("default"));
         }
+        releaseAsksWhenFullAuto(sessionId);
         return ApiResponse.ok(permissionView(sessionId));
+    }
+
+    /**
+     * 全自动生效的瞬间，把本会话已经挂住的两类人工确认一起撤掉。
+     *
+     * <p>后续步骤由 {@code PermissionPolicy} 与 {@code TaskTodoStore.needsConfirmGate}
+     * 直接判定免批，不需要这里处理。这里处理的是**已经挂住**的那部分：</p>
+     * <ul>
+     *   <li>工具授权等待点 —— 工具线程还阻塞着，弹窗也已经显示；</li>
+     *   <li>待办里因危险步闸门停在 {@code awaiting_confirm} 的条目 ——
+     *       模型被告知"等用户在页面确认"，全自动下这一步永远不会有人点。</li>
+     * </ul>
+     *
+     * <p>不放行的话，用户打开两个开关之后仍然要面对一个已经没必要的确认，
+     * 也就仍然会认为「开了自动还在问」。放行是会话内的一次性动作，不写持久授权；
+     * 同时推一条 SSE 事件让页面把弹窗收起来。</p>
+     */
+    private void releaseAsksWhenFullAuto(String sessionId) {
+        if (StringUtils.isBlank(sessionId)) {
+            return;
+        }
+        if (!PermissionPolicy.isFullAuto(
+                permissionStore.getMode(sessionId), permissionStore.getConfirmPolicy(sessionId))) {
+            return;
+        }
+        int releasedAsks = permissionStore.releasePendingAsks(sessionId);
+        // 待办放开后 persist() 会自己推一条 todo 事件，页面上的「待确认」随之变成「进行中」。
+        int releasedItems = Objects.nonNull(taskTodoStore)
+                ? taskTodoStore.releaseConfirmGatedItems(sessionId) : 0;
+        if (releasedAsks <= 0 && releasedItems <= 0) {
+            return;
+        }
+        log.info("全自动已生效，撤销已有确认 session={} 授权等待={} 待办确认={}",
+                sessionId, releasedAsks, releasedItems);
+        if (releasedAsks > 0) {
+            eventCenter.publish(sessionId, "permission_ask_released",
+                    "{\"released\":" + releasedAsks + "}");
+        }
     }
 
     /**

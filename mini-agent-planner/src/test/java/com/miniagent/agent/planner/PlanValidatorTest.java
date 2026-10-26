@@ -1,7 +1,6 @@
 package com.miniagent.agent.planner;
 
 import com.miniagent.agent.task.TaskPlan;
-import com.miniagent.agent.task.TaskSignals;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -116,8 +115,7 @@ class PlanValidatorTest {
     @Test
     void rejectsGoalFileMissingFromGraph() {
         TaskPlan plan = structured("写报告");
-        Goal goal = new Goal("g1", "写报告", TaskSignals.parse("file").describe(),
-                Map.of(), List.of(), List.of("report.md"));
+        Goal goal = new Goal("g1", "写报告", "", Map.of(), List.of(), List.of("report.md"));
         TaskGraph g = new TaskGraph(List.of(
                 node("n1", "获取资料原文", "web")));
         PlanValidationReport report = validator.validate(g, plan, goal);
@@ -128,8 +126,7 @@ class PlanValidatorTest {
 
     @Test
     void rejectsDiagnosticGoalWithResearchNotesGraph() {
-        TaskPlan plan = TaskPlan.of("分析 SenseAudio HTTP 400 报错并给出解决方案", true,
-                TaskSignals.parse("diagnostic,web"));
+        TaskPlan plan = TaskPlan.of("分析 SenseAudio HTTP 400 报错并给出解决方案");
         TaskGraph g = DataflowNormalizer.normalize(new TaskGraph(List.of(
                 node("n1", "获取资料原文", "web"),
                 node("n2", "整理并写入 notes.md", "file_write", List.of("n1")))));
@@ -143,8 +140,7 @@ class PlanValidatorTest {
 
     @Test
     void rejectsDiagnosticSignalWithoutDiagnosticNodeEvenWhenGraphIsStructurallyValid() {
-        TaskPlan plan = TaskPlan.of("定位错误码 429 的失败原因", true,
-                TaskSignals.parse("diagnostic"));
+        TaskPlan plan = TaskPlan.of("定位错误码 429 的失败原因");
         TaskGraph g = new TaskGraph(List.of(
                 node("n1", "读取错误证据", "file_read"),
                 node("n2", "输出普通总结", "deliver", List.of("n1"))));
@@ -156,10 +152,29 @@ class PlanValidatorTest {
                 PlanValidationReport.ValidationError.Type.GOAL_GRAPH_MISMATCH));
     }
 
+    /**
+     * 非诊断目标不套诊断语义：不因为「没有诊断节点」被拒。
+     *
+     * <p>节点用 `research` 而不是 `deliver`：`deliver` 属于 {@code persistsArtifacts} 能力包，
+     * 挂 {@code note_required} 会被 4.2 的落盘验收规则判为 INVALID_DONE_WHEN，
+     * 那样这条用例就测不到自己声明的东西了。</p>
+     */
+    @Test
+    void nonDiagnosticGoalIsNotSubjectToDiagnosticSemantics() {
+        TaskPlan plan = TaskPlan.of("整理今日 AI 技术动态");
+        TaskGraph g = new TaskGraph(List.of(
+                node("n1", "搜索今日 AI 技术", "web"),
+                node("n2", "输出摘要", "research", List.of("n1"))));
+
+        PlanValidationReport report = validator.validate(g, plan);
+        assertEquals(0, report.countByType(
+                PlanValidationReport.ValidationError.Type.GOAL_GRAPH_MISMATCH));
+        assertTrue(report.valid(), "非诊断目标不该被诊断语义拒: " + report.summary());
+    }
+
     @Test
     void rejectsFileDeliveryWhenUserOnlyAskedToSearch() {
-        TaskPlan plan = TaskPlan.of("帮我搜索今日 AI 技术最新动态", true,
-                TaskSignals.parse("web"));
+        TaskPlan plan = TaskPlan.of("帮我搜索今日 AI 技术最新动态");
         TaskGraph g = DataflowNormalizer.normalize(new TaskGraph(List.of(
                 node("n1", "搜索今日 AI 技术", "web"),
                 node("n2", "写入 ai_news_today.md", "file_write", List.of("n1")))));
@@ -171,8 +186,7 @@ class PlanValidatorTest {
 
     @Test
     void acceptsFileDeliveryWhenUserExplicitlyRequestsReport() {
-        TaskPlan plan = TaskPlan.of("搜索今日 AI 技术并整理成 ai_news_today.md", true,
-                TaskSignals.parse("web,file,fileDelivery"));
+        TaskPlan plan = TaskPlan.of("搜索今日 AI 技术并整理成 ai_news_today.md");
         TaskGraph g = DataflowNormalizer.normalize(new TaskGraph(List.of(
                 node("n1", "搜索今日 AI 技术", "web"),
                 node("n2", "写入 ai_news_today.md", "file_write", List.of("n1")))));
@@ -181,8 +195,7 @@ class PlanValidatorTest {
 
     @Test
     void readingExistingFileDoesNotAuthorizeFileWrite() {
-        TaskPlan plan = TaskPlan.of("读取 report.pdf 并总结要点", true,
-                TaskSignals.parse("file,read"));
+        TaskPlan plan = TaskPlan.of("读取 report.pdf 并总结要点");
         TaskGraph g = new TaskGraph(List.of(
                 node("n1", "读取 report.pdf", "file_read"),
                 node("n2", "写入 summary.md", "file_write", List.of("n1"))));
@@ -207,7 +220,7 @@ class PlanValidatorTest {
     }
 
     private static TaskPlan structured(String goal) {
-        return TaskPlan.of(goal, true, TaskSignals.NONE);
+        return TaskPlan.of(goal);
     }
 
     private static TaskNode node(String id, String name, String cap) {

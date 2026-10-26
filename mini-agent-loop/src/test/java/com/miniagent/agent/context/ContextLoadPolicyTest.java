@@ -1,58 +1,49 @@
 package com.miniagent.agent.context;
 
-import com.miniagent.agent.task.TaskSignals;
-import com.miniagent.memory.model.MemoryReadPolicy;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * 本轮上下文加载策略：判据是命中的事实信号，不再是一个类别。
+ * 本轮上下文加载策略：判据只有「会话里有没有挂起的 todo 清单」。
  *
- * <p>这些用例守住的是「一处信号不足以整体降级」——旧实现里一个类别同时决定
- * 历史条数与记忆槽，选错就同时丢两样；现在只有 {@code lightTurn} 会削减记忆槽，
- * 而 {@code lightTurn} 要求问答且无任何动手信号。</p>
+ * <p>原来这里按命中的文本词表分三档（轻问答 / 续任务 / 动手），
+ * 词表层删除后收敛成两档。这些用例守住两件事：
+ * 续跑必须把清单捞回来，新任务必须释放旧清单；
+ * 任何一档都不许把历史或长期记忆砍到不可恢复。</p>
  */
 class ContextLoadPolicyTest {
 
     @Test
-    void 纯问答轮只带用户偏好摘要() {
-        MemoryReadPolicy p = ContextLoadPolicy
-                .forSignals(TaskSignals.parse("question"))
-                .memoryPolicy();
-        assertFalse(p.working());
-        assertFalse(p.longTerm());
-        assertFalse(p.midterm());
-        assertTrue(p.user());
-        assertEquals(200, p.userMaxChars());
-    }
-
-    @Test
-    void 动手轮打开全部检索槽并挂起旧计划() {
-        ContextLoadPolicy p = ContextLoadPolicy.forSignals(TaskSignals.parse("file"));
-        MemoryReadPolicy m = p.memoryPolicy();
-        assertTrue(m.working());
-        assertTrue(m.longTerm());
-        assertTrue(m.user());
-        assertFalse(m.midterm());
-        assertTrue(p.suspendActiveTodo());
-        assertFalse(p.resumeSuspendedTodo());
-    }
-
-    @Test
-    void 续任务轮恢复挂起清单() {
-        ContextLoadPolicy p = ContextLoadPolicy.forSignals(TaskSignals.parse("continue"));
+    void 有挂起清单时续跑并恢复() {
+        ContextLoadPolicy p = ContextLoadPolicy.forSuspendedTodo(true);
         assertTrue(p.resumeSuspendedTodo());
         assertFalse(p.suspendActiveTodo());
+        assertTrue(p.injectTodo());
+        assertTrue(p.injectSkills());
         assertTrue(p.memoryPolicy().working());
     }
 
-    /** 问答叠加动手信号就不再是轻问答，按动手轮加载。 */
     @Test
-    void 问答叠加动手信号不再是轻问答() {
-        TaskSignals s = TaskSignals.parse("question,file");
-        assertFalse(s.lightTurn());
-        assertTrue(ContextLoadPolicy.forSignals(s).memoryPolicy().longTerm());
+    void 没有挂起清单时释放旧计划() {
+        ContextLoadPolicy p = ContextLoadPolicy.forSuspendedTodo(false);
+        assertTrue(p.suspendActiveTodo());
+        assertFalse(p.resumeSuspendedTodo());
+        assertTrue(p.injectTodo());
+        assertTrue(p.memoryPolicy().working());
+    }
+
+    /** 不再有「轻问答只带摘要」这一档：任何一轮都不砍长期记忆。 */
+    @Test
+    void 两档都开启长期记忆() {
+        assertTrue(ContextLoadPolicy.forSuspendedTodo(false).memoryPolicy().longTerm());
+        assertTrue(ContextLoadPolicy.forSuspendedTodo(true).memoryPolicy().longTerm());
+    }
+
+    @Test
+    void 中期记忆恒不注入() {
+        assertFalse(ContextLoadPolicy.forSuspendedTodo(false).memoryPolicy().midterm());
+        assertFalse(ContextLoadPolicy.forSuspendedTodo(true).memoryPolicy().midterm());
     }
 
     /**
@@ -63,16 +54,7 @@ class ContextLoadPolicyTest {
      */
     @Test
     void 历史兜底条数不为零() {
-        for (String s : new String[]{"none", "question", "continue", "file", "web,file"}) {
-            assertNotEquals(0, ContextLoadPolicy.forSignals(TaskSignals.parse(s))
-                    .historyMaxMessages(), s);
-        }
-    }
-
-    /** 空信号按动手轮处理：宁可信其要动手，也不要把上下文砍到 0。 */
-    @Test
-    void 空信号不降级为轻问答() {
-        assertFalse(TaskSignals.NONE.lightTurn());
-        assertTrue(ContextLoadPolicy.forSignals(TaskSignals.NONE).memoryPolicy().longTerm());
+        assertNotEquals(0, ContextLoadPolicy.forSuspendedTodo(false).historyMaxMessages());
+        assertNotEquals(0, ContextLoadPolicy.forSuspendedTodo(true).historyMaxMessages());
     }
 }

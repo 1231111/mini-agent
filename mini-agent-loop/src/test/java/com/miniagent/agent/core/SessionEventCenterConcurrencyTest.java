@@ -43,6 +43,59 @@ class SessionEventCenterConcurrencyTest {
     }
 
     @Test
+    void appendAndSealHaveOneAtomicWinner() throws Exception {
+        for (int attempt = 0; attempt < 500; attempt++) {
+            SessionEventCenter center = new SessionEventCenter();
+            String sessionId = "race-" + attempt;
+            center.start(sessionId, "hello");
+            CountDownLatch start = new CountDownLatch(1);
+            AtomicReference<Boolean> accepted = new AtomicReference<>();
+            AtomicReference<SessionEventCenter.SealResult> sealed = new AtomicReference<>();
+            Thread appender = new Thread(() -> {
+                await(start);
+                accepted.set(center.appendUserMessage(sessionId, "append"));
+            });
+            Thread sealer = new Thread(() -> {
+                await(start);
+                sealed.set(center.sealIfNoPendingUserMessages(sessionId));
+            });
+            appender.start();
+            sealer.start();
+            start.countDown();
+            appender.join();
+            sealer.join();
+
+            if (Boolean.TRUE.equals(accepted.get())) {
+                assertTrue(sealed.get().queued());
+                assertEquals(java.util.List.of("append"), sealed.get().messages());
+            } else {
+                assertFalse(sealed.get().queued());
+                assertTrue(sealed.get().messages().isEmpty());
+            }
+            if (!Boolean.TRUE.equals(accepted.get())) {
+                assertFalse(center.appendUserMessage(sessionId, "too late"));
+            }
+        }
+    }
+
+    @Test
+    void finalAnswerBoundaryReturnsAcceptedAppendForAnotherTurn() {
+        SessionEventCenter center = new SessionEventCenter();
+        center.start("final-boundary", "hello");
+        assertTrue(center.appendUserMessage("final-boundary", "do this too"));
+
+        SessionEventCenter.SealResult result = center.sealIfNoPendingUserMessages("final-boundary");
+
+        assertTrue(result.queued());
+        assertEquals(java.util.List.of("do this too"), result.messages());
+        assertTrue(center.hasRunningSession("final-boundary"));
+        assertTrue(center.appendUserMessage("final-boundary", "another in-flight update"));
+        SessionEventCenter.SealResult next = center.sealIfNoPendingUserMessages("final-boundary");
+        assertTrue(next.queued());
+        assertEquals(java.util.List.of("another in-flight update"), next.messages());
+    }
+
+    @Test
     void concurrentAppendAndSnapshotNeverThrows() throws Exception {
         SessionEventCenter.SessionChannel channel = new SessionEventCenter.SessionChannel();
 
@@ -131,6 +184,15 @@ class SessionEventCenterConcurrencyTest {
         // 合计 42_000 字符 → 只留尾部 16_000
         assertEquals(16_000, channel.think.length());
         assertTrue(channel.think.toString().endsWith("0123456789"));
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(e);
+        }
     }
 
     private static String describe(Throwable t) {

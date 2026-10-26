@@ -6,7 +6,6 @@ package com.miniagent.agent.context;
 public enum ContextSlot {
     IDENTITY(2000),
     AUTHORITY(400),
-    QUESTION(800),
     REFERENCE(300),
     MEMORY(6000),
     SKILLS(2000),

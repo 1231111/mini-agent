@@ -140,9 +140,14 @@ public class RenderDiagramTool {
     }
 
     private static String ok(Path out) throws IOException {
+        // url 只在「文件直接落在工作区根、且是图片」时给：对话区靠 /api/workspace-media 回显，
+        // 没有这个字段模型就会自己编路径，图必然裂（2026-10-22 实证）。
+        String url = BuiltinTools.workspaceMediaUrl(out);
         return "{\"success\":true,\"path\":\""
                 + out.toAbsolutePath().toString().replace("\\", "/")
-                + "\",\"size\":" + Files.size(out) + "}";
+                + "\",\"size\":" + Files.size(out)
+                + (url == null ? "" : ",\"url\":\"" + url + "\"")
+                + "}";
     }
 
     private String runMmdc(Path input, Path output) throws IOException, InterruptedException {

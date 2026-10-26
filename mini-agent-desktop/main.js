@@ -446,7 +446,7 @@ let launchBounds = null;
 
 const BOOT_STAGE_W = 860;
 const BOOT_STAGE_H = 700;
-/** 页面没把炸开播完时，主进程最多再等这么久就直接开聊天页。 */
+/** 启动画面淡出所需时间；超时后主进程仍会继续打开客户端。 */
 const BOOT_BURST_WAIT_MS = 2500;
 const BOOT_EXPAND_MS = 420;
 

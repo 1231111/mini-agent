@@ -62,6 +62,14 @@ public class AgentModelsProperties {
          * 用户看到的却是"模型连接异常"。这里填了窗口，循环才知道该在什么时候压缩。</p>
          */
         private int contextWindowTokens = 0;
+        /**
+         * 该模型支持的上下文窗口档位（token）。声明多档时按
+         * {@link ContextWindowResolver} 的规则选出本次可用窗口：默认档优先，否则取最小档。
+         * 为空表示只有 {@link #contextWindowTokens} 一档。
+         */
+        private List<Integer> supportedContextWindows = new ArrayList<>();
+        /** 厂商侧的输入硬上限（token），0 = 未声明。用于过滤掉不可能生效的档位。 */
+        private int maxInputTokens = 0;
 
         public String getId() { return id; }
         public void setId(String id) { this.id = id; }
@@ -76,6 +84,19 @@ public class AgentModelsProperties {
         public int getContextWindowTokens() { return contextWindowTokens; }
         public void setContextWindowTokens(int contextWindowTokens) {
             this.contextWindowTokens = contextWindowTokens;
+        }
+        public List<Integer> getSupportedContextWindows() { return supportedContextWindows; }
+        public void setSupportedContextWindows(List<Integer> supportedContextWindows) {
+            this.supportedContextWindows = supportedContextWindows == null
+                    ? new ArrayList<>() : supportedContextWindows;
+        }
+        public int getMaxInputTokens() { return maxInputTokens; }
+        public void setMaxInputTokens(int maxInputTokens) { this.maxInputTokens = maxInputTokens; }
+
+        /** 本次请求可用的输入窗口；0 = 未声明任何窗口。 */
+        public int effectiveContextWindow() {
+            return ContextWindowResolver.resolve(
+                    contextWindowTokens, supportedContextWindows, maxInputTokens);
         }
     }
 }

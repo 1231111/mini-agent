@@ -92,7 +92,10 @@ public class UserModelBinder {
             return Binding.noop();
         }
         log.debug("已绑定用户模型: userId={}, model={}", userId, models.settings().modelName());
-        return Binding.wrap(EffectiveModelContext.bind(models.chat(), models.streaming()));
+        // 窗口必须一起绑：后台线程（记忆巩固、每日画像、压缩摘要）用的是同一条绑定量，
+        // 不传窗口时这些线程按「窗口未知」处理，压缩判据退化到配置上限。
+        return Binding.wrap(EffectiveModelContext.bind(models.chat(), models.streaming(),
+                models.settings().contextWindowTokens()));
     }
 
     /** 只绑归属（记忆目录按 userId 隔离，这一步不能省）。 */

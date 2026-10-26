@@ -1,6 +1,5 @@
 package com.miniagent.agent.planner;
 
-import com.miniagent.agent.task.TaskSignals;
 import com.miniagent.agent.todo.HumanYield;
 
 import java.util.Locale;
@@ -26,7 +25,8 @@ import java.util.regex.Pattern;
  * 页面确认按钮）在写入时都已经把节点置为 {@code AWAITING_CONFIRM}，
  * 也就是说凡是它能表达的，{@code awaitingConfirm} 都能表达，而且表达的是「现在」。</p>
  *
- * <p>判据仍然是文本事实（{@link TaskSignals} + 正则），不读任何分类结果。</p>
+ * <p>判据是文本事实与图状态：{@code awaitingConfirm} 表示此刻确实在等人，
+ * 正则只用来判断这句话是不是续跑/授权语句。不再读任务信号层。</p>
  */
 public final class PlannerResumePolicy {
 
@@ -63,14 +63,13 @@ public final class PlannerResumePolicy {
     /**
      * 判断本轮是否可以复用未完成的 Planner 图。
      *
-     * @param signals         本轮从用户消息里观察到的事实
      * @param userMessage     用户消息原文
      * @param awaitingConfirm 图里<b>此刻</b>存在 AWAITING_CONFIRM 节点（即系统正在等用户）
      * @param incomplete      图未全部终态成功
      */
-    public static boolean shouldResume(TaskSignals signals, String userMessage,
+    public static boolean shouldResume(String userMessage,
                                        boolean awaitingConfirm, boolean incomplete) {
-        return shouldResume(signals, userMessage, awaitingConfirm, incomplete, false);
+        return shouldResume(userMessage, awaitingConfirm, incomplete, false);
     }
 
     /**
@@ -79,15 +78,10 @@ public final class PlannerResumePolicy {
      *                             否则用户回一句「开始」会被当成新任务重新规划，
      *                             审批永远走不出去。
      */
-    public static boolean shouldResume(TaskSignals signals, String userMessage,
+    public static boolean shouldResume(String userMessage,
                                        boolean awaitingConfirm, boolean incomplete,
                                        boolean awaitingPlanApproval) {
         if (!incomplete) {
-            return false;
-        }
-        TaskSignals s = signals == null ? TaskSignals.NONE : signals;
-        // 纯问答轮不接管旧图：「你好」不该被上一轮的任务图吃进去
-        if (s.lightTurn()) {
             return false;
         }
         String text = normalize(userMessage);
@@ -97,8 +91,8 @@ public final class PlannerResumePolicy {
         if (awaitingPlanApproval && HumanYield.looksLikePlanApproval(text)) {
             return true;
         }
-        // 命中续跑词表，或文本本身是明确的续跑/授权语句
-        if (s.continueTask() || isExplicitContinuation(text)) {
+        // 文本本身是明确的续跑/授权语句
+        if (isExplicitContinuation(text)) {
             return true;
         }
         // 续跑词表只覆盖有限写法，不能单独覆盖消息边界；

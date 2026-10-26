@@ -20,6 +20,8 @@ public record ToolInvocation(
         POLICY_DENIED,
         /** 等用户批准工具。 */
         PERMISSION_ASK,
+        /** 用户已拒绝待执行工具。 */
+        PERMISSION_DENIED,
         /** 等用户回答问题。 */
         USER_QUESTION,
         /** 执行控制面截停。 */
@@ -56,6 +58,10 @@ public record ToolInvocation(
 
     public static ToolInvocation permissionAsk(String name, ToolResult result) {
         return new ToolInvocation(Outcome.PERMISSION_ASK, name, result, name);
+    }
+
+    public static ToolInvocation permissionDenied(String name, ToolResult result) {
+        return new ToolInvocation(Outcome.PERMISSION_DENIED, name, result, "");
     }
 
     public static ToolInvocation userQuestion(String name, ToolResult result, String display) {

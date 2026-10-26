@@ -871,6 +871,10 @@
             box-shadow: var(--shadow-img);
         }
 
+        /* 流式正文的容器：定稿块是 answer-stream 的直接子节点，末尾未闭合块在这层里
+           （见 paintAnswerNow）。空的时候不能占位，否则每次重画都会多出一点间隙。 */
+        .md-tail:empty { display: none; }
+
         /* =================================================================
            INPUT AREA — chatgpt style: centered, floating
            ================================================================= */
@@ -1385,22 +1389,6 @@
             color: var(--text3, #8a8a8a);
             margin-bottom: 4px;
         }
-        .tl-stream .tl-activity {
-            font-size: 12.5px;
-            color: var(--text2);
-            padding: 6px 10px;
-            background: var(--accent-soft);
-            border-radius: 8px;
-            display: flex;
-            align-items: flex-start;
-            gap: 6px;
-            word-break: break-word;
-        }
-        .tl-stream .tl-activity.done { opacity: 0.75; }
-        .tl-stream .tl-activity.fail {
-            background: rgba(196, 86, 86, 0.12);
-            color: #c45656;
-        }
 
         /* 任务计划列表：按序展示，完成项置灰打勾 */
         .todo-panel {
@@ -1774,7 +1762,7 @@
                                     Plan 模式<small>只读探索 + 写计划，批准后执行</small>
                                 </div>
                                 <div class="perm-item" data-mode="accept_edits" onclick="selectPermissionMode('accept_edits')">
-                                    自动编辑<small>少打断，仍受 todo 硬闸门约束</small>
+                                    自动编辑<small>少打断；与「自动确认」同时开启后，终端命令也不再询问</small>
                                 </div>
                                 <div class="perm-item" data-mode="ask" onclick="selectPermissionMode('ask')">
                                     危险操作询问<small>写文件/终端等须确认</small>
@@ -1793,7 +1781,7 @@
                                 </div>
                                 <div class="perm-item" data-policy="auto"
                                      onclick="selectConfirmPolicy('auto')">
-                                    自动确认<small>待办关键步不等人，直接推进</small>
+                                    自动确认<small>待办关键步不等人；与「自动编辑」同时开启后，后续步骤不再询问授权</small>
                                 </div>
                             </div>
                         </div>
@@ -1810,7 +1798,7 @@
                                 </div>
                                 <div class="perm-item" data-exec="ask"
                                      onclick="selectExecPolicy('ask')">
-                                    需批准<small>本会话第一次执行时确认，之后记住</small>
+                                    需批准<small>每次终端命令执行前确认本次调用（开启全自动后不再询问）</small>
                                 </div>
                                 <div class="perm-item" data-exec="allow"
                                      onclick="selectExecPolicy('allow')">
@@ -1917,9 +1905,14 @@
     <div class="ask-modal">
         <h3>需要确认危险操作</h3>
         <p id="askModalText">工具待确认</p>
-        <div class="ask-actions">
+        <div class="ask-actions" id="askActions">
             <button type="button" class="ask-deny" onclick="denyAskTool()">拒绝</button>
             <button type="button" class="ask-allow" onclick="grantAskTool()">批准并继续</button>
+        </div>
+        <!-- 批准已过期或服务端未接受时换成这一个按钮：那次调用的 token 已经作废，
+             留一个点了没反应的「批准并继续」比不给按钮更糟。 -->
+        <div class="ask-actions" id="askNoticeActions" style="display: none">
+            <button type="button" class="ask-allow" onclick="dismissAskNotice()">知道了</button>
         </div>
     </div>
 </div>
@@ -2100,6 +2093,8 @@ let confirmPolicy = localStorage.getItem('mini_agent_confirm_policy') || 'danger
 let pendingTodoConfirm = null;
 let pendingAskTool = null;
 let pendingAskGrantToken = null;
+/** 审批弹窗的过期定时器：服务端 token 过期后再点「批准」只会拿到 403，所以到点就自动收起。 */
+let pendingAskExpiryTimer = null;
 let isStreaming  = false;
 let streamEpoch  = 0;
 // 本 turn 的起止时间戳，只给思考折叠条的表头文案用（「已处理 12s」/「已完成 12s」）。
@@ -2108,6 +2103,15 @@ let streamEpoch  = 0;
 // 因为我们没有逐条消息的 createTime/finishTime 字段。
 let turnStartedAt  = 0;
 let turnFinishedAt = 0;
+/**
+ * 表头耗时的刷新定时器。
+ *
+ * <p>文案里的秒数是 `Date.now() - turnStartedAt`，算得是对的，但它只在
+ * {@code paint()} 里被重画，而 `paint()` 由 SSE 增量驱动。模型停住等工具、
+ * 或在等首包时**没有任何增量**，秒数就冻在上一个事件那一刻（看到的「已处理 26s」不动）。
+ * 因此必须有一个与事件无关的时钟。</p>
+ */
+let thinkTickTimer = null;
 const SCROLL_BOTTOM_PX = 80;
 let stickToBottom = true;
 
@@ -2961,6 +2965,33 @@ function permissionUrl() {
     return '/api/conversations/' + encodeURIComponent(currentId) + '/permission';
 }
 
+/* 统一响应体的成功判定。
+   服务端 com.miniagent.common.ApiResponse 的契约只有一条：
+     成功 { "success": true, "data": ... }   —— code / message 因 @JsonInclude(NON_NULL) 被整体省略
+     失败 { "success": false, "code": "AUTH.01.01", "message": "..." }
+   code 是**错误码字符串**，不是数字；成功时根本没有这个键。
+   所以不能写 code === 0：浏览器里取到的是 undefined，任何成功响应都会被判成失败。
+   实测故障：grantAskTool 批准已生效、工具已继续跑，页面却弹「批准失败: HTTP 200」。 */
+function apiSuccess(body) {
+    return !!body && body.success === true;
+}
+
+/** 失败原因：优先用服务端 message，其次错误码，最后退回 HTTP 状态。 */
+function apiFailureMessage(body, resp) {
+    if (body && body.message) return String(body.message);
+    if (body && body.code) return String(body.code);
+    return resp ? 'HTTP ' + resp.status : '未知错误';
+}
+
+/** 统一取 data；空响应体不抛异常，交给调用方按失败处理。 */
+async function readApiBody(resp) {
+    try {
+        return await resp.json();
+    } catch (e) {
+        return null;
+    }
+}
+
 async function selectPermissionMode(mode) {
     permissionMode = mode || 'default';
     localStorage.setItem('mini_agent_perm_mode', permissionMode);
@@ -2995,19 +3026,19 @@ async function approvePlan() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ sessionId: currentId, action: 'approve_plan' })
         });
-        const body = await resp.json();
-        if (body.success) {
-            const data = unwrapApiBody(body) || {};
-            document.getElementById('planBannerText').textContent =
-                data.planApproved ? 'Plan 已批准，写工具已解锁' : 'Plan 模式';
+        const body = await readApiBody(resp);
+        if (!resp.ok || !apiSuccess(body)) {
+            // 原来失败分支什么都不做：按钮按下去没反应，用户只能反复点。
+            throw new Error(apiFailureMessage(body, resp));
         }
+        const data = unwrapApiBody(body) || {};
+        document.getElementById('planBannerText').textContent =
+            data.planApproved ? 'Plan 已批准，写工具已解锁' : 'Plan 模式';
     } catch (e) {
         alert('批准失败: ' + e.message);
     }
 }
-function showAskModal(tool, display, grantToken) {
-    pendingAskTool = tool;
-    pendingAskGrantToken = grantToken || null;
+function showAskModal(tool, display, grantToken, expiresAt) {
     const labels = {
         exec_command: '终端命令执行',
         http_post: '发送 HTTP POST 请求'
@@ -3016,50 +3047,126 @@ function showAskModal(tool, display, grantToken) {
     // 只说「终端命令执行」，用户不知道这条命令要干什么，只能盲批。
     // 有 display 就把它摊开说清楚。
     const detail = display ? '本次调用：' + display + '。' : '';
-    document.getElementById('askModalText').textContent =
-        'Agent 需要「' + label + '」才能继续当前步骤。' + detail
-        + '批准仅适用于这次完全相同的调用，并会在短时间后过期。'
-        + '（点批准，不要只点步骤里的「确认并继续」。）';
+    setAskModalText('Agent 需要「' + label + '」才能继续当前步骤。' + detail
+        + '批准只对这一次完全相同的调用有效，过期后需要重新触发。'
+        + '「确认并继续」是待办步骤的确认，不能代替这里的批准。');
+    // 上一次失败留下的「知道了」按钮必须换回可操作的按钮组，
+    // 否则新的审批弹出来却点不到「批准并继续」。
+    showAskActions();
+
+    // 先判断是否已经过期：服务端 token 过期后批准一定失败，
+    // 与其弹一个点不动的框，不如直接告诉用户重来一次。
+    const remaining = expiresAt ? Number(expiresAt) - Date.now() : 0;
+    if (grantToken && remaining <= 0) {
+        pendingAskTool = null;
+        pendingAskGrantToken = null;
+        setAskModalText('这次「' + label + '」的批准已经过期，Agent 会按未批准继续。'
+            + '需要执行时请在下一轮重新触发。');
+        document.getElementById('askModal').classList.add('show');
+        showAskNotice();
+        clearTimeout(pendingAskExpiryTimer);
+        pendingAskExpiryTimer = setTimeout(dismissAskNotice, 4000);
+        return;
+    }
+
+    pendingAskTool = tool;
+    pendingAskGrantToken = grantToken || null;
     document.getElementById('askModal').classList.add('show');
+
+    clearTimeout(pendingAskExpiryTimer);
+    pendingAskExpiryTimer = null;
+    if (grantToken && remaining > 0) {
+        pendingAskExpiryTimer = setTimeout(() => {
+            pendingAskTool = null;
+            pendingAskGrantToken = null;
+            document.getElementById('askModal').classList.remove('show');
+            setAskModalText('工具待确认');
+            showAskActions();
+        }, remaining);
+    }
+}
+
+function setAskModalText(text) {
+    document.getElementById('askModalText').textContent = text;
+}
+
+/** 正常的审批状态：两个按钮都能用。 */
+function showAskActions() {
+    const actions = document.getElementById('askActions');
+    const notice = document.getElementById('askNoticeActions');
+    if (actions) actions.style.display = '';
+    if (notice) notice.style.display = 'none';
+}
+
+/** 只给结论、不给动作：那次调用的 token 已经作废，按钮点不动比不给按钮更糟。 */
+function showAskNotice() {
+    const actions = document.getElementById('askActions');
+    const notice = document.getElementById('askNoticeActions');
+    if (actions) actions.style.display = 'none';
+    if (notice) notice.style.display = '';
+}
+
+function dismissAskNotice() {
+    clearTimeout(pendingAskExpiryTimer);
+    pendingAskExpiryTimer = null;
+    document.getElementById('askModal').classList.remove('show');
+    setAskModalText('工具待确认');
+    showAskActions();
 }
 function denyAskTool() {
+    const tool = pendingAskTool;
+    const grantToken = pendingAskGrantToken;
     pendingAskTool = null;
     pendingAskGrantToken = null;
+    clearTimeout(pendingAskExpiryTimer);
+    pendingAskExpiryTimer = null;
     document.getElementById('askModal').classList.remove('show');
+    if (tool && grantToken && currentId) {
+        fetch(permissionUrl(), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: currentId, action: 'deny_ask', tool, grantToken })
+        }).catch(e => console.warn('deny approval failed', e));
+    }
 }
 async function grantAskTool() {
     const tool = pendingAskTool;
     const grantToken = pendingAskGrantToken;
-    document.getElementById('askModal').classList.remove('show');
-    pendingAskTool = null;
-    pendingAskGrantToken = null;
     if (!tool || !grantToken || !currentId) return;
     try {
-        await fetch(permissionUrl(), {
+        const resp = await fetch(permissionUrl(), {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ sessionId: currentId, action: 'grant_ask', tool,
                 grantToken })
         });
+        const body = await readApiBody(resp);
+        if (!resp.ok || !apiSuccess(body)) {
+            throw new Error(apiFailureMessage(body, resp));
+        }
+        // 只有服务端确认放行之后才收起弹窗、清掉一次性 token。
+        // 顺序反过来的话，请求真失败时用户既看不到原因、也拿不回 token，只能整轮重来。
+        pendingAskTool = null;
+        pendingAskGrantToken = null;
+        clearTimeout(pendingAskExpiryTimer);
+        pendingAskExpiryTimer = null;
+        document.getElementById('askModal').classList.remove('show');
+        setAskModalText('工具待确认');
+        showAskActions();
     } catch (e) {
-        console.warn(e);
-        return;
+        console.warn('grant ask failed', e);
+        // 失败只有三种可能：token 过期、等待点已结束（工具已按未批准返回）、
+        // 或该 token 不属于本会话 —— 都意味着这个 token 不能再用了。
+        // 所以清掉 token，但把原因留在原位，并且只给「知道了」。
+        pendingAskTool = null;
+        pendingAskGrantToken = null;
+        clearTimeout(pendingAskExpiryTimer);
+        setAskModalText('这次批准没有生效：' + e.message
+            + '。Agent 会按未批准继续；需要执行时请在下一轮重新触发。');
+        document.getElementById('askModal').classList.add('show');
+        showAskNotice();
+        pendingAskExpiryTimer = setTimeout(dismissAskNotice, 8000);
     }
-    const deadline = Date.now() + 90000;
-    while (isStreaming && Date.now() < deadline) {
-        await new Promise(r => setTimeout(r, 150));
-    }
-    if (isStreaming) return;
-    await new Promise(r => setTimeout(r, 200));
-    if (isStreaming) return;
-    const text = SYS_PREFIX + '已批准「' + tool + '」，请继续执行。';
-    document.getElementById('welcomeScreen')?.remove();
-    renderUserMsg(text, null, 0, []);
-    addMsgToConv('user', text, null, null);
-    const botBody = renderBotMsg(
-        '<div class="typing-dots"><span></span><span></span><span></span></div>', true);
-    setStreaming(true);
-    sendChatPost(text, currentId, [], [], botBody);
 }
 
 function showUserQuestionModal(payload) {
@@ -3205,8 +3312,8 @@ async function refreshExecPolicyView() {
     if (!currentId) return;
     try {
         const resp = await fetch(permissionUrl());
-        const data = await resp.json();
-        if (data && data.code === 0 && data.data) applyExecPolicyView(data.data);
+        const data = await readApiBody(resp);
+        if (apiSuccess(data) && data.data) applyExecPolicyView(data.data);
     } catch (e) { console.warn('load exec policy failed', e); }
 }
 
@@ -3224,11 +3331,11 @@ async function selectExecPolicy(value) {
             // 否则全局默认一改，这里就会发错档位。
             body: JSON.stringify({ sessionId: currentId, execPolicy: value })
         });
-        const data = await resp.json();
-        if (data && data.code === 0 && data.data) {
+        const data = await readApiBody(resp);
+        if (apiSuccess(data) && data.data) {
             applyExecPolicyView(data.data);
         } else {
-            alert('切换失败：' + ((data && data.message) || '未知错误'));
+            alert('切换失败：' + apiFailureMessage(data, resp));
         }
     } catch (e) {
         console.warn('set exec policy failed', e);
@@ -3517,8 +3624,8 @@ async function switchConv(id, force) {
             });
             // 这次 PUT 不回传 execPolicy，所以不会动会话里的执行策略覆盖；
             // 顺手拿响应里的权限视图刷新 exec 按钮，省一次 GET。
-            const pData = await pResp.json();
-            if (pData && pData.code === 0 && pData.data) applyExecPolicyView(pData.data);
+            const pData = await readApiBody(pResp);
+            if (apiSuccess(pData) && pData.data) applyExecPolicyView(pData.data);
             else await refreshExecPolicyView();
         } catch (_) {
             await refreshExecPolicyView();
@@ -3664,6 +3771,11 @@ function setStreaming(on) {
     // 这样中途重连（再次进 consumeStream）不会把计时清零。
     if (on && !isStreaming) { turnStartedAt = Date.now(); turnFinishedAt = 0; }
     isStreaming = on;
+    if (!on && thinkTickTimer) {
+        // 兜底：取消/断流路径不走 finish()，秒表不能继续空转
+        clearInterval(thinkTickTimer);
+        thinkTickTimer = null;
+    }
     $send.title = on ? '追加说明 (Enter)' : '发送 (Enter)';
     if (!on) parkLiveThink();
     const dock = document.getElementById('liveDock');
@@ -3887,12 +3999,13 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         // 本 turn 是否由失败/取消收尾，只影响折叠条的「已取消 / 已完成」用词
         let turnCancelled = false;
         const MAX_THINK_CHARS = 12000;
-        const MAX_TL_ROWS = 40;
         let thinkPaintTimer = null;
         // 增量渲染的 DOM 引用与已渲染游标（避免每个 token 重建整棵子树导致闪烁）
         let cleared = false, panelEl = null, headLabelEl = null, thinkTextEl = null,
-            timelineEl = null, answerEl = null;
+            timelineEl = null, answerEl = null, answerTailEl = null;
         let renderedThink = '', renderedAnswer = '', appliedCollapsed = null;
+        // 流式正文的两个渲染游标：定稿块（frozen）与末尾未闭合块（tail）
+        let renderedFrozen = '', renderedTail = '';
         let answerPaintTimer = null;
         // 任务计划钉在用户提问下方；sub-goal 仍可回退到 bot 内
         let todoItems = null;
@@ -3917,12 +4030,59 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             if (answerPaintTimer) return;
             answerPaintTimer = setTimeout(() => {
                 answerPaintTimer = null;
-                removeTyping();
-                ensureAnswer();
-                answerEl.innerHTML = renderMDStreaming(answer);
-                renderedAnswer = answer;
-                scrollToBottom();
+                paintAnswerNow();
             }, 50);
+        }
+
+        /**
+         * 流式正文的增量绘制：**已定稿的块只追加一次，只重画末尾那个还没闭合的块**。
+         *
+         * <h3>为什么不能每次 `innerHTML = renderMDStreaming(answer)`</h3>
+         *
+         * 那样每 50ms 重建整棵子树。回答里一旦有 `<img>`，每次重建都会销毁旧节点、造一个新的，
+         * 新节点在图片解码完成前没有尺寸、解码后又撑开 —— 正文随之上下来回跳。
+         * 2026-10-22 实测症状就是「生成时回复字体乱上下跳动」，且只在回答带图时出现。
+         *
+         * 现在按空行切：最后一个空行之前的内容是定稿块，追加后不再碰；
+         * 只有最后一个未闭合块（通常正在打字的那一段）会重画。整段重画只在
+         * 前缀被改写时发生（重连后从头来过），且只发生一次。
+         */
+        function paintAnswerNow() {
+            removeTyping();
+            ensureAnswer();
+            // 自愈：正文容器被整段替换过（finish / 历史回放）时 .md-tail 已经脱离 DOM，
+            // 此时游标全部作废，重建结构后从头画。
+            if (!answerTailEl || !answerTailEl.isConnected) {
+                answerEl.innerHTML = '';
+                answerTailEl = document.createElement('div');
+                answerTailEl.className = 'md-tail';
+                answerEl.appendChild(answerTailEl);
+                renderedFrozen = '';
+                renderedTail = '';
+            }
+            const split = splitStreamingMarkdown(answer);
+            if (split.frozen !== renderedFrozen) {
+                if (split.frozen.startsWith(renderedFrozen)) {
+                    const delta = split.frozen.slice(renderedFrozen.length);
+                    if (delta) answerTailEl.insertAdjacentHTML('beforebegin', renderMD(dropLeadBlanks(delta)));
+                } else {
+                    answerEl.innerHTML = '';
+                    answerTailEl = document.createElement('div');
+                    answerTailEl.className = 'md-tail';
+                    answerEl.appendChild(answerTailEl);
+                    if (split.frozen) {
+                        answerTailEl.insertAdjacentHTML('beforebegin', renderMD(dropLeadBlanks(split.frozen)));
+                    }
+                    renderedTail = '';
+                }
+                renderedFrozen = split.frozen;
+            }
+            if (split.tail !== renderedTail) {
+                answerTailEl.innerHTML = renderMDStreaming(dropLeadBlanks(split.tail));
+                renderedTail = split.tail;
+            }
+            renderedAnswer = answer;
+            scrollToBottom();
         }
 
         function escTodo(s) {
@@ -3939,9 +4099,30 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             timelineEl = document.createElement('div');
             timelineEl.className = 'tl-stream';
             // 位次不变式：panelEl 永远是 bot-body 的最后一个子节点，其余元素插到它前面。
-            // 顺序：进度 → 时间线 → 答案 → 思考（思考钉底，对齐 WorkBuddy）。
+            // 顺序：时间线 → 答案 → 思考（思考钉底，对齐 WorkBuddy）。工具过程行已下线。
             // ref 必须落在 botBody 里，否则 insertAt 会静默降级成 append 跑到思考后面去。
             insertAt(botBody, timelineEl, answerEl || panelEl);
+        }
+        /**
+         * 清空正文容器，并**按固定结构重建** .md-tail。
+         *
+         * <p>不能只写 `answerEl.innerHTML = ''`：那会把 answerTailEl 一起清掉，
+         * 而 renderedFrozen / renderedTail 还是旧值。下一段正文要么插进已脱离 DOM 的节点（静默丢内容），
+         * 要么因为 `split.tail === renderedTail` 判定「没变化」而完全不画。
+         */
+        function resetAnswerDom() {
+            renderedAnswer = '';
+            renderedFrozen = '';
+            renderedTail = '';
+            if (answerPaintTimer) {
+                clearTimeout(answerPaintTimer);
+                answerPaintTimer = null;
+            }
+            if (!answerEl) return;
+            answerEl.innerHTML = '';
+            answerTailEl = document.createElement('div');
+            answerTailEl.className = 'md-tail';
+            answerEl.appendChild(answerTailEl);
         }
         /** 把当前流式正文封存为过程说明，再开新一段（不抹掉可见历史） */
         function sealAnswerToTimeline() {
@@ -3961,50 +4142,21 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 timelineEl.appendChild(note);
             }
             answer = '';
-            renderedAnswer = '';
-            if (answerPaintTimer) {
-                clearTimeout(answerPaintTimer);
-                answerPaintTimer = null;
-            }
-            if (answerEl) answerEl.innerHTML = '';
+            resetAnswerDom();
             thinkCollapsed = false;
             if (panelEl) {
                 panelEl.classList.remove('collapsed', 'done');
                 appliedCollapsed = false;
             }
         }
-        function appendActivity(text) {
-            if (!text) return;
-            ensureTimeline();
-            const key = String(text).replace(/[:：].*/, '').replace(/\s×\d+$/, '').trim();
-            const last = timelineEl.lastElementChild;
-            if (last && last.dataset && last.dataset.key === key) {
-                const n = (+last.dataset.n || 1) + 1;
-                last.dataset.n = String(n);
-                last.textContent = text + ' ×' + n;
-                return;
-            }
-            const row = document.createElement('div');
-            row.className = 'tl-activity';
-            if (text.startsWith('✓')) row.classList.add('done');
-            if (text.startsWith('✗')) row.classList.add('fail');
-            row.dataset.key = key;
-            row.dataset.n = '1';
-            row.textContent = text;
-            timelineEl.appendChild(row);
-            while (timelineEl.children.length > MAX_TL_ROWS)
-                timelineEl.removeChild(timelineEl.firstChild);
-            if (!thinkPaintTimer) {
-                thinkPaintTimer = setTimeout(() => {
-                    thinkPaintTimer = null;
-                    scrollToBottom();
-                }, 120);
-            }
-        }
         function finish(html, cancelled) {
             if (done) return; done = true;
             turnFinishedAt = Date.now();
             turnCancelled = !!cancelled;
+            if (thinkTickTimer) {
+                clearInterval(thinkTickTimer);
+                thinkTickTimer = null;
+            }
             if (answerPaintTimer) {
                 clearTimeout(answerPaintTimer);
                 answerPaintTimer = null;
@@ -4013,8 +4165,13 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             // 保留思考 / 时间线；计划已在用户提问下，不塞进 bot
             ensureAnswer();
             answerEl.innerHTML = html;
+            // 定稿后正文结构由 html 决定，不再有 .md-tail；游标一并作废
+            answerTailEl = null;
+            renderedAnswer = answer;
+            renderedFrozen = '';
+            renderedTail = '';
             if (panelEl) {
-                // 定稿后收起，并重新钉到气泡最底（进度 → 时间线 → 正文 → 思考）
+                // 定稿后收起，并重新钉到气泡最底（时间线 → 正文 → 思考）
                 insertAt(botBody, panelEl, null);
                 panelEl.classList.add('done', 'collapsed');
                 thinkCollapsed = true;
@@ -4046,6 +4203,25 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             if (headLabelEl.textContent !== t) headLabelEl.textContent = t;
         }
 
+        /**
+         * 与 SSE 事件解耦的秒表：每秒重画一次表头，直到定稿。
+         * 重连会再进一次 consumeStream，所以先清掉上一轮的定时器，避免堆叠。
+         */
+        function startThinkTicker() {
+            if (thinkTickTimer) {
+                clearInterval(thinkTickTimer);
+                thinkTickTimer = null;
+            }
+            thinkTickTimer = setInterval(function () {
+                if (turnFinishedAt) {
+                    clearInterval(thinkTickTimer);
+                    thinkTickTimer = null;
+                    return;
+                }
+                paintThinkHead();
+            }, 1000);
+        }
+
         function ensurePanel() {
             if (panelEl) return;
             clearOnce();
@@ -4073,12 +4249,21 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             // 有思考面板后不再用底部 liveDock 重复挂「思考中」
             const dock = document.getElementById('liveDock');
             if (dock) dock.hidden = true;
+            startThinkTicker();
         }
         function ensureAnswer() {
             if (answerEl) return;
             clearOnce();
             answerEl = document.createElement('div');
             answerEl.className = 'answer-stream md-body';
+            /* 结构固定为「定稿块…」+「.md-tail（末尾未闭合块）」：
+               定稿块直接挂在 answerEl 下，新增块插到 .md-tail 之前，.md-tail 始终是最后一个子节点。
+               这样流式期间只需重画 .md-tail，已画好的图不会被反复销毁重建。 */
+            answerTailEl = document.createElement('div');
+            answerTailEl.className = 'md-tail';
+            answerEl.appendChild(answerTailEl);
+            renderedFrozen = '';
+            renderedTail = '';
             // 答案插到思考条前面：思考恒在链尾，正文在它之上。
             insertAt(botBody, answerEl, panelEl);
         }
@@ -4278,9 +4463,6 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 if (thinkText.length > MAX_THINK_CHARS)
                     thinkText = thinkText.slice(thinkText.length - MAX_THINK_CHARS);
                 paint();
-            } else if (name === 'progress') {
-                // 工具开始/结束：追加时间线条，不再覆盖单行
-                appendActivity(typeof data === 'string' ? data : String(data || ''));
             } else if (name === 'todo') {
                 try {
                     const payload = typeof data === 'string' ? JSON.parse(data) : data;
@@ -4326,10 +4508,22 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 try {
                     const payload = typeof data === 'string' ? JSON.parse(data) : data;
                     const tool = payload && (payload.tool || payload.name);
-                    if (tool) showAskModal(tool, payload.display || '', payload.grantToken || '');
+                    if (tool) showAskModal(tool, payload.display || '',
+                        payload.grantToken || '', payload.expiresAt || 0);
                 } catch (_) {
                     if (data) showAskModal(String(data));
                 }
+            } else if (name === 'permission_ask_released') {
+                // 全自动（自动编辑 + 自动确认）在任务运行中生效：后端已经把本会话
+                // 所有等待点放行并继续执行。弹窗必须跟着收起 —— 后端在跑、页面还停在
+                // 「等一个不会再被消费的点击」，就是用户说的「开了自动还卡在授权上」。
+                pendingAskTool = null;
+                pendingAskGrantToken = null;
+                clearTimeout(pendingAskExpiryTimer);
+                pendingAskExpiryTimer = null;
+                document.getElementById('askModal').classList.remove('show');
+                setAskModalText('工具待确认');
+                showAskActions();
             } else if (name === 'user_question') {
                 try {
                     const payload = typeof data === 'string' ? JSON.parse(data) : data;
@@ -4526,6 +4720,40 @@ function bindLightbox(row) {
     });
 }
 
+document.addEventListener('click', async event => {
+    const link = event.target.closest('a[data-auth-download]');
+    if (!link) return;
+    event.preventDefault();
+    const url = link.getAttribute('data-auth-download');
+    const name = link.getAttribute('data-download-name') || 'download';
+    const token = window.MiniAuth?.token();
+    if (!token) {
+        window.location.replace('/login');
+        return;
+    }
+    link.setAttribute('aria-busy', 'true');
+    try {
+        const response = await fetch(url, {
+            headers: { Authorization: 'Bearer ' + token },
+            credentials: 'same-origin'
+        });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const objectUrl = URL.createObjectURL(await response.blob());
+        const anchor = document.createElement('a');
+        anchor.href = objectUrl;
+        anchor.download = name;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+    } catch (error) {
+        console.warn('工作区文件下载失败:', url, error);
+        window.alert('文件下载失败，请确认登录状态后重试。');
+    } finally {
+        link.removeAttribute('aria-busy');
+    }
+});
+
 function copyBotMsg(btn) {
     const bd = btn.closest('.bot-content').querySelector('.bot-body');
     navigator.clipboard.writeText(bd.innerText).then(() => {
@@ -4547,11 +4775,83 @@ function renderMDStreaming(t) {
     return renderMD(s);
 }
 
+/**
+ * 去掉片段开头的空行。
+ *
+ * <p>切点把空行留在了 tail / 增量块的开头，而 `renderMD` 会把 `\n\n` 变成 `</p><p>`。
+ * 单独渲染这一块时，开头那个 `</p>` 前面没有任何 `<p>` 可闭合 —— 按 HTML 的解析规则，
+ * 游离的 `</p>` 会**凭空造出一个空 `<p></p>`**，段落之间就多出 10px 的空隙。
+ * 块级片段本来就不需要行首空行，渲染前丢掉。
+ */
+function dropLeadBlanks(s) {
+    return String(s == null ? '' : s).replace(/^(?:[ \t]*\r?\n)+/, '');
+}
+
+/**
+ * 把流式正文切成「已定稿块」与「末尾还在长的块」。
+ *
+ * <p><b>为什么必须切</b>：`renderMD` 是整段重算的。流式期间每 50ms 拿全文重算一次，
+ * 就等于每 50ms 把整棵子树推倒重建。回答里一旦有 `<img>`，旧节点被销毁、新节点在
+ * 图片解码完成前高度是 0，解码后又撑开 —— 正文随之上下来回跳。
+ * 切成两段之后，只有末尾那一段会重画，前面已经画好的图再也不动。
+ *
+ * <p><b>切点规则</b>：
+ * <ul>
+ *   <li>切在**最后一个空行**上，且空行归入 tail（tail 以 `\n\n` 开头，渲染前由
+ *       {@link dropLeadBlanks} 丢掉，各段落各自成块，段落间距与整段渲染时一致）。</li>
+ *   <li>切点不能落在代码围栏内部，否则半个围栏被当正文、另一半被当代码。</li>
+ *   <li>末尾还有未闭合的 ``` 时，围栏之后的内容一律留在 tail（围栏没闭合时它的渲染结果
+ *       本身就不稳定，不能定稿）。</li>
+ * </ul>
+ *
+ * <p><b>不变量</b>：文本只会往后长，所以新的 `frozen` 一定是旧 `frozen` 的**前缀延长**。
+ * `paintAnswerNow` 的「只追加增量」依赖这一条；一旦不成立就只能整段重画。
+ * 切点是「最后一个空行的位置」，文本变长它只会往后移或不动，因此前缀性天然成立。
+ */
+function splitStreamingMarkdown(text) {
+    const s = text == null ? '' : String(text);
+    if (!s) return { frozen: '', tail: '' };
+
+    // 1) 标出所有代码围栏区间；末尾未闭合的那个一路延伸到文末
+    const fences = [];
+    let at = 0;
+    for (;;) {
+        const open = s.indexOf('```', at);
+        if (open === -1) break;
+        const close = s.indexOf('```', open + 3);
+        if (close === -1) { fences.push([open, s.length]); break; }
+        fences.push([open, close + 3]);
+        at = close + 3;
+    }
+    const insideFence = pos => fences.some(f => pos > f[0] && pos < f[1]);
+
+    // 2) 从后往前找第一个不落在围栏里的空行
+    const hits = [];
+    const blank = /\n[ \t]*\n/g;
+    let m;
+    while ((m = blank.exec(s)) !== null) hits.push(m.index);
+    let cut = -1;
+    for (let i = hits.length - 1; i >= 0; i--) {
+        if (!insideFence(hits[i])) { cut = hits[i]; break; }
+    }
+    if (cut <= 0) return { frozen: '', tail: s };
+    return { frozen: s.slice(0, cut), tail: s.slice(cut) };
+}
+
 /* =========================================================================
    MARKDOWN RENDERER
    ========================================================================= */
 function escA(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+/**
+ * 属性值补引号：只转义引号，**不碰 &**。
+ * 走到这里的 alt 已经过 renderMD 第 2 步的全文 esc()，再转一次 & 会让 `&lt;` 变成字面量显示。
+ *
+ * 这个函数此前只被 parseMediaBang 引用、从来没有定义 —— 因为图片分支一直没被真正走到
+ * （之前后端 415 / 模型只写工作区路径），所以没人发现。2026-10-22 出图打通后第一次进这个分支，
+ * 直接 `ReferenceError: escQ is not defined`，整条回复渲染失败，界面上就是一行红字。
+ */
+function escQ(s) { return String(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
 function balancedUrl(s, open) {
     let d = 0;
@@ -4569,6 +4869,13 @@ function balancedUrl(s, open) {
  * 判据只看 URL 扩展名（复用上传校验用的 AUDIO_EXTS，避免两套扩展名清单漂移），
  * 所以 song_generate 返回的 `![生成的歌曲](/api/generated-media/<owner>/xxx.mp3)`
  * 会渲染成播放器；以前一律拼 <img>，音频就变成一张碎图。
+ *
+ * 放行的 URL 前缀是白名单而不是"看起来像路径就行"：
+ * - /api/generated-media/<owner>/<file>：图片/音频后端产出
+ * - /api/conversation-media/<sid>/<file>：用户上传的附件
+ * - /api/workspace-media/<file>：write_file / render_diagram 落在工作区的图片
+ *   （模型画图降级成手写 SVG 时的唯一回显通道；工作区没有静态资源映射，别指望相对路径能加载）
+ * 工作区那条允许百分号编码，中文文件名（`%E5%B0%81...svg`）才过得了这里的正则。
  */
 function isAudioUrl(url) {
     const clean = String(url).split('?')[0].split('#')[0];
@@ -4587,18 +4894,112 @@ function parseMediaBang(s) {
         const u = balancedUrl(s, rb + 1);
         if (!u) { out += s[p]; i = p + 1; continue; }
         const url = u.url.replace(/&amp;/g, '&');
-        if (!/^https?:\/\//i.test(url) && !/^\/api\/generated-media\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/i.test(url) && !/^\/api\/conversation-media\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/i.test(url) && !/^data:image\//i.test(url))
+        if (!/^https?:\/\//i.test(url) && !/^\/api\/generated-media\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/i.test(url) && !/^\/api\/conversation-media\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/i.test(url) && !/^\/api\/workspace-media\/[A-Za-z0-9._%~-]+$/i.test(url) && !/^data:image\//i.test(url))
             { out += s.slice(p, u.end + 1); i = u.end + 1; continue; }
         if (isAudioUrl(url)) {
-            out += `<audio controls preload="metadata" src="${escA(url)}"></audio>`;
+            out += `<audio controls preload="metadata" ${mediaSrcAttr(url)}></audio>`;
         } else {
             // alt 取自已经过 renderMD 全文转义文本，这里只需补引号（再走 escA 会把 &lt; 二次转义成字面量）
-            out += `<img src="${escA(url)}" alt="${escQ(alt)}" referrerpolicy="no-referrer" loading="lazy">`;
+            out += `<img ${mediaSrcAttr(url)} alt="${escQ(alt)}" referrerpolicy="no-referrer" loading="lazy">`;
         }
         i = u.end + 1;
     }
     return out;
 }
+
+/**
+ * 媒体地址落成属性：站内受保护媒体写成 `data-auth-src`，等 JS 用带 Bearer 的 fetch 取回后再挂 `src`。
+ *
+ * <p>为什么不能直接 `<img src="/api/...">`：服务端只认 `Authorization: Bearer` 头
+ * （{@code JwtSessionService#extractBearerToken}，cookie 与 `access_token` 查询参数两条通路早已移除），
+ * 而 `<img>`/`<audio>` 发出的请求**带不了自定义头** —— 结果就是 401 + 破图。
+ * 站外 https 链接不需要凭证，保持原样。
+ *
+ * <p>另一种情况：这张图**已经取回来过**（{@link MEDIA_BLOB_CACHE} 里有 objectURL）。
+ * 那就不再走 `data-auth-src`，直接把 objectURL 写成 `src` —— 重新渲染时浏览器从内存解码，
+ * 尺寸立刻就位，不会出现「先 0 高、解码后撑开」的跳动。流式重画末尾段落时这条很关键。
+ */
+function mediaSrcAttr(url) {
+    if (!/^\/api\//i.test(url)) return `src="${escA(url)}"`;
+    // 已经取回来的直接挂 objectURL：重新渲染时浏览器从内存解码，不会出现「无尺寸 → 撑开」的跳动。
+    // 还在路上的留 data-auth-src，由 hydrateProtectedMedia 挂同一个 promise 的结果。
+    const cached = MEDIA_BLOB_CACHE.get(url);
+    if (cached && cached.objectUrl) return `src="${escA(cached.objectUrl)}"`;
+    return `data-auth-src="${escA(url)}"`;
+}
+
+/* =========================================================================
+   受保护媒体的加载（<img>/<audio> 发不了 Authorization 头）
+   ========================================================================= */
+const MEDIA_BLOB_CACHE = new Map();   // url -> { promise, objectUrl }
+const MEDIA_BLOB_CACHE_MAX = 40;
+
+/**
+ * 同一个 URL 只取一次，重新渲染出来的新节点直接复用 objectURL。
+ * 失败不入缓存（下次重试），并删掉自己占的位置。
+ */
+function protectedMediaBlob(url) {
+    const cached = MEDIA_BLOB_CACHE.get(url);
+    if (cached) return cached.promise;
+    const entry = { promise: null, objectUrl: null };
+    MEDIA_BLOB_CACHE.set(url, entry);
+    entry.promise = fetch(url, { credentials: 'same-origin' })
+        .then(resp => {
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            return resp.blob();
+        })
+        .then(blob => {
+            entry.objectUrl = URL.createObjectURL(blob);
+            return entry.objectUrl;
+        })
+        .catch(err => {
+            MEDIA_BLOB_CACHE.delete(url);
+            throw err;
+        });
+    evictMediaBlobCache();
+    return entry.promise;
+}
+
+function evictMediaBlobCache() {
+    while (MEDIA_BLOB_CACHE.size > MEDIA_BLOB_CACHE_MAX) {
+        const [oldUrl, old] = MEDIA_BLOB_CACHE.entries().next().value;
+        MEDIA_BLOB_CACHE.delete(oldUrl);
+        if (old.objectUrl) URL.revokeObjectURL(old.objectUrl);
+    }
+}
+
+/** 把 root 下所有 data-auth-src 元素挂上真实 src。 */
+function hydrateProtectedMedia(root) {
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll('[data-auth-src]').forEach(el => {
+        const url = el.getAttribute('data-auth-src');
+        if (!url) return;
+        el.removeAttribute('data-auth-src');   // 同一节点只排队一次
+        protectedMediaBlob(url).then(objectUrl => {
+            // 流式重绘可能已经把节点换掉了，别往废弃节点上写
+            if (el.isConnected) el.src = objectUrl;
+        }).catch(err => {
+            el.setAttribute('data-media-error', '1');
+            console.warn('受保护媒体加载失败:', url, err.message);
+        });
+    });
+}
+
+/* 流式渲染、历史回放、整段重画都会新建节点 —— 用观察器统一接管，免得到处记得调用。 */
+(function observeProtectedMedia() {
+    const start = () => {
+        hydrateProtectedMedia(document.body);
+        new MutationObserver(mutations => {
+            mutations.forEach(m => m.addedNodes.forEach(node => {
+                if (node.nodeType !== 1) return;
+                hydrateProtectedMedia(node.hasAttribute && node.hasAttribute('data-auth-src')
+                    ? node.parentNode : node);
+            }));
+        }).observe(document.body, { childList: true, subtree: true });
+    };
+    if (document.body) start();
+    else document.addEventListener('DOMContentLoaded', start);
+})();
 
 function parseBracketImg(s, label) {
     const needle = '[' + label + '](';
@@ -4617,6 +5018,55 @@ function parseBracketImg(s, label) {
     return out;
 }
 
+/** 把 write_file 回报的 workspace/扁平文件路径换成受认证的下载 URL。 */
+function workspaceDownloadPath(href) {
+    const match = String(href).match(/^workspace\/([^/?#]+)$/i);
+    if (!match) return null;
+    let name;
+    try { name = decodeURIComponent(match[1]); } catch (_) { return null; }
+    if (!name || name.startsWith('.') || name.includes('..') || /[\/\\\x00-\x1f]/.test(name)) return null;
+    return encodeURIComponent(name).replace(/%2E/gi, '.').replace(/%2D/gi, '-').replace(/%5F/gi, '_');
+}
+
+/** 回复常把 write_file 返回的 workspace/文件名作为普通文本，而非 Markdown 链接。 */
+function linkWorkspacePaths(s) {
+    const text = String(s);
+    const protectedRanges = [];
+    // 已有 Markdown 链接的 label/url 以及图片语法不可再改写，否则会嵌套出错误链接。
+    const markdownLink = /!?\[[^\]]*\]\([^)]*\)/g;
+    let existing;
+    while ((existing = markdownLink.exec(text)) !== null) {
+        protectedRanges.push([existing.index, existing.index + existing[0].length]);
+    }
+    const pathPattern = /(^|[\s:：])workspace\/([^\s<>"'`()（）]+)(?=$|[\s),，。；;）])/g;
+    const sourceLines = text.split('\n');
+    let lineStart = 0;
+    const candidates = [];
+    for (const line of sourceLines) {
+        const heading = /(^|[\s:：])(workspace\/[^\s<>"'`()（）]+)(?=$|[\s),，。；;（）])/g;
+        let item;
+        while ((item = heading.exec(line)) !== null) {
+            const start = lineStart + item.index + item[1].length;
+            const end = start + item[2].length;
+            if (!protectedRanges.some(range => start >= range[0] && start < range[1])) {
+                candidates.push({ start, end, token: item[2] });
+            }
+        }
+        lineStart += line.length + 1;
+    }
+    let out = '', cursor = 0;
+    for (const candidate of candidates) {
+        const href = workspaceDownloadPath(candidate.token);
+        if (!href) continue;
+        let displayName = candidate.token.slice('workspace/'.length);
+        try { displayName = decodeURIComponent(displayName); } catch (_) { }
+        out += text.slice(cursor, candidate.start) + '[' + candidate.token.slice(0, 'workspace/'.length) + displayName
+            + '](workspace/' + href + ')';
+        cursor = candidate.end;
+    }
+    return cursor ? out + text.slice(cursor) : text;
+}
+
 function parseLinks(s) {
     let out = '', i = 0;
     while (i < s.length) {
@@ -4630,8 +5080,17 @@ function parseLinks(s) {
         const u = balancedUrl(s, rb + 1);
         if (!u) { out += s[lb]; i = lb + 1; continue; }
         const href = u.url.replace(/&amp;/g, '&');
-        if (!/^https?:\/\//i.test(href) && !/^\/\w/.test(href)) { out += s.slice(lb, u.end + 1); i = u.end + 1; continue; }
-        out += `<a href="${escA(href)}" target="_blank" rel="noopener">${txt}</a>`;
+        const workspacePath = workspaceDownloadPath(href);
+        if (workspacePath) {
+            const downloadUrl = '/api/workspace-download/' + workspacePath;
+            let downloadName = workspacePath;
+            try { downloadName = decodeURIComponent(workspacePath); } catch (_) { }
+            out += `<a href="#" data-auth-download="${escA(downloadUrl)}" data-download-name="${escA(downloadName)}" class="workspace-download-link" rel="nofollow">${txt}</a>`;
+        } else if (!/^https?:\/\//i.test(href) && !/^\/\w/.test(href)) {
+            out += s.slice(lb, u.end + 1);
+        } else {
+            out += `<a href="${escA(href)}" target="_blank" rel="noopener">${txt}</a>`;
+        }
         i = u.end + 1;
     }
     return out;
@@ -4705,6 +5164,7 @@ function renderMD(t) {
 
     t = parseMediaBang(t);
     t = parseBracketImg(t, '图片');
+    t = linkWorkspacePaths(t);
     t = parseLinks(t);
     t = t.replace(/^- (.+)$/gm, '<li>$1</li>');
     t = t.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');

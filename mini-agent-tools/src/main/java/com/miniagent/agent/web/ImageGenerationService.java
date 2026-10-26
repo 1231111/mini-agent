@@ -182,6 +182,9 @@ public class ImageGenerationService {
 
         String primaryBackend = resolveBackend();
         String imageSize = mapAspectRatio(aspectRatio);
+        // 落盘要用 owner 目录（media/generated/<owner>/），这里先抓住调用方的身份：
+        // 竞速/串行都在自己的 future 里绑 owner，回到本线程时只剩这一份快照可用。
+        MemoryStore.OwnerContext ownerCtx = MemoryStore.captureOwnerContext();
         log.info("图像生成: backend={} aspect={} prompt='{}'", primaryBackend, aspectRatio,
                 prompt.substring(0, Math.min(80, prompt.length())));
 
@@ -201,7 +204,7 @@ public class ImageGenerationService {
         if (chain.size() >= 2) {
             BackendAttempt raced = raceBackends(chain.subList(0, 2), prompt, imageSize, deadlineMs);
             if (raced.isOk()) {
-                return toMarkdownImage(raced.url());
+                return toMarkdownImage(raced.url(), ownerCtx);
             }
             lastError = "并行竞速失败（" + raced.error() + "）";
             for (int i = 2; i < chain.size(); i++) {
@@ -212,7 +215,7 @@ public class ImageGenerationService {
                 }
                 BackendAttempt attempt = tryBackend(chain.get(i), prompt, imageSize, deadlineMs);
                 if (attempt.isOk()) {
-                    return toMarkdownImage(attempt.url());
+                    return toMarkdownImage(attempt.url(), ownerCtx);
                 }
                 // 累积而不是覆盖：模型要看到「每一个后端各自为什么不行」，
                 // 才可能判断是换后端、改 prompt 还是等一会儿再来。
@@ -228,7 +231,7 @@ public class ImageGenerationService {
                 }
                 BackendAttempt attempt = tryBackend(backend, prompt, imageSize, deadlineMs);
                 if (attempt.isOk()) {
-                    return toMarkdownImage(attempt.url());
+                    return toMarkdownImage(attempt.url(), ownerCtx);
                 }
                 lastError += "；" + attempt.describe(backend);
             }
@@ -441,11 +444,148 @@ public class ImageGenerationService {
         };
     }
 
-    private static String toMarkdownImage(String imageUrl) {
+    /** 单张生成图的字节上限：再大就不是正常出图结果，别把内存和磁盘交给对端。 */
+    private static final long MAX_IMAGE_BYTES = 32L * 1024 * 1024;
+
+    /**
+     * 后端结果 → 对话区可用的 markdown，**先把图片落到本机**。
+     *
+     * <h2>为什么必须落盘（2026-10-22 实测）</h2>
+     *
+     * <p>硅基流动返回的是临时对象存储链接：
+     * {@code s3.siliconflow.cn/temporary/…&X-Amz-Expires=3600}（1 小时到期）；
+     * 智谱返回的 ufileos 链接带 {@code Expires}（实测约 7 天）。
+     * 原样拼进 markdown 的后果是：当场能看，过一会儿历史记录里的图就裂，断网打不开，
+     * 换个客户端同样看不到 —— 用户以为图丢了，其实是链接过期。
+     *
+     * <p>落盘后走 {@code /api/generated-media/<owner>/<file>}（带登录鉴权、Range、
+     * nosniff 与 CSP sandbox，见 {@code MediaResponses}），图片才是本机资产。
+     *
+     * <p>任何一步失败都退回原 URL 并记 warn：能看比"干净"重要，
+     * 不能因为下载失败让整个出图工具报错。
+     */
+    private String toMarkdownImage(String imageUrl, MemoryStore.OwnerContext ownerCtx) {
+        if (StringUtils.isBlank(imageUrl)) {
+            return imageUrl;
+        }
+        // chatanywhere 的 2ca 分支已经落盘并拼好了 markdown
         if (imageUrl.startsWith("![")) {
             return imageUrl;
         }
-        return "![生成的图片](" + imageUrl + ")";
+        return "![生成的图片](" + persistImage(imageUrl, ownerCtx) + ")";
+    }
+
+    /** 包可见以便用本地假服务器测「下载 → 判类型 → 落盘」全流程（不依赖外网）。 */
+    String persistImage(String imageUrl, MemoryStore.OwnerContext ownerCtx) {
+        try {
+            byte[] bytes;
+            String contentType;
+            if (imageUrl.startsWith("data:")) {
+                int comma = imageUrl.indexOf(',');
+                if (comma < 0) {
+                    return imageUrl;
+                }
+                contentType = imageUrl.substring(5, comma).split(";")[0];
+                bytes = Base64.getDecoder().decode(imageUrl.substring(comma + 1));
+            } else if (imageUrl.startsWith("http://") || imageUrl.startsWith("https://")) {
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(imageUrl))
+                        .timeout(Duration.ofSeconds(60))
+                        .GET()
+                        .build();
+                HttpResponse<java.io.InputStream> response =
+                        HTTP.send(request, HttpResponse.BodyHandlers.ofInputStream());
+                if (response.statusCode() != 200) {
+                    log.warn("生成图下载失败 HTTP {}，退回原链接: {}",
+                            response.statusCode(), abbreviateUrl(imageUrl));
+                    return imageUrl;
+                }
+                contentType = response.headers().firstValue("content-type").orElse("");
+                try (java.io.InputStream in = response.body()) {
+                    // 多读 1 字节用于判定超限，不把对端给的任意长度读进内存
+                    bytes = in.readNBytes((int) MAX_IMAGE_BYTES + 1);
+                }
+                if (bytes.length > MAX_IMAGE_BYTES) {
+                    log.warn("生成图超过 {} 字节上限，退回原链接: {}", MAX_IMAGE_BYTES, abbreviateUrl(imageUrl));
+                    return imageUrl;
+                }
+            } else {
+                // 已经是站内地址（/api/...），不需要再存一次
+                return imageUrl;
+            }
+            if (bytes.length == 0) {
+                return imageUrl;
+            }
+            String ext = imageExtension(bytes, contentType);
+            if (ext == null) {
+                log.warn("下载内容不是可识别的图片（content-type={}），退回原链接: {}",
+                        contentType, abbreviateUrl(imageUrl));
+                return imageUrl;
+            }
+            String fileName = String.format("img_%d_%d.%s",
+                    System.currentTimeMillis(), ThreadLocalRandom.current().nextInt(10000), ext);
+            String storedUrl;
+            // saveGenerated 依赖 MemoryStore 的当前 owner；工具线程上是快照，这里临时绑回来
+            try (var ignored = MemoryStore.bindOwnerContext(ownerCtx)) {
+                storedUrl = mediaStorage.saveGenerated(bytes, fileName);
+            }
+            log.info("生成图已落盘: {} ({} 字节, 来源 {})", storedUrl, bytes.length, abbreviateUrl(imageUrl));
+            return storedUrl;
+        } catch (Exception e) {
+            log.warn("生成图落盘失败，退回原链接: {} ({})", abbreviateUrl(imageUrl), e.toString());
+            return imageUrl;
+        }
+    }
+
+    /**
+     * 按<b>文件头魔数</b>判图片类型，不只看 content-type：对象存储常把图片标成
+     * {@code application/octet-stream}，而扩展名决定了 {@code /api/generated-media}
+     * 会不会放行（`approvedInlineMediaType` 按扩展名查白名单）。
+     * 判定不了返回 null，调用方退原链接 —— 不猜。
+     */
+    static String imageExtension(byte[] bytes, String contentType) {
+        if (Objects.nonNull(bytes)) {
+            if (bytes.length >= 8 && (bytes[0] & 0xFF) == 0x89 && bytes[1] == 0x50
+                    && bytes[2] == 0x4E && bytes[3] == 0x47) {
+                return "png";
+            }
+            if (bytes.length >= 3 && (bytes[0] & 0xFF) == 0xFF && (bytes[1] & 0xFF) == 0xD8
+                    && (bytes[2] & 0xFF) == 0xFF) {
+                return "jpg";
+            }
+            if (bytes.length >= 6 && bytes[0] == 'G' && bytes[1] == 'I' && bytes[2] == 'F') {
+                return "gif";
+            }
+            if (bytes.length >= 12 && bytes[0] == 'R' && bytes[1] == 'I' && bytes[2] == 'F'
+                    && bytes[3] == 'F' && bytes[8] == 'W' && bytes[9] == 'E'
+                    && bytes[10] == 'B' && bytes[11] == 'P') {
+                return "webp";
+            }
+        }
+        String lower = Objects.requireNonNullElse(contentType, "").toLowerCase();
+        if (lower.contains("jpeg") || lower.contains("jpg")) {
+            return "jpg";
+        }
+        if (lower.contains("png")) {
+            return "png";
+        }
+        if (lower.contains("gif")) {
+            return "gif";
+        }
+        if (lower.contains("webp")) {
+            return "webp";
+        }
+        return null;
+    }
+
+    /** 日志里不打完整的签名 URL（带 token，且长度能顶掉半屏）。 */
+    private static String abbreviateUrl(String url) {
+        if (StringUtils.isBlank(url)) {
+            return "";
+        }
+        String head = url.length() <= 48 ? url : url.substring(0, 48) + "…";
+        int q = head.indexOf('?');
+        return q > 0 ? head.substring(0, q) + "?…" : head;
     }
 
     private boolean isCircuitOpen(String backend) {

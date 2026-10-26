@@ -1,7 +1,6 @@
 package com.miniagent.agent.planner;
 
 import com.miniagent.agent.task.TaskPlan;
-import com.miniagent.agent.task.TaskSignals;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -76,7 +75,7 @@ class DataflowNormalizerTest {
                 """);
         assertEquals(List.of("n1_out"), g.byId("n1").outputs());
         assertEquals(List.of("n1_out"), g.byId("n2").inputs());
-        TaskPlan plan = TaskPlan.of("查文档保存", true, TaskSignals.parse("web,file"));
+        TaskPlan plan = TaskPlan.of("查文档保存");
         assertTrue(new PlanValidator().validate(g, plan).valid());
     }
 

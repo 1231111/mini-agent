@@ -527,3 +527,66 @@ docker-compose.yml:64-65,84-85   MINIO_ACCESS_KEY/SECRET: minioadmin / minioadmi
   - 配置的网关是否真的返回 `stream_options.include_usage`（P1 相关降级路径已核实，触发条件未实测）。
   - Milvus/embedding 客户端是否有库内默认 deadline。
 - **旁证但版本不符**：`app-run.log` 为 2026-09-15 产物（早于 HEAD，且含已删除的 `PlannerSelfHealer`/intent 包），其中"池超时 753 次、Hikari 校验失败 884 次"只作为 Hikari 默认池配置的风险旁证，不作为当前代码的直接证据。
+
+
+---
+
+## 8. 2026-10-26 复检：上下文管理对齐 WorkBuddy
+
+本节只记录本轮改动与验证，不改写上文历史结论。上文第 1 节提到的「`llm-summary-enabled` 默认 `false`
+⇒ 中段直接丢弃」在本次已被推翻，见下表。
+
+| 项 | 改造前 | 改造后 | 证据 |
+|---|---|---|---|
+| 累计 token | 超过 `max-estimated-tokens` 直接结束任务 | 只写一条 `TOKEN_USAGE_WARN` 轨迹 + WARN 日志，任务继续 | `ExecutionControl.StopReason` 无 token 项；`markTokenSoftLimitWarned` 只去重告警 |
+| 触发判据 | 仅本地 `TokenEstimator` 估算 | `max(本地估算, 最近真实 inputTokenCount − 工具 schema 开销)` | `AgentLoop.observedMessageTokens` + `ContextCompressor.maybeCompress` |
+| 触发阈值 | `compress-threshold` 单档 0.75 | `pre-message-threshold` 0.5 + `emergency-threshold` 0.9（紧急档穿透冷却） | `application.yml` `agent.context.*` |
+| 压缩时机 | 工具结果入列之后 | **每次请求之前**（含本轮首包），对齐 pre-message 压缩 | `AgentLoop.executeLoop` 中压缩块位于 `callLlm` 之前 |
+| 历史保留 | 尾部按 `TAIL_TOKEN_RATIO=0.4` 留原文 + 保留最后 6 条工具结果 | 只保留「前置 system + 首条用户意图 + 当前轮」，其余折叠为一条交接摘要 | `computeHeadEnd` / `findTailCutIndex` |
+| 跳过 LLM 的判据 | 工程压缩产出 ≤ 窗口 × 0.5 | ≤ 窗口 × 0.15（与 `getEngineeringCompactSufficiencyRatio()` 默认值一致） | `engineering-sufficiency-ratio` |
+| LLM 摘要 | 默认异步补，供下一次压缩 | 默认同步阻塞，摘要返回后才发请求；失败回退到工程交接 | `llm-summary-enabled` 默认 `true` |
+| 窗口解析 | 预设单个 `context-window-tokens`，直接取用 | `ContextWindowResolver`：默认档落在候选集里就用它，否则取最小档，再退回 `max-input-tokens` | `AgentModelsProperties.Preset.effectiveContextWindow()` |
+| 后台线程窗口 | `UserModelBinder.bindModel` 不绑窗口 ⇒ 后台摘要按「未知」处理 | 绑定模型时一并绑定窗口 | `UserModelBinder.bindModel` |
+
+**WorkBuddy 侧依据**（`C://Program Files\WorkBuddy\resources\app.asar.unpacked\cli\dist\codebuddy-lite-wb.mjs`）：
+
+- `resolveCompactTriggerAt` / `getAutoCompactWindow`：窗口存在时 `min(窗口, 自动窗口) × 比例`，否则用绝对值兜底。
+- `resolveEffectiveContextBudget`：`overrideContextWindow` → `contextWindow.defaultLength`（须在 `supportedLengths` 里）→ 最小支持档 → `maxInputTokens`。
+- `getEngineeringCompactSufficiencyRatio()`：默认 `0.15`，可用环境变量覆盖。
+- `HistoryEngineeringCompactor.compact` + `[Compact:PreMessage]` 日志：工程压缩后 `estimatedTokens <= 窗口 × 0.15` 时跳过 LLM 摘要；否则同步跑 `runLlmSummaryForPreMessage`，失败才用截断兜底。
+- 本机下发配置 `C://Users//abc//.workbuddy//cache//acc-product-config-v3.json`：
+  `tokenUsageThresholds.inputTokens.preMessage=0.5`、`emergency=0.9`、`summary.emergency=0.15`、`compact.emergency=0.5`。
+
+**已知差异（保留，不作为待修缺陷）**
+
+1. WorkBuddy 的阈值来自服务端下发配置，MiniAgent 没有产品配置通道，阈值只来自 `application.yml` / 环境变量。
+2. WorkBuddy 有 `overrideContextWindow`（会话级覆盖）；MiniAgent 无会话级覆盖，只有预设声明 + 全局上限。
+3. WorkBuddy 的 `AUTO_COMPACT_WINDOW` 夹在 `[100_000, 1_000_000]`；MiniAgent 的上限由 `agent.context.max-tokens` 给出，不与模型窗口相乘。
+4. 压缩后 MiniAgent 仍按「当前轮」保留消息，WorkBuddy pre-message 压缩发生在用户消息入列之前，因此它没有「保留当前轮」这一步 —— 位置不同导致的必然差异，不是策略差别。
+
+**验证**
+
+- `./mvnw -o -pl mini-agent-loop -am test`：224 项通过，0 失败（含 `ContextCompressorTriggerTest` 9 项、`TokenSoftLimitTest` 5 项）。
+- `./mvnw -q test -pl mini-agent-loop -am -Dtest=ContextCompressorTriggerTest`：9 项通过、0 失败（补了尾部切点回归与够用判据回归后）。
+  注意：只写 `-pl mini-agent-loop` 不带 `-am` 会用本地仓库里的旧 `mini-agent-common`，
+  报 `找不到符号 AGENT_LLM_REFUSE_RETRY`；这不是代码坏了。
+- `./mvnw -o -pl mini-agent-app -am test -Dtest=ContextWindowResolverTest`：7 项通过。
+- 已做：`desktop` 档冷启动实测。`MINI_AGENT_HOME=<临时目录> JWT_SECRET=... java -jar mini-agent-app.jar
+  --spring.profiles.active=desktop --server.port=18080` → `Started ... in 10.448 seconds`，`/actuator/health` 200，
+  日志中没有任何 MySQL / Redis / Milvus 连接尝试。**客户端形态零外部依赖**：H2 文件库
+  （`jdbc:h2:file:${MINI_AGENT_HOME}/data/miniagent;MODE=MySQL`）、`RedisAutoConfiguration` 已被
+  `spring.autoconfigure.exclude` 排掉、`agent.memory.vector.backend=local`。那三件只是 `prod` / compose 档的需要。
+- 已做：真实任务级「压缩 → 注入摘要 → 继续执行」端到端验收（`desktop` 档，`MINI_AGENT_HOME` 指向临时目录，
+  注册 → 建会话 → `POST /api/conversations/{sid}/messages/stream`）。任务为 7 步串行且带依赖
+  （读源码 → 写文件 → 读回确认 → 覆盖改写 → 再读另一个源码 → 同样三步 → 汇总表格），
+  启动参数 `--agent.context.max-tokens=24000 --agent.tools.max-concurrency=1`。
+  结果：压缩触发 2 次，`8475 → 6221`（节省 26.6%，折叠 9 条历史）、`6336 → 3566`（节省 43.7%，折叠 3 条）；
+  两次都走「工程压缩已足够 → 跳过 LLM 摘要」；压缩后模型继续完成第 4–7 步并输出正确表格，
+  未重跑已完成步骤；全程无 `context_length` / 400 / 工具配对报错 —— 说明**摘要作为 `SystemMessage`
+  插在历史中间能被上游（小米 MiMo）接受**。
+- 已做：新增每轮 `压缩判据: 本地估算 X / 真实消息 Y / 预算 Z（窗口 W，schema S）→ 已压缩|未触发` 日志。
+  加这行前，压缩没触发时只能靠猜是阈值错、估算偏低还是预算被 schema 扣掉；连续两轮实测都在猜。
+- **文档未记录（本轮实测发现）**：`TokenEstimator` 对小米 MiMo 的真实 prompt 系统性低估约 45%
+  （首轮本地估算 3304，真实 input 12727 含 schema，扣掉 schema 6630 后仍有 6097）。
+  判据取 `max(本地, 真实)` 所以第 2 轮起由真实值主导，但**首轮没有真实值可用**，
+  首轮若本身超窗仍会被上游拒绝。这是估算器与具体 tokenizer 的偏差，不是阈值问题，暂不改。

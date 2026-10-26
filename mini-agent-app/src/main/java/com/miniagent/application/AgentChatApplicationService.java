@@ -50,7 +50,6 @@ import java.util.Optional;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
-import java.util.function.Consumer;
 import com.miniagent.common.ChatMessageTexts;
 import com.miniagent.common.ChatRole;
 import com.miniagent.common.ErrorCode;
@@ -400,19 +399,15 @@ public class AgentChatApplicationService {
 
         ChatMemory memory = chatMemoryProvider.get(sessionId);
         List<ChatMessage> memMsgs = memory.messages();
-        // 本轮只观察事实信号，不做分类：模型不该因为一次判断失误就同时丢掉
-        // 工具面、历史与执行路径。hasMedia 不参与工具清单与历史条数的判定，
-        // 只用于决定要不要拼上「点评轮」那段提示词。
+        // 本轮不再从用户文本里提取信号。是否拆解、是否建 todo、调哪个工具，
+        // 全部由模型在 AgentLoop 内自行决定；hasMedia 只作为多模态输入传给上下文。
         TaskPlan taskPlan = taskPlanFactory.build(userMessage);
-        if (Objects.nonNull(traceRecorder)) {
-            traceRecorder.recordNode(sessionId, 0, AgentStepNode.TASK_SIGNALS.name(),
-                    "{\"signals\":\"" + taskPlan.signals().describe()
-                            + "\",\"requiresStructuredPlan\":"
-                            + taskPlan.requiresStructuredPlan() + "}",
-                    RunStatus.SUCCESS.name(), 0);
-        }
+        // 权限必须在拼上下文之前绑定：system prompt 的确认口径、todo 块的执行原则
+        // 都要读当前会话的「模式 + 确认策略」。晚绑一步，全自动会话拿到的仍是默认值，
+        // 于是闸门已经放开、提示词还在要求模型向用户讨确认。
+        PermissionContext.setSession(sessionId);
         LoadedContext loaded =
-                contextLoader.load(sessionId, userMessage, hasMedia, taskPlan, memMsgs);
+                contextLoader.load(sessionId, userMessage, hasMedia, memMsgs);
         // 任务级隔离不在这里做。曾经的做法是在换任务时往会话里落一条 system 边界标记，
         // 下一轮重建历史时只取标记之后的消息 —— 那是拿「跨轮追问答不出来」换「不污染」，方向错了。
         // 现在：对话历史整段保留（追问要看得见上文），任务级状态（规划图、压缩摘要）
@@ -438,10 +433,9 @@ public class AgentChatApplicationService {
         String systemPrompt = loaded.systemPrompt();
 
         final boolean streaming = Objects.nonNull(progressEmitter);
-        Consumer<String> progress = Optional.ofNullable(progressEmitter)
-                .<Consumer<String>>map(em -> msg ->
-                        eventCenter.publish(sessionId, "progress", Optional.ofNullable(msg).orElse("")))
-                .orElse(null);
+        // 工具执行过程不再推给前端：对话区只有模型自己的话与最终答案。
+        // 工具名/参数/结果原文（内部 errorCode、文件路径）留在日志与 agent_trace_steps。
+        // 前端也没有 progress 的消费点了，这里不 publish 就不会进 EventStream。
         com.miniagent.agent.core.AgentStreamSink streamSink = !streaming ? null
                 : new com.miniagent.agent.core.AgentStreamSink() {
             @Override public void onThinking(String delta) {
@@ -467,7 +461,6 @@ public class AgentChatApplicationService {
         // 不带窗口时，128k 的模型也会按 512k 估算，压缩永远不触发 → 上游 400 → 误报成网络故障。
         com.miniagent.common.model.EffectiveModelContext.set(
                 effectiveChat, models.streaming(), models.settings().contextWindowTokens());
-        PermissionContext.setSession(sessionId);
         String answer;
         // 规划器的结局：只有"没做完"会被带出去让调用方记为失败；完成与人等状态保持原语义。
         PlanningLoop.RunOutcome unfinishedOutcome = null;
@@ -479,7 +472,7 @@ public class AgentChatApplicationService {
                 PlanningLoop.RunOutcome outcome = planningLoop.runWithOutcome(
                         effectiveChat, systemPrompt, userMessage, multimodalMsg,
                         history, taskPlan, sessionId, run.fencingToken(), executionId,
-                        progress, streamSink);
+                        streamSink);
                 answer = outcome.answer();
                 planApprovalRequired = "PLAN_APPROVAL_REQUIRED".equals(outcome.reason());
                 if (planApprovalRequired && progressEmitter != null) {
@@ -492,10 +485,10 @@ public class AgentChatApplicationService {
                 }
             } else if (hasMedia) {
                 answer = agentLoop.runWithMultimodal(effectiveChat, systemPrompt, multimodalMsg, history,
-                        maxIterations(), progress, taskPlan, streamSink);
+                        maxIterations(), taskPlan, streamSink);
             } else {
                 answer = agentLoop.run(effectiveChat, systemPrompt, userMessage, history,
-                        maxIterations(), progress, taskPlan, streamSink);
+                        maxIterations(), taskPlan, streamSink);
             }
             if (executionControl.isCancelled(sessionId)) {
                 runStatus = RunStatus.CANCELED.name();
@@ -536,6 +529,9 @@ public class AgentChatApplicationService {
             }
             throw e;
         } finally {
+            // 权限上下文在这里提前绑定过，任何在进入内层 try 之前抛出的异常都要清掉，
+            // 否则线程复用时会带着上一个会话的模式去找下一个会话要授权。
+            PermissionContext.clear();
             if (Objects.nonNull(traceRecorder) && traceRecorder.isActive()) {
                 traceRecorder.endExecution(runStatus);
             }

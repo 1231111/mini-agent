@@ -1,9 +1,9 @@
 package com.miniagent.agent.context;
 
+import com.miniagent.agent.permission.PermissionContext;
+import com.miniagent.agent.permission.PermissionPolicy;
 import com.miniagent.agent.scope.TaskBoundary;
 import com.miniagent.agent.scope.TaskScopeRegistry;
-import com.miniagent.agent.task.TaskPlan;
-import com.miniagent.agent.task.TaskSignals;
 import com.miniagent.common.RunStatus;
 import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.agent.trace.TraceRecorder;
@@ -23,7 +23,7 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * 每轮按本轮观察到的事实裁历史、释放上一任务的活动计划，
+ * 每轮按会话里是否有挂起的 todo 裁历史、释放上一任务的活动计划，
  * 并把 system prompt 交给 {@link ContextBuilder}。
  */
 @Component
@@ -44,13 +44,11 @@ public class ContextLoader {
     private ContextBuilder contextBuilder;
 
     /**
-     * 问答轮（无动手信号）保留的历史条数。
+     * 指代场景下历史的相关度精捞上限。
      *
      * <p>这里必须是个正数。给 0 会把整段历史清空，模型连上一轮在谈什么都不知道，
      * 跨轮追问必然答错。历史没带够只会让回答变浅，带成 0 是直接答不出来。</p>
      */
-    @Value("${agent.context.history.question:6}")
-    private int historyQuestion;
     @Value("${agent.context.history.question-with-ref:6}")
     private int historyQuestionWithRef;
     @Value("${agent.context.history.ref-scan-max:48}")
@@ -59,23 +57,23 @@ public class ContextLoader {
     private int historyRefPronounAnchor;
 
     /**
-     * @param hasMedia 本轮用户消息是否带图片/音视频。只影响「点评轮」那段附加提示词，
+     * @param hasMedia 本轮用户消息是否带图片/音视频。只影响 system prompt 里的媒体相关说明，
      *                 不影响历史条数、todo 挂起与工具清单。
      */
     public LoadedContext load(String sessionId, String query, boolean hasMedia,
-                              TaskPlan taskPlan, List<ChatMessage> memMsgs) {
-        TaskSignals signals = Objects.isNull(taskPlan) ? TaskSignals.NONE : taskPlan.signals();
+                              List<ChatMessage> memMsgs) {
         ContextReferenceDecision ref = ContextReference.detect(query);
-        ContextLoadPolicy policy = resolvePolicy(signals, ref);
+        boolean hasSuspendedTodo = Objects.nonNull(sessionId)
+                && taskTodoStore.hasSuspended(sessionId);
+        ContextLoadPolicy policy = resolvePolicy(hasSuspendedTodo, ref);
 
         boolean suspended = false;
         boolean resumed = false;
         TaskBoundary boundary = TaskBoundary.SAME;
         String boundaryReason = "same-task";
         if (Objects.nonNull(sessionId)) {
-            // 轻问答不碰 todo；正在等人工确认时也不释放，否则用户答复会被自己的挂起吃掉
-            boolean waitingHuman = taskTodoStore.hasAwaitingConfirm(sessionId)
-                    && !signals.lightTurn();
+            // 正在等人工确认时不释放，否则用户答复会被自己的挂起吃掉
+            boolean waitingHuman = taskTodoStore.hasAwaitingConfirm(sessionId);
             if (waitingHuman) {
                 log.info("ContextLoader: 跳过 suspend，保留 awaiting_confirm session={}",
                         sessionId);
@@ -104,12 +102,14 @@ public class ContextLoader {
                 : taskScopeRegistry.resolve(sessionId, boundary, boundaryReason).scopeKey();
 
         List<ChatMessage> history = selectHistory(sessionId, memMsgs, query, policy, ref);
+        // 全自动只在「编辑模式 + 自动确认」同时成立时为真。这里读的是运行作用域里的实时值，
+        // 用户在任务跑到一半时打开两个开关，下一步拼出来的提示词就已经是放行口径。
+        boolean fullAuto = PermissionPolicy.isFullAuto(
+                PermissionContext.mode(), PermissionContext.confirmPolicy());
         String systemPrompt = contextBuilder.build(new ContextBuildContext(
-                sessionId, query, policy, Set.of(), ref, taskPlan, hasMedia));
+                sessionId, query, policy, Set.of(), ref, hasMedia, fullAuto));
 
         Map<String, Object> info = new HashMap<>();
-        info.put("signals", signals.describe());
-        info.put("lightTurn", signals.lightTurn());
         info.put("hasMedia", hasMedia);
         info.put("hasReference", ref.hasReference());
         info.put("referenceNegated", ref.isNegated());
@@ -119,6 +119,7 @@ public class ContextLoader {
         info.put("historyMax", policy.historyMaxMessages());
         info.put("injectTodo", policy.injectTodo());
         info.put("injectMidterm", policy.injectMidterm());
+        info.put("fullAuto", fullAuto);
         info.put("injectMemory", policy.injectMemory());
         info.put("injectUser", policy.injectUser());
         info.put("injectSkills", policy.injectSkills());
@@ -138,10 +139,9 @@ public class ContextLoader {
             }
         }
 
-        log.info("ContextLoader: signals=[{}], lightTurn={}, ref={}/neg={}/conf={}, "
+        log.info("ContextLoader: ref={}/neg={}/conf={}, "
                         + "history={}/{}, todoInject={}, suspended={}, resumed={}, "
                         + "scope={}/{}, tools={}",
-                signals.describe(), signals.lightTurn(),
                 ref.hasReference(), ref.isNegated(), ref.confidence(),
                 history.size(), policy.historyMaxMessages(),
                 policy.injectTodo(), suspended, resumed,
@@ -150,16 +150,16 @@ public class ContextLoader {
         return new LoadedContext(systemPrompt, history, policy, scopeKey, info);
     }
 
-    ContextLoadPolicy resolvePolicy(TaskSignals signals, ContextReferenceDecision ref) {
-        TaskSignals s = signals == null ? TaskSignals.NONE : signals;
-        ContextLoadPolicy base = ContextLoadPolicy.forSignals(s);
-        if (!s.lightTurn()) {
+    ContextLoadPolicy resolvePolicy(boolean hasSuspendedTodo, ContextReferenceDecision ref) {
+        ContextLoadPolicy base = ContextLoadPolicy.forSuspendedTodo(hasSuspendedTodo);
+        if (hasSuspendedTodo) {
             return base;
         }
         boolean loadRef = ref != null && ref.shouldLoadPriorHistory();
-        ContextLoadPolicy p = base.withHistoryMaxMessages(
-                loadRef ? historyQuestionWithRef : historyQuestion);
-        return loadRef ? p.withInjectMemory(true) : p;
+        if (!loadRef) {
+            return base;
+        }
+        return base.withHistoryMaxMessages(historyQuestionWithRef).withInjectMemory(true);
     }
 
     List<ChatMessage> selectHistory(String sessionId, List<ChatMessage> all, String query,

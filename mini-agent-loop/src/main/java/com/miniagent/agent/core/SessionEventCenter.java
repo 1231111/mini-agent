@@ -45,7 +45,29 @@ public class SessionEventCenter {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String SSE_PREFIX = "sse:";
     private static final String PENDING_USER_MSG_PREFIX = "pending-user-msg:";
+    private static final String PENDING_USER_MSG_STATE_PREFIX = "pending-user-msg-state:";
+    private static final String PENDING_USER_MSG_RUN_PREFIX = "pending-user-msg-run:";
     private static final Duration PENDING_USER_MSG_TTL = Duration.ofHours(2);
+    private static final org.springframework.data.redis.core.script.DefaultRedisScript<Long> REDIS_APPEND_SCRIPT =
+            new org.springframework.data.redis.core.script.DefaultRedisScript<>(
+                    "if redis.call('GET', KEYS[1]) ~= 'open' then return 0 end "
+                            + "redis.call('LPUSH', KEYS[2], ARGV[1]) "
+                            + "redis.call('EXPIRE', KEYS[1], ARGV[2]) "
+                            + "redis.call('EXPIRE', KEYS[2], ARGV[2]) "
+                            + "return 1", Long.class);
+    private static final org.springframework.data.redis.core.script.DefaultRedisScript<List> REDIS_DRAIN_SCRIPT =
+            new org.springframework.data.redis.core.script.DefaultRedisScript<>(
+                    "local messages = redis.call('LRANGE', KEYS[1], 0, -1) "
+                            + "redis.call('DEL', KEYS[1]) "
+                            + "return messages", List.class);
+    private static final org.springframework.data.redis.core.script.DefaultRedisScript<List> REDIS_SEAL_SCRIPT =
+            new org.springframework.data.redis.core.script.DefaultRedisScript<>(
+                    "if redis.call('GET', KEYS[1]) ~= 'open' then return {0} end "
+                            + "local messages = redis.call('LRANGE', KEYS[2], 0, -1) "
+                            + "if #messages > 0 then redis.call('DEL', KEYS[2]); return {1, cjson.encode(messages)} end "
+                            + "redis.call('SET', KEYS[1], 'closed', 'EX', ARGV[1]) "
+                            + "redis.call('DEL', KEYS[2]) "
+                            + "return {2}", List.class);
 
     private final Map<String, SessionChannel> channels = new ConcurrentHashMap<>();
     /**
@@ -117,11 +139,13 @@ public class SessionEventCenter {
          */
         final Object bufferLock = new Object();
         volatile Status status = Status.running;
+        /** Serializes local append acknowledgements with the final empty-queue check. */
+        final Object pendingUserMessageLock = new Object();
         volatile String sessionId;
+        volatile String runToken;
         volatile String userMessage = "";
         final StringBuilder think = new StringBuilder();
         final StringBuilder answer = new StringBuilder();
-        volatile String progress = "";
         volatile Object planApproval = null;
         volatile String subgoalText = "";
         volatile int subgoalDone = 0;
@@ -148,8 +172,18 @@ public class SessionEventCenter {
         String k = key(sessionId);
         SessionChannel channel = new SessionChannel();
         channel.sessionId = k;
+        channel.runToken = UUID.randomUUID().toString();
         channel.userMessage = Optional.ofNullable(userMessage).orElse("");
         channels.put(k, channel);
+        if (redisMode()) {
+            try {
+                redis.delete(pendingQueueKey(k));
+                redis.opsForValue().set(redisRunKey(k), channel.runToken, PENDING_USER_MSG_TTL);
+                redis.opsForValue().set(redisStateKey(k, channel.runToken), "open", PENDING_USER_MSG_TTL);
+            } catch (Exception e) {
+                log.warn("Redis 追加消息状态初始化失败: sessionId={}, err={}", k, e.getMessage());
+            }
+        }
         publishToOtherInstances(k, "start", "user", channel.userMessage);
     }
 
@@ -247,9 +281,6 @@ public class SessionEventCenter {
         if (!thinkSnapshot.isEmpty()) {
             sendEvent(emitter, "thinking", thinkSnapshot);
         }
-        if (Objects.nonNull(channel.progress) && !channel.progress.isEmpty()) {
-            sendEvent(emitter, "progress", channel.progress);
-        }
         if (channel.planApproval != null) {
             sendEvent(emitter, "plan_approval", channel.planApproval);
         }
@@ -331,15 +362,17 @@ public class SessionEventCenter {
         if (Objects.isNull(channel)) {
             return;
         }
-        channel.finalAnswer = Optional.ofNullable(finalAnswer).orElse("");
-        channel.status = Status.done;
+        synchronized (channel.pendingUserMessageLock) {
+            channel.status = Status.done;
+            channel.finalAnswer = Optional.ofNullable(finalAnswer).orElse("");
+            closeRedisAcceptance(sessionId);
+        }
         channel.doneAt = System.currentTimeMillis();
         for (SseEmitter client : channel.clients) {
             sendEvent(client, "end", channel.finalAnswer);
             try { client.complete(); } catch (Exception ignored) {}
         }
         channel.clients.clear();
-        clearPendingUserMessages(key(sessionId));
         publishToOtherInstances(key(sessionId), "complete", "end", channel.finalAnswer);
     }
 
@@ -348,94 +381,173 @@ public class SessionEventCenter {
         if (Objects.isNull(channel)) {
             return;
         }
-        channel.errorMsg = Optional.ofNullable(message).orElse("处理出错");
-        channel.status = Status.error;
+        synchronized (channel.pendingUserMessageLock) {
+            channel.errorMsg = Optional.ofNullable(message).orElse("处理出错");
+            channel.status = Status.error;
+            closeRedisAcceptance(sessionId);
+        }
         channel.doneAt = System.currentTimeMillis();
         for (SseEmitter client : channel.clients) {
             sendEvent(client, "error", channel.errorMsg);
             try { client.complete(); } catch (Exception ignored) {}
         }
         channel.clients.clear();
-        clearPendingUserMessages(key(sessionId));
         publishToOtherInstances(key(sessionId), "error", "error", channel.errorMsg);
     }
 
-    /** 执行中追加用户消息（跨实例用 Redis 列表）。 */
+    /** 执行中追加用户消息；只有完成原子入队后才向调用方确认成功。 */
     public boolean appendUserMessage(String sessionId, String message) {
         String k = key(sessionId);
+        SessionChannel channel = channels.get(k);
+        if (channel == null || channel.status != Status.running) {
+            return false;
+        }
         if (redisMode()) {
-            // Do not create an orphan Redis list for a completed or unknown
-            // session. The start event is published before the worker accepts
-            // appended messages, so a missing/non-running channel is a real
-            // stale-client signal rather than an invitation to queue forever.
-            SessionChannel channel = channels.get(k);
-            if (channel == null || channel.status != Status.running) {
-                return false;
-            }
             try {
-                String queueKey = PENDING_USER_MSG_PREFIX + k;
-                redis.opsForList().leftPush(queueKey, message);
-                // A worker restart must not leave user input in Redis forever.
-                // The deadline/lease is at most two hours in the default
-                // profile, so this TTL covers a live run while bounding stale
-                // queues after a crash.
-                redis.expire(queueKey, PENDING_USER_MSG_TTL);
-                String ack = message.length() > 50 ? message.substring(0, 50) + "..." : message;
-                sendToLocalClients(channel, "append_ack", ack);
-                publishToOtherInstances(k, "event", "append_ack", ack);
-                log.info("用户追加消息入队(redis): sessionId={}, length={}", sessionId, message.length());
-                return true;
+                Long accepted = redis.execute(REDIS_APPEND_SCRIPT,
+                        List.of(redisStateKey(k, channel.runToken), pendingQueueKey(k)),
+                        Objects.requireNonNullElse(message, ""),
+                        String.valueOf(PENDING_USER_MSG_TTL.toSeconds()));
+                if (!Long.valueOf(1L).equals(accepted)) {
+                    return false;
+                }
             } catch (Exception e) {
                 log.warn("Redis 追加消息失败: {}", e.getMessage());
                 return false;
             }
+        } else {
+            synchronized (channel.pendingUserMessageLock) {
+                if (channel.status != Status.running) {
+                    return false;
+                }
+                channel.pendingUserMessages.offer(Objects.requireNonNullElse(message, ""));
+            }
         }
-        SessionChannel channel = channels.get(k);
-        if (Objects.isNull(channel) || channel.status != Status.running) {
-            return false;
-        }
-        channel.pendingUserMessages.offer(message);
-        sendToLocalClients(channel, "append_ack", message.length() > 50 ? message.substring(0, 50) + "..." : message);
-        log.info("用户追加消息入队: sessionId={}, length={}", sessionId, message.length());
+        String value = Objects.requireNonNullElse(message, "");
+        String ack = value.length() > 50 ? value.substring(0, 50) + "..." : value;
+        sendToLocalClients(channel, "append_ack", ack);
+        publishToOtherInstances(k, "event", "append_ack", ack);
+        log.info("用户追加消息入队: sessionId={}, length={}", sessionId, value.length());
         return true;
     }
 
     public List<String> takePendingUserMessages(String sessionId) {
         String k = key(sessionId);
         if (redisMode()) {
-            List<String> result = new ArrayList<>();
             try {
-                String msg;
-                while ((msg = redis.opsForList().rightPop(PENDING_USER_MSG_PREFIX + k)) != null) {
-                    result.add(msg);
+                List<String> values = redis.execute(REDIS_DRAIN_SCRIPT,
+                        List.of(pendingQueueKey(k)));
+                if (values == null || values.isEmpty()) {
+                    return List.of();
                 }
+                java.util.Collections.reverse(values);
+                return values;
             } catch (Exception e) {
                 log.warn("Redis 取出追加消息失败: {}", e.getMessage());
+                return List.of();
+            }
+        }
+        SessionChannel channel = channels.get(k);
+        if (channel == null) {
+            return List.of();
+        }
+        synchronized (channel.pendingUserMessageLock) {
+            List<String> result = new ArrayList<>();
+            String msg;
+            while ((msg = channel.pendingUserMessages.poll()) != null) {
+                result.add(msg);
             }
             return result;
         }
-        SessionChannel channel = channels.get(k);
-        if (Objects.isNull(channel)) {
-            return List.of();
-        }
-        List<String> result = new ArrayList<>();
-        String msg;
-        while (Objects.nonNull((msg = channel.pendingUserMessages.poll()))) {
-            result.add(msg);
-        }
-        return result;
     }
 
-    private void clearPendingUserMessages(String sessionId) {
+    /**
+     * 原子地处理正常完成边界。返回 queued=true 时把追加消息交给循环继续执行；
+     * 返回 queued=false 时会话已关闭，后续追加必定被拒绝。
+     */
+    public SealResult sealIfNoPendingUserMessages(String sessionId) {
+        String k = key(sessionId);
+        SessionChannel channel = channels.get(k);
+        if (channel == null) {
+            return new SealResult(true, List.of());
+        }
+        if (redisMode()) {
+            try {
+                List<?> result = redis.execute(REDIS_SEAL_SCRIPT,
+                        List.of(redisStateKey(k, channel.runToken), pendingQueueKey(k)),
+                        String.valueOf(PENDING_USER_MSG_TTL.toSeconds()));
+                if (result == null || result.isEmpty()) {
+                    return new SealResult(true, List.of());
+                }
+                long status = Long.parseLong(String.valueOf(result.get(0)));
+                if (status == 1L) {
+                    String encoded = String.valueOf(result.get(1));
+                    List<String> messages = JSON.readValue(encoded,
+                            JSON.getTypeFactory().constructCollectionType(List.class, String.class));
+                    java.util.Collections.reverse(messages);
+                    return new SealResult(true, messages);
+                }
+                if (status == 2L) {
+                    synchronized (channel.pendingUserMessageLock) {
+                        channel.status = Status.done;
+                        channel.finalAnswer = "";
+                        channel.doneAt = System.currentTimeMillis();
+                    }
+                    return new SealResult(false, List.of());
+                }
+                return new SealResult(false, List.of());
+            } catch (Exception e) {
+                log.warn("Redis 任务封存检查失败: sessionId={}, err={}", k, e.getMessage());
+                return new SealResult(false, List.of(), true);
+            }
+        }
+        synchronized (channel.pendingUserMessageLock) {
+            List<String> pending = new ArrayList<>();
+            String msg;
+            while ((msg = channel.pendingUserMessages.poll()) != null) {
+                pending.add(msg);
+            }
+            if (!pending.isEmpty()) {
+                return new SealResult(true, pending);
+            }
+            channel.status = Status.done;
+            channel.finalAnswer = "";
+            channel.doneAt = System.currentTimeMillis();
+            closeRedisAcceptance(k);
+            return new SealResult(false, List.of());
+        }
+    }
+
+    public record SealResult(boolean queued, List<String> messages, boolean failed) {
+        public SealResult(boolean queued, List<String> messages) {
+            this(queued, messages, false);
+        }
+    }
+
+    private static String pendingQueueKey(String sessionId) {
+        return PENDING_USER_MSG_PREFIX + sessionId;
+    }
+
+    private static String redisStateKey(String sessionId, String runToken) {
+        return PENDING_USER_MSG_STATE_PREFIX + sessionId + ":" + runToken;
+    }
+
+    private static String redisRunKey(String sessionId) {
+        return PENDING_USER_MSG_RUN_PREFIX + sessionId;
+    }
+
+    private void closeRedisAcceptance(String sessionId) {
         if (!redisMode()) {
             return;
         }
+        SessionChannel channel = channels.get(key(sessionId));
+        if (channel == null || channel.runToken == null) {
+            return;
+        }
         try {
-            redis.delete(PENDING_USER_MSG_PREFIX + sessionId);
+            redis.opsForValue().set(redisStateKey(sessionId, channel.runToken), "closed", PENDING_USER_MSG_TTL);
         } catch (Exception e) {
-            // Completion/error delivery must remain local even if Redis is
-            // already unavailable during shutdown or failover.
-            log.debug("清理 Redis 追加消息队列失败 session={}: {}", sessionId, e.getMessage());
+            log.debug("关闭 Redis 追加消息接收失败 session={}: {}", sessionId, e.getMessage());
         }
     }
 
@@ -500,14 +612,15 @@ public class SessionEventCenter {
                 }
                 case "complete" -> {
                     channel.finalAnswer = String.valueOf(data);
-                    channel.status = Status.done;
-                    channel.doneAt = System.currentTimeMillis();
+        channel.status = Status.done;
+        closeRedisAcceptance(sessionId);
+        channel.doneAt = System.currentTimeMillis();
                     for (SseEmitter client : channel.clients) {
                         sendEvent(client, "end", channel.finalAnswer);
                         try { client.complete(); } catch (Exception ignored) {}
                     }
                     channel.clients.clear();
-                    clearPendingUserMessages(sessionId);
+                    closeRedisAcceptance(sessionId);
                 }
                 case "error" -> {
                     channel.errorMsg = String.valueOf(data);
@@ -518,7 +631,7 @@ public class SessionEventCenter {
                         try { client.complete(); } catch (Exception ignored) {}
                     }
                     channel.clients.clear();
-                    clearPendingUserMessages(sessionId);
+                    closeRedisAcceptance(sessionId);
                 }
                 default -> {
                     if ("plan_approval".equals(name)) {
@@ -570,7 +683,6 @@ public class SessionEventCenter {
             }
             // seal/reset：正文留给前端归档进时间线；服务端缓冲保留供重连，不再抹掉
             case "reset", "seal" -> { }
-            case "progress" -> channel.progress = text;
             case "session" -> channel.sessionId = text;
             default -> { }
         }

@@ -16,11 +16,11 @@ class PermissionPolicyTest {
     void execAskNeedsGrantInDefaultMode() {
         // ask = 需会话批准。DEFAULT 与 ASK 模式下都要批；ALLOW 才免批。
         assertTrue(PermissionPolicy.needsSessionGrant(
-                PermissionMode.DEFAULT, "exec_command", ExecPolicy.ASK));
+                PermissionMode.DEFAULT, "exec_command", ExecPolicy.ASK, ConfirmPolicy.DANGEROUS));
         assertTrue(PermissionPolicy.needsSessionGrant(
-                PermissionMode.ASK, "exec_command", ExecPolicy.ASK));
+                PermissionMode.ASK, "exec_command", ExecPolicy.ASK, ConfirmPolicy.DANGEROUS));
         assertFalse(PermissionPolicy.needsSessionGrant(
-                PermissionMode.DEFAULT, "exec_command", ExecPolicy.ALLOW));
+                PermissionMode.DEFAULT, "exec_command", ExecPolicy.ALLOW, ConfirmPolicy.DANGEROUS));
     }
 
     @Test
@@ -44,16 +44,17 @@ class PermissionPolicyTest {
                 PermissionPolicy.effectiveExecPolicy(PermissionMode.ACCEPT_EDITS, ExecPolicy.ASK));
         assertEquals(ExecPolicy.ALLOW,
                 PermissionPolicy.effectiveExecPolicy(PermissionMode.ACCEPT_EDITS, ExecPolicy.ALLOW));
-        // 免批只能来自用户显式选择的 allow 档，不能来自会话模式
+        // 免批的来源只有两个：用户显式选的 allow 档，或「自动编辑 + 自动确认」的组合。
+        // 单独打开自动编辑不构成后者 —— 那正是这里要锁住的行为。
         assertTrue(PermissionPolicy.needsSessionGrant(
-                PermissionMode.ACCEPT_EDITS, "exec_command", ExecPolicy.ASK));
+                PermissionMode.ACCEPT_EDITS, "exec_command", ExecPolicy.ASK, ConfirmPolicy.DANGEROUS));
         assertFalse(PermissionPolicy.needsSessionGrant(
-                PermissionMode.ACCEPT_EDITS, "exec_command", ExecPolicy.ALLOW));
+                PermissionMode.ACCEPT_EDITS, "exec_command", ExecPolicy.ALLOW, ConfirmPolicy.DANGEROUS));
         // 编辑类工具仍按模式的既有语义走"别问我"
         assertFalse(PermissionPolicy.needsSessionGrant(
-                PermissionMode.ACCEPT_EDITS, "edit_file", ExecPolicy.ASK));
+                PermissionMode.ACCEPT_EDITS, "edit_file", ExecPolicy.ASK, ConfirmPolicy.DANGEROUS));
         assertFalse(PermissionPolicy.needsSessionGrant(
-                PermissionMode.ACCEPT_EDITS, "http_post", ExecPolicy.ASK));
+                PermissionMode.ACCEPT_EDITS, "http_post", ExecPolicy.ASK, ConfirmPolicy.DANGEROUS));
     }
 
     @Test
@@ -73,7 +74,7 @@ class PermissionPolicyTest {
         // "不产生批准入口"，真正的拒绝由 isExecBlocked 在前置检查里完成。
         // 这条测试锁住这个分工，避免以后有人误以为 false 就是放行。
         assertFalse(PermissionPolicy.needsSessionGrant(
-                PermissionMode.DEFAULT, "exec_command", ExecPolicy.BLOCK));
+                PermissionMode.DEFAULT, "exec_command", ExecPolicy.BLOCK, ConfirmPolicy.DANGEROUS));
         assertTrue(PermissionPolicy.isExecBlocked("exec_command", ExecPolicy.BLOCK));
     }
 
@@ -135,14 +136,14 @@ class PermissionPolicyTest {
     @Test
     void httpPostAlwaysAsksInDefault() {
         assertTrue(PermissionPolicy.needsSessionGrant(
-                PermissionMode.DEFAULT, "http_post", ExecPolicy.ALLOW));
+                PermissionMode.DEFAULT, "http_post", ExecPolicy.ALLOW, ConfirmPolicy.DANGEROUS));
     }
 
     @Test
     void otherDangerousToolsUnaffectedByExecPolicy() {
         // exec 策略不该波及别的工具：ALLOW 也不能让 write_file 在 ASK 模式下免批
         assertTrue(PermissionPolicy.needsSessionGrant(
-                PermissionMode.ASK, "write_file", ExecPolicy.ALLOW));
+                PermissionMode.ASK, "write_file", ExecPolicy.ALLOW, ConfirmPolicy.DANGEROUS));
     }
 
     @Test
@@ -187,8 +188,58 @@ class PermissionPolicyTest {
     void readOnlyModeRequiresGrantForLeakedDangerousTools() {
         // 防御性兜底：万一写/执行工具绕过 specs 直接到了执行侧，仍须授权（等于拒绝）。
         assertTrue(PermissionPolicy.needsSessionGrant(
-                PermissionMode.READ_ONLY, "write_file", ExecPolicy.ALLOW));
+                PermissionMode.READ_ONLY, "write_file", ExecPolicy.ALLOW, ConfirmPolicy.DANGEROUS));
         assertTrue(PermissionPolicy.needsSessionGrant(
-                PermissionMode.READ_ONLY, "exec_command", ExecPolicy.ALLOW));
+                PermissionMode.READ_ONLY, "exec_command", ExecPolicy.ALLOW, ConfirmPolicy.DANGEROUS));
+    }
+
+    // ==================== 全自动：自动编辑 + 自动确认 ====================
+
+    @Test
+    void fullAutoNeedsBothSwitches() {
+        // 产品规则：两个开关同时打开才是全自动。单开任何一个都不改变原有语义。
+        assertTrue(PermissionPolicy.isFullAuto(
+                PermissionMode.ACCEPT_EDITS, ConfirmPolicy.AUTO));
+        assertFalse(PermissionPolicy.isFullAuto(
+                PermissionMode.ACCEPT_EDITS, ConfirmPolicy.DANGEROUS));
+        assertFalse(PermissionPolicy.isFullAuto(
+                PermissionMode.DEFAULT, ConfirmPolicy.AUTO));
+        assertFalse(PermissionPolicy.isFullAuto(
+                PermissionMode.ASK, ConfirmPolicy.AUTO));
+        assertFalse(PermissionPolicy.isFullAuto(
+                PermissionMode.PLAN, ConfirmPolicy.AUTO));
+        assertFalse(PermissionPolicy.isFullAuto(
+                PermissionMode.READ_ONLY, ConfirmPolicy.AUTO),
+                "只读是硬约束，不能被确认策略降级");
+        assertFalse(PermissionPolicy.isFullAuto(PermissionMode.ACCEPT_EDITS, null));
+    }
+
+    @Test
+    void fullAutoRemovesEveryApprovalEntryPoint() {
+        // 「后续步骤不再询问授权」必须覆盖所有会弹批准的工具，而不是只放行 exec_command。
+        for (String tool : java.util.List.of(
+                "exec_command", "http_post", "write_file", "edit_file",
+                "browser_click", "browser_evaluate", "mcp__anything")) {
+            assertFalse(PermissionPolicy.needsSessionGrant(
+                            PermissionMode.ACCEPT_EDITS, tool, ExecPolicy.ASK, ConfirmPolicy.AUTO),
+                    "全自动下不应再产生批准入口: " + tool);
+        }
+    }
+
+    @Test
+    void fullAutoDoesNotTurnBlockIntoExecution() {
+        // 「不询问」不等于「允许执行」：block 仍由前置闸门直接拒绝。
+        assertTrue(PermissionPolicy.isExecBlocked("exec_command", ExecPolicy.BLOCK));
+        assertFalse(PermissionPolicy.needsSessionGrant(
+                PermissionMode.ACCEPT_EDITS, "exec_command", ExecPolicy.BLOCK, ConfirmPolicy.AUTO));
+    }
+
+    @Test
+    void autoConfirmAloneStillAsksForExec() {
+        // 只开「自动确认」只影响待办确认，不放开命令。
+        assertTrue(PermissionPolicy.needsSessionGrant(
+                PermissionMode.DEFAULT, "exec_command", ExecPolicy.ASK, ConfirmPolicy.AUTO));
+        assertTrue(PermissionPolicy.needsSessionGrant(
+                PermissionMode.ASK, "exec_command", ExecPolicy.ASK, ConfirmPolicy.AUTO));
     }
 }

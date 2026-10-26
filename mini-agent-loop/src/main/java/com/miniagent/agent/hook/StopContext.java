@@ -15,15 +15,12 @@ public record StopContext(
         Set<String> toolsInvoked,
         boolean writeFileSucceeded,
         boolean mediaDelivered,
-        boolean requiresStructuredPlan,
         boolean subagent,
         PermissionMode permissionMode,
         boolean planApproved,
-        boolean lightQa,
         boolean plannerOwned,
         boolean hasTodoPlan,
         boolean runnableIncomplete,
-        int missingPlanNudges,
         int incompleteNudges,
         String todoRender
 ) {

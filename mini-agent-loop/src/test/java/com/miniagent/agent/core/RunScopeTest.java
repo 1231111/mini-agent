@@ -2,8 +2,11 @@ package com.miniagent.agent.core;
 
 import com.miniagent.agent.delegate.RoleContext;
 import com.miniagent.agent.delegate.SubagentContext;
+import com.miniagent.agent.permission.ConfirmPolicy;
 import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.agent.permission.PermissionMode;
+import com.miniagent.agent.permission.PermissionPolicy;
+import com.miniagent.agent.permission.SessionPermissionStore;
 import com.miniagent.agent.todo.TaskTodoContext;
 import com.miniagent.agent.tool.BuiltinTools;
 import com.miniagent.agent.tool.WorkspaceContext;
@@ -109,6 +112,37 @@ class RunScopeTest {
         assertEquals("main_task", BuiltinTools.currentTaskName());
         assertNull(WorkspaceContext.getTaskOverride());
         assertTrue(LoopTurnContext.current().hardGate());
+    }
+
+    @Test
+    void midTaskSwitchToFullAutoIsVisibleToTheNextSnapshot() {
+        SessionPermissionStore store = new SessionPermissionStore();
+        PermissionContext.bindStore(store);
+        try {
+            PermissionContext.setSession("live");
+            store.setMode("live", PermissionMode.DEFAULT);
+            RunScope before = RunScope.capture();
+            assertFalse(PermissionPolicy.isFullAuto(
+                    before.permissionMode(), before.confirmPolicy()));
+
+            // 任务执行中改设置：下一个 RunScope 必须立刻反映，不需要重启任务
+            store.setMode("live", PermissionMode.ACCEPT_EDITS);
+            store.setConfirmPolicy("live", ConfirmPolicy.AUTO);
+            RunScope after = RunScope.capture();
+            assertTrue(PermissionPolicy.isFullAuto(
+                    after.permissionMode(), after.confirmPolicy()));
+
+            // 子代理继承同一份快照；绑定后 ThreadLocal 里也必须一致，
+            // 否则子代理里的 todo 闸门会去读子会话（无记录）而退回危险确认。
+            RunScope child = after.asSubagent("child", "coder", null, Path.of("tmp-sub"));
+            assertTrue(PermissionPolicy.isFullAuto(
+                    child.permissionMode(), child.confirmPolicy()));
+            try (var ignored = child.bind()) {
+                assertEquals(ConfirmPolicy.AUTO, PermissionContext.confirmPolicy());
+            }
+        } finally {
+            PermissionContext.clear();
+        }
     }
 
     /** 只用来证明子代理快照会丢掉父闸门。 */

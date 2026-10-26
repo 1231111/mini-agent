@@ -29,12 +29,16 @@ import java.util.concurrent.ConcurrentHashMap;
 import org.apache.commons.lang3.StringUtils;
 
 /**
- * 上下文压缩器（对标 hermes-agent context_compressor.py 5 阶段流水线）。
+ * 上下文压缩器（两步式：工程压缩优先，必要时升级到 LLM 摘要）。
  *
- * 设计要点：
- *   - 5 阶段流水线：pruneOldToolResults → findTailCutIndex → generateSummary → rebuild → sanitizeOrphanedToolPairs
- *   - 按 session 隔离状态，支持多用户并发
- *   - 压缩只服务 Loop 内 messages；记忆晋升走巩固，不写用户级 MIDTERM
+ * <p>流水线：computeHeadEnd → findTailCutIndex → 工程压缩（结构化交接）→ 够不够小？
+ * 不够小且 {@code llm-summary-enabled} 时同步 LLM 摘要 → rebuild → sanitizeOrphanedToolPairs。</p>
+ *
+ * <p>保留策略：前置 system/taskPlan 与首个用户意图（锚定原始诉求）+ **当前轮**（最近一条用户消息
+ * 之后的工具往返，压缩时正在进行的推理现场）。中间已完成的全部历史折叠成一条交接摘要 ——
+ * 不再像旧实现那样按 {@code TAIL_TOKEN_RATIO} 留一段尾部原文，那会同时留下半截历史与重复事实。</p>
+ *
+ * <p>按任务作用域隔离状态，支持多用户并发。压缩只服务 Loop 内 messages；记忆晋升走巩固，不写用户级 MIDTERM。</p>
  */
 @Slf4j
 @Component
@@ -55,22 +59,43 @@ public class ContextCompressor {
     private TaskScopeRegistry taskScopeRegistry;
 
     // ─── 阈值配置 ───
-    /** 压缩触发阈值：上下文占比达到该比例即压缩，留出输出余量。可配置，默认 0.75。 */
-    @Value("${agent.context.compress-threshold:0.75}")
-    private double compressionThreshold;
+    /** 工程压缩阈值：下一次请求前达到该比例时压缩，默认与 WorkBuddy preMessage 对齐。 */
+    @Value("${agent.context.pre-message-threshold:0.5}")
+    private double preMessageThreshold;
+    /** 紧急阈值：provider 用量达到该比例时不受常规冷却限制，避免请求进入不可恢复区。 */
+    @Value("${agent.context.emergency-threshold:0.9}")
+    private double emergencyThreshold;
     /**
-     * true：压缩热路径同步调 LLM 摘要（会拉高 P99）。
-     * false（默认）：热路径硬截断 + 占位摘要，LLM 摘要异步后台跑，供下次压缩使用。
+     * true（默认）：工程压缩不够小时同步调 LLM 摘要，压缩完成后本轮才继续。
+     * 这是 WorkBuddy pre-message 压缩的行为 —— 摘要返回前不放行，避免「先带着旧历史请求、
+     * 再靠后台摘要补上」那种读写竞争。
+     *
+     * <p>false：热路径只做工程压缩，摘要异步补，供**下一次**压缩使用。仅用于对 P99 敏感的部署；
+     * 代价是被压掉的历史在这段时间内只有 stub，模型可能重做已完成的工作。</p>
      */
-    @Value("${agent.context.llm-summary-enabled:false}")
+    @Value("${agent.context.llm-summary-enabled:true}")
     private boolean llmSummaryEnabled;
-    private static final double TAIL_TOKEN_RATIO = 0.4;
+    /** 工程压缩产物不超过有效窗口的 15% 时跳过 LLM 摘要。 */
+    @Value("${agent.context.engineering-sufficiency-ratio:0.15}")
+    private double engineeringSufficiencyRatio;
+    /**
+     * 尾部保留预算占工作窗口的比例。
+     *
+     * <p>为什么要有这个：真实任务里用户通常只说一句话，后面几十轮都是工具往返。
+     * 若按「最近一条用户消息」切尾部，就会把几乎整段工具历史当成「当前轮」留下，
+     * 压缩范围只剩一两条消息 —— 换上摘要反而更长（实测 17195 → 17484 token），
+     * 白花一次 LLM 调用还被回退。WorkBuddy 的做法同样是只保护一段
+     * {@code protectedTail}，其余全部折叠。</p>
+     */
+    @Value("${agent.context.protected-tail-ratio:0.1}")
+    private double protectedTailRatio;
     private static final int PROTECT_FIRST_N = 2;
-    private static final int MIN_MESSAGES_TO_COMPRESS = 8;
-    private static final int DEFAULT_MAX_CONTEXT_TOKENS = 512000;
-    private static final int PROTECT_TOOL_RESULTS_TAIL = 6;
+    private static final int MIN_MESSAGES_TO_COMPRESS = 2;
+    private static final int DEFAULT_MAX_CONTEXT_TOKENS = 200000;
     private static final int MAX_INEFFECTIVE_COMPRESSIONS = 2;
     private static final int MAX_SUMMARY_TOKENS = 3000;
+    /** 摘要消息的统一前缀。预算估算与实际注入必须用同一串，否则「工程压缩够用」的判断会偏乐观。 */
+    static final String SUMMARY_HEADER = "【历史对话摘要】以下是更早对话的交接摘要，作为背景参考：\n";
 
     // ─── 按任务作用域隔离的状态 ───
     private static class SessionState {
@@ -141,45 +166,7 @@ public class ContextCompressor {
         sessionStates.remove(scopeKey(sessionId));
     }
 
-    // ─── 阶段 1: 裁剪旧工具结果 ───
-    private List<ChatMessage> pruneOldToolResults(List<ChatMessage> messages) {
-        // 保留最后 PROTECT_TOOL_RESULTS_TAIL 个工具结果，把更早的工具结果替换为占位符。
-        // 占位符包含工具调用摘要（如文件路径），防止模型压缩后重复读取相同文件。
-        List<ChatMessage> result = new ArrayList<>();
-        int toolResultCount = 0;
-        for (ChatMessage msg : messages) {
-            if (msg instanceof ToolExecutionResultMessage) {
-                toolResultCount++;
-            }
-        }
-        int skipCount = Math.max(0, toolResultCount - PROTECT_TOOL_RESULTS_TAIL);
-        int skipped = 0;
-
-        // 预扫描：建立 toolCallId -> 工具调用摘要 的映射
-        Map<String, String> toolCallSummaries = new java.util.HashMap<>();
-        for (ChatMessage msg : messages) {
-            if (msg instanceof AiMessage ai && ai.hasToolExecutionRequests()) {
-                for (var tc : ai.toolExecutionRequests()) {
-                    toolCallSummaries.put(tc.id(), summarizeToolCall(tc.name(), tc.arguments()));
-                }
-            }
-        }
-
-        for (ChatMessage msg : messages) {
-            if (msg instanceof ToolExecutionResultMessage tr && skipped < skipCount) {
-                skipped++;
-                String summary = toolCallSummaries.getOrDefault(tr.id(), tr.toolName());
-                result.add(ToolExecutionResultMessage.from(tr.id(), tr.toolName(),
-                        "[已裁剪] " + summary));
-            } else {
-                result.add(msg);
-            }
-        }
-        if (skipped > 0) {
-            log.info("预裁剪: 替换了 {} 个旧工具结果", skipped);
-        }
-        return result;
-    }
+    // 工程压缩会将历史作为整体交给 handoff 摘要，不单独保留旧工具结果原文。
 
     /** 从工具调用参数中提取关键信息摘要（如文件路径、搜索关键词） */
     private static String summarizeToolCall(String toolName, String arguments) {
@@ -305,9 +292,20 @@ public class ContextCompressor {
         return com.miniagent.common.StringUtils.truncate(s, max);
     }
 
-    // ─── 阶段 2: 确定切割点 ───
+    // ─── 阶段 2: 切出要折叠的历史，保留受保护的尾部 ───
+    /**
+     * 尾部起点：从末尾往前按 token 预算装，装不下就停；再把最后一个工具轮整体纳入尾部。
+     *
+     * <p>两条约束必须同时成立：</p>
+     * <ul>
+     *   <li><b>预算约束</b>：尾部最多占工作窗口的 {@code protected-tail-ratio}。
+     *       不设上限时，一句话用户 + 几十轮工具的任务会把整段历史都划进尾部，压缩无从下手。</li>
+     *   <li><b>推理现场约束</b>：最近一次工具调用及其结果必须留在尾部，即使它自己就超预算。
+     *       那是「刚拿到结果、正要决策」的现场，换成摘要会让模型重新调用同一个工具。</li>
+     * </ul>
+     */
     private int findTailCutIndex(List<ChatMessage> messages, int headEnd, int maxTokens) {
-        int tailBudget = (int) (maxTokens * TAIL_TOKEN_RATIO);
+        int tailBudget = Math.max(1, (int) (maxTokens * protectedTailRatio));
         int used = 0;
         int cutIdx = messages.size();
         for (int i = messages.size() - 1; i >= headEnd; i--) {
@@ -318,11 +316,14 @@ public class ContextCompressor {
             used += cost;
             cutIdx = i;
         }
-        // 确保尾部包含完整的用户消息
-        cutIdx = ensureLastUserInTail(messages, cutIdx, headEnd);
-        // 确保不拆分 tool_call / tool_result 配对
-        cutIdx = ensureToolPairIntegrity(messages, cutIdx, headEnd);
-        return cutIdx;
+        // 最后一个工具轮（含结果）属于推理现场，不能落到摘要里
+        for (int i = messages.size() - 1; i >= headEnd; i--) {
+            if (messages.get(i) instanceof AiMessage am && am.hasToolExecutionRequests()) {
+                cutIdx = Math.min(cutIdx, i);
+                break;
+            }
+        }
+        return ensureToolPairIntegrity(messages, cutIdx, headEnd);
     }
 
     /**
@@ -356,16 +357,6 @@ public class ContextCompressor {
             return cutIdx - 1;
         }
 
-        return cutIdx;
-    }
-
-    /** 确保尾部以 UserMessage 开始 */
-    private int ensureLastUserInTail(List<ChatMessage> messages, int cutIdx, int headEnd) {
-        for (int i = cutIdx; i < messages.size(); i++) {
-            if (messages.get(i) instanceof UserMessage) {
-                return i;
-            }
-        }
         return cutIdx;
     }
 
@@ -459,84 +450,153 @@ public class ContextCompressor {
     }
 
     // ─── 主入口 ───
-    public List<ChatMessage> maybeCompress(List<ChatMessage> messages, int maxContextTokens) {
-        return maybeCompress(messages, maxContextTokens, null);
+
+    /**
+     * 一次压缩的产出：压缩后的消息 + 真实的压缩前后指标。
+     *
+     * <p>指标必须随返回值一起交出去。此前调用方只有「消息条数有没有变少」这一个信号，
+     * 于是轨迹里把 token 两个字段硬编码成 {@code 0}，前端看到的是
+     * 「0→0 tokens (节省 0.0%)」—— 压缩到底压掉了多少、有没有生效，全都不可观测。
+     * 而且「条数变少」不等于「token 变少」：压缩后 token 反而增加时本类会退回原文
+     * （见 {@code doCompress} 末尾的冷却分支），那种情况下条数可能变少但内容没省。</p>
+     */
+    public record CompressResult(List<ChatMessage> messages, int beforeCount, int afterCount,
+                                 int beforeTokens, int afterTokens) {
+
+        /** 是否真的减少了 token（判据用 token，不用条数）。 */
+        public boolean compressed() {
+            return afterTokens < beforeTokens;
+        }
+
+        public double savedPercent() {
+            return beforeTokens > 0 ? (double) (beforeTokens - afterTokens) / beforeTokens * 100 : 0;
+        }
+
+        /** 未压缩（阈值未到 / 冷却中 / 无效次数过多）时原样返回。 */
+        public static CompressResult untouched(List<ChatMessage> m, int tokens) {
+            int n = Objects.isNull(m) ? 0 : m.size();
+            return new CompressResult(m, n, n, tokens, tokens);
+        }
     }
 
-    public List<ChatMessage> maybeCompress(List<ChatMessage> messages, int maxContextTokens, String sessionId) {
+    /**
+     * 判定是否压缩并执行。
+     *
+     * @param observedTokens 最近一次真实请求的 input token（已扣除工具 schema 开销），
+     *                       调用方拿不到时传 0。本地 {@link TokenEstimator} 按字符加权估算，
+     *                       与厂商分词存在偏差；用真实值校准后判据才不会系统性偏晚。
+     */
+    public CompressResult maybeCompress(List<ChatMessage> messages, int maxContextTokens,
+                                        String sessionId, int observedTokens) {
         if (Objects.isNull(messages) || messages.size() < MIN_MESSAGES_TO_COMPRESS) {
-            return messages;
+            return CompressResult.untouched(messages, 0);
         }
 
         int maxTokens = maxContextTokens > 0 ? maxContextTokens : DEFAULT_MAX_CONTEXT_TOKENS;
-        double ratio = tokenEstimator.contextRatio(messages, maxTokens);
+        // 只估算一次：contextRatio 内部也要做同样的估算，分开调等于每轮多走一遍全量消息。
+        int beforeTokens = tokenEstimator.estimateMessages(messages);
+        // 两者取大：本地估算偏低时以真实值为准（宁可早压），真实值缺失时退回估算。
+        int effectiveTokens = Math.max(beforeTokens, Math.max(0, observedTokens));
+        double ratio = maxTokens > 0 ? (double) effectiveTokens / maxTokens : 0;
 
-        if (ratio < compressionThreshold) {
-            return messages;
+        double triggerThreshold = observedTokens > 0 && (double) observedTokens / maxTokens >= emergencyThreshold
+                ? emergencyThreshold : preMessageThreshold;
+        if (ratio < triggerThreshold) {
+            return CompressResult.untouched(messages, beforeTokens);
         }
+        boolean emergency = ratio >= emergencyThreshold;
 
         String effectiveSessionId = Optional.ofNullable(sessionId).orElse(currentSessionId.get());
         SessionState state = Objects.nonNull(effectiveSessionId) ? getState(effectiveSessionId) : new SessionState();
 
-        if (state.cooldownRemaining > 0) {
+        if (!emergency && state.cooldownRemaining > 0) {
+            // 先算本次跳过后的余量再打印：原来先自减、再打印新值，
+            // 于是日志写「剩余 0 次跳过」却说跳过了一次，读起来自相矛盾。
             state.cooldownRemaining--;
-            log.info("压缩冷却中（剩余 {} 次跳过），当前占比 {}%，跳过压缩",
+            log.info("压缩冷却中：本次跳过，之后还需跳过 {} 次。当前占比 {}%",
                     state.cooldownRemaining,
                     String.format("%.1f", ratio * 100));
-            return messages;
+            return CompressResult.untouched(messages, beforeTokens);
         }
 
-        if (state.ineffectiveCount >= MAX_INEFFECTIVE_COMPRESSIONS) {
+        if (!emergency && state.ineffectiveCount >= MAX_INEFFECTIVE_COMPRESSIONS) {
             log.warn("连续 {} 次压缩节省不到 10%，跳过。建议开新会话。", state.ineffectiveCount);
-            return messages;
+            return CompressResult.untouched(messages, beforeTokens);
         }
 
-        log.info("上下文占比 {}% >= {}%，开始压缩 {} 条消息",
+        log.info("上下文占比 {}% >= {}%（{}），开始压缩 {} 条消息",
                 String.format("%.1f", ratio * 100),
-                String.format("%.0f", compressionThreshold * 100),
+                String.format("%.0f", triggerThreshold * 100),
+                emergency ? "emergency" : "pre-message",
                 messages.size());
 
-        return doCompress(messages, maxTokens, state);
+        return doCompress(messages, maxTokens, state, beforeTokens);
     }
 
-    private List<ChatMessage> doCompress(List<ChatMessage> messages, int maxTokens, SessionState state) {
+    private CompressResult doCompress(List<ChatMessage> messages, int maxTokens, SessionState state,
+                                      int beforeTokens) {
         // 保留原始引用：若压缩无效或边界不合理，原样返回，不丢失任何内容。
         List<ChatMessage> original = messages;
 
-        // 阶段 1
-        messages = pruneOldToolResults(messages);
-
-        // 阶段 2：保护区 = 前置 system/taskPlan + 首个真实用户意图（含其后的图片等内容）。
+        // 阶段 1：保护区 = 前置 system/taskPlan + 首个真实用户意图。
         // 锚定用户原始诉求，确保多轮压缩后模型始终看得到「最初要做什么」。
         int headEnd = computeHeadEnd(messages);
+        // 阶段 2：尾部 = 受预算保护的最近消息 + 最后一个工具轮（推理现场）。
+        // 与 WorkBuddy 的 pre-message 压缩同构：它把整段历史换成工程摘要，另存一段
+        // protectedTail；同样不是「整段历史都留着」。
         int cutIdx = findTailCutIndex(messages, headEnd, maxTokens);
-        if (headEnd >= cutIdx) { log.warn("边界不合理，放弃压缩"); return original; }
+        if (headEnd >= cutIdx) {
+            // 受保护区（system/taskPlan + 首条用户意图）已经覆盖到切点：没有可压缩的中段。
+            // 这是结构性常态（极短会话、单轮任务），不是异常，用 debug 避免刷日志。
+            log.debug("无可压缩中段（headEnd={} ≥ cutIdx={}），跳过本次压缩", headEnd, cutIdx);
+            return CompressResult.untouched(original, beforeTokens);
+        }
 
         List<ChatMessage> toSummarize = messages.subList(headEnd, cutIdx);
         List<ChatMessage> tail = messages.subList(cutIdx, messages.size());
 
-        log.info("压缩边界: 头部 {} + 中间 {} + 尾部 {}，llmSummary={}",
+        log.info("压缩边界: 头部 {} + 被压缩历史 {} + 当前轮 {}，llmSummary={}",
                 headEnd, toSummarize.size(), tail.size(), llmSummaryEnabled);
 
-        // 阶段 3：默认硬截断（不阻塞 Loop）但要留下**结构化交接**；可选同步 LLM；否则异步摘要。
+        // 阶段 3：先做工程压缩（纯字符串重排，零 LLM 成本），再判断是否需要模型摘要。
         //
-        // 为什么不能只写一句"已移除 N 条消息"：默认配置（llm-summary-enabled=false）下，
-        // 中段的决策、写过的文件、失败过的命令会**整体消失**，只留一句占位 —— 模型于是不知道自己
-        // 已经做了什么，常见后果是重跑同一批命令（烧预算）或重新写一遍已有文件。
-        // 这里从被丢弃的消息里抽出可机读的交接信息（改了哪些文件、哪些命令失败、用过哪些工具），
-        // 成本是纯字符串处理，不引入 LLM 调用（不抬高 P99）。
+        // 工程压缩产出必须带交接事实而不是「已移除 N 条」：模型不知道自己做过什么时，
+        // 常见后果是重跑同一批命令、重写已有文件，等于把省下的 token 又花回去。
         int summaryBudget = Math.min(MAX_SUMMARY_TOKENS, (int) (maxTokens * 0.05));
         String stub = buildHandoffStub(toSummarize);
+        String engineeringSummary = StringUtils.isNotBlank(state.previousSummary)
+                ? state.previousSummary + "\n\n" + stub
+                : stub;
+
+        // 判据只看**摘要自身**的大小，不看「头部 + 尾部 + 摘要」的总量。
+        //
+        // 为什么：头部是不可压缩的 system/taskPlan（长任务里常有 8k token），把它计进目标，
+        // 会让「够用」条件永远不成立 —— 每次压缩都叫一次 LLM 摘要，而摘要写得再好也压不动
+        // system prompt。WorkBuddy 比较的同样是工程压缩产出本身（compactContent 的
+        // estimatedTokens ≤ 窗口 × 0.15），不是整包上下文。
+        int headTokens = tokenEstimator.estimateMessages(messages.subList(0, headEnd));
+        int tailTokens = tokenEstimator.estimateMessages(tail);
+        int summaryTokens = tokenEstimator.estimate(new SystemMessage(SUMMARY_HEADER + engineeringSummary));
+        int sufficiencyTarget = (int) (maxTokens * engineeringSufficiencyRatio);
+        boolean engineeringEnough = summaryTokens <= sufficiencyTarget;
+        int projectedTokens = headTokens + tailTokens + summaryTokens;
+        if (engineeringEnough) {
+            log.info("工程压缩已足够：摘要 {} token <= 目标 {}（窗口 {} × {}），压缩后预计 {} token，跳过 LLM 摘要",
+                    summaryTokens, sufficiencyTarget, maxTokens, engineeringSufficiencyRatio, projectedTokens);
+        }
+
         String summary;
-        if (llmSummaryEnabled) {
+        if (engineeringEnough) {
+            summary = engineeringSummary;
+        } else if (llmSummaryEnabled) {
+            // 同步阻塞：WorkBuddy 的 pre-message 压缩同样等待摘要返回后才继续本轮。
             summary = generateSummaryAndExtractMemory(toSummarize, summaryBudget, state);
             if (StringUtils.isBlank(summary)) {
-                summary = stub;
+                log.warn("LLM 摘要为空，回退到工程压缩交接");
+                summary = engineeringSummary;
             }
         } else {
-            summary = StringUtils.isNotBlank(state.previousSummary)
-                    ? state.previousSummary + "\n\n" + stub
-                    : stub;
+            summary = engineeringSummary;
             List<ChatMessage> middleCopy = new ArrayList<>(toSummarize);
             // 异步线程不继承 ThreadLocal：把本轮生效模型显式带进去，
             // 否则后台摘要会回退到全局 Bean（全局 key 失效时这条链路静默失败）。
@@ -563,14 +623,14 @@ public class ContextCompressor {
             }
             compressed.add(msg);
         }
-        compressed.add(new SystemMessage("【历史对话摘要】以下是更早对话的交接摘要，作为背景参考：\n" + summary));
+        compressed.add(new SystemMessage(SUMMARY_HEADER + summary));
         compressed.addAll(tail);
 
         // 阶段 5
         compressed = sanitizeOrphanedToolPairs(compressed);
 
-        // 统计 & 防抖动
-        int before = tokenEstimator.estimateMessages(original);
+        // 统计 & 防抖动（before 由调用方传入，避免同一批消息被估算两次）
+        int before = beforeTokens;
         int after = tokenEstimator.estimateMessages(compressed);
         double savingsPct = before > 0 ? (double)(before - after) / before * 100 : 0;
 
@@ -588,10 +648,14 @@ public class ContextCompressor {
             state.cooldownRemaining = 3;
             state.lastCompressionIncreasedTokens = true;
             log.warn("压缩后 token 反而增加 ({}→{})，进入 3 次冷却期", before, after);
-            return original;
+            return CompressResult.untouched(original, before);
         }
         state.lastCompressionIncreasedTokens = false;
-        return compressed;
+        // 成功压缩后跳过下一次机会：当前轮本身可能仍接近阈值，若下一轮立刻再压，
+        // 会退化成「每轮一次 LLM 摘要」。WorkBuddy 用 preMessageCompactEnded 标记做同一件事。
+        // 紧急档（≥ emergencyThreshold）不受这条限制。
+        state.cooldownRemaining = 1;
+        return new CompressResult(compressed, original.size(), compressed.size(), before, after);
     }
 
     /**

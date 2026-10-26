@@ -1,12 +1,14 @@
 package com.miniagent.agent.hook;
 
-import com.miniagent.common.ErrorCode;
 import com.miniagent.common.MessageConstants;
 import org.springframework.stereotype.Component;
 
 /**
- * 直跑 Loop 的计划完整性：缺清单催 todo.set，未完成则拦收尾。
- * 规划器持有 TaskGraph 时放行，验收由 StepEvaluator 做。
+ * 直跑 Loop 的计划完整性：有 todo 清单但仍有可执行项时拦收尾。
+ *
+ * <p>不再要求「复杂任务必须先建 todo 计划」。是否建计划由模型自己决定，
+ * 这里只负责一件事：模型自己建了清单，就不能在清单未完成时收尾。
+ * 规划器持有 TaskGraph 时放行，验收由 StepEvaluator 做。</p>
  */
 @Component
 public class TodoPlanStopHook implements StopHook {
@@ -25,17 +27,11 @@ public class TodoPlanStopHook implements StopHook {
 
     @Override
     public StopDecision evaluate(StopContext context) {
-        if (context == null || context.lightQa() || context.plannerOwned()) {
+        if (context == null || context.plannerOwned()) {
             return StopDecision.proceed();
         }
         if (context.mediaDelivered()) {
             return StopDecision.proceed();
-        }
-        if (context.requiresStructuredPlan() && !context.hasTodoPlan()
-                && context.missingPlanNudges() < MAX_NUDGES) {
-            return StopDecision.blockRetry(
-                    MessageConstants.STOP_NEED_TODO_PLAN,
-                    ErrorCode.TODO_STOP_MISSING_PLAN.getCode());
         }
         if (context.hasTodoPlan() && context.runnableIncomplete()
                 && context.incompleteNudges() < MAX_NUDGES) {
@@ -43,8 +39,8 @@ public class TodoPlanStopHook implements StopHook {
             if (!context.todoRender().isBlank()) {
                 body = body + "\n" + context.todoRender();
             }
-            return StopDecision.blockRetry(
-                    body, ErrorCode.TODO_STOP_INCOMPLETE.getCode());
+            return StopDecision.blockRetry(body, com.miniagent.common.ErrorCode
+                    .TODO_STOP_INCOMPLETE.getCode());
         }
         return StopDecision.proceed();
     }

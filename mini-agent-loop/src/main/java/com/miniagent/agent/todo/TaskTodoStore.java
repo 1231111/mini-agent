@@ -445,6 +445,48 @@ public class TaskTodoStore {
     }
 
     /**
+     * 全自动（自动编辑 + 自动确认）生效时，把因为危险步闸门停在 awaiting_confirm 的条目放开，
+     * 返回放开条数。
+     *
+     * <p>为什么只放这一部分：{@code awaiting_confirm} 有两个来源 —— 危险步闸门，以及
+     * 「缺密钥 / 须用户补充信息」。后者即便全自动也必须等用户，放开了只会让模型空转。
+     * 判定沿用 {@link #needsConfirmGate} 用过的同一个 {@code DANGEROUS_GOAL}：
+     * 从哪一类进去，就从哪一类出来。</p>
+     *
+     * <p>依赖未满足的条目不动 —— 放行是撤掉人工确认，不是跳过依赖顺序。</p>
+     */
+    public synchronized int releaseConfirmGatedItems(String sessionId) {
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        List<TodoItem> list = todos.get(key);
+        if (list == null || list.isEmpty()) {
+            return 0;
+        }
+        int released = 0;
+        for (int i = 0; i < list.size(); i++) {
+            TodoItem it = list.get(i);
+            if (it.status() != Status.awaiting_confirm) {
+                continue;
+            }
+            String c = it.content() == null ? "" : it.content();
+            if (!DANGEROUS_GOAL.matcher(c).find() || dependencyUnmet(list, it)) {
+                continue;
+            }
+            String note = it.note() == null || it.note().isBlank()
+                    ? "FULL_AUTO" : "FULL_AUTO: " + it.note().trim();
+            list.set(i, new TodoItem(it.id(), it.content(), Status.in_progress, note,
+                    it.doneWhen(), it.evidence(), it.validationHash(), it.dependsOn()));
+            released++;
+        }
+        if (released > 0) {
+            promoteReadyItems(list);
+            persist(key, list);
+            log.info("全自动生效，放开危险步确认 session={} 条数={}", sessionId, released);
+        }
+        return released;
+    }
+
+    /**
      * 关键路径确认：将 awaiting_confirm → in_progress，允许开始执行。
      */
     public synchronized List<TodoItem> confirm(String sessionId, int id, String note, String[] errorOut) {

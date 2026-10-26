@@ -22,17 +22,16 @@ public enum AgentStepNode {
     SUBAGENT_LOOP_START("生命周期", "子代理启动", "delegate_task 拉起子 Agent；子步骤挂 parentStepId", true, true),
     SUBAGENT_LOOP_END("生命周期", "子代理结束", "子 Agent 结束，结果回父任务", true, true),
     COMPRESSION("生命周期", "上下文压缩", "历史过长，压缩后继续（有耗时）", true, true),
-    /** ContextLoader 按本轮信号加载完上下文后的审计快照 */
-    CONTEXT_LOAD("上下文加载", "加载本轮上下文", "按信号裁剪后的历史/记忆/todo 注入说明", true, true),
+    TOKEN_USAGE_WARN("生命周期", "用量告警", "累计 token 越过告警线，仅提示，任务继续执行", true, true),
+    /** ContextLoader 加载完上下文后的审计快照 */
+    CONTEXT_LOAD("上下文加载", "加载本轮上下文", "历史/记忆/todo 注入说明", true, true),
 
-    // —— 任务信号（独立功能阶段，先于执行计划）——
-    /** 从用户消息里观察到的事实信号，逐条可复核；不产出任何类别 */
-    TASK_SIGNALS("任务信号", "观察本轮任务信号", "命中的文本事实（联网/落盘/出图/复杂/续任务…）", true, true),
-    /** 信号的下游产物：供主循环执行用的计划快照 */
-    TASK_PLAN("执行计划", "执行计划定案", "TaskPlan（目标/白名单/是否走结构化计划/命中信号）", true, true),
+    // —— 执行计划 ——
+    /** 供主循环执行用的计划快照 */
+    TASK_PLAN("执行计划", "执行计划定案", "TaskPlan（目标/工具白名单/预置步骤）", true, true),
 
     // —— 生产级 Planner（Goal / DAG / Proposal / Recovery）——
-    GOAL_COMPILED("规划控制", "目标编译完成", "NL+信号 → Goal + TaskGraph", true, true),
+    GOAL_COMPILED("规划控制", "目标编译完成", "NL → Goal + TaskGraph", true, true),
     GRAPH_UPDATED("规划控制", "任务图更新", "DAG 节点状态或结构变更", true, true),
     PROPOSAL("规划控制", "动作提案", "ActionProposal（basedOnVersion + actions）", true, true),
     STATE_COMMIT("规划控制", "状态提交", "PlannerStateStore CAS 升版本", true, true),
@@ -70,6 +69,14 @@ public enum AgentStepNode {
     TOOL_ERROR("工具调用", "工具执行异常", "超时/限流/业务错误等", true, true),
     TOOL_RETRY("工具调用", "工具自动重试", "失败后自动重试", true, true),
     PERM_DENY("工具调用", "权限拒绝", "Plan/Ask 闸门", true, true),
+    /** 用户在审批弹窗点了「批准并继续」，原工具调用在当前线程续跑。 */
+    PERM_GRANT("工具调用", "权限放行", "批准后原地续跑（不写可重放授权）", true, true),
+    /**
+     * 全自动（自动编辑 + 自动确认）吞掉了本会弹出的授权。
+     * core=false：每个危险工具都会记一条，默认折叠，避免塞满时间线；
+     * persisted=true 保留审计能力 —— 否则事后无法区分「本来就免授权」与「被全自动放行」。
+     */
+    PERM_AUTO("工具调用", "全自动放行", "自动编辑+自动确认命中危险工具，未询问用户", true, false),
     HOOK_DENY("工具调用", "钩子拒绝", "ToolHook 拒绝", true, true),
 
     ANSWER("最终结果", "最终回答", "对用户可见产出", true, true),

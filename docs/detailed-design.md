@@ -47,8 +47,8 @@ Mini Agent 是 **单进程 Spring Boot Web 应用**：浏览器打开 `http://12
 |------|--------|------|
 | F01 | 账号登录/注册/退出，JWT（Bearer 头）+ Redis 滑动 TTL | `JwtSessionService`、`POST /api/tokens` |
 | F02 | 对话页：侧栏历史、设置、SSE 流式思考与正文 | `templates/chat.html`、`POST /api/conversations/{sessionId}/messages/stream` |
-| F03 | 任务信号：从用户原文用正则抽事实，不做意图枚举 | `TaskSignalMatcher`、`agent.task-signals.rules` |
-| F04 | 系统上下文：每一轮都装，简单问答用 LIGHT 策略，不是空上下文 | `ContextLoader`、`ContextLoadPolicy` |
+| F03 | 任务参数：目标原文 + 系统控制语识别，不做意图分类、不做词表匹配 | `TaskPlanFactory`、`TaskPlan` |
+| F04 | 系统上下文：每一轮都装；按会话里有没有挂起的 todo 选 CONTINUE / ACTION | `ContextLoader`、`ContextLoadPolicy` |
 | F05 | 直跑 Agent：ReAct，上限 `agent.execution.max-iterations`（默认 **90**） | `AgentLoop` |
 | F06 | 规划 Agent：图为事实源，Todo 只是投影；节点内再跑 AgentLoop | `PlanningLoop`、`PlannerStateStore` |
 | F07 | 子代理：`delegate_task`，内层上限 **25** | `DelegateTaskTool`、`subagent-max-iterations` |
@@ -89,14 +89,16 @@ flowchart LR
 | 规划节点一段 ReAct | `agent.planner.proposal-max-iterations` | **8** | 含 `browser_*` 时升到 16 |
 | 同节点续跑段数 | `agent.planner.proposal-max-chunks` | **6** | 与 8 相乘为节点上限 |
 | 规划外层轮次 | `agent.planner.max-outer-rounds` | **24** | 图调度圈数 |
-| 单次工作窗口 | `agent.context.max-tokens` | 512000（估算 token） | 75% 触发压缩 |
+| 单次工作窗口 | `agent.context.max-tokens` | 512000（估算 token） | 与模型声明的窗口取较小值：`ContextWindowResolver` 按 `context-window-tokens` / `supported-context-windows` / `max-input-tokens` 选出可用窗口（默认档优先，否则最小档），再减去工具 schema 开销（`toolCount × 170`） |
+| 压缩触发 | `agent.context.pre-message-threshold` / `emergency-threshold` | 0.5 / 0.9 | 判据取 `max(TokenEstimator 估算, 最近一次真实 inputTokenCount − schema 开销)` ÷ 工作窗口。达到 0.5 触发；达到 0.9 时无视冷却与「连续无效」护栏 |
+| 压缩后目标比 | `agent.context.engineering-sufficiency-ratio` | 0.15 | 工程压缩（结构化交接，纯字符串处理）后总量 ≤ 工作窗口 × 此值就不再调 LLM 摘要。0.15 与 WorkBuddy `getEngineeringCompactSufficiencyRatio()` 默认值一致 |
 | ChatMemory 条数 | `agent.chat-memory.max-messages` | **64** | 滑动窗口条数 |
 | 工具调用上限 | `agent.execution.max-tool-calls` | 120 | `ExecutionControl` |
-| 本轮估算 token 预算 | `agent.execution.max-estimated-tokens` | 2000000 | 超限停跑 |
+| 累计 token 告警线 | `agent.execution.token-soft-limit` | 8000000 | 每轮 LLM 的 `input+output` **累加**（`ExecutionControl.afterModelTokens`）。**越线只写一条 `TOKEN_USAGE_WARN` 轨迹 + 一条 WARN 日志，不终止任务** —— 累计量随任务时长线性增长，与「是否失控」无因果关系，拿它做终止判据会误杀长任务 |
 | 运行墙钟 | `agent.execution.deadline-ms` | 1800000 | 同上 |
 | 每用户并发任务 | `agent.concurrency.max-tasks-per-user` | 2 | 超限拒绝新跑 |
 | 接口限流 | `agent.rate-limit.per-minute` | 60（dev） | 按用户或 IP |
-| 问答轮历史条数 | `agent.context.history.question` | **6** | 仅 `lightTurn` 裁历史 |
+| 指代历史精捞条数 | `agent.context.history.question-with-ref` | **6** | 指代命中时按相关度取，替代不裁剪 |
 | 出图重编译 | `PlannerProperties.maxReplanRetries` | **2**（Java 字段；yml 未写该键） | `PlanValidator` 拒绝后 |
 | 运行时改图 | `agent.planner.max-rewrite-graph` | **2** | `REWRITE_GRAPH` |
 | 改目标 | `agent.planner.max-revise-goal` | **1** | `REVISE_GOAL` |
@@ -233,30 +235,29 @@ flowchart TD
 `AgentLoop.run` 组给模型的消息顺序（`AgentLoop` 约 355–366 行）固定为：
 
 1. `SystemMessage(systemPrompt)`：`ContextBuilder` 拼出的系统上下文。空白则不放。
-2. `SystemMessage(taskPlan.toPromptBlock)`：本轮任务约束。简单问答在这里追加【轻问答】。
+2. `SystemMessage(taskPlan.toPromptBlock)`：本轮任务约束（`taskGoal` + `allowedTools` + 一句执行方式）。
 3. `history`：`ContextLoader` 裁好的对话历史。
 4. `UserMessage`：本轮用户原文。
 
-简单回答因此至少带有：身份与运行环境、权限说明、`PromptTemplates.QUESTION_MODE`（轻问答模式）、推理与完成约束、确认/输出/当前时间、最近历史（`agent.context.history.question` 默认 **6** 条）、以及【轻问答】任务块。它不注入 todo、技能列表、长期记忆（`ContextLoadPolicy.LIGHT`）。这是减量，不是跳过系统上下文。
+每一轮都带这份系统上下文，不存在「这一轮是简单问答所以跳过」的分支。区分「短问题」与「动手任务」不再由代码做：`AgentLoop` 里没有按文本预分类的注入分支。
 
-#### 3.5.1 简单问答的系统上下文里有什么
+#### 3.5.1 每一轮的系统上下文里有什么
 
-`lightTurn()` = `question && !actionBearing()`。`actionBearing` **不含** `readsFile`。
+| 槽位 | Order | 新任务（ACTION） | 续跑（CONTINUE） |
+|------|-------|------------------|------------------|
+| IDENTITY | 10 | 有。`PromptTemplates.identity()` | 有 |
+| AUTHORITY | 20 | 有 | 有 |
+| REFERENCE | 30 | 仅当指代检测要求带回历史 | 同左 |
+| MEMORY | 40 | 有（`injectMemory=true`） | 有 |
+| SKILLS | 50 | 有 | 有 |
+| REASONING | 60 | 有 | 有 |
+| TOOLS | 70 | 槽位为空。工具说明在 `AgentLoop.bindTurnTools`，不在 Builder 里 | 同左 |
+| TODO | 80 | 挂起上一任务后按当前清单渲染 | 先恢复挂起清单再渲染 |
+| CLOSING | 90 | 有，含当前时间 | 有 |
 
-| 槽位 | Order | 简单问答 |
-|------|-------|----------|
-| IDENTITY | 10 | 有。`PromptTemplates.identity()` |
-| AUTHORITY | 20 | 有 |
-| QUESTION | 25 | 有。`QUESTION_MODE`；带媒体且无动手信号时改为点评轮提示 |
-| REFERENCE | 30 | 仅当指代检测要求带回历史 |
-| MEMORY | 40 | 默认不注入长期记忆；指代命中时 `withInjectMemory(true)` |
-| SKILLS | 50 | 不注入 |
-| REASONING | 60 | 有 |
-| TOOLS | 70 | 槽位为空。工具说明在 `AgentLoop.bindTurnTools`，不在 Builder 里 |
-| TODO | 80 | 不注入 |
-| CLOSING | 90 | 有，含当前时间 |
+槽位表里没有 QUESTION。它原来只在「轻问答」时塞 `PromptTemplates.QUESTION_MODE`；判据删除后它恒为空，已一并去掉。
 
-用户摘要在 LIGHT 策略里最多 200 字（`ContextLoadPolicy` 的 `userMaxChars`）。历史条数以 Loader 覆盖后的配置为准：record 里写的 `-1` 会被 `agent.context.history.question`（默认 6）盖掉。
+历史条数：非指代不裁剪（`-1`），指代命中改为 `agent.context.history.question-with-ref`（默认 **6**）条相关度精捞。两档策略的 `userMaxChars` 都是 0（不限），不再有「短问答只带 200 字用户摘要」这一档。
 
 #### 3.5.2 要规划时，系统上下文之后才进图
 
@@ -322,13 +323,13 @@ if 不需要规划:
     agentLoop.run(userMessage)    // 丢掉系统上下文
 ```
 
-`shouldHandle` 为 false：`agent.planner.enabled=false`，或 `plan == null`，或 `signals.lightTurn()`。为 true：`requiresStructuredPlan` 或 `DecompositionPolicy.hasGraphSignal`（原文或 taskGoal 里能抽出路径或 URL）。否则仅当该 scope 有未完成图且 `PlannerResumePolicy.shouldResume` 为真。
+`shouldHandle` 为 false：`agent.planner.enabled=false`，或 `plan == null`。为 true：`DecompositionPolicy.hasGraphSignal`（原文或 taskGoal 里能抽出路径或 URL）。否则仅当该 scope 有未完成图且 `PlannerResumePolicy.shouldResume` 为真。
 
 ### 3.6 模块间契约
 
 | 从 → 到 | 契约 |
 |---------|------|
-| 拆解 → 系统上下文 | 每一轮都 `load`。信号决定 LIGHT / CONTINUE / ACTION |
+| 拆解 → 系统上下文 | 每一轮都 `load`。挂起状态决定 CONTINUE / ACTION |
 | 系统上下文 → AgentLoop | `systemPrompt` + `history`。简单问答走这条，不走规划器 |
 | 系统上下文 → PlanningLoop | 同一份 `systemPrompt` + `history` |
 | PlanningLoop → AgentLoop | 节点内再跑循环，上限 8 或浏览器 16，最多 6 段，不是 90 |
@@ -375,26 +376,27 @@ flowchart TD
 
 **停机条件（AgentLoop）**：纯文本终答；`MAX_ITERATIONS`；`DUP_TOOLS`（同失败工具 ≥3）；`OUTCOME_UNKNOWN`；`CANCELLED`；`DEADLINE_EXCEEDED`；`PERM_ASK`；`USER_QUESTION`；资源或配额耗尽。
 
-### 4.2 信号怎样决定「上下文装多少」和「进哪个内核」
+### 4.2 进不进规划器，与上下文装多少，是两件事
 
-这两件事都发生，互不代替。简单问答：上下文用 LIGHT，内核用 `AgentLoop`。一步就能做完、但不是纯问答的请求：上下文用 ACTION（记忆、技能、todo），内核仍可能是 `AgentLoop`（没有结构化计划、也没有路径/URL、也没有可续跑的图）。
+这两件事都发生，互不代替。
+
+- **装多少**：只看一个运行时事实 —— 这个会话里有没有被挂起的 todo 清单（`ContextLoadPolicy.forSuspendedTodo(boolean)`）。有 → `CONTINUE`（恢复清单），没有 → `ACTION`（挂起上一任务的活动清单）。不再根据用户原文命中哪些词来决定。
+- **进哪个内核**：`PlanningLoop.shouldHandle`（`agent.planner.enabled=false` 或 `plan == null` 时直接 false），再看 `DecompositionPolicy.hasGraphSignal`（原文或 taskGoal 里能抽出路径或 URL），否则仅当该 scope 有未完成图且 `PlannerResumePolicy.shouldResume` 为真。
+
+一步就能做完的请求：上下文用 `ACTION`（记忆、技能、todo 全开），内核仍是 `AgentLoop`。
 
 ```mermaid
 flowchart TD
-    MSG["用户原文"] --> MATCH["信号匹配"]
-    MATCH --> SIG["TaskSignals"]
-    SIG --> POL{"上下文策略"}
-    POL -->|问答| LIGHT["LIGHT"]
-    POL -->|继续| CONT["CONTINUE"]
-    POL -->|动手| ACT["ACTION"]
-    LIGHT --> Q{"是否规划"}
-    CONT --> Q
+    MSG["用户原文"] --> SUS{"会话里有挂起的todo"}
+    SUS -->|有| CONT["CONTINUE"]
+    SUS -->|没有| ACT["ACTION"]
+    CONT --> Q{"是否规划"}
     ACT --> Q
     Q -->|否| LOOP["AgentLoop"]
     Q -->|是| PLAN["PlanningLoop"]
 ```
 
-`needsStructuredPlan`（`TaskPlanFactory`）为真当：`complex` 或 `diagram`，或（`needsWeb && needsFiles`），或（`needsFiles && !simpleFile`），或（`imageIntoDoc && force-full-on-image-into-doc`）。配置键 `agent.task-signals.rules.force-full-on-image-into-doc` 默认 **true**。
+进不进规划器只由 `shouldHandle` 决定，那里没有「这轮要不要结构化计划」这一档：要么原文/taskGoal 里能抽出路径或 URL（`DecompositionPolicy.hasGraphSignal`），要么该 scope 有未完成图且 `PlannerResumePolicy.shouldResume` 为真。
 
 ### 4.3 工具调用
 
@@ -477,40 +479,42 @@ dev 默认 `registration-enabled=true`，`password-min-length=8`（yml 覆盖 `A
 
 媒体：`hasMedia` 只决定用 `resolveForMultimodal`（预设 `agent.multimodal.vision-preset` 默认 `default`）以及是否拼点评轮提示。它不决定历史条数，也不代替系统上下文。历史经 `ChatMessageTexts.textOnlyHistory`，避免旧的 `image_url` 把文本模型打成 400。
 
-### 5.3 任务拆解
+### 5.3 任务参数
 
-**做：** 原文 → `TaskSignals`（12 个布尔）→ `TaskPlan`（要不要结构化计划）。  
-**不做：** 意图枚举、选工具面、生成图节点。`TaskPlan.steps` 在 Factory 里恒为空。图节点来自 `GoalCompiler`。
+**做：** 原文 trim → `TaskPlan(taskGoal, allowedTools, steps, reason)`。`TaskPlanFactory.build` 只区分一件事：这条消息是不是前端拼的系统控制语（`MessageConstants.isSystemControlMessage`），结果写进 `reason`（`system-control` / `user-message`）。`allowedTools` 恒为 `null`（不限制），`steps` 恒为空。
+
+**不做：** 从用户原文抽「命中信号」，也不判断「这轮要不要结构化计划」。图节点来自 `GoalCompiler`，`TaskPlan` 不产图。
 
 | 字段 | 含义 |
 |------|------|
-| `needsWeb` | 联网/搜索/抓取 |
-| `needsFiles` | 写文件/落盘 |
-| `readsFile` | 读/分析。不算动手信号 |
-| `diagram` | 要架构图/流程图 |
-| `pureImage` | 纯生图 |
-| `imageIntoDoc` | 图写入文档 |
-| `simpleFile` | 单文件短指令 |
-| `question` | 能力/寒暄等问答 |
-| `complex` | 一整套/分步/多模块 |
-| `taskAction` | 生成/写/部署等动作词 |
-| `continueTask` | 「继续/接着」 |
-| `publish` | 发布类 |
+| `taskGoal` | 用户原文（trim 后），作为本轮目标锚 |
+| `allowedTools` | `null` = 全量工具面；子代理会传具体清单 |
+| `steps` | 恒为空。图节点不从这里来 |
+| `reason` | `system-control` / `user-message` / `subagent:*` |
 
-系统控制语（前端拼的「已批准请继续」）走 `MessageConstants.isSystemControlMessage` → 零信号、不拉图。
+**2026-10-22 删除记录。** 这里原来有一层「任务信号」：`TaskSignals`（14 个布尔）+ `TaskSignalProperties`（`agent.task-signals.rules` 下 9 张词表 + `question-max-len` + `force-full-on-image-into-doc`）+ `TaskSignalMatcher`（把词表编译成正则，另带一批硬编码动词/扩展名正则）。它派生两个值：
 
-`needsStructuredPlan` 条件见 4.2。`DecompositionPolicy.hasGraphSignal`：原文或 taskGoal 里能抽出路径或 URL 即为真。短「下载这个链接存盘」即使 `requiresStructuredPlan=false` 仍可进规划器。
+| 原派生值 | 原来影响 | 现在的判据 |
+|---------|---------|-----------|
+| `requiresStructuredPlan` | 目标锚定是否注入；`closeRetrieval` 是否豁免；空终答能否直接返回；`TodoPlanStopHook` 是否先要求 `todo.set` | 目标锚定每轮注入一次；检索闸门只按次数；收尾只按有没有未完成清单 |
+| `lightTurn` | 跳过子目标刷新；收尾不卡 todo；`TodoPlanStopHook` 直接放行；历史条数改小 | 一并删除，统一走 ACTION 策略 |
+
+连带的确定行为变化（不是 bug）：
+
+1. 短问答也注入长期记忆与技能表。以前走 `LIGHT`（`injectMemory=false`），现在没有「短问答」这个判据，只能统一按 `ACTION`。
+2. 检索工具到 `RETRIEVAL_CALL_CAP`（**8** 次）即关闭，不再对任何任务豁免。关闭时移除 `web_search`/`web_extract`/`http_get`/`http_post`/`browser_*` 并注入【检索已够】。
+3. 空终答只在「有未完成 todo 清单」时继续拦；不再因为「这轮被判为结构化任务」而拦。
+
+`DecompositionPolicy.hasGraphSignal`：原文或 taskGoal 里能抽出路径或 URL 即为真。短「下载这个链接存盘」仍可进规划器。
 
 模板（`GoalCompiler.templateGraph`）：diagram、fetchWrite、readThenAnalyze、researchThenFile，否则单节点或澄清图。`structureDeterminate` 为假且需要结构化时才 LLM 编译，`compiler-retry` 默认 1。
 
 | 键 | 默认 |
 |----|------|
-| `agent.task-signals.rules.question-max-len` | 80 |
-| `agent.task-signals.rules.force-full-on-image-into-doc` | true |
 | `agent.planner.compiler-retry` | 1 |
 | `agent.planner.planner-timeout-seconds` | 60（Java 字段） |
 
-禁止：恢复意图枚举；让 Factory 生成假的 `TaskStep` 冒充图；把 `readsFile` 算进 `actionBearing`。
+禁止：恢复按用户原文做分类或词表匹配；让 Factory 生成假的 `TaskStep` 冒充图；把「这轮属于哪一类」重新塞回 `TaskPlan`。
 
 ### 5.4 系统上下文
 
@@ -519,10 +523,10 @@ dev 默认 `registration-enabled=true`，`password-min-length=8`（yml 覆盖 `A
 
 `ContextLoader.load` 步骤：
 
-1. 取 `TaskSignals`，`ContextReference.detect`。
-2. `ContextLoadPolicy.forSignals`：`lightTurn` → LIGHT，`continueTask` → CONTINUE，否则 ACTION。
-3. `lightTurn` 时把历史上限改成配置 6（有指代则 `question-with-ref`，默认也是 6），指代命中则打开记忆注入。
-4. 非 LIGHT 且正在 `awaiting_confirm`：不挂起、不恢复。否则 CONTINUE 恢复挂起清单，ACTION 挂起活动清单。
+1. `ContextReference.detect(query)`；`taskTodoStore.hasSuspended(sessionId)` 得出本轮策略。
+2. `ContextLoadPolicy.forSuspendedTodo(hasSuspendedTodo)`：有挂起清单 → CONTINUE，没有 → ACTION。没有 LIGHT 档。
+3. 指代命中时把历史上限改成 `agent.context.history.question-with-ref`（默认 6）并打开记忆注入；未命中保持不裁剪（`-1`）。
+4. 正在 `awaiting_confirm`：不挂起、不恢复。否则 CONTINUE 恢复挂起清单，ACTION 挂起活动清单。
 5. `TaskScopeRegistry.scopeKey`：`taskId==0` 用 `sessionId`，否则
    `sessionId#taskId`。`current_task_id`、`paused_task_id`、`scope_sequence`
    存在 `agent_session_todos`，用该行 `version` 做 CAS；未装配持久化端口的纯单测
@@ -533,9 +537,11 @@ dev 默认 `registration-enabled=true`，`password-min-length=8`（yml 覆盖 `A
 
 ACTION：`suspendActiveTodo=true`。清单未完成则挂起；全是 completed/cancelled 则归档清空。等确认时跳过挂起。
 
-预算：`agent.context.budget.enabled=true`，`chars-per-token=2.0`。槽 token 默认：identity 2000、authority 400、question 800、reference 300、memory 6000、skills 2000、reasoning 1500、tools 4000、todo 2000、closing 1500。超窗：`max-tokens=512000`，阈值 0.75；`llm-summary-enabled=false` 时硬截断。
+预算：`agent.context.budget.enabled=true`，`chars-per-token=2.0`。槽 token 默认：identity 2000、authority 400、reference 300、memory 6000、skills 2000、reasoning 1500、tools 4000、todo 2000、closing 1500。超窗：`max-tokens=512000`，触发阈值 0.5 / 紧急 0.9。压缩保留「前置 system + 首条用户意图」与**当前轮**（最近一条用户消息之后的工具往返），其余历史折叠为一条交接摘要；`llm-summary-enabled=false` 时只做工程压缩。
 
-`injectMidterm` 三套策略都是 false。`updateMidtermMemory` 主路径无调用方。保留字段，不要做成「打开就有中期记忆」。
+槽位表里没有 QUESTION。它原来只在轻问答时塞 `PromptTemplates.QUESTION_MODE`，判据删除后就成了一个恒空的槽，一并去掉；`agent.context.budget.slot-tokens.question` 也不再读。
+
+`injectMidterm` 两套策略都是 false。`updateMidtermMemory` 主路径无调用方。保留字段，不要做成「打开就有中期记忆」。
 
 Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 
@@ -624,8 +630,9 @@ Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 | CANCELLED | 用户取消 |
 | DEADLINE_EXCEEDED | 墙钟 |
 | TOOL_BUDGET_EXCEEDED | 工具次数 ≥ 120 |
-| TOKEN_BUDGET_EXCEEDED | 估算 token ≥ 2000000 |
 | TENANT_QUOTA_EXCEEDED | 日配额 |
+
+**没有「累计 token 耗尽」这一项，是刻意的**：累计 token 度量的是「这个任务花了多少」，随任务时长线性增长；正常的 60 轮任务和一次原地打转的死循环在这条线上长得一样，用它做终止判据必然误杀长时间任务（旧行为是 `finish("任务已耗尽 token 预算")`）。失控由 `DEADLINE_EXCEEDED`、`TOOL_BUDGET_EXCEEDED`、轮次上限 `MAX_ITERATIONS` 和 `DUP_TOOLS` 拦截 —— 四者都与工作量无关。累计值仍然统计，越过 `token-soft-limit` 时只写一条 `TOKEN_USAGE_WARN` 轨迹。
 
 `ExecutionProperties.capIterations` 把调用方请求压到 `max-iterations`（90）。子代理用 `capSubagentIterations`（25）。
 
@@ -651,7 +658,7 @@ Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 （表 `agent_session_todos`）；同一行还保存 TaskScope 指针，清空 Todo 只清
 `active_json` / `suspended_json`，不会重置任务序号。变更后 SSE `todo`。
 
-`TodoPlanStopHook`：轻问答、本轮 `hardGate`（规划提案）、媒体已交付则放行。需要结构化计划但还没 `todo.set`，或清单还有未完成项，各最多提醒 2 次。`plannerOwned` 等于本轮 hardGate，不是「库里有图」。
+`TodoPlanStopHook`：本轮 `hardGate`（规划提案）、媒体已交付则放行。有清单且还有未完成项时最多提醒 2 次；没有清单就放行，不再要求「先 `todo.set`」。
 
 等人：节点可进入 `AWAITING_CONFIRM`。只有显式调用
 `PATCH /api/conversations/{sessionId}/todos/{id}` 才把指定节点送回 `PENDING`；
@@ -665,7 +672,9 @@ Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 
 `templates/chat.html`，样式内联。`spring.thymeleaf.cache=false` 时改 HTML 刷新即可。前端不是独立 SPA。
 
-SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `progress` `subgoal` `todo` `permission_ask` `user_question` `append_ack` `end` `error` `gone` `context`。`context` 载荷是 `{"used","limit"}`：`used` 为当次模型 input token，`limit` 为 `agent.context.max-tokens`（默认 512000），不是厂商上下文上限。轨迹流是 `trace`（`GET /api/conversations/{sessionId}/traces`）。`reset` 的处理函数在，主路径不 publish。
+SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `subgoal` `todo` `permission_ask` `user_question` `append_ack` `end` `error` `gone` `context`。`context` 载荷是 `{"used","limit"}`：`used` 为当次模型 input token，`limit` 为 `agent.context.max-tokens`（默认 512000），不是厂商上下文上限。轨迹流是 `trace`（`GET /api/conversations/{sessionId}/traces`）。`reset` 的处理函数在，主路径不 publish。
+
+`progress` 已下线（2026-10-22）：工具名、参数、结果原文不再进对话区，只写日志与 `agent_trace_steps`。`AgentLoop` 的 `progressCallback` 参数链一并删除（`AgentLoop`、`NodeExecutor`、`PlanningLoop`、`ClientMultiAgent`、`AgentChatApplicationService`），`SessionEventCenter` 也不再缓存 `progress`。对话区保留的是 `thinking`（深度思考）、`seal`（把已流出的正文封存为「过程说明」）、`token`（最终答案）、`todo`（计划条）。
 
 `TraceRecorder` 写入 `agent_trace_steps`。页面 `GET /trace`。`isFailedResult` 用文本是否包含 `"error"` 判断失败，成功结果里若带这个子串会被误判。
 
@@ -680,7 +689,12 @@ SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `progress
 | 规划图 / Todo / TaskScope | MySQL `agent_session_planner` / `agent_session_todos` | `storage=db`；TaskScope 用行版本 CAS |
 | 会话权限 | `agent_session_permissions` | mode、Plan 批准、Ask grant、confirm 与 exec 覆盖均用行版本 CAS |
 | 上传与生成媒体 | `{data-dir}/media` | 不用已弃用的 `file.upload.base-dir` |
-| Skills / workspace | `{data-dir}/skills`、`workspace` | |
+| Skills / workspace | `{data-dir}/skills`、`workspace` | 工作区生成文件由受认证的下载端点提供 |
+
+### 工作区生成文件下载
+
+`write_file` 等工具将文件写入工作区根目录后，回复里的 `workspace/文件名` 会由 `linkWorkspacePaths` 转为可点击链接。`/api/workspace-download/{filename}` 要求 Bearer 认证，只接受工作区根目录下普通文件；拒绝隐藏文件、路径分隔符、目录遍历及指向根目录外的符号链接，不限制扩展名。由于浏览器导航不能附加 `Authorization`，点击处理器用 `window.MiniAuth.token()` 发起认证请求，读取 Blob 后触发下载。响应使用 `Content-Disposition: attachment`、`X-Content-Type-Options: nosniff` 和 `Cache-Control: private, no-store`。工作区是单实例共享目录，因此已登录用户之间共享下载可见性；此端点不是按文件 owner 隔离的存储。
+
 | 向量 | 本地 JSON 或 Milvus | `backend` 切换 |
 | 轨迹 | `agent_trace_steps` | |
 
@@ -718,7 +732,7 @@ V7 已删意图规则表，不要再建。
 | replica | `local` | 不能按多实例 SSE 去测 |
 | 权限会话 | DB + 本机缓存 | `agent_session_permissions.version` CAS，跨重启/副本恢复 |
 | Flyway | dev 关闭 | 表结构靠 Hibernate update |
-| 意图层 | 已删除 | 用 TaskSignals |
+| 意图层 | 已删除 | 也不再用任务信号表替代；模型自己看原文 |
 
 ---
 
@@ -797,6 +811,29 @@ V7 已删意图规则表，不要再建。
 | POST | `/api/conversations/{sessionId}/files` | multipart `file` |
 | GET | `/api/generated-media/{owner}/{filename}` | 属主或 SYSTEM_ADMIN |
 | GET | `/api/conversation-media/{sessionId}/{filename}` | 会话属主或管理员 |
+| GET | `/api/workspace-media/{filename}` | 登录即可；只放行工作区根目录下的图片 |
+
+**媒体内联白名单**（`MiniAgentChatPageController#approvedInlineMediaType`）：`png/jpg/jpeg/gif/webp/svg/mp3/wav/mp4`。
+`svg` 于 2026-10-22 加入 —— 图片后端不可用时模型会降级成「手写 `<svg>` 存成文件」，不放行就只有裂图；
+安全隐患由统一出口 `MediaResponses` 收住（每个响应都带 `X-Content-Type-Options: nosniff` 与
+`Content-Security-Policy: default-src 'none'; sandbox`）。svg 只看扩展名、不信 `Files.probeContentType`：
+`.svg` 的系统 MIME 映射可能是 `text/plain`/`application/xml`，信探测会在部分机器上随机 415。
+
+**生成图落盘**（`ImageGenerationService#persistImage`）：除 chatanywhere 的 `gpt-image-2-ca` 分支外，
+其余后端的成功结果都是**远端临时链接**——硅基流动是 `s3.siliconflow.cn/temporary/…&X-Amz-Expires=3600`（1 小时），
+智谱是带 `Expires` 的 ufileos 链接（约 7 天）。这些 URL 以前被原样拼进 markdown，于是「当场能看、
+过一会儿历史记录里裂图、断网打不开」。现在出图后立刻下载字节、按**文件头魔数**定扩展名（对象存储常把图片标成
+`application/octet-stream`），写入 `media/generated/<owner>/`，返回 `/api/generated-media/<owner>/<file>`。
+上限 `MAX_IMAGE_BYTES = 32MiB`；下载失败 / 非图片 / 判不出类型一律退回原 URL 并记 warn —— 能看比"干净"重要。
+
+**`/api/workspace-media`** 存在的原因：`write_file` 的相对路径落在 `{data-dir}/workspace/`，
+而工作区**没有任何静态资源映射**（`/api/generated-media/**` 只服务 `media/generated/<owner>/`）。
+边界三条：只认工作区**根目录下的扁平文件名**（`root.equals(file.getParent())` 挡 `../` 与子目录，
+再比 `toRealPath()` 的父目录挡「指向根外的符号链接」）、只放行判定为 `image/*` 的类型、必须登录。
+取舍：工作区是单实例共享目录、没有 owner 维度，
+登录用户之间能互读对方工作区里的图片；端点只放开图片这一小类，不扩大到全文。
+`write_file` / `render_diagram` 写到根目录的图片会在工具结果里带 `url` 字段
+（`BuiltinTools#workspaceMediaUrl`，文件名做百分号编码），模型据此拼 `![](url)`，这才连上对话区。
 
 ### 8.4 轨迹、规划健康、记忆、管理
 
@@ -840,8 +877,8 @@ V7 已删意图规则表，不要再建。
 | 新 MCP 服务器 | yml `agent.mcp.servers`，再把 `enabled` 打开 |
 | 新技能 | `{data-dir}/skills/<name>/SKILL.md` |
 | 新模型预设 | `agent.models.presets` |
-| 新任务信号 | `agent.task-signals.rules.*` 加正则 |
-| 上下文贡献 | 已有 `SystemContextContributor` 槽位。新槽也要出现在简单问答的装配结果里，不能只挂在规划分支 |
+| 新能力识别 | 别加词表。缺什么能力就加工具（`ToolRegistry.register`），让模型自己选 |
+| 上下文贡献 | 已有 `SystemContextContributor` 槽位。新槽要在每一轮的装配结果里出现，不能只挂在规划分支 |
 
 不要为了「将来可能多个实现」先抽只有一个实现的接口。
 
@@ -873,13 +910,13 @@ V7 已删意图规则表，不要再建。
 | 长工具超时被判 `OUTCOME_UNKNOWN` 整轮停 | 中 | 高 | 与现网一致；`exec_command` 超时不是 UNKNOWN |
 | 文本含 `"error"` 被轨迹判失败 | 中 | 中 | 知悉即可 |
 | 管理接口未做角色门禁 | 高 | 高 | 当前代码就是这样。加固属于改代码，不是已有功能 |
-| 把意图模块抄回来 | 中 | 高 | 用 TaskSignals |
+| 把意图模块抄回来 | 中 | 高 | 现在没有替代层：模型自己看原文，不要让代码替它分类 |
 
 ---
 
 ## 13. 已知局限（不要做）
 
-1. **意图分类子系统**：包已删，V7 掉表。用 `TaskSignals`。
+1. **意图分类与任务信号子系统**：包已删，V7 掉表。不要重造词表层。
 2. **中期记忆注入**：策略恒 false，无生产者。
 3. **`GET /api/token-usage`**：返回空对象。
 4. **`agent_session_permissions` 表**：运行时权限在内存。
@@ -909,21 +946,21 @@ V7 已删意图规则表，不要再建。
 
 ### 阶段 B — 系统上下文 + 直跑
 
-1. `ContextLoader` 先做最小系统提示：身份 + 轻问答块 + 最近历史。
+1. `ContextLoader` 先做最小系统提示：身份 + 权限 + 当前时间 + 最近历史。
 2. `AgentLoop.run` 的消息列表以 `SystemMessage(systemPrompt)` 开头，后面才是历史和用户原文。
 3. `POST /api/conversations/{sessionId}/messages/stream` 推 `thinking` / `token` / `end`。
 4. 一个 `read_file`，经 `ToolPipeline`。
 5. 循环上限 90。ChatMemory 窗口 64。
 
-验收：用户说「你好」，请求体里看得到系统提示和【轻问答】，不是只有用户原文。用户说「读某文件」会发 tool_call，结果回到模型再出终答。
+验收：用户说「你好」，请求体里看得到系统提示，不是只有用户原文。用户说「读某文件」会发 tool_call，结果回到模型再出终答。
 
-### 阶段 C — 三套上下文策略
+### 阶段 C — 两套上下文策略 + 进不进规划器
 
-1. `TaskSignals` 12 布尔 + yml 正则。
-2. LIGHT / CONTINUE / ACTION。ACTION 必须挂起上一份未完成 Todo。
+1. `ContextLoadPolicy` 只有 CONTINUE / ACTION，判据是 `taskTodoStore.hasSuspended(sessionId)`。
+2. ACTION 必须挂起上一份未完成 Todo；CONTINUE 先恢复再渲染。
 3. `shouldHandle` 在 `load` 之后。false 分支把 `loaded` 传进 `AgentLoop`，true 分支把同一份传进 `PlanningLoop`。
 
-验收：「你好」不带出上一张已完成计划，但仍有身份和轻问答系统提示。「继续」能恢复挂起清单。
+验收：「你好」不带出上一张已完成计划（ACTION 会挂起或归档它）。「继续」能恢复挂起清单，此时策略是 CONTINUE。
 
 ### 阶段 D — 规划
 
@@ -940,7 +977,7 @@ V7 已删意图规则表，不要再建。
 
 ### 不要做的捷径
 
-- 不要用意图枚举替代 `TaskSignals`。
+- 不要用词表或意图枚举替代「让模型自己读原文」。
 - 不要在 Controller 里直接调 ChatModel，跳过系统上下文和 Loop。
 - 不要给每个工具单独 REST。
 - 不要把不规划写成 `agentLoop.run(userMessage)`。
@@ -956,9 +993,9 @@ V7 已删意图规则表，不要再建。
 | 编排 | `mini-agent-app/.../AgentChatApplicationService.java` |
 | 直跑消息组装 | `mini-agent-loop/.../AgentLoop.java` 的 `run` |
 | 系统提示槽位 | `mini-agent-loop/.../context/ContextContributorConfiguration.java` |
-| 轻问答文案 | `mini-agent-loop/.../application/PromptTemplates.java` 的 `QUESTION_MODE` |
+| 任务块文案 | `mini-agent-loop/.../task/TaskPlan.java` 的 `toPromptBlock` |
 | 规划 | `mini-agent-planner/.../PlanningLoop.java` |
-| 信号 | `mini-agent-loop/.../task/TaskSignals.java` |
+| 任务参数 | `mini-agent-loop/.../task/TaskPlanFactory.java` |
 | 上下文策略 | `mini-agent-loop/.../context/ContextLoadPolicy.java` |
 | 工具管道 | `mini-agent-loop/.../execution/ToolPipeline.java` |
 | 默认配置 | `mini-agent-app/src/main/resources/application.yml` |

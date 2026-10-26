@@ -116,50 +116,6 @@ agent:
     # 不设该环境变量时退回下面这组本地 origin，dev 档行为不变。
     # desktop 档会显式钉死本地值，不吃这个变量 —— 见 application-desktop.yml。
     allowed-origins: ${ALLOWED_ORIGINS:http://localhost:*,http://127.0.0.1:*,file://}
-  # 任务信号：只从用户消息里提取「已经出现的事实」，不做分类、不选类别。
-  # 每条词表命中的就是命中的，可以逐条复核；下游各取所需，一处失效不牵连别处。
-  task-signals:
-    rules:
-      # 语义判断（复杂任务/图配文档）的开关
-      force-full-on-image-into-doc: true
-      question-max-len: 80   # 超过这个长度就不再当作短问答/短指令
-      # ── 事实词表：命中即为真，以下每一条都只描述「文本里出现了什么」 ──
-      web-signals:
-        - "(?i)https?://"
-        - "(?i)飞书|feishu|lark|wiki"
-        - "(?i)抓取|爬取|打开网页|访问(该|这个)?(链接|地址|网址)"
-        - "(?i)获取.{0,12}(资料|内容|页面)|web_extract|browser"
-        - "(?i)搜索|检索|调研|搜一下|查一下"
-      file-signals:
-        - "(?i)\\.md\\b|markdown|md\\s*文件"
-        - "(?i)写(到|入)?桌面|桌面上|文档|write_file|保存到"
-        - "(?i)架构图|流程图|时序图|结构图|mermaid|render_diagram|\\.mmd\\b"
-      image-into-doc-signals:
-        - "(?i)(图片|海报|插画|壁纸|封面|配图).{0,40}(替换|写入|插入|写进|写到|放到|贴到).{0,40}(md|markdown|文档|\\.md)"
-        - "(?i)(替换|写入|插入|写进|写到|放到|贴到).{0,40}(md|markdown|文档|\\.md).{0,40}(图片|海报|插画|配图)"
-        - "(?i)替换到你生成的|要有图片|包含图片|带上?图片|配上?图"
-      pure-image-signals:
-        - "(?i)画一?[张幅]|画个|画一张"
-        - "(?i)文生图|图生图|txt2img|img2img"
-        - "(?i)生成一?[张幅].{0,24}(海报|封面|壁纸|插画|图片)"
-        - "(?i)draw\\s+(a|an|me)|generate\\s+(an?\\s+)?image|create\\s+(an?\\s+)?image"
-        - "(?i)make\\s+(an?\\s+)?(image|picture|illustration)"
-      question-signals:
-        - "(?i)^\\s*(你(可以|能)做(什么|哪些)(事情|事)?|你有什么(能力|功能|本事)|你会什么|能做什么|有什么(能力|功能)|怎么用你|如何使用你|你会哪些|你都支持哪些|有哪些工具|支持什么功能|你是谁|介绍一下你(自己)?|自我介绍|help|what can you do|who are you|what are you|what do you support|你好|您好|hello|hi+|hey)\\s*[?？！!。.~…]*\\s*$"
-      task-action-signals:
-        - "(?i)生成|画|写|创建|修改|编辑|替换|删除|执行|运行|部署|搜索|打开|爬|下载|实现|开发|搭建|设计文档|建表|refactor|implement|deploy|generate"
-      continue-signals:
-        - "(?i)^(继续|接着(做|干|写|改)?|然后(把|再|继续)|按刚才的|在上次基础上|接着上次)"
-      complex-signals:
-        - "(?i)一整套|完整(的)?(项目|系统|方案|架构|平台)|多模块|多个文件|分别(实现|生成|写)|并且.*并且"
-        - "(?i)拆成|分步|步骤|阶段|里程碑|脚手架|骨架|monorepo|微服务|架构设计|技术方案|系统设计|从零(开始|搭建)|端到端"
-        - "(?i)至少\\s*\\d+|不少于\\s*\\d+|\\d+\\s*个(文件|模块|接口|页面|服务)"
-        - "(?i)generate\\s+(a\\s+)?(full|complete|entire)|scaffold|multi[- ]?step|end[- ]to[- ]end"
-        - "(?i)然后.*(再|接着|最后)|先.*再.*最后|建库|建表|CREATE\\s+TABLE|CREATE\\s+DATABASE"
-      image-and-doc-signals:
-        - "(?i)(生成|画).{0,40}(图|图片|结构图|架构图|流程图|插画).{0,60}(替换|写入|插入|写进|写到|放到).{0,40}(md|markdown|文档|\\.md)"
-        - "(?i)(替换|写入|插入|写进|写到|放到).{0,40}(md|markdown|文档|\\.md).{0,40}(图|图片|结构图)"
-        - "(?i)替换到你生成的|(生成|画).{0,40}(图|结构图|架构图).{0,40}替换"
   # 聊天模型预设（前端可选；空字段回退 langchain4j.open-ai.chat-model.*）
   models:
     default-preset: default
@@ -170,7 +126,13 @@ agent:
         # 决定何时压缩，前端"上下文已用 X%"也按这个分母显示。
         # 不填（0）= 未知，回退到 agent.context.max-tokens —— 但那样配小窗口模型时
         # 压缩会永不触发，上游以 context-length 400 拒绝，用户看到的是"模型连接异常"。
+        # 同一模型按套餐开放多档时，用 supported-context-windows 列出各档，
+        # 本字段作为默认档；选档规则见 ContextWindowResolver（与 WorkBuddy 一致：
+        # 默认档落在候选集里就用它，否则取最小档）。
         context-window-tokens: 512000
+        # supported-context-windows: [128000, 200000, 512000]
+        # 厂商输入硬上限：高于它的档位不可能生效，会在选档前被过滤掉
+        # max-input-tokens: 512000
       - id: chatanywhere
         label: ChatAnywhere
         base-url: https://api.chatanywhere.tech/v1
@@ -185,17 +147,28 @@ agent:
     # 工作窗口**上限**（估算 token）。实际窗口取 min(此值, 预设的 context-window-tokens)：
     # 这里是一个全局天花板，不是"所有模型都按这个算"。
     max-tokens: 512000
-    compress-threshold: 0.75
-    # false=Loop 内硬截断不调 LLM（但会生成结构化交接摘要：写过哪些文件/执行过哪些命令/哪些失败过）；
-    # true=热路径同步调 LLM 摘要，质量更高但 P99 会翻倍。
-    llm-summary-enabled: false
+    # 两档压缩阈值，语义与 WorkBuddy 的 preMessage / emergency 一致：
+    #   pre-message  下一次请求前，上下文达到工作窗口的该比例就压缩（默认 0.5）；
+    #   emergency    provider 真实 input 已达到该比例时无视冷却与「连续无效」护栏，
+    #                避免请求进入上游必然拒绝的区间（默认 0.9）。
+    # 触发依据取「本地估算」与「最近一次真实 inputTokenCount」的较大值，
+    # 本地估算按 0.7/0.3 分 CJK/拉丁字符加权，与厂商分词有偏差，真实值用于校正。
+    # 注意：日常任务每轮 prompt 几万 token，占 512k 窗口不到 10%，看不到压缩是正常的。
+    pre-message-threshold: 0.5
+    emergency-threshold: 0.9
+    # true=压缩时同步调 LLM 摘要：任务在压缩期间暂停，摘要完成后再继续下一轮。
+    # false=只做工程压缩（结构化交接 stub），LLM 摘要异步补，供下次压缩使用。
+    llm-summary-enabled: true
+    # 两步压缩的第二道判据：先做工程压缩（纯字符串重排，零成本），
+    # 压缩后总量 ≤ 工作窗口 × 本比例就不再花一次 LLM 调用。
+    # 0.15 与 WorkBuddy 的 getEngineeringCompactSufficiencyRatio() 默认值一致。
+    engineering-sufficiency-ratio: 0.15
     budget:
       enabled: true
       chars-per-token: 2.0
       slot-tokens:
         identity: 2000
         authority: 400
-        question: 800
         reference: 300
         memory: 6000
         skills: 2000
@@ -204,9 +177,6 @@ agent:
         todo: 2000
         closing: 1500
     history:
-      # 问答轮（问且无动手信号）保留的历史条数。
-      # 不能给 0：历史清空后模型看不到上一轮在谈什么，跨轮追问必然答错。
-      question: 6
       # QUESTION 指代：相关度精捞最多保留条数（非盲目最近 N）
       question-with-ref: 6
       # 指代精捞：从会话末尾向前扫描的候选池大小
@@ -295,9 +265,14 @@ agent:
   execution:
     deadline-ms: 1800000
     max-tool-calls: 120
-    # 本轮所有 LLM 调用 input+output 之和。须大于单次工作窗口，
-    # 否则一轮肥请求就会「任务已耗尽 token 预算」。约 6～8 次满窗口调用。
-    max-estimated-tokens: 2000000
+    # 单任务累计 token 的**告警线**，不是终止线。
+    # 累计 token = Σ(每轮 input)，随任务时长线性增长；正常长任务与原地打转的死循环
+    # 在这条线上长得一样，拿它当终止判据必然误杀长时间任务（旧行为：超过
+    # max-estimated-tokens 直接结束，用户看到「任务已耗尽 token 预算」）。
+    # 现在越线只写一条 TOKEN_USAGE_WARN 轨迹 + 一条 WARN 日志，任务继续跑完。
+    # 真正拦失控的是下面三道，加上重复工具检测 —— 这四项都与工作量无关：
+    #   deadline-ms（墙钟）、max-tool-calls（工具次数）、max-iterations（轮次）。
+    token-soft-limit: 8000000
     # 直跑循环上限（引擎封顶）。规划器节点上限仍是 planner.proposal-max-iterations。
     max-iterations: 90
     # delegate_task 内层循环上限

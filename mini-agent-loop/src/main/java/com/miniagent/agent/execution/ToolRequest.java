@@ -15,7 +15,8 @@ public record ToolRequest(
         int turn,
         String runId,
         String probeDeny,
-        Set<String> allowedTools
+        Set<String> allowedTools,
+        boolean waitForApproval
 ) {
     public ToolRequest {
         name = name == null ? "" : name;
@@ -35,7 +36,7 @@ public record ToolRequest(
     public static ToolRequest of(
             RunScope scope, String name, String arguments, int turn, String runId) {
         RunScope s = scope == null ? RunScope.capture() : scope;
-        return new ToolRequest(s, name, arguments, turn, runId, null, null);
+        return new ToolRequest(s, name, arguments, turn, runId, null, null, false);
     }
 
     public static ToolRequest of(
@@ -52,10 +53,14 @@ public record ToolRequest(
     }
 
     public ToolRequest withProbeDeny(String deny) {
-        return new ToolRequest(scope, name, arguments, turn, runId, deny, allowedTools);
+        return new ToolRequest(scope, name, arguments, turn, runId, deny, allowedTools, waitForApproval);
     }
 
     public ToolRequest withAllowedTools(Set<String> names) {
-        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, names);
+        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, names, waitForApproval);
+    }
+
+    public ToolRequest withApprovalWait() {
+        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, allowedTools, true);
     }
 }

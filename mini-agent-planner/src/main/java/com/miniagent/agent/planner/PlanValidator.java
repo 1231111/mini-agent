@@ -37,6 +37,18 @@ public class PlanValidator {
                     + "save|export)");
 
     /**
+     * 用户目标里的错误诊断语义。
+     *
+     * <p>这段判据原来放在任务信号层（{@code TaskSignalMatcher}），由词表匹配后
+     * 以一个布尔值传进来。信号层删除后，这里是唯一消费者，判据直接读目标原文：
+     * 「用户要的是不是定位一个失败」是图验收的一部分，不需要另一层中间表示。</p>
+     */
+    private static final Pattern DIAGNOSTIC_GOAL = Pattern.compile(
+            "(?i)(错误码|错误代码|报错|报错信息|异常|故障|失败原因|失败信息|错误原因|"
+                    + "诊断|故障定位|排查错误|定位问题|为何失败|为什么失败|error\\s*code|"
+                    + "error|exception|failure|diagnos|debug|troubleshoot)");
+
+    /**
      * 向后兼容的接受方法，返回 boolean
      * @deprecated 请使用 {@link #validate(TaskGraph, TaskPlan)} 获取结构化报告
      */
@@ -317,9 +329,13 @@ public class PlanValidator {
         ));
     }
 
+    static boolean isDiagnosticGoal(String goal) {
+        return goal != null && DIAGNOSTIC_GOAL.matcher(goal).find();
+    }
+
     static void addGoalGraphSemanticErrors(TaskGraph g, TaskPlan plan,
             List<PlanValidationReport.ValidationError> errors) {
-        if (plan == null || !plan.signals().diagnostic()) {
+        if (plan == null || !isDiagnosticGoal(plan.taskGoal())) {
             return;
         }
         boolean hasDiagnosis = g.nodes().stream().anyMatch(n -> {

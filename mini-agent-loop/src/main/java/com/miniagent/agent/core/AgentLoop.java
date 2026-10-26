@@ -17,7 +17,6 @@ import com.miniagent.agent.hook.StopContext;
 import com.miniagent.agent.hook.StopDecision;
 import com.miniagent.agent.hook.StopHookChain;
 import com.miniagent.agent.task.TaskPlan;
-import com.miniagent.agent.task.TaskSignals;
 import com.miniagent.agent.surface.ToolSurface;
 import com.miniagent.agent.context.ContextContributorConfiguration;
 import com.miniagent.agent.permission.PermissionContext;
@@ -49,6 +48,7 @@ import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.chat.response.PartialThinking;
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
+import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.agent.trace.TraceRecorder;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -220,6 +220,23 @@ public class AgentLoop {
     }
 
     /**
+     * 上一轮真实请求里的「消息部分」token 数，用于校准压缩判据。
+     *
+     * <p>为什么不能直接用 {@code lastInputTokens}：那个值含工具 schema 开销，而压缩判据的
+     * 分母（{@code budget}）已经把它扣掉了。分子含、分母不含会让占比系统性偏高，
+     * 于是压缩提前触发、无谓丢上下文。这里把 schema 部分减掉，两边口径对齐。</p>
+     *
+     * @return 拿不到真实 usage 时返回 0，调用方退回本地估算
+     */
+    private int observedMessageTokens(String sessionId, int schemaTokens) {
+        long lastInput = executionControl.lastInputTokens(sessionId);
+        if (lastInput <= 0) {
+            return 0;
+        }
+        return (int) Math.max(0, lastInput - schemaTokens);
+    }
+
+    /**
      * LLM 调用的最大重试次数（不含首次）。
      *
      * <p>默认 2：与 langchain4j 阻塞客户端的默认 maxRetries 对齐。注意流式客户端
@@ -345,18 +362,8 @@ public class AgentLoop {
                       String userMessage,
                       List<ChatMessage> chatHistory,
                       int maxIterations,
-                      Consumer<String> progressCallback) {
-        return run(chatModel, systemMessage, userMessage, chatHistory, maxIterations, progressCallback, null);
-    }
-
-    public String run(ChatModel chatModel,
-                      String systemMessage,
-                      String userMessage,
-                      List<ChatMessage> chatHistory,
-                      int maxIterations,
-                      Consumer<String> progressCallback,
                       TaskPlan taskPlan) {
-        return run(chatModel, systemMessage, userMessage, chatHistory, maxIterations, progressCallback, taskPlan, null);
+        return run(chatModel, systemMessage, userMessage, chatHistory, maxIterations, taskPlan, null);
     }
 
     /**
@@ -368,7 +375,6 @@ public class AgentLoop {
                       String userMessage,
                       List<ChatMessage> chatHistory,
                       int maxIterations,
-                      Consumer<String> progressCallback,
                       TaskPlan taskPlan,
                       AgentStreamSink streamSink) {
         List<ChatMessage> messages = new ArrayList<>();
@@ -384,7 +390,7 @@ public class AgentLoop {
         }
         messages.add(new UserMessage(userMessage));
         return executeLoop(chatModel, messages, Optional.ofNullable(userMessage).orElse(""),
-                maxIterations, progressCallback, taskPlan, streamSink).text();
+                maxIterations, taskPlan, streamSink).text();
     }
 
     public LoopOutcome runOutcome(ChatModel chatModel,
@@ -392,7 +398,6 @@ public class AgentLoop {
                                   String userMessage,
                                   List<ChatMessage> chatHistory,
                                   int maxIterations,
-                                  Consumer<String> progressCallback,
                                   TaskPlan taskPlan,
                                   AgentStreamSink streamSink) {
         List<ChatMessage> messages = new ArrayList<>();
@@ -405,18 +410,17 @@ public class AgentLoop {
             messages.addAll(chatHistory);
         messages.add(new UserMessage(userMessage));
         return executeLoop(chatModel, messages, Optional.ofNullable(userMessage).orElse(""),
-                maxIterations, progressCallback, taskPlan, streamSink);
+                maxIterations, taskPlan, streamSink);
     }
 
     public LoopOutcome continueLoop(ChatModel chatModel,
                                     List<ChatMessage> messages,
                                     String userTextForFilePattern,
                                     int maxIterations,
-                                    Consumer<String> progressCallback,
                                     TaskPlan taskPlan,
                                     AgentStreamSink streamSink) {
         return executeLoop(chatModel, messages, Optional.ofNullable(userTextForFilePattern).orElse(""),
-                maxIterations, progressCallback, taskPlan, streamSink);
+                maxIterations, taskPlan, streamSink);
     }
 
     /**
@@ -443,19 +447,9 @@ public class AgentLoop {
                                     UserMessage userMessage,
                                     List<ChatMessage> chatHistory,
                                     int maxIterations,
-                                    Consumer<String> progressCallback) {
-        return runWithMultimodal(chatModel, systemMessage, userMessage, chatHistory, maxIterations, progressCallback, null);
-    }
-
-    public String runWithMultimodal(ChatModel chatModel,
-                                    String systemMessage,
-                                    UserMessage userMessage,
-                                    List<ChatMessage> chatHistory,
-                                    int maxIterations,
-                                    Consumer<String> progressCallback,
                                     TaskPlan taskPlan) {
         return runWithMultimodal(chatModel, systemMessage, userMessage, chatHistory,
-                maxIterations, progressCallback, taskPlan, null);
+                maxIterations, taskPlan, null);
     }
 
     public String runWithMultimodal(ChatModel chatModel,
@@ -463,7 +457,6 @@ public class AgentLoop {
                                     UserMessage userMessage,
                                     List<ChatMessage> chatHistory,
                                     int maxIterations,
-                                    Consumer<String> progressCallback,
                                     TaskPlan taskPlan,
                                     AgentStreamSink streamSink) {
         List<ChatMessage> messages = new ArrayList<>();
@@ -479,7 +472,7 @@ public class AgentLoop {
         }
         messages.add(userMessage);
         return executeLoop(chatModel, messages, firstUserTextForFileIntent(userMessage),
-                maxIterations, progressCallback, taskPlan, streamSink).text();
+                maxIterations, taskPlan, streamSink).text();
     }
 
     public LoopOutcome runWithMultimodalOutcome(ChatModel chatModel,
@@ -487,7 +480,6 @@ public class AgentLoop {
                                                 UserMessage userMessage,
                                                 List<ChatMessage> chatHistory,
                                                 int maxIterations,
-                                                Consumer<String> progressCallback,
                                                 TaskPlan taskPlan,
                                                 AgentStreamSink streamSink) {
         List<ChatMessage> messages = new ArrayList<>();
@@ -500,12 +492,14 @@ public class AgentLoop {
             messages.addAll(chatHistory);
         messages.add(userMessage);
         return executeLoop(chatModel, messages, firstUserTextForFileIntent(userMessage),
-                maxIterations, progressCallback, taskPlan, streamSink);
+                maxIterations, taskPlan, streamSink);
     }
 
     /**
      * 与 {@link #run} 共用的主循环。
-     * {@code progressCallback} 非空时，每次工具调用前后推送进度文本（用于 SSE 实时反馈）。
+     *
+     * <p>工具调用的过程不推前端：前端只收 {@code thinking} / {@code token} / {@code todo}
+     * 这类面向用户的增量。工具名、参数、结果原文属于实现细节，记录在 trace 与日志里。</p>
      */
     // ==================== Loop 状态 ====================
 
@@ -542,12 +536,8 @@ public class AgentLoop {
         String loopEndReason = "DONE";
         boolean injectAppendHintAfterTools = false; // tool_call 被长度截断：工具执行后需注入续写引导
         boolean lengthTruncatedToolCalls = false; // 当前轮 tool_call 参数可能被截断
-        boolean requiresStructuredPlan = false; // 复杂任务：未 set 计划前只放行 todo
-        int planReminderCount = 0;              // 催促先写 todo 的次数
         int incompleteTodoReminders = 0;        // 未完成 todo 却试图收尾的次数
         boolean goalAnchorInjected = false;     // 是否已注入任务目标锚定
-        /** 寒暄/轻问答：不吃上一轮残留 todo，也不拦截收尾 */
-        boolean lightQa = false;
         volatile String permissionAskTool = null;
         volatile String userQuestionText = null;
         volatile boolean unknownOutcome = false;
@@ -625,7 +615,6 @@ public class AgentLoop {
                               List<ChatMessage> messages,
                               String userTextForFilePattern,
                               int maxIterations,
-                              Consumer<String> progressCallback,
                               TaskPlan taskPlan,
                               AgentStreamSink streamSink) {
         ToolSurface.Resolved base = resolveBaseSurface(taskPlan);
@@ -636,8 +625,6 @@ public class AgentLoop {
                 Optional.ofNullable(userTextForFilePattern).orElse("")).find();
         String taskGoal = summarizeTaskGoal(
                 Objects.nonNull(taskPlan) ? taskPlan.taskGoal() : userTextForFilePattern);
-        state.requiresStructuredPlan = Objects.nonNull(taskPlan) && taskPlan.requiresStructuredPlan();
-        state.lightQa = Objects.nonNull(taskPlan) && taskPlan.signals().lightTurn();
 
         String sessionId = currentSessionId.get();
         executionControl.heartbeat(sessionId);
@@ -650,11 +637,7 @@ public class AgentLoop {
             boolean sub = SubagentContext.isActive();
             String loopType = sub ? "SUBAGENT_LOOP_START" : "AGENT_LOOP_START";
             var startStep = traceRecorder.recordNode(sessionId, 0, loopType,
-                    "{\"signals\":\""
-                            + (Objects.isNull(taskPlan)
-                            ? TaskSignals.NONE.describe() : taskPlan.signals().describe())
-                            + "\",\"requiresStructuredPlan\":"
-                            + (Objects.nonNull(taskPlan) && taskPlan.requiresStructuredPlan()) + "}",
+                    "{\"taskGoalChars\":" + taskGoal.length() + "}",
                     RunStatus.RUNNING.name(), 0);
             if (sub && Objects.nonNull(startStep) && Objects.nonNull(startStep.getId())) {
                 // 后续子步骤挂到本 START 下（同 execution 树状嵌套）
@@ -677,12 +660,11 @@ public class AgentLoop {
         }
 
         if (Objects.nonNull(taskPlan)) {
-            log.info("Agent计划: signals=[{}], taskGoal='{}', requiresPlan={}, toolSurface={}",
-                    taskPlan.signals().describe(), taskGoal, taskPlan.requiresStructuredPlan(),
-                    surfaceLabel(base));
+            log.info("Agent计划: taskGoal='{}', reason='{}', toolSurface={}",
+                    taskGoal, taskPlan.reason(), surfaceLabel(base));
         }
-        log.info("Agent任务开始: taskGoal='{}', maxIterations={}, toolsAvailable={}, explicitFileDelivery={}, requiresPlan={}",
-                taskGoal, iterations, base.names().size(), explicitlyNeedsFile, state.requiresStructuredPlan);
+        log.info("Agent任务开始: taskGoal='{}', maxIterations={}, toolsAvailable={}, explicitFileDelivery={}",
+                taskGoal, iterations, base.names().size(), explicitlyNeedsFile);
 
         for (int turn = 0; turn < iterations; turn++) {
             ExecutionControl.StopReason turnStop = executionControl.afterModelTokens(sessionId, 0);
@@ -706,8 +688,8 @@ public class AgentLoop {
                 }
             }
 
-            // 任务目标锚定（复杂任务注入一次，压缩后仍靠头部 user + 此提醒保持方向）
-            if (state.requiresStructuredPlan && !state.goalAnchorInjected) {
+            // 任务目标锚定（注入一次，压缩后仍靠头部 user + 此提醒保持方向）
+            if (!state.goalAnchorInjected) {
                 messages.add(new SystemMessage(
                         "【任务目标锚定】本轮 taskGoal：" + taskGoal
                                 + "\n所有工具调用与计划步骤必须服务该目标；禁止跑去处理无关需求。"
@@ -721,14 +703,10 @@ public class AgentLoop {
                                 + "立刻执行 ActionProposal 中的当前步骤。"));
             }
 
-            // 轻问答不挂上一轮残留子目标，避免「你好」被旧图任务劫持
-            if (!state.lightQa) {
-                refreshSubGoal(messages, state, sessionId, streamSink);
-            }
+            // 挂上 todo 的当前子目标作为可刷新指针；本轮没有清单时它不会注入任何内容
+            refreshSubGoal(messages, state, sessionId, streamSink);
 
-            String subGoalLog = state.lightQa
-                    ? taskGoal
-                    : Optional.ofNullable(state.lastSubGoalText).orElse(taskGoal);
+            String subGoalLog = Optional.ofNullable(state.lastSubGoalText).orElse(taskGoal);
             state.currentTurn = turn;
             if (Objects.nonNull(traceRecorder)) {
                 traceRecorder.recordTurnStart(sessionId, turn, state.lastSubGoalText,
@@ -739,6 +717,40 @@ public class AgentLoop {
             log.info("Agent循环第 {}/{} 轮: {}, messages={}, availableTools={}, alreadyInvoked={}",
                     turn + 1, iterations, truncate(subGoalLog, 80), messages.size(),
                     specsForTurn.size(), state.toolsInvoked);
+
+            // 每次请求前压缩，与 WorkBuddy 的 pre-message 压缩同位置：**发出请求之前**判断，
+            // 而不是等工具跑完再补。这一条同时覆盖两种情况：
+            //   ① 本轮首包要用上一轮留下来的长历史（数据库里最多 max-messages 条）；
+            //   ② 上一次工具往返刚塞进大段结果。
+            // 预算 = 模型窗口（或配置上限）− 工具 schema 开销：schema 每轮都发，
+            // 不计入的话真实 prompt 会比估算大一截，压缩永远偏晚。
+            int window = effectiveContextTokens();
+            int schemaTokens = toolSchemaTokenEstimate(specsForTurn.size());
+            int budget = Math.max(1000, window - schemaTokens);
+            // 压缩是**同步阻塞**的：执行到这里本轮就不再往下走，压完才发请求。
+            // 只有工程压缩不够小时才会再插一次摘要用的 LLM 调用。
+            int observed = observedMessageTokens(sessionId, schemaTokens);
+            ContextCompressor.CompressResult cr =
+                    contextCompressor.maybeCompress(messages, budget, sessionId, observed);
+            messages = cr.messages();
+            // 每轮把判据的分子分母都打出来。没有这行时"压缩为什么没触发"只能靠猜：
+            // 真实 usage 含工具 schema、本地估算偏低、预算被 schema 扣掉，三个数各不相同，
+            // 任何一个缺失都会让人误判成"阈值配错了"。
+            log.info("压缩判据: 本地估算 {} / 真实消息 {} / 预算 {}（窗口 {}，schema {}）→ {}",
+                    cr.beforeTokens(), observed, budget, window, schemaTokens,
+                    cr.compressed() ? "已压缩" : "未触发");
+            if (cr.compressed()) {
+                if (Objects.nonNull(traceRecorder)) {
+                    // 用 token 判据而不是「条数变少」：压缩后 token 反而增加时本类会退回原文。
+                    traceRecorder.recordCompression(sessionId, turn, cr.beforeCount(), cr.afterCount(),
+                            cr.beforeTokens(), cr.afterTokens());
+                }
+                // 立刻把压缩后的上下文用量推给前端，否则进度要等下一次 LLM 返回才刷新。
+                if (Objects.nonNull(streamSink)) {
+                    streamSink.onContext(cr.afterTokens(), budget);
+                }
+            }
+
             // 记录 LLM 请求上下文（超长 prompt 截断，避免轨迹写入拖死线程）
             if (Objects.nonNull(traceRecorder)) {
                 String promptCtx = truncate(formatMessagesForTrace(messages), 8000);
@@ -756,6 +768,23 @@ public class AgentLoop {
                     ? response.tokenUsage().inputTokenCount() + response.tokenUsage().outputTokenCount()
                     : Math.max(1, messages.size() * 32L);
             ExecutionControl.StopReason modelStop = executionControl.afterModelTokens(sessionId, estimatedTokens);
+            // 记录真实 input 快照：压缩判据要用它校准本地估算（见 ContextCompressor#maybeCompress）。
+            if (response != null && response.tokenUsage() != null) {
+                executionControl.recordInputTokens(sessionId, response.tokenUsage().inputTokenCount());
+            }
+            // 累计 token 越线只告警，不终止任务（口径与 WorkBuddy 一致：任务不该因为"干得久"而停）。
+            // 真正的失控拦截是 deadline / maxToolCalls / 轮次上限 / 重复工具检测，四者都与工作量无关。
+            if (executionControl.markTokenSoftLimitWarned(sessionId)) {
+                long used = executionControl.estimatedTokens(sessionId);
+                log.warn("本任务累计 token 已越过告警线（{} > {}），任务继续执行；"
+                                + "如需控制成本请缩短任务或调高 agent.execution.token-soft-limit",
+                        used, executionControl.tokenSoftLimit());
+                if (Objects.nonNull(traceRecorder)) {
+                    traceRecorder.recordNode(AgentStepNode.TOKEN_USAGE_WARN.name(),
+                            "累计 token 越过告警线：" + used + "，任务继续执行（不终止）",
+                            RunStatus.SUCCESS.name(), 0);
+                }
+            }
             if (modelStop != ExecutionControl.StopReason.NONE) {
                 state.loopEndReason = controlEndReason(modelStop);
                 return finish(controlMessage(modelStop), state, messages);
@@ -924,7 +953,7 @@ public class AgentLoop {
                     }
                 }
 
-                executeToolCalls(toolCalls, messages, progressCallback, state);
+                executeToolCalls(toolCalls, messages, state);
                 if (state.unknownOutcome) {
                     state.loopEndReason = OUTCOME_UNKNOWN;
                     return finish("工具调用可能已产生副作用，但终态无法确认。"
@@ -995,15 +1024,8 @@ public class AgentLoop {
                     }
                 }
 
-                int msgCountBefore = messages.size();
-                // 预算 = 模型窗口（或配置上限）− 工具 schema 开销：schema 每轮都发，
-                // 不计入的话真实 prompt 会比估算大一截，压缩永远偏晚。
-                int window = effectiveContextTokens();
-                int budget = Math.max(1000, window - toolSchemaTokenEstimate(specsForTurn.size()));
-                messages = contextCompressor.maybeCompress(messages, budget, sessionId);
-                if (Objects.nonNull(traceRecorder) && messages.size() < msgCountBefore) {
-                    traceRecorder.recordCompression(sessionId, turn, msgCountBefore, messages.size(), 0, 0);
-                }
+                // 预算与压缩已移到每轮请求前（见上方「每次请求前压缩」）：
+                // 放在这里只有一个后果 —— 首包带着未压缩的长历史发出去，压缩永远慢一拍。
                 continue;
             }
 
@@ -1011,6 +1033,24 @@ public class AgentLoop {
             String result = tryReturnFinalText(aiMessage, messages, state, explicitlyNeedsFile,
                     turn, iterations, sessionId);
             if (Objects.nonNull(result)) {
+                if (Objects.nonNull(eventCenter)) {
+                    SessionEventCenter.SealResult seal = eventCenter.sealIfNoPendingUserMessages(sessionId);
+                    if (seal.failed()) {
+                        throw new IllegalStateException("无法确认追加消息队列状态，拒绝静默结束任务");
+                    }
+                    if (seal.queued()) {
+                        for (String appended : seal.messages()) {
+                            messages.add(new UserMessage(appended));
+                        }
+                        state.goalAnchorInjected = false;
+                        if (Objects.nonNull(streamSink)) {
+                            streamSink.onThinking(MessageConstants.AGENT_SUBTASK_PROMPT);
+                        }
+                        log.info("最终回答前收到追加消息，继续执行: sessionId={}, messages={}",
+                                sessionId, seal.messages().size());
+                        continue;
+                    }
+                }
                 if (Objects.nonNull(traceRecorder)) {
                     traceRecorder.recordAnswer(sessionId, turn, result);
                 }
@@ -1133,7 +1173,7 @@ public class AgentLoop {
             names.remove("exec_command");
             names.remove("read_package");
         }
-        if (closeRetrieval(state.requiresStructuredPlan, state.retrievalCalls)) {
+        if (closeRetrieval(state.retrievalCalls)) {
             int before = names.size();
             names.removeIf(AgentLoop::isRetrievalTool);
             if (names.size() != before && !state.retrievalClosedNote) {
@@ -1281,7 +1321,8 @@ public class AgentLoop {
     private ToolRequest toolRequest(String name, String args, int turn,
                                     boolean denyProbes, LoopState state, RunScope scope) {
         ToolRequest request = ToolRequest.of(scope, name, args, turn, state.runId)
-                .withAllowedTools(state.allowedToolsForTurn);
+                .withAllowedTools(state.allowedToolsForTurn)
+                .withApprovalWait();
         if (denyProbes) {
             request = request.withProbeDeny(denyCappedBrowserProbe(name));
         }
@@ -1298,7 +1339,7 @@ public class AgentLoop {
             case USER_QUESTION -> state.userQuestionText = invocation.loopSignal();
             case EXECUTED -> state.noteStructuredResult(
                     invocation.toolName(), invocation.result());
-            case POLICY_DENIED, CONTROL_STOP, FENCE_REJECTED -> {
+            case POLICY_DENIED, PERMISSION_DENIED, CONTROL_STOP, FENCE_REJECTED -> {
             }
         }
         return invocation.text();
@@ -1308,7 +1349,7 @@ public class AgentLoop {
         return switch (reason) {
             case CANCELLED -> CANCELLED;
             case DEADLINE_EXCEEDED -> DEADLINE_EXCEEDED;
-            case TOOL_BUDGET_EXCEEDED, TOKEN_BUDGET_EXCEEDED, TENANT_QUOTA_EXCEEDED -> RESOURCE_QUOTA_EXCEEDED;
+            case TOOL_BUDGET_EXCEEDED, TENANT_QUOTA_EXCEEDED -> RESOURCE_QUOTA_EXCEEDED;
             case NONE -> "DONE";
         };
     }
@@ -1318,7 +1359,6 @@ public class AgentLoop {
             case CANCELLED -> "任务已取消";
             case DEADLINE_EXCEEDED -> "任务已超过执行 deadline";
             case TOOL_BUDGET_EXCEEDED -> "任务已耗尽工具调用配额";
-            case TOKEN_BUDGET_EXCEEDED -> "任务已耗尽 token 预算";
             case TENANT_QUOTA_EXCEEDED -> "租户 token 配额已耗尽";
             case NONE -> "";
         };
@@ -1551,7 +1591,7 @@ public class AgentLoop {
             }
         });
 
-        awaitStream(latch, receivedAny, streamSink, firstTokenTimeoutSec);
+        awaitStream(latch, receivedAny, firstTokenTimeoutSec);
         Throwable err = errorRef.get();
         if (Objects.nonNull(err)) {
             if (err instanceof Exception ex) {
@@ -1565,10 +1605,14 @@ public class AgentLoop {
     /**
      * 每 {@link #STREAM_POLL_SEC} 秒看一次取消。
      * 停止接口在模型返回前就生效；此前首包之后是一次 600 秒的等待，取消要等模型自己说完。
+     *
+     * <p>等待期只写日志，不往思考流里推提示。这里曾经每 15 秒追加一条
+     * 「模型处理中，长文档/建表任务首包可能较慢」—— 那句话与实际条件无关
+     * （触发条件只是「首包没来」），却被拼进用户可见的深度思考正文，
+     * 与模型真实推理混在一起，还会被 MAX_THINK_CHARS 当正文截断。</p>
      */
     private void awaitStream(CountDownLatch latch,
                              java.util.concurrent.atomic.AtomicBoolean receivedAny,
-                             AgentStreamSink streamSink,
                              long firstTokenTimeoutSec) throws Exception {
         long firstDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(firstTokenTimeoutSec);
         long finishDeadline = 0L;
@@ -1593,10 +1637,6 @@ public class AgentLoop {
                         "流式 LLM 首包超时（" + firstTokenTimeoutSec + "s 内无任何增量）");
             }
             log.info("仍在等待 LLM 首包响应… 约剩余 {}s", remainSec);
-            try {
-                streamSink.onThinking("\n（模型处理中，长文档/建表任务首包可能较慢，请稍候…）\n");
-            } catch (Exception ignored) {
-            }
         }
     }
 
@@ -1617,9 +1657,9 @@ public class AgentLoop {
                 || name.startsWith("browser_");
     }
 
-    /** 规划图自己控步数。直跑检索到顶就收口，避免 90 轮上限形同没有。 */
-    static boolean closeRetrieval(boolean requiresStructuredPlan, int retrievalCalls) {
-        return !requiresStructuredPlan && retrievalCalls >= RETRIEVAL_CALL_CAP;
+    /** 直跑检索到顶就收口，避免 90 轮上限形同没有。规划图由自己的调度控步数。 */
+    static boolean closeRetrieval(int retrievalCalls) {
+        return retrievalCalls >= RETRIEVAL_CALL_CAP;
     }
 
     /** 按请求体大小估计首包等待：思考模型 + 超长 schema 需要更久 */
@@ -1645,25 +1685,28 @@ public class AgentLoop {
 
     // ==================== 工具执行 ====================
 
-    /** 统一执行工具调用（多工具并行，单工具串行），结果追加到 messages */
-    private void executeToolCalls(List<?> toolCalls, List<ChatMessage> messages,
-                                   Consumer<String> progressCallback, LoopState state) {
-        // 推送进度
-        if (Objects.nonNull(progressCallback)) {
-            String names = toolCalls.stream()
+    /**
+     * 统一执行工具调用（多工具并行，单工具串行），结果追加到 messages。
+     *
+     * <p>这里不再向前端推 SSE {@code progress}。对话区只保留模型自己的话（过程说明）
+     * 与最终答案；工具名、参数、结果原文（含内部 errorCode、文件路径）属于实现细节，
+     * 不该进用户界面。完整记录仍在 {@code traceRecorder}（{@code /trace} 可查）与日志里。</p>
+     */
+    private void executeToolCalls(List<?> toolCalls, List<ChatMessage> messages, LoopState state) {
+        if (!toolCalls.isEmpty()) {
+            log.info("工具调用: {}", toolCalls.stream()
                     .map(tc -> formatProgressMsg(toolNameOf(tc), argumentsOf(tc)))
-                    .reduce((a, b) -> a + " | " + b).orElse("");
-            progressCallback.accept(names);
+                    .reduce((a, b) -> a + " | " + b).orElse(""));
         }
 
         // 必须把参数一起交出去：exec_command 的只读性取决于命令行内容（git status 只读、
         // mvnw package 不是），只看工具名会把整批含 exec_command 的调用一律降级成串行。
         if (toolExecutionGuards.canRunBatchInParallel(
                 toolCalls, AgentLoop::toolNameOf, AgentLoop::argumentsOf)) {
-            executeToolCallsParallel(toolCalls, messages, progressCallback, state);
+            executeToolCallsParallel(toolCalls, messages, state);
         } else {
             for (var tc : toolCalls) {
-                executeToolCallSingle(tc, messages, progressCallback, state);
+                executeToolCallSingle(tc, messages, state);
             }
         }
     }
@@ -1678,7 +1721,7 @@ public class AgentLoop {
 
     /** 并行执行多个工具 */
     private void executeToolCallsParallel(List<?> toolCalls, List<ChatMessage> messages,
-                                           Consumer<String> progressCallback, LoopState state) {
+                                           LoopState state) {
         Map<String, String> cachedResults = new HashMap<>();
         Map<String, ToolInvocation> invocations = new ConcurrentHashMap<>();
         // 用 ExecutorService.submit 拿到真正的 Future：cancel(true) 会**中断**工作线程，
@@ -1710,14 +1753,14 @@ public class AgentLoop {
             }
 
             log.info("  [并行] {}({})", name, truncate(redactSensitive(args), 150));
-            if (Objects.nonNull(progressCallback)) {
-                progressCallback.accept(formatProgressMsg(name, args));
-            }
 
             long timeout = resolveToolTimeout(name, args);
             ToolRequest request = toolRequest(
                     name, args, turn, denyProbes, state, scope);
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeout);
+            // 审批等待是执行预算之外的一段时间，必须加进去；只取 max 会让
+            // 用户在 TTL 后段批准时，工具刚醒就被判超时。
+            long deadline = System.nanoTime()
+                    + TimeUnit.SECONDS.toNanos(toolWaitSeconds(request, timeout));
             batchDeadline = Math.max(batchDeadline, deadline);
             futures.add(VIRTUAL_EXECUTOR.submit(() -> {
                 try (var ignored = scope.bind()) {
@@ -1805,15 +1848,14 @@ public class AgentLoop {
             }
 
             log.info("  [并行] {}: {}", name, truncate(redactSensitive(result), 200));
-            recordToolOutcome(state, name, argumentsOf(tc), result, progressCallback);
+            recordToolOutcome(state, name, argumentsOf(tc), result);
             messages.add(ToolExecutionResultMessage.from(
                     toolIdOf(tc), name, resultForContext));
         }
     }
 
     /** 串行执行单个工具 */
-    private void executeToolCallSingle(Object tc, List<ChatMessage> messages,
-                                         Consumer<String> progressCallback, LoopState state) {
+    private void executeToolCallSingle(Object tc, List<ChatMessage> messages, LoopState state) {
         String name = toolNameOf(tc);
         String args = argumentsOf(tc);
 
@@ -1821,7 +1863,7 @@ public class AgentLoop {
         if (state.lengthTruncatedToolCalls && !"write_file".equals(name) && !"read_file".equals(name)) {
             String truncErr = "{\"error\":\"本次工具调用的参数因模型输出长度上限被截断，无法执行。请用更短的参数重试。\"}";
             log.warn("  [截断保护] 跳过执行 {}，参数可能不完整", name);
-            recordToolOutcome(state, name, args, truncErr, progressCallback);
+            recordToolOutcome(state, name, args, truncErr);
             messages.add(ToolExecutionResultMessage.from(toolIdOf(tc), name, truncErr));
             return;
         }
@@ -1829,9 +1871,6 @@ public class AgentLoop {
         String cacheKey = name + ":" + args;
 
         log.info("  {}({})", name, truncate(redactSensitive(args), 150));
-        if (Objects.nonNull(progressCallback)) {
-            progressCallback.accept(formatProgressMsg(name, args));
-        }
 
         String result;
         if (isCacheableTool(name) && state.toolResultCache.containsKey(cacheKey)) {
@@ -1859,11 +1898,13 @@ public class AgentLoop {
                             return toolPipeline.invoke(request);
                         }
                     });
+            long waitTimeout = toolWaitSeconds(request, timeout);
             try {
-                result = applyInvocation(future.get(timeout, TimeUnit.SECONDS), state);
+                result = applyInvocation(future.get(waitTimeout, TimeUnit.SECONDS), state);
             } catch (java.util.concurrent.TimeoutException te) {
                 future.cancel(true);
-                log.warn("  工具 {} 执行超时（{}s），已中断工作线程（子进程由工具侧强杀进程树）", name, timeout);
+                log.warn("  工具 {} 执行超时（{}s，含审批等待），已中断工作线程（子进程由工具侧强杀进程树）",
+                        name, waitTimeout);
                 ToolResult timeoutResult = timeoutToolResult(name, args, timeout);
                 state.noteStructuredResult(name, timeoutResult);
                 result = timeoutResult.legacyText();
@@ -1899,9 +1940,38 @@ public class AgentLoop {
         }
 
         log.info("  {}: {}", name, truncate(redactSensitive(result), 300));
-        recordToolOutcome(state, name, args, result, progressCallback);
+        recordToolOutcome(state, name, args, result);
         messages.add(ToolExecutionResultMessage.from(
                 toolIdOf(tc), name, resultForContext));
+    }
+
+    /**
+     * 外层等待比审批窗口多留的余量（秒）：留给唤醒、参数核对和真正的工具执行。
+     */
+    private static final long APPROVAL_WAIT_MARGIN_SECONDS = 15L;
+    /** ToolPipeline 不可用（单测 / mock）时的兜底审批窗口，与 application.yml 默认值一致。 */
+    private static final long DEFAULT_APPROVAL_WAIT_SECONDS = 300L;
+
+    private long approvalWaitSeconds() {
+        ToolPipeline pipeline = toolPipeline;
+        long ttl = pipeline == null
+                ? DEFAULT_APPROVAL_WAIT_SECONDS : pipeline.askGrantTtlSeconds();
+        return Math.max(1L, ttl) + APPROVAL_WAIT_MARGIN_SECONDS;
+    }
+
+    /**
+     * 一次工具调用在外层要等多久。
+     *
+     * <p>{@code waitForApproval} 的调用分两段：先等用户点批准（审批 TTL），
+     * 批准之后才开始工具自己的执行预算。这两段是<b>相加</b>关系。
+     * 取 {@code max(ttl, timeout)} 是错的：审批占掉大半 TTL 后，工具只剩不到
+     * 原本预算的时间，{@code mvnw package} 这类长命令会在批准后立刻被判超时。</p>
+     */
+    private long toolWaitSeconds(ToolRequest request, long toolTimeoutSeconds) {
+        if (request == null || !request.waitForApproval()) {
+            return toolTimeoutSeconds;
+        }
+        return approvalWaitSeconds() + Math.max(1L, toolTimeoutSeconds);
     }
 
     /**
@@ -1977,17 +2047,13 @@ public class AgentLoop {
         return sb.toString().trim();
     }
 
-    private void recordToolOutcome(LoopState state, String name, String args, String result,
-                                   Consumer<String> progressCallback) {
+    private void recordToolOutcome(LoopState state, String name, String args, String result) {
         state.noteToolFinished(name, args, result);
         boolean failed = TraceRecorder.isFailedResult(result);
         String st = failed ? RunStatus.FAILURE.name() : RunStatus.SUCCESS.name();
         if (Objects.nonNull(traceRecorder))
             traceRecorder.recordToolResult(
                     currentSessionId.get(), state.currentTurn, name, result, 0, st);
-        if (Objects.nonNull(progressCallback))
-            progressCallback.accept((failed ? "✗ " : "✓ ") + name + ": "
-                    + truncate(redactSensitive(result), 120));
         notifyToolExecution(state, name, result);
     }
 
@@ -2161,18 +2227,14 @@ public class AgentLoop {
             if (state.writeFileSucceeded && !hasBlockingTodos(sessionId)) {
                 return "（文件已生成，见 workspace/）";
             }
-            if (!state.lightQa
-                    && (hasBlockingTodos(sessionId)
-                    || (state.requiresStructuredPlan && !taskTodoStore.hasPlan(sessionId)))) {
+            if (hasBlockingTodos(sessionId)) {
                 finalText = "";
             } else {
                 return "（模型未返回内容）";
             }
         }
 
-        if (!state.lightQa
-                && Objects.nonNull(sessionId)
-                && taskTodoStore.hasPlan(sessionId)) {
+        if (Objects.nonNull(sessionId) && taskTodoStore.hasPlan(sessionId)) {
             boolean runnable = taskTodoStore.hasRunnableIncomplete(sessionId);
             if (!turnPolicy.hardGate() && runnable
                     && state.incompleteTodoReminders >= 2) {
@@ -2253,23 +2315,18 @@ public class AgentLoop {
                 Set.copyOf(state.toolsInvoked),
                 state.writeFileSucceeded,
                 state.mediaDelivered,
-                state.requiresStructuredPlan,
                 SubagentContext.isActive(),
                 PermissionContext.mode(),
                 PermissionContext.planApproved(),
-                state.lightQa,
                 turnPolicy.hardGate(),
                 hasPlan,
                 runnable,
-                state.planReminderCount,
                 state.incompleteTodoReminders,
                 render);
     }
 
     private static void noteStopNudge(LoopState state, String reason) {
-        if (ErrorCode.TODO_STOP_MISSING_PLAN.getCode().equals(reason)) {
-            state.planReminderCount++;
-        } else if (ErrorCode.TODO_STOP_INCOMPLETE.getCode().equals(reason)) {
+        if (ErrorCode.TODO_STOP_INCOMPLETE.getCode().equals(reason)) {
             state.incompleteTodoReminders++;
         }
     }

@@ -103,6 +103,8 @@ if (structured && !schedulableCapability(cap)) {
 
 **Remediation:** Run capability validation unconditionally whenever the planner owns the turn; make the `structured` flag affect only the decomposition-quality checks.
 
+**Status (2026-10-22): fixed.** `PlanValidator.validate` now hardcodes `boolean structured = true` (`PlanValidator.java:97`) and the `requiresStructuredPlan` flag no longer exists — `TaskPlan` was reduced to `(taskGoal, allowedTools, steps, reason)` when the task-signal layer was deleted. Capability validation therefore runs on every validated graph. This also closes the lenient-validation item recorded in project memory as "`PlanValidator` 的 `structured = plan.requiresStructuredPlan()` 在模型判档下校验偏松".
+
 ### P2-2 — `compileAndValidate` returns a graph it just declared invalid
 
 **Evidence** — `PlanningLoop.java:1117-1130`

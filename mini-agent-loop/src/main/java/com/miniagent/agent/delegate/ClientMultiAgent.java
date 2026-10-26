@@ -4,10 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.core.ExecutionProperties;
-import com.miniagent.agent.core.SessionEventCenter;
 import com.miniagent.agent.execution.ToolCallContext;
 import com.miniagent.agent.task.TaskPlan;
-import com.miniagent.agent.task.TaskSignals;
 import com.miniagent.agent.tool.CapabilityRegistry;
 import dev.langchain4j.model.chat.ChatModel;
 import org.apache.commons.lang3.StringUtils;
@@ -24,7 +22,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Consumer;
 
 /**
  * 客户端上的一次对话。主会话是宿主，角色子代理在这里跑，挂同一份取消和预算。
@@ -57,8 +54,6 @@ public class ClientMultiAgent {
     private ExecutionProperties executionProperties;
     @Autowired
     private CapabilityRegistry capabilityRegistry;
-    @Autowired(required = false)
-    private SessionEventCenter eventCenter;
 
     public ClientMultiAgent(ExecutionControl executionControl, RoleLoader roleLoader) {
         this.executionControl = executionControl;
@@ -132,14 +127,12 @@ public class ClientMultiAgent {
         if (StringUtils.isNotBlank(parentSid)) {
             attachWorker(parentSid, subSid);
         }
-        Consumer<String> progress = text -> publishProgress(parentSid, roleLabel, text);
         String answer;
         try (SubagentScope scope = SubagentScope.enter(subSid, role, false)) {
             answer = agentLoop.run(model, systemPrompt, userMessage, List.of(),
-                    executionProperties.getSubagentMaxIterations(), progress,
+                    executionProperties.getSubagentMaxIterations(),
                     new TaskPlan(goal, tools, List.of(),
-                            "subagent:" + (role.isEmpty() ? "general" : role),
-                            false, TaskSignals.NONE));
+                            "subagent:" + (role.isEmpty() ? "general" : role)));
         } catch (Exception e) {
             return error("子 Agent 执行失败: " + e.getMessage());
         } finally {
@@ -154,13 +147,6 @@ public class ClientMultiAgent {
         } catch (Exception e) {
             return error(e.getMessage());
         }
-    }
-
-    private void publishProgress(String parentSid, String roleLabel, String text) {
-        if (eventCenter == null || StringUtils.isBlank(parentSid) || StringUtils.isBlank(text)) {
-            return;
-        }
-        eventCenter.publish(parentSid, "progress", "[" + roleLabel + "] " + text);
     }
 
     List<String> resolveTools(List<String> custom, RoleConfig roleConfig) {

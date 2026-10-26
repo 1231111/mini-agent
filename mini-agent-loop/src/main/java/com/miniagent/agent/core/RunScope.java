@@ -2,6 +2,7 @@ package com.miniagent.agent.core;
 
 import com.miniagent.agent.delegate.RoleContext;
 import com.miniagent.agent.delegate.SubagentContext;
+import com.miniagent.agent.permission.ConfirmPolicy;
 import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.todo.TaskTodoContext;
@@ -24,6 +25,7 @@ public record RunScope(
         MemoryStore.OwnerContext owner,
         LoopTurnPolicy turnPolicy,
         PermissionMode permissionMode,
+        ConfirmPolicy confirmPolicy,
         boolean planApproved,
         boolean permissionForced,
         boolean subagent,
@@ -47,6 +49,7 @@ public record RunScope(
         owner = owner == null ? new MemoryStore.OwnerContext(null, null) : owner;
         turnPolicy = turnPolicy == null ? LoopTurnPolicy.NONE : turnPolicy;
         permissionMode = permissionMode == null ? PermissionMode.DEFAULT : permissionMode;
+        confirmPolicy = confirmPolicy == null ? ConfirmPolicy.DANGEROUS : confirmPolicy;
         parentSessionId = parentSessionId == null ? "" : parentSessionId;
         role = role == null ? "" : role;
         taskName = taskName == null || taskName.isBlank() ? "default" : taskName;
@@ -58,6 +61,7 @@ public record RunScope(
                 MemoryStore.captureOwnerContext(),
                 LoopTurnContext.current(),
                 PermissionContext.mode(),
+                PermissionContext.confirmPolicy(),
                 PermissionContext.planApproved(),
                 PermissionContext.isForced(),
                 SubagentContext.isActive(),
@@ -74,7 +78,7 @@ public record RunScope(
 
     public RunScope withSession(String sid) {
         return new RunScope(
-                sid, owner, turnPolicy, permissionMode, planApproved, permissionForced,
+                sid, owner, turnPolicy, permissionMode, confirmPolicy, planApproved, permissionForced,
                 subagent, parentSessionId, role, taskName, writeTask, workspaceRoot,
                 execution, chatModel, streamingModel, contextWindowTokens);
     }
@@ -96,7 +100,7 @@ public record RunScope(
         PermissionMode mode = childMode == null ? permissionMode : childMode;
         return new RunScope(
                 subSessionId, owner, LoopTurnPolicy.NONE,
-                mode,
+                mode, confirmPolicy,
                 planApproved, true, true, parent,
                 roleId == null ? "" : roleId, taskName, "out", subWorkspace,
                 null, chatModel, streamingModel, contextWindowTokens);
@@ -127,7 +131,7 @@ public record RunScope(
             TaskTodoContext.clear();
         }
         if (permissionForced) {
-            PermissionContext.force(sessionId, permissionMode, planApproved);
+            PermissionContext.force(sessionId, permissionMode, confirmPolicy, planApproved);
         } else if (sessionId != null && !sessionId.isBlank()) {
             PermissionContext.setSession(sessionId);
         } else {

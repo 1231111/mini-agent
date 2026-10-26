@@ -61,6 +61,14 @@ public class MediaStorage {
         }
         return "/api/generated-media/" + owner + "/" + safeName;
     }
+    /**
+     * 工作区物理目录（{@code write_file} 相对路径的默认落点）。
+     *
+     * <p>只给 {@code /api/workspace-media/{filename}} 那个受控读端点用，<b>不能</b>注册成
+     * Spring 静态资源 —— 工作区里是 agent 和用户任意写的文件，静态映射等于整目录可读。
+     */
+    public Path workspaceDir() { return paths.workspace(); }
+
     public Path conversationsDir() { return paths.mediaConversations(); }
     public Path uploadsDir() { return paths.mediaUploads(); }
 

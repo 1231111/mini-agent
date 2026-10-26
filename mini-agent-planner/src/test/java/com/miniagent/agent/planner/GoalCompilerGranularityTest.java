@@ -1,7 +1,6 @@
 package com.miniagent.agent.planner;
 
 import com.miniagent.agent.task.TaskPlan;
-import com.miniagent.agent.task.TaskSignals;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -28,7 +27,7 @@ class GoalCompilerGranularityTest {
         ChatModel chat = mock(ChatModel.class);
         when(chat.chat(any(ChatRequest.class))).thenThrow(new RuntimeException("no"));
         String msg = "写一个 hello.txt";
-        TaskPlan plan = TaskPlan.of(msg, true, TaskSignals.parse("file,simpleFile"));
+        TaskPlan plan = TaskPlan.of(msg);
         GoalCompiler.CompileResult r = compiler.compile(chat, msg, plan);
         assertEquals(GoalCompiler.CompilationSource.MODEL_ERROR, r.source());
         assertTrue(r.degraded());
@@ -37,7 +36,7 @@ class GoalCompilerGranularityTest {
 
     @Test
     void parseDropsPlaceholderCriterion() throws Exception {
-        Goal seed = new Goal("g1", "写一个 hello.txt", TaskSignals.NONE.describe(),
+        Goal seed = new Goal("g1", "写一个 hello.txt", "",
                 Map.of(), List.of(), List.of("完成 objective 且可验收"));
         GoalCompiler.ParsedCompilation p = compiler.parseCompilation("""
                 {"successCriteria":["完成 objective 且可验收"],
@@ -57,7 +56,7 @@ class GoalCompilerGranularityTest {
         when(chat.chat(any(ChatRequest.class))).thenThrow(new RuntimeException("planner unavailable"));
 
         String msg = "调研一下竞品方案";
-        TaskPlan plan = TaskPlan.of(msg, false, TaskSignals.parse("web"));
+        TaskPlan plan = TaskPlan.of(msg);
         GoalCompiler.CompileResult result = c.compile(chat, msg, plan);
 
         assertEquals(GoalCompiler.CompilationSource.MODEL_ERROR, result.source());
@@ -72,7 +71,7 @@ class GoalCompilerGranularityTest {
         ChatModel chat = mock(ChatModel.class);
         when(chat.chat(any(ChatRequest.class))).thenThrow(new RuntimeException("planner unavailable"));
         String msg = "调研一下竞品方案";
-        TaskPlan plan = TaskPlan.of(msg, false, TaskSignals.parse("web"));
+        TaskPlan plan = TaskPlan.of(msg);
         GoalCompiler.CompileResult result = compiler.compileWithCorrection(
                 chat, msg, plan, "上一步验证失败，请修正");
         assertTrue(result.graph().isEmpty(), "修正编译失败不得回退模板图");
@@ -80,7 +79,7 @@ class GoalCompilerGranularityTest {
 
     @Test
     void validatorRejectsUnknownCapability() {
-        TaskPlan plan = TaskPlan.of("执行一个动作", false, TaskSignals.parse("action"));
+        TaskPlan plan = TaskPlan.of("执行一个动作");
         TaskGraph graph = new TaskGraph(List.of(
                 new TaskNode("n1", "执行一个动作", "teleport", List.of(), List.of(), List.of(),
                         TaskNodeStatus.PENDING, 10, DoneWhen.note(), "", "", 0, "")));

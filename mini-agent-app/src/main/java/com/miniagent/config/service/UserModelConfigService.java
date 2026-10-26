@@ -257,7 +257,7 @@ public class UserModelConfigService {
         String baseUrl = firstNonBlank(Objects.nonNull(p) ? p.getBaseUrl() : null, globalBaseUrl);
         String modelName = firstNonBlank(Objects.nonNull(p) ? p.getModelName() : null, globalModelName);
         String apiKey = firstNonBlank(Objects.nonNull(p) ? p.getApiKey() : null, globalApiKey);
-        int window = Objects.nonNull(p) ? p.getContextWindowTokens() : 0;
+        int window = Objects.nonNull(p) ? p.effectiveContextWindow() : 0;
         return new EffectiveModelSettings(pid, label, baseUrl, modelName, apiKey, window);
     }
 

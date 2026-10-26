@@ -18,6 +18,11 @@ import java.util.Set;
 
 /**
  * 现有 system prompt 块拆成贡献者。顺序即拼装顺序。
+ *
+ * <p>这里不再有「问答模式」槽位。曾经它按用户文本词表注入
+ * {@code PromptTemplates.QUESTION_MODE} 与媒体点评提示词，2026-10-22 随词表层一起删除：
+ * 「你好」与「这不对吧」该不该走简化流程，现在由模型结合上下文判断，
+ * 代码不再对用户原文做预分类。槽位表里也不再保留一个恒空的 QUESTION。</p>
  */
 @Configuration
 @EnableConfigurationProperties(ContextBudgetProperties.class)
@@ -36,27 +41,6 @@ public class ContextContributorConfiguration {
     @Order(20)
     SystemContextContributor authorityContributor() {
         return ctx -> ContextFragment.of(ContextSlot.AUTHORITY, PromptTemplates.AUTHORITY);
-    }
-
-    /**
-     * 只往 {@link ContextSlot#QUESTION} 里塞文字，不动任何资源。
-     *
-     * <p>点评轮（带媒体 + 无动手信号）优先于纯问答轮：两句判据都是可复核的事实，
-     * 而「别继续发布/搜索、只看截图说话」这段约束在带媒体的那一轮更具体。
-     * 工具清单、历史条数、执行路径一概不收窄 —— 那些收窄了退不回来。</p>
-     */
-    @Bean
-    @Order(25)
-    SystemContextContributor questionModeContributor() {
-        return ctx -> {
-            if (ctx.reviewTurn()) {
-                return ContextFragment.of(ContextSlot.QUESTION, PromptTemplates.REVIEW_MODE_PROMPT);
-            }
-            if (!ctx.lightTurn()) {
-                return ContextFragment.of(ContextSlot.QUESTION, "");
-            }
-            return ContextFragment.of(ContextSlot.QUESTION, PromptTemplates.QUESTION_MODE);
-        };
     }
 
     @Bean
@@ -139,7 +123,8 @@ public class ContextContributorConfiguration {
             String now = LocalDateTime.now().format(CLOCK);
             return ContextFragment.of(ContextSlot.CLOSING,
                     PromptTemplates.UNTRUSTED_DATA_RULES + "\n\n"
-                            + PromptTemplates.CONFIRMATION + "\n\n"
+                            + (ctx.fullAuto() ? PromptTemplates.FULL_AUTO_CONFIRMATION
+                                              : PromptTemplates.CONFIRMATION) + "\n\n"
                             + PromptTemplates.OUTPUT + "\n\n当前时间：" + now);
         };
     }

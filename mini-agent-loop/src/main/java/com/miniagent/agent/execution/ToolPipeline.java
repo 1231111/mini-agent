@@ -11,6 +11,7 @@ import com.miniagent.agent.permission.ExecPolicyService;
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.permission.PermissionPolicy;
 import com.miniagent.agent.permission.SessionPermissionStore;
+import com.miniagent.agent.permission.AskGrant;
 import com.miniagent.agent.tool.AskUserQuestionTool;
 import com.miniagent.agent.tool.ToolConcurrencyPolicy;
 import com.miniagent.agent.tool.ToolDescriptor;
@@ -18,6 +19,7 @@ import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.agent.tool.ToolResult;
 import com.miniagent.agent.tool.impl.ExecCommandParams;
+import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.agent.trace.TraceRecorder;
 import com.miniagent.common.MessageConstants;
 import com.miniagent.common.RunStatus;
@@ -95,6 +97,18 @@ public class ToolPipeline {
         this.traceRecorder = traceRecorder;
     }
 
+    /**
+     * 一次审批的有效窗口（秒）。
+     *
+     * <p>AgentLoop 必须用同一个数去算它外层 {@code Future.get} 的等待上限：
+     * 外层若按工具执行预算（通常 60～120s）先超时，工作线程会被 {@code cancel(true)}
+     * 打断，而用户的批准还在有效期内 —— 现象就是「弹窗还在、点了也没用」。
+     * 所以这个值不从别处复制，唯一来源留在管道里。</p>
+     */
+    public long askGrantTtlSeconds() {
+        return Math.max(1L, askGrantTtlSeconds);
+    }
+
     public ToolInvocation invoke(ToolRequest request) {
         if (request == null || request.name().isBlank()) {
             return ToolInvocation.policyDenied("", ToolResult.failure(
@@ -107,7 +121,7 @@ public class ToolPipeline {
         int turn = request.turn();
 
         if (BROWSER_EVALUATE.equals(name) && !browserEvaluateEnabled) {
-            recordNode(sid, turn, "PERM_DENY",
+            recordNode(sid, turn, AgentStepNode.PERM_DENY,
                     "{\"tool\":\"" + name
                             + "\",\"reason\":\"browser_evaluate_disabled\"}",
                     RunStatus.FAILURE.name());
@@ -117,7 +131,7 @@ public class ToolPipeline {
                     false));
         }
         if (request.allowedTools() != null && !request.allowedTools().contains(name)) {
-            recordNode(sid, turn, "PERM_DENY",
+            recordNode(sid, turn, AgentStepNode.PERM_DENY,
                     "{\"tool\":\"" + name + "\",\"reason\":\"tool_surface\"}",
                     RunStatus.FAILURE.name());
             return ToolInvocation.policyDenied(name, ToolResult.failure(
@@ -141,7 +155,7 @@ public class ToolPipeline {
         }
         String proposalDeny = run.turnPolicy().denyTool(name);
         if (proposalDeny != null) {
-            recordNode(sid, turn, "HOOK_DENY",
+            recordNode(sid, turn, AgentStepNode.HOOK_DENY,
                     "{\"tool\":\"" + name + "\",\"reason\":\"planner_hard_gate\"}",
                     RunStatus.FAILURE.name());
             return ToolInvocation.gateDenied(name, ToolResult.fromLegacy(proposalDeny));
@@ -149,7 +163,7 @@ public class ToolPipeline {
         PermissionMode mode = run.permissionMode();
         boolean planOk = run.planApproved();
         if (mode == PermissionMode.PLAN && !planOk && !PermissionPolicy.isPlanSafe(name)) {
-            recordNode(sid, turn, "PERM_DENY",
+            recordNode(sid, turn, AgentStepNode.PERM_DENY,
                     "{\"tool\":\"" + name + "\",\"mode\":\"PLAN\"}",
                     RunStatus.FAILURE.name());
             return ToolInvocation.policyDenied(name, ToolResult.fromLegacy(
@@ -158,7 +172,7 @@ public class ToolPipeline {
         if (AskUserQuestionTool.TOOL_NAME.equals(name)) {
             String text = AskUserQuestionTool.displayText(args);
             emitUserQuestion(sid, AskUserQuestionTool.sseJson(args));
-            recordNode(sid, turn, "WAITING_FOR_HUMAN",
+            recordNode(sid, turn, AgentStepNode.WAITING_FOR_HUMAN,
                     "{\"tool\":\"" + name + "\"}", RunStatus.SUCCESS.name());
             return ToolInvocation.userQuestion(
                     name,
@@ -172,7 +186,7 @@ public class ToolPipeline {
         ToolPreDecision pre = toolHookChain.before(
                 new ToolHookContext(sid, name, args, turn, sub));
         if (pre != null && pre.deny()) {
-            recordNode(sid, turn, "HOOK_DENY",
+            recordNode(sid, turn, AgentStepNode.HOOK_DENY,
                     "{\"tool\":\"" + name + "\"}", RunStatus.FAILURE.name());
             String msg = Optional.ofNullable(pre.denyMessage())
                     .orElse("{\"error\":\"工具被 Hook 拒绝\"}");
@@ -192,7 +206,7 @@ public class ToolPipeline {
         // needsSessionGrant 对 BLOCK 返回 false（禁止不该有"批准一下就放行"的路），
         // 所以如果不在这里拦，就变成了放行 —— 这是唯一一处必须前置的判定。
         if (PermissionPolicy.isExecBlocked(name, effectiveExec)) {
-            recordNode(sid, turn, "PERM_DENY",
+            recordNode(sid, turn, AgentStepNode.PERM_DENY,
                     "{\"tool\":\"" + name + "\",\"execPolicy\":\"block\"}",
                     RunStatus.FAILURE.name());
             return ToolInvocation.policyDenied(name, ToolResult.fromLegacy(
@@ -200,18 +214,68 @@ public class ToolPipeline {
                             + "本会话或全局把终端命令执行设为禁止，且该档位不受会话模式影响。"
                             + "要执行命令请先把策略切到 ask 或 allow。\"}"));
         }
-        if (PermissionPolicy.needsSessionGrant(mode, name, effectiveExec) && !granted) {
-            var grant = permissionStore.issueAskGrant(
-                    sid, name, effective, Math.max(1L, askGrantTtlSeconds) * 1000L);
+        // 全自动（自动编辑 + 自动确认）：不产生任何授权入口。留一条 PERM_AUTO 轨迹 ——
+        // 否则事后无法区分「这个工具本来就不需要授权」与「本来要授权、被全自动吞掉了」。
+        boolean needsGrant = PermissionPolicy.needsSessionGrant(
+                mode, name, effectiveExec, run.confirmPolicy());
+        if (!needsGrant && !granted && PermissionPolicy.isFullAuto(mode, run.confirmPolicy())
+                && PermissionPolicy.isAskDangerous(name)) {
+            recordNode(sid, turn, AgentStepNode.PERM_AUTO,
+                    "{\"tool\":\"" + name + "\",\"mode\":\"accept_edits\","
+                            + "\"confirmPolicy\":\"auto\"}",
+                    RunStatus.SUCCESS.name());
+        }
+        if (needsGrant && !granted) {
+            AskGrant grant = permissionStore.issueAskGrant(
+                    sid, name, effective, askGrantTtlSeconds() * 1000L);
+            boolean attached = request.waitForApproval() && grant != null
+                    && permissionStore.attachAskResume(sid, grant.token());
             emitPermissionAsk(sid, name, effective, grant == null ? null : grant.token(),
                     grant == null ? 0L : grant.expiresAtEpochMillis());
-            recordNode(sid, turn, "WAITING_FOR_HUMAN",
+            recordNode(sid, turn, AgentStepNode.WAITING_FOR_HUMAN,
                     "{\"tool\":\"" + name + "\",\"mode\":\"" + mode.wireName()
                             + "\",\"reason\":\"permission_ask\"}",
                     RunStatus.SUCCESS.name());
-            String pending = String.format(
-                    MessageConstants.AGENT_PERM_ASK_TOOL_PENDING, name, name);
-            return ToolInvocation.permissionAsk(name, ToolResult.fromLegacy(pending));
+            if (!attached) {
+                String pending = String.format(
+                        MessageConstants.AGENT_PERM_ASK_TOOL_PENDING, name, name);
+                return ToolInvocation.permissionAsk(name, ToolResult.fromLegacy(pending));
+            }
+            try {
+                var approval = permissionStore.awaitAskApproval(sid, grant.token(),
+                        Math.max(1L, grant.expiresAtEpochMillis() - System.currentTimeMillis()));
+                if (approval.isEmpty()) {
+                    // 拒绝、超时、取消都会走到这里。必须留一条 PERM_DENY：
+                    // 前端那句「用户未在有效期内批准」和真实原因（点了拒绝 / 超时）
+                    // 在界面上长得一样，只有轨迹能区分。
+                    recordNode(sid, turn, AgentStepNode.PERM_DENY,
+                            "{\"tool\":\"" + name + "\",\"reason\":\"approval_not_granted\"}",
+                            RunStatus.FAILURE.name());
+                    return ToolInvocation.permissionDenied(name, ToolResult.failure(
+                            ToolErrorCode.PERMISSION_DENIED, "用户未批准本次工具调用（已拒绝或已超时）", false));
+                }
+                AskGrant approvedGrant = approval.get();
+                granted = approvedGrant.toolName().equals(name)
+                        && approvedGrant.argumentsDigest().equals(
+                        SessionPermissionStore.argumentDigest(name, effective));
+                if (!granted) {
+                    recordNode(sid, turn, AgentStepNode.PERM_DENY,
+                            "{\"tool\":\"" + name + "\",\"reason\":\"argument_mismatch\"}",
+                            RunStatus.FAILURE.name());
+                    return ToolInvocation.permissionDenied(name, ToolResult.failure(
+                            ToolErrorCode.PERMISSION_DENIED, "批准与当前工具参数不匹配", false));
+                }
+                recordNode(sid, turn, AgentStepNode.PERM_GRANT,
+                        "{\"tool\":\"" + name + "\",\"resumed\":true}",
+                        RunStatus.SUCCESS.name());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                recordNode(sid, turn, AgentStepNode.PERM_DENY,
+                        "{\"tool\":\"" + name + "\",\"reason\":\"interrupted\"}",
+                        RunStatus.FAILURE.name());
+                return ToolInvocation.controlStop(name, ToolResult.failure(
+                        ToolErrorCode.CANCELLED, "等待批准时任务已取消", false));
+            }
         }
         ToolResult raw = executeJournaled(
                 run,
@@ -359,7 +423,6 @@ public class ToolPipeline {
             case CANCELLED -> "任务已取消";
             case DEADLINE_EXCEEDED -> "任务已超过执行 deadline";
             case TOOL_BUDGET_EXCEEDED -> "任务已耗尽工具调用配额";
-            case TOKEN_BUDGET_EXCEEDED -> "任务已耗尽 token 预算";
             case TENANT_QUOTA_EXCEEDED -> "租户 token 配额已耗尽";
             case NONE -> "";
         };
@@ -413,11 +476,17 @@ public class ToolPipeline {
         eventCenter.publish(sessionId, MessageConstants.SSE_USER_QUESTION, json);
     }
 
+    /**
+     * 节点码用 {@link AgentStepNode} 而不是字符串：漏登记的 code 会退化成
+     * 「未知 AgentStepNode code」WARN 并被当成非核心节点，轨迹页看不到 —— 线上就踩过
+     * （{@code PERM_AUTO} / {@code PERM_GRANT} 一直是字面量，枚举里没有）。
+     * 改成枚举参数后，少写一个登记直接编译不过。
+     */
     private void recordNode(
-            String sessionId, int turn, String node, String content, String status) {
+            String sessionId, int turn, AgentStepNode node, String content, String status) {
         if (traceRecorder == null) {
             return;
         }
-        traceRecorder.recordNode(sessionId, turn, node, content, status, 0);
+        traceRecorder.recordNode(sessionId, turn, node.name(), content, status, 0);
     }
 }

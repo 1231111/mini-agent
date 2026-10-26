@@ -160,6 +160,9 @@ public class BuiltinTools {
                 "写入文件内容。新建文件用本工具；修改已存在的文件请改用 edit_file，不要用本工具重写整个文件。\n"
                         + "路径写文件名即可，落在 workspace 根下，如 design.md。"
                         + "子任务隔离目录仅在子 Agent 覆盖 workspace 时使用。\n"
+                        + "返回值里若带 url 字段（图片类：svg/png/jpg/gif/webp），说明该图可以显示在对话里 —— "
+                        + "回复时请原样用 ![说明](url)，不要改写成相对路径或本地绝对路径，"
+                        + "工作区没有静态资源映射，只有这个 url 能加载。\n"
                         + "【大文件必读】单轮输出有长度上限，超长文件（如完整的 3D 仿真 HTML、长代码）一次写不完会被截断。"
                         + "正确做法：第一次用 mode=\"overwrite\"（默认）写开头部分，之后多次用 mode=\"append\" 把剩余内容续写到同一文件，直到写完。不要试图一次塞进全部内容。",
                 WriteFileParams.class,
@@ -1011,12 +1014,50 @@ public class BuiltinTools {
             long totalBytes = Files.size(target);
             log.info("文件已{}: {} (本次 {} 字符, 当前共 {} 字节)",
                     append ? "追加" : "写入", target.toAbsolutePath(), finalContent.length(), totalBytes);
+            String mediaUrl = workspaceMediaUrl(target);
             return "{\"success\":true,\"mode\":\"" + (append ? "append" : "overwrite")
                     + "\",\"path\":\"" + target.toString().replace("\\", "/")
                     + "\",\"bytes_written\":" + finalContent.getBytes(StandardCharsets.UTF_8).length
-                    + ",\"total_bytes\":" + totalBytes + "}";
+                    + ",\"total_bytes\":" + totalBytes
+                    + (Objects.isNull(mediaUrl) ? "" : ",\"url\":\"" + mediaUrl + "\"")
+                    + "}";
         } catch (Exception e) {
             return "{\"error\":\"写入文件失败: " + e.getMessage() + "\"}";
+        }
+    }
+
+    /** 能在对话里内联回显的图片扩展名；与 {@code /api/workspace-media} 的放行集合一致。 */
+    private static final Set<String> INLINE_IMAGE_EXTS = Set.of("svg", "png", "jpg", "jpeg", "gif", "webp");
+
+    /**
+     * 直接落在<b>工作区根目录</b>的图片 → 可回显 URL；其余情况返回 null。
+     *
+     * <h2>为什么工具结果里要塞这个字段</h2>
+     *
+     * <p>工作区没有静态资源映射，图片只有 {@code /api/workspace-media/{filename}} 这一个受控读端点。
+     * 不把 URL 告诉模型，它就会自己拼一个相对路径写进 markdown（实证：
+     * {@code write_file -> cyberpunk_city_night.svg}，最终回复里的图片地址既没有路由、前端也不认），
+     * 结果就是"文件生成了但对话里什么都没有"。
+     *
+     * <p>只给根目录下的文件：端点是扁平的，子目录里的文件给了 URL 反而让模型拼错。
+     * 文件名做百分号编码 —— 中文文件名（{@code 秋日不打烊-封面.svg}）直接塞进 URL 会被浏览器截断。
+     */
+    static String workspaceMediaUrl(Path target) {
+        try {
+            Path root = effectiveWorkspaceRoot().toAbsolutePath().normalize();
+            Path abs = target.toAbsolutePath().normalize();
+            if (!root.equals(abs.getParent())) {
+                return null;
+            }
+            String name = abs.getFileName().toString();
+            int dot = name.lastIndexOf('.');
+            if (dot <= 0 || !INLINE_IMAGE_EXTS.contains(name.substring(dot + 1).toLowerCase(Locale.ROOT))) {
+                return null;
+            }
+            return "/api/workspace-media/" + java.net.URLEncoder.encode(name, StandardCharsets.UTF_8)
+                    .replace("+", "%20");
+        } catch (Exception e) {
+            return null;
         }
     }
 

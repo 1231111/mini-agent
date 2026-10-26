@@ -1,7 +1,6 @@
 package com.miniagent.agent.planner;
 
 import com.miniagent.agent.task.TaskPlan;
-import com.miniagent.agent.task.TaskSignals;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -37,7 +36,7 @@ class GoalCompilerRequestAlignmentTest {
         GoalCompiler.ParsedCompilation parsed = new GoalCompiler.ParsedCompilation(
                 drifted, new TaskGraph(List.of(webNode(), fileNode())), intent);
 
-        TaskPlan plan = TaskPlan.of(SEARCH, true, TaskSignals.parse("web,action"));
+        TaskPlan plan = TaskPlan.of(SEARCH);
         GoalCompiler.ParsedCompilation aligned = compiler.alignWithRequest(parsed, plan);
 
         assertEquals(1, aligned.graph().nodes().size(), "未授权的落盘节点必须被移除");
@@ -63,7 +62,7 @@ class GoalCompilerRequestAlignmentTest {
         GoalCompiler.ParsedCompilation parsed = new GoalCompiler.ParsedCompilation(
                 goal, new TaskGraph(List.of(webNode(), fileNode())), intent);
 
-        TaskPlan plan = TaskPlan.of(msg, true, TaskSignals.parse("web,file"));
+        TaskPlan plan = TaskPlan.of(msg);
         GoalCompiler.ParsedCompilation aligned = compiler.alignWithRequest(parsed, plan);
 
         assertEquals(2, aligned.graph().nodes().size());
