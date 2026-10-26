@@ -546,6 +546,7 @@ public class SessionEventCenter {
         }
         try {
             redis.opsForValue().set(redisStateKey(sessionId, channel.runToken), "closed", PENDING_USER_MSG_TTL);
+            redis.delete(redisRunKey(sessionId));
         } catch (Exception e) {
             log.debug("关闭 Redis 追加消息接收失败 session={}: {}", sessionId, e.getMessage());
         }
@@ -602,6 +603,7 @@ public class SessionEventCenter {
             switch (type) {
                 case "start" -> {
                     channel.status = Status.running;
+                    channel.runToken = null;
                     channel.userMessage = String.valueOf(data);
                     synchronized (channel.bufferLock) {
                         channel.think.setLength(0);
@@ -612,15 +614,13 @@ public class SessionEventCenter {
                 }
                 case "complete" -> {
                     channel.finalAnswer = String.valueOf(data);
-        channel.status = Status.done;
-        closeRedisAcceptance(sessionId);
-        channel.doneAt = System.currentTimeMillis();
+                    channel.status = Status.done;
+                    channel.doneAt = System.currentTimeMillis();
                     for (SseEmitter client : channel.clients) {
                         sendEvent(client, "end", channel.finalAnswer);
                         try { client.complete(); } catch (Exception ignored) {}
                     }
                     channel.clients.clear();
-                    closeRedisAcceptance(sessionId);
                 }
                 case "error" -> {
                     channel.errorMsg = String.valueOf(data);
@@ -631,7 +631,6 @@ public class SessionEventCenter {
                         try { client.complete(); } catch (Exception ignored) {}
                     }
                     channel.clients.clear();
-                    closeRedisAcceptance(sessionId);
                 }
                 default -> {
                     if ("plan_approval".equals(name)) {
