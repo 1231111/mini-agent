@@ -18,6 +18,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 用系统浏览器打开账号门户。主进程会校验只允许 http/https。
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
 
+  // 原生目录选择（会话工作目录）。取消返回 null；路径校验在服务端。
+  pickDirectory: () => ipcRenderer.invoke('dialog:pick-directory'),
+
   // 后端就绪 / 启动失败。主进程在后端 /actuator/health 返回 UP 之后发出，
   // 比渲染层自己盲轮询端口准确。
   getBackendStatus: () => ipcRenderer.invoke('get-backend-status'),

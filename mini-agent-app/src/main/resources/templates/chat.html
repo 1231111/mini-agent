@@ -203,7 +203,23 @@
             transition: background .12s, color .12s;
             display: flex; align-items: center;
         }
-        .sb-item span { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+        .sb-item-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+        .sb-running-indicator {
+            width: 14px; height: 14px; flex: 0 0 14px;
+            margin: 0 6px 0 8px;
+            color: #168a58;
+            animation: sb-run-spin .9s linear infinite;
+        }
+        .sb-running-indicator svg { display: block; width: 14px; height: 14px; }
+        .sb-running-indicator circle {
+            fill: none; stroke: currentColor; stroke-width: 2.2;
+            stroke-linecap: round; stroke-dasharray: 34 16;
+        }
+        @keyframes sb-run-spin { to { transform: rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) {
+            .sb-running-indicator { animation-duration: 2.4s; }
+        }
+
         .sb-item:hover { background: var(--surface); color: var(--text); }
         .sb-item.active { background: var(--surface); color: var(--text); }
         .sb-item-actions {
@@ -851,8 +867,8 @@
         }
         /* Generated images */
         .bot-body img {
-            max-width: 100%; max-height: 500px;
-            border-radius: 12px; margin: 14px 0;
+            max-width: 100%; max-height: 72vh;
+            border-radius: 8px; margin: 14px 0;
             display: block; cursor: zoom-in;
             box-shadow: var(--shadow-img);
             transition: transform .25s ease, box-shadow .25s ease;
@@ -1124,6 +1140,30 @@
             z-index: 100;
         }
         .perm-menu.show { display: block; }
+        /* 工作目录菜单：比权限菜单宽，因为要放绝对路径 */
+        .ws-menu { min-width: 340px; max-width: 420px; }
+        .ws-row { display: flex; gap: 8px; align-items: center; padding: 6px 8px; font-size: 12px; }
+        .ws-key { color: var(--text3); flex: 0 0 auto; }
+        .ws-value {
+            color: var(--text2); word-break: break-all; font-variant-numeric: tabular-nums;
+            max-height: 34px; overflow: auto;
+        }
+        .ws-input {
+            width: 100%; box-sizing: border-box; padding: 7px 9px; font-size: 12px;
+            color: var(--text); background: var(--bg); border: 1px solid var(--border);
+            border-radius: 7px; outline: none;
+        }
+        .ws-input:focus { border-color: var(--accent); }
+        .ws-actions { display: flex; gap: 6px; padding: 4px 8px 2px; }
+        .ws-act {
+            padding: 6px 10px; font-size: 12px; border-radius: 7px; cursor: pointer;
+            border: 1px solid var(--border); background: transparent; color: var(--text2);
+            font-family: inherit;
+        }
+        .ws-act:hover { background: var(--surface2); color: var(--text); }
+        .ws-act.primary { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+        .ws-hint { padding: 2px 8px 4px; font-size: 11px; color: var(--text3); min-height: 14px; }
+        .ws-hint.is-error { color: #ff8080; }
         .perm-item {
             padding: 8px 12px; border-radius: 8px; cursor: pointer;
             font-size: 13px;
@@ -1218,15 +1258,40 @@
             background: rgba(0,0,0,.9); z-index: 1000;
             align-items: center; justify-content: center;
             backdrop-filter: blur(8px);
-            cursor: zoom-out;
+            overflow: auto;
         }
         .lightbox.on { display: flex; }
-        .lightbox img {
-            max-width: 92vw; max-height: 92vh;
-            border-radius: 10px;
-            box-shadow: 0 20px 80px rgba(0,0,0,.9);
-            cursor: default;
+        .lightbox-stage {
+            position: absolute; inset: 64px 16px 20px;
+            overflow: auto; text-align: center;
         }
+        .lightbox img {
+            display: block; width: auto; height: auto; max-width: none; max-height: none; margin: 0 auto;
+            border-radius: 4px;
+            box-shadow: 0 20px 80px rgba(0,0,0,.9);
+            cursor: grab; transform-origin: top center;
+        }
+        .lightbox img:active { cursor: grabbing; }
+        .lb-toolbar {
+            position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+            display: flex; align-items: center; gap: 6px; z-index: 2; padding: 6px;
+            border: 1px solid rgba(255,255,255,.18); border-radius: 8px;
+            background: rgba(28,30,35,.92); color: #fff; box-shadow: 0 4px 18px rgba(0,0,0,.35);
+        }
+        .lb-toolbar button {
+            min-width: 34px; height: 32px; padding: 0 9px; border: 0; border-radius: 5px;
+            background: transparent; color: inherit; font: inherit; font-size: 13px; cursor: pointer;
+        }
+        .lb-toolbar button:hover { background: rgba(255,255,255,.16); }
+        .lb-zoom-label { min-width: 46px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; }
+        /* 下载/复制的反馈放在工具栏里：alert 会打断用户，且复制是高频操作 */
+        .lb-notice {
+            max-width: 220px; padding: 0 8px; font-size: 12px; line-height: 32px;
+            color: #9fe6bd; opacity: 0; transition: opacity .18s ease;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .lb-notice.on { opacity: 1; }
+        .lb-notice.is-error { color: #ff9a9a; }
         .lb-close {
             position: absolute; top: 18px; right: 18px;
             width: 40px; height: 40px;
@@ -1810,6 +1875,33 @@
                                 </div>
                             </div>
                         </div>
+                        <!-- 工作目录（会话级）：agent 在这里读写文件、跑命令 -->
+                        <div class="perm-selector" id="wsSelector">
+                            <button class="in-tool-btn perm-btn" id="wsBtn" title="工作目录"
+                                    onclick="toggleWsMenu()">
+                                <svg fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" width="16" height="16">
+                                    <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+                                </svg>
+                                <span id="wsLabel">工作区</span>
+                            </button>
+                            <div class="perm-menu ws-menu" id="wsMenu">
+                                <div class="ws-row">
+                                    <span class="ws-key">当前</span>
+                                    <span class="ws-value" id="wsCurrent">默认工作区</span>
+                                </div>
+                                <div class="ws-row">
+                                    <input class="ws-input" id="wsInput" placeholder="D:/projects/my-app"
+                                           onkeydown="if(event.key==='Enter'){event.preventDefault();saveWorkspace();}">
+                                </div>
+                                <div class="ws-actions">
+                                    <button type="button" id="wsPickBtn" class="ws-act" onclick="pickWorkspaceDirectory()"
+                                            style="display:none">选择文件夹</button>
+                                    <button type="button" class="ws-act primary" onclick="saveWorkspace()">应用</button>
+                                    <button type="button" class="ws-act" onclick="resetWorkspace()">恢复默认</button>
+                                </div>
+                                <div class="ws-hint" id="wsHint"></div>
+                            </div>
+                        </div>
                         <!-- 角色选择器 -->
                         <div class="role-selector" id="roleSelector">
                             <button class="in-tool-btn role-btn" id="roleBtn" title="选择角色" onclick="toggleRoleMenu()">
@@ -1891,9 +1983,20 @@
 </div>
 
 <!-- Lightbox -->
-<div class="lightbox" id="lightbox" onclick="closeLightbox()">
+<div class="lightbox" id="lightbox" onclick="closeLightbox()" role="dialog" aria-modal="true" aria-label="图片预览">
+    <div class="lb-toolbar" onclick="event.stopPropagation()" aria-label="图片操作">
+        <button type="button" title="缩小" onclick="changeLightboxScale(-0.2)">−</button>
+        <span class="lb-zoom-label" id="lbZoomLabel">100%</span>
+        <button type="button" title="放大" onclick="changeLightboxScale(0.2)">＋</button>
+        <button type="button" onclick="fitLightboxImage()">适应宽度</button>
+        <button type="button" onclick="downloadLightboxImage()">下载</button>
+        <button type="button" onclick="copyLightboxImage()">复制</button>
+        <span class="lb-notice" id="lbNotice" role="status" aria-live="polite"></span>
+    </div>
     <button class="lb-close" onclick="closeLightbox()">✕</button>
-    <img id="lbImg" src="" alt="" onclick="event.stopPropagation()">
+    <div class="lightbox-stage" id="lightboxStage" onclick="event.stopPropagation()">
+        <img id="lbImg" src="" alt="">
+    </div>
 </div>
 
 <!-- Drag overlay -->
@@ -2627,9 +2730,101 @@ function removeImage() {
 /* =========================================================================
    LIGHTBOX
    ========================================================================= */
-function openLightbox(src) { document.getElementById('lbImg').src = src; document.getElementById('lightbox').classList.add('on'); }
-function closeLightbox() { document.getElementById('lightbox').classList.remove('on'); }
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeLightbox(); removeCtxMenu(); } });
+let lightboxScale = 1;
+function openLightbox(src) {
+    const image = document.getElementById('lbImg');
+    image.src = src; image.onload = fitLightboxImage;
+    document.getElementById('lightbox').classList.add('on');
+    requestAnimationFrame(fitLightboxImage);
+}
+function setLightboxScale(scale) {
+    const image = document.getElementById('lbImg');
+    // 下限 0.05 而不是 0.25：超宽长图（如 5000px 宽的架构图）按宽度适配时比值可能只有 0.1，
+    // 卡在 0.25 会直接溢出舞台，横向也被裁掉。
+    lightboxScale = Math.max(0.05, Math.min(4, scale));
+    image.style.width = Math.round(image.naturalWidth * lightboxScale) + 'px';
+    image.style.height = Math.round(image.naturalHeight * lightboxScale) + 'px';
+    document.getElementById('lbZoomLabel').textContent = Math.round(lightboxScale * 100) + '%';
+}
+/**
+ * 适配宽度，不是「整图塞进窗口」。
+ *
+ * 高窄图（520×3001 的架构图）按整图适配时高度比只有 0.26，打开后比对话区里还小 ——
+ * 用户点开看到图片缩水，体感就是「点击不能放大」。宽度铺满 + 纵向滚动才可读，
+ * 这也是图片查看器和 PDF 阅读器的默认行为。
+ *
+ * 上限是 3 倍而不是 100%：SVG 的 naturalWidth 等于 viewBox 尺寸（架构图常是 500 多），
+ * 限制在原始尺寸会让矢量图在预览层里比对话区还小。位图大于舞台时这个上限不生效，
+ * 小于舞台时才放大 —— 那正是「适配宽度」该有的样子。
+ */
+function fitLightboxImage() {
+    const stage = document.getElementById('lightboxStage');
+    const image = document.getElementById('lbImg');
+    if (!image.naturalWidth || !stage) return;
+    setLightboxScale(Math.min((stage.clientWidth - 24) / image.naturalWidth, 3));
+    stage.scrollTop = 0; stage.scrollLeft = 0;
+}
+function changeLightboxScale(delta) { setLightboxScale(lightboxScale + delta); }
+let lightboxNoticeTimer = null;
+/** 工具栏内的非阻塞提示；元素缺失时退回 alert，避免反馈静默丢失。 */
+function showLightboxNotice(text, isError) {
+    const notice = document.getElementById('lbNotice');
+    if (!notice) { window.alert(text); return; }
+    notice.textContent = text;
+    notice.classList.toggle('is-error', !!isError);
+    notice.classList.add('on');
+    if (lightboxNoticeTimer) clearTimeout(lightboxNoticeTimer);
+    lightboxNoticeTimer = setTimeout(() => {
+        notice.classList.remove('on');
+        lightboxNoticeTimer = null;
+    }, 1800);
+}
+async function downloadLightboxImage() {
+    const image = document.getElementById('lbImg');
+    try {
+        const response = await fetch(image.src);
+        if (!response.ok) throw new Error('download failed');
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        const ext = (blob.type.split('/')[1] || 'png').replace('svg+xml', 'svg');
+        link.href = url; link.download = 'architecture-diagram.' + ext;
+        document.body.appendChild(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        showLightboxNotice('已下载');
+    } catch (_) { showLightboxNotice('下载失败，请检查图片是否可访问', true); }
+}
+async function copyLightboxImage() {
+    const image = document.getElementById('lbImg');
+    try {
+        const response = await fetch(image.src);
+        if (!response.ok) throw new Error('image fetch failed');
+        const blob = await response.blob();
+        const png = blob.type === 'image/png' ? blob : await new Promise((resolve, reject) => {
+            const canvas = document.createElement('canvas'); canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
+            canvas.getContext('2d').drawImage(image, 0, 0);
+            canvas.toBlob(value => value ? resolve(value) : reject(new Error('conversion failed')), 'image/png');
+        });
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
+        showLightboxNotice('已复制');
+    } catch (_) { showLightboxNotice('复制失败，请改用下载', true); }
+}
+document.getElementById('lightboxStage').addEventListener('wheel', event => {
+    if (!document.getElementById('lightbox').classList.contains('on')) return;
+    event.preventDefault(); changeLightboxScale(event.deltaY < 0 ? 0.1 : -0.1);
+}, { passive: false });
+window.addEventListener('resize', () => { if (document.getElementById('lightbox').classList.contains('on')) fitLightboxImage(); });
+function closeLightbox() {
+    document.getElementById('lightbox').classList.remove('on');
+    const notice = document.getElementById('lbNotice');
+    if (notice) { notice.classList.remove('on', 'is-error'); notice.textContent = ''; }
+    if (lightboxNoticeTimer) { clearTimeout(lightboxNoticeTimer); lightboxNoticeTimer = null; }
+}
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { closeLightbox(); removeCtxMenu(); }
+    if (document.getElementById('lightbox').classList.contains('on') && (e.ctrlKey || e.metaKey) && e.key === '+') changeLightboxScale(0.2);
+    if (document.getElementById('lightbox').classList.contains('on') && (e.ctrlKey || e.metaKey) && e.key === '-') changeLightboxScale(-0.2);
+});
 
 /* =========================================================================
    SCROLL-TO-BOTTOM BUTTON
@@ -2935,6 +3130,138 @@ async function resetModelConfig() {
 }
 
 loadModelConfig();
+
+/* =========================================================================
+   WORKSPACE（会话级工作目录）
+   ========================================================================= */
+
+function workspaceUrl() {
+    return '/api/conversations/' + encodeURIComponent(currentId) + '/workspace';
+}
+
+function toggleWsMenu() {
+    const menu = document.getElementById('wsMenu');
+    if (!menu) return;
+    const willShow = !menu.classList.contains('show');
+    ['permMenu', 'confirmMenu', 'execMenu', 'roleMenu'].forEach(id =>
+        document.getElementById(id)?.classList.remove('show'));
+    menu.classList.toggle('show', willShow);
+    if (willShow) {
+        // 原生目录选择只在桌面壳里有；网页版没有这个能力，按钮直接隐藏
+        const pick = document.getElementById('wsPickBtn');
+        if (pick) pick.style.display = window.electronAPI?.pickDirectory ? '' : 'none';
+        loadWorkspace();
+        setTimeout(() => document.getElementById('wsInput')?.focus(), 0);
+        setTimeout(() => document.addEventListener('click', closeWsMenuOutside, { once: true }), 0);
+    }
+}
+
+function closeWsMenuOutside(ev) {
+    const wrap = document.getElementById('wsSelector');
+    if (wrap && wrap.contains(ev.target)) return;
+    document.getElementById('wsMenu')?.classList.remove('show');
+}
+
+function shortWorkspaceLabel(path) {
+    if (!path) return '工作区';
+    const parts = String(path).split(/[\\/]+/).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : path;
+}
+
+function paintWorkspaceView(view) {
+    const current = document.getElementById('wsCurrent');
+    const label = document.getElementById('wsLabel');
+    const hint = document.getElementById('wsHint');
+    const effective = view?.effectivePath || view?.path || null;
+    const bound = !!view?.path;
+    if (current) current.textContent = effective || '默认工作区';
+    if (label) {
+        label.textContent = bound ? shortWorkspaceLabel(effective) : '工作区';
+        label.title = effective || '';
+    }
+    if (hint) {
+        hint.classList.toggle('is-error', !!view?.missing);
+        hint.textContent = view?.missing
+            ? '绑定目录已不存在，当前回退到默认工作区'
+            : (bound ? '' : '未指定时用默认工作区，文件写在数据目录下');
+    }
+    const btn = document.getElementById('wsBtn');
+    if (btn) btn.classList.toggle('active', bound);
+}
+
+async function loadWorkspace() {
+    if (!currentId) { paintWorkspaceView(null); return; }
+    try {
+        const resp = await fetch(workspaceUrl());
+        const body = await readApiBody(resp);
+        if (!apiSuccess(body)) { paintWorkspaceView(null); return; }
+        const view = body.data || {};
+        paintWorkspaceView(view);
+        const input = document.getElementById('wsInput');
+        if (input && document.activeElement !== input) input.value = view.path || '';
+    } catch (_) {
+        paintWorkspaceView(null);
+    }
+}
+
+async function saveWorkspace() {
+    const input = document.getElementById('wsInput');
+    const hint = document.getElementById('wsHint');
+    const path = (input?.value || '').trim();
+    if (!currentId) { if (hint) hint.textContent = '请先打开一个会话'; return; }
+    if (!path) { if (hint) { hint.textContent = '请填写绝对路径'; hint.classList.add('is-error'); } return; }
+    if (hint) { hint.classList.remove('is-error'); hint.textContent = '正在校验…'; }
+    try {
+        const resp = await fetch(workspaceUrl(), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path })
+        });
+        const body = await readApiBody(resp);
+        if (!apiSuccess(body)) {
+            if (hint) { hint.textContent = apiFailureMessage(body, resp); hint.classList.add('is-error'); }
+            return;
+        }
+        paintWorkspaceView(body.data || {});
+        if (hint) hint.textContent = '已切换，下一次发送消息生效';
+    } catch (e) {
+        if (hint) { hint.textContent = '保存失败: ' + e.message; hint.classList.add('is-error'); }
+    }
+}
+
+async function resetWorkspace() {
+    const hint = document.getElementById('wsHint');
+    if (!currentId) return;
+    try {
+        const resp = await fetch(workspaceUrl(), { method: 'DELETE' });
+        const body = await readApiBody(resp);
+        if (!apiSuccess(body)) {
+            if (hint) { hint.textContent = apiFailureMessage(body, resp); hint.classList.add('is-error'); }
+            return;
+        }
+        const input = document.getElementById('wsInput');
+        if (input) input.value = '';
+        paintWorkspaceView(body.data || null);
+        if (hint) { hint.classList.remove('is-error'); hint.textContent = '已恢复默认工作区'; }
+    } catch (e) {
+        if (hint) { hint.textContent = '恢复失败: ' + e.message; hint.classList.add('is-error'); }
+    }
+}
+
+async function pickWorkspaceDirectory() {
+    const pick = window.electronAPI?.pickDirectory;
+    if (!pick) return;
+    try {
+        const dir = await pick();
+        if (!dir) return;
+        const input = document.getElementById('wsInput');
+        if (input) input.value = dir;
+        await saveWorkspace();
+    } catch (e) {
+        const hint = document.getElementById('wsHint');
+        if (hint) { hint.textContent = '无法打开目录选择: ' + e.message; hint.classList.add('is-error'); }
+    }
+}
 
 /* =========================================================================
    PERMISSION MODE（Plan / Ask / Accept edits）
@@ -3465,7 +3792,52 @@ function scrollToBottom(smooth = false, force = false) {
 /* =========================================================================
    SIDEBAR RENDER
    ========================================================================= */
+
+const sidebarRunningSessions = new Set();
+let sidebarRefreshTimer = null;
+let sidebarRenderEpoch = 0;
+
+async function refreshSidebarRunningSessions() {
+    const rows = [...document.querySelectorAll('.sb-item[data-session-id]')];
+    const states = await Promise.all(rows.map(async row => {
+        const sid = row.dataset.sessionId;
+        try {
+            const resp = await fetch('/api/conversations/' + encodeURIComponent(sid) + '/task');
+            if (!resp.ok) return null;
+            const status = await apiJson(resp) || {};
+            return [sid, status.running === true];
+        } catch (_) { return null; }
+    }));
+    states.forEach(state => {
+        if (!state) return;
+        if (state[1]) sidebarRunningSessions.add(state[0]);
+        else sidebarRunningSessions.delete(state[0]);
+    });
+    rows.forEach(row => updateSidebarRunningIndicator(row));
+}
+
+function updateSidebarRunningIndicator(row) {
+    const running = sidebarRunningSessions.has(row.dataset.sessionId);
+    row.classList.toggle('is-running', running);
+    let indicator = row.querySelector('.sb-running-indicator');
+    if (running && !indicator) {
+        indicator = document.createElement('span');
+        indicator.className = 'sb-running-indicator';
+        indicator.setAttribute('role', 'img');
+        indicator.setAttribute('aria-label', '任务运行中');
+        indicator.title = '任务运行中';
+        indicator.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6"></circle></svg>';
+        row.insertBefore(indicator, row.querySelector('.sb-item-actions'));
+    } else if (!running && indicator) indicator.remove();
+}
+
+function startSidebarRunningRefresh() {
+    if (sidebarRefreshTimer) return;
+    sidebarRefreshTimer = setInterval(refreshSidebarRunningSessions, 5000);
+}
+
 async function renderSidebar() {
+    const renderEpoch = ++sidebarRenderEpoch;
     const el = document.getElementById('sbHistory');
     el.innerHTML = '';
     let list = [];
@@ -3479,6 +3851,7 @@ async function renderSidebar() {
         el.innerHTML = '<div style="padding:10px 8px;font-size:12px;color:var(--text3)">\u52a0\u8f7d\u5931\u8d25</div>';
         return;
     }
+    if (renderEpoch !== sidebarRenderEpoch) return;
     // Normalize updatedAt to numeric timestamps
     list.forEach(c => {
         if (typeof c.updatedAt === 'string') {
@@ -3488,6 +3861,7 @@ async function renderSidebar() {
     });
     if (list.length === 0) {
         el.innerHTML = '<div style="padding:10px 8px;font-size:12px;color:var(--text3)">暂无历史对话</div>';
+        if (renderEpoch === sidebarRenderEpoch) startSidebarRunningRefresh();
         return;
     }
     const ts = Date.now();
@@ -3510,8 +3884,9 @@ async function renderSidebar() {
         items.forEach(c => {
             const row = document.createElement('div');
             row.className = 'sb-item' + (c.sessionId === currentId ? ' active' : '');
+            row.dataset.sessionId = c.sessionId;
             row.title = c.title || '新对话';
-            row.innerHTML = `<span>${esc(c.title || '新对话')}</span>
+            row.innerHTML = `<span class="sb-item-title">${esc(c.title || '新对话')}</span>
                 <div class="sb-item-actions">
                     <button class="sb-act-btn danger" title="删除"
                             onclick="event.stopPropagation();delConvAndRefresh('${c.sessionId}')">🗑</button>
@@ -3519,8 +3894,13 @@ async function renderSidebar() {
             row.onclick = () => switchConv(c.sessionId);
             row.oncontextmenu = e => { e.preventDefault(); showCtxMenu(e, c.sessionId); };
             el.appendChild(row);
+            updateSidebarRunningIndicator(row);
         });
     });
+    if (renderEpoch === sidebarRenderEpoch) {
+        refreshSidebarRunningSessions();
+        startSidebarRunningRefresh();
+    }
 }
 
 /* =========================================================================
@@ -3587,6 +3967,7 @@ function startNewChat(doFocus = true) {
     currentId = null;
     localStorage.removeItem(LS_CUR);
     resetExecPolicyView();
+    paintWorkspaceView(null);
     $msg.innerHTML = WELCOME;
     renderSidebar();
     if (doFocus) $inp.focus();
@@ -3610,6 +3991,8 @@ async function switchConv(id, force) {
     await loadMoreMessages(id, false);
     checkAndPollTask(id);
     renderSidebar();
+    // 工作目录是会话级状态，切会话必须重新取，否则会把上一个会话的目录显示成当前目录
+    loadWorkspace();
     // 将会话权限模式与本地选择对齐（并刷新 Plan banner）
     if (permissionMode) {
         try {
@@ -5028,6 +5411,16 @@ function workspaceDownloadPath(href) {
     return encodeURIComponent(name).replace(/%2E/gi, '.').replace(/%2D/gi, '-').replace(/%5F/gi, '_');
 }
 
+/**
+ * 下载地址上的会话参数。
+ *
+ * 会话可以绑定自己的工作目录，文件就不在默认工作区里了；不带 sid 时端点只能在
+ * {数据根}/workspace 下找，链接必然 404。没有当前会话时不加参数（等同于默认工作区）。
+ */
+function workspaceSidQuery() {
+    return currentId ? '?sid=' + encodeURIComponent(currentId) : '';
+}
+
 /** 回复常把 write_file 返回的 workspace/文件名作为普通文本，而非 Markdown 链接。 */
 function linkWorkspacePaths(s) {
     const text = String(s);
@@ -5082,7 +5475,7 @@ function parseLinks(s) {
         const href = u.url.replace(/&amp;/g, '&');
         const workspacePath = workspaceDownloadPath(href);
         if (workspacePath) {
-            const downloadUrl = '/api/workspace-download/' + workspacePath;
+            const downloadUrl = '/api/workspace-download/' + workspacePath + workspaceSidQuery();
             let downloadName = workspacePath;
             try { downloadName = decodeURIComponent(workspacePath); } catch (_) { }
             out += `<a href="#" data-auth-download="${escA(downloadUrl)}" data-download-name="${escA(downloadName)}" class="workspace-download-link" rel="nofollow">${txt}</a>`;

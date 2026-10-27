@@ -923,6 +923,30 @@ ipcMain.handle('win:state', () => ({
   fullscreen: mainWindow && !mainWindow.isDestroyed() ? mainWindow.isFullScreen() : false
 }));
 
+/**
+ * 选工作目录。
+ *
+ * <p>为什么必须走原生对话框：浏览器里的 <input type="file" webkitdirectory> 只能选目录
+ * 里的文件、拿不到目录本身的可写路径，而 agent 需要的是"往这个目录里写文件"。</p>
+ *
+ * <p>返回值是<b>用户选中的原始路径</b>，不做任何校验 —— 目录是否可写、是否系统目录
+ * 由服务端判定（那里才是唯一可信的一层，渲染进程能被页面脚本影响）。取消返回 null。</p>
+ */
+ipcMain.handle('dialog:pick-directory', async () => {
+  const options = {
+    title: '选择工作目录',
+    buttonLabel: '使用此目录',
+    properties: ['openDirectory', 'createDirectory'],
+  };
+  const result = mainWindow && !mainWindow.isDestroyed()
+    ? await dialog.showOpenDialog(mainWindow, options)
+    : await dialog.showOpenDialog(options);
+  if (!result || result.canceled || !result.filePaths || result.filePaths.length === 0) {
+    return null;
+  }
+  return result.filePaths[0];
+});
+
 /* ────────────────────── 应用生命周期 ────────────────────── */
 
 /**

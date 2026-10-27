@@ -176,6 +176,28 @@ public final class PromptTemplates {
             点不动就换 by=css / by=text，不要编造工具名。
             """;
 
+    /**
+     * 出图策略：文生图优先，确定性渲染只做兜底。
+     *
+     * <p>口径来自 2026-10-27 的明确选择：架构图/流程图也先走 {@code image_generate}，
+     * 只有它判为不可用（后端全挂、Key 无效）时才降级到 {@code render_diagram}。
+     * 所以这里<b>不写</b>「架构图必须用 render_diagram」这类禁令 —— 那等于绕过用户的决定。</p>
+     *
+     * <p>降级方向是不对称的：Mermaid 画得出流程和拓扑，画不出插画。
+     * 「降级」只覆盖「文字 + 连线」这一类的图，其余必须如实报错，
+     * 不能让模型用 ASCII 图或者随便一张图糊弄过去。</p>
+     */
+    public static final String IMAGE_GUIDANCE = """
+            # 出图
+            任何出图需求都先调 image_generate：插画、封面、概念图、UI 概念稿、架构图、流程图一律先走它。
+            它返回「所有后端均失败」「API Key 无效」后，本次运行内不会再出现在工具表里，此时按图类型分流：
+            - 架构图 / 流程图 / 时序图 / ER 图 → 改用 render_diagram 出 .svg（矢量，放大不糊），
+              交付时说明「文生图后端不可用，已降级为矢量图」。
+            - 插画 / 封面 / 实物渲染 → 降不了级：如实告诉用户后端不可用；
+              不要用 render_diagram 硬凑，也不要用 ASCII 图当作交付物。
+            同一个 prompt 不要重复调 image_generate —— 后端已经挂了，再试一次只是再失败一次。
+            """;
+
     public static final String PLANNING_GUIDANCE = """
             # 结构化计划
             仅当当前会话还没有 todo 清单时才 todo(action=set)。

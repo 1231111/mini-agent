@@ -35,13 +35,13 @@ class MiniAgentChatPageControllerAuthorizationTest {
         MiniAgentChatPageController controller = new MiniAgentChatPageController();
         MockHttpServletRequest unauthenticated = new MockHttpServletRequest();
 
-        var authResponse = controller.downloadWorkspaceFile("report.docx", unauthenticated);
+        var authResponse = controller.downloadWorkspaceFile("report.docx", null, unauthenticated);
         assertEquals(401, authResponse.getStatusCode().value());
 
         MockHttpServletRequest authenticated = new MockHttpServletRequest();
         authenticated.setAttribute(JwtSessionService.ATTR_PRINCIPAL,
                 new AuthenticatedUser(7L, 1L, "user", com.miniagent.config.entity.UserRole.USER));
-        var invalidResponse = controller.downloadWorkspaceFile("../secret.docx", authenticated);
+        var invalidResponse = controller.downloadWorkspaceFile("../secret.docx", null, authenticated);
         assertEquals(400, invalidResponse.getStatusCode().value());
     }
 
@@ -59,7 +59,7 @@ class MiniAgentChatPageControllerAuthorizationTest {
         MockHttpServletRequest request = new MockHttpServletRequest();
         request.setAttribute(JwtSessionService.ATTR_PRINCIPAL,
                 new AuthenticatedUser(7L, 1L, "user", com.miniagent.config.entity.UserRole.USER));
-        ResponseEntity<?> response = controller.downloadWorkspaceFile("冠虹尽头.docx", request);
+        ResponseEntity<?> response = controller.downloadWorkspaceFile("冠虹尽头.docx", null, request);
 
         assertEquals(200, response.getStatusCode().value());
         assertEquals("attachment", response.getHeaders().getContentDisposition().getType());

@@ -240,7 +240,15 @@ public class ImageGenerationService {
         log.error("所有图像生成后端均失败: {}", lastError);
         // 所有后端都打不通属于依赖侧不可用 —— 显式声明可重试，
         // 否则上游会把它当成「这任务做不了」而放弃改 prompt / 换方案。
-        return errorJson(ToolErrorCode.DEPENDENCY_UNAVAILABLE, "所有后端均失败: " + lastError);
+        //
+        // 文案里直接写降级方向：AgentLoop 判到 DEPENDENCY_UNAVAILABLE 会把本工具从下一轮
+        // 工具表里移除，模型只看到"工具没了"不知道该换谁，就退化成写脚本画图或用 ASCII 凑数。
+        // 指路写进错误本身，比只写进系统提示更可靠（系统提示可能被裁剪，工具结果一定在上下文里）。
+        return errorJson(ToolErrorCode.DEPENDENCY_UNAVAILABLE,
+                "所有后端均失败: " + lastError
+                        + "。文生图在本次运行内不可用（下一轮会从工具表移除）："
+                        + "架构图/流程图/时序图/ER 图改用 render_diagram 出 .svg；"
+                        + "插画/封面类降不了级，如实告知用户，不要用 ASCII 图冒充交付物。");
     }
 
     /** 并行竞速：任一成功即返回其尝试结果；全部失败返回聚合了各方原因的失败结果 */

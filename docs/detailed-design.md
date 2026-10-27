@@ -811,7 +811,10 @@ V7 已删意图规则表，不要再建。
 | POST | `/api/conversations/{sessionId}/files` | multipart `file` |
 | GET | `/api/generated-media/{owner}/{filename}` | 属主或 SYSTEM_ADMIN |
 | GET | `/api/conversation-media/{sessionId}/{filename}` | 会话属主或管理员 |
-| GET | `/api/workspace-media/{filename}` | 登录即可；只放行工作区根目录下的图片 |
+| GET | `/api/workspace-media/{filename}` | 登录即可；只放行工作区根目录下的图片；可选 `?sid=` 指定会话工作目录 |
+| GET | `/api/conversations/{sessionId}/workspace` | 会话工作目录：`path` / `defaultPath` / `effectivePath` / `missing` |
+| PUT | `/api/conversations/{sessionId}/workspace` | 绑定工作目录（body `{"path": "绝对路径"}`） |
+| DELETE | `/api/conversations/{sessionId}/workspace` | 恢复默认工作区 |
 
 **媒体内联白名单**（`MiniAgentChatPageController#approvedInlineMediaType`）：`png/jpg/jpeg/gif/webp/svg/mp3/wav/mp4`。
 `svg` 于 2026-10-22 加入 —— 图片后端不可用时模型会降级成「手写 `<svg>` 存成文件」，不放行就只有裂图；
@@ -834,6 +837,66 @@ V7 已删意图规则表，不要再建。
 登录用户之间能互读对方工作区里的图片；端点只放开图片这一小类，不扩大到全文。
 `write_file` / `render_diagram` 写到根目录的图片会在工具结果里带 `url` 字段
 （`BuiltinTools#workspaceMediaUrl`，文件名做百分号编码），模型据此拼 `![](url)`，这才连上对话区。
+
+#### 出图策略（文生图优先，确定性渲染兜底）
+
+2026-10-27 明确的口径：**任何出图需求先走 `image_generate`**，包括架构图和流程图；
+只有它判为不可用时才降级到 `render_diagram`。
+
+- **降级触发器**：`ImageGenerationService` 所有后端失败返回 `DEPENDENCY_UNAVAILABLE`，
+  `AgentLoop#markToolResultEffects` 置 `state.imageGenerateUnavailable`，
+  `resolveTools` 下一轮把 `image_generate` 从工具表移除。作用域是**本次运行**（`LoopState` 字段），
+  下次提问自动恢复 —— 一次后端抖动不该永久禁用生图。
+- **降级方向是不对称的**：架构图 / 流程图 / 时序图 / ER 图能降（Mermaid 画得出拓扑和文字），
+  插画 / 封面 / 实物渲染降不了，只能如实报错。提示词里明确禁止用 `render_diagram` 硬凑、
+  也禁止用 ASCII 图当作交付物。
+- **两条指路通道**：`PromptTemplates.IMAGE_GUIDANCE`（按工具面注入，见 `toolGuidance`）+
+  `ImageGenerationService` 失败文案里直接点名 `render_diagram`。后者更可靠 ——
+  系统提示可能被裁剪，工具结果一定在上下文里。
+- **已知边界**：`render_diagram` 出图依赖本机 `npx`，桌面客户端只内置 JRE 不内置 Node。
+  客户机上没有 Node 时降级路径是断的（Mermaid 出 SVG 同样要 npx 渲染）。
+  这条不是提示词能解决的，得在打包层决定是否随客户端带渲染器。
+- **取舍**：文生图画架构图的文字不保证正确（长标识符容易漏字），这是选「文生图优先」时
+  接受的代价；需要文字逐字精确的图，随时可以明确要求走 `render_diagram`。
+
+#### 出图清晰度（`render_diagram`）
+
+三个坑叠在一起，缺一个都会让「图不清晰」复发：
+
+- **PNG 必须带 `-s`**。mermaid-cli 的 `--scale` 默认是 1，出的是「SVG 固有尺寸 = 像素尺寸」。
+  2026-10-27 实测：40 节点 / 6 个 subgraph 的架构图固有尺寸只有 **520×3001**，每个中文字符落在 3-4px。
+  现在默认 `-s 3`（`DEFAULT_PNG_SCALE`），可用 `scale` 参数在 1-4 之间覆盖。
+- **不要用 `--size` 提升清晰度**。它的语义是「最长边等于给定值」，对又高又窄的架构图是反向效果：
+  `--size 2048` 把 520×3001 变成 **354×2046**，比不传还糊。等比放大只有 `-s` 一条路。
+- **mermaid 产出的 SVG 要补固宽固高**。它写的是 `width="100%"` + `viewBox`，这种 SVG 被 `<img>` 加载时
+  没有固有尺寸 —— 实测 `naturalWidth` 是 **26×150**（Chrome 的默认替换尺寸），对话区里缩成一条竖线，
+  预览层按 26px 算适配比例越放越离谱。`RenderDiagramTool#pinSvgSize` 把 `viewBox` 的宽高写进
+  `width`/`height` 属性（已经是指定像素宽高的不动），修正后 `naturalWidth` 才是 519×3001。
+  SVG 是矢量，放大任意倍数都不糊，所以工具描述里引导模型在用它时**优先出 .svg**。
+
+前端配套（`chat.html#fitLightboxImage`）：预览层按**宽度**适配而不是「整图塞进窗口」。高窄图按整图适配时
+高度比只有 0.26，打开后比对话区还小 —— 这就是用户说的「点击不能放大」。宽度铺满 + 纵向滚动；
+上限取 3 倍而不是 100%，否则 `naturalWidth` 只有 519 的矢量图在预览层里反而比对话区小。
+
+### 会话工作目录
+
+默认工作区是应用级的 `{data-dir}/workspace`，所有会话共用。会话可以绑定自己的目录
+（`chat_conversations.workspace_root`），让 agent 直接在真实项目里读写文件、跑命令。
+
+- **校验只做一次，在服务端**（`ConversationWorkspaceService#validate`）：绝对路径、必须存在且是目录、
+  必须可写、落库前取 `toRealPath()`（符号链接折成真实路径）、拒绝磁盘根与 Windows/Program Files。
+  前端目录选择器只是取值，不做判定 —— 页面能被脚本影响，不能当信任边界。
+- **生效方式**：`AgentChatApplicationService#applySessionWorkspace` 在任务开始时把目录装进
+  `WorkspaceContext.setRootOverride`，工具线程经 `RunScope` 的 `bind()` 还原；任务结束在 `finally` 清掉
+  （线程复用，漏清会让下一个会话在别人的目录里干活）。
+- **连带改动**：`exec_command` 的工作目录由 `defaultWorkspaceRoot()` 改为
+  `effectiveWorkspaceRoot()`（`BuiltinTools#execWorkingDirectory`）—— 否则文件写进项目、命令跑在数据目录，
+  子 Agent 也会在父工作区里互踩（审计 CMD-05）。
+- **媒体与下载**：`/api/workspace-media`、`/api/workspace-download` 接受可选 `?sid=`，按该会话的绑定目录解析；
+  `sid` 必须过 `SessionAuthorizationService#owns`，不通过返回 404（不透露会话是否存在）。
+  `workspaceMediaUrl` 只在工作区被覆盖时追加 `?sid=`，默认工作区的 URL 形态不变。
+- **绑定目录被删**：`sessionRoot` 返回空并打 WARN，任务退回默认工作区继续，不让整个任务失败；
+  接口用 `missing=true` 告诉前端"当前是回退状态"。
 
 ### 8.4 轨迹、规划健康、记忆、管理
 

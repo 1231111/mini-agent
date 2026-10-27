@@ -72,7 +72,7 @@ class SessionEventCenterConcurrencyTest {
                 assertFalse(sealed.get().queued());
                 assertTrue(sealed.get().messages().isEmpty());
             }
-            if (!Boolean.TRUE.equals(accepted.get())) {
+            if (!sealed.get().queued()) {
                 assertFalse(center.appendUserMessage(sessionId, "too late"));
             }
         }

@@ -113,4 +113,23 @@ class ContextContributorConfigurationTest {
         assertTrue(fullAuto.contains("当前时间："),
                 "换口径不能把时间戳一起丢: " + fullAuto);
     }
+
+    /**
+     * 出图策略按工具面注入，且必须点名降级去向。
+     *
+     * <p>口径是「文生图优先、后端不可用才降级 render_diagram」。这段没进 system prompt，
+     * 降级就只剩工具错误文案一条通道；无条件注入则要给没有生图能力的会话白付 token。</p>
+     */
+    @Test
+    void 出图策略按工具面注入() {
+        String withImage = ContextContributorConfiguration.toolGuidance(
+                Set.of("image_generate", "render_diagram"));
+        assertTrue(withImage.contains("# 出图"), "有 image_generate 时必须注入出图策略：" + withImage);
+        assertTrue(withImage.contains("render_diagram"), "降级去向要点名：" + withImage);
+        assertTrue(withImage.contains("插画"), "要说明插画类降不了级：" + withImage);
+        assertTrue(withImage.contains("不要用 ASCII 图"), "要堵掉 ASCII 凑数这条退路：" + withImage);
+
+        String withoutImage = ContextContributorConfiguration.toolGuidance(Set.of("read_file"));
+        assertTrue(!withoutImage.contains("# 出图"), "没有生图工具时不该注入：" + withoutImage);
+    }
 }

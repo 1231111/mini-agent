@@ -159,6 +159,8 @@ public record RunScope(
         } else {
             WorkspaceContext.clearRootOverride();
         }
+        // 会话标识与工作区根必须同源安装：工具结果里的媒体地址要靠它指回正确的根
+        WorkspaceContext.setSessionOverride(sessionId);
         ExecutionTurnContext.set(execution);
         if (chatModel != null || streamingModel != null) {
             // 窗口一并恢复：并行工具/子代理线程上的辅助 LLM 调用与压缩阈值都要用它，

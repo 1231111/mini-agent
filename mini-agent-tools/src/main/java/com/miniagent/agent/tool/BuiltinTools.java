@@ -619,6 +619,8 @@ public class BuiltinTools {
                 .name("image_generate")
                 .description("生成图片（云端多后端自动降级：ChatAnywhere/MiMo/FAL/SiliconFlow/智谱CogView）。\n" +
                         "适合快速生成概念图、插画等。英文 prompt 效果最好，中文也可以用。\n" +
+                        "这是默认出图入口：架构图/流程图也先走它。后端全部失败时工具会被移除，\n" +
+                        "届时架构图/流程图改走 render_diagram，插画类如实告知用户。\n" +
                         "后端由工具自动选择，无需关心细节；工具直接返回可渲染的图片链接（Markdown 格式）。\n" +
                         "用户只是要看图时：原样输出图片链接，不要额外解释、不要说\"图片已生成\"。\n" +
                         "用户要求把图写进文档时：先用 todo 拆成「生图 → 定位文档 → 写入图片链接」，\n" +
@@ -786,6 +788,23 @@ public class BuiltinTools {
     public static Path effectiveWorkspaceRoot() {
         Path override = WorkspaceContext.getRootOverride();
         return Objects.nonNull(override) ? override.toAbsolutePath().normalize() : defaultWorkspaceRoot();
+    }
+
+    /**
+     * {@code exec_command} 的工作目录。
+     *
+     * <p>必须是"生效工作区"而不是默认工作区：会话绑定项目目录、子 Agent 隔离目录都通过
+     * {@link WorkspaceContext#getRootOverride()} 生效，写死默认值会让命令跑在别处 ——
+     * 文件写进项目、构建产物落在数据目录，且子 Agent 能在父工作区里互相踩（审计 CMD-05）。</p>
+     *
+     * <p>目录不存在时建出来：绑定目录在校验阶段已存在，但子 Agent 目录可能还没创建。</p>
+     */
+    static File execWorkingDirectory() {
+        File dir = effectiveWorkspaceRoot().toFile();
+        if (!dir.exists()) {
+            dir.mkdirs();
+        }
+        return dir;
     }
 
     /** 为子 Agent 准备独立写出目录：workspace/_sub/{safeId}/ */
@@ -1041,6 +1060,10 @@ public class BuiltinTools {
      *
      * <p>只给根目录下的文件：端点是扁平的，子目录里的文件给了 URL 反而让模型拼错。
      * 文件名做百分号编码 —— 中文文件名（{@code 秋日不打烊-封面.svg}）直接塞进 URL 会被浏览器截断。
+     *
+     * <p><b>工作区被覆盖时追加 {@code ?sid=}</b>：会话绑定了自己的目录后文件不在
+     * {@code {dataDir}/workspace} 下，端点按默认根去找必然 404。带上会话标识，端点才能
+     * 按该会话的绑定目录解析。未覆盖工作区时不加参数，URL 形态与既有客户端保持一致。
      */
     static String workspaceMediaUrl(Path target) {
         try {
@@ -1054,8 +1077,14 @@ public class BuiltinTools {
             if (dot <= 0 || !INLINE_IMAGE_EXTS.contains(name.substring(dot + 1).toLowerCase(Locale.ROOT))) {
                 return null;
             }
-            return "/api/workspace-media/" + java.net.URLEncoder.encode(name, StandardCharsets.UTF_8)
+            String url = "/api/workspace-media/" + java.net.URLEncoder.encode(name, StandardCharsets.UTF_8)
                     .replace("+", "%20");
+            String sessionId = WorkspaceContext.getSessionOverride();
+            if (WorkspaceContext.getRootOverride() != null && sessionId != null && !sessionId.isBlank()) {
+                url += "?sid=" + java.net.URLEncoder.encode(sessionId, StandardCharsets.UTF_8)
+                        .replace("+", "%20");
+            }
+            return url;
         } catch (Exception e) {
             return null;
         }
@@ -1372,11 +1401,10 @@ public class BuiltinTools {
                     ? new ProcessBuilder("cmd.exe", "/c", command)
                     : new ProcessBuilder("bash", "-c", command);
 
-            // 第4层：工作目录限制在 workspace（避免扫用户主目录）
-            File workDirFile = defaultWorkspaceRoot().toFile();
-            if (!workDirFile.exists()) {
-                workDirFile.mkdirs();
-            }
+            // 第4层：工作目录限制在工作区（避免扫用户主目录）。
+            // 目录选择单独抽成 execWorkingDirectory()，因为它必须跟着"生效工作区"走，
+            // 而这一点只有单元测试守得住（真实跑一次 agent 才能观察到）。
+            File workDirFile = execWorkingDirectory();
             pb.directory(workDirFile);
             log.info("命令执行目录: {}", workDirFile.getAbsolutePath());
 

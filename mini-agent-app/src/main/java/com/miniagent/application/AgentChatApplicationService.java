@@ -19,6 +19,7 @@ import com.miniagent.memory.MemoryStore;
 import com.miniagent.agent.todo.TaskTodoContext;
 import com.miniagent.agent.memory.ChatMemoryConfig;
 import com.miniagent.agent.tool.BuiltinTools;
+import com.miniagent.agent.tool.WorkspaceContext;
 import com.miniagent.config.service.DatabaseConversationStore;
 import com.miniagent.web.dto.FileAttachment;
 import com.miniagent.web.dto.MediaRef;
@@ -126,6 +127,8 @@ public class AgentChatApplicationService {
     private com.miniagent.memory.MemoryManager memoryManager;
     @Autowired
     private com.miniagent.agent.memory.writer.MemoryToolExecutionSink toolExecutionSink;
+    @Autowired
+    private ConversationWorkspaceService conversationWorkspaceService;
 
     private int maxIterations() {
         return executionProperties.getMaxIterations();
@@ -178,6 +181,26 @@ public class AgentChatApplicationService {
         }
     }
 
+    /**
+     * 把会话绑定的工作目录装到当前线程。
+     *
+     * <p>只设 ThreadLocal，不碰 {@code RunScope}：{@code AgentLoop} 派发工具前会
+     * {@code RunScope.capture()}，捕获到的就是这里的值，随后在工具线程上
+     * {@code bind()} 还原。这条链路意味着<b>必须在这里设、在 {@code finally} 里清</b> ——
+     * 线程是复用的，漏清会让下一个会话在别人的目录里干活。</p>
+     *
+     * <p>未绑定、或绑定目录已失效时什么都不做：默认工作区由
+     * {@code BuiltinTools.effectiveWorkspaceRoot()} 自己兜底，这里覆盖成默认值反而会
+     * 盖掉子 Agent 的隔离目录。</p>
+     */
+    private void applySessionWorkspace(Long userId, String sessionId) {
+        conversationWorkspaceService.sessionRoot(sessionId, userId).ifPresent(root -> {
+            WorkspaceContext.setRootOverride(root);
+            WorkspaceContext.setSessionOverride(sessionId);
+            log.info("会话工作目录生效: session={}, path={}", sessionId, root);
+        });
+    }
+
     private String executeAgentWithProgress(
             Long userId,
             String sessionId,
@@ -217,6 +240,7 @@ public class AgentChatApplicationService {
             // 记录任务开始事件
             recordEvent(sessionId, null, com.miniagent.memory.model.AgentEvent.EventType.TASK_START,
                 "user", Map.of("question", truncate(userMessage, 500)), null);
+            applySessionWorkspace(userId, sessionId);
             AgentResult agentResult = doExecuteAgent(
                     userId,
                     sessionId,
@@ -287,6 +311,10 @@ public class AgentChatApplicationService {
                 streamingService.markIdle(sessionId);
             }
             TaskTodoContext.clear();
+            // 工作区覆盖是线程级的，必须在本轮结束清掉：这个线程会被后续请求复用，
+            // 留着会让下一个会话莫名其妙地在别人的项目目录里写文件。
+            WorkspaceContext.clearRootOverride();
+            WorkspaceContext.clearSessionOverride();
 
             // 巩固走后台，避免挡住 SSE end（PERM_ASK 批准后续跑会等流结束）
             if (memoryManager != null) {

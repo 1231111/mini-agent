@@ -47,4 +47,24 @@ class ImageGenerationErrorContractTest {
         assertEquals(ToolStatus.FAILED, r.status());
         assertTrue(r.legacyText().contains("后端 x 失败"), "原因文本必须保留");
     }
+
+    /**
+     * 后端全挂时，错误文案必须指路降级工具。
+     *
+     * <p>{@code AgentLoop} 判到 {@code DEPENDENCY_UNAVAILABLE} 会把 image_generate 从下一轮
+     * 工具表里移除。模型只看到「工具没了」，不知道换哪个，就会退化成写脚本画图或用 ASCII 凑数。
+     * 这条文案是降级链路最后一道保险 —— 系统提示可能被裁剪，工具结果一定在上下文里。</p>
+     */
+    @Test
+    void 后端不可用时错误文案指向降级工具() {
+        // 不注入任何后端 key：fallback 链为空，直接走「无可用后端」的失败分支
+        ImageGenerationService service = new ImageGenerationService();
+
+        ToolResult r = ToolResult.fromLegacy(service.generate("a flowchart", "landscape"));
+
+        assertEquals(ToolStatus.FAILED, r.status());
+        assertEquals(ToolErrorCode.DEPENDENCY_UNAVAILABLE, r.errorCode());
+        assertTrue(r.message().contains("render_diagram"), "要指名兜底工具：" + r.message());
+        assertTrue(r.message().contains("插画"), "要说明插画类降不了级：" + r.message());
+    }
 }

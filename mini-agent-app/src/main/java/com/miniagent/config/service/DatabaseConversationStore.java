@@ -219,6 +219,24 @@ public class DatabaseConversationStore {
         }).orElse(false);
     }
 
+    /**
+     * 绑定/清除会话工作目录。传 {@code null} 表示恢复默认工作区。
+     *
+     * <p>只改这一列，不动 {@code updatedAt}：切换工作目录不是一次对话活动，
+     * 否则侧栏"今天/昨天"分组会因为改了目录而把会话顶到最前面。</p>
+     */
+    @Transactional
+    public boolean setWorkspaceRoot(Long userId, String id, String workspaceRoot) {
+        if (Objects.isNull(userId) || StringUtils.isBlank(id)) {
+            return false;
+        }
+        return conversationRepo.findByIdAndUserIdAndDeletedFalse(id, userId).map(conv -> {
+            conv.setWorkspaceRoot(StringUtils.isBlank(workspaceRoot) ? null : workspaceRoot.trim());
+            conversationRepo.save(conv);
+            return true;
+        }).orElse(false);
+    }
+
     /** Soft delete. Messages are retained for audit/recovery and are hidden by the parent flag. */
     @Transactional
     public boolean delete(String id) {
@@ -287,6 +305,7 @@ public class DatabaseConversationStore {
         conv.title = entity.getTitle();
         conv.createdAt = entity.getCreatedAt();
         conv.updatedAt = entity.getUpdatedAt();
+        conv.workspaceRoot = entity.getWorkspaceRoot();
         conv.messages = messageRepo.findByConversationIdOrderByTimestampAsc(entity.getId())
                 .stream().map(m -> {
             Message msg = new Message();
@@ -314,6 +333,8 @@ public class DatabaseConversationStore {
         public String title;
         public long createdAt;
         public long updatedAt;
+        /** 会话绑定的工作目录；null = 跟随默认工作区。 */
+        public String workspaceRoot;
         public List<Message> messages = new ArrayList<>();
     }
 

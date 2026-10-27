@@ -135,6 +135,8 @@ public class MiniAgentChatPageController {
     private SystemAdminService systemAdminService;
     @Autowired
     private MediaStorage mediaStorage;
+    @Autowired
+    private com.miniagent.application.ConversationWorkspaceService conversationWorkspaceService;
 
     @Value("${file.upload.max-size:734003200}")
     private long maxUploadSizeBytes;
@@ -602,17 +604,24 @@ public class MiniAgentChatPageController {
     @GetMapping("/api/workspace-media/{filename}")
     @ResponseBody
     public ResponseEntity<?> serveWorkspaceMedia(@PathVariable("filename") String filename,
+                                                 @RequestParam(value = "sid", required = false) String sid,
                                                  HttpServletRequest request) {
         Object rawPrincipal = request == null ? null
                 : request.getAttribute(JwtSessionService.ATTR_PRINCIPAL);
-        if (!(rawPrincipal instanceof AuthenticatedUser)) {
+        if (!(rawPrincipal instanceof AuthenticatedUser principal)) {
             return ResponseEntity.status(401).body("Authentication required");
         }
         if (!safeFlatFileName(filename)) {
             return ResponseEntity.badRequest().body("Illegal path");
         }
+        Path root;
         try {
-            Path media = resolveWorkspaceMedia(mediaStorage.workspaceDir(), filename);
+            root = workspaceRootForRequest(principal.userId(), sid);
+        } catch (SecurityException e) {
+            return ResponseEntity.notFound().build();
+        }
+        try {
+            Path media = resolveWorkspaceMedia(root, filename);
             if (Objects.isNull(media)) {
                 return ResponseEntity.notFound().build();
             }
@@ -636,17 +645,24 @@ public class MiniAgentChatPageController {
     @GetMapping("/api/workspace-download/{filename}")
     @ResponseBody
     public ResponseEntity<?> downloadWorkspaceFile(@PathVariable("filename") String filename,
+                                                   @RequestParam(value = "sid", required = false) String sid,
                                                    HttpServletRequest request) {
         Object rawPrincipal = request == null ? null
                 : request.getAttribute(JwtSessionService.ATTR_PRINCIPAL);
-        if (!(rawPrincipal instanceof AuthenticatedUser)) {
+        if (!(rawPrincipal instanceof AuthenticatedUser principal)) {
             return ResponseEntity.status(401).body("Authentication required");
         }
         if (!safeFlatFileName(filename)) {
             return ResponseEntity.badRequest().body("Illegal path");
         }
+        Path root;
         try {
-            Path file = resolveWorkspaceDownload(mediaStorage.workspaceDir(), filename);
+            root = workspaceRootForRequest(principal.userId(), sid);
+        } catch (SecurityException e) {
+            return ResponseEntity.notFound().build();
+        }
+        try {
+            Path file = resolveWorkspaceDownload(root, filename);
             if (file == null) {
                 return ResponseEntity.notFound().build();
             }
@@ -666,6 +682,35 @@ public class MiniAgentChatPageController {
             log.warn("工作区文件下载失败 filename={}", filename, e);
             return ResponseEntity.internalServerError().body("Failed to read file");
         }
+    }
+
+    /**
+     * 媒体/下载端点该用哪个工作区根。
+     *
+     * <p><b>为什么要带 {@code sid}</b>：会话可以绑定自己的工作目录，文件落在那里之后，
+     * 用固定的 {@code {dataDir}/workspace} 去找必然 404 —— 表现为"模型说写好了，页面全是裂图"。
+     * 端点因此接受一个会话 id，按它的绑定目录解析。</p>
+     *
+     * <p><b>越权判定</b>：{@code sid} 来自查询串，可以随便填。所以必须先过
+     * {@link SessionAuthorizationService#owns}；不通过统一抛 {@link SecurityException}
+     * 由调用方转 404 —— 返回 403 等于告诉攻击者"这个会话存在但不是你的"。</p>
+     *
+     * <p>未绑定目录、或绑定目录已失效时退回默认工作区：这时文件本来就在默认工作区，
+     * 而不是在某个外部目录。</p>
+     */
+    private Path workspaceRootForRequest(Long userId, String sid) {
+        Path fallback = mediaStorage.workspaceDir();
+        if (StringUtils.isBlank(sid)) {
+            return fallback;
+        }
+        String sessionId = sid.trim();
+        if (sessionId.length() > 128) {
+            throw new SecurityException("非法会话标识");
+        }
+        if (!sessionAuthorization.owns(userId, sessionId)) {
+            throw new SecurityException("会话不属于当前用户");
+        }
+        return conversationWorkspaceService.sessionRoot(sessionId, userId).orElse(fallback);
     }
 
     /**
@@ -1198,6 +1243,96 @@ public class MiniAgentChatPageController {
                 .distinct()
                 .allMatch(id -> sessionAuthorization.owns(userId, id))
                 && traces.stream().allMatch(step -> StringUtils.isNotBlank(step.getSessionId()));
+    }
+
+    // ========== 会话工作目录 ==========
+
+    /**
+     * 当前会话的工作目录。
+     *
+     * <p>返回的是<b>落库值</b>与<b>默认值</b>两个字段，不是一个"最终路径"：
+     * 前端要能把"没绑定"和"绑定了但目录已被删掉"区分开，否则用户看到路径不变会以为没设成功。</p>
+     */
+    @GetMapping(value = "/api/conversations/{sessionId}/workspace",
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<Object> getConversationWorkspace(@PathVariable("sessionId") String sessionId,
+                                                        HttpServletRequest request) {
+        Long userId = resolveUserId(request);
+        if (Objects.isNull(userId)) {
+            return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        }
+        if (StringUtils.isBlank(sessionId)) {
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "sessionId required");
+        }
+        sessionAuthorization.requireOwner(userId, sessionId);
+        DatabaseConversationStore.Conversation conversation =
+                conversationStore.getForUser(userId, sessionId);
+        String bound = conversation == null ? null : conversation.workspaceRoot;
+        Map<String, Object> view = new LinkedHashMap<>();
+        view.put("path", StringUtils.isBlank(bound) ? null : bound);
+        view.put("defaultPath", conversationWorkspaceService.defaultRoot().toString());
+        view.put("effectivePath", conversationWorkspaceService.effectiveRoot(sessionId, userId).toString());
+        view.put("missing", StringUtils.isNotBlank(bound)
+                && conversationWorkspaceService.sessionRoot(sessionId, userId).isEmpty());
+        return ApiResponse.ok(view);
+    }
+
+    /**
+     * 绑定会话工作目录。校验规则全部在 {@link ConversationWorkspaceService}，
+     * 这里只做身份与归属判定 —— 把规则写两遍必然会有一天两边不一致。
+     */
+    @PutMapping(value = "/api/conversations/{sessionId}/workspace",
+            consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<Object> putConversationWorkspace(@PathVariable("sessionId") String sessionId,
+                                                        @RequestBody(required = false) Map<String, Object> body,
+                                                        HttpServletRequest request) {
+        Long userId = resolveUserId(request);
+        if (Objects.isNull(userId)) {
+            return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        }
+        if (StringUtils.isBlank(sessionId)) {
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "sessionId required");
+        }
+        sessionAuthorization.requireOwner(userId, sessionId);
+        Object rawPath = body == null ? null : body.get("path");
+        try {
+            String stored = conversationWorkspaceService.bind(sessionId, userId,
+                    rawPath == null ? null : String.valueOf(rawPath));
+            Map<String, Object> view = new LinkedHashMap<>();
+            view.put("path", stored);
+            view.put("effectivePath", stored);
+            return ApiResponse.ok(view);
+        } catch (IllegalArgumentException e) {
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, e.getMessage());
+        }
+    }
+
+    /** 恢复默认工作区。 */
+    @DeleteMapping(value = "/api/conversations/{sessionId}/workspace",
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<Object> deleteConversationWorkspace(@PathVariable("sessionId") String sessionId,
+                                                           HttpServletRequest request) {
+        Long userId = resolveUserId(request);
+        if (Objects.isNull(userId)) {
+            return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        }
+        if (StringUtils.isBlank(sessionId)) {
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "sessionId required");
+        }
+        sessionAuthorization.requireOwner(userId, sessionId);
+        try {
+            conversationWorkspaceService.unbind(sessionId, userId);
+        } catch (IllegalArgumentException e) {
+            return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN, e.getMessage());
+        }
+        Map<String, Object> view = new LinkedHashMap<>();
+        view.put("path", null);
+        view.put("effectivePath", conversationWorkspaceService.defaultRoot().toString());
+        return ApiResponse.ok(view);
     }
 
     // ========== 权限模式（按会话） ==========

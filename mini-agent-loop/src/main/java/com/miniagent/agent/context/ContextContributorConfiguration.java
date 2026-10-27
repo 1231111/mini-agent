@@ -156,6 +156,11 @@ public class ContextContributorConfiguration {
         if (toolNames.contains("browser_navigate")) {
             parts.add(PromptTemplates.BROWSER_GUIDANCE);
         }
+        // 只在真有 image_generate 时讲降级：没有它就没有「不可用后改走 render_diagram」这回事，
+        // 无条件注入等于往每轮提示词里塞一段用不上的规则。
+        if (toolNames.contains("image_generate")) {
+            parts.add(PromptTemplates.IMAGE_GUIDANCE);
+        }
         if (!graphOwned && (toolNames.contains("todo") || toolNames.contains("delegate_task"))) {
             parts.add(PromptTemplates.PLANNING_GUIDANCE);
         }
