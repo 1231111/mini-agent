@@ -596,6 +596,8 @@ public class DefaultMemoryManager implements MemoryManager {
         ep.setTenantId(entity.getTenantId());
         ep.setUserId(entity.getUserId());
         ep.setProjectId(entity.getProjectId());
+        ep.setSessionId(entity.getSessionId());
+        ep.setTaskId(entity.getTaskId());
         ep.setTaskSummary(entity.getTaskSummary());
         ep.setOutcome(Episode.Outcome.valueOf(entity.getOutcome().name()));
         ep.setFailureCode(entity.getFailureCode());

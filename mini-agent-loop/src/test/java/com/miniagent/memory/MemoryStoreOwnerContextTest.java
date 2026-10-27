@@ -1,5 +1,7 @@
 package com.miniagent.memory;
 
+import com.miniagent.common.context.OwnerContext;
+
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -14,23 +16,23 @@ class MemoryStoreOwnerContextTest {
 
     @AfterEach
     void clearContext() {
-        MemoryStore.clearCurrentUser();
-        MemoryStore.clearCurrentTenant();
+        OwnerContext.clearCurrentUser();
+        OwnerContext.clearCurrentTenant();
     }
 
     @Test
     void nestedBindingRestoresThePreviousOwner() {
-        MemoryStore.setCurrentUser(1L);
-        MemoryStore.setCurrentTenant("tenant-a");
+        OwnerContext.setCurrentUser(1L);
+        OwnerContext.setCurrentTenant("tenant-a");
 
-        try (var ignored = MemoryStore.bindOwnerContext(
-                new MemoryStore.OwnerContext(2L, "tenant-b"))) {
-            assertEquals(2L, MemoryStore.getCurrentUser());
-            assertEquals("tenant-b", MemoryStore.getCurrentTenant());
+        try (var ignored = OwnerContext.bind(
+                new OwnerContext(2L, "tenant-b"))) {
+            assertEquals(2L, OwnerContext.currentUserId());
+            assertEquals("tenant-b", OwnerContext.currentTenantId());
         }
 
-        assertEquals(1L, MemoryStore.getCurrentUser());
-        assertEquals("tenant-a", MemoryStore.getCurrentTenant());
+        assertEquals(1L, OwnerContext.currentUserId());
+        assertEquals("tenant-a", OwnerContext.currentTenantId());
     }
 
     @Test
@@ -38,14 +40,14 @@ class MemoryStoreOwnerContextTest {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try {
             executor.submit(() -> {
-                try (var ignored = MemoryStore.bindOwnerContext(
-                        new MemoryStore.OwnerContext(9L, "tenant-nine"))) {
-                    assertEquals(9L, MemoryStore.getCurrentUser());
+                try (var ignored = OwnerContext.bind(
+                        new OwnerContext(9L, "tenant-nine"))) {
+                    assertEquals(9L, OwnerContext.currentUserId());
                 }
             }).get(5, TimeUnit.SECONDS);
 
-            MemoryStore.OwnerContext observed = executor.submit(
-                    MemoryStore::captureOwnerContext).get(5, TimeUnit.SECONDS);
+            OwnerContext observed = executor.submit(
+                    OwnerContext::capture).get(5, TimeUnit.SECONDS);
             assertNull(observed.userId());
             assertNull(observed.tenantId());
         } finally {

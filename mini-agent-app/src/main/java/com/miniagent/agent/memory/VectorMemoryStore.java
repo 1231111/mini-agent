@@ -5,7 +5,7 @@ import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import com.miniagent.common.embedding.SharedEmbeddingModel;
-import com.miniagent.memory.AgentDataPaths;
+import com.miniagent.common.io.AgentDataPaths;
 import com.miniagent.memory.MemoryVectorIndex;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;

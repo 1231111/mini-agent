@@ -1,11 +1,12 @@
 package com.miniagent.agent.web;
 
+import com.miniagent.common.context.OwnerContext;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.config.storage.MediaStorage;
-import com.miniagent.memory.MemoryStore;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -184,7 +185,7 @@ public class ImageGenerationService {
         String imageSize = mapAspectRatio(aspectRatio);
         // 落盘要用 owner 目录（media/generated/<owner>/），这里先抓住调用方的身份：
         // 竞速/串行都在自己的 future 里绑 owner，回到本线程时只剩这一份快照可用。
-        MemoryStore.OwnerContext ownerCtx = MemoryStore.captureOwnerContext();
+        OwnerContext ownerCtx = OwnerContext.capture();
         log.info("图像生成: backend={} aspect={} prompt='{}'", primaryBackend, aspectRatio,
                 prompt.substring(0, Math.min(80, prompt.length())));
 
@@ -254,13 +255,13 @@ public class ImageGenerationService {
     /** 并行竞速：任一成功即返回其尝试结果；全部失败返回聚合了各方原因的失败结果 */
     private BackendAttempt raceBackends(List<String> backends, String prompt, String imageSize, long deadlineMs) {
         log.info("并行竞速后端: {}", backends);
-        MemoryStore.OwnerContext owner = MemoryStore.captureOwnerContext();
+        OwnerContext owner = OwnerContext.capture();
         List<String> names = new ArrayList<>(backends);
         List<CompletableFuture<BackendAttempt>> futures = new ArrayList<>();
         for (String backend : backends) {
             futures.add(CompletableFuture.supplyAsync(
                     () -> {
-                        try (var ignored = MemoryStore.bindOwnerContext(owner)) {
+                        try (var ignored = OwnerContext.bind(owner)) {
                             return tryBackend(backend, prompt, imageSize, deadlineMs);
                         }
                     }, BACKEND_EXECUTOR));
@@ -369,9 +370,9 @@ public class ImageGenerationService {
             if (timeoutSec <= 0) {
                 return BackendAttempt.fail("内层预算已耗尽，未发起请求");
             }
-            MemoryStore.OwnerContext owner = MemoryStore.captureOwnerContext();
+            OwnerContext owner = OwnerContext.capture();
             CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
-                try (var ignored = MemoryStore.bindOwnerContext(owner)) {
+                try (var ignored = OwnerContext.bind(owner)) {
                     return invokeBackend(backend, prompt, imageSize);
                 } catch (Exception e) {
                     throw new RuntimeException(e);
@@ -472,7 +473,7 @@ public class ImageGenerationService {
      * <p>任何一步失败都退回原 URL 并记 warn：能看比"干净"重要，
      * 不能因为下载失败让整个出图工具报错。
      */
-    private String toMarkdownImage(String imageUrl, MemoryStore.OwnerContext ownerCtx) {
+    private String toMarkdownImage(String imageUrl, OwnerContext ownerCtx) {
         if (StringUtils.isBlank(imageUrl)) {
             return imageUrl;
         }
@@ -484,7 +485,7 @@ public class ImageGenerationService {
     }
 
     /** 包可见以便用本地假服务器测「下载 → 判类型 → 落盘」全流程（不依赖外网）。 */
-    String persistImage(String imageUrl, MemoryStore.OwnerContext ownerCtx) {
+    String persistImage(String imageUrl, OwnerContext ownerCtx) {
         try {
             byte[] bytes;
             String contentType;
@@ -533,8 +534,8 @@ public class ImageGenerationService {
             String fileName = String.format("img_%d_%d.%s",
                     System.currentTimeMillis(), ThreadLocalRandom.current().nextInt(10000), ext);
             String storedUrl;
-            // saveGenerated 依赖 MemoryStore 的当前 owner；工具线程上是快照，这里临时绑回来
-            try (var ignored = MemoryStore.bindOwnerContext(ownerCtx)) {
+            // saveGenerated 读取当前 owner；工具线程上使用已捕获的身份快照。
+            try (var ignored = OwnerContext.bind(ownerCtx)) {
                 storedUrl = mediaStorage.saveGenerated(bytes, fileName);
             }
             log.info("生成图已落盘: {} ({} 字节, 来源 {})", storedUrl, bytes.length, abbreviateUrl(imageUrl));

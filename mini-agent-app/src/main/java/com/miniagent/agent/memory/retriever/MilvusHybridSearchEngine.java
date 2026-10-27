@@ -189,12 +189,16 @@ public class MilvusHybridSearchEngine implements HybridSearchEngine {
 
     private List<ScoredMemory> keywordSearch(MemoryQuery query) {
         try {
-            List<AgentMemoryEntryEntity> entities = entryRepository.searchByKeyword(
-                query.getScope().tenantId(), query.getQuery());
+            MemoryScope scope = query.getScope();
+            List<AgentMemoryEntryEntity> entities = entryRepository.searchByKeywordInScope(
+                    scope.tenantId(),
+                    AgentMemoryEntryEntity.ScopeType.valueOf(scope.scopeType().name()),
+                    scope.scopeId(),
+                    query.getQuery());
 
             return entities.stream()
                 .filter(e -> e.getStatus() == AgentMemoryEntryEntity.Status.ACTIVE)
-                .limit(query.getTopK())
+                .filter(e -> matchesScope(query, e))
                 .map(entity -> {
                     MemoryEntry memory = MemoryEntryMapper.fromEntity(entity);
                     double keywordScore = scoreCalculator.keywordRelevance(query.getQuery(), entity.getContent());
@@ -202,6 +206,8 @@ public class MilvusHybridSearchEngine implements HybridSearchEngine {
                         0, keywordScore, memory, scoreCalculator.scopeMatch(query, memory));
                     return new ScoredMemory(memory, score);
                 })
+                .sorted((a, b) -> Double.compare(b.getFinalScore(), a.getFinalScore()))
+                .limit(query.getTopK())
                 .collect(Collectors.toList());
         } catch (Exception e) {
             log.warn("关键词检索失败: {}", e.getMessage());

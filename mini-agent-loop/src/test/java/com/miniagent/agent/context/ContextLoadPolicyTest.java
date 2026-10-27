@@ -40,12 +40,6 @@ class ContextLoadPolicyTest {
         assertTrue(ContextLoadPolicy.forSuspendedTodo(true).memoryPolicy().longTerm());
     }
 
-    @Test
-    void 中期记忆恒不注入() {
-        assertFalse(ContextLoadPolicy.forSuspendedTodo(false).memoryPolicy().midterm());
-        assertFalse(ContextLoadPolicy.forSuspendedTodo(true).memoryPolicy().midterm());
-    }
-
     /**
      * 历史兜底条数不能是 0。
      *

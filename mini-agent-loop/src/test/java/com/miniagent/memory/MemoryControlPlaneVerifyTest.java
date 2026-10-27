@@ -1,5 +1,7 @@
 package com.miniagent.memory;
 
+import com.miniagent.common.context.OwnerContext;
+
 import com.miniagent.agent.context.ContextLoadPolicy;
 import com.miniagent.memory.model.MemoryReadPolicy;
 import com.miniagent.memory.model.SemanticFact;
@@ -35,20 +37,25 @@ class MemoryControlPlaneVerifyTest {
         service = new DefaultMemoryService();
         ReflectionTestUtils.setField(service, "memoryStore", store);
         ReflectionTestUtils.setField(service, "memoryManager", null);
-        MemoryStore.clearCurrentUser();
-        MemoryStore.clearCurrentTenant();
-        MemoryStore.setCurrentUser(7L);
-        MemoryStore.setCurrentTenant("t1");
+        OwnerContext.clearCurrentUser();
+        OwnerContext.clearCurrentTenant();
+        OwnerContext.setCurrentUser(7L);
+        OwnerContext.setCurrentTenant("t1");
         store.loadFromDisk();
         store.add("memory", "长期笔记：仓库用 JDK 21");
-        store.updateMidtermMemory("中期摘要：上周在做报表项目");
+        try {
+            java.nio.file.Files.writeString(tempDir.resolve("users/7/MIDTERM.md"), "中期摘要：上周在做报表项目");
+            store.loadFromDisk();
+        } catch (java.io.IOException e) {
+            throw new AssertionError(e);
+        }
         store.add("user", "沟通偏好：先结论后细节");
     }
 
     @AfterEach
     void tearDown() {
-        MemoryStore.clearCurrentUser();
-        MemoryStore.clearCurrentTenant();
+        OwnerContext.clearCurrentUser();
+        OwnerContext.clearCurrentTenant();
     }
 
     /**
@@ -74,14 +81,12 @@ class MemoryControlPlaneVerifyTest {
         String prompt = service.retrieveForPrompt("s1", "写一份方案", policy);
         assertTrue(prompt.contains("JDK 21"), prompt);
         assertFalse(prompt.contains("报表项目"), prompt);
-        assertFalse(policy.midterm());
     }
 
     @Test
     void 新任务默认打开长期记忆() {
         ContextLoadPolicy p = ContextLoadPolicy.forSuspendedTodo(false);
         assertTrue(p.injectMemory());
-        assertFalse(p.injectMidterm());
         assertTrue(p.injectUser());
     }
 

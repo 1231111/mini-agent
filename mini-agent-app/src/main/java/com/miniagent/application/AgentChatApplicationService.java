@@ -1,5 +1,7 @@
 package com.miniagent.application;
 
+import com.miniagent.common.context.OwnerContext;
+
 import com.miniagent.agent.context.SessionHistoryVectorStore;
 import com.miniagent.agent.core.ContextCompressor;
 import com.miniagent.agent.context.ContextLoader;
@@ -8,6 +10,7 @@ import com.miniagent.agent.core.SessionEventCenter;
 import jakarta.annotation.PostConstruct;
 
 import com.miniagent.agent.core.AgentLoop;
+import com.miniagent.agent.core.TaskExecutionContext;
 import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.core.ExecutionProperties;
 import com.miniagent.agent.task.TaskPlan;
@@ -217,11 +220,12 @@ public class AgentChatApplicationService {
             throw new IllegalStateException(start.error());
         }
         TaskRunService.RunHandle run = start.handle();
-        MemoryStore.OwnerContext owner =
-                new MemoryStore.OwnerContext(userId, String.valueOf(tenantId));
+        OwnerContext owner =
+                new OwnerContext(userId, String.valueOf(tenantId));
         boolean executionStarted = false;
 
-        try (var ignoredOwner = MemoryStore.bindOwnerContext(owner)) {
+        long[] taskId = {0L};
+        try (var ignoredOwner = OwnerContext.bind(owner)) {
             executionControl.start(sessionId, tenantId);
             executionStarted = true;
             // Install the execution lease before publishing the running state.
@@ -237,9 +241,6 @@ public class AgentChatApplicationService {
             } catch (Exception e) {
                 log.debug("用户画像晋升跳过: {}", e.getMessage());
             }
-            // 记录任务开始事件
-            recordEvent(sessionId, null, com.miniagent.memory.model.AgentEvent.EventType.TASK_START,
-                "user", Map.of("question", truncate(userMessage, 500)), null);
             applySessionWorkspace(userId, sessionId);
             AgentResult agentResult = doExecuteAgent(
                     userId,
@@ -248,13 +249,15 @@ public class AgentChatApplicationService {
                     userMessage,
                     progressEmitter,
                     imageDataUrls,
-                    mediaRefs);
+                    mediaRefs,
+                    taskId);
+            taskId[0] = agentResult.taskId();
             String answer = agentResult.answer();
             if (executionControl.isCancelled(sessionId)) {
                 taskRunService.markCancelled(run, "Cancelled by user");
                 recordEvent(
                         sessionId,
-                        null,
+                        Long.toString(taskId[0]),
                         com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
                         "executor",
                         Map.of("reason", "cancelled"),
@@ -269,7 +272,7 @@ public class AgentChatApplicationService {
                 // 同时失真。现在按结局分流：UNFINISHED/FAILED 记为失败并留下原因码。
                 String reason = unfinished.reason();
                 taskRunService.markFailed(run, "任务未达成目标: " + reason);
-                recordEvent(sessionId, null,
+                recordEvent(sessionId, Long.toString(taskId[0]),
                         com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
                         "executor", Map.of("reason", reason),
                         com.miniagent.memory.model.AgentEvent.EventStatus.FAILED);
@@ -280,7 +283,7 @@ public class AgentChatApplicationService {
             taskRunService.markCompleted(run);
 
             // 记录任务成功事件
-            recordEvent(sessionId, null, com.miniagent.memory.model.AgentEvent.EventType.TASK_COMPLETE,
+            recordEvent(sessionId, Long.toString(taskId[0]), com.miniagent.memory.model.AgentEvent.EventType.TASK_COMPLETE,
                 "executor", Map.of("answer", truncate(answer, 500)),
                 com.miniagent.memory.model.AgentEvent.EventStatus.SUCCESS);
 
@@ -293,7 +296,7 @@ public class AgentChatApplicationService {
             }
 
             // 记录任务失败事件
-            recordEvent(sessionId, null, com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
+            recordEvent(sessionId, Long.toString(taskId[0]), com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
                 "executor", Map.of("error", e.getMessage()),
                 com.miniagent.memory.model.AgentEvent.EventStatus.FAILED);
 
@@ -323,7 +326,7 @@ public class AgentChatApplicationService {
                 CompletableFuture.runAsync(() -> {
                     // 异步线程不继承 ThreadLocal：显式绑定归属与该用户配置的模型，
                     // 否则巩固的 LLM 提炼会回退到全局 Bean（全局 key 失效即稳定 401）。
-                    try (var ignoredOwner = MemoryStore.bindOwnerContext(owner);
+                    try (var ignoredOwner = OwnerContext.bind(owner);
                          var ignoredModel = userModelBinder.bindModel(consolidateUserId)) {
                         memoryManager.consolidate(consolidateSid);
                     } catch (Exception e) {
@@ -350,7 +353,7 @@ public class AgentChatApplicationService {
         }
         try {
             com.miniagent.memory.model.AgentEvent event = new com.miniagent.memory.model.AgentEvent();
-            event.setTenantId(MemoryStore.effectiveTenantId());
+            event.setTenantId(OwnerContext.effectiveTenantId());
             event.setSessionId(sessionId);
             event.setTaskId(taskId);
             event.setEventType(eventType);
@@ -374,9 +377,9 @@ public class AgentChatApplicationService {
      * 任务图无法验收）—— 调用方必须据此把 run 记为失败，而不是完成。</p>
      */
     record AgentResult(String answer, PlanningLoop.RunOutcome unfinishedOutcome,
-                       boolean planApprovalRequired) {
+                       boolean planApprovalRequired, long taskId) {
         AgentResult(String answer, PlanningLoop.RunOutcome unfinishedOutcome) {
-            this(answer, unfinishedOutcome, false);
+            this(answer, unfinishedOutcome, false, 0L);
         }
     }
 
@@ -393,6 +396,10 @@ public class AgentChatApplicationService {
                 || outcome.outcome() == PlanningLoop.Outcome.FAILED);
     }
 
+    static void captureTaskId(long[] taskIdHolder, long taskId) {
+        taskIdHolder[0] = taskId;
+    }
+
     private AgentResult doExecuteAgent(
             Long userId,
             String sessionId,
@@ -400,7 +407,8 @@ public class AgentChatApplicationService {
             String userMessage,
             SseEmitter progressEmitter,
             List<String> imageDataUrls,
-            List<MediaRef> mediaRefs) {
+            List<MediaRef> mediaRefs,
+            long[] taskId) {
         List<String> images = Optional.ofNullable(imageDataUrls).orElseGet(List::of).stream()
                 .filter(StringUtils::isNotBlank).toList();
         List<MediaRef> media = Optional.ofNullable(mediaRefs).orElseGet(List::of).stream()
@@ -436,7 +444,13 @@ public class AgentChatApplicationService {
         PermissionContext.setSession(sessionId);
         LoadedContext loaded =
                 contextLoader.load(sessionId, userMessage, hasMedia, memMsgs);
-        // 任务级隔离不在这里做。曾经的做法是在换任务时往会话里落一条 system 边界标记，
+        captureTaskId(taskId, loaded.taskId());
+        try (TaskExecutionContext.Scope taskScope = TaskExecutionContext.bind(loaded.taskId())) {
+        // 记录的 taskId 与本轮 LoadedContext 一致，并由 RunScope 传播到工具线程。
+        recordEvent(sessionId, Long.toString(loaded.taskId()),
+                com.miniagent.memory.model.AgentEvent.EventType.TASK_START,
+                "user", Map.of("question", truncate(userMessage, 500)), null);
+        // 任务级隔离不在这里做.曾经的做法是在换任务时往会话里落一条 system 边界标记，
         // 下一轮重建历史时只取标记之后的消息 —— 那是拿「跨轮追问答不出来」换「不污染」，方向错了。
         // 现在：对话历史整段保留（追问要看得见上文），任务级状态（规划图、压缩摘要）
         // 按 loaded.scopeKey() 隔离，换任务后天然读不到旧状态。边界判定见 TaskScopeRegistry。
@@ -549,7 +563,8 @@ public class AgentChatApplicationService {
                 StringUtils.isNotBlank(userMessage) ? userMessage : displayQuestion,
                 answer,
                 allSavedPaths.isEmpty() ? null : allSavedPaths);
-        return new AgentResult(answer, unfinishedOutcome, planApprovalRequired);
+        return new AgentResult(answer, unfinishedOutcome, planApprovalRequired, loaded.taskId());
+        }
         } catch (Exception e) {
             runStatus = RunStatus.FAILURE.name();
             if (Objects.nonNull(traceRecorder)) {
@@ -560,6 +575,7 @@ public class AgentChatApplicationService {
             // 权限上下文在这里提前绑定过，任何在进入内层 try 之前抛出的异常都要清掉，
             // 否则线程复用时会带着上一个会话的模式去找下一个会话要授权。
             PermissionContext.clear();
+            TaskExecutionContext.clear();
             if (Objects.nonNull(traceRecorder) && traceRecorder.isActive()) {
                 traceRecorder.endExecution(runStatus);
             }

@@ -60,6 +60,25 @@ public class ContextLoader {
      * @param hasMedia 本轮用户消息是否带图片/音视频。只影响 system prompt 里的媒体相关说明，
      *                 不影响历史条数、todo 挂起与工具清单。
      */
+    static long parseTaskId(String scopeKey, String sessionId) {
+        if (scopeKey == null || sessionId == null || scopeKey.equals(sessionId)) {
+            return 0L;
+        }
+        String prefix = sessionId + "#";
+        if (!scopeKey.startsWith(prefix)) {
+            throw new IllegalArgumentException("Task scope key does not belong to session");
+        }
+        try {
+            long taskId = Long.parseLong(scopeKey.substring(prefix.length()));
+            if (taskId <= 0) {
+                throw new IllegalArgumentException("Task scope id must be positive");
+            }
+            return taskId;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid task scope key", e);
+        }
+    }
+
     public LoadedContext load(String sessionId, String query, boolean hasMedia,
                               List<ChatMessage> memMsgs) {
         ContextReferenceDecision ref = ContextReference.detect(query);
@@ -100,6 +119,7 @@ public class ContextLoader {
         String scopeKey = Objects.isNull(sessionId)
                 ? null
                 : taskScopeRegistry.resolve(sessionId, boundary, boundaryReason).scopeKey();
+        long taskId = scopeKey == null ? 0L : parseTaskId(scopeKey, sessionId);
 
         List<ChatMessage> history = selectHistory(sessionId, memMsgs, query, policy, ref);
         // 全自动只在「编辑模式 + 自动确认」同时成立时为真。这里读的是运行作用域里的实时值，
@@ -118,7 +138,6 @@ public class ContextLoader {
         info.put("historyMessages", history.size());
         info.put("historyMax", policy.historyMaxMessages());
         info.put("injectTodo", policy.injectTodo());
-        info.put("injectMidterm", policy.injectMidterm());
         info.put("fullAuto", fullAuto);
         info.put("injectMemory", policy.injectMemory());
         info.put("injectUser", policy.injectUser());
@@ -147,7 +166,7 @@ public class ContextLoader {
                 policy.injectTodo(), suspended, resumed,
                 scopeKey, boundaryReason, 0);
 
-        return new LoadedContext(systemPrompt, history, policy, scopeKey, info);
+        return new LoadedContext(systemPrompt, history, policy, scopeKey, taskId, info);
     }
 
     ContextLoadPolicy resolvePolicy(boolean hasSuspendedTodo, ContextReferenceDecision ref) {

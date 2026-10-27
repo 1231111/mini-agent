@@ -1,5 +1,7 @@
 package com.miniagent.memory;
 
+import com.miniagent.common.context.OwnerContext;
+
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -24,36 +26,36 @@ class MemoryStoreProductionTest {
     @BeforeEach
     void setUp() {
         store = new MemoryStore(tempDir);
-        MemoryStore.clearCurrentUser();
-        MemoryStore.clearCurrentTenant();
+        OwnerContext.clearCurrentUser();
+        OwnerContext.clearCurrentTenant();
     }
 
     @AfterEach
     void tearDown() {
-        MemoryStore.clearCurrentUser();
-        MemoryStore.clearCurrentTenant();
+        OwnerContext.clearCurrentUser();
+        OwnerContext.clearCurrentTenant();
     }
 
     @Test
     void 用户隔离_互不可见() {
-        MemoryStore.setCurrentUser(1L);
+        OwnerContext.setCurrentUser(1L);
         store.add("memory", "用户1的私有笔记");
 
-        MemoryStore.setCurrentUser(2L);
+        OwnerContext.setCurrentUser(2L);
         store.add("memory", "用户2的私有笔记");
 
-        MemoryStore.setCurrentUser(1L);
+        OwnerContext.setCurrentUser(1L);
         assertTrue(store.readEntries("memory").stream().anyMatch(s -> s.contains("用户1")));
         assertFalse(store.readEntries("memory").stream().anyMatch(s -> s.contains("用户2")));
 
-        MemoryStore.setCurrentUser(2L);
+        OwnerContext.setCurrentUser(2L);
         assertTrue(store.readEntries("memory").stream().anyMatch(s -> s.contains("用户2")));
         assertFalse(store.readEntries("memory").stream().anyMatch(s -> s.contains("用户1")));
     }
 
     @Test
     void 同会话内add后快照立即可见() {
-        MemoryStore.setCurrentUser(100L);
+        OwnerContext.setCurrentUser(100L);
         store.loadFromDisk();
         String emptySnapshot = store.getMemorySnapshot();
         assertEquals("", emptySnapshot, "会话初快照应为空");
@@ -77,7 +79,7 @@ class MemoryStoreProductionTest {
 
     @Test
     void loadFromDisk_会刷新快照() {
-        MemoryStore.setCurrentUser(100L);
+        OwnerContext.setCurrentUser(100L);
         store.add("memory", "待刷新条目");
         store.loadFromDisk();
         assertTrue(store.getMemorySnapshot().contains("待刷新条目"));
@@ -85,7 +87,7 @@ class MemoryStoreProductionTest {
 
     @Test
     void 字符上限_拒绝超限追加() {
-        MemoryStore.setCurrentUser(100L);
+        OwnerContext.setCurrentUser(100L);
         String chunk = "A".repeat(500);
         for (int i = 0; i < 4; i++) {
             Map<String, Object> r = store.add("memory", chunk + i);
@@ -98,7 +100,7 @@ class MemoryStoreProductionTest {
 
     @Test
     void 重复条目_幂等不膨胀() {
-        MemoryStore.setCurrentUser(100L);
+        OwnerContext.setCurrentUser(100L);
         store.add("memory", "固定偏好：中文回答");
         store.add("memory", "固定偏好：中文回答");
         assertEquals(1, store.readEntries("memory").size());
@@ -106,21 +108,21 @@ class MemoryStoreProductionTest {
 
     @Test
     void 向量召回为空时_回退全量快照() {
-        MemoryStore.setCurrentUser(100L);
+        OwnerContext.setCurrentUser(100L);
         store.add("memory", "向量库尚未建立时的笔记");
         store.loadFromDisk();
 
         FakeVectorIndex vec = new FakeVectorIndex(true);
         store.setVectorStore(vec);
 
-        String snap = store.getSnapshotForQuery("无关查询", true, false, false, 0);
+        String snap = store.getSnapshotForQuery("无关查询", true, false, 0);
         assertTrue(snap.contains("向量库尚未建立时的笔记"),
                 "recall 空集时应回退 memorySnapshot 全量注入");
     }
 
     @Test
     void 向量召回非空时_只注入召回子集() {
-        MemoryStore.setCurrentUser(100L);
+        OwnerContext.setCurrentUser(100L);
         store.add("memory", "Alpha 项目约定");
         store.add("memory", "Beta 部署流程");
         store.loadFromDisk();
@@ -129,7 +131,7 @@ class MemoryStoreProductionTest {
         vec.nextRecall = List.of("Beta 部署流程");
         store.setVectorStore(vec);
 
-        String snap = store.getSnapshotForQuery("部署", true, false, false, 0);
+        String snap = store.getSnapshotForQuery("部署", true, false, 0);
         assertTrue(snap.contains("Beta 部署流程"));
         assertFalse(snap.contains("Alpha 项目约定"),
                 "向量命中子集时不应再注入未召回条目");

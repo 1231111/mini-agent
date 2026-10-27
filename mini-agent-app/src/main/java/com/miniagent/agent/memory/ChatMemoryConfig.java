@@ -6,7 +6,7 @@ import com.miniagent.common.ChatRole;
 import com.miniagent.common.event.SessionEvictedEvent;
 import com.miniagent.config.service.DatabaseConversationStore;
 import com.miniagent.config.storage.MediaStorage;
-import com.miniagent.memory.AgentDataPaths;
+import com.miniagent.common.io.AgentDataPaths;
 import com.miniagent.memory.MemoryBlobStore;
 import com.miniagent.memory.MemoryStore;
 import com.miniagent.memory.MemoryVectorIndex;

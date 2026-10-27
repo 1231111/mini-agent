@@ -1,5 +1,7 @@
 package com.miniagent.memory;
 
+import com.miniagent.common.context.OwnerContext;
+
 import com.miniagent.memory.model.AgentContext;
 import com.miniagent.memory.model.Episode;
 import com.miniagent.memory.model.MemoryContext;
@@ -48,7 +50,6 @@ public class DefaultMemoryService implements MemoryService {
                 query,
                 policy.longTerm(),
                 policy.user(),
-                policy.midterm(),
                 policy.userMaxChars());
         blob = dropOverlappingBlobLines(blob, structured);
 
@@ -141,9 +142,9 @@ public class DefaultMemoryService implements MemoryService {
             return fail;
         }
         SemanticFact fact = new SemanticFact();
-        fact.setTenantId(MemoryStore.effectiveTenantId());
+        fact.setTenantId(OwnerContext.effectiveTenantId());
         fact.setScope(MemoryScope.ofUser(
-                MemoryStore.effectiveTenantId(), MemoryStore.effectiveUserIdString()));
+                OwnerContext.effectiveTenantId(), OwnerContext.effectiveUserId()));
         fact.setSubject(clip(content, FACT_SUBJECT_MAX));
         fact.setPredicate(MemoryKeys.PREDICATE_PREFERENCE);
         fact.setObjectValue(content);
@@ -189,9 +190,9 @@ public class DefaultMemoryService implements MemoryService {
     private List<SemanticFact> userFacts() {
         try {
             return memoryManager.queryFacts(
-                    MemoryStore.effectiveTenantId(),
+                    OwnerContext.effectiveTenantId(),
                     MemoryScope.ScopeType.USER.name(),
-                    MemoryStore.effectiveUserIdString(),
+                    OwnerContext.effectiveUserId(),
                     null).stream()
                     .filter(SemanticFact::isValid)
                     .toList();
@@ -202,8 +203,8 @@ public class DefaultMemoryService implements MemoryService {
 
     private MemoryContext loadStructured(String sessionId, String query, MemoryReadPolicy policy) {
         AgentContext ctx = new AgentContext();
-        ctx.setTenantId(MemoryStore.effectiveTenantId());
-        ctx.setUserId(MemoryStore.effectiveUserIdString());
+        ctx.setTenantId(OwnerContext.effectiveTenantId());
+        ctx.setUserId(OwnerContext.effectiveUserId());
         ctx.setSessionId(sessionId);
         ctx.setGoal(query);
         MemoryContext raw = memoryManager.buildContext(ctx);

@@ -14,6 +14,17 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class ContextLoaderPolicyTest {
 
+    @Test
+    void parsesTaskIdOnlyFromTheOwningSessionScopeKey() {
+        assertEquals(0L, ContextLoader.parseTaskId("session-1", "session-1"));
+        assertEquals(12L, ContextLoader.parseTaskId("session-1#12", "session-1"));
+        assertThrows(IllegalArgumentException.class,
+                () -> ContextLoader.parseTaskId("session-2#12", "session-1"));
+        assertThrows(IllegalArgumentException.class,
+                () -> ContextLoader.parseTaskId("session-1#0", "session-1"));
+    }
+
+
     private final ContextLoader loader = new ContextLoader();
 
     /**
@@ -22,14 +33,12 @@ class ContextLoaderPolicyTest {
      * <p>删掉词表层之前，短问答走 LIGHT 策略（{@code injectMemory=false}）。
      * 现在区分「短问题」与「动手任务」不能再靠用户文本，策略里只剩「有没有挂起的 todo」，
      * 所以短问答也会注入长期记忆。这是删除分类层后的既定结果：多花一点 token，
-     * 换「不再按字面猜用户想干什么」。{@code injectMidterm} 仍恒为 false ——
-     * 那条通路没有生产者。</p>
+     * 换「不再按字面猜用户想干什么」。</p>
      */
     @Test
-    void 新任务无指代也注入长期记忆但中期恒关() {
+    void 新任务无指代也注入长期记忆() {
         ContextLoadPolicy p = loader.resolvePolicy(false, ContextReferenceDecision.none());
         assertTrue(p.injectMemory(), "ACTION 策略 injectMemory 一直为 true，不按文本降档");
-        assertFalse(p.injectMidterm(), "中期记忆没有生产者，恒不注入");
         assertTrue(p.injectUser());
         assertTrue(p.suspendActiveTodo(), "新任务要释放上一任务的活动清单");
         assertFalse(p.resumeSuspendedTodo(), "没有挂起清单可捞");
@@ -41,7 +50,6 @@ class ContextLoaderPolicyTest {
                 new ContextReferenceDecision(true, 0.9, List.of("那份报告"), false);
         ContextLoadPolicy p = loader.resolvePolicy(false, ref);
         assertTrue(p.injectMemory());
-        assertFalse(p.injectMidterm());
     }
 
     /** 续跑轮不受指代影响：本来就要看完整历史。 */

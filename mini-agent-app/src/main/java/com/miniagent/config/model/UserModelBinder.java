@@ -1,5 +1,7 @@
 package com.miniagent.config.model;
 
+import com.miniagent.common.context.OwnerContext;
+
 import com.miniagent.common.model.EffectiveModelContext;
 import com.miniagent.config.entity.User;
 import com.miniagent.config.repository.UserRepository;
@@ -104,7 +106,7 @@ public class UserModelBinder {
             return Binding.noop();
         }
         return Binding.wrap(
-                MemoryStore.bindOwnerContext(new MemoryStore.OwnerContext(userId, tenantId)));
+                OwnerContext.bind(new OwnerContext(userId, tenantId)));
     }
 
     private String resolveTenantId(Long userId) {

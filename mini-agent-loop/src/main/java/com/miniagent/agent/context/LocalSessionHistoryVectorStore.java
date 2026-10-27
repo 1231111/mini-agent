@@ -2,7 +2,7 @@ package com.miniagent.agent.context;
 
 import com.miniagent.common.embedding.SharedEmbeddingModel;
 import com.miniagent.common.event.SessionEvictedEvent;
-import com.miniagent.memory.AgentDataPaths;
+import com.miniagent.common.io.AgentDataPaths;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.store.embedding.EmbeddingMatch;

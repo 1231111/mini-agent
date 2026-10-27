@@ -1,10 +1,11 @@
 package com.miniagent.config.storage;
 
+import com.miniagent.common.context.OwnerContext;
+
 import org.springframework.beans.factory.annotation.Autowired;
 
 import com.miniagent.common.MessageConstants;
-import com.miniagent.memory.AgentDataPaths;
-import com.miniagent.memory.MemoryStore;
+import com.miniagent.common.io.AgentDataPaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -40,7 +41,7 @@ public class MediaStorage {
 
     /** 当前执行 owner 的生成目录。缺少 owner 时拒绝写入，避免回退到共享公共目录。 */
     public Path generatedOwnerDir() {
-        Long owner = MemoryStore.getCurrentUser();
+        Long owner = OwnerContext.currentUserId();
         if (owner == null || owner <= 0) {
             throw new IllegalStateException("Generated media requires an authenticated owner context");
         }
@@ -55,7 +56,7 @@ public class MediaStorage {
     /** 把 owner 目录中的文件转换成受保护 URL。 */
     public String generatedUrl(String filename) {
         String safeName = safeFilename(filename);
-        Long owner = MemoryStore.getCurrentUser();
+        Long owner = OwnerContext.currentUserId();
         if (owner == null || owner <= 0) {
             throw new IllegalStateException("Generated media requires an authenticated owner context");
         }

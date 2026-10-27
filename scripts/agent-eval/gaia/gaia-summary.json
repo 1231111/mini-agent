@@ -1,0 +1,25 @@
+{
+  "repo": "gaia-benchmark/GAIA",
+  "splits": {
+    "validation": {
+      "rows": 165,
+      "per_level": {
+        "1": 53,
+        "2": 86,
+        "3": 26
+      },
+      "with_attachment": 38,
+      "attachment_present": 38,
+      "attachment_missing": 0,
+      "without_attachment": 127,
+      "runnable_locally": 165,
+      "with_public_answer": 165,
+      "placeholder_answers": 0,
+      "parquet": "2023\\validation\\metadata.parquet",
+      "jsonl": "gaia-validation.jsonl",
+      "eval_cases": 165,
+      "cases_file": "cases-gaia-validation.json"
+    }
+  },
+  "proxy_note": "代理判定：回复包含标准答案（非官方归一化准匹配）。GAIA 官方 scorer 需要另跑，本文件只用于本地冒烟/回归。"
+}

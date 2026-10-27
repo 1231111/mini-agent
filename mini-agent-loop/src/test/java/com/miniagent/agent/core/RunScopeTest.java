@@ -1,5 +1,7 @@
 package com.miniagent.agent.core;
 
+import com.miniagent.common.context.OwnerContext;
+
 import com.miniagent.agent.delegate.RoleContext;
 import com.miniagent.agent.delegate.SubagentContext;
 import com.miniagent.agent.permission.ConfirmPolicy;
@@ -33,14 +35,26 @@ class RunScopeTest {
         PermissionContext.clear();
         LoopTurnContext.clear();
         ExecutionTurnContext.clear();
+        TaskExecutionContext.clear();
         SubagentContext.exit();
         RoleContext.clear();
         TaskTodoContext.clear();
         BuiltinTools.clearCurrentTaskName();
         WorkspaceContext.clearTaskOverride();
         WorkspaceContext.clearRootOverride();
-        MemoryStore.clearCurrentUser();
-        MemoryStore.clearCurrentTenant();
+        OwnerContext.clearCurrentUser();
+        OwnerContext.clearCurrentTenant();
+    }
+
+    @Test
+    void bindRestoresTaskIdentityAcrossWorkerScope() {
+        TaskExecutionContext.set(42L);
+        RunScope captured = RunScope.capture();
+        TaskExecutionContext.set(0L);
+        try (var ignored = captured.bind()) {
+            assertEquals(42L, TaskExecutionContext.currentTaskId());
+        }
+        assertEquals(0L, TaskExecutionContext.currentTaskId());
     }
 
     @Test

@@ -30,7 +30,7 @@ import java.util.concurrent.ThreadLocalRandom;
  * <h2>为什么要有这个类（而不是让技能自己跑脚本）</h2>
  *
  * <p>生成物必须落到 {@code media/generated/&lt;owner&gt;/} 才能被 {@code /api/generated-media/**}
- * 交付给前端。那个 {@code <owner>} 来自 {@code MemoryStore.currentUserId}，是 {@code ThreadLocal}：
+ * 交付给前端。那个 {@code <owner>} 来自 {@code OwnerContext.currentUserId}，是 {@code ThreadLocal}：
  * Java 侧靠 {@code RunScope.bind()} 把它带进工具执行线程，而 {@code exec_command} 起的是
  * <b>独立操作系统进程</b>，环境变量里没有 userId，ThreadLocal 也不可能跨进程。
  * 所以「生歌落盘」这件事只能在 Java 里做，技能层永远做不到 —— 这不是口味问题。

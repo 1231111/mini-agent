@@ -18,6 +18,10 @@ public interface AgentMemoryEntryRepository extends JpaRepository<AgentMemoryEnt
     List<AgentMemoryEntryEntity> findByTenantIdAndStatus(
         String tenantId, AgentMemoryEntryEntity.Status status);
 
+    @Query("SELECT DISTINCT e.tenantId FROM AgentMemoryEntryEntity e " +
+           "WHERE e.status = 'ACTIVE' AND e.tenantId IS NOT NULL")
+    List<String> findDistinctActiveTenantIds();
+
     List<AgentMemoryEntryEntity> findByTenantIdAndScopeTypeAndScopeIdAndStatus(
         String tenantId, AgentMemoryEntryEntity.ScopeType scopeType,
         String scopeId, AgentMemoryEntryEntity.Status status);
@@ -31,6 +35,15 @@ public interface AgentMemoryEntryRepository extends JpaRepository<AgentMemoryEnt
            "AND e.status = 'ACTIVE' AND e.content LIKE %:keyword%")
     List<AgentMemoryEntryEntity> searchByKeyword(@Param("tenantId") String tenantId,
                                                   @Param("keyword") String keyword);
+
+    @Query("SELECT e FROM AgentMemoryEntryEntity e WHERE e.tenantId = :tenantId " +
+           "AND e.scopeType = :scopeType AND e.scopeId = :scopeId " +
+           "AND e.status = 'ACTIVE' AND e.content LIKE %:keyword%")
+    List<AgentMemoryEntryEntity> searchByKeywordInScope(
+            @Param("tenantId") String tenantId,
+            @Param("scopeType") AgentMemoryEntryEntity.ScopeType scopeType,
+            @Param("scopeId") String scopeId,
+            @Param("keyword") String keyword);
 
     @Modifying
     @Transactional

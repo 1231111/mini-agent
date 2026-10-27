@@ -10,6 +10,8 @@ public class Episode {
     private String tenantId;
     private String userId;
     private String projectId;
+    private String sessionId;
+    private String taskId;
     private String taskSummary;
     private Outcome outcome;
     private String failureCode;
@@ -46,6 +48,12 @@ public class Episode {
 
     public String getProjectId() { return projectId; }
     public void setProjectId(String projectId) { this.projectId = projectId; }
+
+    public String getSessionId() { return sessionId; }
+    public void setSessionId(String sessionId) { this.sessionId = sessionId; }
+
+    public String getTaskId() { return taskId; }
+    public void setTaskId(String taskId) { this.taskId = taskId; }
 
     public String getTaskSummary() { return taskSummary; }
     public void setTaskSummary(String taskSummary) { this.taskSummary = taskSummary; }

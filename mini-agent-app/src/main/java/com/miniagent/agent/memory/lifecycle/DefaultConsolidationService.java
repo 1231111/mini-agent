@@ -1,5 +1,7 @@
 package com.miniagent.agent.memory.lifecycle;
 
+import com.miniagent.common.context.OwnerContext;
+
 import com.miniagent.common.SecurityUtils;
 import com.miniagent.common.StringUtils;
 import com.miniagent.common.model.EffectiveModelContext;
@@ -28,7 +30,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.*;
 import java.util.stream.Collectors;
@@ -60,6 +63,9 @@ public class DefaultConsolidationService implements ConsolidationService {
     private AgentEpisodeRepository episodeRepository;
 
     @Autowired
+    private AgentChatTaskLock episodeTaskLock;
+
+    @Autowired
     private WorkingMemoryManager workingMemoryManager;
 
     @Autowired(required = false)
@@ -83,16 +89,29 @@ public class DefaultConsolidationService implements ConsolidationService {
     @Autowired
     private ObjectMapper objectMapper;
 
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
     @Override
-    @Transactional
     public void consolidate(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
             return;
         }
-        // 巩固的辅助 LLM 调用必须走该会话所属用户配置的模型：本方法既可能被交互线程的
-        // CompletableFuture 调到，也可能被定时 Worker 调到，两者都不保证线程上已有模型绑定。
         try (var ignoredModel = bindSessionModel(sessionId)) {
-            doConsolidate(sessionId);
+            List<AgentEventEntity> pending = eventRepository.findBySessionIdOrderByCreatedAtAsc(sessionId)
+                    .stream().filter(event -> !Boolean.TRUE.equals(event.getProcessed())).toList();
+            Map<String, List<AgentEventEntity>> byTask = pending.stream()
+                    .filter(event -> event.getTaskId() != null && !event.getTaskId().isBlank())
+                    .collect(Collectors.groupingBy(event -> event.getTenantId() + "\u0000" + event.getTaskId()));
+            for (List<AgentEventEntity> taskEvents : byTask.values()) {
+                AgentEventEntity first = taskEvents.get(0);
+                consolidateTask(first.getTenantId(), sessionId, first.getTaskId());
+            }
+            boolean hasLegacy = pending.stream().anyMatch(event ->
+                    event.getTaskId() == null || event.getTaskId().isBlank());
+            if (hasLegacy || pending.isEmpty()) {
+                doConsolidate(sessionId);
+            }
         }
     }
 
@@ -104,6 +123,55 @@ public class DefaultConsolidationService implements ConsolidationService {
         return userModelBinder.bindForSession(sessionId);
     }
 
+    public void consolidateTask(String tenantId, String sessionId, String taskId) {
+        if (tenantId == null || tenantId.isBlank() || sessionId == null || sessionId.isBlank()
+                || taskId == null || taskId.isBlank()) {
+            return;
+        }
+        try (var ignoredModel = bindSessionModel(sessionId)) {
+            if (!episodeTaskLock.tryLock(tenantId, sessionId, taskId)) {
+                log.debug("任务经历正在由其他执行器巩固: session={}, task={}", sessionId, taskId);
+                return;
+            }
+            try {
+                consolidateTaskEvents(tenantId, sessionId, taskId);
+            } finally {
+                episodeTaskLock.unlock(tenantId, sessionId, taskId);
+            }
+        }
+    }
+
+    private void consolidateTaskEvents(String tenantId, String sessionId, String taskId) {
+        List<AgentEventEntity> events = eventRepository
+                .findByTenantIdAndSessionIdAndTaskIdOrderByCreatedAtAsc(tenantId, sessionId, taskId);
+        List<AgentEventEntity> unprocessed = events.stream()
+                .filter(event -> !Boolean.TRUE.equals(event.getProcessed()))
+                .toList();
+        if (unprocessed.isEmpty()) {
+            return;
+        }
+
+        AgentEpisodeEntity existing = episodeRepository
+                .findFirstByTenantIdAndSessionIdAndTaskIdOrderByCreatedAtAsc(tenantId, sessionId, taskId)
+                .orElse(null);
+        AgentEpisodeEntity extracted = extractEpisode(events, null, taskId);
+        if (extracted == null) {
+            return;
+        }
+        extracted.setId(existing != null ? existing.getId() : null);
+        if (existing != null) {
+            extracted.setId(existing.getId());
+            extracted.setAccessCount(existing.getAccessCount());
+            extracted.setLastAccessedAt(existing.getLastAccessedAt());
+        }
+
+        TransactionTemplate transaction = new TransactionTemplate(transactionManager);
+        transaction.executeWithoutResult(status -> {
+            episodeRepository.save(extracted);
+            eventRepository.markProcessed(unprocessed.stream().map(AgentEventEntity::getId).toList());
+        });
+    }
+
     private void doConsolidate(String sessionId) {
         // 1. 先读工作记忆：它挂在 Redis TTL 上，是本流程里最易失的数据，优先抢救
         WorkingMemory workingMemory = loadWorkingMemory(sessionId);
@@ -111,6 +179,7 @@ public class DefaultConsolidationService implements ConsolidationService {
         List<AgentEventEntity> events = eventRepository.findBySessionIdOrderByCreatedAtAsc(sessionId);
         List<AgentEventEntity> unprocessed = events.stream()
             .filter(e -> !Boolean.TRUE.equals(e.getProcessed()))
+            .filter(e -> e.getTaskId() == null || e.getTaskId().isBlank())
             .collect(Collectors.toList());
 
         if (unprocessed.isEmpty()) {
@@ -136,14 +205,19 @@ public class DefaultConsolidationService implements ConsolidationService {
             // 2. 提炼 Episode（事件流 + 工作记忆联合）
             AgentEpisodeEntity episode = extractEpisode(unprocessed, workingMemory);
             if (episode != null) {
-                episodeRepository.save(episode);
+                List<Long> ids = unprocessed.stream().map(AgentEventEntity::getId).collect(Collectors.toList());
+                TransactionTemplate transaction = new TransactionTemplate(transactionManager);
+                transaction.executeWithoutResult(status -> {
+                    episodeRepository.save(episode);
+                    eventRepository.markProcessed(ids);
+                });
                 workingMemoryManager.touch(sessionId);
                 log.info("巩固完成: session={}, episode={}", sessionId, episode.getTaskSummary());
+            } else {
+                List<Long> ids = unprocessed.stream().map(AgentEventEntity::getId).collect(Collectors.toList());
+                new TransactionTemplate(transactionManager)
+                        .executeWithoutResult(status -> eventRepository.markProcessed(ids));
             }
-
-            // 3. 标记为已处理
-            List<Long> ids = unprocessed.stream().map(AgentEventEntity::getId).collect(Collectors.toList());
-            eventRepository.markProcessed(ids);
         } catch (Exception e) {
             log.error("巩固失败: session={}", sessionId, e);
         }
@@ -182,6 +256,11 @@ public class DefaultConsolidationService implements ConsolidationService {
     }
 
     private AgentEpisodeEntity extractEpisode(List<AgentEventEntity> events, WorkingMemory wm) {
+        return extractEpisode(events, wm, null);
+    }
+
+    private AgentEpisodeEntity extractEpisode(
+            List<AgentEventEntity> events, WorkingMemory wm, String taskId) {
         if (events.isEmpty() && !hasSubstance(wm)) {
             return null;
         }
@@ -330,6 +409,7 @@ public class DefaultConsolidationService implements ConsolidationService {
         // 纯状态结转时没有事件，租户/会话从工作记忆取
         episode.setTenantId(!events.isEmpty() ? events.get(0).getTenantId() : wm.getTenantId());
         episode.setSessionId(!events.isEmpty() ? events.get(0).getSessionId() : wm.getSessionId());
+        episode.setTaskId(taskId != null ? taskId : uniqueTaskId(events));
         if (wm != null) {
             episode.setProjectId(wm.getProjectId());
         }
@@ -374,14 +454,14 @@ public class DefaultConsolidationService implements ConsolidationService {
      *
      * <p>工作记忆挂在 Redis TTL 上，超时即蒸发；此时不能就这么把 user_id 写成 null ——
      * 记忆检索按用户隔离，丢一次归属，这条 Episode 就再也检索不到了。所以退回本线程
-     * 已绑定的归属（{@link MemoryStore#getCurrentUser()}），它来自 consolidate 入口按
+     * 已绑定的归属（{@link OwnerContext#currentUserId()}），它来自 consolidate 入口按
      * sessionId 反查的用户，或交互线程已绑好的上下文。
      */
     private String resolveEpisodeUserId(WorkingMemory wm) {
         if (wm != null && wm.getUserId() != null && !wm.getUserId().isBlank()) {
             return wm.getUserId();
         }
-        Long bound = MemoryStore.getCurrentUser();
+        Long bound = OwnerContext.currentUserId();
         return bound == null ? null : String.valueOf(bound);
     }
 
@@ -482,9 +562,9 @@ public class DefaultConsolidationService implements ConsolidationService {
             return;
         }
         String tenant = episode.getTenantId() != null && !episode.getTenantId().isBlank()
-                ? episode.getTenantId() : MemoryStore.effectiveTenantId();
+                ? episode.getTenantId() : OwnerContext.effectiveTenantId();
         String userId = episode.getUserId() != null && !episode.getUserId().isBlank()
-                ? episode.getUserId() : MemoryStore.effectiveUserIdString();
+                ? episode.getUserId() : OwnerContext.effectiveUserId();
         for (String factText : facts) {
             // 提炼出来的"事实"会以「已知事实」注入系统提示，是提示注入最隐蔽的一条路：
             // 让模型把一句话总结成事实就够了。命中即跳过这一条（不抛，避免毒消息轮回），
@@ -519,6 +599,17 @@ public class DefaultConsolidationService implements ConsolidationService {
             out.add(SecurityScanner.redactIfUnsafe(item));
         }
         return out;
+    }
+
+    static String uniqueTaskId(List<AgentEventEntity> events) {
+        if (events == null || events.isEmpty()) {
+            return null;
+        }
+        Set<String> taskIds = events.stream()
+                .map(AgentEventEntity::getTaskId)
+                .filter(id -> id != null && !id.isBlank())
+                .collect(Collectors.toSet());
+        return taskIds.size() == 1 ? taskIds.iterator().next() : null;
     }
 
     private String buildFallbackSummary(List<AgentEventEntity> events) {

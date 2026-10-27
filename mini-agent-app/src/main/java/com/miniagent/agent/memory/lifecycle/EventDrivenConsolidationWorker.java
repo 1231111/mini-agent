@@ -59,22 +59,31 @@ public class EventDrivenConsolidationWorker {
 
             log.info("发现 {} 条未处理事件，开始巩固...", unprocessed.size());
 
-            // 按 sessionId 分组
-            var bySession = unprocessed.stream()
-                .limit(batchSize)
-                .collect(Collectors.groupingBy(AgentEventEntity::getSessionId));
-
-            for (var entry : bySession.entrySet()) {
-                String sessionId = entry.getKey();
-                if (sessionId == null) {
-                    continue;
-                }
+            var batches = unprocessed.stream().limit(batchSize).collect(Collectors.toList());
+            var byTask = batches.stream()
+                    .filter(event -> event.getSessionId() != null
+                            && event.getTaskId() != null && !event.getTaskId().isBlank())
+                    .collect(Collectors.groupingBy(event -> event.getTenantId() + "\u0000"
+                            + event.getSessionId() + "\u0000" + event.getTaskId()));
+            for (List<AgentEventEntity> taskEvents : byTask.values()) {
+                AgentEventEntity first = taskEvents.get(0);
                 try {
-                    consolidationService.consolidate(sessionId);
+                    consolidationService.consolidateTask(
+                            first.getTenantId(), first.getSessionId(), first.getTaskId());
                 } catch (Exception e) {
-                    log.warn("巩固失败: session={}", sessionId, e);
+                    log.warn("任务经历巩固失败: session={}, task={}", first.getSessionId(), first.getTaskId(), e);
                 }
             }
+            batches.stream()
+                    .filter(event -> event.getSessionId() != null
+                            && (event.getTaskId() == null || event.getTaskId().isBlank()))
+                    .map(AgentEventEntity::getSessionId).distinct().forEach(sessionId -> {
+                        try {
+                            consolidationService.consolidate(sessionId);
+                        } catch (Exception e) {
+                            log.warn("旧版会话经历巩固失败: session={}", sessionId, e);
+                        }
+                    });
         } finally {
             taskLock.unlock(LOCK_NAME);
         }

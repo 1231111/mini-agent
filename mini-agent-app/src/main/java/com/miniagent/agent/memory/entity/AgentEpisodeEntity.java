@@ -7,6 +7,7 @@ import java.time.LocalDateTime;
 @Entity
 @Table(name = "agent_episodes", indexes = {
     @Index(name = "idx_ae_tenant", columnList = "tenant_id"),
+    @Index(name = "idx_ae_task", columnList = "tenant_id, session_id, task_id", unique = true),
     @Index(name = "idx_ae_project", columnList = "project_id"),
     @Index(name = "idx_ae_outcome", columnList = "outcome")
 })
@@ -27,6 +28,9 @@ public class AgentEpisodeEntity extends BaseMemoryEntity {
 
     @Column(name = "session_id", length = 128)
     private String sessionId;
+
+    @Column(name = "task_id", length = 128)
+    private String taskId;
 
     @Column(name = "task_summary", nullable = false, length = 500)
     private String taskSummary;
@@ -79,6 +83,9 @@ public class AgentEpisodeEntity extends BaseMemoryEntity {
 
     public String getSessionId() { return sessionId; }
     public void setSessionId(String sessionId) { this.sessionId = sessionId; }
+
+    public String getTaskId() { return taskId; }
+    public void setTaskId(String taskId) { this.taskId = taskId; }
 
     public String getTaskSummary() { return taskSummary; }
     public void setTaskSummary(String taskSummary) { this.taskSummary = taskSummary; }

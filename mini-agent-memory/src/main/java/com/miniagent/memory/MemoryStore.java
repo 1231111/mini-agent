@@ -7,11 +7,11 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.StringUtils;
+import com.miniagent.common.context.OwnerContext;
 
 /**
  * 持久化记忆存储 — 参考 hermes-agent 的 MemoryStore 设计，按 userId 隔离。
@@ -22,7 +22,7 @@ import org.apache.commons.lang3.StringUtils;
  * - MIDTERM.md：跨该用户所有会话滚动压缩的中期记忆
  *
  * 设计特性：
- * - 按 userId 隔离：当前用户由 {@link #currentUserId} ThreadLocal 提供（复刻 AgentLoop 的 session 模式），
+ * - 按 userId 隔离：当前用户由 {@link OwnerContext} 提供，并可随执行快照跨线程传播。
  *   未设置时落到 _default，多用户互不污染。
  * - § 分隔条目，字符数硬上限（MEMORY 2200，USER 1375，MIDTERM 6000）
  * - 冻结快照：session 开始时加载，session 中写盘但不刷新快照（保持 prefix cache 稳定）
@@ -35,72 +35,10 @@ public class MemoryStore {
     private static final String ENTRY_DELIMITER = "\n§\n";
     private static final int MEMORY_CHAR_LIMIT = 2200;
     private static final int USER_CHAR_LIMIT = 1375;
-    private static final int MIDTERM_CHAR_LIMIT = 6000;
     private static final Long DEFAULT_USER = -1L;
     /** 结构化记忆未绑定时的租户兜底，与历史数据 "default" 对齐。 */
     public static final String FALLBACK_TENANT = "default";
 
-    /** 当前用户 ID（由 AgentChatApplicationService 每轮入口 set/clear）。null → _default。 */
-    private static final ThreadLocal<Long> currentUserId = new ThreadLocal<>();
-    private static final ThreadLocal<String> currentTenantId = new ThreadLocal<>();
-    public static void setCurrentUser(Long userId) { currentUserId.set(userId); }
-    public static void clearCurrentUser() { currentUserId.remove(); }
-    /** 读取当前线程绑定的 userId，供并行工具执行前快照、子线程内重建上下文。 */
-    public static Long getCurrentUser() { return currentUserId.get(); }
-
-    /** 当前租户标识，与 userId 一起传播到异步工具和子 Agent。 */
-    public static void setCurrentTenant(String tenantId) {
-        if (StringUtils.isBlank(tenantId)) {
-            currentTenantId.remove();
-        } else {
-            currentTenantId.set(tenantId.trim());
-        }
-    }
-
-    public static void clearCurrentTenant() { currentTenantId.remove(); }
-    public static String getCurrentTenant() { return currentTenantId.get(); }
-
-    /** 可跨线程显式传播的不可变 owner 快照。 */
-    public record OwnerContext(Long userId, String tenantId) {}
-
-    /** close 不抛 checked exception，便于安全地用于 try-with-resources。 */
-    @FunctionalInterface
-    public interface OwnerContextScope extends AutoCloseable {
-        @Override
-        void close();
-    }
-
-    public static OwnerContext captureOwnerContext() {
-        return new OwnerContext(getCurrentUser(), getCurrentTenant());
-    }
-
-    /**
-     * 在当前线程临时绑定 owner；支持嵌套，关闭后精确恢复进入前的上下文。
-     */
-    public static OwnerContextScope bindOwnerContext(OwnerContext context) {
-        OwnerContext previous = captureOwnerContext();
-        OwnerContext next = Objects.requireNonNullElse(context, new OwnerContext(null, null));
-        restoreOwnerContext(next);
-        AtomicBoolean closed = new AtomicBoolean();
-        return () -> {
-            if (closed.compareAndSet(false, true)) {
-                restoreOwnerContext(previous);
-            }
-        };
-    }
-
-    private static void restoreOwnerContext(OwnerContext context) {
-        if (context.userId() == null) {
-            clearCurrentUser();
-        } else {
-            setCurrentUser(context.userId());
-        }
-        if (StringUtils.isBlank(context.tenantId())) {
-            clearCurrentTenant();
-        } else {
-            setCurrentTenant(context.tenantId());
-        }
-    }
 
     /** 每个用户独立的记忆状态。所有可变字段的读写都在该实例的 lock 下进行。 */
     private static final class UserMemory {
@@ -110,7 +48,6 @@ public class MemoryStore {
         String midtermMemory = "";
         String memorySnapshot = "";
         String userSnapshot = "";
-        String midtermSnapshot = "";
         boolean loaded = false;
     }
 
@@ -158,18 +95,8 @@ public class MemoryStore {
     // =========================================================================
 
     private Long effectiveUserId() {
-        Long uid = currentUserId.get();
+        Long uid = OwnerContext.currentUserId();
         return Optional.ofNullable(uid).orElse(DEFAULT_USER);
-    }
-
-    public static String effectiveTenantId() {
-        String tenant = getCurrentTenant();
-        return StringUtils.isBlank(tenant) ? FALLBACK_TENANT : tenant;
-    }
-
-    public static String effectiveUserIdString() {
-        Long uid = getCurrentUser();
-        return String.valueOf(Optional.ofNullable(uid).orElse(DEFAULT_USER));
     }
 
     /** 当前用户的记忆根目录：memory/users/{userId}/ （_default 用于匿名/系统）。 */
@@ -243,7 +170,6 @@ public class MemoryStore {
         }
         um.memorySnapshot = renderBlock("MEMORY", um.memoryEntries, MEMORY_CHAR_LIMIT);
         um.userSnapshot = renderBlock("USER", um.userEntries, USER_CHAR_LIMIT);
-        um.midtermSnapshot = renderTextBlock("MIDTERM", um.midtermMemory, MIDTERM_CHAR_LIMIT);
         um.loaded = true;
         if (Objects.nonNull(vectorStore) && vectorStore.isEnabled() && !vectorStore.hasIndex(userId)
                 && !(um.memoryEntries.isEmpty() && um.userEntries.isEmpty())) {
@@ -334,8 +260,6 @@ public class MemoryStore {
 
     public String getMemorySnapshot() { return current().memorySnapshot; }
     public String getUserSnapshot() { return current().userSnapshot; }
-    public String getMidtermSnapshot() { return current().midtermSnapshot; }
-
     /** 获取组合快照（MEMORY + USER + MIDTERM），用于注入 system prompt。 */
     public String getCombinedSnapshot() {
         UserMemory um = current();
@@ -346,19 +270,15 @@ public class MemoryStore {
         if (!um.userSnapshot.isEmpty()) {
             blocks.add(um.userSnapshot);
         }
-        if (!um.midtermSnapshot.isEmpty()) {
-            blocks.add(um.midtermSnapshot);
-        }
         return String.join("\n\n", blocks);
     }
 
     /**
      * 面向当前对话的记忆快照：若向量召回可用，MEMORY 笔记按 query 语义召回 Top-K（按需注入，
-     * 避免全量注入稀释重点）；USER 画像与 MIDTERM 中期记忆体量小且始终相关，仍全量注入。
-     * 向量不可用时回退为 {@link #getCombinedSnapshot()} 全量注入。
+     * 避免全量注入稀释重点）；向量不可用时回退为 {@link #getCombinedSnapshot()} 全量注入。
      */
     public String getSnapshotForQuery(String query) {
-        return getSnapshotForQuery(query, true, true, true, 0);
+        return getSnapshotForQuery(query, true, true, 0);
     }
 
     /**
@@ -367,8 +287,8 @@ public class MemoryStore {
      * @param userMaxChars USER 截断；0=不截断
      */
     public String getSnapshotForQuery(String query, boolean includeMemory, boolean includeUser,
-                                      boolean includeMidterm, int userMaxChars) {
-        if (!includeMemory && !includeUser && !includeMidterm) {
+                                      int userMaxChars) {
+        if (!includeMemory && !includeUser) {
             return "";
         }
         UserMemory um = current();
@@ -397,51 +317,7 @@ public class MemoryStore {
             }
             blocks.add(user);
         }
-        if (includeMidterm && !um.midtermSnapshot.isEmpty()) {
-            blocks.add(um.midtermSnapshot);
-        }
         return String.join("\n\n", blocks);
-    }
-
-    /**
-     * 更新当前用户的跨会话中期记忆。该记忆不是逐条追加，而是滚动摘要：
-     * 每次对话结束后由上层模型把旧摘要 + 本轮对话压缩成新的统一摘要。
-     */
-    public void updateMidtermMemory(String summary) {
-        if (Objects.isNull(summary)) {
-            return;
-        }
-        summary = summary.trim();
-        if (summary.isEmpty()) {
-            return;
-        }
-        if (summary.length() > MIDTERM_CHAR_LIMIT) {
-            summary = summary.substring(0, MIDTERM_CHAR_LIMIT);
-        }
-        String scanErr = SecurityScanner.scan(summary);
-        if(Objects.nonNull(scanErr)) {
-            // 中期记忆来自模型归纳，若安全扫描失败则不写入，避免污染系统提示。
-            return;
-        }
-        Long uid = effectiveUserId();
-        UserMemory um = current();
-        um.lock.lock();
-        try {
-            um.midtermMemory = summary;
-            if (Objects.nonNull(blobStore)) {
-                blobStore.saveMidterm(uid, summary);
-            } else {
-                FilesWriteString(midtermPath(uid), summary);
-            }
-            um.midtermSnapshot = renderTextBlock("MIDTERM", um.midtermMemory, MIDTERM_CHAR_LIMIT);
-        } finally {
-            um.lock.unlock();
-        }
-    }
-
-    public String getRawMidtermMemory() {
-        String m = current().midtermMemory;
-        return Optional.ofNullable(m).orElse("");
     }
 
     // =========================================================================
@@ -616,7 +492,6 @@ public class MemoryStore {
     private void refreshSnapshots(UserMemory um) {
         um.memorySnapshot = renderBlock("MEMORY", um.memoryEntries, MEMORY_CHAR_LIMIT);
         um.userSnapshot = renderBlock("USER", um.userEntries, USER_CHAR_LIMIT);
-        um.midtermSnapshot = renderTextBlock("MIDTERM", um.midtermMemory, MIDTERM_CHAR_LIMIT);
     }
 
     private List<String> entriesOf(UserMemory um, String target) {

@@ -1,5 +1,7 @@
 package com.miniagent.agent.core;
 
+import com.miniagent.common.context.OwnerContext;
+
 import com.miniagent.agent.delegate.RoleContext;
 import com.miniagent.agent.delegate.SubagentContext;
 import com.miniagent.agent.permission.ConfirmPolicy;
@@ -22,7 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public record RunScope(
         String sessionId,
-        MemoryStore.OwnerContext owner,
+        OwnerContext owner,
         LoopTurnPolicy turnPolicy,
         PermissionMode permissionMode,
         ConfirmPolicy confirmPolicy,
@@ -35,6 +37,7 @@ public record RunScope(
         String writeTask,
         Path workspaceRoot,
         ExecutionTurnContext.Scope execution,
+        long taskId,
         ChatModel chatModel,
         StreamingChatModel streamingModel,
         int contextWindowTokens
@@ -46,7 +49,7 @@ public record RunScope(
     }
 
     public RunScope {
-        owner = owner == null ? new MemoryStore.OwnerContext(null, null) : owner;
+        owner = owner == null ? new OwnerContext(null, null) : owner;
         turnPolicy = turnPolicy == null ? LoopTurnPolicy.NONE : turnPolicy;
         permissionMode = permissionMode == null ? PermissionMode.DEFAULT : permissionMode;
         confirmPolicy = confirmPolicy == null ? ConfirmPolicy.DANGEROUS : confirmPolicy;
@@ -58,7 +61,7 @@ public record RunScope(
     public static RunScope capture() {
         return new RunScope(
                 AgentLoop.getCurrentSession(),
-                MemoryStore.captureOwnerContext(),
+                OwnerContext.capture(),
                 LoopTurnContext.current(),
                 PermissionContext.mode(),
                 PermissionContext.confirmPolicy(),
@@ -71,6 +74,7 @@ public record RunScope(
                 WorkspaceContext.getTaskOverride(),
                 WorkspaceContext.getRootOverride(),
                 ExecutionTurnContext.current(),
+                TaskExecutionContext.currentTaskId(),
                 AgentLoop.getCurrentChatModel(),
                 AgentLoop.getCurrentStreamingModel(),
                 EffectiveModelContext.currentContextWindow());
@@ -80,7 +84,7 @@ public record RunScope(
         return new RunScope(
                 sid, owner, turnPolicy, permissionMode, confirmPolicy, planApproved, permissionForced,
                 subagent, parentSessionId, role, taskName, writeTask, workspaceRoot,
-                execution, chatModel, streamingModel, contextWindowTokens);
+                execution, taskId, chatModel, streamingModel, contextWindowTokens);
     }
 
     /**
@@ -103,7 +107,7 @@ public record RunScope(
                 mode, confirmPolicy,
                 planApproved, true, true, parent,
                 roleId == null ? "" : roleId, taskName, "out", subWorkspace,
-                null, chatModel, streamingModel, contextWindowTokens);
+                null, taskId, chatModel, streamingModel, contextWindowTokens);
     }
 
     /**
@@ -111,7 +115,7 @@ public record RunScope(
      */
     public Binding bind() {
         RunScope previous = capture();
-        MemoryStore.OwnerContextScope owners = MemoryStore.bindOwnerContext(owner);
+        OwnerContext.Scope owners = OwnerContext.bind(owner);
         applyLocals();
         AtomicBoolean closed = new AtomicBoolean();
         return () -> {
@@ -162,6 +166,7 @@ public record RunScope(
         // 会话标识与工作区根必须同源安装：工具结果里的媒体地址要靠它指回正确的根
         WorkspaceContext.setSessionOverride(sessionId);
         ExecutionTurnContext.set(execution);
+        TaskExecutionContext.set(taskId);
         if (chatModel != null || streamingModel != null) {
             // 窗口一并恢复：并行工具/子代理线程上的辅助 LLM 调用与压缩阈值都要用它，
             // 只恢复模型会让"该不该压缩"在这条路径上退回全局常量。

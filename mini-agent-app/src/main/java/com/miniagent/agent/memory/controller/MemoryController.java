@@ -341,9 +341,9 @@ public class MemoryController {
         }
         MemoryScope requested = query.getScope();
         if (!Objects.equals(user.tenantKey(), requested.tenantId())) {
-            query.setScope(new MemoryScope(user.tenantKey(), requested.scopeType(), requested.scopeId()));
+            throw new AccessDeniedException("Tenant is not accessible");
         }
-        requireRequestedScope(user, query.getScope());
+        requireRequestedScope(user, requested);
     }
 
     private void bindContextToPrincipal(AgentContext ctx, AuthenticatedUser user) {

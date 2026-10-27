@@ -1,7 +1,7 @@
 package com.miniagent.agent.execution;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.miniagent.memory.AgentDataPaths;
+import com.miniagent.common.io.AgentDataPaths;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;

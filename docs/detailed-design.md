@@ -191,14 +191,14 @@ flowchart TB
     app["mini-agent-app"] --> planner["mini-agent-planner"]
     planner --> loopm["mini-agent-loop"]
     loopm --> tools["mini-agent-tools"]
-    tools --> memory["mini-agent-memory"]
-    memory --> common["mini-agent-common"]
+    tools --> common["mini-agent-common"]
+    memory["mini-agent-memory"] --> common
 ```
 
 | 模块 | 职责（一句话） |
 |------|----------------|
 | `mini-agent-common` | `ApiResponse`、`ErrorCode`、`MessageConstants`、共享 embedding/Milvus 客户端 |
-| `mini-agent-memory` | `MemoryStore` / `MemoryService` 接口、数据目录 `AgentDataPaths` |
+| `mini-agent-memory` | `MemoryStore` / `MemoryService` 接口及记忆领域模型；owner 上下文与通用数据目录位于 `mini-agent-common` |
 | `mini-agent-tools` | `ToolRegistry`、内置工具、MCP、浏览器、ComfyUI |
 | `mini-agent-loop` | `AgentLoop`、系统上下文、权限、Todo、轨迹、`delegate_task` |
 | `mini-agent-planner` | `PlanningLoop`、图编译/调度/评估 |
@@ -541,7 +541,7 @@ ACTION：`suspendActiveTodo=true`。清单未完成则挂起；全是 completed/
 
 槽位表里没有 QUESTION。它原来只在轻问答时塞 `PromptTemplates.QUESTION_MODE`，判据删除后就成了一个恒空的槽，一并去掉；`agent.context.budget.slot-tokens.question` 也不再读。
 
-`injectMidterm` 两套策略都是 false。`updateMidtermMemory` 主路径无调用方。保留字段，不要做成「打开就有中期记忆」。
+`injectMidterm` 两套策略都是 false，`updateMidtermMemory` 主路径无调用方，因此 MIDTERM 不属于当前运行时注入或写入链路。`MemoryStore` 仍读取旧 `MIDTERM.md`，DB blob 仍保留 `midterm`，冷启动 DB 为空时会把旧文件导入 DB；这些读入路径是历史数据兼容，不得与运行时功能混为一谈。保留兼容字段与导入逻辑，不要把开关打开成中期记忆注入；待明确迁移窗口和存量数据处置策略后，再单独移除兼容读路径。
 
 Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 
@@ -579,15 +579,23 @@ Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 | `MemoryService` | 系统上下文 + `memory` 工具 | `retrieveForPrompt`、`add/replace/remove/read` |
 | `MemoryManager` | 巩固 + `/v1/memory` | 事件、条目、工作记忆、事实/SOP/episode、`consolidate` |
 
-对话路径只调 `retrieveForPrompt`。任务起止 `recordEvent`。结束后异步 `consolidate`（线程内 `bindOwnerContext` + 绑定用户模型）。
+对话路径只调 `retrieveForPrompt`。任务起止通过 `recordEvent` 写入 `AgentEvent`；工具执行由 `MemoryToolExecutionSink` 写入 `TOOL_EXECUTION`。结束后异步 `consolidate`（线程内绑定 owner 与用户模型）。
 
 `memory` 工具：action = add / replace / remove / read；target = `memory` 或 `user`。用户画像走语义事实，不要只追加 blob。
 
-`MemoryReadPolicy` 由 `ContextLoadPolicy.memoryPolicy()` 映射：working←`injectTodo`，longTerm←`injectMemory`，user←`injectUser`，midterm←`injectMidterm`。policy 全关返回空字符串。
+`MemoryReadPolicy` 由 `ContextLoadPolicy.memoryPolicy()` 映射：working←`injectTodo`，longTerm←`injectMemory`，user←`injectUser`。policy 全关返回空字符串。
 
 写入：`AgentEvent` → 分类 → 重要度 → 闸门（`agent.memory.importance-threshold` 默认 0.3；短于 8 字、套话、安全扫描丢弃）→ 去重 → 表。分类：用户反馈→USER；工具/任务/错误→EPISODIC；计划变更/事实→SEMANTIC；可复用步骤→PROCEDURAL。
 
+**本轮任务级记忆契约（阶段一）**：事件的 `sessionId` 是会话归属，`taskId` 是该会话内 `TaskScopeRegistry` 发出的十进制任务序号，不能把 `sessionId#taskId` 的 `scopeKey` 当作 `taskId`。`TASK_START`、`TASK_COMPLETE`、`TASK_FAIL` 与 `TOOL_EXECUTION` 必须使用同一轮执行捕获的任务序号；一次执行期间不得在事件生产者处重新解析当前作用域。`taskId=0` 表示初始任务且合法。`TaskScopeRegistry` 当前负责任务状态隔离，但不构成持久化任务谱系；阶段一不生成 `CONTINUES`、`CONTRADICTS` 边，也不声称有跨任务经历簇。
+
+**检索契约（阶段一）**：只返回 `ACTIVE` 记忆。`VERIFIED` 是巩固/审核状态，不代表可检索发布；将来若开放检索必须单独定义发布转换。每个候选在进入混合排序前都必须匹配完整 `MemoryScope`（`tenantId + scopeType + scopeId`），无论来自 keyword 还是 vector。评分中的 `scopeRelevance` 不是授权过滤。Controller 必须以认证主体 tenant 为准；显式不匹配的 tenant 请求拒绝，不静默改写。
+
+**租户键契约**：记忆主键可继续使用全局生成的数值 ID；所有业务查找、更新、删除与关联查询仍必须同时约束 `tenantId`。新增唯一约束不得只含 `memoryId` 以外的租户业务字段；应将 `tenant_id` 纳入复合唯一键。现有全局 ID 不等于授权凭证。
+
 工作记忆：MySQL `agent_working_memories` + Redis `wm:{sessionId}`，TTL `agent.replica.memory-ttl-seconds` 默认 86400。向量：`agent.memory.vector.enabled=true`，`backend=local` 或 `milvus`（维度 1792）。
+
+**暂不纳入阶段一**：`experience_clusters` 成员关系表/CAS 合并拆分、`skill_applications` 节点级应用记录、云 API Gateway/Continuation Token。当前工程没有这些模型或埋点；不得将 JSON task id 数组或 `(tenant_id, skill_id, task_id)` 唯一键写成已验收设计。后续实现簇时成员必须独立持久化并有唯一成员键与版本/CAS；技能应用必须以可区分的节点/事件 ID 记录，才能表示同一任务内多次或部分应用。
 
 禁止：上下文绕过 `MemoryService` 直接查表；巩固放在 SSE `end` 之前同步等待。
 

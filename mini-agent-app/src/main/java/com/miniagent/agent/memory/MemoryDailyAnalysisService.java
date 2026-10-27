@@ -137,7 +137,7 @@ public class MemoryDailyAnalysisService {
 已有记忆（可能为空）：
 """ + memoryService.retrieveForPrompt(
                 null, "用户偏好",
-                new MemoryReadPolicy(false, false, true, false, 0)) + """
+                new MemoryReadPolicy(false, false, true, 0)) + """
 
 对话记录：
 """ + transcript + """

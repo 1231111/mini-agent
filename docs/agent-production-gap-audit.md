@@ -405,7 +405,7 @@ docker-compose.yml:64-65,84-85   MINIO_ACCESS_KEY/SECRET: minioadmin / minioadmi
 | D-2 | P2 | `@PostConstruct` 把所有 `PROCESSING` 行重置为 `PENDING`（无实例/租约过滤）⇒ 多实例启动重复投递 | `MemoryIndexOutboxService.java:60-74` |
 | D-3 | P2 | 巩固里 `catch(Exception){log.debug; return true;}` 失败即"已巩固"，静默吞掉工作记忆结转 | `DefaultConsolidationService.java:177-180` |
 | D-4 | P2 | 记忆无质量度量（只有计数），写闸门拒绝计数只在进程内 | `MemoryStats.java:8-19`、`RuleBasedMemoryWriteGate.java:52,129-133` |
-| D-5 | P3 | midterm 记忆整套死代码（无生产调用者、三条策略都 `injectMidterm=false`） | `MemoryStore.java:410-440`、`docs/detailed-design.md:538,883` |
+| D-5 | P3 | MIDTERM 运行时注入/更新路径停产，但旧数据兼容链仍在：策略恒 false、无生产更新调用者；`MIDTERM.md` 与 DB blob `midterm` 仍会加载，冷启动 DB 为空时会导入旧文件 | `ContextLoadPolicy.java`、`MemoryStore.java`、`MemoryBlobStore.java`、`RedisMysqlMemoryBlobStore.java`、`AgentUserMemory.java` |
 | D-6 | P3 | 组织级 scope 退化为租户 id，与 TENANT scope 语义重叠 | `MemoryScopePolicy.java:36-38`、`HybridScoreCalculator.java:79-81` |
 | E-1 | P2 | 限流器 map 永不淘汰（1 万个 key 之后新客户端永久 429）、按 `getRemoteAddr()` 取 IP（反代后所有人共用一个桶）、`RedisRateLimiter` 无调用者（多副本限额翻倍）、无 `Retry-After` | `RateLimitFilter.java:36-37,63-68,85-92`、`RedisRateLimiter.java:11-27` |
 | E-2 | P2 | Agent 运行跑在 ForkJoinPool.commonPool（并行度=核数-1、无界队列），排在队列里的请求在返回 200 + 开流之后才开始跑 ⇒ 表现为"卡住"，最长 30 分钟 | `AgentChatApplicationService.java:268,523` vs `ToolExecutorConfig.java:41-49` |

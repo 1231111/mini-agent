@@ -1,0 +1,167 @@
+{
+  "summary": {
+    "total": 6,
+    "pass": 2,
+    "pass_rate": 0.3333,
+    "substring_only": 0,
+    "errors": 0,
+    "by_level": {
+      "1": {
+        "total": 2,
+        "pass": 2,
+        "substring_only": 0,
+        "error": 0
+      },
+      "2": {
+        "total": 2,
+        "pass": 0,
+        "substring_only": 0,
+        "error": 0
+      },
+      "3": {
+        "total": 2,
+        "pass": 0,
+        "substring_only": 0,
+        "error": 0
+      }
+    }
+  },
+  "config": {
+    "base_url": "http://127.0.0.1:62765",
+    "limit": 2,
+    "levels": [],
+    "timeout": 300,
+    "self_test": true
+  },
+  "scoring_note": "近似 GAIA 官方归一化准匹配；官方 scorer 仍是报数权威。substring_only 表示只有子串命中、不算通过。",
+  "results": [
+    {
+      "id": "gaia_validation_L2_c61d22de",
+      "task_id": "c61d22de-5f6c-4958-a7f6-5e9707bd3466",
+      "level": 2,
+      "expected": "egalitarian",
+      "session": "stub-session",
+      "answer": "I could not determine the answer",
+      "error": null,
+      "elapsed": 0.0,
+      "pass": false,
+      "events": {
+        "token": 1,
+        "end": 1
+      },
+      "score": {
+        "exact": false,
+        "contains": false,
+        "normalized_expected": "egalitarian",
+        "normalized_actual": "i could not determine answer"
+      }
+    },
+    {
+      "id": "gaia_validation_L2_17b5a6a3",
+      "task_id": "17b5a6a3-bc87-42e8-b0fb-6ab0781ef2cc",
+      "level": 2,
+      "expected": "34689",
+      "session": "stub-session",
+      "answer": "I could not determine the answer",
+      "error": null,
+      "elapsed": 0.0,
+      "pass": false,
+      "events": {
+        "token": 1,
+        "end": 1
+      },
+      "score": {
+        "exact": false,
+        "contains": false,
+        "normalized_expected": "34689",
+        "normalized_actual": "i could not determine answer"
+      }
+    },
+    {
+      "id": "gaia_validation_L1_e1fc63a2",
+      "task_id": "e1fc63a2-da7a-432f-be78-7c4a95598703",
+      "level": 1,
+      "expected": "17",
+      "session": "stub-session",
+      "answer": "17",
+      "error": null,
+      "elapsed": 0.0,
+      "pass": true,
+      "events": {
+        "token": 1,
+        "end": 1
+      },
+      "score": {
+        "exact": true,
+        "contains": true,
+        "normalized_expected": "17",
+        "normalized_actual": "17"
+      }
+    },
+    {
+      "id": "gaia_validation_L1_8e867cd7",
+      "task_id": "8e867cd7-cff9-4e6c-867a-ff5ddc2550be",
+      "level": 1,
+      "expected": "3",
+      "session": "stub-session",
+      "answer": "3",
+      "error": null,
+      "elapsed": 0.0,
+      "pass": true,
+      "events": {
+        "token": 1,
+        "end": 1
+      },
+      "score": {
+        "exact": true,
+        "contains": true,
+        "normalized_expected": "3",
+        "normalized_actual": "3"
+      }
+    },
+    {
+      "id": "gaia_validation_L3_676e5e31",
+      "task_id": "676e5e31-a554-4acc-9286-b60d90a92d26",
+      "level": 3,
+      "expected": "86",
+      "session": "stub-session",
+      "answer": "I could not determine the answer",
+      "error": null,
+      "elapsed": 0.0,
+      "pass": false,
+      "events": {
+        "token": 1,
+        "end": 1
+      },
+      "score": {
+        "exact": false,
+        "contains": false,
+        "normalized_expected": "86",
+        "normalized_actual": "i could not determine answer"
+      }
+    },
+    {
+      "id": "gaia_validation_L3_bec74516",
+      "task_id": "bec74516-02fc-48dc-b202-55e78d0e17cf",
+      "level": 3,
+      "expected": "26.4",
+      "session": "stub-session",
+      "answer": "I could not determine the answer",
+      "error": null,
+      "elapsed": 0.0,
+      "pass": false,
+      "events": {
+        "token": 1,
+        "end": 1
+      },
+      "score": {
+        "exact": false,
+        "contains": false,
+        "normalized_expected": "264",
+        "normalized_actual": "i could not determine answer"
+      }
+    }
+  ],
+  "cases_file": "scripts\\agent-eval\\gaia\\cases-gaia-validation.json",
+  "started_at": "2026-10-09 09:10:45"
+}

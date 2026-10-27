@@ -1,6 +1,7 @@
-package com.miniagent.memory;
+package com.miniagent.common.io;
 
 import jakarta.annotation.PostConstruct;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -9,18 +10,11 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import org.apache.commons.lang3.StringUtils;
 
-/**
- * 统一数据根：媒体 / 记忆 / skills 都相对此目录，禁止再绑 user.dir。
- *
- * 解析顺序：agent.data-dir → 环境变量 MINI_AGENT_HOME → {user.home}/.miniagent
- */
+/** Shared data-root paths for media, memory, skills, and workspace storage. */
 @Component
 public class AgentDataPaths {
-
     private static final Logger log = LoggerFactory.getLogger(AgentDataPaths.class);
-
     private final Path root;
 
     public AgentDataPaths(@Value("${agent.data-dir:}") String dataDir) {
@@ -51,37 +45,31 @@ public class AgentDataPaths {
     public Path skills() { return root.resolve("skills"); }
     public Path workspace() { return root.resolve("workspace"); }
 
-    /** 解析相对路径；兼容旧前缀 conversation-images/、generated-images/、user-uploads/ */
     public Path resolveMedia(String relativeOrUrl) {
         if (StringUtils.isBlank(relativeOrUrl)) {
             throw new IllegalArgumentException("path blank");
         }
-        String p = relativeOrUrl.trim().replace('\\', '/');
-        if (p.startsWith("/api/generated-media/")) {
-            p = p.substring("/api/generated-media/".length());
-            return mediaGenerated().resolve(p).normalize();
+        String path = relativeOrUrl.trim().replace('\\', '/');
+        if (path.startsWith("/api/generated-media/")) {
+            return mediaGenerated().resolve(path.substring("/api/generated-media/".length())).normalize();
         }
-        if (p.startsWith("/generated-images/")) {
-            p = "generated-images/" + p.substring("/generated-images/".length());
+        if (path.startsWith("/generated-images/")) {
+            path = "generated-images/" + path.substring("/generated-images/".length());
         }
-        if (p.startsWith("generated-images/")) {
-            return mediaGenerated().resolve(p.substring("generated-images/".length())).normalize();
+        if (path.startsWith("generated-images/")) {
+            return mediaGenerated().resolve(path.substring("generated-images/".length())).normalize();
         }
-        if (p.startsWith("conversation-images/")) {
-            return mediaConversations().resolve(p.substring("conversation-images/".length())).normalize();
+        if (path.startsWith("conversation-images/")) {
+            return mediaConversations().resolve(path.substring("conversation-images/".length())).normalize();
         }
-        if (p.startsWith("media/")) {
-            return root.resolve(p).normalize();
+        if (path.startsWith("media/")) {
+            return root.resolve(path).normalize();
         }
-        if (p.startsWith("user-uploads/") || p.startsWith("./user-uploads/")) {
-            String rest = p.replaceFirst("^\\.?/?user-uploads/", "");
-            return mediaUploads().resolve(rest).normalize();
+        if (path.startsWith("user-uploads/") || path.startsWith("./user-uploads/")) {
+            return mediaUploads().resolve(path.replaceFirst("^\\.?/?user-uploads/", "")).normalize();
         }
-        Path asIs = Path.of(p);
-        if (asIs.isAbsolute()) {
-            return asIs.normalize();
-        }
-        return root.resolve(p).normalize();
+        Path asIs = Path.of(path);
+        return asIs.isAbsolute() ? asIs.normalize() : root.resolve(path).normalize();
     }
 
     static Path resolveRoot(String dataDir) {

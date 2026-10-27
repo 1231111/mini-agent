@@ -7,14 +7,13 @@ public record MemoryReadPolicy(
         boolean working,
         boolean longTerm,
         boolean user,
-        boolean midterm,
         int userMaxChars
 ) {
     public boolean any() {
-        return working || longTerm || user || midterm;
+        return working || longTerm || user;
     }
 
     public static MemoryReadPolicy none() {
-        return new MemoryReadPolicy(false, false, false, false, 0);
+        return new MemoryReadPolicy(false, false, false, 0);
     }
 }

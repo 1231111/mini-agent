@@ -1,5 +1,8 @@
 package com.miniagent.agent.memory.writer;
 
+import com.miniagent.common.context.OwnerContext;
+
+import com.miniagent.agent.core.TaskExecutionContext;
 import com.miniagent.agent.core.ToolExecutionSink;
 import com.miniagent.agent.tool.ToolStatus;
 import com.miniagent.memory.MemoryManager;
@@ -52,8 +55,9 @@ public class MemoryToolExecutionSink implements ToolExecutionSink {
         boolean failed = status != ToolStatus.SUCCESS;
         try {
             AgentEvent event = new AgentEvent();
-            event.setTenantId(MemoryStore.effectiveTenantId());
+            event.setTenantId(OwnerContext.effectiveTenantId());
             event.setSessionId(sessionId);
+            event.setTaskId(Long.toString(TaskExecutionContext.currentTaskId()));
             event.setEventType(AgentEvent.EventType.TOOL_EXECUTION);
             event.setActor("executor");
             event.setStatus(failed
