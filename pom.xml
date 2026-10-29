@@ -14,6 +14,7 @@
     <modules>
         <module>mini-agent-common</module>
         <module>mini-agent-memory</module>
+        <module>mini-agent-memory-service</module>
         <module>mini-agent-tools</module>
         <module>mini-agent-loop</module>
         <module>mini-agent-planner</module>

@@ -215,7 +215,32 @@ flowchart TB
 
 `mini-agent-loop` 同时装了拆解、上下文、执行、部分闭环。实现时按运行时边界拆类。
 
-### 3.5 运行时总图（一轮用户消息）
+### 3.5 云端记忆服务解耦边界（阶段一）
+
+`mini-agent-memory` 不是可执行 Spring Boot 服务，而是被执行端和记忆实现共同依赖的跨进程契约模块。阶段一先把最容易形成一致性闭环的 Procedure 节点终态结算切成窄端口：
+
+| 契约 | 作用 | 禁止依赖 |
+|------|------|----------|
+| `MemoryPrincipal` | 传递已经由调用方认证的 `tenantId/userId/projectId/sessionId` | 不接受请求体伪造身份替代服务端认证 |
+| `ProcedureSettlementCommand` | 携带执行时绑定的 `procedureId/procedureVersion`、任务/节点幂等键和 SUCCESS/FAILURE | 不按服务端当前版本猜测结算版本 |
+| `ProcedureSettlementPort` | 结算一次 Procedure 应用事实，返回 `RECORDED/DUPLICATE/STALE_PROCEDURE/SKIPPED` | 不暴露 JPA Entity、Repository、Spring 类型 |
+
+当前运行时结构是：
+
+```text
+PlanningLoop
+  -> NodeTerminalCommitPort
+  -> ProcedureNodeTerminalCommitAdapter
+  -> ProcedureSettlementPort
+  -> ProcedureApplicationSettlementService
+  -> agent_procedure_applications + agent_procedures
+```
+
+`ProcedureNodeTerminalCommitAdapter` 只负责把 Planner 的 `TaskNode` 和 `OwnerContext` 转成 `ProcedureSettlementCommand`；`ProcedureApplicationSettlementService` 只实现 `ProcedureSettlementPort`，保留原有 `REQUIRES_NEW` 幂等事实写入、唯一键并发裁决、版本条件更新和治理失败隔离。这样未来服务器部署可以把 `ProcedureSettlementPort` 替换为带服务间认证的远程适配器，云端记忆服务也不需要依赖 `mini-agent-planner`。
+
+本阶段尚未声称远程 HTTP 服务已经完成：尚未新增独立的 `mini-agent-memory-service` Spring Boot 进程、内部认证过滤器、HTTP DTO/controller、重试与 outbox 投递。桌面档继续使用同进程本地实现；服务器档在远程适配器完成前仍使用 `mini-agent-app` 内的本地实现。下一阶段应先定义 HTTP DTO 与服务间认证，再决定同步结算是否改为可靠事件加幂等消费者，不能把同步网络失败直接变成已完成节点失败。
+
+### 3.6 运行时总图（一轮用户消息）
 
 这张图是实现时的主路径。**不规划的出口不能连到 `AgentLoop`。** 它先进入系统上下文，系统上下文再进入循环。简单回答走的就是左边这条。
 

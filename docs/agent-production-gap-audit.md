@@ -46,6 +46,12 @@
 
 **仍未完成或未验证**：跨任务类型自动分类判据、隔离执行器对候选步骤的独立验证、自动采纳执行入口。`automatic-acceptance-enabled` 默认关闭。当前候选只追加 Episode 中已存在的 `resolution`，而非自动推断方案。`experience_clusters` 的 H2 merge/split CAS 回滚、PROJECT 会话绑定/解绑/成员移除失效、跨租户绑定拒绝和候选验证记录持久化均已有回归覆盖；真实 MySQL 兼容性仍未实测。
 
+### 2026-10-29 补充：云端记忆服务第一条解耦切片已落地
+
+已将 Procedure 节点终态结算从 Planner 类型中抽出为 `mini-agent-memory` 的跨进程窄契约：`MemoryPrincipal`、`ProcedureSettlementCommand`、`ProcedureSettlementPort` 和 `ProcedureSettlementResult`。`ProcedureApplicationSettlementService` 现在只依赖该记忆端口；新增 `ProcedureNodeTerminalCommitAdapter` 负责把 `NodeTerminalCommitPort` / `TaskNode` / `OwnerContext` 转换为契约命令。
+
+这一步只完成边界和本地适配，不是云端服务已经上线。当前桌面与服务器仍使用 `mini-agent-app` 内的本地数据库实现；独立记忆服务、服务间认证、HTTP DTO/controller、重试/outbox 和远程适配器仍未完成。新增契约测试 3 项，本地结算回归 7 项通过；编译通过。
+
 ### 2026-10-28 补充（三）：Procedure 低成功率自动归档（自进化第 1 步）
 
 **实现范围**：当前不再只是记录成功率。每个新的、幂等成功结算的 Procedure 节点完成统计重算后，`ProcedureApplicationSettlementService.commit` 在独立事务触发 `ProcedureGovernanceService`：默认该版累计 `attempt_count >= 10` 且 `success_rate <= 0.20` 时，以 tenant/owner/version/status/样本数/成功率为条件 CAS 把 ACTIVE 改为 ARCHIVED，后续规划器不再注入。参数可配置且有总开关。ARCHIVED 行不删除、不改 steps；同名的新内容写入时复用该行、升版、清零本版计数并复活。治理异常隔离，不改变节点结果或已提交的结算事实。
