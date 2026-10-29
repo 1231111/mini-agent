@@ -4,7 +4,9 @@ import com.miniagent.agent.memory.entity.AgentEpisodeEntity;
 import com.miniagent.agent.memory.entity.AgentEventEntity;
 import com.miniagent.agent.memory.repository.AgentEpisodeRepository;
 import com.miniagent.agent.memory.repository.AgentEventRepository;
+import com.miniagent.common.context.OwnerContext;
 import com.miniagent.config.OpenAiModelProperties;
+import com.miniagent.memory.model.WorkingMemory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -30,6 +32,8 @@ class DefaultConsolidationServiceTest {
 
     @BeforeEach
     void setUp() {
+        OwnerContext.clearCurrentTenant();
+        OwnerContext.clearCurrentUser();
         service = new DefaultConsolidationService();
         eventRepository = mock(AgentEventRepository.class);
         episodeRepository = mock(AgentEpisodeRepository.class);
@@ -72,7 +76,60 @@ class DefaultConsolidationServiceTest {
         verify(eventRepository).markProcessed(List.of(1L));
         verify(transactionManager).commit(any(TransactionStatus.class));
         verify(taskLock).unlock("tenant-a", "session-a", "7");
-        verify(eventRepository, never()).findBySessionIdOrderByCreatedAtAsc(anyString());
+        verify(eventRepository, never()).findByTenantIdAndSessionIdOrderByCreatedAtAsc("tenant-b", "session-a");
+    }
+
+    @Test
+    void legacyConsolidationReadsAndChecksOnlyRequestedTenantSession() {
+        when(eventRepository.findByTenantIdAndSessionIdOrderByCreatedAtAsc("tenant-a", "session-a"))
+                .thenReturn(List.of());
+        WorkingMemory workingMemory = new WorkingMemory();
+        workingMemory.setTenantId("tenant-a");
+        workingMemory.setSessionId("session-a");
+        workingMemory.setGoal("complete task");
+        WorkingMemoryManager workingMemoryManager = mock(WorkingMemoryManager.class);
+        when(workingMemoryManager.get("session-a")).thenReturn(workingMemory);
+        ReflectionTestUtils.setField(service, "workingMemoryManager", workingMemoryManager);
+        when(episodeRepository.existsByTenantIdAndSessionId("tenant-a", "session-a")).thenReturn(false);
+        when(episodeRepository.save(any(AgentEpisodeEntity.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+
+        service.consolidate("tenant-a", "session-a");
+
+        var saved = org.mockito.ArgumentCaptor.forClass(AgentEpisodeEntity.class);
+        verify(episodeRepository).save(saved.capture());
+        assertEquals("tenant-a", saved.getValue().getTenantId());
+        assertEquals("session-a", saved.getValue().getSessionId());
+        verify(eventRepository, times(2))
+                .findByTenantIdAndSessionIdOrderByCreatedAtAsc("tenant-a", "session-a");
+        verify(episodeRepository).existsByTenantIdAndSessionId("tenant-a", "session-a");
+        verify(episodeRepository, never()).findBySessionId(anyString());
+    }
+
+    @Test
+    void legacyConsolidationSkipsWorkingMemoryOwnedByAnotherTenant() {
+        when(eventRepository.findByTenantIdAndSessionIdOrderByCreatedAtAsc("tenant-a", "session-a"))
+                .thenReturn(List.of());
+        WorkingMemory workingMemory = new WorkingMemory();
+        workingMemory.setTenantId("tenant-b");
+        workingMemory.setSessionId("session-a");
+        workingMemory.setGoal("foreign task");
+        WorkingMemoryManager workingMemoryManager = mock(WorkingMemoryManager.class);
+        when(workingMemoryManager.get("session-a")).thenReturn(workingMemory);
+        ReflectionTestUtils.setField(service, "workingMemoryManager", workingMemoryManager);
+
+        service.consolidate("tenant-a", "session-a");
+
+        verify(episodeRepository, never()).save(any(AgentEpisodeEntity.class));
+        verify(episodeRepository, never()).existsByTenantIdAndSessionId(anyString(), anyString());
+        verify(eventRepository, never()).markProcessed(anyList());
+    }
+
+    @Test
+    void legacyConsolidationWithoutBoundTenantIsRejected() {
+        service.consolidate("session-a");
+
+        verifyNoInteractions(eventRepository, episodeRepository, transactionManager);
     }
 
     @Test

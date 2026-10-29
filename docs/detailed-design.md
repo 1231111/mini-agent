@@ -595,7 +595,48 @@ Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 
 工作记忆：MySQL `agent_working_memories` + Redis `wm:{sessionId}`，TTL `agent.replica.memory-ttl-seconds` 默认 86400。向量：`agent.memory.vector.enabled=true`，`backend=local` 或 `milvus`（维度 1792）。
 
-**暂不纳入阶段一**：`experience_clusters` 成员关系表/CAS 合并拆分、`skill_applications` 节点级应用记录、云 API Gateway/Continuation Token。当前工程没有这些模型或埋点；不得将 JSON task id 数组或 `(tenant_id, skill_id, task_id)` 唯一键写成已验收设计。后续实现簇时成员必须独立持久化并有唯一成员键与版本/CAS；技能应用必须以可区分的节点/事件 ID 记录，才能表示同一任务内多次或部分应用。
+**Procedure 应用闭环（已实现）**：作用域固定为 **USER**（`tenant_id + userId`），不用 PROJECT —— 对话执行只有 `OwnerContext(userId, tenantId)`，没有可信的 `projectId`，而 `MemoryController` 也只授权 USER/SESSION。
+
+**SOP 身份与版本（写入侧契约）**：identity 是 `(tenant_id, scope_type, scope_id, trim + lowercase 后的 name)`，`procedure_version` 是这一行的属性，**不是** identity 的一部分。`ux_ap_identity`（tenant_id, scope_type, scope_id, name）在库层面禁止同名两行 —— 桌面档由 `ddl-auto: update` 从 `AgentProcedureEntity` 的注解建，prod 档 `ddl-auto: validate` 不校验唯一键、由 V13 迁移建，两处必须同名同列。`ProcedureUpsertService` 是唯一写入点：
+
+- 内容（description + preconditions + steps + successConditions）与库里一致 → 幂等写，不升版、不动计数。
+- 内容变了 → 原地升版：**同 id**、`procedure_version + 1`、`success_count`/`attempt_count`/`success_rate`/`usage_count` 全部清零。id 不变是因为已经发出去、指向这条 SOP 的节点引用必须继续解析到它；计数清零是因为这些计数描述的是「**这一版内容**被用过几次、成了几次」，v1 的成绩不属于 v2。旧版本的证据按 `procedure_version` 留在 `agent_procedure_applications` 里，没丢。
+- `importance` 与名称拼写只走元数据更新：重要度是排序权重，不是 SOP 内容，改它不该清掉这一版的成功率。
+- 同名的 `ARCHIVED` 行被**复用**并升版复活，不新建行 —— 唯一身份不允许同名两行。
+- 并发：首次写入靠唯一键裁决（插入放在 `REQUIRES_NEW` 独立事务里，撞键只回滚内层），已有行靠 `procedure_version` 做 CAS，最多重试 3 次；每次重试前重读并重新判断内容，重试用尽报 `MEMORY_WRITE_FAILED`，不静默丢写入。
+- V13 迁移负责存量：先按同一套归一化规则把同名重复行改名成 `<原名> #archived-<id>` 并置 `ARCHIVED`，再建唯一索引。**不把被合并行的计数累加到保留行** —— 应用事实仍按原 `procedure_id` 记账，把计数搬过去会让「统计可由事实重算」这条不变量失效。
+
+链路如下：
+
+1. `DefaultMemoryManager.findForCurrentOwner` 按 USER scope 查 `ACTIVE` Procedure，转成 `ProcedurePromptInput`（id、version、名称、前置条件、步骤、成功条件）；`GoalCompiler` 经 `ProcedurePromptPort` 把候选注入规划提示，模型在节点上声明 `procedureId` / `procedureVersion`。写入侧由 `ProcedureUpsertService` 保证同一身份的 `ACTIVE` 行唯一，所以候选里不会出现同名两行。
+2. `GoalCompiler.parseGraph` **只接受本轮候选里存在的 id+version**：非法或缺失的声明直接丢弃，节点退化为不挂 Procedure。不猜、不补、不按名称模糊匹配。
+3. `TaskNode` 保存 `procedureId/procedureVersion`，所有 `with*` 变换都保留引用。`PlannerStateStore.sameGraphSemantics` 目前**不**比较这两个字段 —— 它们是绑定元数据，变化不应触发 planVersion 冲突。
+4. 节点终态由 `PlanningLoop.settleNode` 上报 `NodeTerminalCommitPort`，只在 `NODE_SUCCESS` / `NODE_FAILED` 和图终验失败处调用。`TOOL_EXECUTION` 的成败**不参与**结算：工具成功不等于节点验收成功。
+5. `ProcedureApplicationSettlementService` 写 `agent_procedure_applications`，唯一键 `ux_apa_attempt`（tenant_id, user_id, session_id, task_id, node_id, procedure_id, procedure_version）保证重放、恢复、重复终验只结算一次。
+6. 统计是**派生值**：`bumpSettlement` 只累加 `success_count/attempt_count/usage_count`，`refreshSuccessRate` 再用计数重算 `success_rate`。**不能把比率写进同一条 UPDATE**：MySQL 按赋值列表从左到右求值，`successCount` 已被前一条赋值加过 delta，表达式里再 `+ delta` 就是双倍计入（首次成功会得到 2.0）。
+7. 幂等**不许**用 `INSERT ... ON DUPLICATE KEY UPDATE`：H2（桌面档）即使 `MODE=MySQL` 也报 SQL 语法错误（实测）。实现是「`REQUIRES_NEW` 独立事务内先查后插 + 唯一键兜底 + `DataIntegrityViolationException` 视为已结算」；冲突只回滚内层事务，外层统计不受影响。
+8. 失败隔离：Procedure 被删除、版本升级或归属变更时 `bumpSettlement` 返回 0，只跳过统计并 warn，**不回滚**已提交的应用事实；`settleNode` 整体 try-catch，记忆侧故障不得让已通过验收的节点变成任务失败。
+
+9. `ProcedureApplicationSettlementService.commit` 在成功率重算后，经 `ProcedureGovernanceService` 新事务触发检查。默认判据：当前版本累计 `attempt_count >= 10` 且 `success_rate <= 0.20`；阈值可由 `agent.memory.procedure.governance.enabled/min-attempts/archive-max-success-rate` 覆盖。命中时把 `ACTIVE` 改为 `ARCHIVED`，停止向规划器注入；只有新结算触发检查，重复结算被幂等键挡住，不重复治理。写入的 CAS 同时检查 tenant/owner/version/status/样本数/比率，过期判定更新 0 行。治理异常只 warn，不影响已经完成的节点和结算事实。第 1 步只做可逆的停止推荐，不自动改 SOP 内容；同名内容写入时 `ProcedureUpsertService` 复用该行、升版并复活。
+
+**第 1 步治理规则的边界**：10 次与 20% 是保守默认运行参数，不是经过统计学验证的普适最佳值；阈值可配置，功能可总开关。第 1 步只会发现「长期明显低成功率」并归档。
+
+**第 2 步失败经验提案（已实现）**：任务 Episode 被持久化后，只有同时满足下列证据门槛才会生成 `agent_procedure_rewrite_proposals`：Episode 结果为 `FAILURE`、`resolution` 非空且通过 `SecurityScanner`、同租户/用户/会话/任务恰有一条 `FAILURE` 的 `agent_procedure_applications`、Procedure 当前版本与该应用版本一致、当前版本至少达到自动治理样本数且成功率不高于归档阈值。任务级 Episode 无法区分同任务多个 Procedure 应用；零条或多条匹配一律不归因、不提案。
+
+提案唯一键为 `(tenant_id, procedure_id, base_version, episode_id)`。提案保存旧内容快照、候选内容与 `episode_id/application_id/node_id/action_id` 证据；候选只把失败 Episode 的结构化 `resolution` 追加为步骤，不调用模型自行编造。提案文本长度受限并经过安全扫描。状态为 `PENDING/APPROVED/REJECTED/CONFLICT`，审核 API 只允许所属用户操作自己的提案。批准时以 `base_version` 执行原地 CAS 升版并清零本版统计；若 Procedure 已被升级、归档或删除，则提案记为 `CONFLICT`，不覆盖新版本。审批决策、SOP 升版和提案状态在一个事务内完成。
+
+此阶段是**人工审核内容演化**，不是无人值守自动写 SOP。`chat.html` 设置面板已提供提案列表、候选步骤与证据展示，以及批准/拒绝操作；接口为 `GET /v1/memory/procedure-proposals` 与 `POST /v1/memory/procedure-proposals/{id}/review`。审核升版前会保存 `PROPOSAL_APPROVAL` revision。独立验证记录由另一认证用户提交，记录绑定候选 SHA-256；`automatic-acceptance-enabled` 默认 `false`。该证据目前是授权验证者提交的结果，不是隔离执行器自动产出的测试报告，因此不能据此宣称具备安全的无人值守自动采纳。已用 H2 持久化测试验证验证记录、候选哈希变化失效、租户隔离、作者禁止验证和 proposal/verifier 唯一约束。`experience_clusters` 已有 USER/PROJECT 成员模型、Episode 成员唯一约束、版本 CAS 的服务方法和认证 REST 操作；真实数据库下 merge/split CAS 回滚、项目会话绑定和跨租户授权均已有 H2 持久化测试。真实 MySQL 行为仍未实测。
+
+**工具执行观测（与 Procedure 结算无关）**：模型返回真实 tool call 列表后，主循环按该列表顺序解析 `ExecutionTurnContext.ActionBinding`，并以 provider call ID 固定绑定。`ToolRequest`、`ActionJournal` 与 `TOOL_EXECUTION` 共用同一 `actionId/nodeId`；执行事实事件的 payload 在有 planner binding 时才附加这两个字段。无规划的直接调用不虚构关联；被长度截断保护跳过的调用仍记录失败事实，但不附 planner binding。这条链路只服务 Episode 提炼与失败统计，**不参与** Procedure 应用事实与成功率结算。
+
+**已知边界（不得当成已实现）**：以下是当前仍未完成的能力或验证，不应把已存在的实体/配置误当成闭环已经接通。第 1 步自动治理完成低成功率 SOP 归档；第 2 步将既有结构化 resolution 形成待审核候选；独立验证目前是认证验证者提交记录，不是自动执行器；无人值守自动采纳仍未实现。
+
+- `PROJECT` scope 的项目表、成员 ACL、会话绑定、解绑入口和运行时可信 `projectId` 解析已实现；Controller 与跨租户/成员运行链路仍需集成测试，尚不能以实体存在代替端到端授权验证。
+- `agent_procedure_revisions` 已保存 Procedure 内容快照，首次创建、一般升版及提案批准路径接入 capture；`ProcedureRevisionService.rollback` 是服务方法，尚未开放 REST API。H2 已验证 capture/rollback JSON 数组往返，真实 MySQL 尚未验证。
+- 大小写变体：MySQL 默认排序规则（utf8mb4_unicode_ci）本身不区分大小写，`ux_ap_identity` 在 MySQL 上连大小写变体一起拦；H2（桌面档）唯一索引区分大小写，只能靠写入路径的身份归一拦截。写入路径两边一致，**直连库改数据时不保证**。
+- `experience_clusters` 的服务和 REST 操作已实现，但 merge/split 的唯一成员约束、事务回滚和并发 CAS 尚缺真实 H2/MySQL 持久化测试；V15 migration 当前已覆盖 H2 MySQL mode 的建表与重复执行。
+- `agent_procedure_candidate_validations` 由 V16 创建，唯一键限制每个 proposal/verifier 只有一条记录；验证结果按 proposal、tenant、候选哈希查询。自动采纳开关默认关闭，当前没有从巩固 worker 到自动采纳的执行链路。
+- V13 合并存量重复行时只改名归档，不改写 `agent_procedure_applications.procedure_id`；被归档行的历史应用事实仍指向它自己。
 
 禁止：上下文绕过 `MemoryService` 直接查表；巩固放在 SSE `end` 之前同步等待。
 

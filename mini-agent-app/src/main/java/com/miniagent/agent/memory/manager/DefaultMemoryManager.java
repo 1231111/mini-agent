@@ -10,8 +10,12 @@ import com.miniagent.agent.memory.lifecycle.WorkingMemoryManager;
 import com.miniagent.agent.memory.repository.*;
 import com.miniagent.agent.memory.retriever.MilvusHybridSearchEngine;
 import com.miniagent.common.embedding.SharedEmbeddingModel;
+import com.miniagent.common.context.OwnerContext;
+import com.miniagent.agent.planner.ProcedurePromptInput;
+import com.miniagent.agent.planner.ProcedurePromptPort;
 import com.miniagent.common.ErrorCode;
 import com.miniagent.common.exception.BusinessException;
+import org.apache.commons.lang3.StringUtils;
 import com.miniagent.memory.MemoryManager;
 import com.miniagent.memory.SecurityScanner;
 import com.miniagent.memory.lifecycle.ForgettingPolicy;
@@ -36,7 +40,7 @@ import java.util.stream.Collectors;
  * 默认记忆管理器：编排写入、检索、生命周期各组件。
  */
 @Service
-public class DefaultMemoryManager implements MemoryManager {
+public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort {
 
     private static final Logger log = LoggerFactory.getLogger(DefaultMemoryManager.class);
 
@@ -72,6 +76,9 @@ public class DefaultMemoryManager implements MemoryManager {
 
     @Autowired
     private AgentProcedureRepository procedureRepository;
+
+    @Autowired
+    private ProcedureUpsertService procedureUpsertService;
 
     @Autowired
     private AgentEventRepository eventRepository;
@@ -326,14 +333,31 @@ public class DefaultMemoryManager implements MemoryManager {
         }
 
         // 4. 查询可用 SOP
-        if (ctx.getProjectId() != null && ctx.getGoal() != null) {
-            List<AgentProcedureEntity> procs = procedureRepository.findByTenantIdAndScopeTypeAndScopeIdAndStatus(
-                ctx.getTenantId(),
-                AgentMemoryEntryEntity.ScopeType.PROJECT,
-                ctx.getProjectId(),
-                AgentMemoryEntryEntity.Status.ACTIVE);
-            for (AgentProcedureEntity p : procs) {
-                context.addSkill(p.getName() + ": " + (p.getDescription() != null ? p.getDescription() : ""));
+        //
+        // 作用域必须与 ProcedurePromptPort.findForCurrentOwner 一致：那条路径是
+        // 规划器拿候选的唯一来源，只认 USER scope（tenant + userId）。这里若继续只查
+        // PROJECT，对话执行又没有 projectId，结果就是「用户写的 SOP 在规划器里可见、
+        // 在系统提示的可用方法里不可见」—— 同一份记忆两个视图，排查时会被引到错方向。
+        // 有项目上下文时仍以 PROJECT 为准，没有才回落到 USER。
+        if (ctx.getGoal() != null) {
+            AgentMemoryEntryEntity.ScopeType sopScope = null;
+            String sopScopeId = null;
+            if (StringUtils.isNotBlank(ctx.getProjectId())) {
+                sopScope = AgentMemoryEntryEntity.ScopeType.PROJECT;
+                sopScopeId = ctx.getProjectId();
+            } else if (StringUtils.isNotBlank(ctx.getUserId())) {
+                sopScope = AgentMemoryEntryEntity.ScopeType.USER;
+                sopScopeId = ctx.getUserId();
+            }
+            if (sopScope != null) {
+                List<AgentProcedureEntity> procs = procedureRepository
+                        .findByTenantIdAndScopeTypeAndScopeIdAndStatus(
+                                ctx.getTenantId(), sopScope, sopScopeId,
+                                AgentMemoryEntryEntity.Status.ACTIVE);
+                for (AgentProcedureEntity p : procs) {
+                    context.addSkill(p.getName() + ": "
+                            + (p.getDescription() != null ? p.getDescription() : ""));
+                }
             }
         }
 
@@ -419,22 +443,43 @@ public class DefaultMemoryManager implements MemoryManager {
 
     @Override
     @Transactional
-    public void writeProcedure(Procedure procedure) {
+    public Procedure writeProcedure(Procedure procedure) {
         // SOP 会以"可用方法"注入提示，是"持久化指令"最容易被忽视的一条路径
         requireSafeForPrompt(
                 procedure.getName() + " " + procedure.getDescription(),
                 null, "程序性记忆(SOP)");
-        AgentProcedureEntity entity = new AgentProcedureEntity();
-        entity.setTenantId(procedure.getTenantId());
-        entity.setScopeType(AgentMemoryEntryEntity.ScopeType.valueOf(procedure.getScope().scopeType().name()));
-        entity.setScopeId(procedure.getScope().scopeId());
-        entity.setName(procedure.getName());
-        entity.setDescription(procedure.getDescription());
-        entity.setStepsJson(writeJson(procedure.getSteps()));
-        entity.setPreconditionsJson(writeJson(procedure.getPreconditions()));
-        entity.setSuccessConditionsJson(writeJson(procedure.getSuccessConditions()));
-        entity.setImportance(procedure.getImportance());
-        procedureRepository.save(entity);
+        // 身份判定、升版、计数清零都在 ProcedureUpsertService 里，这里只管安全闸门与模型转换。
+        ProcedureUpsertService.Upserted upserted = procedureUpsertService.upsert(procedure);
+        return toProcedureModel(upserted.entity());
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<ProcedurePromptInput> findForCurrentOwner(String query) {
+        OwnerContext owner = OwnerContext.capture();
+        if (owner.userId() == null || owner.tenantId() == null || owner.tenantId().isBlank()) {
+            return List.of();
+        }
+        String projectId = OwnerContext.currentProjectId();
+        List<AgentProcedureEntity> candidates = new ArrayList<>(procedureRepository
+                .findByTenantIdAndScopeTypeAndScopeIdAndStatus(owner.tenantId(),
+                        AgentMemoryEntryEntity.ScopeType.USER, String.valueOf(owner.userId()),
+                        AgentMemoryEntryEntity.Status.ACTIVE));
+        if (projectId != null && !projectId.isBlank()) {
+            candidates.addAll(procedureRepository.findByTenantIdAndScopeTypeAndScopeIdAndStatus(
+                    owner.tenantId(), AgentMemoryEntryEntity.ScopeType.PROJECT, projectId,
+                    AgentMemoryEntryEntity.Status.ACTIVE));
+        }
+        return candidates.stream()
+                .filter(p -> query == null || query.isBlank()
+                        || p.getName().toLowerCase(Locale.ROOT).contains(query.toLowerCase(Locale.ROOT))
+                        || Objects.toString(p.getDescription(), "").toLowerCase(Locale.ROOT)
+                                .contains(query.toLowerCase(Locale.ROOT)))
+                .limit(20)
+                .map(p -> new ProcedurePromptInput(p.getId(), p.getProcedureVersion(), p.getName(),
+                        p.getDescription(), parseJsonList(p.getPreconditionsJson()),
+                        parseJsonList(p.getStepsJson()), parseJsonList(p.getSuccessConditionsJson())))
+                .toList();
     }
 
     @Override
@@ -483,6 +528,11 @@ public class DefaultMemoryManager implements MemoryManager {
     @Override
     public void consolidate(String sessionId) {
         consolidationService.consolidate(sessionId);
+    }
+
+    @Override
+    public void consolidate(String tenantId, String sessionId) {
+        consolidationService.consolidate(tenantId, sessionId);
     }
 
     @Override
@@ -631,6 +681,7 @@ public class DefaultMemoryManager implements MemoryManager {
     private Procedure toProcedureModel(AgentProcedureEntity entity) {
         Procedure proc = new Procedure();
         proc.setId(entity.getId());
+        proc.setVersion(entity.getProcedureVersion());
         proc.setTenantId(entity.getTenantId());
         proc.setScope(new MemoryScope(entity.getTenantId(),
             MemoryScope.ScopeType.valueOf(entity.getScopeType().name()), entity.getScopeId()));
@@ -641,7 +692,12 @@ public class DefaultMemoryManager implements MemoryManager {
         proc.setSuccessConditions(parseJsonList(entity.getSuccessConditionsJson()));
         proc.setUsageCount(entity.getUsageCount() != null ? entity.getUsageCount() : 0);
         proc.setSuccessRate(entity.getSuccessRate() != null ? entity.getSuccessRate() : 0);
+        proc.setAttemptCount(entity.getAttemptCount() != null ? entity.getAttemptCount() : 0L);
+        proc.setSuccessCount(entity.getSuccessCount() != null ? entity.getSuccessCount() : 0L);
         proc.setImportance(entity.getImportance() != null ? entity.getImportance() : 0.5);
+        if (entity.getStatus() != null) {
+            proc.setStatus(MemoryStatus.valueOf(entity.getStatus().name()));
+        }
         return proc;
     }
 

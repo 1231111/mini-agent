@@ -66,6 +66,29 @@ class ToolPipelineTest {
     }
 
     @Test
+    void suppliedPlannerBindingControlsJournalNodeAndIdempotencyKey() {
+        ToolRegistry registry = new ToolRegistry();
+        AtomicInteger calls = new AtomicInteger();
+        registry.register("write_file", "w", Map.of(), x -> {
+            calls.incrementAndGet();
+            return "{\"ok\":true}";
+        });
+        Fixture fixture = new Fixture("allow", registry);
+        ExecutionTurnContext.open("s", 8L, List.of(), () -> true);
+        var binding = new ExecutionTurnContext.ActionBinding(
+                "action-1", "planner-node-4", "write_file", "idem-key-5");
+
+        ToolInvocation first = fixture.pipeline.invoke(ToolRequest.of("s", "write_file", "{}", 2, "r")
+                .withActionBinding(binding));
+        ToolInvocation replay = fixture.pipeline.invoke(ToolRequest.of("s", "write_file", "{}", 2, "r2")
+                .withActionBinding(binding));
+
+        assertTrue(first.result().isSuccess());
+        assertTrue(replay.text().contains("deduplicated"));
+        assertEquals(1, calls.get());
+    }
+
+    @Test
     void hardGateDoesNotExecuteTool() {
         ToolRegistry registry = new ToolRegistry();
         AtomicInteger calls = new AtomicInteger();

@@ -51,6 +51,17 @@ class MemoryToolExecutionSinkTest {
     }
 
     @Test
+    void plannerActionBindingIsPersistedWithExecutionEvent() {
+        var binding = new com.miniagent.agent.core.ExecutionTurnContext.ActionBinding(
+                "action-7", "node-3", "write_file", "idem-9");
+        sink.onToolExecuted("s1", 3, "write_file", ToolStatus.SUCCESS, "ok", binding);
+
+        AgentEvent event = lastEvent();
+        assertEquals("action-7", event.getPayload().get("actionId"));
+        assertEquals("node-3", event.getPayload().get("nodeId"));
+    }
+
+    @Test
     void failureIsRecordedWithErrorOnly() {
         sink.onToolExecuted("s1", 4, "exec_command", ToolStatus.FAILED, "命令执行失败");
 

@@ -7,6 +7,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public record OwnerContext(Long userId, String tenantId) {
     private static final ThreadLocal<Long> CURRENT_USER = new ThreadLocal<>();
     private static final ThreadLocal<String> CURRENT_TENANT = new ThreadLocal<>();
+    private static final ThreadLocal<String> CURRENT_PROJECT = new ThreadLocal<>();
 
     @FunctionalInterface
     public interface Scope extends AutoCloseable {
@@ -16,6 +17,15 @@ public record OwnerContext(Long userId, String tenantId) {
 
     public static OwnerContext capture() {
         return new OwnerContext(CURRENT_USER.get(), CURRENT_TENANT.get());
+    }
+
+    public static String currentProjectId() {
+        return CURRENT_PROJECT.get();
+    }
+
+    public static void setCurrentProjectId(String projectId) {
+        if (projectId == null || projectId.isBlank()) CURRENT_PROJECT.remove();
+        else CURRENT_PROJECT.set(projectId.trim());
     }
 
     public static void setCurrentUser(Long userId) {
@@ -62,12 +72,16 @@ public record OwnerContext(Long userId, String tenantId) {
 
     public static Scope bind(OwnerContext context) {
         OwnerContext previous = capture();
+        String previousProject = CURRENT_PROJECT.get();
         OwnerContext next = Objects.requireNonNullElse(context, new OwnerContext(null, null));
         restore(next);
+        CURRENT_PROJECT.remove();
         AtomicBoolean closed = new AtomicBoolean();
         return () -> {
             if (closed.compareAndSet(false, true)) {
                 restore(previous);
+                if (previousProject == null) CURRENT_PROJECT.remove();
+                else CURRENT_PROJECT.set(previousProject);
             }
         };
     }

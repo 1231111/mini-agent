@@ -11,6 +11,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.memory.entity.AgentEventEntity;
 import com.miniagent.agent.memory.entity.AgentEpisodeEntity;
+import com.miniagent.agent.memory.manager.ProcedureRewriteProposalService;
 import com.miniagent.agent.memory.repository.AgentEventRepository;
 import com.miniagent.agent.memory.repository.AgentEpisodeRepository;
 import com.miniagent.memory.MemoryKeys;
@@ -62,6 +63,9 @@ public class DefaultConsolidationService implements ConsolidationService {
     @Autowired
     private AgentEpisodeRepository episodeRepository;
 
+    @Autowired(required = false)
+    private ProcedureRewriteProposalService rewriteProposalService;
+
     @Autowired
     private AgentChatTaskLock episodeTaskLock;
 
@@ -94,23 +98,32 @@ public class DefaultConsolidationService implements ConsolidationService {
 
     @Override
     public void consolidate(String sessionId) {
-        if (sessionId == null || sessionId.isBlank()) {
+        String tenantId = OwnerContext.currentTenantId();
+        if (tenantId == null || tenantId.isBlank()) {
+            log.warn("拒绝未绑定租户的会话巩固: session={}", sessionId);
+            return;
+        }
+        consolidate(tenantId, sessionId);
+    }
+
+    public void consolidate(String tenantId, String sessionId) {
+        if (tenantId == null || tenantId.isBlank() || sessionId == null || sessionId.isBlank()) {
             return;
         }
         try (var ignoredModel = bindSessionModel(sessionId)) {
-            List<AgentEventEntity> pending = eventRepository.findBySessionIdOrderByCreatedAtAsc(sessionId)
+            List<AgentEventEntity> pending = eventRepository
+                    .findByTenantIdAndSessionIdOrderByCreatedAtAsc(tenantId, sessionId)
                     .stream().filter(event -> !Boolean.TRUE.equals(event.getProcessed())).toList();
             Map<String, List<AgentEventEntity>> byTask = pending.stream()
                     .filter(event -> event.getTaskId() != null && !event.getTaskId().isBlank())
-                    .collect(Collectors.groupingBy(event -> event.getTenantId() + "\u0000" + event.getTaskId()));
+                    .collect(Collectors.groupingBy(AgentEventEntity::getTaskId));
             for (List<AgentEventEntity> taskEvents : byTask.values()) {
-                AgentEventEntity first = taskEvents.get(0);
-                consolidateTask(first.getTenantId(), sessionId, first.getTaskId());
+                consolidateTask(tenantId, sessionId, taskEvents.get(0).getTaskId());
             }
             boolean hasLegacy = pending.stream().anyMatch(event ->
                     event.getTaskId() == null || event.getTaskId().isBlank());
             if (hasLegacy || pending.isEmpty()) {
-                doConsolidate(sessionId);
+                doConsolidate(tenantId, sessionId);
             }
         }
     }
@@ -166,17 +179,26 @@ public class DefaultConsolidationService implements ConsolidationService {
         }
 
         TransactionTemplate transaction = new TransactionTemplate(transactionManager);
-        transaction.executeWithoutResult(status -> {
-            episodeRepository.save(extracted);
+        AgentEpisodeEntity persisted = transaction.execute(status -> {
+            AgentEpisodeEntity saved = episodeRepository.save(extracted);
             eventRepository.markProcessed(unprocessed.stream().map(AgentEventEntity::getId).toList());
+            return saved;
         });
+        if (rewriteProposalService != null) {
+            try {
+                rewriteProposalService.proposeFromFailureEpisode(persisted);
+            } catch (Exception e) {
+                log.warn("Procedure 改写提案生成失败，不影响 Episode 巩固: episode={}", persisted.getId(), e);
+            }
+        }
     }
 
-    private void doConsolidate(String sessionId) {
+    private void doConsolidate(String tenantId, String sessionId) {
         // 1. 先读工作记忆：它挂在 Redis TTL 上，是本流程里最易失的数据，优先抢救
-        WorkingMemory workingMemory = loadWorkingMemory(sessionId);
+        WorkingMemory workingMemory = loadWorkingMemory(tenantId, sessionId);
 
-        List<AgentEventEntity> events = eventRepository.findBySessionIdOrderByCreatedAtAsc(sessionId);
+        List<AgentEventEntity> events = eventRepository
+                .findByTenantIdAndSessionIdOrderByCreatedAtAsc(tenantId, sessionId);
         List<AgentEventEntity> unprocessed = events.stream()
             .filter(e -> !Boolean.TRUE.equals(e.getProcessed()))
             .filter(e -> e.getTaskId() == null || e.getTaskId().isBlank())
@@ -186,16 +208,18 @@ public class DefaultConsolidationService implements ConsolidationService {
             // 事件已全部处理过。若工作记忆仍有实质任务状态、且该 session 尚无 Episode，
             // 补一次纯状态结转 —— 否则任务目标会随 Redis TTL 一起消失。
             // hasEpisode 用于防重：定时 Worker 反复调用也不会写出重复 Episode。
-            if (hasSubstance(workingMemory) && !hasEpisode(sessionId)) {
+            if (workingMemory != null && hasSubstance(workingMemory)
+                    && !hasEpisode(tenantId, sessionId)) {
                 try {
                     AgentEpisodeEntity carried = extractEpisode(List.of(), workingMemory);
                     if (carried != null) {
                         episodeRepository.save(carried);
                         workingMemoryManager.touch(sessionId);
-                        log.info("工作记忆结转: session={}, goal={}", sessionId, carried.getTaskSummary());
+                        log.info("工作记忆结转: tenant={}, session={}, goal={}",
+                                tenantId, sessionId, carried.getTaskSummary());
                     }
                 } catch (Exception e) {
-                    log.error("工作记忆结转失败: session={}", sessionId, e);
+                    log.error("工作记忆结转失败: tenant={}, session={}", tenantId, sessionId, e);
                 }
             }
             return;
@@ -212,7 +236,8 @@ public class DefaultConsolidationService implements ConsolidationService {
                     eventRepository.markProcessed(ids);
                 });
                 workingMemoryManager.touch(sessionId);
-                log.info("巩固完成: session={}, episode={}", sessionId, episode.getTaskSummary());
+                log.info("巩固完成: tenant={}, session={}, episode={}",
+                        tenantId, sessionId, episode.getTaskSummary());
             } else {
                 List<Long> ids = unprocessed.stream().map(AgentEventEntity::getId).collect(Collectors.toList());
                 new TransactionTemplate(transactionManager)
@@ -224,9 +249,18 @@ public class DefaultConsolidationService implements ConsolidationService {
     }
 
     /** 读工作记忆；失败不影响主流程（Redis 不可用时退化为无工作记忆）。 */
-    private WorkingMemory loadWorkingMemory(String sessionId) {
+    private WorkingMemory loadWorkingMemory(String tenantId, String sessionId) {
         try {
-            return workingMemoryManager.get(sessionId);
+            WorkingMemory workingMemory = workingMemoryManager.get(sessionId);
+            if (workingMemory == null) {
+                return null;
+            }
+            if (!tenantId.equals(workingMemory.getTenantId())) {
+                log.warn("工作记忆租户不匹配，跳过状态结转: tenant={}, session={}, storedTenant={}",
+                        tenantId, sessionId, workingMemory.getTenantId());
+                return null;
+            }
+            return workingMemory;
         } catch (Exception e) {
             log.debug("读取工作记忆失败: session={}, {}", sessionId, e.getMessage());
             return null;
@@ -244,13 +278,12 @@ public class DefaultConsolidationService implements ConsolidationService {
         return hasGoal || hasDone || hasFailed;
     }
 
-    /** 该 session 是否已有 Episode（防止纯状态结转重复执行）。 */
-    private boolean hasEpisode(String sessionId) {
+    /** 该 tenant/session 是否已有 Episode（防止纯状态结转重复执行）。 */
+    private boolean hasEpisode(String tenantId, String sessionId) {
         try {
-            List<AgentEpisodeEntity> existing = episodeRepository.findBySessionId(sessionId);
-            return existing != null && !existing.isEmpty();
+            return episodeRepository.existsByTenantIdAndSessionId(tenantId, sessionId);
         } catch (Exception e) {
-            log.debug("查询已有 Episode 失败，保守认为已存在: session={}", sessionId);
+            log.debug("查询已有 Episode 失败，保守认为已存在: tenant={}, session={}", tenantId, sessionId);
             return true;
         }
     }

@@ -49,6 +49,13 @@ public class MemoryToolExecutionSink implements ToolExecutionSink {
     @Override
     public void onToolExecuted(String sessionId, int turn, String toolName,
                                ToolStatus status, String resultText) {
+        onToolExecuted(sessionId, turn, toolName, status, resultText, null);
+    }
+
+    @Override
+    public void onToolExecuted(String sessionId, int turn, String toolName,
+                               ToolStatus status, String resultText,
+                               com.miniagent.agent.core.ExecutionTurnContext.ActionBinding binding) {
         if (memoryManager == null) {
             return;
         }
@@ -63,7 +70,7 @@ public class MemoryToolExecutionSink implements ToolExecutionSink {
             event.setStatus(failed
                     ? AgentEvent.EventStatus.FAILED
                     : AgentEvent.EventStatus.SUCCESS);
-            event.setPayload(buildPayload(toolName, turn, failed, resultText));
+            event.setPayload(buildPayload(toolName, turn, failed, resultText, binding));
             memoryManager.recordEvent(event);
         } catch (Exception e) {
             log.debug("工具执行事件上报失败: {} {}", toolName, e.getMessage());
@@ -71,10 +78,15 @@ public class MemoryToolExecutionSink implements ToolExecutionSink {
     }
 
     private Map<String, Object> buildPayload(String toolName, int turn,
-                                             boolean failed, String resultText) {
+                                             boolean failed, String resultText,
+                                             com.miniagent.agent.core.ExecutionTurnContext.ActionBinding binding) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("tool", toolName);
         payload.put("turn", turn);
+        if (binding != null) {
+            payload.put("actionId", binding.actionId());
+            payload.put("nodeId", binding.nodeId());
+        }
         if (failed) {
             payload.put("error", resultText);
         } else {

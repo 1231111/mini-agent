@@ -7,6 +7,7 @@ import java.util.*;
  */
 public class Procedure {
     private Long id;
+    private Integer version;
     private String tenantId;
     private MemoryScope scope;
     private String name;
@@ -16,6 +17,14 @@ public class Procedure {
     private List<String> successConditions;
     private int usageCount;
     private double successRate;
+    /**
+     * 当前版本被结算过的节点数与其中成功的节点数。
+     *
+     * <p>只有 {@code successRate} 时无法区分「1 次成功」和「100 次成功」，
+     * 而这个闭环的全部意义就是让「这一版 SOP 到底靠不靠得住」可判断，所以两个原始计数一起给出。</p>
+     */
+    private long attemptCount;
+    private long successCount;
     private double importance;
     private MemoryStatus status;
     private long createdAt;
@@ -37,6 +46,9 @@ public class Procedure {
 
     public Long getId() { return id; }
     public void setId(Long id) { this.id = id; }
+
+    public Integer getVersion() { return version; }
+    public void setVersion(Integer version) { this.version = version; }
 
     public String getTenantId() { return tenantId; }
     public void setTenantId(String tenantId) { this.tenantId = tenantId; }
@@ -64,6 +76,12 @@ public class Procedure {
 
     public double getSuccessRate() { return successRate; }
     public void setSuccessRate(double successRate) { this.successRate = successRate; }
+
+    public long getAttemptCount() { return attemptCount; }
+    public void setAttemptCount(long attemptCount) { this.attemptCount = attemptCount; }
+
+    public long getSuccessCount() { return successCount; }
+    public void setSuccessCount(long successCount) { this.successCount = successCount; }
 
     public double getImportance() { return importance; }
     public void setImportance(double importance) { this.importance = importance; }

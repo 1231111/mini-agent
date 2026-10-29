@@ -10,14 +10,51 @@
 
 ## 0. 总体结论
 
-**这不是玩具项目。** 它已经拥有多数自研 agent 没有的东西：工具执行单一管道（控制面→权限→Hook→幂等日志→注册表）、写前动作日志与强制状态迁移表、执行预算（deadline/工具次数/token/租户配额）、规划图 + CAS 版本 + 派发栅栏、todo 依赖拓扑与产物哈希验收、上下文压缩五阶段流水线、轨迹持久化与 SSE 事件中枢、多实例 Redis 锁与 fencing token、生产启动自检、桌面端 Electron 安全基线。第 5 节逐条列出并给出证据。
+### 2026-10-28 补充：Procedure 应用闭环已实现，经验聚类仍未实现
 
-**但它现在不能按"生产级 agent"交付。** 三类结构性问题：
+**状态：已实现（本轮修复 3 处缺陷），但范围仅到 USER scope 的 Procedure。**
 
-1. **策略层存在，强制层缺失。** 权限模式、exec 策略、路径约束、SSRF 校验、幂等契约都有代码、注释甚至测试，但真实的系统调用路径绕过它们：`edit_file`/`read_file` 直通任意绝对路径；`ACCEPT_EDITS` 把"别问我"提升成"免批执行任意命令"；审批按工具名永久生效；`GuardedHttpClient` 写得完全正确但**零生产调用者**；`SecretCryptoService`（AES-GCM）**不在密钥写入路径上**。
-2. **"没做完"和"做完了"系统分不清。** 规划器耗尽/图死锁/迭代上限/todo 未完成提醒超限，最终都返回一句友好文本，调用方一律 `markCompleted`；完成判定靠正则与子串，验收靠模型自证；失败原因一律显示为"模型连接异常"。
-3. **边界是"约定"不是"机制"。** 工具结果与记忆拼进系统提示词且无信任分隔；子进程继承全部环境变量；审批粒度是工具名；trace 关联在虚拟线程上丢失；workspace 是全局共享目录、无租户维度；`docker compose up` 用仓库已知口令发布 MySQL(root)/Redis/Milvus。
+链路已打通：`DefaultMemoryManager.findForCurrentOwner` 按 USER scope 取 ACTIVE Procedure → `ProcedurePromptPort` 注入规划提示 → 模型在节点声明 `procedureId/procedureVersion` → `GoalCompiler.parseGraph` 只接受本轮候选内的 id+version（非法声明直接丢弃）→ `TaskNode` 保存引用并在所有 `with*` 变换中保留 → `PlanningLoop` 在 `NODE_SUCCESS/NODE_FAILED` 与图终验失败处调用 `NodeTerminalCommitPort` → `ProcedureApplicationSettlementService` 写 `agent_procedure_applications` 并重算 `agent_procedures` 的计数与成功率。`V12__ProcedureApplicationSettlement` 迁移补齐新列、应用表与唯一键，H2/MySQL 通用且幂等。
 
+**本轮修掉的三处缺陷（均已回归验证）**：
+
+| 缺陷 | 机制 | 后果 |
+|---|---|---|
+| 成功率双倍计入 | `settle` 把 `successRate = (successCount + delta) / (attemptCount + 1)` 与 `successCount = successCount + delta` 写在同一条 UPDATE；MySQL 按赋值列表从左到右求值，右侧读到已加过的值 | 首次成功算出 2.0，之后整体偏高 |
+| 幂等 SQL 在桌面档直接报错 | `insertIfAbsent` 用 `INSERT ... ON DUPLICATE KEY UPDATE`；H2 即使 `MODE=MySQL` 也不支持（实测语法错误） | 桌面客户端每次节点结算抛 SQL 异常，应用事实完全落不了库 |
+| 记忆故障反向决定任务成败 | `settleNode` 无异常隔离，`bumpSettlement` 未命中时服务层抛 `IllegalStateException` | 用户删掉/升级 Procedure 会让正在跑的任务被判失败 |
+
+修法：把统计拆成 `bumpSettlement`（只加计数）与 `refreshSuccessRate`（按计数重算，`case when attemptCount > 0` 防除零）；幂等改为 `REQUIRES_NEW` 独立事务内先查后插、唯一键兜底、`DataIntegrityViolationException` 视为已结算；未命中只 warn 不抛，`settleNode` 整体 try-catch。
+
+### 2026-10-28 补充（二）：SOP 身份与原地升版已实现
+
+**状态：已实现，闭环的写入侧不再是「每次新建一行」。**
+
+| 缺陷 | 机制 | 后果 |
+|---|---|---|
+| 同名 SOP 每次写入都新增一行 v1 | `DefaultMemoryManager.writeProcedure` 无条件 `new AgentProcedureEntity()` + `save`，`procedure_version` 恒为 1（列默认值），且 `agent_procedures` 上没有任何唯一约束（V1 baseline 只有 `idx_ap_scope` / `idx_ap_name`） | 同名两行都 ACTIVE，都被 `findForCurrentOwner` 收进规划提示当成两条 Procedure；节点结算只把计数加到其中一行，用户看到的那条成功率永远不动 |
+| 没有版本语义 | 同上 —— 版本从不递增 | `bumpSettlement` 的 `procedure_version = :version` 守卫永远不做区分；`agent_procedure_applications` 分不出 v1 和 v2 |
+| 写接口拿不到写入结果 | `POST /v1/memory/procedures` 返回 `ApiResponse<Void>` | 调用方不知道 id，也无法知道是新建还是升版，闭环的观测面（版本 / 版本内计数）取不到 |
+
+修法：`ProcedureUpsertService` 按 `(tenant_id, scope_type, scope_id, trim+lowercase(name))` 做身份 upsert（内容未变幂等、内容变了原地升版并清零本版计数、`importance` 只走元数据更新、`ARCHIVED` 同名行复用复活），CAS 靠 `procedure_version`；`ux_ap_identity` 唯一索引兜底并发；`V13__ProcedureIdentityUniqueness` 先把存量重复行改名成 `<原名> #archived-<id>` 归档再建索引；写接口返回 `ProcedureWriteResultDTO`（id / version / attemptCount / successCount / successRate）。
+
+**反向验证**：把 `writeProcedure` 临时还原成「new + save」，`writeProcedureEntryPointKeepsIdentityAndBumpsVersion` 立即在第二行被 `ux_ap_identity` 撞成 `DataIntegrityViolationException` —— 这个不变量由库强制，不依赖某一条代码路径。全量 `mini-agent-app` 178 项通过。
+
+**已实现：第 1 步（自动归档）**：新的应用事实写入并完成 `success_rate` 重算后，`ProcedureGovernanceService` 检查该 owner 的 ACTIVE Procedure。默认至少 10 次结算且成功率 ≤ 20% 即 CAS 归档；阈值位于 `agent.memory.procedure.governance`，有总开关。归档只停止推荐，不改 SOP 内容、不删除应用事实；同名 SOP 传入新内容时由 `ProcedureUpsertService` 升版复活。治理异常只 warn，不影响已完成节点。
+
+**已实现：第 2 步（失败经验驱动的审核提案）**：Episode 巩固后，仅在失败 Episode 可唯一关联到同任务唯一失败 Procedure 应用、当前版本样本数/成功率满足治理门槛且存在安全的结构化 resolution 时，生成待审核提案。提案保留基线内容快照和应用证据，按 `(tenant, procedure, base_version, episode)` 幂等。后端支持按 owner 查询、拒绝或批准；批准前写入 Procedure revision，随后以基线版本 CAS 升版，冲突不会覆盖新版本，SOP 升版与提案状态同事务提交。`chat.html` 设置面板已有提案列表与批准/拒绝交互。独立验证记录 API 绑定候选 SHA-256，验证人须为不同认证用户；这仍是验证人提交的证据，不是隔离测试执行器的机器结果。
+
+**仍未完成或未验证**：跨任务类型自动分类判据、隔离执行器对候选步骤的独立验证、自动采纳执行入口。`automatic-acceptance-enabled` 默认关闭。当前候选只追加 Episode 中已存在的 `resolution`，而非自动推断方案。`experience_clusters` 的 H2 merge/split CAS 回滚、PROJECT 会话绑定/解绑/成员移除失效、跨租户绑定拒绝和候选验证记录持久化均已有回归覆盖；真实 MySQL 兼容性仍未实测。
+
+### 2026-10-28 补充（三）：Procedure 低成功率自动归档（自进化第 1 步）
+
+**实现范围**：当前不再只是记录成功率。每个新的、幂等成功结算的 Procedure 节点完成统计重算后，`ProcedureApplicationSettlementService.commit` 在独立事务触发 `ProcedureGovernanceService`：默认该版累计 `attempt_count >= 10` 且 `success_rate <= 0.20` 时，以 tenant/owner/version/status/样本数/成功率为条件 CAS 把 ACTIVE 改为 ARCHIVED，后续规划器不再注入。参数可配置且有总开关。ARCHIVED 行不删除、不改 steps；同名的新内容写入时复用该行、升版、清零本版计数并复活。治理异常隔离，不改变节点结果或已提交的结算事实。
+
+**真库验证**：H2/MySQL mode 覆盖阈值边界、样本不足、成功率高于阈值、tenant/owner 隔离、旧版本 CAS 失败、状态变化 CAS 失败、已归档行不重复处理；服务测试覆盖治理抛异常仍保留成功结算。默认 10/20% 是可覆盖的保守运行值，不是统计学最优阈值。
+
+**第 2 步（失败经验驱动的审核提案）已实现**：失败 Episode 在巩固后只有满足唯一失败应用归因、样本量/成功率门槛和安全检查才创建提案；批准时按基线版本 CAS 升版并同事务更新提案状态。详见上方「已实现：第 2 步」。
+
+**剩余缺口**：经验簇服务和认证 REST 操作、Episode 唯一成员键、PROJECT 授权检查与 CAS 已有初版实现；真实数据库下 merge/split 并发原子性仍待测试。无审核自动采纳执行入口仍未实现，候选验证记录 API 已实现但需要独立执行沙箱，不能把人工提交结果当机器验证。
 ### 严重度分布（独立缺陷数）
 
 | 级别 | 数量 | 代表问题 |

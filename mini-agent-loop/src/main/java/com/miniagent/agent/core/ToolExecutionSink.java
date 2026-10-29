@@ -24,4 +24,10 @@ public interface ToolExecutionSink {
      */
     void onToolExecuted(String sessionId, int turn, String toolName,
                         ToolStatus status, String resultText);
+
+    default void onToolExecuted(String sessionId, int turn, String toolName,
+                                ToolStatus status, String resultText,
+                                ExecutionTurnContext.ActionBinding binding) {
+        onToolExecuted(sessionId, turn, toolName, status, resultText);
+    }
 }

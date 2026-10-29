@@ -34,6 +34,12 @@ public class ChatConversation {
     @Column(name = "workspace_root", length = 1024)
     private String workspaceRoot;
 
+    @Column(name = "project_id", length = 128)
+    private String projectId;
+
+    public String getProjectId() { return projectId; }
+    public void setProjectId(String projectId) { this.projectId = projectId; }
+
     public String getWorkspaceRoot() { return workspaceRoot; }
     public void setWorkspaceRoot(String workspaceRoot) { this.workspaceRoot = workspaceRoot; }
 

@@ -12,6 +12,9 @@ public interface AgentEventRepository extends JpaRepository<AgentEventEntity, Lo
 
     List<AgentEventEntity> findBySessionIdOrderByCreatedAtAsc(String sessionId);
 
+    List<AgentEventEntity> findByTenantIdAndSessionIdOrderByCreatedAtAsc(
+            String tenantId, String sessionId);
+
     List<AgentEventEntity> findByTenantIdAndSessionIdAndTaskIdOrderByCreatedAtAsc(
             String tenantId, String sessionId, String taskId);
 

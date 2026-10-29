@@ -1,5 +1,6 @@
 package com.miniagent.agent.execution;
 
+import com.miniagent.agent.core.ExecutionTurnContext;
 import com.miniagent.agent.core.RunScope;
 
 import java.util.Set;
@@ -16,8 +17,13 @@ public record ToolRequest(
         String runId,
         String probeDeny,
         Set<String> allowedTools,
-        boolean waitForApproval
+        boolean waitForApproval,
+        ExecutionTurnContext.ActionBinding actionBinding
 ) {
+    public ToolRequest(RunScope scope, String name, String arguments, int turn, String runId,
+                       String probeDeny, Set<String> allowedTools, boolean waitForApproval) {
+        this(scope, name, arguments, turn, runId, probeDeny, allowedTools, waitForApproval, null);
+    }
     public ToolRequest {
         name = name == null ? "" : name;
         arguments = arguments == null ? "" : arguments;
@@ -53,14 +59,18 @@ public record ToolRequest(
     }
 
     public ToolRequest withProbeDeny(String deny) {
-        return new ToolRequest(scope, name, arguments, turn, runId, deny, allowedTools, waitForApproval);
+        return new ToolRequest(scope, name, arguments, turn, runId, deny, allowedTools, waitForApproval, actionBinding);
     }
 
     public ToolRequest withAllowedTools(Set<String> names) {
-        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, names, waitForApproval);
+        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, names, waitForApproval, actionBinding);
     }
 
     public ToolRequest withApprovalWait() {
-        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, allowedTools, true);
+        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, allowedTools, true, actionBinding);
+    }
+
+    public ToolRequest withActionBinding(ExecutionTurnContext.ActionBinding binding) {
+        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, allowedTools, waitForApproval, binding);
     }
 }

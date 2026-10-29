@@ -47,6 +47,21 @@ class RunScopeTest {
     }
 
     @Test
+    void executionScopeResolvesRepeatedToolCallsInOriginalCallOrder() {
+        var first = new ExecutionTurnContext.ActionBinding("action-a", "node-a", "read_file", "key-a");
+        var second = new ExecutionTurnContext.ActionBinding("action-b", "node-b", "read_file", "key-b");
+        ExecutionTurnContext.Scope scope = ExecutionTurnContext.open(
+                "s", 1L, List.of(first, second), () -> true);
+
+        var boundFirst = scope.resolve("provider-call-1", "read_file");
+        var boundSecond = scope.resolve("provider-call-2", "read_file");
+
+        assertEquals(first, boundFirst);
+        assertEquals(second, boundSecond);
+        assertEquals(first, scope.resolve("provider-call-1", "read_file"));
+    }
+
+    @Test
     void bindRestoresTaskIdentityAcrossWorkerScope() {
         TaskExecutionContext.set(42L);
         RunScope captured = RunScope.capture();

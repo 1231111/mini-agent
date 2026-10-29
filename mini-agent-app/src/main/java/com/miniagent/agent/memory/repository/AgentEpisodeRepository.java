@@ -31,11 +31,18 @@ public interface AgentEpisodeRepository extends JpaRepository<AgentEpisodeEntity
     @Query("SELECT e FROM AgentEpisodeEntity e WHERE e.sessionId = :sessionId ORDER BY e.createdAt")
     List<AgentEpisodeEntity> findBySessionId(@Param("sessionId") String sessionId);
 
+    List<AgentEpisodeEntity> findByTenantIdAndSessionId(String tenantId, String sessionId);
+
+    boolean existsByTenantIdAndSessionId(String tenantId, String sessionId);
+
     java.util.Optional<AgentEpisodeEntity> findFirstByTenantIdAndSessionIdAndTaskIdOrderByCreatedAtAsc(
             String tenantId, String sessionId, String taskId);
 
     List<AgentEpisodeEntity> findByTenantIdAndSessionIdAndTaskId(
             String tenantId, String sessionId, String taskId);
+
+    java.util.Optional<AgentEpisodeEntity> findByIdAndTenantIdAndUserId(
+            Long id, String tenantId, String userId);
 
     List<AgentEpisodeEntity> findByTenantIdAndUserIdAndTaskSummaryContainingOrderByCreatedAtDesc(
             String tenantId, String userId, String keyword);

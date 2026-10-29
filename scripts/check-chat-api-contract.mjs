@@ -55,6 +55,13 @@ must('grantAskTool 提交 grantToken',
 // 4) 失败时不能只剩一个已作废的「批准并继续」按钮。
 must('存在「知道了」这类只读提示按钮', /id="askNoticeActions"/.test(source));
 
+// 5) Procedure rewrite review UI must keep the server/API contract intact.
+must('打开设置时加载 Procedure 提案', /loadProcedureProposals\(\);/.test(stripped));
+must('候选文本通过 textContent 渲染', /steps\.textContent\s*=/.test(stripped));
+must('审核提交带 Bearer token', /procedure-proposals\/\$\{encodeURIComponent\(id\)\}\/review[\s\S]{0,240}?Authorization:\s*'Bearer '\s*\+\s*token/.test(stripped));
+must('审核请求提交 approved 结果', /body:\s*JSON\.stringify\(\{\s*approved\s*\}\)/.test(stripped));
+must('审核成功后重新加载提案', /await\s+loadProcedureProposals\(\)/.test(stripped));
+
 const pad = (s, n) => s + ' '.repeat(Math.max(0, n - s.length));
 let failed = 0;
 for (const c of checks) {

@@ -74,16 +74,19 @@ public class EventDrivenConsolidationWorker {
                     log.warn("任务经历巩固失败: session={}, task={}", first.getSessionId(), first.getTaskId(), e);
                 }
             }
-            batches.stream()
-                    .filter(event -> event.getSessionId() != null
+            var legacyGroups = batches.stream()
+                    .filter(event -> event.getSessionId() != null && event.getTenantId() != null
                             && (event.getTaskId() == null || event.getTaskId().isBlank()))
-                    .map(AgentEventEntity::getSessionId).distinct().forEach(sessionId -> {
-                        try {
-                            consolidationService.consolidate(sessionId);
-                        } catch (Exception e) {
-                            log.warn("旧版会话经历巩固失败: session={}", sessionId, e);
-                        }
-                    });
+                    .collect(Collectors.groupingBy(event -> event.getTenantId() + "\u0000" + event.getSessionId()));
+            for (List<AgentEventEntity> legacyEvents : legacyGroups.values()) {
+                AgentEventEntity first = legacyEvents.get(0);
+                try {
+                    consolidationService.consolidate(first.getTenantId(), first.getSessionId());
+                } catch (Exception e) {
+                    log.warn("旧版会话经历巩固失败: tenant={}, session={}",
+                            first.getTenantId(), first.getSessionId(), e);
+                }
+            }
         } finally {
             taskLock.unlock(LOCK_NAME);
         }

@@ -2070,6 +2070,10 @@
                 </div>
             </div>
         </div>
+        <div class="settings-section" id="procedureProposalSection">
+            <div class="model-menu-title">SOP 改写审核</div>
+            <div id="procedureProposalList" class="settings-row-meta" aria-live="polite">打开设置后加载</div>
+        </div>
         <div class="settings-section">
             <div class="model-menu-title">外观</div>
             <div class="settings-row">
@@ -2313,6 +2317,91 @@ function toggleTheme() {
 function openSettings() {
     document.getElementById('settingsModal')?.classList.add('show');
     paintThemeUi();
+    loadProcedureProposals();
+}
+
+async function loadProcedureProposals() {
+    const list = document.getElementById('procedureProposalList');
+    if (!list) return;
+    list.textContent = '正在加载…';
+    try {
+        const token = window.MiniAuth?.token();
+        if (!token) throw new Error('登录状态已失效');
+        const response = await fetch('/v1/memory/procedure-proposals', {
+            headers: { Authorization: 'Bearer ' + token }
+        });
+        const body = await response.json();
+        if (!response.ok || !apiSuccess(body)) throw new Error(apiFailureMessage(body, response));
+        const proposals = apiJsonData(body);
+        list.replaceChildren();
+        if (!Array.isArray(proposals) || proposals.length === 0) {
+            list.textContent = '暂无改写提案';
+            return;
+        }
+        proposals.forEach(proposal => {
+            const section = document.createElement('section');
+            section.className = 'settings-section';
+            const title = document.createElement('strong');
+            title.textContent = `${proposal.procedureName || '未命名 SOP'} · v${proposal.baseVersion}`;
+            const status = document.createElement('div');
+            status.className = 'settings-row-meta';
+            status.textContent = `状态：${proposal.status}`;
+            section.append(title, status);
+            const candidate = parseProposalJson(proposal.proposedContentJson);
+            const steps = document.createElement('pre');
+            steps.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:12px;max-height:180px;overflow:auto';
+            steps.textContent = `候选步骤：\n${Array.isArray(candidate.steps) ? candidate.steps.join('\n') : '无'}`;
+            section.appendChild(steps);
+            const evidence = document.createElement('details');
+            const summary = document.createElement('summary'); summary.textContent = '查看失败证据';
+            const evidenceText = document.createElement('pre');
+            evidenceText.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:12px';
+            const parsedEvidence = parseProposalJson(proposal.evidenceJson);
+            evidenceText.textContent = String(parsedEvidence.resolution || '无可展示证据');
+            evidence.append(summary, evidenceText); section.appendChild(evidence);
+            if (proposal.status === 'PENDING') {
+                const actions = document.createElement('div');
+                actions.className = 'model-menu-actions';
+                ['拒绝', '批准'].forEach((label, index) => {
+                    const button = document.createElement('button');
+                    button.type = 'button'; button.textContent = label;
+                    button.className = index ? 'model-btn-primary' : 'model-btn-secondary';
+                    button.onclick = () => reviewProcedureProposal(proposal.id, index === 1, button);
+                    actions.appendChild(button);
+                });
+                section.appendChild(actions);
+            }
+            list.appendChild(section);
+        });
+    } catch (error) {
+        list.textContent = '提案加载失败：' + (error.message || '请求失败');
+    }
+}
+
+function parseProposalJson(value) {
+    try { return JSON.parse(value || '{}'); } catch (_) { return {}; }
+}
+
+function apiJsonData(body) {
+    return body && Object.prototype.hasOwnProperty.call(body, 'data') ? body.data : body;
+}
+
+async function reviewProcedureProposal(id, approved, button) {
+    button.disabled = true;
+    try {
+        const token = window.MiniAuth?.token();
+        const response = await fetch(`/v1/memory/procedure-proposals/${encodeURIComponent(id)}/review`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+            body: JSON.stringify({ approved })
+        });
+        const body = await response.json();
+        if (!response.ok || !apiSuccess(body)) throw new Error(apiFailureMessage(body, response));
+        await loadProcedureProposals();
+    } catch (error) {
+        alert('审核失败：' + (error.message || '请求失败'));
+        button.disabled = false;
+    }
 }
 
 function closeSettings() {
@@ -3150,9 +3239,22 @@ function toggleWsMenu() {
         // 原生目录选择只在桌面壳里有；网页版没有这个能力，按钮直接隐藏
         const pick = document.getElementById('wsPickBtn');
         if (pick) pick.style.display = window.electronAPI?.pickDirectory ? '' : 'none';
-        loadWorkspace();
-        setTimeout(() => document.getElementById('wsInput')?.focus(), 0);
-        setTimeout(() => document.addEventListener('click', closeWsMenuOutside, { once: true }), 0);
+        const unavailable = !currentId;
+        ['wsInput', 'wsPickBtn'].forEach(id => {
+            const control = document.getElementById(id);
+            if (control) control.disabled = unavailable;
+        });
+        document.querySelectorAll('#wsMenu .ws-act').forEach(control => {
+            control.disabled = unavailable;
+        });
+        const hint = document.getElementById('wsHint');
+        loadWorkspace().then(() => {
+            if (hint && unavailable && menu.classList.contains('show')) {
+                hint.textContent = '工作区按会话保存，请先打开一个会话';
+            }
+        });
+        if (!unavailable) setTimeout(() => document.getElementById('wsInput')?.focus(), 0);
+        setTimeout(() => document.addEventListener('click', closeWsMenuOutside), 0);
     }
 }
 
@@ -3160,6 +3262,12 @@ function closeWsMenuOutside(ev) {
     const wrap = document.getElementById('wsSelector');
     if (wrap && wrap.contains(ev.target)) return;
     document.getElementById('wsMenu')?.classList.remove('show');
+    document.removeEventListener('click', closeWsMenuOutside);
+}
+
+function closeWsMenu() {
+    document.getElementById('wsMenu')?.classList.remove('show');
+    document.removeEventListener('click', closeWsMenuOutside);
 }
 
 function shortWorkspaceLabel(path) {
@@ -3224,6 +3332,7 @@ async function saveWorkspace() {
         }
         paintWorkspaceView(body.data || {});
         if (hint) hint.textContent = '已切换，下一次发送消息生效';
+        closeWsMenu();
     } catch (e) {
         if (hint) { hint.textContent = '保存失败: ' + e.message; hint.classList.add('is-error'); }
     }
@@ -3243,6 +3352,7 @@ async function resetWorkspace() {
         if (input) input.value = '';
         paintWorkspaceView(body.data || null);
         if (hint) { hint.classList.remove('is-error'); hint.textContent = '已恢复默认工作区'; }
+        closeWsMenu();
     } catch (e) {
         if (hint) { hint.textContent = '恢复失败: ' + e.message; hint.classList.add('is-error'); }
     }
@@ -3968,6 +4078,7 @@ function startNewChat(doFocus = true) {
     localStorage.removeItem(LS_CUR);
     resetExecPolicyView();
     paintWorkspaceView(null);
+    closeWsMenu();
     $msg.innerHTML = WELCOME;
     renderSidebar();
     if (doFocus) $inp.focus();

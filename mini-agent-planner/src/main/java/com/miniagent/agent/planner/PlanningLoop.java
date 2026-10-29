@@ -65,6 +65,8 @@ public class PlanningLoop {
     private final SessionLock sessionLock;
     private final ToolSuccessStats toolSuccessStats;
     private TraceRecorder traceRecorder;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private NodeTerminalCommitPort nodeTerminalCommitPort;
 
     public PlanningLoop(PlannerProperties properties,
                         GoalCompiler goalCompiler,
@@ -443,6 +445,8 @@ public class PlanningLoop {
                     TaskGraph g = snap.graph().replace(
                             bad.withStatus(TaskNodeStatus.FAILED)
                                     .withError(acc.reason()));
+                    settleNode(sessionId, "acceptance-" + bad.id() + "-" + snap.planVersion(),
+                            bad, NodeTerminalCommitPort.Result.FAILURE);
                     FailureDiagnosis dx = recoveryEngine.diagnose(
                             bad, diagnoseTool(bad, ""), acc.reason());
                     try {
@@ -585,6 +589,12 @@ public class PlanningLoop {
                     recordToolOutcome(node, false);
                     String reason = "drift:偏离子目标 " + node.name();
                     g = g.replace(node.withStatus(TaskNodeStatus.FAILED).withError(reason));
+                    stateStore.appendEvent(sessionId, new DomainEvent(
+                            "ev_" + UUID.randomUUID().toString().substring(0, 8),
+                            DomainEventType.NODE_FAILED, action.actionId(), action.taskId(),
+                            Map.of("reason", reason), null));
+                    settleNode(sessionId, action.actionId(), node,
+                            NodeTerminalCommitPort.Result.FAILURE);
                     FailureDiagnosis dx = recoveryEngine.diagnose(
                             node, diagnoseTool(node, step.lastTool()), reason,
                             step.lastErrorCode());
@@ -620,6 +630,7 @@ public class PlanningLoop {
                             "ev_" + UUID.randomUUID().toString().substring(0, 8),
                             DomainEventType.NODE_SUCCESS, action.actionId(), action.taskId(),
                             Map.of(), null));
+                    settleNode(sessionId, action.actionId(), node, NodeTerminalCommitPort.Result.SUCCESS);
                 } else if (next == TaskNodeStatus.READY) {
                     g = g.replace(node.withStatus(TaskNodeStatus.READY).withError(""));
                 } else {
@@ -631,6 +642,7 @@ public class PlanningLoop {
                             "ev_" + UUID.randomUUID().toString().substring(0, 8),
                             DomainEventType.NODE_FAILED, action.actionId(), action.taskId(),
                             Map.of("reason", ev.reason()), null));
+                    settleNode(sessionId, action.actionId(), node, NodeTerminalCommitPort.Result.FAILURE);
                     FailureDiagnosis dx = recoveryEngine.diagnose(
                             node, diagnoseTool(node, step.lastTool()), ev.reason(),
                             step.lastErrorCode());
@@ -1376,7 +1388,7 @@ public class PlanningLoop {
             }
             out.add(new TaskNode(newId, n.name(), n.capability(), deps,
                     n.inputs(), n.outputs(), TaskNodeStatus.PENDING, n.priority(),
-                    n.doneWhen(), n.toolHint(), "", 0, ""));
+                    n.doneWhen(), n.toolHint(), "", 0, "").withProcedure(n.procedureId(), n.procedureVersion()));
         }
         TaskGraph g = new TaskGraph(out);
         if (g.hasCycle()) {
@@ -1571,6 +1583,30 @@ public class PlanningLoop {
             return "";
         }
         return node.capability();
+    }
+
+    /**
+     * 节点终态结算给记忆侧。
+     *
+     * <p><b>为什么整体吞异常</b>：Procedure 统计是旁路观测，不是任务的一部分。
+     * 数据库抖动、Procedure 被删、归属变更都会让结算失败；若让异常冒泡，
+     * 一个已经通过验收的节点会被判成任务失败 —— 记忆的故障反向决定了任务的成败，
+     * 这是不能接受的耦合。失败只降级为 warn，图状态照常提交。</p>
+     */
+    private void settleNode(String sessionId, String actionId, TaskNode node,
+                            NodeTerminalCommitPort.Result result) {
+        if (nodeTerminalCommitPort == null || node == null
+                || node.procedureId() == null || node.procedureVersion() == null) {
+            return;
+        }
+        try {
+            nodeTerminalCommitPort.commit(sessionId,
+                    com.miniagent.agent.core.TaskExecutionContext.currentTaskId(),
+                    actionId, node, result);
+        } catch (Exception e) {
+            log.warn("Procedure 终态结算失败，不影响任务结果: session={}, node={}, procedure={}, version={}, err={}",
+                    sessionId, node.id(), node.procedureId(), node.procedureVersion(), e.getMessage());
+        }
     }
 
     private void recordToolOutcome(TaskNode node, boolean ok) {

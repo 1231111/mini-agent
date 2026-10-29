@@ -199,6 +199,16 @@ agent:
   memory:
     # db=多副本真相源（agent_user_memory）；file=仅本地目录
     storage: db
+    procedure:
+      governance:
+        enabled: true
+        # 至少有 10 个终态结算样本才判定，避免单次/少数失败被噪声触发
+        min-attempts: 10
+        # 达到样本数后，成功率 <= 20% 的 SOP 自动从 ACTIVE 候选归档
+        archive-max-success-rate: 0.20
+        # 候选自动采纳默认关闭；开启前必须接入独立验证者和审计策略
+        automatic-acceptance-enabled: false
+        minimum-independent-validations: 2
     vector:
       enabled: true
       # local=本机 InMemory+JSON；milvus=生产向量库（compose/prod）

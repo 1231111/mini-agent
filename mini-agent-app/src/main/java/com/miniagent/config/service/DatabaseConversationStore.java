@@ -226,6 +226,23 @@ public class DatabaseConversationStore {
      * 否则侧栏"今天/昨天"分组会因为改了目录而把会话顶到最前面。</p>
      */
     @Transactional
+    public boolean setProjectId(Long userId, String id, String projectId) {
+        if (userId == null || StringUtils.isBlank(id)) return false;
+        return conversationRepo.findByIdAndUserIdAndDeletedFalse(id, userId).map(conv -> {
+            conv.setProjectId(StringUtils.isBlank(projectId) ? null : projectId.trim());
+            conversationRepo.save(conv);
+            return true;
+        }).orElse(false);
+    }
+
+    @Transactional(readOnly = true)
+    public Optional<String> findProjectIdForUser(Long userId, String id) {
+        if (userId == null || StringUtils.isBlank(id)) return Optional.empty();
+        return conversationRepo.findByIdAndUserIdAndDeletedFalse(id, userId)
+                .map(ChatConversation::getProjectId).filter(StringUtils::isNotBlank);
+    }
+
+    @Transactional
     public boolean setWorkspaceRoot(Long userId, String id, String workspaceRoot) {
         if (Objects.isNull(userId) || StringUtils.isBlank(id)) {
             return false;
@@ -306,6 +323,7 @@ public class DatabaseConversationStore {
         conv.createdAt = entity.getCreatedAt();
         conv.updatedAt = entity.getUpdatedAt();
         conv.workspaceRoot = entity.getWorkspaceRoot();
+        conv.projectId = entity.getProjectId();
         conv.messages = messageRepo.findByConversationIdOrderByTimestampAsc(entity.getId())
                 .stream().map(m -> {
             Message msg = new Message();
@@ -335,6 +353,7 @@ public class DatabaseConversationStore {
         public long updatedAt;
         /** 会话绑定的工作目录；null = 跟随默认工作区。 */
         public String workspaceRoot;
+        public String projectId;
         public List<Message> messages = new ArrayList<>();
     }
 

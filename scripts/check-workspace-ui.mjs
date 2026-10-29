@@ -74,8 +74,17 @@ const injected = `
   assert('保存后标签显示目录名', $('wsLabel').textContent === 'demo', $('wsLabel').textContent);
   assert('保存后当前路径更新', $('wsCurrent').textContent === 'D:/projects/demo', $('wsCurrent').textContent);
   assert('保存成功后清掉错误色', !$('wsHint').classList.contains('is-error'));
+  assert('保存成功后菜单收起', !$('wsMenu').classList.contains('show'));
+
+  // 外部点击监听必须在菜单内点击后仍然有效
+  toggleWsMenu();
+  await wait(10);
+  $('wsInput').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert('菜单内点击后外部点击仍可关闭菜单', !$('wsMenu').classList.contains('show'));
 
   // 恢复默认
+  toggleWsMenu();
   await resetWorkspace();
   assert('恢复默认走 DELETE', window.__wsCalls.includes('DELETE /api/conversations/s_ws_test/workspace'), window.__wsCalls.join(' | '));
   assert('恢复默认后按钮取消高亮', !$('wsBtn').classList.contains('active'));
@@ -88,7 +97,19 @@ const injected = `
   const html = renderMD('产物：workspace/报告.docx');
   assert('正文里的工作区文件链接带上 sid', html.includes('/api/workspace-download/') && html.includes('sid=s_ws_test'), html);
 
+  // 新建聊天时工作区设置不可编辑，避免用户以为设置已保存
+  currentId = null;
+  startNewChat(false);
+  toggleWsMenu();
+  await wait(10);
+  assert('无会话时显示作用范围提示', $('wsHint').textContent.includes('按会话保存'));
+  assert('无会话时禁用路径输入', $('wsInput').disabled);
+  assert('无会话时禁用应用按钮', $('wsMenu').querySelector('.ws-act.primary').disabled);
+  assert('无会话时不发送额外保存请求', window.__wsCalls.filter(c => c.startsWith('PUT ')).length === 2);
+  toggleWsMenu();
+
   // 切会话必须重新取目录，不能把上一个会话的目录显示成当前目录
+  currentId = 's_ws_test';
   window.__wsState = { path: 'E:/other', effectivePath: 'E:/other', defaultPath: 'C:/data/workspace', missing: false };
   await loadWorkspace();
   assert('切会话后重新拉取并刷新显示', $('wsCurrent').textContent === 'E:/other', $('wsCurrent').textContent);

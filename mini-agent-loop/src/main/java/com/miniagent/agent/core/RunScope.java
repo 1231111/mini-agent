@@ -40,7 +40,8 @@ public record RunScope(
         long taskId,
         ChatModel chatModel,
         StreamingChatModel streamingModel,
-        int contextWindowTokens
+        int contextWindowTokens,
+        String projectId
 ) {
     @FunctionalInterface
     public interface Binding extends AutoCloseable {
@@ -77,14 +78,15 @@ public record RunScope(
                 TaskExecutionContext.currentTaskId(),
                 AgentLoop.getCurrentChatModel(),
                 AgentLoop.getCurrentStreamingModel(),
-                EffectiveModelContext.currentContextWindow());
+                EffectiveModelContext.currentContextWindow(),
+                OwnerContext.currentProjectId());
     }
 
     public RunScope withSession(String sid) {
         return new RunScope(
                 sid, owner, turnPolicy, permissionMode, confirmPolicy, planApproved, permissionForced,
                 subagent, parentSessionId, role, taskName, writeTask, workspaceRoot,
-                execution, taskId, chatModel, streamingModel, contextWindowTokens);
+                execution, taskId, chatModel, streamingModel, contextWindowTokens, projectId);
     }
 
     /**
@@ -107,7 +109,7 @@ public record RunScope(
                 mode, confirmPolicy,
                 planApproved, true, true, parent,
                 roleId == null ? "" : roleId, taskName, "out", subWorkspace,
-                null, taskId, chatModel, streamingModel, contextWindowTokens);
+                null, taskId, chatModel, streamingModel, contextWindowTokens, projectId);
     }
 
     /**
@@ -127,6 +129,7 @@ public record RunScope(
     }
 
     void applyLocals() {
+        OwnerContext.setCurrentProjectId(projectId);
         if (sessionId != null && !sessionId.isBlank()) {
             AgentLoop.setCurrentSession(sessionId);
             TaskTodoContext.set(sessionId);

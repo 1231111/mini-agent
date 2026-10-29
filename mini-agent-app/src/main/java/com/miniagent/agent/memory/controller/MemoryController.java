@@ -2,6 +2,12 @@ package com.miniagent.agent.memory.controller;
 
 import com.miniagent.common.ApiResponse;
 import com.miniagent.web.dto.resp.MemoryIdDTO;
+import com.miniagent.web.dto.resp.ProcedureWriteResultDTO;
+import com.miniagent.web.dto.resp.ProcedureProposalReviewRequest;
+import com.miniagent.agent.memory.entity.ProcedureRewriteProposalEntity;
+import com.miniagent.agent.memory.manager.ProcedureRewriteProposalService;
+import com.miniagent.agent.memory.manager.ProcedureCandidateValidationService;
+import com.miniagent.web.dto.resp.ProcedureCandidateValidationRequest;
 import com.miniagent.config.entity.UserRole;
 import com.miniagent.config.security.AuthenticatedUser;
 import com.miniagent.config.security.SessionAuthorizationService;
@@ -30,6 +36,13 @@ public class MemoryController {
 
     @Autowired
     private SessionAuthorizationService sessionAuthorization;
+
+    @Autowired
+    private ProcedureRewriteProposalService rewriteProposalService;
+    @Autowired
+    private ProcedureCandidateValidationService candidateValidationService;
+    @Autowired
+    private com.miniagent.agent.memory.service.AgentProjectAuthorizationService projectAuthorization;
 
     /**
      * 记录 Agent 事件。
@@ -154,15 +167,52 @@ public class MemoryController {
     }
 
     /**
-     * 写入 SOP。
+     * 写入 SOP。同名同归属域是 upsert：内容没变幂等返回，内容变了原地升版。
      */
     @PostMapping("/procedures")
-    public ApiResponse<Void> writeProcedure(@RequestBody Procedure procedure,
-                                            HttpServletRequest request) {
+    public ApiResponse<ProcedureWriteResultDTO> writeProcedure(@RequestBody Procedure procedure,
+                                                               HttpServletRequest request) {
         AuthenticatedUser user = requireUser(request);
         bindScopedRecord(procedure, user);
-        memoryManager.writeProcedure(procedure);
-        return ApiResponse.ok(null);
+        Procedure written = memoryManager.writeProcedure(procedure);
+        return ApiResponse.ok(new ProcedureWriteResultDTO(written.getId(), written.getVersion(),
+                written.getAttemptCount(), written.getSuccessCount(), written.getSuccessRate()));
+    }
+
+    @GetMapping("/procedure-proposals")
+    public ApiResponse<List<ProcedureRewriteProposalEntity>> listProcedureProposals(HttpServletRequest request) {
+        AuthenticatedUser user = requireUser(request);
+        try (var ignored = com.miniagent.common.context.OwnerContext.bind(
+                new com.miniagent.common.context.OwnerContext(user.userId(), user.tenantKey()))) {
+            return ApiResponse.ok(rewriteProposalService.listMine());
+        }
+    }
+
+    @PostMapping("/procedure-proposals/{id}/validation")
+    public ApiResponse<com.miniagent.agent.memory.entity.ProcedureCandidateValidationEntity> validateProcedureProposal(
+            @PathVariable Long id, @RequestBody ProcedureCandidateValidationRequest request,
+            HttpServletRequest servletRequest) {
+        AuthenticatedUser user = requireUser(servletRequest);
+        if (request == null) throw new IllegalArgumentException("validation request required");
+        try (var ignored = com.miniagent.common.context.OwnerContext.bind(
+                new com.miniagent.common.context.OwnerContext(user.userId(), user.tenantKey()))) {
+            return ApiResponse.ok(candidateValidationService.record(id, user.userId(),
+                    request.passed(), request.evidenceJson()));
+        }
+    }
+
+    @PostMapping("/procedure-proposals/{id}/review")
+    public ApiResponse<ProcedureRewriteProposalEntity> reviewProcedureProposal(
+            @PathVariable Long id, @RequestBody ProcedureProposalReviewRequest request,
+            HttpServletRequest servletRequest) {
+        AuthenticatedUser user = requireUser(servletRequest);
+        if (request == null) {
+            throw new IllegalArgumentException("review request required");
+        }
+        try (var ignored = com.miniagent.common.context.OwnerContext.bind(
+                new com.miniagent.common.context.OwnerContext(user.userId(), user.tenantKey()))) {
+            return ApiResponse.ok(rewriteProposalService.review(id, request.approved()));
+        }
     }
 
     /**
@@ -197,10 +247,12 @@ public class MemoryController {
         if (projectId != null && user.role() == UserRole.USER) {
             throw new AccessDeniedException("Project-scoped memory requires elevated role");
         }
+        if (projectId != null && !projectId.isBlank()) {
+            projectAuthorization.requireMember(projectId, user.userId(), user.tenantKey());
+        }
         int safeTopK = Math.max(1, Math.min(topK, 100));
-        List<Episode> episodes = user.role() == UserRole.USER
-                ? memoryManager.recallEpisodes(query, user.tenantKey(),
-                        String.valueOf(user.userId()), null, safeTopK)
+        List<Episode> episodes = projectId == null || projectId.isBlank()
+                ? memoryManager.recallEpisodes(query, user.tenantKey(), String.valueOf(user.userId()), null, safeTopK)
                 : memoryManager.recallEpisodes(query, user.tenantKey(), projectId, safeTopK);
         return ApiResponse.ok(episodes);
     }
@@ -213,7 +265,7 @@ public class MemoryController {
                                          HttpServletRequest request) {
         AuthenticatedUser user = requireUser(request);
         sessionAuthorization.requireOwner(user.userId(), sessionId);
-        memoryManager.consolidate(sessionId);
+        memoryManager.consolidate(user.tenantKey(), sessionId);
         return ApiResponse.ok(null);
     }
 
@@ -270,6 +322,9 @@ public class MemoryController {
             procedure.setScope(MemoryScope.ofUser(user.tenantKey(), String.valueOf(user.userId())));
         }
         requireRequestedScope(user, procedure.getScope());
+        if (procedure.getScope().scopeType() == MemoryScope.ScopeType.PROJECT) {
+            projectAuthorization.requireMember(procedure.getScope().scopeId(), user.userId(), user.tenantKey());
+        }
     }
 
     private MemoryScope requestedScope(AuthenticatedUser user, String tenantId,
@@ -283,6 +338,9 @@ public class MemoryController {
         }
         MemoryScope scope = new MemoryScope(user.tenantKey(), type, scopeId);
         requireRequestedScope(user, scope);
+        if (type == MemoryScope.ScopeType.PROJECT) {
+            projectAuthorization.requireMember(scopeId, user.userId(), user.tenantKey());
+        }
         return scope;
     }
 
@@ -355,8 +413,8 @@ public class MemoryController {
         if (ctx.getSessionId() != null && !ctx.getSessionId().isBlank()) {
             sessionAuthorization.requireOwner(user.userId(), ctx.getSessionId());
         }
-        if (ctx.getProjectId() != null && user.role() == UserRole.USER) {
-            throw new AccessDeniedException("Project-scoped memory requires elevated role");
+        if (ctx.getProjectId() != null) {
+            projectAuthorization.requireMember(ctx.getProjectId(), user.userId(), user.tenantKey());
         }
     }
 
@@ -370,6 +428,10 @@ public class MemoryController {
     private void requireRequestedScope(AuthenticatedUser user, MemoryScope scope) {
         if (scope == null || !Objects.equals(user.tenantKey(), scope.tenantId())) {
             throw new AccessDeniedException("Memory scope is not accessible");
+        }
+        if (scope.scopeType() == MemoryScope.ScopeType.PROJECT) {
+            projectAuthorization.requireMember(scope.scopeId(), user.userId(), user.tenantKey());
+            return;
         }
         if (user.role() != UserRole.USER) {
             return;

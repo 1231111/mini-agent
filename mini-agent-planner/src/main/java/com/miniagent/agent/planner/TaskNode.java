@@ -25,7 +25,9 @@ public record TaskNode(
         String lastError,
         int retryCount,
         String output,
-        Map<String, String> outputBindings
+        Map<String, String> outputBindings,
+        Long procedureId,
+        Integer procedureVersion
 ) {
     static final String BLOCKED_PREFIX = "block:";
     public TaskNode {
@@ -45,12 +47,23 @@ public record TaskNode(
         outputBindings = outputBindings == null ? Map.of() : Map.copyOf(outputBindings);
     }
 
+    /** 兼容旧快照和既有调用：没有 Procedure 引用时保持空值。 */
+    public TaskNode(String id, String name, String capability, List<String> dependsOn,
+                    List<String> inputs, List<String> outputs, TaskNodeStatus status, int priority,
+                    DoneWhen doneWhen, String toolHint, java.util.Map<String, Object> toolArguments,
+                    String compensation, List<String> covers, String lastError, int retryCount,
+                    String output, Map<String, String> outputBindings) {
+        this(id, name, capability, dependsOn, inputs, outputs, status, priority, doneWhen,
+                toolHint, toolArguments, compensation, covers, lastError, retryCount,
+                output, outputBindings, null, null);
+    }
+
     /** 兼容旧持久化格式和既有 Compiler 调用。 */
     public TaskNode(String id, String name, String capability, List<String> dependsOn,
                     List<String> inputs, List<String> outputs, TaskNodeStatus status, int priority,
                     DoneWhen doneWhen, String toolHint, String lastError, int retryCount, String output) {
         this(id, name, capability, dependsOn, inputs, outputs, status, priority, doneWhen, toolHint,
-                java.util.Map.of(), "", List.of(), lastError, retryCount, output);
+                java.util.Map.of(), "", List.of(), lastError, retryCount, output, Map.of(), null, null);
     }
 
     /** 构造器兼容旧快照：没有命名产物时按空绑定处理。 */
@@ -60,67 +73,73 @@ public record TaskNode(
                     String compensation, List<String> covers, String lastError, int retryCount,
                     String output) {
         this(id, name, capability, dependsOn, inputs, outputs, status, priority, doneWhen, toolHint,
-                toolArguments, compensation, covers, lastError, retryCount, output, Map.of());
+                toolArguments, compensation, covers, lastError, retryCount, output, Map.of(), null, null);
+    }
+
+    public TaskNode withProcedure(Long procedureId, Integer version) {
+        return new TaskNode(this.id, name, capability, dependsOn, inputs, outputs, status, priority,
+                doneWhen, toolHint, toolArguments, compensation, covers, lastError, retryCount,
+                output, outputBindings, procedureId, version);
     }
 
     public TaskNode withStatus(TaskNodeStatus s) {
         return new TaskNode(id, name, capability, dependsOn, inputs, outputs, s,
                 priority, doneWhen, toolHint, toolArguments, compensation, covers, lastError, retryCount,
-                output, outputBindings);
+                output, outputBindings, procedureId, procedureVersion);
     }
 
     public TaskNode withError(String err) {
         return new TaskNode(id, name, capability, dependsOn, inputs, outputs, status,
                 priority, doneWhen, toolHint, toolArguments, compensation, covers,
-                err == null ? "" : err, retryCount, output, outputBindings);
+                err == null ? "" : err, retryCount, output, outputBindings, procedureId, procedureVersion);
     }
 
     public TaskNode withRetryInc() {
         return new TaskNode(id, name, capability, dependsOn, inputs, outputs, status,
                 priority, doneWhen, toolHint, toolArguments, compensation, covers, lastError, retryCount + 1,
-                output, outputBindings);
+                output, outputBindings, procedureId, procedureVersion);
     }
 
     public TaskNode withToolHint(String hint) {
         return new TaskNode(id, name, capability, dependsOn, inputs, outputs, status,
                 priority, doneWhen, hint == null ? "" : hint, toolArguments, compensation, covers,
-                lastError, retryCount, output, outputBindings);
+                lastError, retryCount, output, outputBindings, procedureId, procedureVersion);
     }
 
     public TaskNode withToolArguments(Map<String, Object> args) {
         return new TaskNode(id, name, capability, dependsOn, inputs, outputs, status,
                 priority, doneWhen, toolHint, args, compensation, covers,
-                lastError, retryCount, output, outputBindings);
+                lastError, retryCount, output, outputBindings, procedureId, procedureVersion);
     }
 
     public TaskNode withOutput(String out) {
         return new TaskNode(id, name, capability, dependsOn, inputs, outputs, status,
                 priority, doneWhen, toolHint, toolArguments, compensation, covers, lastError, retryCount,
-                out == null ? "" : out, outputBindings);
+                out == null ? "" : out, outputBindings, procedureId, procedureVersion);
     }
 
     public TaskNode withOutput(String legacyOutput, Map<String, String> bindings) {
         return new TaskNode(id, name, capability, dependsOn, inputs, outputs, status,
                 priority, doneWhen, toolHint, toolArguments, compensation, covers, lastError, retryCount,
-                legacyOutput == null ? "" : legacyOutput, bindings);
+                legacyOutput == null ? "" : legacyOutput, bindings, procedureId, procedureVersion);
     }
 
     TaskNode withPorts(List<String> nextInputs, List<String> nextOutputs) {
         return new TaskNode(id, name, capability, dependsOn, nextInputs, nextOutputs, status,
                 priority, doneWhen, toolHint, toolArguments, compensation, covers, lastError,
-                retryCount, output, outputBindings);
+                retryCount, output, outputBindings, procedureId, procedureVersion);
     }
 
     public TaskNode withCapability(String cap) {
         return new TaskNode(id, name, cap, dependsOn, inputs, outputs, status,
                 priority, doneWhen, toolHint, toolArguments, compensation, covers,
-                lastError, retryCount, output, outputBindings);
+                lastError, retryCount, output, outputBindings, procedureId, procedureVersion);
     }
 
     public TaskNode withDoneWhen(DoneWhen next) {
         return new TaskNode(id, name, capability, dependsOn, inputs, outputs, status,
                 priority, next == null ? DoneWhen.note() : next, toolHint, toolArguments,
-                compensation, covers, lastError, retryCount, output, outputBindings);
+                compensation, covers, lastError, retryCount, output, outputBindings, procedureId, procedureVersion);
     }
 
     /** REPLACE_TOOL 写入的失败工具，不是 Compiler 绑定。 */

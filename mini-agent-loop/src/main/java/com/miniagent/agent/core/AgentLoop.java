@@ -55,6 +55,7 @@ import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -1693,6 +1694,7 @@ public class AgentLoop {
      * 不该进用户界面。完整记录仍在 {@code traceRecorder}（{@code /trace} 可查）与日志里。</p>
      */
     private void executeToolCalls(List<?> toolCalls, List<ChatMessage> messages, LoopState state) {
+        Map<String, ExecutionTurnContext.ActionBinding> bindings = resolveToolBindings(toolCalls);
         if (!toolCalls.isEmpty()) {
             log.info("工具调用: {}", toolCalls.stream()
                     .map(tc -> formatProgressMsg(toolNameOf(tc), argumentsOf(tc)))
@@ -1703,12 +1705,27 @@ public class AgentLoop {
         // mvnw package 不是），只看工具名会把整批含 exec_command 的调用一律降级成串行。
         if (toolExecutionGuards.canRunBatchInParallel(
                 toolCalls, AgentLoop::toolNameOf, AgentLoop::argumentsOf)) {
-            executeToolCallsParallel(toolCalls, messages, state);
+            executeToolCallsParallel(toolCalls, messages, state, bindings);
         } else {
             for (var tc : toolCalls) {
-                executeToolCallSingle(tc, messages, state);
+                executeToolCallSingle(tc, messages, state, bindings.get(toolIdOf(tc)));
             }
         }
+    }
+
+    private Map<String, ExecutionTurnContext.ActionBinding> resolveToolBindings(List<?> toolCalls) {
+        ExecutionTurnContext.Scope execution = ExecutionTurnContext.current();
+        if (execution == null) {
+            return Map.of();
+        }
+        Map<String, ExecutionTurnContext.ActionBinding> bindings = new LinkedHashMap<>();
+        for (Object call : toolCalls) {
+            String callId = toolIdOf(call);
+            if (!callId.isBlank()) {
+                bindings.put(callId, execution.resolve(callId, toolNameOf(call)));
+            }
+        }
+        return Map.copyOf(bindings);
     }
 
     private static boolean hasBrowserTool(List<?> toolCalls) {
@@ -1721,7 +1738,8 @@ public class AgentLoop {
 
     /** 并行执行多个工具 */
     private void executeToolCallsParallel(List<?> toolCalls, List<ChatMessage> messages,
-                                           LoopState state) {
+                                           LoopState state,
+                                           Map<String, ExecutionTurnContext.ActionBinding> bindings) {
         Map<String, String> cachedResults = new HashMap<>();
         Map<String, ToolInvocation> invocations = new ConcurrentHashMap<>();
         // 用 ExecutorService.submit 拿到真正的 Future：cancel(true) 会**中断**工作线程，
@@ -1756,7 +1774,8 @@ public class AgentLoop {
 
             long timeout = resolveToolTimeout(name, args);
             ToolRequest request = toolRequest(
-                    name, args, turn, denyProbes, state, scope);
+                    name, args, turn, denyProbes, state, scope)
+                    .withActionBinding(bindings.get(toolIdOf(tc)));
             // 审批等待是执行预算之外的一段时间，必须加进去；只取 max 会让
             // 用户在 TTL 后段批准时，工具刚醒就被判超时。
             long deadline = System.nanoTime()
@@ -1848,14 +1867,16 @@ public class AgentLoop {
             }
 
             log.info("  [并行] {}: {}", name, truncate(redactSensitive(result), 200));
-            recordToolOutcome(state, name, argumentsOf(tc), result);
+            recordToolOutcome(state, name, argumentsOf(tc), result,
+                    bindings.get(toolIdOf(tc)));
             messages.add(ToolExecutionResultMessage.from(
                     toolIdOf(tc), name, resultForContext));
         }
     }
 
     /** 串行执行单个工具 */
-    private void executeToolCallSingle(Object tc, List<ChatMessage> messages, LoopState state) {
+    private void executeToolCallSingle(Object tc, List<ChatMessage> messages, LoopState state,
+                                       ExecutionTurnContext.ActionBinding binding) {
         String name = toolNameOf(tc);
         String args = argumentsOf(tc);
 
@@ -1863,7 +1884,7 @@ public class AgentLoop {
         if (state.lengthTruncatedToolCalls && !"write_file".equals(name) && !"read_file".equals(name)) {
             String truncErr = "{\"error\":\"本次工具调用的参数因模型输出长度上限被截断，无法执行。请用更短的参数重试。\"}";
             log.warn("  [截断保护] 跳过执行 {}，参数可能不完整", name);
-            recordToolOutcome(state, name, args, truncErr);
+            recordToolOutcome(state, name, args, truncErr, null);
             messages.add(ToolExecutionResultMessage.from(toolIdOf(tc), name, truncErr));
             return;
         }
@@ -1888,7 +1909,8 @@ public class AgentLoop {
             final boolean denyProbes = shouldDropBrowserProbes(
                     consecutiveProbeTurns(messages));
             ToolRequest request = toolRequest(
-                    fName, fArgs, turn, denyProbes, state, scope);
+                    fName, fArgs, turn, denyProbes, state, scope)
+                    .withActionBinding(binding);
             // submit 而非 supplyAsync：只有 ExecutorService 的 Future 才支持
             // "cancel(true) 真正中断工作线程"。CompletableFuture 的 cancel 只改状态，
             // 于是超时后工具还在跑（还在写盘），模型重试就产生重复副作用。
@@ -1940,7 +1962,7 @@ public class AgentLoop {
         }
 
         log.info("  {}: {}", name, truncate(redactSensitive(result), 300));
-        recordToolOutcome(state, name, args, result);
+        recordToolOutcome(state, name, args, result, binding);
         messages.add(ToolExecutionResultMessage.from(
                 toolIdOf(tc), name, resultForContext));
     }
@@ -2048,13 +2070,18 @@ public class AgentLoop {
     }
 
     private void recordToolOutcome(LoopState state, String name, String args, String result) {
+        recordToolOutcome(state, name, args, result, null);
+    }
+
+    private void recordToolOutcome(LoopState state, String name, String args, String result,
+                                   ExecutionTurnContext.ActionBinding binding) {
         state.noteToolFinished(name, args, result);
         boolean failed = TraceRecorder.isFailedResult(result);
         String st = failed ? RunStatus.FAILURE.name() : RunStatus.SUCCESS.name();
         if (Objects.nonNull(traceRecorder))
             traceRecorder.recordToolResult(
                     currentSessionId.get(), state.currentTurn, name, result, 0, st);
-        notifyToolExecution(state, name, result);
+        notifyToolExecution(state, name, result, binding);
     }
 
     /**
@@ -2068,7 +2095,8 @@ public class AgentLoop {
      *
      * <p>{@code AWAITING_USER} 不上报：那种情况下工具压根没执行，报成一次执行是假事实。</p>
      */
-    private void notifyToolExecution(LoopState state, String name, String result) {
+    private void notifyToolExecution(LoopState state, String name, String result,
+                                     ExecutionTurnContext.ActionBinding binding) {
         ToolExecutionSink sink = this.toolExecutionSink;
         if (Objects.isNull(sink) || Objects.isNull(currentSessionId.get())) {
             return;
@@ -2079,7 +2107,7 @@ public class AgentLoop {
         }
         try {
             sink.onToolExecuted(currentSessionId.get(), state.currentTurn, name,
-                    parsed.status(), truncate(redactSensitive(result), 400));
+                    parsed.status(), truncate(redactSensitive(result), 400), binding);
         } catch (Exception e) {
             log.debug("工具执行事件上报失败: {} {}", name, e.getMessage());
         }

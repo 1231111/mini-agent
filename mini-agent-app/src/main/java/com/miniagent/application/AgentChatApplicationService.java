@@ -132,6 +132,8 @@ public class AgentChatApplicationService {
     private com.miniagent.agent.memory.writer.MemoryToolExecutionSink toolExecutionSink;
     @Autowired
     private ConversationWorkspaceService conversationWorkspaceService;
+    @Autowired
+    private ConversationProjectService conversationProjectService;
 
     private int maxIterations() {
         return executionProperties.getMaxIterations();
@@ -220,12 +222,14 @@ public class AgentChatApplicationService {
             throw new IllegalStateException(start.error());
         }
         TaskRunService.RunHandle run = start.handle();
-        OwnerContext owner =
-                new OwnerContext(userId, String.valueOf(tenantId));
+        String authorizedProjectId = conversationProjectService.resolveAuthorized(
+                userId, String.valueOf(tenantId), sessionId);
+        OwnerContext owner = new OwnerContext(userId, String.valueOf(tenantId));
         boolean executionStarted = false;
 
         long[] taskId = {0L};
         try (var ignoredOwner = OwnerContext.bind(owner)) {
+            OwnerContext.setCurrentProjectId(authorizedProjectId);
             executionControl.start(sessionId, tenantId);
             executionStarted = true;
             // Install the execution lease before publishing the running state.
@@ -327,8 +331,9 @@ public class AgentChatApplicationService {
                     // 异步线程不继承 ThreadLocal：显式绑定归属与该用户配置的模型，
                     // 否则巩固的 LLM 提炼会回退到全局 Bean（全局 key 失效即稳定 401）。
                     try (var ignoredOwner = OwnerContext.bind(owner);
+                         var ignoredProject = bindProject(authorizedProjectId);
                          var ignoredModel = userModelBinder.bindModel(consolidateUserId)) {
-                        memoryManager.consolidate(consolidateSid);
+                        memoryManager.consolidate(owner.tenantId(), consolidateSid);
                     } catch (Exception e) {
                         log.debug("记忆巩固失败: {}", e.getMessage());
                     }
@@ -364,6 +369,12 @@ public class AgentChatApplicationService {
         } catch (Exception e) {
             log.debug("事件记录失败: {}", e.getMessage());
         }
+    }
+
+    private OwnerContext.Scope bindProject(String projectId) {
+        String previous = OwnerContext.currentProjectId();
+        OwnerContext.setCurrentProjectId(projectId);
+        return () -> OwnerContext.setCurrentProjectId(previous);
     }
 
     private String truncate(String s, int maxLen) {

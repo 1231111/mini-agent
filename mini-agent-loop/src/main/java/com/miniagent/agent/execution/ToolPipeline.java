@@ -284,7 +284,8 @@ public class ToolPipeline {
                 effective,
                 turn,
                 request.runId(),
-                request.allowedTools());
+                request.allowedTools(),
+                request.actionBinding());
         String processed = toolHookChain.after(
                 new ToolHookContext(sid, name, effective, turn, sub), raw.legacyText());
         ToolResult result = Objects.equals(processed, raw.legacyText())
@@ -294,11 +295,13 @@ public class ToolPipeline {
 
     private ToolResult executeJournaled(
             RunScope run, String sessionId, String name, String arguments,
-            int turn, String runId, Set<String> allowedTools) {
+            int turn, String runId, Set<String> allowedTools,
+            ExecutionTurnContext.ActionBinding actionBinding) {
         // 必须吃参数：exec_command 的幂等性取决于命令行（只读命令可安全重试，
         // 写类命令重跑可能重复副作用）。按名字取到的永远是注册期那份保守契约。
         ToolDescriptor descriptor = toolExecutionGuards.descriptor(name, arguments);
-        ActionJournalKey key = journalKey(run, sessionId, name, arguments, turn, runId);
+        ActionJournalKey key = journalKey(run, sessionId, name, arguments, turn, runId,
+                actionBinding);
         String argumentsHash = sha256(arguments);
         int attempt = 1;
         try {
@@ -364,11 +367,12 @@ public class ToolPipeline {
 
     private ActionJournalKey journalKey(
             RunScope run, String sessionId, String name, String arguments,
-            int turn, String runId) {
+            int turn, String runId, ExecutionTurnContext.ActionBinding suppliedBinding) {
         ExecutionTurnContext.Scope fence = run == null ? null : run.execution();
         if (fence != null) {
-            ExecutionTurnContext.ActionBinding binding = fence.resolve(
-                    name + "@" + turn + "@" + sha256(arguments), name);
+            ExecutionTurnContext.ActionBinding binding = suppliedBinding != null
+                    ? suppliedBinding
+                    : fence.resolve(name + "@" + turn + "@" + sha256(arguments), name);
             return new ActionJournalKey(
                     fence.sessionId(), fence.planVersion(),
                     binding.nodeId(), binding.idempotencyKey());

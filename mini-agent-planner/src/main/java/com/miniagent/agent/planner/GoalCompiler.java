@@ -174,6 +174,15 @@ public class GoalCompiler {
             capability 是能力类别，不决定具体工具；执行阶段由 Router 按能力从注册表
             检索候选，模型在候选内选择。不要填写具体工具名。
             priority 为 0~100 的整数，越大越优先，只影响同批 READY 调度。
+
+            【复用已有 Procedure】
+            用户消息里若列出了可复用的 Procedure（带 procedureId 与 version），且某个节点
+            确实按它的步骤执行，必须在该节点上显式声明：
+              "procedureId": <列表中的 id>, "procedureVersion": <列表中的 version>
+            这两个字段是可选的，但一旦声明就必须成对出现，且只能取本轮列表里的值——
+            不要编造 id，不要自己估版本号。不按任何 Procedure 执行时两个字段都省略。
+            声明会被记成"这一版 Procedure 在该节点被使用了一次"，用于统计它的成功率；
+            所以宁可省略，也不要把不相关的 Procedure 挂到节点上。
             """;
 
     /**
@@ -212,8 +221,28 @@ public class GoalCompiler {
     @Autowired(required = false)
     private SkillStore skillStore;
 
+    @Autowired(required = false)
+    private ProcedurePromptPort procedurePromptPort;
+
     /** skill 摘要给规划模型的字符上限：词表之外还要留预算给任务描述。 */
     private static final int SKILL_DIGEST_MAX = 1200;
+
+    private String procedureDigest(String prefix) {
+        if (procedurePromptPort == null) {
+            return prefix;
+        }
+        List<ProcedurePromptInput> procedures = procedurePromptPort.findForCurrentOwner("");
+        if (procedures == null || procedures.isEmpty()) {
+            return prefix;
+        }
+        String digest = procedures.stream().limit(20)
+                .map(p -> "procedureId=" + p.procedureId() + " version=" + p.version()
+                        + " name=" + p.name() + " description=" + p.description()
+                        + " preconditions=" + p.preconditions() + " steps=" + p.steps()
+                        + " successConditions=" + p.successConditions())
+                .collect(Collectors.joining("\\n"));
+        return prefix + "\\n可复用的用户 Procedure（只使用下列 ID/version；引用需由本轮绑定）：\\n" + digest;
+    }
 
     /** 装配/测试用：显式指定 skill 来源。生产走 {@code @Autowired(required=false)}。 */
     void attachSkillStore(SkillStore store) {
@@ -226,23 +255,23 @@ public class GoalCompiler {
      */
     String skillDigest() {
         if (skillStore == null) {
-            return "";
+            return procedureDigest("");
         }
         String summary;
         try {
             summary = skillStore.getSkillListSummary();
         } catch (Exception e) {
             log.warn("读取 skill 摘要失败，按无技能继续拆解: {}", e.getMessage());
-            return "";
+            return procedureDigest("");
         }
         if (StringUtils.isBlank(summary)) {
-            return "";
+            return procedureDigest("");
         }
         if (summary.length() > SKILL_DIGEST_MAX) {
             summary = summary.substring(0, SKILL_DIGEST_MAX) + "\n（技能清单已截断）";
         }
-        return "\n本轮可用技能：若用户目标命中某技能，该步骤的 capability 必须选到"
-                + "它所依赖的能力类别，不要退化成只能写文件：\n" + summary;
+        return procedureDigest("\n本轮可用技能：若用户目标命中某技能，该步骤的 capability 必须选到"
+                + "它所依赖的能力类别，不要退化成只能写文件：\n" + summary);
     }
 
     public GoalCompiler(PlannerProperties properties) {
@@ -595,6 +624,10 @@ public class GoalCompiler {
     }
 
     TaskGraph parseGraph(String text) throws Exception {
+        return parseGraph(text, List.of());
+    }
+
+    TaskGraph parseGraph(String text, List<ProcedurePromptInput> allowedProcedures) throws Exception {
         String json = extractJson(text);
         JsonNode root = MAPPER.readTree(json);
         JsonNode nodes = root.get("nodes");
@@ -627,9 +660,16 @@ public class GoalCompiler {
             if (dwNode == null) {
                 dwNode = n.get("done_when");
             }
-            list.add(new TaskNode(id, name, cap, deps, stringList(n, "inputs"),
+            TaskNode node = new TaskNode(id, name, cap, deps, stringList(n, "inputs"),
                     stringList(n, "outputs"), TaskNodeStatus.PENDING,
-                    priority, DoneWhen.parse(dwNode), "", "", 0, ""));
+                    priority, DoneWhen.parse(dwNode), "", "", 0, "");
+            if (n.hasNonNull("procedureId") && n.hasNonNull("procedureVersion")
+                    && allowedProcedures.stream().anyMatch(p ->
+                    p.procedureId().equals(n.get("procedureId").asLong())
+                            && p.version().equals(n.get("procedureVersion").asInt()))) {
+                node = node.withProcedure(n.get("procedureId").asLong(), n.get("procedureVersion").asInt());
+            }
+            list.add(node);
         }
         return DataflowNormalizer.normalize(new TaskGraph(list));
     }
@@ -637,7 +677,9 @@ public class GoalCompiler {
     /** 解析模型完整编译结果，同时保留 Goal 根字段而非丢回 TaskPlan。 */
     ParsedCompilation parseCompilation(String text, Goal base) throws Exception {
         JsonNode root = MAPPER.readTree(extractJson(text));
-        TaskGraph graph = parseGraph(text);
+        List<ProcedurePromptInput> available = procedurePromptPort == null
+                ? List.of() : procedurePromptPort.findForCurrentOwner("");
+        TaskGraph graph = parseGraph(text, available == null ? List.of() : available);
         Goal seed = base == null
                 ? new Goal("goal_" + UUID.randomUUID().toString().substring(0, 8), "",
                 "", null, Map.of(), List.of(), List.of())

@@ -63,8 +63,13 @@ public interface MemoryManager {
 
     // === 程序性记忆 ===
 
-    /** 写入一个 SOP */
-    void writeProcedure(Procedure procedure);
+    /**
+     * 写入一个 SOP。
+     *
+     * <p>按 {@code (tenant, scope, name)} 归一的身份做 upsert：内容没变是幂等写，内容变了原地升版。
+     * 返回落库后的真实状态（id、版本、版本内计数），调用方不需要再查一次才知道刚写进去的是第几版。</p>
+     */
+    Procedure writeProcedure(Procedure procedure);
 
     /** 按名称查询 SOP */
     List<Procedure> queryProcedures(String tenantId, String scopeType, String scopeId, String name);
@@ -82,6 +87,9 @@ public interface MemoryManager {
 
     /** 记忆巩固：session 结束时从事件流提炼 Episode */
     void consolidate(String sessionId);
+
+    /** 按租户边界执行会话巩固。 */
+    void consolidate(String tenantId, String sessionId);
 
     /** 遗忘：按策略归档/删除低价值记忆 */
     void forget(String tenantId);
