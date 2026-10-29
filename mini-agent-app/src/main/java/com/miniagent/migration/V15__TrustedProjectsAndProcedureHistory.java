@@ -17,7 +17,16 @@ public class V15__TrustedProjectsAndProcedureHistory extends BaseJavaMigration {
     public void migrate(Context context) throws Exception {
         Connection connection = context.getConnection();
         try (Statement statement = connection.createStatement()) {
-            if (!columnExists(connection, "chat_conversations", "project_id")) {
+            // 必须先判表存在，再判列：columnExists() 在表不存在时返回 false，
+            // 单靠它会直接去 ALTER 一张不存在的表。
+            //
+            // 这不是理论问题：桌面档全新安装时库是空的（基线由 ddl-auto 从实体反推），
+            // 而 Flyway 跑在 Hibernate 之前 —— chat_conversations 此时还不存在，
+            // 于是全新装机必在 V15 失败：
+            //   Error Code: 42102 / Table "CHAT_CONVERSATIONS" not found
+            // 已装过的机器有这张表，所以只在"新装机"暴露，很容易漏测。
+            if (tableExists(connection, "chat_conversations")
+                    && !columnExists(connection, "chat_conversations", "project_id")) {
                 statement.execute("ALTER TABLE chat_conversations ADD COLUMN project_id VARCHAR(128)");
             }
             if (!tableExists(connection, "agent_projects")) {

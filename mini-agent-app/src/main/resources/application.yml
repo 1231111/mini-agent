@@ -116,6 +116,45 @@ agent:
     # 不设该环境变量时退回下面这组本地 origin，dev 档行为不变。
     # desktop 档会显式钉死本地值，不吃这个变量 —— 见 application-desktop.yml。
     allowed-origins: ${ALLOWED_ORIGINS:http://localhost:*,http://127.0.0.1:*,file://}
+  memory:
+    # db=多副本真相源（agent_user_memory）；file=仅本地目录
+    storage: db
+    service:
+      # local：桌面端默认同进程 H2/MySQL；remote：服务器 Agent 调用独立记忆服务。
+      mode: ${MEMORY_SERVICE_MODE:local}
+      base-url: ${MEMORY_SERVICE_BASE_URL:}
+      internal-key: ${MEMORY_SERVICE_INTERNAL_KEY:}
+      connect-timeout-ms: ${MEMORY_SERVICE_CONNECT_TIMEOUT_MS:3000}
+      read-timeout-ms: ${MEMORY_SERVICE_READ_TIMEOUT_MS:10000}
+    procedure:
+      # remote 模式下把 SOP 版本投影到独立记忆服务的投递节奏（local 模式不启用）。
+      # 投递失败按指数退避，10 次后留在 FAILED 等人工核对。
+      outbox:
+        interval-ms: ${MEMORY_PROCEDURE_OUTBOX_INTERVAL_MS:5000}
+      governance:
+        enabled: true
+        # 至少有 10 个终态结算样本才判定，避免单次/少数失败被噪声触发
+        min-attempts: 10
+        # 达到样本数后，成功率 <= 20% 的 SOP 自动从 ACTIVE 候选归档
+        archive-max-success-rate: 0.20
+        # 候选自动采纳默认关闭；开启前必须接入独立验证者和审计策略
+        automatic-acceptance-enabled: false
+        minimum-independent-validations: 2
+    vector:
+      enabled: true
+      # local=本机 InMemory+JSON；milvus=生产向量库（compose/prod）
+      backend: local
+      top-k: 6
+      min-score: 0.4
+      milvus:
+        uri: http://127.0.0.1:19530
+        token:
+        # 结构化记忆：tenant_id/memory_id/content schema
+        collection: agent_memory
+        # 旧版用户 Blob 索引：user_id/text schema；必须与结构化集合物理隔离
+        blob-collection: agent_memory_blob_v1
+        # Yuan-embedding-2.0-zh=1792；改模型需重建 Milvus 集合
+        dimension: 1792
   # 聊天模型预设（前端可选；空字段回退 langchain4j.open-ai.chat-model.*）
   models:
     default-preset: default
@@ -196,34 +235,6 @@ agent:
     memory-ttl-seconds: 86400
     planner-ttl-seconds: 86400
     run-lock-ttl-seconds: 7200
-  memory:
-    # db=多副本真相源（agent_user_memory）；file=仅本地目录
-    storage: db
-    procedure:
-      governance:
-        enabled: true
-        # 至少有 10 个终态结算样本才判定，避免单次/少数失败被噪声触发
-        min-attempts: 10
-        # 达到样本数后，成功率 <= 20% 的 SOP 自动从 ACTIVE 候选归档
-        archive-max-success-rate: 0.20
-        # 候选自动采纳默认关闭；开启前必须接入独立验证者和审计策略
-        automatic-acceptance-enabled: false
-        minimum-independent-validations: 2
-    vector:
-      enabled: true
-      # local=本机 InMemory+JSON；milvus=生产向量库（compose/prod）
-      backend: local
-      top-k: 6
-      min-score: 0.4
-      milvus:
-        uri: http://127.0.0.1:19530
-        token:
-        # 结构化记忆：tenant_id/memory_id/content schema
-        collection: agent_memory
-        # 旧版用户 Blob 索引：user_id/text schema；必须与结构化集合物理隔离
-        blob-collection: agent_memory_blob_v1
-        # Yuan-embedding-2.0-zh=1792；改模型需重建 Milvus 集合
-        dimension: 1792
   sse:
     timeout-ms: 1800000
   observability:

@@ -1,0 +1,48 @@
+spring:
+  application:
+    name: mini-agent-memory
+  datasource:
+    # 默认落本地 H2 文件库，便于单机验证；生产用 DB_URL 指向独立 MySQL schema。
+    # 不要指向 mini-agent-app 的库：两边的 Flyway 历史与表结构不同，会在启动时撞表。
+    url: ${DB_URL:jdbc:h2:file:${MEMORY_SERVICE_HOME:${user.home}/.miniagent-memory}/data/memory;MODE=MySQL;DB_CLOSE_DELAY=-1}
+    username: ${DB_USERNAME:sa}
+    password: ${DB_PASSWORD:}
+    driver-class-name: ${DB_DRIVER:org.h2.Driver}
+  flyway:
+    # 服务自带迁移，不依赖执行侧的 V1..V15。
+    #
+    # 路径必须是 db/migration-memory，不能是 db/migration：
+    # mini-agent-memory 同时被 mini-agent-app 当作依赖打进 fat jar，
+    # 而 app 的 spring.flyway.locations 里就有 classpath:db/migration（递归扫描）。
+    # 放在 db/migration 下会让 app 同时看到自己的 V1__baseline.sql 和这里的
+    # V1__procedure_settlement_schema.sql，启动时直接：
+    #   FlywayException: Found more than one migration with version 1
+    # 这两套迁移本来就指向**不同的库**（见迁移文件头部注释），版本号也是各自从 1 起，
+    # 所以只能靠路径隔离，不能靠版本号协商。
+    enabled: true
+    locations: classpath:db/migration-memory
+    baseline-on-migrate: false
+
+server:
+  # 默认只监听回环地址：内部 API 不应该在未配置网关时暴露到外网。
+  address: ${MEMORY_SERVICE_ADDRESS:127.0.0.1}
+  port: ${MEMORY_SERVICE_PORT:8091}
+
+memory:
+  service:
+    security:
+      # 空值时所有写接口一律拒绝（fail-closed），不存在“没配密钥就放行”的降级路径。
+      internal-key: ${MEMORY_SERVICE_INTERNAL_KEY:}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
+logging:
+  level:
+    com.miniagent.memory.service: ${MEMORY_SERVICE_LOG_LEVEL:INFO}

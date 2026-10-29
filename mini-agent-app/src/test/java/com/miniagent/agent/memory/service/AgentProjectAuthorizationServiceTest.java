@@ -20,8 +20,10 @@ class AgentProjectAuthorizationServiceTest {
     private final AgentProjectRepository projects = mock(AgentProjectRepository.class);
     private final AgentProjectMemberRepository members = mock(AgentProjectMemberRepository.class);
     private final UserRepository users = mock(UserRepository.class);
+    private final com.miniagent.agent.memory.manager.ProjectAuthorizationSyncService authorizationSync =
+            mock(com.miniagent.agent.memory.manager.ProjectAuthorizationSyncService.class);
     private final AgentProjectAuthorizationService service =
-            new AgentProjectAuthorizationService(projects, members, users);
+            new AgentProjectAuthorizationService(projects, members, users, authorizationSync);
 
     @AfterEach
     void clearOwner() { OwnerContext.clearCurrentTenant(); OwnerContext.clearCurrentUser(); }
@@ -29,15 +31,18 @@ class AgentProjectAuthorizationServiceTest {
     @Test
     void addMemberRequiresActiveSameTenantUserAndProjectOwner() {
         AgentProjectEntity project = project();
+        when(projects.findForUpdate("project-a", "21")).thenReturn(Optional.of(project));
         when(projects.findByProjectIdAndTenantId("project-a", "21")).thenReturn(Optional.of(project));
         User target = new User(); target.setId(10L); target.setTenantId(21L); target.setEnabled(true);
         when(users.findById(10L)).thenReturn(Optional.of(target));
         when(members.findByProjectIdAndUserId("project-a", 10L)).thenReturn(Optional.empty());
+        when(members.findAllByProjectIdOrderByUserIdAsc("project-a")).thenReturn(java.util.List.of());
         try (var ignored = OwnerContext.bind(new OwnerContext(9L, "21"))) {
             service.addMember("project-a", 10L);
         }
         verify(members).saveAndFlush(argThat(member -> member.getProjectId().equals("project-a")
                 && member.getUserId().equals(10L)));
+        verify(authorizationSync).enqueue(eq("21"), eq("project-a"), eq(9L), eq(2L), anyList());
 
         target.setTenantId(22L);
         assertThrows(AccessDeniedException.class, () -> {

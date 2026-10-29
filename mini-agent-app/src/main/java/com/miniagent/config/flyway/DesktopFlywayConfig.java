@@ -57,8 +57,33 @@ public class DesktopFlywayConfig {
                 // 失败发生在 baseline 之前：库结构没动过，重试无副作用。
                 throw new IllegalStateException("检查/修复 Flyway 历史表失败", e);
             }
-            flyway.migrate();
+            migrateWithActionableErrors(flyway);
         };
+    }
+
+    /**
+     * 跑 migrate，把"能一眼看出修法"的 Flyway 失败翻译成人话。
+     *
+     * <p>背景（真实踩过）：源码里把 SQL 迁移改成 Java 迁移后，旧文件仍留在
+     * {@code target/classes}（以及已打包的 jar）里 —— Maven 不 clean 就不会删掉被移除的资源。
+     * 于是同一条 location 链上出现两个同版本迁移，Flyway 抛
+     * {@code Found more than one migration with version 9}，启动直接 code=1。
+     * 这条信息藏在几十帧堆栈中间，用户看到的是"客户端启动报错"，很难联想到构建残留。
+     */
+    private void migrateWithActionableErrors(org.flywaydb.core.Flyway flyway) {
+        try {
+            flyway.migrate();
+        } catch (org.flywaydb.core.api.FlywayException e) {
+            String message = String.valueOf(e.getMessage());
+            if (message.contains("Found more than one migration with version")) {
+                throw new IllegalStateException(
+                        "启动中止：同一个版本号上存在多个迁移，几乎总是**构建残留** —— "
+                                + "源码里删掉或改名过的迁移文件还留在 target/classes 或已打包的 jar 里。\n"
+                                + "修复：先 mvn clean 再重新打包（只 mvn package 不会清掉旧资源）。\n"
+                                + "原始错误：" + message, e);
+            }
+            throw e;
+        }
     }
 
     /** 删掉历史表里执行失败的行（success=0），让被卡死的迁移链能重跑。见类注释的安全性论证。 */

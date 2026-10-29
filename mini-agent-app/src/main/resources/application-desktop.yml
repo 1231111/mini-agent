@@ -213,6 +213,11 @@ agent:
   # （havingValue=local, matchIfMissing=true），不需要 Milvus 与 etcd/MinIO。
   memory:
     storage: db
+    # 桌面档固定本地结算，理由与上面的 replica.mode 相同：客户端不该吃服务器的环境变量。
+    # 若环境里残留 MEMORY_SERVICE_MODE=remote，remote 装配会因为 base-url 为空直接启动失败，
+    # 用户看到的是“客户端打不开”，而不是一条配置错误。
+    service:
+      mode: local
     vector:
       enabled: true
       backend: local

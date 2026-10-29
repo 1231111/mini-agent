@@ -5,6 +5,7 @@ import com.miniagent.agent.memory.entity.AgentProjectMemberEntity;
 import com.miniagent.agent.memory.repository.AgentProjectMemberRepository;
 import com.miniagent.agent.memory.repository.AgentProjectRepository;
 import com.miniagent.agent.memory.service.AgentProjectAuthorizationService;
+import com.miniagent.agent.memory.manager.ProjectAuthorizationSyncService;
 import com.miniagent.common.context.OwnerContext;
 import com.miniagent.config.entity.ChatConversation;
 import com.miniagent.config.repository.ChatConversationRepository;
@@ -42,6 +43,7 @@ class ConversationProjectServicePersistenceTest {
     @Autowired private ChatConversationRepository conversations;
     @Autowired private PlatformTransactionManager transactionManager;
     @MockBean private UserRepository users;
+    @MockBean private ProjectAuthorizationSyncService authorizationSync;
 
     @AfterEach
     void clearOwner() {

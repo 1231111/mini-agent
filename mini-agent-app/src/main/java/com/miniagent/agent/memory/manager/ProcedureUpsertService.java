@@ -11,6 +11,7 @@ import com.miniagent.common.exception.BusinessException;
 import com.miniagent.memory.model.Procedure;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -77,6 +78,15 @@ public class ProcedureUpsertService {
     private final ObjectMapper objectMapper;
     private final ProcedureRevisionService revisionService;
     private final TransactionTemplate requiresNew;
+
+    /**
+     * 远端投影登记。local 模式下它是 no-op，字段可为 null（单元测试直接 new 本类）。
+     *
+     * <p>用字段注入而不是构造器参数，是为了不改动既有构造签名——本类有直接 {@code new}
+     * 的持久化测试，加参数会让它们全部失效，而它们验证的正是升版 CAS 这类核心行为。</p>
+     */
+    @Autowired(required = false)
+    private ProcedureDefinitionSyncService definitionSyncService;
 
     public ProcedureUpsertService(AgentProcedureRepository procedures, ObjectMapper objectMapper,
                                   PlatformTransactionManager transactionManager, ProcedureRevisionService revisionService) {
@@ -179,6 +189,9 @@ public class ProcedureUpsertService {
                 entity.setStatus(AgentMemoryEntryEntity.Status.ACTIVE);
                 AgentProcedureEntity saved = procedures.saveAndFlush(entity);
                 revisionService.capture(saved, "CREATE", null, OwnerContext.currentUserId());
+                // 与插入同事务：投影登记失败就让这一行一起回滚，
+                // 不能留下「本地有 SOP、远端不认识」的半截状态。
+                enqueueDefinition(saved);
                 return saved;
             });
         } catch (DataIntegrityViolationException duplicate) {
@@ -195,7 +208,11 @@ public class ProcedureUpsertService {
         for (int attempt = 1; attempt <= MAX_UPGRADE_ATTEMPTS; attempt++) {
             boolean active = current.getStatus() == AgentMemoryEntryEntity.Status.ACTIVE;
             if (active && sameContent(current, incoming)) {
-                syncMetadataIfNeeded(current, incoming);
+                if (syncMetadataIfNeeded(current, incoming)) {
+                    // 内容没变、只改了权重或名字拼写：不升版，但远端那份也要对齐，否则
+                    // 规划排序用的 importance 会一直是第一次投影时的值。
+                    enqueueDefinition(requireById(current.getId()));
+                }
                 return current;
             }
 
@@ -207,7 +224,11 @@ public class ProcedureUpsertService {
                     writeJson(incoming.getSuccessConditions()), importanceOf(incoming),
                     AgentMemoryEntryEntity.Status.ACTIVE);
             if (updated == 1) {
-                return requireById(current.getId());
+                AgentProcedureEntity promoted = requireById(current.getId());
+                // 每一版都要投影：远端只认识它收到的版本，跳过中间版本会让结算拿着的版本号
+                // 在服务端找不到行，统计静默丢失。
+                enqueueDefinition(promoted);
+                return promoted;
             }
 
             // CAS 未命中：别人先升了版（或把这一行状态改了）。重读后重新判断内容是否已经一致。
@@ -221,15 +242,17 @@ public class ProcedureUpsertService {
         throw new BusinessException(ErrorCode.MEMORY_WRITE_FAILED, "SOP 并发升级冲突，请重试");
     }
 
-    private void syncMetadataIfNeeded(AgentProcedureEntity current, Procedure incoming) {
+    /** @return 是否真的改了元数据（调用方据此决定要不要重新投影） */
+    private boolean syncMetadataIfNeeded(AgentProcedureEntity current, Procedure incoming) {
         Double incomingImportance = importanceOf(incoming);
         boolean sameImportance = Objects.equals(current.getImportance(), incomingImportance);
         boolean sameSpelling = Objects.equals(current.getName(), storedName(incoming));
         if (sameImportance && sameSpelling) {
-            return;
+            return false;
         }
         procedures.updateMetadata(current.getId(), current.getTenantId(),
                 storedName(incoming), incomingImportance);
+        return true;
     }
 
     /**
@@ -252,6 +275,13 @@ public class ProcedureUpsertService {
 
     private static int versionOf(AgentProcedureEntity entity) {
         return entity.getProcedureVersion() == null ? 1 : entity.getProcedureVersion();
+    }
+
+    /** 把当前行交给投影队列。异常向上冒泡：宁可这次写入失败，也不要留一条永远结算不到的 SOP。 */
+    private void enqueueDefinition(AgentProcedureEntity entity) {
+        if (definitionSyncService != null) {
+            definitionSyncService.enqueue(entity);
+        }
     }
 
     private static Double importanceOf(Procedure procedure) {

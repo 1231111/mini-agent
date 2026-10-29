@@ -42,6 +42,16 @@ if (-not $SkipJar) {
 if (-not (Test-Path $jarPath)) { throw "找不到 fat jar：$jarPath" }
 Write-Host ("      jar: {0:N1} MB" -f ((Get-Item $jarPath).Length / 1MB))
 
+# 迁移链体检：必须检查**产物 jar**，不能只靠单测。
+#   1) 这里用 `package` 不带 clean —— Maven 不会删 target/classes 里已从源码移除的资源，
+#      删过/改名的迁移会一直躺着，被打进 jar；
+#   2) 这里带 -DskipTests —— MigrationVersionUniquenessTest 压根不会跑。
+# 真实事故：源码把 V9 的 SQL 改写成 Java V12 后，旧的 V9 SQL 留在 target/classes，
+# 打进 jar 后 Flyway 启动即报 "Found more than one migration with version 9"，客户端 code=1。
+Write-Host '[1.5/3] 检查 jar 内迁移链 ...' -ForegroundColor Cyan
+& (Join-Path $PSScriptRoot 'check-jar-migrations.ps1') -Jar $jarPath
+if ($LASTEXITCODE -ne 0) { throw "jar 内迁移链不干净（见上方报告）。修复：mvn clean 后重新打包。" }
+
 # ── 2. jlink ──────────────────────────────────────────────────
 if (-not $SkipJre) {
     Write-Host '[2/3] 用 jlink 裁剪 JRE ...' -ForegroundColor Cyan

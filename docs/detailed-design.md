@@ -215,7 +215,7 @@ flowchart TB
 
 `mini-agent-loop` 同时装了拆解、上下文、执行、部分闭环。实现时按运行时边界拆类。
 
-### 3.5 云端记忆服务解耦边界（阶段一）
+### 3.5 云端记忆服务解耦边界（Procedure 远程链路已接通；其他记忆能力仍在执行端）
 
 `mini-agent-memory` 不是可执行 Spring Boot 服务，而是被执行端和记忆实现共同依赖的跨进程契约模块。阶段一先把最容易形成一致性闭环的 Procedure 节点终态结算切成窄端口：
 
@@ -224,6 +224,8 @@ flowchart TB
 | `MemoryPrincipal` | 传递已经由调用方认证的 `tenantId/userId/projectId/sessionId` | 不接受请求体伪造身份替代服务端认证 |
 | `ProcedureSettlementCommand` | 携带执行时绑定的 `procedureId/procedureVersion`、任务/节点幂等键和 SUCCESS/FAILURE | 不按服务端当前版本猜测结算版本 |
 | `ProcedureSettlementPort` | 结算一次 Procedure 应用事实，返回 `RECORDED/DUPLICATE/STALE_PROCEDURE/SKIPPED` | 不暴露 JPA Entity、Repository、Spring 类型 |
+| `ProcedureDefinitionCommand` / `ProcedureDefinitionPort` | 在结算前把某一版 SOP 投影到记忆服务，返回 `CREATED/UPDATED/UNCHANGED/STALE/CONFLICT` | 投影不得修改结算计数 |
+| `ProjectAuthorizationCommand` / `ProjectAuthorizationPort` | 投影执行端项目 owner 与完整成员集合的版本化快照 | 服务端不得用请求中的 `projectId` 自证授权 |
 
 当前运行时结构是：
 
@@ -232,13 +234,48 @@ PlanningLoop
   -> NodeTerminalCommitPort
   -> ProcedureNodeTerminalCommitAdapter
   -> ProcedureSettlementPort
-  -> ProcedureApplicationSettlementService
-  -> agent_procedure_applications + agent_procedures
+       local  -> ProcedureApplicationSettlementService -> JPA（桌面/单机）
+       remote -> RemoteProcedureSettlementPort -> HTTP -> mini-agent-memory（memory-service profile）
+
+DefaultMemoryManager.writeProcedure
+  -> ProcedureUpsertService（身份 upsert / 升版 CAS）
+  -> ProcedureDefinitionSyncService.enqueue（同事务写 agent_procedure_definition_outbox）
+  -> @Scheduled drain -> ProcedureDefinitionPort -> HTTP -> mini-agent-memory（memory-service profile）
+
+AgentProjectAuthorizationService.create/addMember/removeMember
+  -> agent_projects.authorization_version + agent_project_authorization_outbox（同一事务）
+  -> ProjectAuthorizationSyncService.drain
+  -> ProjectAuthorizationPort -> HTTP -> mini-agent-memory（memory-service profile）
 ```
 
-`ProcedureNodeTerminalCommitAdapter` 只负责把 Planner 的 `TaskNode` 和 `OwnerContext` 转成 `ProcedureSettlementCommand`；`ProcedureApplicationSettlementService` 只实现 `ProcedureSettlementPort`，保留原有 `REQUIRES_NEW` 幂等事实写入、唯一键并发裁决、版本条件更新和治理失败隔离。这样未来服务器部署可以把 `ProcedureSettlementPort` 替换为带服务间认证的远程适配器，云端记忆服务也不需要依赖 `mini-agent-planner`。
+`ProcedureNodeTerminalCommitAdapter` 只负责把 Planner 的 `TaskNode` 和 `OwnerContext` 转成 `ProcedureSettlementCommand`，并对结算端口异常做隔离：记忆服务故障不能把已完成节点改判为失败。
 
-本阶段尚未声称远程 HTTP 服务已经完成：尚未新增独立的 `mini-agent-memory-service` Spring Boot 进程、内部认证过滤器、HTTP DTO/controller、重试与 outbox 投递。桌面档继续使用同进程本地实现；服务器档在远程适配器完成前仍使用 `mini-agent-app` 内的本地实现。下一阶段应先定义 HTTP DTO 与服务间认证，再决定同步结算是否改为可靠事件加幂等消费者，不能把同步网络失败直接变成已完成节点失败。
+#### 阶段二：`mini-agent-memory` 独立服务运行形态
+
+不新增 Maven 模块。既有 `mini-agent-memory` 同时包含记忆领域/契约与服务端适配代码；`MemoryServiceApplication` 启动时激活 `memory-service` profile，服务端 API、JDBC 实现与安全配置仅在该 profile 装配。使用 Maven Boot 插件的 `exec` classifier 产出独立可运行包，默认监听 `127.0.0.1:8091`，配置文件为 `application-memory-service.yml`，Flyway 迁移位于 `db/migration-memory`。V1/V2 时间列使用 `DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)`；MySQL 8.4 严格模式实测表明 `DATETIME(6) DEFAULT CURRENT_TIMESTAMP` 会以错误 1067 拒绝，H2 不会暴露此差异。
+
+| 端点 | 作用 | 认证 |
+|------|------|------|
+| `PUT /internal/v1/memory/procedures/{procedureId}` | 投影某一版 SOP 的身份、内容与状态 | `X-Memory-Internal-Key` |
+| `POST /internal/v1/memory/procedure-settlements` | 结算一次节点终态 | 同上 |
+| `PUT /internal/v1/memory/projects/{projectId}/authorization` | 同步项目 owner、成员集合与授权版本 | 同上 |
+| `GET /actuator/health` | 存活探针 | 无 |
+
+关键不变量：
+
+1. **归属从服务端投影读，不从请求读。** 结算只带 `procedureId + procedureVersion`；这一行属于 `USER` 还是 `PROJECT`、`scope_id` 是谁，以已收敛的投影为准。信任请求里的 scope 等于让任何持内部密钥的调用方把自己的结算记到别人的 SOP 上。
+2. **先校验归属，再落应用事实。** 越权请求不会在 `agent_procedure_applications` 留下“这次真的用了”的证据。
+3. **投影是可追赶的镜像。** 更旧版本返回 `STALE`（乱序/重试的正常结果，调用方视为已收敛）；同版本不同内容返回 `CONFLICT`（需要人工确认，不能自动覆盖）；更新版本覆盖内容并清零计数。
+4. **清零不写在同一条 UPDATE 的 `CASE` 里。** MySQL 按赋值列表从左到右求值，一旦 `procedure_version=?` 排在 `CASE` 前，判断退化成「新版本 < 新版本」，永远为假。升版与清零拆成两条语句。
+5. **投影不吞失败。** 写 SOP 与 outbox 快照同事务；投递失败按指数退避重试，超过上限保留 `FAILED` 行与最后错误。投影丢失不会只表现为“少一条日志”，而是这条 SOP 之后所有结算都变成 `STALE_PROCEDURE`。
+
+#### 明确未实现（不要当成已支持）
+
+- `PROJECT` scope 现在按服务端 `memory_project_authorizations` / `memory_project_members` 快照校验：`tenantId + projectId` 必须匹配，只有当前 owner 或成员可结算；撤权快照生效后被移除成员的结算返回 `SKIPPED`，且不写应用事实。执行端通过 `agent_project_authorization_outbox` 可靠投递版本快照；同版本异内容为 `CONFLICT`，旧版本为 `STALE`，不能恢复旧成员权限。快照异步投递存在短暂收敛延迟，部署上需监控 outbox 积压与失败。
+- 记忆系统的其余能力（Episode、语义事实、检索、巩固、遗忘、向量索引、Proposal、`experience_clusters`、项目 ACL）**仍只在 `mini-agent-app` 内**，没有迁移到独立服务。
+- 已使用 MySQL 8.4 独立 schema 实测 Flyway V1/V2、服务启动、授权投影、PROJECT Procedure 投影、成员结算与撤权后拒绝；App 的授权与 Procedure outbox 到独立服务的 HTTP 端到端投递仍待验收。
+- 撤权与结算在服务端通过授权主记录 `SELECT ... FOR UPDATE` 串行化：先取得锁的操作先完成，撤权提交后开始的结算读取新成员快照并返回 `SKIPPED`。该语义已在 H2 集成测试覆盖，仍需在 MySQL 并发负载下回归。
+- 服务 profile 默认使用独立 H2 文件库；**不要把它指向 `mini-agent-app` 的库**，服务端 `db/migration-memory` 与执行侧迁移历史、表结构不同。
 
 ### 3.6 运行时总图（一轮用户消息）
 

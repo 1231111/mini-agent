@@ -70,6 +70,13 @@
             transition: background .15s;
         }
         .sb-header button:hover { background: var(--surface); }
+        /* 返回对话：本页由左侧栏「轨迹」整页跳转进入，没有它就成了单向门 */
+        .sb-back {
+            display: block; margin: 8px 12px 0; padding: 6px 10px;
+            border-radius: 8px; color: var(--text2); font-size: 13px;
+            text-decoration: none; transition: background .15s, color .15s;
+        }
+        .sb-back:hover { background: var(--surface); color: var(--text); }
         .sb-list { flex: 1; overflow-y: auto; padding: 8px; }
         .sb-item {
             padding: 10px 12px; border-radius: 8px;
@@ -361,6 +368,7 @@
             </svg>
         </button>
     </div>
+    <a class="sb-back" href="/">← 返回对话</a>
     <div class="sb-list" id="sessionList"></div>
 </div>
 

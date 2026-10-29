@@ -23,6 +23,9 @@ public class AgentProjectEntity {
     @Column(name = "project_name", nullable = false, length = 256)
     private String projectName;
 
+    @Column(name = "authorization_version", nullable = false)
+    private Long authorizationVersion = 1L;
+
     @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;
 
@@ -34,6 +37,8 @@ public class AgentProjectEntity {
     public void setOwnerUserId(Long ownerUserId) { this.ownerUserId = ownerUserId; }
     public String getProjectName() { return projectName; }
     public void setProjectName(String projectName) { this.projectName = projectName; }
+    public Long getAuthorizationVersion() { return authorizationVersion; }
+    public void setAuthorizationVersion(Long authorizationVersion) { this.authorizationVersion = authorizationVersion; }
     public LocalDateTime getCreatedAt() { return createdAt; }
     public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
 }

@@ -1,6 +1,6 @@
 # mini-agent 生产级差距审计报告
 
-- **审计对象**：`D:\AI\miniagent`（Java 21 / Spring Boot 3.4.5 / LangChain4j 1.15，7 个 Maven 模块，543 个 Java 文件 / 56,234 行 + Electron 桌面壳 + 账号/计费服务）
+- **审计对象**：`D:\AI\miniagent`（Java 21 / Spring Boot 3.4.5 / LangChain4j 1.15，7 个 Maven 模块（记忆服务作为 `mini-agent-memory` 的独立运行 profile），543 个 Java 文件 / 56,234 行 + Electron 桌面壳 + 账号/计费服务）
 - **对标基线**：生产级 agent 运行时（Claude Code、Codex CLI、Devin、Manus 一类）在**安全边界、完成判定、上下文治理、可观测性、可运维性**五个维度的最低要求
 - **方法**：全量读源码（含测试与配置）+ 6 个子系统深度审计 + 对关键判定做独立复核（不采信未验证的结论）+ 运行期日志取样
 - **版本基线**：HEAD `f4aacc2`（2026-10-08）；工作区有未提交改动（含 13 个安全测试被暂存删除），见 P1-18
@@ -51,6 +51,33 @@
 已将 Procedure 节点终态结算从 Planner 类型中抽出为 `mini-agent-memory` 的跨进程窄契约：`MemoryPrincipal`、`ProcedureSettlementCommand`、`ProcedureSettlementPort` 和 `ProcedureSettlementResult`。`ProcedureApplicationSettlementService` 现在只依赖该记忆端口；新增 `ProcedureNodeTerminalCommitAdapter` 负责把 `NodeTerminalCommitPort` / `TaskNode` / `OwnerContext` 转换为契约命令。
 
 这一步只完成边界和本地适配，不是云端服务已经上线。当前桌面与服务器仍使用 `mini-agent-app` 内的本地数据库实现；独立记忆服务、服务间认证、HTTP DTO/controller、重试/outbox 和远程适配器仍未完成。新增契约测试 3 项，本地结算回归 7 项通过；编译通过。
+
+### 2026-10-29 补充（二）：独立记忆服务已可启动，Procedure 纵向切片打通
+
+> 本轮后续实测补充：MySQL 8.4 暴露 V1/V2 时间默认值不兼容；已改为 `CURRENT_TIMESTAMP(6)`。PROJECT 授权行锁/H2 回归通过；MySQL 服务端 API 正向投影、结算与撤权已验证。App outbox 到远端的真实 HTTP E2E 与 MySQL 并发撤权测试仍未完成，不能据此称整条生产链路验收完成。
+
+**已实现并实测**
+
+- 独立记忆服务运行能力归入既有 `mini-agent-memory` Maven 模块（不再新增并列模块），由 `MemoryServiceApplication` 与 `memory-service` profile 独立启动；默认 `127.0.0.1:8091`，自带 Flyway `V1__procedure_settlement_schema.sql`。该模块同时保留领域契约，服务端 API/JDBC 组件仅在服务 profile 激活时装配。
+- 内部 API：`PUT /internal/v1/memory/procedures/{procedureId}`（投影）与 `POST /internal/v1/memory/procedure-settlements`（结算），统一用 `X-Memory-Internal-Key` 常量时间比较；密钥未配置时一律 401（fail-closed）。
+- 新增跨进程契约 `ProcedureDefinitionCommand` / `ProcedureDefinitionPort` / `ProcedureDefinitionResult`，与既有 `MemoryPrincipal` / `ProcedureSettlementCommand` 同包。
+- `mini-agent-app` 侧新增 `agent.memory.service.mode=local|remote` 选择；remote 下结算与投影由同一个 `RemoteProcedureSettlementPort` 提供，避免出现「结算走远端、投影没配」的半接通组合。
+- 新增 `agent_procedure_definition_outbox`（V17）与 `ProcedureDefinitionSyncService`：`ProcedureUpsertService` 在写入/升版的同一事务登记快照，后台按版本投递，失败指数退避，超过 10 次保留 `FAILED` 与最后错误。local 模式下完全不参与。
+- 修复一个真实语义 bug：升版清零原先写成同一条 `UPDATE` 里的 `CASE WHEN procedure_version < ?`，而 `procedure_version=?` 排在 `CASE` 之前；MySQL 按赋值列表从左到右求值，判断退化为「新版本 < 新版本」，计数永远不清零。改为先更新内容与版本、再单独清零。
+
+**验证**
+
+- `ProcedureSettlementIntegrationTest`（真实 H2 + Flyway）13 项：投影建行计数为 0、重复投影幂等、同版本不同内容冲突、升版清零、旧版本 STALE、结算累加与成功率重算、同节点重复结算 DUPLICATE、过期版本不改计数、他人结算 SKIPPED 且不落应用事实、PROJECT 授权快照校验与撤权、撤权和结算授权行锁语义、授权快照版本冲突/过期、USER scope 与 userId 不符被拒。
+- `mini-agent-app` Procedure 相关 49 项回归通过（含 Upsert 10 项、结算 7 项、迁移 5 项）。
+- 新增 `ProcedureDefinitionOutboxMigrationTest`（可重跑、版本唯一键、换版本可追加）。
+- 真实 jar 启动烟测：health 200；无密钥/错密钥 401；投影 `CREATED → UNCHANGED`；结算 `RECORDED → DUPLICATE`；升版 `UPDATED`；旧版本结算 `STALE_PROCEDURE`；他人结算 `SKIPPED`。
+
+**已知缺口（按性质分开）**
+
+- 已由后续 2026-10-29 补充闭合：PROJECT scope 的 owner/member 授权快照进入独立记忆服务，结算基于服务端表校验；执行侧成员变更同事务递增授权版本并写 outbox，后台重试投递。2026-10-29 后续实测已在 MySQL 8.4 完成服务端迁移与 API 链路验证；仍待 App outbox 到服务端的真实 HTTP E2E、MySQL 并发撤权回归、outbox 故障注入及指标告警。授权快照异步投递仍有短暂收敛延迟。
+- 功能缺环：Episode、语义事实、检索、巩固、遗忘、向量索引、Proposal、`experience_clusters`、项目 ACL 仍只在 `mini-agent-app` 内，未迁移。
+- 工程债：独立服务只做过 H2 验证，未连真实 MySQL；服务自带 schema 与执行侧 schema 必须分库，共库会在启动时撞表。
+- 工程债：`MemoryTaskLock` 的跨实例互斥在无 Redis 时退化为进程内锁，多实例部署投递 outbox 仍可能重复搬运（投影本身幂等，不会改计数）。
 
 ### 2026-10-28 补充（三）：Procedure 低成功率自动归档（自进化第 1 步）
 
