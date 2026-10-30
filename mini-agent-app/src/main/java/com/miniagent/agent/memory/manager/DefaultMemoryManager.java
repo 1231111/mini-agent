@@ -13,6 +13,8 @@ import com.miniagent.common.embedding.SharedEmbeddingModel;
 import com.miniagent.common.context.OwnerContext;
 import com.miniagent.agent.planner.ProcedurePromptInput;
 import com.miniagent.agent.planner.ProcedurePromptPort;
+import com.miniagent.memory.service.evolution.CandidateProcedure;
+import com.miniagent.memory.service.web.EvolutionResponse;
 import com.miniagent.common.ErrorCode;
 import com.miniagent.common.exception.BusinessException;
 import org.apache.commons.lang3.StringUtils;
@@ -453,6 +455,26 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
         return toProcedureModel(upserted.entity());
     }
 
+    @Autowired(required = false)
+    private RemoteProcedureSettlementPort remoteEvolutionClient;
+
+    private int canaryAssignment(String tenantId, Long userId, String sessionId, long taskId,
+                                 Long procedureId, long proposalId) {
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            String key = String.join("|", tenantId, userId.toString(), sessionId,
+                    Long.toString(taskId), procedureId.toString(), Long.toString(proposalId));
+            byte[] bytes = digest.digest(key.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            long value = java.nio.ByteBuffer.wrap(bytes, 0, Long.BYTES).getLong() & Long.MAX_VALUE;
+            return (int) (value % 100);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
+    }
+
+    @Value("${agent.memory.procedure.evolution-routing-enabled:false}")
+    private boolean canaryRoutingEnabled;
+
     @Override
     @Transactional(readOnly = true)
     public List<ProcedurePromptInput> findForCurrentOwner(String query) {
@@ -470,16 +492,63 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
                     owner.tenantId(), AgentMemoryEntryEntity.ScopeType.PROJECT, projectId,
                     AgentMemoryEntryEntity.Status.ACTIVE));
         }
-        return candidates.stream()
+        List<ProcedurePromptInput> baseline = candidates.stream()
                 .filter(p -> query == null || query.isBlank()
                         || p.getName().toLowerCase(Locale.ROOT).contains(query.toLowerCase(Locale.ROOT))
                         || Objects.toString(p.getDescription(), "").toLowerCase(Locale.ROOT)
                                 .contains(query.toLowerCase(Locale.ROOT)))
-                .limit(20)
                 .map(p -> new ProcedurePromptInput(p.getId(), p.getProcedureVersion(), p.getName(),
                         p.getDescription(), parseJsonList(p.getPreconditionsJson()),
                         parseJsonList(p.getStepsJson()), parseJsonList(p.getSuccessConditionsJson())))
                 .toList();
+        RemoteProcedureSettlementPort remoteClient = canaryRoutingEnabled ? remoteEvolutionClient : null;
+        if (remoteClient == null) return baseline.stream().limit(20).toList();
+        String sessionId = com.miniagent.agent.core.AgentLoop.getCurrentSession();
+        long taskId = com.miniagent.agent.core.TaskExecutionContext.currentTaskId();
+        if (StringUtils.isBlank(sessionId) || taskId <= 0) return baseline.stream().limit(20).toList();
+        Map<Long, ProcedurePromptInput> selected = new LinkedHashMap<>();
+        List<EvolutionResponse> activeCanaries;
+        try {
+            activeCanaries = remoteClient.listCanaryCandidates(owner.tenantId(), owner.userId());
+        } catch (Exception e) {
+            log.warn("Canary assignment lookup failed; excluding USER procedures for this plan: {}",
+                    e.getClass().getSimpleName());
+            Set<Long> userProcedureIds = candidates.stream()
+                    .filter(local -> local.getScopeType() == AgentMemoryEntryEntity.ScopeType.USER)
+                    .map(AgentProcedureEntity::getId).collect(Collectors.toSet());
+            return baseline.stream().filter(p -> !userProcedureIds.contains(p.procedureId()))
+                    .limit(20).toList();
+        }
+        Set<Long> excludedProcedures = new HashSet<>();
+        for (EvolutionResponse proposal : activeCanaries) {
+            if (proposal.procedureId() == null || proposal.userId() == null
+                    || !owner.userId().equals(proposal.userId()) || !owner.tenantId().equals(proposal.tenantId())) continue;
+            ProcedurePromptInput local = baseline.stream()
+                    .filter(p -> Objects.equals(p.procedureId(), proposal.procedureId())
+                            && Objects.equals(p.version(), proposal.baselineVersion()))
+                    .findFirst().orElse(null);
+            if (local == null || proposal.canaryTargetPercent() <= 0) continue;
+            boolean candidate = canaryAssignment(owner.tenantId(), owner.userId(), sessionId, taskId,
+                    proposal.procedureId(), proposal.proposalId()) < proposal.canaryTargetPercent();
+            if (candidate) {
+                try {
+                    EvolutionResponse snapshot = remoteClient.fetchCanaryCandidate(owner.tenantId(), owner.userId(),
+                            proposal.procedureId(), proposal.proposalId(), proposal.candidateHash());
+                    CandidateProcedure content = objectMapper.readValue(snapshot.candidateContentJson(), CandidateProcedure.class);
+                    selected.put(proposal.procedureId(), new ProcedurePromptInput(proposal.procedureId(),
+                            proposal.baselineVersion(), local.name(), content.description(), content.preconditions(),
+                            content.steps(), content.successConditions(), proposal.proposalId(),
+                            proposal.candidateHash(), "CANDIDATE", proposal.canaryTargetPercent()));
+                } catch (Exception e) {
+                    log.warn("Canary candidate snapshot unavailable; excluding procedure for this plan: proposal={} status={}",
+                            proposal.proposalId(), e.getClass().getSimpleName());
+                    excludedProcedures.add(proposal.procedureId());
+                }
+            }
+        }
+        baseline.stream().filter(p -> !excludedProcedures.contains(p.procedureId()))
+                .forEach(p -> selected.putIfAbsent(p.procedureId(), p));
+        return selected.values().stream().limit(20).toList();
     }
 
     @Override

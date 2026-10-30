@@ -33,6 +33,18 @@ memory:
     security:
       # 空值时所有写接口一律拒绝（fail-closed），不存在“没配密钥就放行”的降级路径。
       internal-key: ${MEMORY_SERVICE_INTERNAL_KEY:}
+      # runner/router 密钥只允许对应受信组件使用，不能复用内部 API 密钥。
+      runner-key: ${MEMORY_SERVICE_RUNNER_KEY:}
+      router-key: ${MEMORY_SERVICE_ROUTER_KEY:}
+      attestation-max-age-seconds: ${MEMORY_SERVICE_ATTESTATION_MAX_AGE_SECONDS:300}
+  evolution:
+    enabled: ${MEMORY_EVOLUTION_ENABLED:false}
+    minimum-samples: ${MEMORY_EVOLUTION_MINIMUM_SAMPLES:20}
+    maximum-baseline-failure-rate: ${MEMORY_EVOLUTION_MAX_BASELINE_FAILURE_RATE:0.5}
+    minimum-improvement: ${MEMORY_EVOLUTION_MINIMUM_IMPROVEMENT:0.05}
+    canary-percent: ${MEMORY_EVOLUTION_CANARY_PERCENT:5}
+    minimum-canary-samples: ${MEMORY_EVOLUTION_MINIMUM_CANARY_SAMPLES:100}
+    rollback-failure-rate: ${MEMORY_EVOLUTION_ROLLBACK_FAILURE_RATE:0.25}
 
 management:
   endpoints:

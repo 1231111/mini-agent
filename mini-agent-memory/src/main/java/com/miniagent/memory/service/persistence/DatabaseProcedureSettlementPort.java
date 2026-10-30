@@ -10,10 +10,7 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
 
@@ -27,8 +24,8 @@ import java.util.List;
  * <p><b>为什么先校验归属再写应用事实</b>：越权请求不该在 {@code agent_procedure_applications}
  * 里留下一条“这次真的用了”的证据。先失败，再落任何数据。</p>
  *
- * <p><b>两次事务不是疏忽</b>：应用事实用 {@code REQUIRES_NEW} 单独提交，撞唯一键只回滚那一条。
- * 计数更新是另一条语句，条件里带 {@code procedure_version}——迟到结算不会把 v1 的成绩记到 v2。</p>
+ * <p>应用事实和版本统计在同一事务内提交，候选变体只保留独立事实，不污染基线 Procedure 统计。
+ * 结算按 procedure_version 做 CAS 条件，迟到结算不会把旧版本的成绩写到新版本。</p>
  */
 @Service
 @Profile("memory-service")
@@ -36,17 +33,18 @@ public class DatabaseProcedureSettlementPort implements ProcedureSettlementPort 
     private static final Logger log = LoggerFactory.getLogger(DatabaseProcedureSettlementPort.class);
 
     private final JdbcTemplate jdbc;
-    private final TransactionTemplate requiresNew;
 
-    public DatabaseProcedureSettlementPort(JdbcTemplate jdbc, PlatformTransactionManager transactionManager) {
+    public DatabaseProcedureSettlementPort(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
-        this.requiresNew = new TransactionTemplate(transactionManager);
-        this.requiresNew.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
 
     @Override
     @Transactional
     public ProcedureSettlementResult settle(ProcedureSettlementCommand command) {
+        validateEvolutionIdentity(command);
+        if (command.evolutionProposalId() != null && !isActiveCandidate(command)) {
+            return ProcedureSettlementResult.staleProcedure();
+        }
         List<ProcedureScope> scopes = jdbc.query(
                 "SELECT scope_type, scope_id FROM agent_procedures "
                         + "WHERE id = ? AND tenant_id = ? AND procedure_version = ?",
@@ -65,22 +63,24 @@ public class DatabaseProcedureSettlementPort implements ProcedureSettlementPort 
         }
 
         try {
-            Boolean inserted = requiresNew.execute(status -> {
-                jdbc.update("INSERT INTO agent_procedure_applications "
+            int inserted = jdbc.update("INSERT INTO agent_procedure_applications "
                                 + "(tenant_id,user_id,session_id,task_id,node_id,procedure_id,procedure_version,"
-                                + "action_id,result,created_at) "
-                                + "VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                                + "action_id,result,evolution_proposal_id,evolution_candidate_hash,procedure_variant,created_at) "
+                                + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
                         command.principal().tenantId(), command.principal().userId(),
                         command.principal().sessionId(), command.taskId(), command.nodeId(),
                         command.procedureId(), command.procedureVersion(), command.actionId(),
-                        command.outcome().name());
-                return true;
-            });
-            if (!Boolean.TRUE.equals(inserted)) {
+                        command.outcome().name(), command.evolutionProposalId(), command.evolutionCandidateHash(),
+                        command.procedureVariant());
+            if (inserted != 1) {
                 return ProcedureSettlementResult.duplicate();
             }
         } catch (DuplicateKeyException duplicate) {
             return ProcedureSettlementResult.duplicate();
+        }
+
+        if ("CANDIDATE".equals(command.procedureVariant())) {
+            return ProcedureSettlementResult.recorded();
         }
 
         int updated = jdbc.update("UPDATE agent_procedures SET "
@@ -102,6 +102,30 @@ public class DatabaseProcedureSettlementPort implements ProcedureSettlementPort 
                         + "WHERE id = ? AND tenant_id = ?",
                 command.procedureId(), command.principal().tenantId());
         return ProcedureSettlementResult.recorded();
+    }
+
+    private boolean isActiveCandidate(ProcedureSettlementCommand command) {
+        Integer matches = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM memory_evolution_proposals
+                 WHERE tenant_id=? AND user_id=? AND procedure_id=? AND proposal_id=?
+                   AND candidate_hash=? AND status='CANARY'
+                """, Integer.class, command.principal().tenantId(), command.principal().userId(),
+                command.procedureId(), command.evolutionProposalId(), command.evolutionCandidateHash());
+        return matches != null && matches == 1;
+    }
+
+    private static void validateEvolutionIdentity(ProcedureSettlementCommand command) {
+        if (command.evolutionProposalId() == null) {
+            if (command.evolutionCandidateHash() != null || !"BASELINE".equals(command.procedureVariant())) {
+                throw new IllegalArgumentException("baseline settlement cannot carry candidate identity");
+            }
+            return;
+        }
+        if (command.evolutionProposalId() <= 0 || command.evolutionCandidateHash() == null
+                || !command.evolutionCandidateHash().matches("[0-9a-f]{64}")
+                || !"CANDIDATE".equals(command.procedureVariant())) {
+            throw new IllegalArgumentException("candidate settlement identity is invalid");
+        }
     }
 
     private boolean isAuthorized(ProcedureScope scope, MemoryPrincipal principal) {

@@ -1091,6 +1091,23 @@ public class PlanningLoop {
                 sb.append("上一轮失败上下文（必须先处理，不要盲重试）：")
                         .append(n.lastError()).append('\n');
             }
+            if (n != null && StringUtils.isNotBlank(n.procedureSnapshotJson())) {
+                try {
+                    ProcedurePromptInput procedure = new com.fasterxml.jackson.databind.ObjectMapper()
+                            .readValue(n.procedureSnapshotJson(), ProcedurePromptInput.class);
+                    sb.append("本节点固定使用已授权 Procedure 快照：procedureId=")
+                            .append(procedure.procedureId()).append(" version=").append(procedure.version())
+                            .append(" variant=").append(n.procedureVariant())
+                            .append(" proposalId=").append(n.evolutionProposalId())
+                            .append(" candidateHash=").append(n.evolutionCandidateHash())
+                            .append(" canaryTargetPercent=").append(n.canaryTargetPercent()).append('\n')
+                            .append("preconditions=").append(procedure.preconditions()).append('\n')
+                            .append("执行步骤（必须依序遵循）：").append(procedure.steps()).append('\n')
+                            .append("successConditions=").append(procedure.successConditions()).append('\n');
+                } catch (Exception e) {
+                    throw new IllegalStateException("Persisted procedure snapshot is invalid for task " + n.id(), e);
+                }
+            }
             sb.append("- taskId=").append(a.taskId())
                     .append(" capability=").append(cap)
                     .append(" tool=").append(a.tool())

@@ -217,7 +217,7 @@ flowchart TB
 
 ### 3.5 云端记忆服务解耦边界（Procedure 远程链路已接通；其他记忆能力仍在执行端）
 
-`mini-agent-memory` 不是可执行 Spring Boot 服务，而是被执行端和记忆实现共同依赖的跨进程契约模块。阶段一先把最容易形成一致性闭环的 Procedure 节点终态结算切成窄端口：
+`mini-agent-memory` 既是共享的记忆领域/契约 Maven 模块，也能通过 `MemoryServiceApplication` + `memory-service` profile 独立运行。当前独立服务只承载 Procedure 投影、结算、PROJECT 授权快照和新加入的进化控制面；Episode 采集/巩固、原 Proposal 人工审核 UI 与客户端运行适配仍在 `mini-agent-app`。阶段一先把最容易形成一致性闭环的 Procedure 节点终态结算切成窄端口：
 
 | 契约 | 作用 | 禁止依赖 |
 |------|------|----------|
@@ -259,6 +259,7 @@ AgentProjectAuthorizationService.create/addMember/removeMember
 | `PUT /internal/v1/memory/procedures/{procedureId}` | 投影某一版 SOP 的身份、内容与状态 | `X-Memory-Internal-Key` |
 | `POST /internal/v1/memory/procedure-settlements` | 结算一次节点终态 | 同上 |
 | `PUT /internal/v1/memory/projects/{projectId}/authorization` | 同步项目 owner、成员集合与授权版本 | 同上 |
+| `/internal/v1/memory/evolution/proposals` | 保存候选、查询状态；提供 validation-runs、decision、canary-observations 子端点 | 同上；`memory.evolution.enabled` 默认 false |
 | `GET /actuator/health` | 存活探针 | 无 |
 
 关键不变量：
@@ -272,8 +273,9 @@ AgentProjectAuthorizationService.create/addMember/removeMember
 #### 明确未实现（不要当成已支持）
 
 - `PROJECT` scope 现在按服务端 `memory_project_authorizations` / `memory_project_members` 快照校验：`tenantId + projectId` 必须匹配，只有当前 owner 或成员可结算；撤权快照生效后被移除成员的结算返回 `SKIPPED`，且不写应用事实。执行端通过 `agent_project_authorization_outbox` 可靠投递版本快照；同版本异内容为 `CONFLICT`，旧版本为 `STALE`，不能恢复旧成员权限。快照异步投递存在短暂收敛延迟，部署上需监控 outbox 积压与失败。
-- 记忆系统的其余能力（Episode、语义事实、检索、巩固、遗忘、向量索引、Proposal、`experience_clusters`、项目 ACL）**仍只在 `mini-agent-app` 内**，没有迁移到独立服务。
-- 已使用 MySQL 8.4 独立 schema 实测 Flyway V1/V2、服务启动、授权投影、PROJECT Procedure 投影、成员结算与撤权后拒绝；App 的授权与 Procedure outbox 到独立服务的 HTTP 端到端投递仍待验收。
+- 记忆系统的其余能力（Episode、语义事实、检索、巩固、遗忘、向量索引、原有 Proposal 人工审核 UI、`experience_clusters`、完整客户端授权流程）仍在 `mini-agent-app`，没有整体迁移到独立服务。
+- 新增的进化控制面只保存候选与状态快照；没有可信隔离执行器的签名证明，因此 `validation-runs` 当前 fail-closed，不会因调用端提交 `passed=true` 而通过验证。App 真实流量也尚未按 canary 分配版本，故自动决策、灰度、监控和回滚均未达到生产可用，默认 `memory.evolution.enabled=false`。
+- 已使用 MySQL 8.4 独立 schema 实测 Flyway V1/V2、服务启动、授权投影、PROJECT Procedure 投影、成员结算与撤权后拒绝；V3 目前仅通过 H2 Flyway 测试，MySQL 8.4 migration、App outbox 到独立服务的完整 HTTP E2E 仍待验收。
 - 撤权与结算在服务端通过授权主记录 `SELECT ... FOR UPDATE` 串行化：先取得锁的操作先完成，撤权提交后开始的结算读取新成员快照并返回 `SKIPPED`。该语义已在 H2 集成测试覆盖，仍需在 MySQL 并发负载下回归。
 - 服务 profile 默认使用独立 H2 文件库；**不要把它指向 `mini-agent-app` 的库**，服务端 `db/migration-memory` 与执行侧迁移历史、表结构不同。
 

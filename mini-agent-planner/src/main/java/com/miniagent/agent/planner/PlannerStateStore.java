@@ -243,7 +243,14 @@ public class PlannerStateStore {
                     || !Objects.equals(a.inputs(), b.inputs()) || !Objects.equals(a.outputs(), b.outputs())
                     || !Objects.equals(a.doneWhen(), b.doneWhen()) || !Objects.equals(a.toolHint(), b.toolHint())
                     || !Objects.equals(a.toolArguments(), b.toolArguments())
-                    || !Objects.equals(a.compensation(), b.compensation()) || !Objects.equals(a.covers(), b.covers())) {
+                    || !Objects.equals(a.compensation(), b.compensation()) || !Objects.equals(a.covers(), b.covers())
+                    || !Objects.equals(a.procedureId(), b.procedureId())
+                    || !Objects.equals(a.procedureVersion(), b.procedureVersion())
+                    || !Objects.equals(a.evolutionProposalId(), b.evolutionProposalId())
+                    || !Objects.equals(a.evolutionCandidateHash(), b.evolutionCandidateHash())
+                    || !Objects.equals(a.procedureVariant(), b.procedureVariant())
+                    || !Objects.equals(a.procedureSnapshotJson(), b.procedureSnapshotJson())
+                    || a.canaryTargetPercent() != b.canaryTargetPercent()) {
                 return false;
             }
         }

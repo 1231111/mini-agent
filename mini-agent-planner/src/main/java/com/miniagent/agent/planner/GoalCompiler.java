@@ -224,14 +224,47 @@ public class GoalCompiler {
     @Autowired(required = false)
     private ProcedurePromptPort procedurePromptPort;
 
+    void attachProcedurePromptPort(ProcedurePromptPort port) {
+        this.procedurePromptPort = port;
+    }
+
     /** skill 摘要给规划模型的字符上限：词表之外还要留预算给任务描述。 */
     private static final int SKILL_DIGEST_MAX = 1200;
 
     private String procedureDigest(String prefix) {
+        return procedureDigest(prefix, loadProcedureSnapshot());
+    }
+
+    String skillDigest(List<ProcedurePromptInput> procedures) {
+        if (skillStore == null) {
+            return procedureDigest("", procedures);
+        }
+        String summary;
+        try {
+            summary = skillStore.getSkillListSummary();
+        } catch (Exception e) {
+            log.warn("读取 skill 摘要失败，按无技能继续拆解: {}", e.getMessage());
+            return procedureDigest("", procedures);
+        }
+        if (StringUtils.isBlank(summary)) {
+            return procedureDigest("", procedures);
+        }
+        if (summary.length() > SKILL_DIGEST_MAX) {
+            summary = summary.substring(0, SKILL_DIGEST_MAX) + "\\n（技能清单已截断）";
+        }
+        return procedureDigest("\\n本轮可用技能：若用户目标命中某技能，该步骤的 capability 必须选到"
+                + "它所依赖的能力类别，不要退化成只能写文件：\\n" + summary, procedures);
+    }
+
+    private List<ProcedurePromptInput> loadProcedureSnapshot() {
         if (procedurePromptPort == null) {
-            return prefix;
+            return List.of();
         }
         List<ProcedurePromptInput> procedures = procedurePromptPort.findForCurrentOwner("");
+        return procedures == null ? List.of() : List.copyOf(procedures);
+    }
+
+    private String procedureDigest(String prefix, List<ProcedurePromptInput> procedures) {
         if (procedures == null || procedures.isEmpty()) {
             return prefix;
         }
@@ -239,7 +272,8 @@ public class GoalCompiler {
                 .map(p -> "procedureId=" + p.procedureId() + " version=" + p.version()
                         + " name=" + p.name() + " description=" + p.description()
                         + " preconditions=" + p.preconditions() + " steps=" + p.steps()
-                        + " successConditions=" + p.successConditions())
+                        + " successConditions=" + p.successConditions()
+                        + " variant=" + p.procedureVariant())
                 .collect(Collectors.joining("\\n"));
         return prefix + "\\n可复用的用户 Procedure（只使用下列 ID/version；引用需由本轮绑定）：\\n" + digest;
     }
@@ -390,10 +424,11 @@ public class GoalCompiler {
         if (chat == null) {
             return null;
         }
+        List<ProcedurePromptInput> procedureSnapshot = loadProcedureSnapshot();
 
         String user = "用户消息:\n" + userMessage
                 + "\n任务目标:" + (plan == null ? "" : plan.taskGoal())
-                + skillDigest()
+                + skillDigest(procedureSnapshot)
                 + "\n\n**修正要求**:\n" + correctionPrompt
                 + "\n\n请根据上述修正要求重新生成任务图。";
 
@@ -402,7 +437,7 @@ public class GoalCompiler {
                 .build());
         String text = response.aiMessage() == null ? "" : response.aiMessage().text();
         try {
-            ParsedCompilation parsed = parseCompilation(text, goalFromPlan(userMessage, plan));
+            ParsedCompilation parsed = parseCompilation(text, goalFromPlan(userMessage, plan), procedureSnapshot);
             if (parsed == null || parsed.graph() == null || parsed.graph().isEmpty()) {
                 // 空图是最难定位的一类失败：模型回的是**合法 JSON 但没有可用的 nodes 数组**，
                 // 所以既不抛异常、也没有任何痕迹 —— 外部只能看到一次空结果。
@@ -563,7 +598,8 @@ public class GoalCompiler {
             kept.add(new TaskNode(n.id(), n.name(), n.capability(), deps, inputs, n.outputs(),
                     n.status(), n.priority(), n.doneWhen(), n.toolHint(), n.toolArguments(),
                     n.compensation(), n.covers(), n.lastError(), n.retryCount(), n.output(),
-                    n.outputBindings()));
+                    n.outputBindings(), n.procedureId(), n.procedureVersion(), n.evolutionProposalId(),
+                    n.evolutionCandidateHash(), n.procedureVariant(), n.procedureSnapshotJson(), n.canaryTargetPercent()));
         }
         return new TaskGraph(kept);
     }
@@ -597,18 +633,19 @@ public class GoalCompiler {
         if (chat == null) {
             return null;
         }
+        List<ProcedurePromptInput> procedureSnapshot = loadProcedureSnapshot();
         String user = "用户消息:\n" + userMessage
                 + "\n任务目标:" + (plan == null ? "" : plan.taskGoal())
                 + "\n若同时要获取资料并保存文件，至少拆成获取 + 写入两个节点。"
                 + "\n若同时要读取表格并统计，至少拆成读取 + 计算两个节点。"
                 + "\n不要把打开/读取/解析同一文件拆成多个节点。"
-                + skillDigest();
+                + skillDigest(procedureSnapshot);
         var response = chat.chat(ChatRequest.builder()
                 .messages(List.of(new SystemMessage(compilerSystem()), UserMessage.from(user)))
                 .build());
         String text = response.aiMessage() == null ? "" : response.aiMessage().text();
         try {
-            ParsedCompilation parsed = parseCompilation(text, goalFromPlan(userMessage, plan));
+            ParsedCompilation parsed = parseCompilation(text, goalFromPlan(userMessage, plan), procedureSnapshot);
             if (parsed == null || parsed.graph() == null || parsed.graph().isEmpty()) {
                 // 空图是最难定位的一类失败：模型回的是**合法 JSON 但没有可用的 nodes 数组**，
                 // 所以既不抛异常、也没有任何痕迹 —— 外部只能看到一次空结果。
@@ -663,11 +700,22 @@ public class GoalCompiler {
             TaskNode node = new TaskNode(id, name, cap, deps, stringList(n, "inputs"),
                     stringList(n, "outputs"), TaskNodeStatus.PENDING,
                     priority, DoneWhen.parse(dwNode), "", "", 0, "");
-            if (n.hasNonNull("procedureId") && n.hasNonNull("procedureVersion")
-                    && allowedProcedures.stream().anyMatch(p ->
-                    p.procedureId().equals(n.get("procedureId").asLong())
-                            && p.version().equals(n.get("procedureVersion").asInt()))) {
-                node = node.withProcedure(n.get("procedureId").asLong(), n.get("procedureVersion").asInt());
+            if (n.hasNonNull("procedureId") && n.hasNonNull("procedureVersion")) {
+                long requestedId = n.get("procedureId").asLong();
+                int requestedVersion = n.get("procedureVersion").asInt();
+                ProcedurePromptInput procedure = allowedProcedures.stream().filter(p ->
+                                java.util.Objects.equals(p.procedureId(), requestedId)
+                                        && java.util.Objects.equals(p.version(), requestedVersion))
+                        .findFirst().orElse(null);
+                if (procedure != null) {
+                    node = node.withProcedure(procedure.procedureId(), procedure.version());
+                    node = node.withProcedureSnapshot(MAPPER.writeValueAsString(procedure))
+                            .withCanaryTargetPercent(procedure.canaryTargetPercent());
+                    if (procedure.evolutionProposalId() != null) {
+                        node = node.withEvolutionCandidate(procedure.evolutionProposalId(),
+                                procedure.evolutionCandidateHash());
+                    }
+                }
             }
             list.add(node);
         }
@@ -676,9 +724,12 @@ public class GoalCompiler {
 
     /** 解析模型完整编译结果，同时保留 Goal 根字段而非丢回 TaskPlan。 */
     ParsedCompilation parseCompilation(String text, Goal base) throws Exception {
+        return parseCompilation(text, base, loadProcedureSnapshot());
+    }
+
+    ParsedCompilation parseCompilation(String text, Goal base,
+                                       List<ProcedurePromptInput> available) throws Exception {
         JsonNode root = MAPPER.readTree(extractJson(text));
-        List<ProcedurePromptInput> available = procedurePromptPort == null
-                ? List.of() : procedurePromptPort.findForCurrentOwner("");
         TaskGraph graph = parseGraph(text, available == null ? List.of() : available);
         Goal seed = base == null
                 ? new Goal("goal_" + UUID.randomUUID().toString().substring(0, 8), "",

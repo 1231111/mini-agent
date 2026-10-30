@@ -45,7 +45,10 @@ public class ProcedureNodeTerminalCommitAdapter implements NodeTerminalCommitPor
                     node.procedureVersion(),
                     result == Result.SUCCESS
                             ? ProcedureSettlementCommand.Outcome.SUCCESS
-                            : ProcedureSettlementCommand.Outcome.FAILURE));
+                            : ProcedureSettlementCommand.Outcome.FAILURE,
+                    node.evolutionProposalId(),
+                    node.evolutionCandidateHash().isBlank() ? null : node.evolutionCandidateHash(),
+                    node.procedureVariant()));
         } catch (RuntimeException e) {
             // 记忆服务是结果的旁路消费者；网络或持久化故障不能把已完成节点改判为失败。
             log.warn("Procedure 结算服务不可用，跳过本次结算: session={}, task={}, node={}, reason={}",

@@ -256,6 +256,34 @@ class ProcedureSettlementIntegrationTest {
         assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM agent_procedures", Integer.class));
     }
 
+    @Test
+    void candidateSettlementIsPersistedSeparatelyFromBaselineAndIdempotentPerVariant() {
+        synchronizer.synchronize(definition(1L, 1, "USER", "7", "steps-v1"));
+        jdbc.update("INSERT INTO memory_evolution_proposals "
+                        + "(tenant_id,user_id,procedure_id,base_version,candidate_id,base_content_json,candidate_content_json,"
+                        + "candidate_hash,generator_version,evidence_ids_json,status,created_at,updated_at) "
+                        + "VALUES ('tenant',7,1,1,'candidate-91','{}','{}',?,'test','[]','CANARY',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "b".repeat(64));
+        Long proposalId = jdbc.queryForObject("SELECT proposal_id FROM memory_evolution_proposals "
+                + "WHERE tenant_id='tenant' AND candidate_id='candidate-91'", Long.class);
+        assertEquals(1L, proposalId);
+        ProcedureSettlementCommand baseline = settlement(1L, 1, 7L, null, "same-node",
+                ProcedureSettlementCommand.Outcome.SUCCESS);
+        ProcedureSettlementCommand candidate = new ProcedureSettlementCommand(
+                baseline.principal(), baseline.taskId(), baseline.nodeId(), baseline.actionId(),
+                baseline.procedureId(), baseline.procedureVersion(), baseline.outcome(),
+                proposalId, "b".repeat(64), "CANDIDATE");
+
+        assertEquals(ProcedureSettlementResult.Status.RECORDED, settlementPort.settle(candidate).status());
+        assertEquals(ProcedureSettlementResult.Status.RECORDED, settlementPort.settle(baseline).status());
+        assertEquals(ProcedureSettlementResult.Status.DUPLICATE, settlementPort.settle(candidate).status());
+        assertEquals(2, jdbc.queryForObject("SELECT COUNT(*) FROM agent_procedure_applications", Integer.class));
+        assertEquals(1L, jdbc.queryForObject("SELECT COUNT(*) FROM agent_procedure_applications "
+                + "WHERE procedure_variant='CANDIDATE' AND evolution_proposal_id=? AND evolution_candidate_hash=?",
+                Long.class, proposalId, "b".repeat(64)));
+        assertEquals(1L, ((Number) row(1L).get("attempt_count")).longValue());
+    }
+
     private Map<String, Object> row(long procedureId) {
         return jdbc.queryForMap("SELECT * FROM agent_procedures WHERE id = ?", procedureId);
     }

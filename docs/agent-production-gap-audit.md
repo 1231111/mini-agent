@@ -1,5 +1,46 @@
 # mini-agent 生产级差距审计报告
 
+### 2026-10-30 补充（五）：规划授权快照在提示与解析间保持一致
+
+- `GoalCompiler.compileWithLlm()` 与 `compileWithLlmAndCorrection()` 各自在单次模型调用前读取一次 `ProcedurePromptInput` 快照；该快照同时用于模型提示构造和 `parseCompilation(..., snapshot)` 的模型引用授权，不再在解析阶段重新查询当前 allowlist。
+- 快照列表复制为不可变 `List.copyOf`，本轮节点绑定的 `procedureSnapshotJson`、proposal/hash、variant 和 `canaryTargetPercent` 因而来自模型本轮实际可见的同一授权结果。
+- 回归测试令 `ProcedurePromptPort` 第一次返回 v3、第二次返回 v4，并断言模型提示与 TaskNode 都锁定 v3，且远端读取次数为 1。Planner 定向测试 `ProcedureReferenceCompatibilityTest` + `GoalCompilerGranularityTest` 共 13/13 通过。
+- **边界**：此修复只消除单次规划请求内部的双读竞态，不建立跨服务原子快照，也不代表 Canary 运行时已形成可信观测闭环。尚无独立受信 router/runner、Canary observation outbox/worker、Procedure promotion CAS 与投影确认、真实 Procedure 版本回滚；MySQL 8.4、跨进程 E2E、多实例/故障注入、告警和运维演练仍未验收。所有演进/路由开关继续默认关闭，不能宣称生产闭环完成。
+
+### 2026-10-30 补充（四）：规划节点固定 Canary 快照并接入执行提示
+
+- `DefaultMemoryManager.findForCurrentOwner()` 在 `MEMORY_PROCEDURE_EVOLUTION_ROUTING_ENABLED` 开启时查询 memory-service 活动 Canary 清单，按 SHA-256 的 tenant/user/session/task/procedure/proposal 键与服务端 `canaryTargetPercent` 稳定分组；候选组读取受保护快照。清单或快照读取失败时排除相关 USER Procedure，避免选中 candidate 却执行 baseline；PROJECT Procedure 不参与 USER Canary。
+- `ProcedurePromptInput` 的 owner allowlist 对象现在把 `evolutionProposalId`、`evolutionCandidateHash`、`procedureVariant` 和 `canaryTargetPercent` 一并带入 `TaskNode`。`TaskNode` 的状态、错误、重试和输出转换保留比例与 `procedureSnapshotJson`；`PlannerStateStore.sameGraphSemantics()` 把两者都纳入同一 planVersion 的不可变语义。
+- `PlanningLoop.focusBlock()` 按节点快照注入固定 Procedure 的前置条件、步骤和成功条件；快照 JSON 无法解析时失败关闭。重试仍使用已持久化的 TaskNode，不重新读活动列表。
+- 新增/更新回归：Planner `ProcedureReferenceCompatibilityTest` 6/6；App `RemoteProcedureSettlementPortTest` 10/10；memory-service `ProcedureEvolutionServiceTest` 5/5。Planner、App 和 memory-service 主代码编译通过（App 首次编译缺少两个 import，补齐后适配器测试 reactor 编译通过）。
+- **当前能力边界**：规划查询和解析仍可能独立读取 allowlist，尚未用同一份 request-scoped 快照贯穿 prompt 与 parse；memory-service 只有 HMAC attestation 校验，没有由服务启动并执行的真实受限 runner。App 还没有 candidate/baseline 终态 Canary observation outbox/worker，因此服务端不能获得可靠的真实流量样本；自动推广到 Procedure 的版本 CAS、投影确认和版本级 rollback 也未完成。
+- **验收边界**：未完成 MySQL 8.4 迁移实测、App+memory-service 独立进程 HTTP E2E、多实例并发、崩溃/断网注入、监控告警和运维演练。`MEMORY_EVOLUTION_ENABLED` 默认仍为 `false`，Canary 路由默认 `false`；生产级记忆自动进化业务闭环仍未达成。
+
+### 2026-10-30 补充（三）：增加授权 Canary 候选快照查询契约
+
+- memory-service 增加 `GET /internal/v1/memory/evolution/proposals/{proposalId}/candidate`，受 `X-Memory-Internal-Key` 保护，并在 SQL 中同时限定 tenant、user、procedure、proposal、candidate hash 与 `status='CANARY'`；不匹配或非活动候选统一返回 404。候选内容只在此 Canary 专用 endpoint 返回，普通 proposal 查询不返回 candidate JSON。
+- App `RemoteProcedureSettlementPort.fetchCanaryCandidate(...)` 调用该 endpoint 并反序列化 immutable 候选内容。测试覆盖参数、内部密钥、候选正文；memory-service 服务测试 5/5 通过，App 远程适配器测试 9/9 通过，`./mvnw -o -pl mini-agent-app -am -DskipTests compile` 全 reactor 编译通过。
+- **功能缺环（仍未完成）**：此接口还没有被 `ProcedurePromptPort` / `GoalCompiler` 调用；没有稳定分流键、比例分配、用户/会话粘性、关闭/回滚时的强制 baseline 路径；没有 candidate snapshot 绑定 planner 的 `TaskNode` 与执行重试。因此这只是受保护的读取能力，不是实际 Canary 流量路由。
+- **验收边界**：本轮完整跨模块测试曾因旧测试 HTTP server read timeout 失败；定向重跑后远程适配器 9/9 通过。MySQL 8.4、App + memory-service 进程 E2E、真实隔离 runner、可靠 observation outbox worker、自动推广与真实 Procedure 回滚尚未验证/实现。`memory.evolution.enabled=false` 保持不变，业务闭环未达成。
+
+### 2026-10-30 补充（二）：执行节点和结算记录携带 Canary 变体身份
+
+- **本轮已实现**：Planner `TaskNode` 新增 `evolutionProposalId`、`evolutionCandidateHash`、`procedureVariant`。旧构造器/旧 JSON 快照按 `BASELINE` 兼容；候选必须同时具备 proposal ID、64 位小写 SHA-256 和 `CANDIDATE`，节点状态、重试、输出等变换保留身份；`PlannerStateStore` 的计划语义比较纳入这些字段。
+- `ProcedureNodeTerminalCommitAdapter` 将候选身份传入 `ProcedureSettlementCommand`；HTTP settlement DTO 和 App remote request 透传 proposal/hash/variant。服务端只有 proposal 的 tenant/user/procedure/hash 完全匹配且状态为 `CANARY` 才接受候选事实。V6 为应用事实增加这三列，幂等唯一键纳入 variant，允许同一节点的 baseline 与 candidate 分别记账。
+- **统计隔离**：candidate settlement 只落应用事实，不增加活动 Procedure 的 baseline `attempt_count`/`success_count`；baseline 仍按原结算路径更新计数。候选 ID/hash 不匹配活动 CANARY proposal 时返回 `STALE_PROCEDURE`。
+- **验证**：Planner 的 `ProcedureReferenceCompatibilityTest` 5 项通过，含节点变换、JSON 快照 round-trip 和不完整/伪造身份拒绝；`ProcedureSettlementIntegrationTest` 14 项通过，含 V6 migration、候选/基线分组幂等和 baseline 计数隔离；`ProcedureSettlementControllerTest` 3 项、`MemoryPortContractTest` 3 项、`RemoteProcedureSettlementPortTest` 8 项通过。使用 H2/MySQL mode，不等于 MySQL 8.4 验收。
+- **功能缺环（仍未完成）**：memory-service 尚无按授权 owner 查询活动 candidate snapshot 的 API；App 规划仍只读本地活动 Procedure，尚无稳定分流键与真实 candidate 内容绑定；该身份字段当前只是契约基础，没有任何生产入口能产生候选 TaskNode。终态结算事实尚未写入可靠 observation outbox，也没有调用现有 router attestation API 的 worker。尚无自动推广、Procedure CAS 应用、投影确认或真实回滚。
+- **验收边界**：本轮没有完成真实隔离 runner、App + memory-service 进程级 Canary E2E、多实例/崩溃/断网测试、MySQL 8.4 migration 验证、指标告警和运维演练。`memory.evolution.enabled` 必须保持 `false`；生产级记忆自动进化业务闭环仍未达成。
+
+### 2026-10-30 补充：Canary 统计加入 baseline 对照，控制面不再无凭据启动
+
+- **本轮已修复**：`CanaryObservationRequest` 增加 `variant`（`BASELINE` / `CANDIDATE`）；`memory_evolution_canary_observations` 通过 V5 migration 增加 `variant`，既有观测以 `CANDIDATE` 迁移，不丢历史记录。router HMAC 签名覆盖 variant，重复 `observationId` 只能以同一组别和结果重放，冲突重放被拒绝。
+- `observeCanary` 分别计算 baseline 与 candidate 样本数/失败率。只有两组均达到 `minimumCanarySamples` 且 candidate 失败率同时高于配置回滚阈值和 baseline，proposal 才进入 `ROLLED_BACK`。proposal 已回滚后的同一已记录观测可幂等重放。
+- `decide` 不再只因 proposal 为 `VALIDATED` 就把状态改成 `CANARY`；必须验证 router 对 tenant、proposal、candidate hash、目标百分比、router ID 和 `READY` 的限时 HMAC 证明。默认 `memory.evolution.enabled=false` 未改。
+- **验证**：`./mvnw -o -pl mini-agent-memory -am -Dtest=ProcedureEvolutionServiceTest,ProcedureSettlementIntegrationTest,ProcedureSettlementControllerTest -Dsurefire.failIfNoSpecifiedTests=false test`，21/21 通过；覆盖两组统计、回滚、签名篡改拒绝和幂等重放。仅为 H2/MySQL mode 定向测试，不是生产环境验收。
+- **功能缺环（仍未完成）**：仓库内没有实际隔离 runner，也没有 App 真实 Canary 路由器；router 的 HMAC key 目前只能作为配置密钥被服务端验证，尚无独立运行组件产生的就绪证明或运行观测。candidate snapshot 尚未绑定 `GoalCompiler` / `TaskNode`，App 执行、终态结算和 candidate-aware 观测 outbox 未接通。自动推广、Procedure CAS 应用、跨服务投影确认与真实版本回滚均未实现。当前新增 `READY` attestation 只封住“无证明时把状态记成 CANARY”，不能证明真实流量已切换。
+- **工程验收债**：V5 migration 未在 MySQL 8.4 验证；未做 App + memory-service 进程级 E2E、并发/崩溃/断网注入、生产 runner/router 身份配置、指标告警和运维演练。生产级自动进化闭环仍未达成，开关必须保持关闭。
+
 - **审计对象**：`D:\AI\miniagent`（Java 21 / Spring Boot 3.4.5 / LangChain4j 1.15，7 个 Maven 模块（记忆服务作为 `mini-agent-memory` 的独立运行 profile），543 个 Java 文件 / 56,234 行 + Electron 桌面壳 + 账号/计费服务）
 - **对标基线**：生产级 agent 运行时（Claude Code、Codex CLI、Devin、Manus 一类）在**安全边界、完成判定、上下文治理、可观测性、可运维性**五个维度的最低要求
 - **方法**：全量读源码（含测试与配置）+ 6 个子系统深度审计 + 对关键判定做独立复核（不采信未验证的结论）+ 运行期日志取样
@@ -51,6 +92,14 @@
 已将 Procedure 节点终态结算从 Planner 类型中抽出为 `mini-agent-memory` 的跨进程窄契约：`MemoryPrincipal`、`ProcedureSettlementCommand`、`ProcedureSettlementPort` 和 `ProcedureSettlementResult`。`ProcedureApplicationSettlementService` 现在只依赖该记忆端口；新增 `ProcedureNodeTerminalCommitAdapter` 负责把 `NodeTerminalCommitPort` / `TaskNode` / `OwnerContext` 转换为契约命令。
 
 这一步只完成边界和本地适配，不是云端服务已经上线。当前桌面与服务器仍使用 `mini-agent-app` 内的本地数据库实现；独立记忆服务、服务间认证、HTTP DTO/controller、重试/outbox 和远程适配器仍未完成。新增契约测试 3 项，本地结算回归 7 项通过；编译通过。
+
+### 2026-10-29 补充（三）：自动进化服务端控制面初版落入 mini-agent-memory
+
+- 新增记忆服务 V3 migration：候选 proposal、成对验证 trial、canary observation 持久化；服务端控制面位于 `com.miniagent.memory.service.evolution` / `persistence.ProcedureEvolutionService`，HTTP 入口为 `/internal/v1/memory/evolution/proposals`。
+- Proposal 保存 USER scope 所有者、基线版本与内容快照、候选内容、生成器版本、来源证据 ID 和 SHA-256；状态记录验证、决策、canary、发布/回退的过程。发布通过 Procedure 版本 CAS，候选失败不会改动活动 Procedure。
+- 配置默认 `memory.evolution.enabled=false`。**本轮没有完成生产级自动进化闭环**：`validation-runs` 目前 fail-closed，因为没有可信隔离执行器、签名证明与可验证 runner；不接受调用端提交的 `passed=true` 作为机器证据。canary API 暂存观测模型，但 App 尚未按 `canary_target_percent` 对真实请求做稳定分流。因此自动决策、真实灰度发布、生产监控与自动回滚尚未启用，不能把控制面/状态表称为已闭环。
+- 候选内容当前由请求提交并由记忆服务做结构/安全扫描与快照，不包含可信 LLM 生成器；下一步需把 Episode/应用事实 outbox 迁移进记忆服务并接入受限生成器。原有 Proposal 与人工审核链仍保留在 `mini-agent-app`，尚未通过远程 API 迁移。
+- 验证边界：此前 H2 定向测试覆盖候选 hash 持久化与不可信验证 fail-closed；本轮新增 runner/router HMAC attestation 校验契约，但没有接入隔离执行器或真实流量路由器，`validate/decide/observeCanary` 仍 fail-closed。MySQL 8.4 V3、端到端 runner、App 候选生成和 App 流量分流尚未验证；本轮 Maven 进程被环境 SIGTERM 终止，未取得新的构建通过证据。
 
 ### 2026-10-29 补充（二）：独立记忆服务已可启动，Procedure 纵向切片打通
 

@@ -10,11 +10,13 @@ import com.miniagent.memory.port.ProcedureSettlementResult;
 import com.miniagent.memory.port.ProjectAuthorizationCommand;
 import com.miniagent.memory.port.ProjectAuthorizationPort;
 import com.miniagent.memory.port.ProjectAuthorizationResult;
+import com.miniagent.memory.service.web.EvolutionResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
 
 import java.util.Objects;
 
@@ -51,7 +53,7 @@ public class RemoteProcedureSettlementPort implements ProcedureSettlementPort, P
                     .uri(properties.baseUrl() + "/internal/v1/memory/procedure-settlements")
                     .header(INTERNAL_KEY_HEADER, properties.internalKey())
                     .contentType(MediaType.APPLICATION_JSON)
-                    .body(command)
+                    .body(new RemoteProcedureSettlementRequest(command))
                     .retrieve()
                     .body(byte[].class);
             if (body == null || body.length == 0) {
@@ -93,6 +95,62 @@ public class RemoteProcedureSettlementPort implements ProcedureSettlementPort, P
             throw new RemoteProcedureSettlementException("memory service Procedure synchronization failed", e);
         }
     }
+
+    public java.util.List<EvolutionResponse> listCanaryCandidates(String tenantId, long userId) {
+        try {
+            EvolutionResponse[] responses = client.get()
+                    .uri(properties.baseUrl() + "/internal/v1/memory/evolution/proposals?tenantId={tenantId}&userId={userId}",
+                            tenantId, userId)
+                    .header(INTERNAL_KEY_HEADER, properties.internalKey())
+                    .retrieve()
+                    .body(EvolutionResponse[].class);
+            return responses == null ? java.util.List.of() : java.util.List.of(responses);
+        } catch (Exception e) {
+            log.warn("Remote Canary candidate listing failed: user={} status={}",
+                    userId, e.getClass().getSimpleName());
+            throw new RemoteProcedureSettlementException("memory service Canary candidate listing failed", e);
+        }
+    }
+
+    public EvolutionResponse fetchCanaryCandidate(String tenantId, long userId, long procedureId,
+                                                 long proposalId, String candidateHash) {
+        try {
+            return client.get()
+                    .uri(properties.baseUrl() + "/internal/v1/memory/evolution/proposals/" + proposalId
+                            + "/candidate?tenantId={tenantId}&userId={userId}&procedureId={procedureId}&candidateHash={candidateHash}",
+                            tenantId, userId, procedureId, candidateHash)
+                    .header(INTERNAL_KEY_HEADER, properties.internalKey())
+                    .retrieve()
+                    .body(EvolutionResponse.class);
+        } catch (Exception e) {
+            log.warn("Remote Canary candidate fetch failed: proposal={} procedure={} status={}",
+                    proposalId, procedureId, e.getClass().getSimpleName());
+            throw new RemoteProcedureSettlementException("memory service Canary candidate fetch failed", e);
+        }
+    }
+
+    public void submitFailureEvidence(FailureEvidenceRequest request) {
+        try {
+            byte[] body = client.post()
+                    .uri(properties.baseUrl() + "/internal/v1/memory/evolution/proposals/failure-evidence")
+                    .header(INTERNAL_KEY_HEADER, properties.internalKey())
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(request)
+                    .retrieve()
+                    .body(byte[].class);
+            if (body == null || body.length == 0) {
+                throw new IllegalStateException("memory service returned an empty failure-evidence response");
+            }
+        } catch (Exception e) {
+            log.warn("Remote failure evidence submission failed: procedure={} version={} status={}",
+                    request.procedureId(), request.procedureVersion(), e.getClass().getSimpleName());
+            throw new RemoteProcedureSettlementException("memory service failure evidence submission failed", e);
+        }
+    }
+
+    public record FailureEvidenceRequest(String tenantId, Long userId, Long procedureId, Integer procedureVersion,
+                                         String sessionId, Long taskId, String nodeId, String failureCode,
+                                         String taskSummary, String resolution) { }
 
     @Override
     public ProjectAuthorizationResult synchronize(ProjectAuthorizationCommand command) {
@@ -160,6 +218,28 @@ public class RemoteProcedureSettlementPort implements ProcedureSettlementPort, P
 
     public record ProcedureDefinitionSyncResponse(Status status, Integer currentVersion) {
         public enum Status { CREATED, UPDATED, UNCHANGED, STALE, CONFLICT }
+    }
+
+    public record RemoteProcedureSettlementRequest(String tenantId, Long userId, String projectId,
+                                                   String sessionId, long taskId, String nodeId,
+                                                   String actionId, long procedureId, int procedureVersion,
+                                                   ProcedureSettlementCommand.Outcome outcome,
+                                                   Long evolutionProposalId, String evolutionCandidateHash,
+                                                   String procedureVariant) {
+        static RemoteProcedureSettlementRequest from(ProcedureSettlementCommand command) {
+            return new RemoteProcedureSettlementRequest(command.principal().tenantId(),
+                    command.principal().userId(), command.principal().projectId(), command.principal().sessionId(),
+                    command.taskId(), command.nodeId(), command.actionId(), command.procedureId(),
+                    command.procedureVersion(), command.outcome(), command.evolutionProposalId(),
+                    command.evolutionCandidateHash(), command.procedureVariant());
+        }
+
+        RemoteProcedureSettlementRequest(ProcedureSettlementCommand command) {
+            this(command.principal().tenantId(), command.principal().userId(), command.principal().projectId(),
+                    command.principal().sessionId(), command.taskId(), command.nodeId(), command.actionId(),
+                    command.procedureId(), command.procedureVersion(), command.outcome(),
+                    command.evolutionProposalId(), command.evolutionCandidateHash(), command.procedureVariant());
+        }
     }
 
     public record RemoteSettlementResponse(ProcedureSettlementResult.Status status) {

@@ -64,7 +64,7 @@ public class DefaultConsolidationService implements ConsolidationService {
     private AgentEpisodeRepository episodeRepository;
 
     @Autowired(required = false)
-    private ProcedureRewriteProposalService rewriteProposalService;
+    private com.miniagent.agent.memory.manager.FailureEvidenceOutboxService failureEvidenceOutboxService;
 
     @Autowired
     private AgentChatTaskLock episodeTaskLock;
@@ -179,18 +179,13 @@ public class DefaultConsolidationService implements ConsolidationService {
         }
 
         TransactionTemplate transaction = new TransactionTemplate(transactionManager);
-        AgentEpisodeEntity persisted = transaction.execute(status -> {
+        transaction.executeWithoutResult(status -> {
             AgentEpisodeEntity saved = episodeRepository.save(extracted);
-            eventRepository.markProcessed(unprocessed.stream().map(AgentEventEntity::getId).toList());
-            return saved;
-        });
-        if (rewriteProposalService != null) {
-            try {
-                rewriteProposalService.proposeFromFailureEpisode(persisted);
-            } catch (Exception e) {
-                log.warn("Procedure 改写提案生成失败，不影响 Episode 巩固: episode={}", persisted.getId(), e);
+            if (failureEvidenceOutboxService != null) {
+                failureEvidenceOutboxService.enqueue(saved);
             }
-        }
+            eventRepository.markProcessed(unprocessed.stream().map(AgentEventEntity::getId).toList());
+        });
     }
 
     private void doConsolidate(String tenantId, String sessionId) {

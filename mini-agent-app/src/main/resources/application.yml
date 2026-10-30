@@ -127,10 +127,15 @@ agent:
       connect-timeout-ms: ${MEMORY_SERVICE_CONNECT_TIMEOUT_MS:3000}
       read-timeout-ms: ${MEMORY_SERVICE_READ_TIMEOUT_MS:10000}
     procedure:
+      # 仅在独立 memory-service 的 Canary 清单可用时启用执行端分流；默认关闭。
+      # 开启前必须具备稳定 owner/task 上下文、可取回的候选快照和终态 observation 投递。
+      evolution-routing-enabled: ${MEMORY_PROCEDURE_EVOLUTION_ROUTING_ENABLED:false}
       # remote 模式下把 SOP 版本投影到独立记忆服务的投递节奏（local 模式不启用）。
       # 投递失败按指数退避，10 次后留在 FAILED 等人工核对。
       outbox:
         interval-ms: ${MEMORY_PROCEDURE_OUTBOX_INTERVAL_MS:5000}
+      evolution-outbox:
+        interval-ms: ${MEMORY_EVOLUTION_OUTBOX_INTERVAL_MS:5000}
       governance:
         enabled: true
         # 至少有 10 个终态结算样本才判定，避免单次/少数失败被噪声触发
