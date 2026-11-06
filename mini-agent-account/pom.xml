@@ -112,6 +112,10 @@
                 <executions>
                     <execution>
                         <goals>
+                            <!-- build-info 让 /actuator/info 回显构建时间与版本：
+                                 部署后一次 curl 就能判定线上跑的是不是这次打出来的包，
+                                 不用再靠"新端点返回 401 还是 500"这种间接探针去猜。 -->
+                            <goal>build-info</goal>
                             <goal>repackage</goal>
                         </goals>
                     </execution>

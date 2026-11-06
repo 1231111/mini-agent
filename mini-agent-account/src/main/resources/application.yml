@@ -60,6 +60,11 @@ management:
   endpoint:
     health:
       show-details: never
+  info:
+    # 暴露 build-info 插件写入的 META-INF/build-info.properties。
+    # 线上排查"部署到底生效没"时，GET /actuator/info 直接给出本次构建的时间与版本。
+    build:
+      enabled: true
 
 agent:
   account:
