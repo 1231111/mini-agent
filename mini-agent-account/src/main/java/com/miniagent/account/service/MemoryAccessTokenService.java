@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.account.entity.User;
 import com.miniagent.memory.contract.MemoryAccessToken;
 import com.miniagent.account.repository.UserRepository;
+import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -17,6 +20,7 @@ import java.util.Base64;
 /** Account-signed opaque credential for memory-service, including a bounded offline lease. */
 @Service
 public class MemoryAccessTokenService {
+    private static final Logger log = LoggerFactory.getLogger(MemoryAccessTokenService.class);
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final int REFRESH_CREDENTIAL_BYTES = 32;
 
@@ -34,6 +38,35 @@ public class MemoryAccessTokenService {
         this.clock = clock;
         this.keyMaterial = keyMaterial == null ? "" : keyMaterial.trim();
         this.internalKey = internalKey == null ? "" : internalKey.trim();
+    }
+
+    /**
+     * 启动即校验密钥，而不是等到用户点登录才炸。
+     *
+     * <p>密钥缺失时 {@link #issue} 会抛 {@link IllegalStateException}，被全局异常处理器包成
+     * {@code SYSTEM.01.01}，运维看到的是"系统内部错误"，而真正原因是环境变量没配。
+     * 这里把它提前到容器启动阶段，日志里直接给出该设置什么。</p>
+     */
+    @PostConstruct
+    void validateConfiguration() {
+        if (keyMaterial.isBlank()) {
+            throw new IllegalStateException(
+                    "agent.account.memory-token-key 未配置：请在部署环境中设置 ACCOUNT_MEMORY_TOKEN_KEY"
+                            + "（Base64 编码、解码后正好 32 字节），生成方式：openssl rand -base64 32。"
+                            + "未配置时登录会因无法签发记忆访问令牌而返回系统内部错误。");
+        }
+        try {
+            MemoryAccessToken.decodeKey(keyMaterial);
+        } catch (RuntimeException e) {
+            throw new IllegalStateException(
+                    "agent.account.memory-token-key 格式不合法（" + e.getMessage()
+                            + "）：ACCOUNT_MEMORY_TOKEN_KEY 必须是 Base64 编码、解码后正好 32 字节，"
+                            + "生成方式：openssl rand -base64 32。", e);
+        }
+        if (internalKey.isBlank()) {
+            log.warn("agent.account.internal-key 未配置：memory-service 无法通过 /internal/oauth/introspect "
+                    + "在线校验记忆令牌，只能退回离线解密；请设置 ACCOUNT_INTERNAL_KEY 并与 memory-service 保持一致。");
+        }
     }
 
     @Transactional
