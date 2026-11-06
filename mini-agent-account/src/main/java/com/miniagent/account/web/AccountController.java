@@ -3,6 +3,7 @@ package com.miniagent.account.web;
 import com.miniagent.account.entity.User;
 import com.miniagent.account.repository.UserRepository;
 import com.miniagent.account.service.AccountAuthService;
+import com.miniagent.account.service.MemoryAccessTokenService;
 import com.miniagent.account.service.DesktopLoginTicketStore;
 import com.miniagent.account.web.dto.AccountUserResponse;
 import com.miniagent.common.ApiResponse;
@@ -22,8 +23,8 @@ import org.springframework.web.bind.annotation.RestController;
  * 这是刻意的：调用方（客户机本地后端的 {@code CloudAccountClient}）只换 base-url，
  * 不改路径 —— 拆分服务不该变成一次协议变更。
  *
- * <p>响应形状也与那边一致（{@code ApiResponse} 包一层，{@code data} 里是身份）。
- * 差别只有一处：这里没有 token —— 账号服务不签发会话，见 {@link AccountUserResponse}。
+ * <p>响应形状也与那边一致（{@code ApiResponse} 包一层，{@code data} 里是身份），
+ * 并附带由 Account 签发、供 memory-service 校验的 72 小时 memory access token。
  */
 @RestController
 public class AccountController {
@@ -34,6 +35,8 @@ public class AccountController {
     private DesktopLoginTicketStore tickets;
     @Autowired
     private UserRepository users;
+    @Autowired
+    private MemoryAccessTokenService memoryTokens;
 
     public record LoginRequest(String username, String password) {
     }
@@ -59,7 +62,11 @@ public class AccountController {
             return ApiResponse.fail(ErrorCode.AUTH_LOGIN_FAILED);
         }
         return auth.login(req.username(), req.password())
-                .map(user -> ApiResponse.ok(AccountUserResponse.of(user)))
+                .map(user -> {
+                    MemoryAccessTokenService.IssuedCredential issued = memoryTokens.issue(user);
+                    return ApiResponse.ok(AccountUserResponse.of(issued.user(), issued.accessToken(),
+                            issued.refreshCredential()));
+                })
                 .orElse(ApiResponse.fail(ErrorCode.AUTH_LOGIN_FAILED));
     }
 
@@ -80,7 +87,9 @@ public class AccountController {
             return ApiResponse.fail(result.error(), result.detail());
         }
         User user = result.user();
-        return ApiResponse.ok(AccountUserResponse.of(user));
+        MemoryAccessTokenService.IssuedCredential issued = memoryTokens.issue(user);
+        return ApiResponse.ok(AccountUserResponse.of(issued.user(), issued.accessToken(),
+                issued.refreshCredential()));
     }
 
     /**
@@ -97,9 +106,12 @@ public class AccountController {
         if (userId == null) {
             return ApiResponse.fail(ErrorCode.AUTH_SESSION_INVALID, "登录凭证无效或已使用");
         }
-        return users.findById(userId)
-                .map(user -> ApiResponse.ok(AccountUserResponse.of(user)))
-                .orElseGet(() -> ApiResponse.fail(
-                        ErrorCode.AUTH_NOT_AUTHENTICATED, "请重新注册"));
+        User user = users.findById(userId).filter(User::isEnabled).orElse(null);
+        if (user == null) {
+            return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED, "请重新注册");
+        }
+        MemoryAccessTokenService.IssuedCredential issued = memoryTokens.issue(user);
+        return ApiResponse.ok(AccountUserResponse.of(issued.user(), issued.accessToken(),
+                issued.refreshCredential()));
     }
 }

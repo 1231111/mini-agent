@@ -9,16 +9,16 @@
     <version>0.0.1-SNAPSHOT</version>
     <packaging>pom</packaging>
     <name>mini-agent-springboot</name>
-    <description>LangChain4j 智能体（按组成部分：common / memory / tools / loop / planner / app）</description>
+    <description>LangChain4j 智能体：工具、规划、记忆，外加账号与云端记忆两个独立进程</description>
 
     <modules>
         <module>mini-agent-common</module>
         <module>mini-agent-memory</module>
         <module>mini-agent-tools</module>
-        <module>mini-agent-loop</module>
         <module>mini-agent-planner</module>
         <module>mini-agent-app</module>
         <module>mini-agent-account</module>
+        <module>mini-agent-memory-service</module>
     </modules>
 
     <properties>
@@ -83,11 +83,6 @@
             <dependency>
                 <groupId>com.miniagent</groupId>
                 <artifactId>mini-agent-tools</artifactId>
-                <version>${project.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>com.miniagent</groupId>
-                <artifactId>mini-agent-loop</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

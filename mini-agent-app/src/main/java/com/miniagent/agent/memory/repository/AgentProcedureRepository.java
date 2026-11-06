@@ -8,6 +8,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
+import java.util.Optional;
 
 public interface AgentProcedureRepository extends JpaRepository<AgentProcedureEntity, Long> {
 
@@ -29,6 +30,8 @@ public interface AgentProcedureRepository extends JpaRepository<AgentProcedureEn
      * H2（桌面档）默认大小写敏感。同一个身份规则在两种库上得出两种结果，是最难查的一类漂移，
      * 统一在 Java 侧按同一套归一化比较。集合规模由「一个归属域里的 SOP 条数」界定。</p>
      */
+    Optional<AgentProcedureEntity> findByTenantIdAndCloudItemId(String tenantId, Long cloudItemId);
+
     List<AgentProcedureEntity> findByTenantIdAndScopeTypeAndScopeId(
         String tenantId, AgentMemoryEntryEntity.ScopeType scopeType, String scopeId);
 

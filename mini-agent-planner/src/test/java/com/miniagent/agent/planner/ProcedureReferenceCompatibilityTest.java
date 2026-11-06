@@ -115,8 +115,9 @@ class ProcedureReferenceCompatibilityTest {
                 .withProcedure(17L, 3);
         assertThrows(IllegalArgumentException.class, () -> baseline.withProcedureVariant("CANDIDATE"));
         assertThrows(IllegalArgumentException.class, () -> baseline.withEvolutionCandidate(81L, ""));
-        assertThrows(IllegalArgumentException.class, () -> baseline.withEvolutionCandidate(81L, "a".repeat(64))
-                .withProcedureVariant("BASELINE"));
+        TaskNode baselineAssignment = baseline.withEvolutionAssignment(81L, "a".repeat(64), "BASELINE", 25);
+        assertEquals("BASELINE", baselineAssignment.procedureVariant());
+        assertEquals(81L, baselineAssignment.evolutionProposalId());
     }
 
     @Test

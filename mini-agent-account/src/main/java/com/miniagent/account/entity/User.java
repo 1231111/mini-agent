@@ -54,4 +54,8 @@ public class User extends BaseEntity {
 
     @Column(nullable = false)
     private boolean enabled = true;
+
+    @Column(name = "memory_refresh_token_hash", length = 64, unique = true)
+    private String memoryRefreshTokenHash;
+
 }

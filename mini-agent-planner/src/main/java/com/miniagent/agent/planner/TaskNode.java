@@ -64,9 +64,11 @@ public record TaskNode(
         if (!evolutionCandidateHash.isEmpty() && !evolutionCandidateHash.matches("[0-9a-f]{64}")) {
             throw new IllegalArgumentException("evolutionCandidateHash must be a lowercase SHA-256 hex digest");
         }
-        if (evolutionProposalId != null && (evolutionProposalId <= 0 || evolutionCandidateHash.isBlank()
-                || !"CANDIDATE".equals(procedureVariant))) {
-            throw new IllegalArgumentException("candidate procedure requires proposal id, hash, and CANDIDATE variant");
+        if (evolutionProposalId != null && (evolutionProposalId <= 0 || evolutionCandidateHash.isBlank())) {
+            throw new IllegalArgumentException("Canary assignment requires proposal id and candidate hash");
+        }
+        if (evolutionProposalId == null && canaryTargetPercent != 0) {
+            throw new IllegalArgumentException("Canary target requires proposal identity");
         }
         if ("CANDIDATE".equals(procedureVariant) && evolutionProposalId == null) {
             throw new IllegalArgumentException("CANDIDATE variant requires evolution proposal identity");
@@ -109,9 +111,14 @@ public record TaskNode(
     }
 
     public TaskNode withEvolutionCandidate(Long proposalId, String candidateHash) {
+        return withEvolutionAssignment(proposalId, candidateHash, "CANDIDATE", canaryTargetPercent);
+    }
+
+    public TaskNode withEvolutionAssignment(Long proposalId, String candidateHash, String variant, int targetPercent) {
         return new TaskNode(id, name, capability, dependsOn, inputs, outputs, status, priority,
                 doneWhen, toolHint, toolArguments, compensation, covers, lastError, retryCount,
-                output, outputBindings, procedureId, procedureVersion, proposalId, candidateHash, "CANDIDATE", procedureSnapshotJson, canaryTargetPercent);
+                output, outputBindings, procedureId, procedureVersion, proposalId, candidateHash, variant,
+                procedureSnapshotJson, targetPercent);
     }
 
     public TaskNode withProcedureSnapshot(String snapshotJson) {

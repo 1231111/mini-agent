@@ -10,6 +10,7 @@ import com.miniagent.memory.port.ProcedureSettlementPort;
 import com.miniagent.memory.port.ProcedureSettlementResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -46,6 +47,7 @@ public class ProcedureApplicationSettlementService implements ProcedureSettlemen
     private final ProcedureGovernanceService governance;
     private final ProcedureGovernanceProperties governanceProperties;
     private final ProcedureRevisionService revisionService;
+    private final ObjectProvider<ProcedureCloudSync> cloudSync;
     private final TransactionTemplate requiresNew;
 
     public ProcedureApplicationSettlementService(AgentProcedureApplicationRepository applications,
@@ -53,12 +55,14 @@ public class ProcedureApplicationSettlementService implements ProcedureSettlemen
                                                   PlatformTransactionManager transactionManager,
                                                   ProcedureGovernanceService governance,
                                                   ProcedureGovernanceProperties governanceProperties,
-                                                  ProcedureRevisionService revisionService) {
+                                                  ProcedureRevisionService revisionService,
+                                                  ObjectProvider<ProcedureCloudSync> cloudSync) {
         this.applications = applications;
         this.procedures = procedures;
         this.governance = governance;
         this.governanceProperties = governanceProperties;
         this.revisionService = revisionService;
+        this.cloudSync = cloudSync;
         this.requiresNew = new TransactionTemplate(transactionManager);
         this.requiresNew.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
@@ -67,6 +71,9 @@ public class ProcedureApplicationSettlementService implements ProcedureSettlemen
     @Transactional
     public ProcedureSettlementResult settle(ProcedureSettlementCommand command) {
         MemoryPrincipal principal = command.principal();
+        if ("CANDIDATE".equals(command.procedureVariant())) {
+            return ProcedureSettlementResult.staleProcedure();
+        }
         if (!tryRecordApplication(principal, command)) {
             return ProcedureSettlementResult.duplicate();
         }
@@ -91,7 +98,7 @@ public class ProcedureApplicationSettlementService implements ProcedureSettlemen
         // 每个 owner 的 ACTIVE SOP 数量是有界集合；CAS 会在数据库里重验版本和判据。
         // 失败只影响治理，不回滚刚完成的节点，也不抹掉应用事实/统计。
         try {
-            if (governanceProperties.isEnabled()) {
+            if (governanceProperties.isEnabled() && cloudSync.getIfAvailable() == null) {
                 governance.archiveUnderperforming(principal.tenantId(), principal.userId());
             }
         } catch (Exception e) {

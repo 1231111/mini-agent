@@ -123,6 +123,9 @@ public class ShadowUserService {
                     "账号已被停用（users.id=" + id + "），请联系管理员");
         }
 
+        user.setCloudTenantId(cloudUser.cloudTenantId());
+        user.setMemoryAccessToken(cloudUser.memoryToken());
+        user.setMemoryRefreshCredential(cloudUser.memoryRefreshCredential());
         if (cloudUser.displayName() != null
                 && !Objects.equals(user.getDisplayName(), cloudUser.displayName())) {
             user.setDisplayName(cloudUser.displayName());
@@ -166,7 +169,11 @@ public class ShadowUserService {
                 log.info("影子用户角色随云端更新: 本地 id={} role={}", user.getId(), role);
             }
         }
-        return changed ? userRepository.save(user) : user;
+        user.setCloudTenantId(cloudUser.cloudTenantId());
+        user.setMemoryAccessToken(cloudUser.memoryToken());
+        user.setMemoryRefreshCredential(cloudUser.memoryRefreshCredential());
+        return changed || cloudUser.memoryToken() != null
+                ? userRepository.save(user) : user;
     }
 
     private User create(CloudUser cloudUser) {
@@ -182,6 +189,9 @@ public class ShadowUserService {
         User user = new User();
         user.setUsername(username);
         user.setExternalId(cloudUser.externalId());
+        user.setCloudTenantId(cloudUser.cloudTenantId());
+        user.setMemoryAccessToken(cloudUser.memoryToken());
+        user.setMemoryRefreshCredential(cloudUser.memoryRefreshCredential());
         user.setDisplayName(cloudUser.displayName() != null ? cloudUser.displayName() : cloudUser.username());
         user.setTenantId(systemTenantId());
         user.setRole(adoptRole ? orDefault(parseRole(cloudUser.role())) : UserRole.USER);

@@ -138,6 +138,7 @@ const READY_PREFIX = 'MINIAGENT_READY ';
 const BACKEND_START_TIMEOUT_MS = 120000;
 /** 云端账号服务。登录校验和注册页都用这个地址，环境变量或 config.json 可覆盖。 */
 const CLOUD_ACCOUNT_BASE = 'http://120.53.87.241:8081';
+const CLOUD_MEMORY_BASE = 'http://120.53.87.241:8091';
 const DESKTOP_LOGIN_PROTOCOL = 'miniagent';
 let pendingDesktopTicket = '';
 
@@ -164,6 +165,18 @@ function portalUrl() {
     : (fromConfig !== undefined && fromConfig !== null && String(fromConfig).trim() !== ''
       ? String(fromConfig)
       : CLOUD_ACCOUNT_BASE);
+  return raw.trim().replace(/\/+$/, '');
+}
+
+/** Cloud memory API; independent from the Account portal/API address. */
+function memoryServiceUrl() {
+  const fromEnv = process.env.MEMORY_SERVICE_BASE_URL;
+  const fromConfig = config.memoryServiceUrl;
+  const raw = fromEnv !== undefined && String(fromEnv).trim() !== ''
+    ? String(fromEnv)
+    : (fromConfig !== undefined && fromConfig !== null && String(fromConfig).trim() !== ''
+      ? String(fromConfig)
+      : CLOUD_MEMORY_BASE);
   return raw.trim().replace(/\/+$/, '');
 }
 
@@ -293,6 +306,9 @@ function startBackend(rt, nonce) {
   env.JWT_SECRET = ensureDesktopJwtSecret();
   if (!env.CLOUD_AUTH_BASE_URL || !String(env.CLOUD_AUTH_BASE_URL).trim()) {
     env.CLOUD_AUTH_BASE_URL = portalUrl();
+  }
+  if (!env.MEMORY_SERVICE_BASE_URL || !String(env.MEMORY_SERVICE_BASE_URL).trim()) {
+    env.MEMORY_SERVICE_BASE_URL = memoryServiceUrl();
   }
   const bundledBrowsers = path.join(process.resourcesPath, 'browsers');
   if (app.isPackaged && fs.existsSync(bundledBrowsers)) {

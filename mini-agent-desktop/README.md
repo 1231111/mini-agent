@@ -379,24 +379,22 @@ Electron 为本次子进程生成随机 nonce；只有子进程输出的
 
 ## 云端账号（注册/登录走云端）
 
-账号体系可以放到一台**云端** MiniAgent 上：注册与密码校验都由它完成，本机只留一条
-"影子用户"记录。配置在 `application-desktop.yml`：
+账号和记忆服务部署在云端，桌面 Agent 仍在用户本机运行。当前服务器地址分别是：
 
-```yaml
-agent:
-  auth:
-    cloud:
-      base-url: http://<云端主机>:8081   # CLOUD_AUTH_BASE_URL，留空则走本地账号
-      connect-timeout-ms: 3000
-      read-timeout-ms: 10000
-      adopt-role: false
-```
+| 服务 | 客户端地址 | 用途 |
+|---|---|---|
+| Account | `http://120.53.87.241:8081` | 登录校验、注册及签发记忆访问凭证 |
+| memory-service | `http://120.53.87.241:8091` | 云端记忆读写和记忆进化 |
 
-云端用 `docker compose -f docker-compose.account.yml up -d --build` 启动。
-桌面壳启动后端时，若环境变量 `CLOUD_AUTH_BASE_URL` 为空，则设为
-`http://120.53.87.241:8081`（`main.js` 的 `CLOUD_ACCOUNT_BASE`）。
-门户地址同样默认这个主机：环境变量 `MINIAGENT_PORTAL_URL`，否则 `config.json` 的 `portalUrl`，
-都没有才用上面的默认值。登录页没有本机注册，登录框下面的链接打开
+Electron 壳启动本地 Spring Boot 后端时，会自动注入 `CLOUD_AUTH_BASE_URL` 与
+`MEMORY_SERVICE_BASE_URL`。环境变量优先于 `config.json` 中的 `portalUrl`、
+`memoryServiceUrl`；没有覆盖值时使用上述默认地址。门户跳转地址由
+`MINIAGENT_PORTAL_URL` 或 `config.json` 的 `portalUrl` 控制，默认使用 Account 地址。
+直接运行后端 JAR 不经过 Electron 壳，因此需要自行设置这两个环境变量。
+
+桌面端不配置 `ACCOUNT_INTERNAL_KEY` 或 `ACCOUNT_MEMORY_TOKEN_KEY`。用户登录 Account 后，
+Account 为本地影子用户签发用户专属的记忆访问凭证，客户端使用该凭证访问 memory-service。
+登录页没有本机注册，登录框下面的链接打开
 `{门户}/login?desktop=1`。线上账号服务目前只有 `/login`，没有 `/register`，
 所以不能把浏览器打到 `/register`（会得到 `SYSTEM.01.01`）。
 注册成功后账号服务发一张一次性凭证，浏览器跳

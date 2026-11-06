@@ -113,6 +113,12 @@ public class AgentChatApplicationService {
     private SessionEventCenter eventCenter;
     @Autowired
     private BuiltinTools builtinTools;
+    /**
+     * 代码诊断待检查队列。与 {@code builtinTools.clearToolCache()} 同生命周期清空：
+     * 新用户消息开始时，上一轮没来得及检查的文件不该再作为「刚改过」注入。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.miniagent.agent.coding.DiagnosticCollector diagnosticCollector;
     @Autowired
     private TaskRunService taskRunService;
     @Autowired
@@ -432,6 +438,9 @@ public class AgentChatApplicationService {
 
         contextCompressor.setCurrentSession(sessionId);
         builtinTools.clearToolCache();
+        if (Objects.nonNull(diagnosticCollector)) {
+            diagnosticCollector.clear();
+        }
 
         if (Objects.nonNull(traceRecorder)) {
             traceRecorder.ensureExecution(sessionId, userMessage);

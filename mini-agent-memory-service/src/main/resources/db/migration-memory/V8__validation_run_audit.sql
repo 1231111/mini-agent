@@ -1,0 +1,21 @@
+CREATE TABLE memory_evolution_validation_runs (
+    run_id VARCHAR(128) NOT NULL,
+    tenant_id VARCHAR(64) NOT NULL,
+    user_id BIGINT NOT NULL,
+    proposal_id BIGINT NOT NULL,
+    candidate_hash CHAR(64) NOT NULL,
+    base_content_hash CHAR(64) NOT NULL,
+    candidate_content_hash CHAR(64) NOT NULL,
+    suite_id VARCHAR(128) NOT NULL,
+    suite_version VARCHAR(128) NOT NULL,
+    runner_version VARCHAR(128),
+    runner_attestation VARCHAR(1024),
+    status VARCHAR(24) NOT NULL,
+    failure_reason VARCHAR(2000),
+    started_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    finished_at DATETIME(6),
+    PRIMARY KEY (run_id),
+    CONSTRAINT ux_mevr_proposal_suite UNIQUE (tenant_id, proposal_id, candidate_hash, suite_id, suite_version),
+    INDEX idx_mevr_status (status, started_at),
+    INDEX idx_mevr_proposal (tenant_id, proposal_id, candidate_hash)
+);

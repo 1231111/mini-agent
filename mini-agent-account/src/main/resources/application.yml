@@ -81,3 +81,4 @@ agent:
     # 云端 agent 或客户机本地后端先验掉用户的 token，再带这个密钥转发过来。
     # 留空则不启用会员接口（返回 503 并在启动时 WARN），不会静默地变成无鉴权。
     internal-key: ${ACCOUNT_INTERNAL_KEY:}
+    memory-token-key: ${ACCOUNT_MEMORY_TOKEN_KEY:}

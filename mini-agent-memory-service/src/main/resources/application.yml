@@ -1,0 +1,68 @@
+server:
+  address: ${MEMORY_SERVICE_ADDRESS:127.0.0.1}
+  port: ${MEMORY_SERVICE_PORT:8091}
+
+spring:
+  application:
+    name: mini-agent-memory-service
+  datasource:
+    url: ${DB_URL:jdbc:h2:file:./data/memory-service;MODE=MySQL;DB_CLOSE_DELAY=-1}
+    username: ${DB_USERNAME:sa}
+    password: ${DB_PASSWORD:}
+  flyway:
+    enabled: true
+    # 与 App 的 db/migration 路径隔离：两条链各自从 V1 编号，指向两个库（见 db/migration-memory/README.md）
+    locations: classpath:db/migration-memory
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+memory:
+  service:
+    # api：只提供 HTTP（测试默认，避免抢评估作业）。worker / all：升级并进程内回放。compose 设 all。
+    role: ${MEMORY_SERVICE_ROLE:api}
+    account-base-url: ${ACCOUNT_BASE_URL:}
+    account-internal-key: ${ACCOUNT_INTERNAL_KEY:}
+    memory-token-key: ${ACCOUNT_MEMORY_TOKEN_KEY:}
+    account-connect-timeout-ms: ${ACCOUNT_CONNECT_TIMEOUT_MS:1500}
+    account-read-timeout-ms: ${ACCOUNT_READ_TIMEOUT_MS:2500}
+    issuers:
+      eval-worker:
+        public-keys: ${MEMORY_SERVICE_EVAL_PUBLIC_KEYS:}
+        roles: eval
+  evolution:
+    policy:
+      default-mode: ${MEMORY_EVOLUTION_DEFAULT_MODE:AUTO}
+    experiment:
+      # 客户端只使用本库当前修订，不跑对照臂。离线通过后直接升级，再同步回客户端。
+      require-live-arms: ${MEMORY_EVOLUTION_REQUIRE_LIVE_ARMS:false}
+    llm:
+      base-url: ${MEMORY_EVOLUTION_LLM_BASE_URL:${LLM_BASE_URL:https://token-plan-cn.xiaomimimo.com/v1}}
+      api-key: ${MEMORY_EVOLUTION_LLM_API_KEY:${LLM_API_KEY:}}
+      model: ${MEMORY_EVOLUTION_LLM_MODEL:${LLM_MODEL:mimo-v2.6-pro}}
+    budget:
+      daily-tokens-per-tenant: ${MEMORY_EVOLUTION_DAILY_TOKENS:2000000}
+
+# 进程内离线回放。未配置规划或裁判地址时不领取评估作业。
+eval-worker:
+  planner:
+    base-url: ${EVAL_PLANNER_BASE_URL:${LLM_BASE_URL:}}
+    api-key: ${EVAL_PLANNER_API_KEY:${LLM_API_KEY:}}
+    model: ${EVAL_PLANNER_MODEL:${LLM_MODEL:}}
+    timeout-seconds: ${EVAL_PLANNER_TIMEOUT_SECONDS:120}
+  judge:
+    base-url: ${EVAL_JUDGE_BASE_URL:${LLM_BASE_URL:}}
+    api-key: ${EVAL_JUDGE_API_KEY:${LLM_API_KEY:}}
+    model: ${EVAL_JUDGE_MODEL:${LLM_MODEL:}}
+    timeout-seconds: ${EVAL_JUDGE_TIMEOUT_SECONDS:120}
+  judge-version: ${EVAL_JUDGE_VERSION:pairwise-swap-v1}

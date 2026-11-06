@@ -1,58 +1,43 @@
 package com.miniagent.agent.memory.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.miniagent.agent.memory.manager.CloudMemoryClient;
 import com.miniagent.agent.memory.manager.ProcedureApplicationSettlementService;
 import com.miniagent.agent.memory.manager.ProcedureSettlementModeProperties;
-import com.miniagent.agent.memory.manager.RemoteProcedureSettlementPort;
-import com.miniagent.memory.port.ProcedureDefinitionPort;
 import com.miniagent.memory.port.ProcedureSettlementPort;
-import com.miniagent.memory.port.ProjectAuthorizationPort;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import com.miniagent.config.repository.UserRepository;
+import com.miniagent.config.cloud.CloudAccountClient;
 
 /**
- * 选择本地数据库结算或独立记忆服务结算。
- *
- * <p>remote 模式下投影端口也必须存在：没有投影，服务端不认识任何 {@code procedureId}，
- * 结算会全部落到 {@code STALE_PROCEDURE}。两者由同一个客户端提供，避免出现
- * 「结算走远端、投影没配」这种一半接通的组合。</p>
+ * 本库结算始终在。配置云端地址后，同一个客户端以 Account 用户凭证访问云端记忆服务。
  */
 @Configuration
 @EnableConfigurationProperties(ProcedureSettlementModeProperties.class)
 public class MemorySettlementConfig {
 
     @Bean
-    @ConditionalOnProperty(prefix = "agent.memory.service", name = "mode", havingValue = "remote")
-    public RemoteProcedureSettlementPort remoteMemoryClient(
-            ObjectMapper objectMapper, ProcedureSettlementModeProperties properties) {
-        return new RemoteProcedureSettlementPort(objectMapper, properties);
+    @ConditionalOnCloudMemory
+    public CloudMemoryClient cloudMemoryClient(ProcedureSettlementModeProperties properties,
+                                               ObjectMapper objectMapper,
+                                               ObjectProvider<StringRedisTemplate> redis,
+                                               MeterRegistry metrics,
+                                               UserRepository users,
+                                               CloudAccountClient accounts) {
+        return new CloudMemoryClient(properties, objectMapper, redis, metrics, users, accounts);
     }
 
     @Bean
     @Primary
-    @ConditionalOnProperty(prefix = "agent.memory.service", name = "mode", havingValue = "remote")
-    public ProcedureSettlementPort remoteProcedureSettlementPort(RemoteProcedureSettlementPort client) {
-        return client;
-    }
-
-    @Bean
-    @ConditionalOnProperty(prefix = "agent.memory.service", name = "mode", havingValue = "remote")
-    public ProcedureDefinitionPort remoteProcedureDefinitionPort(RemoteProcedureSettlementPort client) {
-        return client;
-    }
-
-    @Bean
-    @ConditionalOnProperty(prefix = "agent.memory.service", name = "mode", havingValue = "remote")
-    public ProjectAuthorizationPort remoteProjectAuthorizationPort(RemoteProcedureSettlementPort client) {
-        return client;
-    }
-
-    @Bean
-    @Primary
-    @ConditionalOnProperty(prefix = "agent.memory.service", name = "mode", havingValue = "local", matchIfMissing = true)
+    @ConditionalOnProperty(prefix = "agent.memory.service", name = "mode",
+            havingValue = "local", matchIfMissing = true)
     public ProcedureSettlementPort localProcedureSettlementPort(
             ProcedureApplicationSettlementService local) {
         return local;

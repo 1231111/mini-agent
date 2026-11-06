@@ -2,7 +2,7 @@
 
 云端账号与会员服务：登录、注册、会员等级、充值。
 
-它是一个**独立的 Spring Boot 应用**（端口 8081），与云端 agent（mini-agent-app，8080）**共用同一个 MySQL 库**，但只碰五张表：`tenants`、`users`、`membership_plans`、`membership_subscriptions`、`membership_orders`。
+它是一个独立的 Spring Boot 应用（端口 8081），库是 MySQL `mini_agent`，只碰五张表：`tenants`、`users`、`membership_plans`、`membership_subscriptions`、`membership_orders`。Agent 在桌面端，用本机 H2，compose 不启动它。
 
 ---
 
@@ -29,18 +29,17 @@ docker compose -f docker-compose.account.yml up -d --build
 
 桌面端把 `CLOUD_AUTH_BASE_URL` 和 `MINIAGENT_PORTAL_URL` 都设成同一个地址。
 
-### 和云端 agent 放在同一个库
+### 和云端记忆一起
 
 ```bash
-docker compose up -d mysql app account
+docker compose up -d --build
 ```
 
-`account` 的 `depends_on` 里显式依赖 `app` 的健康检查，原因见下一节。这条路径不能让 account 先建表。
+这一份起 MySQL、账号（8081）、记忆服务（127.0.0.1:8091）。没有 agent 容器。
 
 ### 本地
 
 ```bash
-# 需要一个已跑过 agent 迁移的 MySQL（见下一节的顺序要求）
 export DB_URL='jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8'
 export DB_USERNAME=root
 export DB_PASSWORD=...
@@ -56,20 +55,11 @@ curl -s http://127.0.0.1:8081/actuator/health
 # {"status":"UP"}
 ```
 
-## 3. 部署顺序：agent 先，account 后
+## 3. 未实现：不要把 agent 的 Flyway 指到账号库
 
-这不是偏好，是硬要求。
+账号服务在空库上用自己的 V1、V2 建表，历史表是 `flyway_schema_history_account`。
 
-| 顺序 | 结果 |
-| --- | --- |
-| agent 先 → account 后 | ✅ agent 的 V1..V8 建出全部业务表；account 的 V1 是 `CREATE TABLE IF NOT EXISTS`，两条全部跳过 |
-| account 先 → agent 后 | ❌ agent 的 `V2__production_security_and_usage.sql` 里那句裸 `CREATE TABLE tenants` 撞上 "table already exists"，**agent 直接起不来** |
-
-那句 `CREATE TABLE` 是历史迁移，**不能**改成 `IF NOT EXISTS`——会改变已执行库的 checksum，Flyway 会报校验失败。所以顺序只能靠部署编排表达（compose 里由 `depends_on` 承担）。
-
-代价：account 要等 agent 的 healthcheck（`start_period: 90s`）通过才启动，所以 `docker compose up` 之后约两分钟内登录会报 `AUTH.03.01`（账号服务不可达）。这是预期行为，不是故障。
-
-另一个必须记住的点：**两个应用各有自己的 Flyway 历史表**（本服务是 `flyway_schema_history_account`）。共用一张 `flyway_schema_history` 会让两边互相把对方的迁移记录判成「缺失」或「漂移」，启动时直接报校验失败。
+Agent 的 `V2__production_security_and_usage.sql` 里是裸 `CREATE TABLE tenants`。那句不能改成 `IF NOT EXISTS`，改了会变已执行库的 checksum。桌面端走自己的 H2，不碰这个库。若把 agent 的 prod 档指到同一 MySQL，V2 会撞上 "table already exists"，agent 起不来。
 
 ## 4. 端点
 
@@ -107,7 +97,7 @@ curl -s http://127.0.0.1:8081/actuator/health
 
 ### 本服务不签发 token
 
-响应里没有 token 字段，这不是缺项。token 由**收到用户请求的那一侧**自己签——客户机本地后端签本地会话，云端 agent 签它自己的。好处是 HS256 密钥不必在两个服务之间同步，本服务因此只回答「这个用户名+密码对应哪个身份」（`data.userId` / `username` / `displayName` / `role`）。
+响应里没有 token 字段，这不是缺项。token 由桌面端自己签。本服务只回答「这个用户名+密码对应哪个身份」（`data.userId` / `username` / `displayName` / `role`）。
 
 ### 会员等级 → agent 的翻译只有一行
 
@@ -125,11 +115,11 @@ agent 侧的配额闸门 `DbTenantTokenQuota.check/consume(tenantId)` 只读这�
 
 客户机没配 `ACCOUNT_INTERNAL_KEY`（或和账号服务不一致）时，上报直接跳过，门户数字停在 0。本地注册、没有 `external_id` 的用户也不会上报。
 
-### 云端 agent 侧必须配 `shared-database: true`
+### `shared-database`
 
-这是本轮踩到的一个会破坏数据的坑。
+`application-prod.yml` 里 `agent.auth.cloud.shared-database: true`。当前 compose 不启动这个档。桌面端是另一个库，保持默认 `false`，登录后在本地造一条影子用户。
 
-云端 agent 与账号服务**同库**，账号行就是 agent 的行。但如果 agent 侧没开这个开关，它仍会按「客户机」的逻辑走 `ShadowUserService`，为每个账号**再插一条影子行**：
+若有人把 agent 的 prod 档和账号指到同一个库，却把这个开关关掉，会再插一条影子行：
 
 ```
 users 表（同一个库）
@@ -139,7 +129,7 @@ users 表（同一个库）
 
 后果是同一人两条记录，而会员配额写在 **id=1 的租户**上、agent 读的是 **id=2 的租户**——症状是「买了会员但额度没变」，且日志里一切正常。
 
-云端 agent 的 `application-prod.yml` 因此固定：
+`application-prod.yml` 里因此写着：
 
 ```yaml
 agent:
@@ -159,7 +149,7 @@ agent:
 | 键 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `server.port` | `ACCOUNT_SERVER_PORT` | 8081 | 监听端口 |
-| `spring.datasource.url` | `DB_URL` | `jdbc:mysql://127.0.0.1:3306/mini_agent?...` | 必须与 agent 指向同一个库 |
+| `spring.datasource.url` | `DB_URL` | `jdbc:mysql://127.0.0.1:3306/mini_agent?...` | 账号库。桌面端 agent 不连它 |
 | `spring.datasource.username` | `DB_USERNAME` | root | |
 | `spring.datasource.password` | `DB_PASSWORD`（回退 `MYSQL_PASSWORD`） | 空 | |
 | `agent.account.registration-enabled` | — | `true`（prod 也是 `true`） | 与 agent 的 prod 档相反，见第 1 节 |

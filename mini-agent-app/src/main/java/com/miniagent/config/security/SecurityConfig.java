@@ -96,6 +96,9 @@ public class SecurityConfig {
             "/api/auth/cloud-status",
             // 网页注册完成后，浏览器用自定义协议把一次性凭证交回尚未登录的客户端。
             "/api/auth/desktop-login",
+            // 服务间记忆结算、Procedure 投影和演进 CAS 由各 controller 校验
+            // X-Memory-Internal-Key；不能要求它们再携带用户 JWT。
+            "/internal/v1/memory/**",
             "/actuator/health",
             "/actuator/info",
             "/css/**",

@@ -15,7 +15,7 @@ services:
   mysql:
     image: mysql:8.0
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-mysql_root_pass}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 必须显式设置}
       MYSQL_DATABASE: mini_agent
       MYSQL_CHARACTER_SET_SERVER: utf8mb4
       MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
@@ -32,6 +32,7 @@ services:
       context: .
       args:
         MODULE: mini-agent-account
+    image: miniagent-account:local
     depends_on:
       mysql:
         condition: service_healthy
@@ -41,8 +42,9 @@ services:
       SPRING_PROFILES_ACTIVE: prod
       DB_URL: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
       DB_USERNAME: root
-      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-mysql_root_pass}
-      ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:-}
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 必须显式设置}
+      ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:?ACCOUNT_INTERNAL_KEY 必须显式设置}
+      ACCOUNT_MEMORY_TOKEN_KEY: ${ACCOUNT_MEMORY_TOKEN_KEY:?ACCOUNT_MEMORY_TOKEN_KEY 必须显式设置（32 字节随机密钥的 Base64）}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8081/actuator/health"]
       interval: 15s

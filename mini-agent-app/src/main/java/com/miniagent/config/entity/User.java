@@ -53,4 +53,13 @@ public class User extends BaseEntity {
     @Column(name = "external_id", length = 128)
     private String externalId;
 
+    @Column(name = "cloud_tenant_id", length = 128)
+    private String cloudTenantId;
+
+    @Column(name = "memory_access_token", length = 4096)
+    private String memoryAccessToken;
+
+    @Column(name = "memory_refresh_credential", length = 128)
+    private String memoryRefreshCredential;
+
 }

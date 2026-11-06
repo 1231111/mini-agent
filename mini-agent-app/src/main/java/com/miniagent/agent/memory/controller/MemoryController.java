@@ -174,9 +174,17 @@ public class MemoryController {
                                                                HttpServletRequest request) {
         AuthenticatedUser user = requireUser(request);
         bindScopedRecord(procedure, user);
-        Procedure written = memoryManager.writeProcedure(procedure);
-        return ApiResponse.ok(new ProcedureWriteResultDTO(written.getId(), written.getVersion(),
-                written.getAttemptCount(), written.getSuccessCount(), written.getSuccessRate()));
+        try (var ignored = com.miniagent.common.context.OwnerContext.bind(
+                new com.miniagent.common.context.OwnerContext(user.userId(), user.tenantKey()))) {
+            if (procedure.getScope() != null
+                    && procedure.getScope().scopeType() == MemoryScope.ScopeType.PROJECT) {
+                com.miniagent.common.context.OwnerContext.setCurrentProjectId(
+                        procedure.getScope().scopeId());
+            }
+            Procedure written = memoryManager.writeProcedure(procedure);
+            return ApiResponse.ok(new ProcedureWriteResultDTO(written.getId(), written.getVersion(),
+                    written.getAttemptCount(), written.getSuccessCount(), written.getSuccessRate()));
+        }
     }
 
     @GetMapping("/procedure-proposals")
@@ -227,9 +235,15 @@ public class MemoryController {
             HttpServletRequest request) {
         AuthenticatedUser user = requireUser(request);
         MemoryScope scope = requestedScope(user, tenantId, scopeType, scopeId);
-        List<Procedure> procs = memoryManager.queryProcedures(
-                scope.tenantId(), scope.scopeType().name(), scope.scopeId(), name);
-        return ApiResponse.ok(procs);
+        try (var ignored = com.miniagent.common.context.OwnerContext.bind(
+                new com.miniagent.common.context.OwnerContext(user.userId(), user.tenantKey()))) {
+            if (scope.scopeType() == MemoryScope.ScopeType.PROJECT) {
+                com.miniagent.common.context.OwnerContext.setCurrentProjectId(scope.scopeId());
+            }
+            List<Procedure> procs = memoryManager.queryProcedures(
+                    scope.tenantId(), scope.scopeType().name(), scope.scopeId(), name);
+            return ApiResponse.ok(procs);
+        }
     }
 
     /**

@@ -14,5 +14,6 @@ package com.miniagent.config.cloud;
  * @param displayName 云端显示名，可为空
  * @param role        云端角色名（如 {@code USER}），可为空；本地影子用户不采纳它，理由见 CloudAccountService
  */
-public record CloudUser(String externalId, String username, String displayName, String role) {
+public record CloudUser(String externalId, String username, String displayName, String role,
+                        String cloudTenantId, String memoryToken, String memoryRefreshCredential) {
 }

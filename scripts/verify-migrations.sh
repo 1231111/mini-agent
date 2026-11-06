@@ -96,6 +96,9 @@ check_chain "agent" \
 check_chain "account" \
   "mini-agent-account/src/main/resources/db/migration" \
   "mini-agent-account/src/main/java/com/miniagent/account/migration"
+check_chain "memory-service" \
+  "mini-agent-memory-service/src/main/resources/db/migration-memory" \
+  "mini-agent-memory-service/src/main/java/com/miniagent/memoryservice/migration"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "迁移序列校验失败" >&2

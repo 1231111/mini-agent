@@ -35,6 +35,13 @@ public class AgentProcedureApplicationEntity {
     @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;
 
+    @Column(name = "evolution_proposal_id")
+    private Long evolutionProposalId;
+    @Column(name = "evolution_candidate_hash", length = 64)
+    private String evolutionCandidateHash;
+    @Column(name = "procedure_variant", nullable = false, length = 16)
+    private String procedureVariant = "BASELINE";
+
     @PrePersist
     void onCreate() { if (createdAt == null) createdAt = LocalDateTime.now(); }
 
@@ -58,4 +65,10 @@ public class AgentProcedureApplicationEntity {
     public void setActionId(String actionId) { this.actionId = actionId; }
     public Result getResult() { return result; }
     public void setResult(Result result) { this.result = result; }
+    public Long getEvolutionProposalId() { return evolutionProposalId; }
+    public void setEvolutionProposalId(Long value) { evolutionProposalId = value; }
+    public String getEvolutionCandidateHash() { return evolutionCandidateHash; }
+    public void setEvolutionCandidateHash(String value) { evolutionCandidateHash = value; }
+    public String getProcedureVariant() { return procedureVariant; }
+    public void setProcedureVariant(String value) { procedureVariant = value; }
 }

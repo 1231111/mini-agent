@@ -70,6 +70,15 @@ mini-agent-desktop/.build-tmp/
 .verify/pw-driver/_bundle.jar
 # 只含 headless shell 的临时 browsers 根目录（launch-test.cjs 用）
 .verify/browsers-shell-only/
+# 从 fat jar 里解出的可执行包（单个 263MB，超过 GitHub 100MB 单文件上限，push 会被拒）
+.verify/*.jar
+.verify/**/*.jar
+# 验证跑出来的运行时数据根目录（data/logs/memory/skills/workspace），不属于源码
+.verify-runtime/
+.verify-runtime-key/
+# 一次性脚本与流水线中间产物
+tmp/
+outputs/
 
 # 内联 embedding 的 ONNX 变体（.verify/onnx/export_onnx.py 的产出）。
 # 三档实际体积：int8 315MB / fp16 655MB / fp32 1308MB（还有 fp32 那份 1.2GB 的

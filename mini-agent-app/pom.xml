@@ -30,10 +30,6 @@
         </dependency>
         <dependency>
             <groupId>com.miniagent</groupId>
-            <artifactId>mini-agent-loop</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.miniagent</groupId>
             <artifactId>mini-agent-planner</artifactId>
         </dependency>
         <dependency>

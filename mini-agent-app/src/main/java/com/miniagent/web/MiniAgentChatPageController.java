@@ -281,6 +281,7 @@ public class MiniAgentChatPageController {
                 .tenantId(user.getTenantId())
                 .role(user.getRole())
                 .token(token)
+                .cloudTenantId(user.getCloudTenantId())
                 .build();
     }
 

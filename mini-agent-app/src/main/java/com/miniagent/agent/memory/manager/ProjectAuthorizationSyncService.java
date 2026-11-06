@@ -30,14 +30,16 @@ public class ProjectAuthorizationSyncService {
     private static final int MAX_ATTEMPTS = 10;
 
     @Autowired private AgentProjectAuthorizationOutboxRepository outbox;
-    @Autowired private ProcedureSettlementModeProperties mode;
     @Autowired private ObjectProvider<ProjectAuthorizationPort> portProvider;
     @Autowired private MemoryTaskLock taskLock;
     @Autowired private PlatformTransactionManager transactionManager;
     @Autowired private ObjectMapper objectMapper;
 
-    public void enqueue(String tenantId, String projectId, long ownerUserId, long version, List<Long> memberUserIds) {
-        if (!mode.remote()) return;
+    public void enqueue(String tenantId, String projectId, long ownerUserId, long version,
+                        List<Long> memberUserIds) {
+        if (portProvider.getIfAvailable() == null) {
+            return;
+        }
         try {
             AgentProjectAuthorizationOutboxEntity item = outbox
                     .findByTenantIdAndProjectIdAndAuthorizationVersion(tenantId, projectId, version).orElse(null);
@@ -63,7 +65,9 @@ public class ProjectAuthorizationSyncService {
     @Scheduled(fixedDelayString = "${agent.memory.procedure.outbox.interval-ms:5000}")
     public void drain() {
         ProjectAuthorizationPort port = portProvider.getIfAvailable();
-        if (!mode.remote() || port == null || !taskLock.tryLock(LOCK_NAME, LOCK_TTL)) return;
+        if (port == null || !taskLock.tryLock(LOCK_NAME, LOCK_TTL)) {
+            return;
+        }
         try {
             TransactionTemplate tx = new TransactionTemplate(transactionManager);
             List<AgentProjectAuthorizationOutboxEntity> processing = outbox.findByStatus(

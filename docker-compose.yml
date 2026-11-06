@@ -16,224 +16,63 @@ services:
       - "127.0.0.1:3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
+      - ./docker/mysql-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # 密码必须与上面 MYSQL_ROOT_PASSWORD 同源。写死 "-pmysql_root_pass" 的话，
       # 一旦有人用 MYSQL_ROOT_PASSWORD 覆盖了root 密码，健康检查用的还是旧密码 ——
-      # mysqladmin ping 认证失败 → 容器永远不 healthy → app 永远卡在 depends_on 上，
+      # mysqladmin ping 认证失败 → 容器永远不 healthy → 账号和记忆服务卡在 depends_on 上，
       # 而日志里只会看到 mysql 反复 unhealthy，看不出是密码对不上。
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$${MYSQL_ROOT_PASSWORD}\""]
       interval: 10s
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    container_name: miniagent-redis
-    ports:
-      # 同上：只绑回环，不对外发布。
-      - "127.0.0.1:6379:6379"
-    # 生产档的 ProductionReadinessValidator 硬断言 REDIS_PASSWORD 非空。
-    # 光在 app 侧设那个变量是自欺欺人 —— Redis 自己不校验，密码就只是一行摆设。
-    # 所以这里让 Redis 真的要求认证，密码与 app 侧同源；且不给默认值。
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD 必须显式设置（不要使用仓库示例值）}"]
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      # 带密码后 ping 也必须认证，否则健康检查永远失败、app 永远等不到 redis healthy。
-      # --no-auth-warning 只是为了不让 "Using a password with -a" 刷满日志。
-      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD:?}", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  etcd:
-    image: quay.io/coreos/etcd:v3.5.16
-    container_name: miniagent-etcd
-    environment:
-      ETCD_AUTO_COMPACTION_MODE: revision
-      ETCD_AUTO_COMPACTION_RETENTION: "1000"
-      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
-      ETCD_SNAPSHOT_COUNT: "50000"
-    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
-    volumes:
-      - etcd-data:/etcd
-    healthcheck:
-      test: ["CMD", "etcdctl", "endpoint", "health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  minio:
-    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
-    container_name: miniagent-minio
-    environment:
-      # 不给 minioadmin/minioadmin：这是 MinIO 的出厂名，任何扫描器都会先试它。
-      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY 必须显式设置}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY 必须显式设置}
-    command: minio server /minio_data --console-address ":9001"
-    volumes:
-      - minio-data:/minio_data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  milvus:
-    image: milvusdb/milvus:v2.4.17
-    container_name: miniagent-milvus
-    command: ["milvus", "run", "standalone"]
-    security_opt:
-      - seccomp:unconfined
-    environment:
-      ETCD_ENDPOINTS: etcd:2379
-      MINIO_ADDRESS: minio:9000
-      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?}
-      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?}
-    ports:
-      # 向量库不对外发布；只有 app 需要它，走 compose 内网。
-      - "127.0.0.1:19530:19530"
-      - "127.0.0.1:9091:9091"
-    volumes:
-      - milvus-data:/var/lib/milvus
-    depends_on:
-      etcd:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:9091/healthz"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 40s
-
-  embedding:
+  memory-service:
     build:
-      context: ./embedding-server
-    container_name: miniagent-embedding
-    ports:
-      # 内网服务，不对外发布；需要本机调试时用 127.0.0.1:8008。
-      - "127.0.0.1:8008:8008"
-    environment:
-      MODEL_DIR: /models/models/IEITYuan--Yuan-embedding-2.0-zh/snapshots/master
-      MODEL_NAME: Yuan-embedding-2.0-zh
-      DEVICE: cpu
-    volumes:
-      - ./embedding-server/models:/models:ro
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/health')",
-        ]
-      interval: 30s
-      timeout: 10s
-      retries: 20
-      start_period: 180s
-
-  app:
-    build: .
-    container_name: miniagent-app
+      context: .
+      args:
+        MODULE: mini-agent-memory-service
+    image: miniagent-memory:local
+    container_name: miniagent-memory-service
     depends_on:
       mysql:
         condition: service_healthy
-      redis:
-        condition: service_healthy
-      milvus:
-        condition: service_healthy
-      embedding:
-        condition: service_healthy
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8091:8091"
     environment:
-      SPRING_PROFILES_ACTIVE: prod
-      MINI_AGENT_HOME: /app/data
-
-      # ═══ 生产档断言要求显式提供的变量 ═══
-      #
-      # ProductionReadinessValidator（@Profile("prod")）在启动时硬断言这些**环境变量名**非空，
-      # 缺一个就是 "Production readiness validation failed: DB_URL is required; ..." 直接起不来。
-      #
-      # 前三项由 application-prod.yml 里的 ${DB_URL:...} 接住，同时也喂给数据源；
-      # 后五项只有断言在读。命名上必须用这里的名字，不能拿 SPRING_DATASOURCE_* 代替。
-      DB_URL: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
-      # 应用不用 root：应用只需要 mini_agent 库的读写权限，root 会把"注错库/删库"的代价放大到整实例。
-      # 首次部署需按 README/运维手册给 DB_USERNAME 对应的账号授权；
-      # 临时沿用 root 时也必须显式设置 DB_USERNAME=root，而不是由模板替你决定。
-      DB_USERNAME: ${DB_USERNAME:?DB_USERNAME 必须显式设置（建议使用非 root 的应用账号）}
+      MEMORY_SERVICE_ROLE: all
+      MEMORY_SERVICE_ADDRESS: 0.0.0.0
+      MEMORY_SERVICE_PORT: 8091
+      DB_URL: jdbc:mysql://mysql:3306/mini_agent_memory?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
+      DB_USERNAME: root
       DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 必须显式设置}
-      # 与上面 redis 服务的 --requirepass 同源，两边不一致时会连不上 Redis。
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD 必须显式设置}
-      # 每一项都必须是精确的 HTTPS origin（不能带 path / query / 凭据）。
-      # 不提供 localhost 兜底：公网部署必须明确声明浏览器来源，避免忘记配置时
-      # 让一个看似正常但错误的 CORS 白名单进入生产。
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS 必须显式设置为 HTTPS origin}
-      # 32 字节 Base64。生成：openssl rand -base64 32
-      # 刻意不给默认值：默认值一旦进仓库，所有部署共用同一把密钥 —— 等于出厂即泄密。
-      # 宁可缺失时启动失败，也不要静默用一个"看起来正常"的弱密钥。
-      MODEL_CONFIG_ENCRYPTION_KEY: ${MODEL_CONFIG_ENCRYPTION_KEY:-}
-      # HS256 签名密钥，至少 32 字节。生成：openssl rand -base64 48
-      JWT_SECRET: ${JWT_SECRET:-}
-      # 对话模型凭据。断言会拦住缺失的情况 —— 否则进程起来了却无法对话，
-      # 那种故障要查很久才发现只是少配了一个 key。
-      LLM_API_KEY: ${LLM_API_KEY:-}
-
-      SPRING_DATA_REDIS_HOST: redis
-      AGENT_REPLICA_MODE: redis
-      AGENT_MEMORY_VECTOR_BACKEND: milvus
-      AGENT_MEMORY_VECTOR_MILVUS_URI: http://milvus:19530
-      AGENT_CODEBASE_EMBEDDING_BASE_URL: http://embedding:8008/v1
-      AGENT_CODEBASE_EMBEDDING_MODEL: Yuan-embedding-2.0-zh
-      AGENT_CODEBASE_EMBEDDING_API_KEY: local
-      AGENT_MEMORY_VECTOR_MILVUS_DIMENSION: "1792"
-      # 账号与会员服务的地址。application-prod.yml 里的默认值就是
-      # http://account:8081，这里显式写出来是为了让 "app 依赖 account"
-      # 这件事在 compose 里看得见，而不是藏在 yml 的默认值里。
       ACCOUNT_BASE_URL: http://account:8081
-      # 与 account 服务必须同值。两边读的是同一个环境变量名，
-      # 就是为了不出现"改了一个忘了另一个"——那种情况的症状只是会员页 403，
-      # 看起来像权限 bug，排查方向一开始就错了。
       ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:?ACCOUNT_INTERNAL_KEY 必须显式设置}
+      ACCOUNT_MEMORY_TOKEN_KEY: ${ACCOUNT_MEMORY_TOKEN_KEY:?ACCOUNT_MEMORY_TOKEN_KEY 必须显式设置（32 字节随机密钥的 Base64）}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
     volumes:
-      - app-data:/app/data
+      - memory-service-data:/app/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/actuator/health"]
-      interval: 30s
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8091/actuator/health"]
+      interval: 15s
       timeout: 5s
-      retries: 5
-      start_period: 90s
+      retries: 10
+      start_period: 45s
 
   # 账号与会员服务：登录、注册、会员等级、充值。
-  #
-  # 它和 app 是同一个 MySQL 库，但只碰 tenants / users / membership_* 这五张表。
-  # 拆出来的收益是客户端（桌面壳的本地后端）只需要连这个"只做账号"的轻量服务，
-  # 不必去连一个完整的 agent 实例 —— 后者会顺带把对话、工具执行等能力暴露出来。
+  # 库是 mini_agent，只建 tenants / users / membership_*。
+  # Agent 在桌面端，用本机 H2，不在这里启动。
   account:
     build:
       context: .
       args:
         MODULE: mini-agent-account
+    image: miniagent-account:local
     container_name: miniagent-account
     depends_on:
       mysql:
-        condition: service_healthy
-      # ═══ 顺序是有要求的：agent 先、account 后 ═══
-      #
-      # account 的 V1__account_baseline.sql 用 CREATE TABLE IF NOT EXISTS 建
-      # tenants / users，而 agent 的 V2 是裸的 CREATE TABLE。两者同一个库：
-      #   agent 先   → V1..V8 建出全部业务表，account 那两条全部跳过 ✓
-      #   account 先 → agent 的 V2 撞 "table already exists"，agent 直接起不来 ✗
-      #
-      # 那条 CREATE TABLE 不能改成 IF NOT EXISTS —— 会改变已执行库的 checksum，
-      # Flyway 会报校验失败。所以顺序只能由这里表达，不是哪个先都行。
-      #
-      # 代价是 account 要等 app 的 healthcheck（start_period 90s）通过才启动，
-      # 所以 docker compose up 之后约两分钟内登录会报 AUTH.03.01（账号服务不可达）。
-      # 这是预期行为，不是故障。
-      app:
         condition: service_healthy
     ports:
       - "8081:8081"
@@ -245,6 +84,7 @@ services:
       # 服务间密钥必须显式设置；缺失时拒绝启动，避免部署看似健康但会员
       # 端点退化为未认证的故障路径。
       ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:?ACCOUNT_INTERNAL_KEY 必须显式设置}
+      ACCOUNT_MEMORY_TOKEN_KEY: ${ACCOUNT_MEMORY_TOKEN_KEY:?ACCOUNT_MEMORY_TOKEN_KEY 必须显式设置（32 字节随机密钥的 Base64）}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8081/actuator/health"]
       interval: 15s
@@ -254,9 +94,4 @@ services:
 
 volumes:
   mysql-data:
-  redis-data:
-  etcd-data:
-  minio-data:
-  milvus-data:
-  app-data:
-  embedding-models:
+  memory-service-data:

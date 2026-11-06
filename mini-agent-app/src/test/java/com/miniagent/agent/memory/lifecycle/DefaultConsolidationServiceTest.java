@@ -136,6 +136,13 @@ class DefaultConsolidationServiceTest {
     void repeatedConsolidationUpdatesExistingEpisodeRatherThanInsertingAnother() {
         AgentEpisodeEntity existing = new AgentEpisodeEntity();
         existing.setId(99L);
+        existing.setTenantId("tenant-a");
+        existing.setSessionId("session-a");
+        existing.setTaskId("7");
+        var created = java.time.LocalDateTime.of(2025, 12, 31, 23, 0);
+        var updated = java.time.LocalDateTime.of(2026, 1, 1, 0, 0);
+        existing.setCreatedAt(created);
+        existing.setUpdatedAt(updated);
         existing.setAccessCount(4);
         var accessed = java.time.LocalDateTime.of(2026, 1, 1, 0, 0);
         existing.setLastAccessedAt(accessed);
@@ -150,9 +157,13 @@ class DefaultConsolidationServiceTest {
 
         var saved = org.mockito.ArgumentCaptor.forClass(AgentEpisodeEntity.class);
         verify(episodeRepository).save(saved.capture());
+        assertSame(existing, saved.getValue());
         assertEquals(99L, saved.getValue().getId());
+        assertEquals(created, saved.getValue().getCreatedAt());
+        assertEquals(updated, saved.getValue().getUpdatedAt());
         assertEquals(4, saved.getValue().getAccessCount());
         assertEquals(accessed, saved.getValue().getLastAccessedAt());
+        assertEquals("执行了 1 个工具调用，0 个失败", saved.getValue().getTaskSummary());
         verify(episodeRepository, never()).saveAll(anyList());
     }
 

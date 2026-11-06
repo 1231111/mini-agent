@@ -11,6 +11,42 @@ import java.util.List;
 
 public interface UserRepository extends JpaRepository<User, Long> {
     Optional<User> findByUsername(String username);
+
+    @Query("select u.memoryAccessToken from User u where u.id = :id")
+    Optional<String> findMemoryAccessTokenById(@org.springframework.data.repository.query.Param("id") Long id);
+
+    @Query("select u.memoryRefreshCredential from User u where u.id = :id")
+    Optional<String> findMemoryRefreshCredentialById(
+            @org.springframework.data.repository.query.Param("id") Long id);
+
+    @org.springframework.data.jpa.repository.Modifying
+    @org.springframework.transaction.annotation.Transactional
+    @Query("update User u set u.memoryAccessToken = :accessToken, "
+            + "u.memoryRefreshCredential = :refreshCredential where u.id = :id and "
+            + "u.memoryRefreshCredential = :expectedCredential")
+    int updateMemoryCredentialsIfUnchanged(
+            @org.springframework.data.repository.query.Param("id") Long id,
+            @org.springframework.data.repository.query.Param("expectedCredential") String expectedCredential,
+            @org.springframework.data.repository.query.Param("accessToken") String accessToken,
+            @org.springframework.data.repository.query.Param("refreshCredential") String refreshCredential);
+
+    @Query("select u.cloudTenantId from User u where u.id = :id")
+    Optional<String> findCloudTenantIdById(@org.springframework.data.repository.query.Param("id") Long id);
+
+    @Query("select u.externalId from User u where u.id = :id")
+    Optional<String> findExternalIdById(@org.springframework.data.repository.query.Param("id") Long id);
+
+    @Query("select u.tenantId from User u where u.id = :id")
+    Optional<Long> findLocalTenantIdById(@org.springframework.data.repository.query.Param("id") Long id);
+
+    @Query("select u.memoryAccessToken from User u where u.externalId = :externalId")
+    Optional<String> findMemoryAccessTokenByExternalId(
+            @org.springframework.data.repository.query.Param("externalId") String externalId);
+
+    @Query("select u.cloudTenantId from User u where u.externalId = :externalId")
+    Optional<String> findCloudTenantIdByExternalId(
+            @org.springframework.data.repository.query.Param("externalId") String externalId);
+
     boolean existsByUsername(String username);
     long countByRole(UserRole role);
 

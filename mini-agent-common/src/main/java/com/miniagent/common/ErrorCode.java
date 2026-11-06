@@ -78,6 +78,18 @@ public enum ErrorCode {
     MEMORY_CONTENT_REJECTED("MEMORY.01.05", "记忆内容被安全扫描拒绝（疑似提示注入或凭据外泄）"),
     MEMORY_WRITE_FAILED("MEMORY.02.01", "记忆写入失败"),
     MEMORY_MIDTERM_UPDATE_FAILED("MEMORY.03.01", "中期记忆更新失败"),
+    // 云端记忆服务：04=条目与修订, 05=提案, 06=进化治理, 07=结果事件, 08=人工抽检
+    MEMORY_ITEM_VERSION_CONFLICT("MEMORY.04.01", "条目已被修改（版本冲突）"),
+    MEMORY_ITEM_EVOLUTION_LOCKED("MEMORY.04.02", "条目已锁定，禁止进化"),
+    MEMORY_REVISION_NOT_FOUND("MEMORY.04.03", "修订不存在"),
+    MEMORY_PROPOSAL_STATE_INVALID("MEMORY.05.01", "提案不存在或当前状态不允许该操作"),
+    MEMORY_PROPOSAL_EXPIRED("MEMORY.05.02", "提案已过期"),
+    MEMORY_EVOLUTION_FROZEN("MEMORY.06.01", "进化已冻结"),
+    MEMORY_EVOLUTION_BUDGET_EXHAUSTED("MEMORY.06.02", "租户进化预算已用完"),
+    MEMORY_OUTCOME_INVALID("MEMORY.07.01", "结果事件格式非法"),
+    MEMORY_OUTCOME_ARM_MISMATCH("MEMORY.07.02", "结果事件分臂与服务端复算不一致"),
+    MEMORY_REVIEW_NOT_FOUND("MEMORY.08.01", "抽检任务不存在或已提交"),
+    MEMORY_REQUEST_INVALID("MEMORY.09.01", "记忆服务请求参数非法"),
 
     // ==================== TODO 任务待办 ====================
     TODO_NOT_FOUND("TODO.01.01", "待办项不存在"),

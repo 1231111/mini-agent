@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.async.AsyncRequestTimeoutException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.io.IOException;
 
@@ -99,6 +100,17 @@ public class GlobalExceptionHandler {
         log.warn("缺少请求参数: {}", e.getParameterName());
         return ResponseEntity.badRequest()
                 .body(ApiResponse.fail(ErrorCode.CONFIG_INVALID, "缺少参数: " + e.getParameterName()));
+    }
+
+    // ==================== 显式 HTTP 状态异常 ====================
+
+    @ExceptionHandler(ResponseStatusException.class)
+    public ResponseEntity<ApiResponse<Void>> handleResponseStatus(ResponseStatusException e) {
+        HttpStatus status = HttpStatus.valueOf(e.getStatusCode().value());
+        String reason = e.getReason() == null ? status.getReasonPhrase() : e.getReason();
+        log.warn("HTTP 请求失败 [{}]: {}", status.value(), reason);
+        return ResponseEntity.status(status)
+                .body(ApiResponse.fail(ErrorCode.SYSTEM_INTERNAL_ERROR, reason));
     }
 
     // ==================== 状态非法 ====================

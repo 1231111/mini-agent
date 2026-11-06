@@ -22,6 +22,9 @@ public class UserDTO {
 
     private UserRole role = UserRole.USER;
 
-    /** 登录/注册成功时签发的 JWT。其它场景不填。 */
+    /** 登录/注册成功时签发的本地会话 JWT。其它场景不填。 */
     private String token;
+
+    /** 云端记忆租户，不等于本地 tenantId。 */
+    private String cloudTenantId;
 }

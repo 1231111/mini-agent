@@ -446,7 +446,8 @@ public class PlanningLoop {
                             bad.withStatus(TaskNodeStatus.FAILED)
                                     .withError(acc.reason()));
                     settleNode(sessionId, "acceptance-" + bad.id() + "-" + snap.planVersion(),
-                            bad, NodeTerminalCommitPort.Result.FAILURE);
+                            bad, NodeTerminalCommitPort.Result.FAILURE,
+                            failureDetail(null, acc.reason(), userMessage));
                     FailureDiagnosis dx = recoveryEngine.diagnose(
                             bad, diagnoseTool(bad, ""), acc.reason());
                     try {
@@ -594,7 +595,8 @@ public class PlanningLoop {
                             DomainEventType.NODE_FAILED, action.actionId(), action.taskId(),
                             Map.of("reason", reason), null));
                     settleNode(sessionId, action.actionId(), node,
-                            NodeTerminalCommitPort.Result.FAILURE);
+                            NodeTerminalCommitPort.Result.FAILURE,
+                            failureDetail(step.lastErrorCode(), reason, userMessage));
                     FailureDiagnosis dx = recoveryEngine.diagnose(
                             node, diagnoseTool(node, step.lastTool()), reason,
                             step.lastErrorCode());
@@ -630,7 +632,9 @@ public class PlanningLoop {
                             "ev_" + UUID.randomUUID().toString().substring(0, 8),
                             DomainEventType.NODE_SUCCESS, action.actionId(), action.taskId(),
                             Map.of(), null));
-                    settleNode(sessionId, action.actionId(), node, NodeTerminalCommitPort.Result.SUCCESS);
+                    settleNode(sessionId, action.actionId(), node,
+                            NodeTerminalCommitPort.Result.SUCCESS,
+                            new NodeTerminalCommitPort.Detail(null, null, userMessage));
                 } else if (next == TaskNodeStatus.READY) {
                     g = g.replace(node.withStatus(TaskNodeStatus.READY).withError(""));
                 } else {
@@ -642,7 +646,9 @@ public class PlanningLoop {
                             "ev_" + UUID.randomUUID().toString().substring(0, 8),
                             DomainEventType.NODE_FAILED, action.actionId(), action.taskId(),
                             Map.of("reason", ev.reason()), null));
-                    settleNode(sessionId, action.actionId(), node, NodeTerminalCommitPort.Result.FAILURE);
+                    settleNode(sessionId, action.actionId(), node,
+                            NodeTerminalCommitPort.Result.FAILURE,
+                            failureDetail(step.lastErrorCode(), ev.reason(), userMessage));
                     FailureDiagnosis dx = recoveryEngine.diagnose(
                             node, diagnoseTool(node, step.lastTool()), ev.reason(),
                             step.lastErrorCode());
@@ -1611,7 +1617,8 @@ public class PlanningLoop {
      * 这是不能接受的耦合。失败只降级为 warn，图状态照常提交。</p>
      */
     private void settleNode(String sessionId, String actionId, TaskNode node,
-                            NodeTerminalCommitPort.Result result) {
+                            NodeTerminalCommitPort.Result result,
+                            NodeTerminalCommitPort.Detail detail) {
         if (nodeTerminalCommitPort == null || node == null
                 || node.procedureId() == null || node.procedureVersion() == null) {
             return;
@@ -1619,11 +1626,17 @@ public class PlanningLoop {
         try {
             nodeTerminalCommitPort.commit(sessionId,
                     com.miniagent.agent.core.TaskExecutionContext.currentTaskId(),
-                    actionId, node, result);
+                    actionId, node, result, detail);
         } catch (Exception e) {
             log.warn("Procedure 终态结算失败，不影响任务结果: session={}, node={}, procedure={}, version={}, err={}",
                     sessionId, node.id(), node.procedureId(), node.procedureVersion(), e.getMessage());
         }
+    }
+
+    private static NodeTerminalCommitPort.Detail failureDetail(ToolErrorCode code, String reason,
+                                                               String userMessage) {
+        String errorCode = code == null || code == ToolErrorCode.NONE ? null : code.name();
+        return new NodeTerminalCommitPort.Detail(errorCode, reason, userMessage);
     }
 
     private void recordToolOutcome(TaskNode node, boolean ok) {

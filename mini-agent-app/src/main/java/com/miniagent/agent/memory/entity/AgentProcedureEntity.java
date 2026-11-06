@@ -21,7 +21,8 @@ import java.time.LocalDateTime;
 @Table(name = "agent_procedures",
     indexes = {
         @Index(name = "idx_ap_scope", columnList = "scope_type, scope_id"),
-        @Index(name = "idx_ap_name", columnList = "name")
+        @Index(name = "idx_ap_name", columnList = "name"),
+        @Index(name = "idx_ap_cloud_item", columnList = "cloud_item_id")
     },
     uniqueConstraints = {
         @UniqueConstraint(name = "ux_ap_identity",
@@ -70,6 +71,14 @@ public class AgentProcedureEntity extends BaseMemoryEntity {
 
     @Column(name = "procedure_version", nullable = false)
     private Integer procedureVersion = 1;
+
+    /** memory-service 的条目 id。空表示还没和云端对上。 */
+    @Column(name = "cloud_item_id")
+    private Long cloudItemId;
+
+    /** 本地这行内容对应的云端修订号。云端升版后同步把它盖掉。 */
+    @Column(name = "cloud_revision_no")
+    private Integer cloudRevisionNo;
 
     @Column(name = "success_count", nullable = false)
     private Long successCount = 0L;
@@ -123,6 +132,12 @@ public class AgentProcedureEntity extends BaseMemoryEntity {
 
     public Integer getProcedureVersion() { return procedureVersion; }
     public void setProcedureVersion(Integer procedureVersion) { this.procedureVersion = procedureVersion; }
+
+    public Long getCloudItemId() { return cloudItemId; }
+    public void setCloudItemId(Long cloudItemId) { this.cloudItemId = cloudItemId; }
+
+    public Integer getCloudRevisionNo() { return cloudRevisionNo; }
+    public void setCloudRevisionNo(Integer cloudRevisionNo) { this.cloudRevisionNo = cloudRevisionNo; }
 
     public Long getSuccessCount() { return successCount; }
     public void setSuccessCount(Long successCount) { this.successCount = successCount; }

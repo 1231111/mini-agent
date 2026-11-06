@@ -3,7 +3,7 @@ package com.miniagent.agent.planner;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.task.TaskPlan;
-import com.miniagent.agent.llm.DedicatedChatModel;
+import com.miniagent.common.llm.DedicatedChatModel;
 import com.miniagent.agent.skill.SkillStore;
 import com.miniagent.agent.tool.CapabilityRegistry;
 import com.miniagent.common.model.EffectiveModelContext;
@@ -224,7 +224,8 @@ public class GoalCompiler {
     @Autowired(required = false)
     private ProcedurePromptPort procedurePromptPort;
 
-    void attachProcedurePromptPort(ProcedurePromptPort port) {
+    /** 显式指定 Procedure 来源；评估 worker 回放时用它注入待比较的那一版 SOP。 */
+    public void attachProcedurePromptPort(ProcedurePromptPort port) {
         this.procedurePromptPort = port;
     }
 
@@ -708,12 +709,12 @@ public class GoalCompiler {
                                         && java.util.Objects.equals(p.version(), requestedVersion))
                         .findFirst().orElse(null);
                 if (procedure != null) {
-                    node = node.withProcedure(procedure.procedureId(), procedure.version());
-                    node = node.withProcedureSnapshot(MAPPER.writeValueAsString(procedure))
-                            .withCanaryTargetPercent(procedure.canaryTargetPercent());
+                    node = node.withProcedure(procedure.procedureId(), procedure.version())
+                            .withProcedureSnapshot(MAPPER.writeValueAsString(procedure));
                     if (procedure.evolutionProposalId() != null) {
-                        node = node.withEvolutionCandidate(procedure.evolutionProposalId(),
-                                procedure.evolutionCandidateHash());
+                        node = node.withEvolutionAssignment(procedure.evolutionProposalId(),
+                                procedure.evolutionCandidateHash(), procedure.procedureVariant(),
+                                procedure.canaryTargetPercent());
                     }
                 }
             }

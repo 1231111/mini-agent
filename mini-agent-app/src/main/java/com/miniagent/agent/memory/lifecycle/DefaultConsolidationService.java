@@ -63,9 +63,6 @@ public class DefaultConsolidationService implements ConsolidationService {
     @Autowired
     private AgentEpisodeRepository episodeRepository;
 
-    @Autowired(required = false)
-    private com.miniagent.agent.memory.manager.FailureEvidenceOutboxService failureEvidenceOutboxService;
-
     @Autowired
     private AgentChatTaskLock episodeTaskLock;
 
@@ -171,21 +168,37 @@ public class DefaultConsolidationService implements ConsolidationService {
         if (extracted == null) {
             return;
         }
-        extracted.setId(existing != null ? existing.getId() : null);
+        AgentEpisodeEntity episodeToSave = extracted;
         if (existing != null) {
-            extracted.setId(existing.getId());
             extracted.setAccessCount(existing.getAccessCount());
             extracted.setLastAccessedAt(existing.getLastAccessedAt());
+            copyExtractedFields(extracted, existing);
+            episodeToSave = existing;
         }
 
+        AgentEpisodeEntity episode = episodeToSave;
         TransactionTemplate transaction = new TransactionTemplate(transactionManager);
         transaction.executeWithoutResult(status -> {
-            AgentEpisodeEntity saved = episodeRepository.save(extracted);
-            if (failureEvidenceOutboxService != null) {
-                failureEvidenceOutboxService.enqueue(saved);
-            }
+            episodeRepository.save(episode);
             eventRepository.markProcessed(unprocessed.stream().map(AgentEventEntity::getId).toList());
         });
+    }
+
+    private static void copyExtractedFields(AgentEpisodeEntity source, AgentEpisodeEntity target) {
+        target.setTenantId(source.getTenantId());
+        target.setUserId(source.getUserId());
+        target.setProjectId(source.getProjectId());
+        target.setSessionId(source.getSessionId());
+        target.setTaskId(source.getTaskId());
+        target.setTaskSummary(source.getTaskSummary());
+        target.setOutcome(source.getOutcome());
+        target.setFailureCode(source.getFailureCode());
+        target.setActionsJson(source.getActionsJson());
+        target.setObservationsJson(source.getObservationsJson());
+        target.setResolution(source.getResolution());
+        target.setImportance(source.getImportance());
+        target.setAccessCount(source.getAccessCount());
+        target.setLastAccessedAt(source.getLastAccessedAt());
     }
 
     private void doConsolidate(String tenantId, String sessionId) {

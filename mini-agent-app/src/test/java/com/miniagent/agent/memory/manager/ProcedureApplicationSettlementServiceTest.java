@@ -13,6 +13,7 @@ import com.miniagent.memory.port.ProcedureSettlementCommand;
 import com.miniagent.memory.port.ProcedureSettlementResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.SimpleTransactionStatus;
@@ -33,9 +34,12 @@ class ProcedureApplicationSettlementServiceTest {
     private final ProcedureRevisionService revisions = mock(ProcedureRevisionService.class);
     private final ProcedureApplicationSettlementService service =
             new ProcedureApplicationSettlementService(applications, procedures, txManager,
-                    governance, governanceProperties, revisions);
+                    governance, governanceProperties, revisions, mock(ObjectProvider.class));
     private final ProcedureNodeTerminalCommitAdapter adapter =
-            new ProcedureNodeTerminalCommitAdapter(service);
+            new ProcedureNodeTerminalCommitAdapter(service,
+                    mock(ObjectProvider.class),
+                    mock(ObjectProvider.class),
+                    mock(ObjectProvider.class));
 
     @BeforeEach
     void allowNestedTransaction() {

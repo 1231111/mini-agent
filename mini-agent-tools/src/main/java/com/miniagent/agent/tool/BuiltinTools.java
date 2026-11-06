@@ -94,9 +94,54 @@ public class BuiltinTools {
     private final ConcurrentHashMap<String, String> toolResultCache =
             new ConcurrentHashMap<>();
 
+    /**
+     * 读观察账本：本次用户消息内「模型看过哪个文件的哪个版本」。
+     *
+     * <h2>要解决的问题</h2>
+     *
+     * <p>{@code write_file} 的 overwrite 模式此前是<b>无条件覆盖</b>，唯一的拦截是
+     * 「用不到一半大小的短文本盖大文件」那条启发式。于是存在一条静默数据损坏路径：
+     * 模型 read_file 拿到内容 → 中间人（用户手动编辑、git 操作、其他工具）改了同一个文件
+     * → 模型基于旧内容 write_file → <b>别人的改动被无声回滚，没有任何报错</b>。</p>
+     *
+     * <p>{@link ToolConcurrencyPolicy} 的 {@code WRITE_BY_PATH} 锁解决不了这个：
+     * 它防的是「同一时刻两个写并发」，防不了「读了很久之后再写」—— 后者在时间维度上是空的。</p>
+     *
+     * <h2>为什么按内容指纹而不是按修改时间</h2>
+     *
+     * <p>Windows 上 {@code lastModifiedTime} 会因为云同步、杀毒软件扫描而变化，但内容没变；
+     * 反过来，同一秒内的两次写入时间戳可能完全相同，内容却变了。时间戳只能当快速路径，
+     * 判定必须落在内容上。所以这里存 SHA-256，每次比对现算。</p>
+     *
+     * <h2>为什么 edit_file 不拦</h2>
+     *
+     * <p>{@code edit_file} 靠 {@code old_string} 逐字符唯一匹配，本身就保证了「被编辑的那段没变」，
+     * 一致性强度不比整文件指纹弱。给它加整文件校验反而会误伤这条合法高频路径：
+     * <pre>read → edit(第1处) → edit(第2处)</pre>
+     * 第一次 edit 已经改了文件，第二次 edit 手上的观察立刻过期，正常连续的增量编辑会全被拒。
+     * 所以 edit_file 只<b>更新</b>账本，不做前置校验。</p>
+     *
+     * <p>key 用规范化后的绝对路径（{@code toRealPath()} 不可用时退回
+     * {@code toAbsolutePath().normalize()}）：模型可能用 {@code Foo.java}、
+     * {@code ./Foo.java}、{@code workspace/Foo.java}、绝对路径四种写法指向同一个文件，
+     * 按入参字符串记账会导致「读过但认不出来」。</p>
+     */
+    private final ConcurrentHashMap<String, ReadObservation> readObservations =
+            new ConcurrentHashMap<>();
+
+    /**
+     * 一次读取观察。{@code partial == true} 表示只读了文件的一部分，
+     * <b>不能</b>作为整文件覆盖的依据。
+     *
+     * @param digest SHA-256 十六进制
+     */
+    private record ReadObservation(String digest, boolean partial) {}
+
     /** 清空工具结果缓存（每条新用户消息开始时调用） */
     public void clearToolCache() {
         toolResultCache.clear();
+        // 读观察随缓存一起作废：新用户消息开始时，上一轮看到的文件版本不再可信。
+        readObservations.clear();
     }
 
     /**
@@ -116,6 +161,96 @@ public class BuiltinTools {
             String kn = k.replace('\\', '/');
             return kn.contains(norm) || (!StringUtils.isBlank(fileName) && kn.contains(fileName));
         });
+    }
+
+    // ==================== 读观察账本 ====================
+
+    /**
+     * 账本 key：规范化绝对路径。
+     *
+     * <p>{@code toRealPath()} 能解开符号链接与 junction（同一个文件的不同写法会归到同一个 key），
+     * 但要求文件已存在；写入前文件可能还不存在，此时退回词法规范化。</p>
+     */
+    private static String observationKey(Path target) {
+        try {
+            return target.toRealPath().toString();
+        } catch (Exception ignored) {
+            return target.toAbsolutePath().normalize().toString();
+        }
+    }
+
+    /** 现算文件内容 SHA-256（十六进制）。文件不存在返回空串。 */
+    private static String digestOf(Path target) {
+        if (!Files.isRegularFile(target)) {
+            return "";
+        }
+        try (var in = Files.newInputStream(target)) {
+            var md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                md.update(buf, 0, n);
+            }
+            return java.util.HexFormat.of().formatHex(md.digest());
+        } catch (Exception e) {
+            // 算不出来就不记账：宁可退化成「无观察」，也不要拿一个假指纹去误拦正确写入。
+            log.debug("计算内容指纹失败: {}", target, e);
+            return "";
+        }
+    }
+
+    /** 登记一次读取观察。{@code partial} 只读了一部分时置 true。 */
+    private void rememberRead(Path target, boolean partial) {
+        String digest = digestOf(target);
+        if (digest.isEmpty()) {
+            return;
+        }
+        readObservations.put(observationKey(target), new ReadObservation(digest, partial));
+    }
+
+    /**
+     * 写入成功后把账本更新成「写入后的内容」。
+     *
+     * <p>必须更新而不是删除：删除会让紧随其后的第二次写入变成「无观察」而被拒；
+     * 更新成新指纹才能让 {@code write → write}、{@code write → edit} 这类连续操作畅通。</p>
+     */
+    private void rememberWrite(Path target) {
+        String digest = digestOf(target);
+        if (digest.isEmpty()) {
+            return;
+        }
+        readObservations.put(observationKey(target), new ReadObservation(digest, false));
+    }
+
+    /**
+     * 整文件覆盖前的准入判定。
+     *
+     * @return {@code null} 表示允许覆盖；否则为可直接返回给模型的 CONFLICT JSON
+     */
+    private String checkOverwriteAllowed(Path target, String path, boolean force) {
+        if (force) {
+            return null;
+        }
+        ReadObservation observed = readObservations.get(observationKey(target));
+        if (observed == null) {
+            return errorJson(ToolErrorCode.CONFLICT,
+                    "拒绝覆盖未读取过的文件 " + path + "（该文件已存在）。"
+                            + "先 read_file 看清现有内容再决定怎么写；"
+                            + "如果确实要用当前内容整体替换，传 force=true。");
+        }
+        if (observed.partial()) {
+            return errorJson(ToolErrorCode.CONFLICT,
+                    "拒绝覆盖 " + path + "：上次只读取了它的一部分，不足以判断整体替换会丢掉什么。"
+                            + "请完整读一遍（不传 offset/limit），或传 force=true 明确承担覆盖风险。");
+        }
+        String current = digestOf(target);
+        if (!current.isEmpty() && !current.equals(observed.digest())) {
+            return errorJson(ToolErrorCode.CONFLICT,
+                    "拒绝覆盖 " + path + "：它在被读取之后已被修改（内容指纹不一致），"
+                            + "直接写回会静默回滚这些改动。请重新 read_file 拿到最新内容后重写；"
+                            + "若确认要用当前内容覆盖，传 force=true。");
+        }
+        return null;
     }
 
 
@@ -160,6 +295,9 @@ public class BuiltinTools {
                 "写入文件内容。新建文件用本工具；修改已存在的文件请改用 edit_file，不要用本工具重写整个文件。\n"
                         + "路径写文件名即可，落在 workspace 根下，如 design.md。"
                         + "子任务隔离目录仅在子 Agent 覆盖 workspace 时使用。\n"
+                        + "【覆盖前会校验】overwrite 一个已存在的文件时，工具会核对它现在的内容是否仍等于你读到的版本。"
+                        + "没读过、只读了片段、或读过之后被别人改过，都会被拒绝 —— 因为写回旧内容会静默回滚那些改动，且不会有任何报错。"
+                        + "被拒绝时的正确做法是重新 read_file 拿最新内容；只有用户明确要求整体覆盖才传 force=true。\n"
                         + "返回值里若带 url 字段（图片类：svg/png/jpg/gif/webp），说明该图可以显示在对话里 —— "
                         + "回复时请原样用 ![说明](url)，不要改写成相对路径或本地绝对路径，"
                         + "工作区没有静态资源映射，只有这个 url 能加载。\n"
@@ -170,7 +308,8 @@ public class BuiltinTools {
                     if (Objects.isNull(params.getContent())) {
                         return "{\"error\":\"缺少 content 参数（或参数被截断）。大文件请分块写入：首次 mode=overwrite，后续 mode=append。\"}";
                     }
-                    return writeFile(params.getPath(), params.getContent(), params.isAppendMode());
+                    return writeFile(params.getPath(), params.getContent(),
+                            params.isAppendMode(), params.isForce());
                 });
 
         registry.register("list_files", "列出目录文件",
@@ -407,6 +546,8 @@ public class BuiltinTools {
 
             Files.writeString(target, updated, StandardCharsets.UTF_8);
             invalidateReadCache(path);
+            // 更新（不是清空）读观察：让 read → edit → edit 这类连续增量编辑继续放行。
+            rememberWrite(target);
             int replaced = replaceAll ? occurrences : 1;
             log.info("文件已编辑: {}（替换 {} 处）", target.toAbsolutePath(), replaced);
             return "{\"success\":true,\"path\":\"" + target.toString().replace("\\", "/")
@@ -495,7 +636,7 @@ public class BuiltinTools {
 
     private void registerExecTool() {
         // 这里刻意不再读 agent.tools.exec-enabled / exec-policy 来打"免批还是需批"的日志：
-        // 策略的真正裁决点是 ExecPolicyService（mini-agent-loop），
+        // 策略的真正裁决点是 ExecPolicyService（mini-agent-planner），
         // 它已经在自己启动时打过 "exec_command 策略: 全局默认 = ..."。
         // 在 tools 模块再解析一遍配置就会出现两份解析逻辑，正是漂移的来源。
         // 而且 tools 依赖 common、不依赖 loop（反向依赖会成环），本来就拿不到那个服务。
@@ -600,9 +741,14 @@ public class BuiltinTools {
                         return text;
                     }
                     String chunk = append ? "\n\n" + text : text;
-                    String written = writeFile(path, chunk, append);
+                    // 工具自有产物（默认 _source.md / 内部镜像 notes.md）跳过一致性校验：
+                    // 内容是刚抽取出来的，不存在「写回陈旧内容」这回事，重抽同页要能直接覆盖。
+                    // 模型显式指定的其他路径仍走校验 —— 那里确实可能覆盖到用户的项目文件。
+                    boolean toolOwnedArtifact = StringUtils.isBlank(params.getPath())
+                            || pathFileName(path).equalsIgnoreCase("_source.md");
+                    String written = writeFile(path, chunk, append, toolOwnedArtifact);
                     if (!append && pathFileName(path).equalsIgnoreCase("_source.md")) {
-                        writeFile("notes.md", chunk, false);
+                        writeFile("notes.md", chunk, false, true);
                     }
                     return written;
                 });
@@ -873,6 +1019,7 @@ public class BuiltinTools {
             StringBuilder sb = new StringBuilder();
             int lineNo = 0;
             int written = 0;
+            boolean hitLimit = false;
             try (var reader = Files.newBufferedReader(target, StandardCharsets.UTF_8)) {
                 String line;
                 while ((line = readLineCapped(reader, READ_LINE_CAP)) != null) {
@@ -881,12 +1028,16 @@ public class BuiltinTools {
                         continue;
                     }
                     if (written >= maxLines) {
+                        // 行数上限截断：文件后面还有内容没读，这条观察不能当整文件依据。
+                        hitLimit = true;
                         break;
                     }
                     sb.append(lineNo).append('|').append(line).append('\n');
                     written++;
                 }
             }
+            // 登记读观察：只有「从头读完、未被行数截断」才算整文件观察。
+            rememberRead(target, from > 1 || hitLimit);
             if (written == 0 && lineNo > 0 && from > lineNo) {
                 return "{\"error\":\"起始行 " + offset + " 超出文件末尾，该文件共 "
                         + lineNo + " 行\"}";
@@ -1000,10 +1151,14 @@ public class BuiltinTools {
     }
 
     private String writeFile(String path, String content) {
-        return writeFile(path, content, false);
+        return writeFile(path, content, false, false);
     }
 
     private String writeFile(String path, String content, boolean append) {
+        return writeFile(path, content, append, false);
+    }
+
+    private String writeFile(String path, String content, boolean append, boolean force) {
         try {
             // 如果 path 只是文件名（无目录分隔符），默认写到 workspace 根；
             // 子 Agent 通过 WorkspaceContext.taskOverride 隔离。
@@ -1017,6 +1172,12 @@ public class BuiltinTools {
                         java.nio.file.StandardOpenOption.CREATE,
                         java.nio.file.StandardOpenOption.APPEND);
             } else if (Files.exists(target)) {
+                // 先过一致性闸门：覆盖一个「没读过」或「读过之后又被改过」的文件，
+                // 会把别人的改动静默回滚掉。append 不需要（它不丢内容）。
+                String refusal = checkOverwriteAllowed(target, path, force);
+                if (Objects.nonNull(refusal)) {
+                    return refusal;
+                }
                 long existing = Files.size(target);
                 long incoming = finalContent.getBytes(StandardCharsets.UTF_8).length;
                 if (existing >= KEEP_LARGE_FILE_MIN_BYTES && incoming * 2 < existing) {
@@ -1030,6 +1191,7 @@ public class BuiltinTools {
                 Files.writeString(target, finalContent, StandardCharsets.UTF_8);
             }
             invalidateReadCache(path);
+            rememberWrite(target);
             long totalBytes = Files.size(target);
             log.info("文件已{}: {} (本次 {} 字符, 当前共 {} 字节)",
                     append ? "追加" : "写入", target.toAbsolutePath(), finalContent.length(), totalBytes);

@@ -96,6 +96,24 @@ langchain4j:
       sendThinking: false
 
 # Agent 配置
+memory:
+  service:
+    security:
+      # App 仅需装配该配置类型；独立 memory-service 的写接口仍由自身 profile 暴露。
+      internal-key: ${MEMORY_SERVICE_INTERNAL_KEY:}
+      runner-key: ${MEMORY_SERVICE_RUNNER_KEY:}
+      router-key: ${MEMORY_SERVICE_ROUTER_KEY:}
+      attestation-max-age-seconds: ${MEMORY_SERVICE_ATTESTATION_MAX_AGE_SECONDS:300}
+  evolution:
+    # App 作为执行侧依赖该配置类型；自动演进决策仍由独立 memory-service 发起。
+    enabled: ${MEMORY_EVOLUTION_ENABLED:false}
+    minimum-samples: ${MEMORY_EVOLUTION_MINIMUM_SAMPLES:20}
+    maximum-baseline-failure-rate: ${MEMORY_EVOLUTION_MAX_BASELINE_FAILURE_RATE:0.5}
+    minimum-improvement: ${MEMORY_EVOLUTION_MINIMUM_IMPROVEMENT:0.05}
+    canary-percent: ${MEMORY_EVOLUTION_CANARY_PERCENT:5}
+    minimum-canary-samples: ${MEMORY_EVOLUTION_MINIMUM_CANARY_SAMPLES:100}
+    rollback-failure-rate: ${MEMORY_EVOLUTION_ROLLBACK_FAILURE_RATE:0.25}
+
 agent:
   # 统一数据根（记忆/媒体/skills/workspace）。可用环境变量 MINI_AGENT_HOME 覆盖。
   # 默认：{user.home}/.miniagent ，不再写入项目仓库旁路目录。
@@ -120,22 +138,21 @@ agent:
     # db=多副本真相源（agent_user_memory）；file=仅本地目录
     storage: db
     service:
-      # local：桌面端默认同进程 H2/MySQL；remote：服务器 Agent 调用独立记忆服务。
+      # 本地记忆保持可用；配置 memory-service 地址后，云端访问使用 Account 签发的用户凭证。
       mode: ${MEMORY_SERVICE_MODE:local}
+      sync-interval-ms: ${MEMORY_SERVICE_SYNC_INTERVAL_MS:15000}
       base-url: ${MEMORY_SERVICE_BASE_URL:}
-      internal-key: ${MEMORY_SERVICE_INTERNAL_KEY:}
       connect-timeout-ms: ${MEMORY_SERVICE_CONNECT_TIMEOUT_MS:3000}
       read-timeout-ms: ${MEMORY_SERVICE_READ_TIMEOUT_MS:10000}
+      # 云端读超时。规划只读本库。
+      context-timeout-ms: ${MEMORY_SERVICE_CONTEXT_TIMEOUT_MS:300}
+      fallback-ttl-hours: ${MEMORY_SERVICE_FALLBACK_TTL_HOURS:6}
+      # 结果事件携带的环境版本；换规划模型/工具 schema 时由运维改并登记到 memory-service。
+      env-version: ${MEMORY_SERVICE_ENV_VERSION:}
+    outcome-outbox:
+      interval-ms: ${MEMORY_OUTCOME_OUTBOX_INTERVAL_MS:2000}
+      batch-size: ${MEMORY_OUTCOME_OUTBOX_BATCH_SIZE:500}
     procedure:
-      # 仅在独立 memory-service 的 Canary 清单可用时启用执行端分流；默认关闭。
-      # 开启前必须具备稳定 owner/task 上下文、可取回的候选快照和终态 observation 投递。
-      evolution-routing-enabled: ${MEMORY_PROCEDURE_EVOLUTION_ROUTING_ENABLED:false}
-      # remote 模式下把 SOP 版本投影到独立记忆服务的投递节奏（local 模式不启用）。
-      # 投递失败按指数退避，10 次后留在 FAILED 等人工核对。
-      outbox:
-        interval-ms: ${MEMORY_PROCEDURE_OUTBOX_INTERVAL_MS:5000}
-      evolution-outbox:
-        interval-ms: ${MEMORY_EVOLUTION_OUTBOX_INTERVAL_MS:5000}
       governance:
         enabled: true
         # 至少有 10 个终态结算样本才判定，避免单次/少数失败被噪声触发

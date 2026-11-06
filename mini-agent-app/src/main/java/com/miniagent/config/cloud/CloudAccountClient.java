@@ -28,10 +28,8 @@ import java.util.Map;
  * {@code POST /api/users}。这两条路径与云端 agent 自己的同名端点<b>刻意一致</b>：
  * 切换"账号逻辑在本地"与"账号逻辑在账号服务"时只换 base-url，调用方一行都不用改。
  *
- * <p>账号服务不签发 token（见其 {@code AccountApplication} 的说明），响应里也没有 token 字段。
- * 这不是缺项：token 由收到用户请求的那一侧自己签 —— 客户机本地后端签本地会话，
- * 云端 agent 签它自己的。好处是 HS256 密钥不必在两个服务之间同步。
- * 本类因此只回答"这个用户名+密码对应哪个身份"。
+ * <p>账号服务返回 Account 身份和专供 memory-service 使用的 memory access token；
+ * 本地会话仍由桌面端本地后端独立管理。本类负责解析账号身份与云端记忆凭证。
  *
  * <h3>两个必须做对的地方</h3>
  *
@@ -105,6 +103,29 @@ public class CloudAccountClient {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("ticket", ticket);
         return call("/api/desktop-tickets/redeem", body);
+    }
+
+    public CloudUser refreshMemoryCredential(String refreshCredential) {
+        if (!configured()) {
+            throw new CloudAccountException(ErrorCode.AUTH_CLOUD_NOT_CONFIGURED, null);
+        }
+        if (refreshCredential == null || refreshCredential.isBlank()) {
+            throw new CloudAccountException(ErrorCode.AUTH_NOT_AUTHENTICATED, "缺少记忆服务续期凭证");
+        }
+        Map<String, Object> body = Map.of("refreshCredential", refreshCredential);
+        byte[] raw;
+        try {
+            raw = client.post().uri(baseUrl + "/internal/oauth/refresh")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(body).retrieve().body(byte[].class);
+        } catch (ResourceAccessException e) {
+            throw new CloudAccountException(ErrorCode.AUTH_CLOUD_UNREACHABLE,
+                    "无法连接云端账号服务", e);
+        } catch (RestClientResponseException e) {
+            throw new CloudAccountException(ErrorCode.AUTH_CLOUD_REJECTED,
+                    "云端账号服务拒绝记忆凭证续期（HTTP " + e.getStatusCode().value() + "）", e);
+        }
+        return parse(raw == null ? "" : new String(raw, StandardCharsets.UTF_8));
     }
 
     /**
@@ -233,7 +254,15 @@ public class CloudAccountClient {
                     "云端账号服务响应缺少 data.username");
         }
 
-        return new CloudUser(externalId, username, text(data, "displayName"), text(data, "role"));
+        String cloudTenantId = text(data, "tenantId");
+        String memoryToken = text(data, "memoryToken");
+        String memoryRefreshCredential = text(data, "memoryRefreshCredential");
+        if (cloudTenantId == null || memoryToken == null || memoryRefreshCredential == null) {
+            throw new CloudAccountException(ErrorCode.AUTH_CLOUD_INVALID_RESPONSE,
+                    "云端账号服务响应缺少云端租户或记忆访问凭证");
+        }
+        return new CloudUser(externalId, username, text(data, "displayName"), text(data, "role"),
+                cloudTenantId, memoryToken, memoryRefreshCredential);
     }
 
     private static String text(JsonNode node, String field) {

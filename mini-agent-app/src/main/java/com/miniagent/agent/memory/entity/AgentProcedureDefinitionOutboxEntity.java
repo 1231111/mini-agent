@@ -74,6 +74,15 @@ public class AgentProcedureDefinitionOutboxEntity extends BaseMemoryEntity {
     @Column(name = "last_error", length = 1000)
     private String lastError;
 
+    @Column(name = "evolution_proposal_id")
+    private Long evolutionProposalId;
+
+    @Column(name = "evolution_operation", length = 16)
+    private String evolutionOperation;
+
+    @Column(name = "evolution_candidate_hash", length = 64)
+    private String evolutionCandidateHash;
+
     public enum Status { PENDING, PROCESSING, DONE, FAILED }
 
     public Long getId() { return id; }
@@ -113,4 +122,10 @@ public class AgentProcedureDefinitionOutboxEntity extends BaseMemoryEntity {
     public void setNextAttemptAt(java.time.LocalDateTime nextAttemptAt) { this.nextAttemptAt = nextAttemptAt; }
     public String getLastError() { return lastError; }
     public void setLastError(String lastError) { this.lastError = lastError; }
+    public Long getEvolutionProposalId() { return evolutionProposalId; }
+    public void setEvolutionProposalId(Long evolutionProposalId) { this.evolutionProposalId = evolutionProposalId; }
+    public String getEvolutionOperation() { return evolutionOperation; }
+    public void setEvolutionOperation(String evolutionOperation) { this.evolutionOperation = evolutionOperation; }
+    public String getEvolutionCandidateHash() { return evolutionCandidateHash; }
+    public void setEvolutionCandidateHash(String evolutionCandidateHash) { this.evolutionCandidateHash = evolutionCandidateHash; }
 }
