@@ -43,8 +43,10 @@ services:
       DB_URL: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
       DB_USERNAME: root
       DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 必须显式设置}
-      ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:?ACCOUNT_INTERNAL_KEY 必须显式设置}
-      ACCOUNT_MEMORY_TOKEN_KEY: ${ACCOUNT_MEMORY_TOKEN_KEY:?ACCOUNT_MEMORY_TOKEN_KEY 必须显式设置（32 字节随机密钥的 Base64）}
+      # ACCOUNT_INTERNAL_KEY / ACCOUNT_MEMORY_TOKEN_KEY 不再从环境注入：
+      # 两者在内置 application.yml 里已有默认值，注入空值反而会覆盖默认值
+      # （Spring 的 ${VAR:default} 在 VAR 存在但为空时取空串，不走 default）。
+      # 要轮换密钥就改 yml 并同时更新 account 与 memory-service。
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8081/actuator/health"]
       interval: 15s

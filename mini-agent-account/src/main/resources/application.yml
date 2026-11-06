@@ -85,5 +85,12 @@ agent:
     # 所以它没有"用户会话"这个概念。会员查询的鉴权由调用方完成 ——
     # 云端 agent 或客户机本地后端先验掉用户的 token，再带这个密钥转发过来。
     # 留空则不启用会员接口（返回 503 并在启动时 WARN），不会静默地变成无鉴权。
-    internal-key: ${ACCOUNT_INTERNAL_KEY:}
-    memory-token-key: ${ACCOUNT_MEMORY_TOKEN_KEY:}
+    internal-key: ${ACCOUNT_INTERNAL_KEY:gMPzIKw7wTtIZOhGibpoAGkdzzXYbsEEfhUVDg0Tb1w=}
+
+    # 记忆访问令牌的 AES-256 密钥：本服务用它加密 ma1. 令牌，memory-service 用它解密校验。
+    # 两边必须完全一致（见 mini-agent-memory-service 的同名配置项）。
+    #
+    # 这里给了内置默认值，目的是让容器"零环境变量"也能起来。代价是这把密钥进入了
+    # 版本库 —— 能读仓库的人可以伪造任意 tenantId 的令牌。要收紧就换掉本行、改用
+    # ACCOUNT_MEMORY_TOKEN_KEY 注入，并确认两个服务同时更新（换密钥会让已签发令牌失效）。
+    memory-token-key: ${ACCOUNT_MEMORY_TOKEN_KEY:mMdxSRXpWYc8ApX3ejLKFsxzUN0ZBMW5GkE7Rjv5QmI=}

@@ -32,8 +32,10 @@ memory:
     # api：只提供 HTTP（测试默认，避免抢评估作业）。worker / all：升级并进程内回放。compose 设 all。
     role: ${MEMORY_SERVICE_ROLE:api}
     account-base-url: ${ACCOUNT_BASE_URL:}
-    account-internal-key: ${ACCOUNT_INTERNAL_KEY:}
-    memory-token-key: ${ACCOUNT_MEMORY_TOKEN_KEY:}
+    account-internal-key: ${ACCOUNT_INTERNAL_KEY:gMPzIKw7wTtIZOhGibpoAGkdzzXYbsEEfhUVDg0Tb1w=}
+    # 必须与 mini-agent-account 的 agent.account.memory-token-key 完全一致：
+    # Account 用它加密 ma1. 令牌，这里用它解密（Account 不可达时的离线校验路径）。
+    memory-token-key: ${ACCOUNT_MEMORY_TOKEN_KEY:mMdxSRXpWYc8ApX3ejLKFsxzUN0ZBMW5GkE7Rjv5QmI=}
     account-connect-timeout-ms: ${ACCOUNT_CONNECT_TIMEOUT_MS:1500}
     account-read-timeout-ms: ${ACCOUNT_READ_TIMEOUT_MS:2500}
     issuers:

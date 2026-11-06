@@ -47,8 +47,8 @@ services:
       DB_USERNAME: root
       DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 必须显式设置}
       ACCOUNT_BASE_URL: http://account:8081
-      ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:?ACCOUNT_INTERNAL_KEY 必须显式设置}
-      ACCOUNT_MEMORY_TOKEN_KEY: ${ACCOUNT_MEMORY_TOKEN_KEY:?ACCOUNT_MEMORY_TOKEN_KEY 必须显式设置（32 字节随机密钥的 Base64）}
+      # 内部密钥与记忆令牌密钥由两个服务的 application.yml 内置默认值提供（两者必须一致）。
+      # 这里不再注入：注入空串会覆盖 yml 默认值，导致启动校验失败。
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_MODEL: ${LLM_MODEL:-}
@@ -81,10 +81,9 @@ services:
       DB_URL: jdbc:mysql://mysql:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
       DB_USERNAME: root
       DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 必须显式设置（不要使用仓库示例值）}
-      # 服务间密钥必须显式设置；缺失时拒绝启动，避免部署看似健康但会员
-      # 端点退化为未认证的故障路径。
-      ACCOUNT_INTERNAL_KEY: ${ACCOUNT_INTERNAL_KEY:?ACCOUNT_INTERNAL_KEY 必须显式设置}
-      ACCOUNT_MEMORY_TOKEN_KEY: ${ACCOUNT_MEMORY_TOKEN_KEY:?ACCOUNT_MEMORY_TOKEN_KEY 必须显式设置（32 字节随机密钥的 Base64）}
+      # ACCOUNT_INTERNAL_KEY / ACCOUNT_MEMORY_TOKEN_KEY 由 application.yml 内置默认值提供。
+      # 不在这里注入：注入空串会覆盖默认值（Spring 的 ${VAR:default} 在 VAR 存在但为空时
+      # 取空串），而注入真实值等于把密钥再写一份到编排文件里。
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8081/actuator/health"]
       interval: 15s
