@@ -593,6 +593,30 @@ function revealAppChrome() {
   }
 }
 
+/**
+ * 载入后端首页。
+ *
+ * 未登录时 chat.html 在 <head> 里立刻执行 location.replace('/login')，原始导航被取消，
+ * Electron 的 loadURL 会以 ERR_ABORTED (-3) 拒绝。它表示「页面自己跳走了」，不是加载失败：
+ * 后端与登录页都是好的，把它当失败会让启动流程弹出「后端启动失败」。
+ *
+ * 所以只在「确实被中止」且「当前地址仍在本机后端名下」时放过；真正的连接拒绝
+ * （ERR_CONNECTION_REFUSED 等）仍然向上抛，不会被这条规则吞掉。
+ */
+async function loadAppPage() {
+  try {
+    await mainWindow.loadURL(`${getApiBase()}/`);
+  } catch (e) {
+    const message = String((e && e.message) || e);
+    const current = mainWindow && !mainWindow.isDestroyed()
+      ? mainWindow.webContents.getURL() : '';
+    if (/ERR_ABORTED/.test(message) && current.startsWith(getApiBase())) {
+      return;
+    }
+    throw e;
+  }
+}
+
 async function openAppAfterBurst() {
   const burst = waitForCraneBurst();
   pushBootStage('ready', '服务已就绪');
@@ -605,7 +629,7 @@ async function openAppAfterBurst() {
     await animateBounds(launchBounds, BOOT_EXPAND_MS);
   }
   bootPresenting = false;
-  await mainWindow.loadURL(`${getApiBase()}/`);
+  await loadAppPage();
 }
 
 function createWindow() {
@@ -1057,7 +1081,7 @@ async function completeDesktopLogin(ticket) {
   // token 的真相源已经是磁盘那份，页面加载时由 preload 自己读出来，
   // 少一条「把凭证注入页面」的通路。
   try {
-    await mainWindow.loadURL(`${getApiBase()}/`);
+    await loadAppPage();
   } catch (e) {
     dialog.showErrorBox('登录失败', e.message || String(e));
   }
