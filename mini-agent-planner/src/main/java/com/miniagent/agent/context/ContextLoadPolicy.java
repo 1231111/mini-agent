@@ -5,12 +5,14 @@ import com.miniagent.memory.model.MemoryReadPolicy;
 /**
  * 本轮上下文加载策略。
  *
- * <p>判据只有一个运行时事实：这个会话里是否还有被挂起的 todo 清单。
- * 有 → 续跑，把清单捞回来；没有 → 释放上一任务的清单，按新任务加载。
- * 不再根据用户消息里命中了哪些词来决定。</p>
+ * <p>这里<b>不再决定「要不要挂起/恢复任务清单」</b>。清单归属于任务，由
+ * {@code TaskTodoStore} 与 {@code TaskScopeRegistry} 管；一旦本类也参与搬迁，
+ * 就必须回答「这一轮算不算换任务」，而那是一个只能靠猜的问题 ——
+ * 之前的实现用「会话里有没有被挂起的清单」当判据，条件一旦成立就恒成立，
+ * 于是每一轮都把旧清单捞回来，新任务被上一个任务接管。</p>
  *
- * <p>具体条数由 {@link ContextLoader} 按配置与 {@link ContextReferenceDecision} 覆盖；
- * 指代场景下历史为相关度精捞上限，而非盲目最近 N 条。</p>
+ * <p>现在本类只回答一个问题：<b>这一轮要加载多少历史、开哪些记忆通道</b>。
+ * 任务边界与清单归属不在这里，见 {@link ContextLoader#load}。</p>
  *
  * <p>历史条数这里只放兜底值，且不允许是 0：0 会让 {@code selectHistory} 直接返回空，
  * 模型看不到上一轮在做什么，跨轮追问必然答错。这个下限必须由策略本身守住。</p>
@@ -24,37 +26,30 @@ public record ContextLoadPolicy(
         boolean injectMemory,
         boolean injectUser,
         int userMaxChars,
-        boolean injectSkills,
-        boolean suspendActiveTodo,
-        boolean resumeSuspendedTodo
+        boolean injectSkills
 ) {
 
-    /** 续跑：把挂起的任务清单捞回来，其余全开。 */
-    private static final ContextLoadPolicy CONTINUE = new ContextLoadPolicy(
-            -1, true, true, true, 0, true, false, true);
-
     /**
-     * 新任务：释放上一任务的活动计划，避免新请求被旧清单劫持。
+     * 默认策略：不裁剪历史（-1），四个注入通道全开。
      *
-     * <p>未完成 → 挂起，下轮若判定为续跑会捞回；已完成/已取消 → 归档清空，
-     * 不再注入、不再推 UI。等确认的计划不走这里
-     * （{@code ContextLoader} 在 awaiting_confirm 时跳过）。</p>
+     * <p>之前有 CONTINUE / ACTION 两个常量，区别只在「挂起还是恢复清单」；
+     * 那两个动作已经删掉，剩下的取值完全相同，所以合并成一个。</p>
      */
-    private static final ContextLoadPolicy ACTION = new ContextLoadPolicy(
-            -1, true, true, true, 0, true, true, false);
+    private static final ContextLoadPolicy DEFAULTS = new ContextLoadPolicy(
+            -1, true, true, true, 0, true);
 
-    public static ContextLoadPolicy forSuspendedTodo(boolean hasSuspendedTodo) {
-        return hasSuspendedTodo ? CONTINUE : ACTION;
+    public static ContextLoadPolicy defaults() {
+        return DEFAULTS;
     }
 
     public ContextLoadPolicy withHistoryMaxMessages(int n) {
         return new ContextLoadPolicy(n, injectTodo, injectMemory, injectUser,
-                userMaxChars, injectSkills, suspendActiveTodo, resumeSuspendedTodo);
+                userMaxChars, injectSkills);
     }
 
     public ContextLoadPolicy withInjectMemory(boolean v) {
         return new ContextLoadPolicy(historyMaxMessages, injectTodo, v, injectUser,
-                userMaxChars, injectSkills, suspendActiveTodo, resumeSuspendedTodo);
+                userMaxChars, injectSkills);
     }
 
     /**

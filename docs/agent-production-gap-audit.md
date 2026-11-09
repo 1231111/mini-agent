@@ -901,3 +901,85 @@ V9~V13 本来就是这套写法（传 `connection.getSchema()`），V15 之后�
 - `DesktopHealthGroupTest`（3 项）：统一档确实含 redis（说明覆盖有必要）、
   桌面档 readiness 不含 redis、桌面档 redis indicator 仍为 false。
 - 连同 `TracePageNavigationTest`(3) 与 `CloudAccountClientRetryTest`(4) 共 13 项全过。
+
+---
+
+## TODO-01 新任务带上一个任务的执行计划（2026-11-09 修复）
+
+### 表现
+
+同一会话里，上一轮是"查北京→郑州航班"（清单 3 条、0/3 未完成），
+下一条消息是"把招标功能做成静态交互 UI"。UI 在新消息下方画出**航班那 3 条**
+待办，模型正文却是对的。截图见会话记录。
+
+### 代码机制
+
+`AgentSessionTodo` 一个会话**一行**，行里两个字段：`active_json`（当前清单）、
+`suspended_json`（上一份清单）。因为只有一个槽位，代码用
+`TaskTodoStore.suspendActive()` / `resumeSuspended()` 在两个字段之间搬清单。
+
+搬之前的判据只有一句（`ContextLoadPolicy.forSuspendedTodo`）：
+
+```java
+hasSuspendedTodo = taskTodoStore.hasSuspended(sessionId);
+return hasSuspendedTodo ? CONTINUE : ACTION;   // CONTINUE: suspend=false, resume=true
+```
+
+`hasSuspended` 回答的是"库里有没有残留的挂起清单"，不是"用户这轮要续跑"。
+这个条件一旦成立就恒成立，于是**每一轮 CONTEXT_LOAD 都执行 `resumeSuspended`**，
+把旧清单捞回 active。`resumeSuspended` 的规则又是"active 为空就恢复"，
+所以只要模型这一轮没调 `task.set`，旧清单就成了"当前任务清单"，
+并被 `publishTodoUi` 推给前端。
+
+同一个原因还导致第二个症状：清单永远 `pending`（没有任何代码在执行结束时收口），
+`allTerminal()` 恒 false，`suspendActive()` 只能走"挂起"分支，
+`suspended_json` 长期非空 → 恒续跑。
+
+### 影响
+
+- 提示词被污染：`TaskTodoStore.render` 把旧清单当"当前任务计划"注入 system prompt；
+- 任务边界判错：`resumed=true` → `TaskBoundary.RESUME`，`scopeKey` 换成旧任务的键，
+  规划图/压缩摘要按错误的 taskId 取；
+- UI 与真实工作不一致。
+
+### 修法（本轮）
+
+**删掉"挂起 / 恢复"这套推测机制，任务边界只由客观状态推进。**
+
+- `TaskTodoStore`：删除 `suspendActive` / `resumeSuspended` / `hasSuspended` /
+  `suspendedJson` / `.suspended.json`；新增 `hasOnlyTerminal(sessionId)` 与
+  `archiveActive(sessionId)`（只在全部 `completed`/`cancelled` 时清空）；
+  `persist` 恒写 `suspendedJson=null`（列保留，避免再加迁移）。
+- `ContextLoadPolicy`：删除 `suspendActiveTodo` / `resumeSuspendedTodo` /
+  `forSuspendedTodo`，收敛为 `defaults()`；本类只负责历史条数与注入通道。
+- `ContextLoader.load`：`awaiting_confirm` → 不动；`hasOnlyTerminal` → `NEW`
+  （reason=`prev-plan-terminal`）+ 归档；其余一律 `SAME`。
+  未完成清单**留在原地**，换任务由模型显式 `task.clear` / `task.set` 表达。
+- `ContextLoader` 的 `CONTEXT_LOAD` 事件字段：`todoSuspended`/`todoResumed`
+  替换为 `todoArchived`。
+- `TaskTodoStore.render` 增加硬约束：本轮目标与清单不符时必须先
+  `todo action=clear` 或 `action=set`，不得沿用旧清单。
+
+### 不变量
+
+1. 框架**不判断**"这一轮算不算新任务"——没有正则、没有附件启发式。
+2. 未完成清单不搬家、不自动恢复。
+3. `TaskBoundary.RESUME` 保留枚举，但当前没有任何代码自动触发它；
+   要接"接着做"必须先有模型显式入口（`task.resume`）。
+
+### 验证
+
+- `TaskTodoConfirmTest`（10 项）：全终态才归档；未完成原地保留；
+  空清单不算终态；**遗留 `suspended_json` 不复活**；`save` 恒写 `suspended=null`。
+- `ContextLoadPolicyTest`（4）、`ContextLoaderPolicyTest`（4）、
+  `ContextContributorConfigurationTest`（5）、`MemoryControlPlaneVerifyTest`（5）、
+  `TaskScopeRegistryTest`（12）全过。
+- planner 模块全量 **364 项全绿**。
+
+### 仍未收口
+
+- 清单仍按 `sessionId` 一个槽位存，未按 `scopeKey` 分键。因此"上一任务未完成、
+  用户直接换话题"这一档，清单仍会留在当前任务里 —— 现在靠 `render` 的硬约束
+  要求模型显式换清单，属于"表达权交给模型"，不是框架猜。
+  彻底隔离需要 `TodoItem` 增加 `taskId` 归属（第二步）。
+- `task.resume` 未实现，中断任务无法由模型显式恢复。

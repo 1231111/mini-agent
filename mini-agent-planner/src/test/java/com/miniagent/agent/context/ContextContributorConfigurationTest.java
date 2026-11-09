@@ -26,7 +26,7 @@ class ContextContributorConfigurationTest {
 
     private static ContextBuildContext ctx(boolean hasMedia, boolean fullAuto) {
         return new ContextBuildContext("s-1", "这不对吧",
-                ContextLoadPolicy.forSuspendedTodo(false), Set.of(), null, hasMedia, fullAuto);
+                ContextLoadPolicy.defaults(), Set.of(), null, hasMedia, fullAuto);
     }
 
     /**

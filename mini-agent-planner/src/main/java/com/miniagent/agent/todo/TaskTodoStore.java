@@ -76,8 +76,6 @@ public class TaskTodoStore {
     }
 
     private final Map<String, List<TodoItem>> todos = new ConcurrentHashMap<>();
-    /** 挂起计划 JSON（DB 模式缓存；每次 ensureLoaded 从持久化刷新） */
-    private final Map<String, String> suspendedJson = new ConcurrentHashMap<>();
     /** 文件 mtime：仅 file 回退模式 */
     private final Map<String, Long> fileMtimes = new ConcurrentHashMap<>();
     private final Path persistDir;
@@ -904,7 +902,6 @@ public class TaskTodoStore {
     public synchronized void clear(String sessionId) {
         String key = safeKey(sessionId);
         todos.remove(key);
-        suspendedJson.remove(key);
         fileMtimes.remove(key);
         if (useDb()) {
             try {
@@ -916,40 +913,49 @@ public class TaskTodoStore {
         }
         try {
             Files.deleteIfExists(persistFile(key));
-            Files.deleteIfExists(suspendedFile(key));
         } catch (Exception e) {
             log.warn("删除 todo 文件失败: {}", e.getMessage());
         }
     }
 
     /**
-     * 释放当前活动计划：未完成则挂起（可「继续」恢复）；已终态则归档清空。
-     * 新动手轮必须走这里，否则已完成清单仍会被注入 prompt 并推到 UI。
+     * 当前清单是否「存在且全部终态」。
+     *
+     * <p>这是任务结束的唯一客观信号：库里查一下就能确认，不涉及对用户消息的任何解读。
+     * 空清单<b>不算</b>终态 —— 空只说明这个任务还没列过计划，
+     * 若把它当终态，每轮都会白白推进一个新任务号。</p>
      */
-    public synchronized boolean suspendActive(String sessionId) {
+    public synchronized boolean hasOnlyTerminal(String sessionId) {
         String key = safeKey(sessionId);
         ensureLoaded(key);
         List<TodoItem> list = todos.get(key);
         if (list == null || list.isEmpty()) {
             return false;
         }
-        if (allTerminal(list)) {
-            todos.put(key, new ArrayList<>());
-            persist(key, List.of());
-            log.info("todo 已完成任务已归档 session={}", key);
-            return true;
-        }
-        try {
-            String sus = itemsToJson(list);
-            todos.put(key, new ArrayList<>());
-            suspendedJson.put(key, sus);
-            persist(key, List.of());
-            log.info("todo 已挂起: session={}", key);
-            return true;
-        } catch (Exception e) {
-            log.warn("挂起 todo 失败 {}: {}", key, e.getMessage());
+        return allTerminal(list);
+    }
+
+    /**
+     * 归档已终态的计划：清空当前清单，给下一个任务让位。
+     *
+     * <p>只处理「全部 completed / cancelled」的情况。未完成的清单原样留在当前任务里 ——
+     * 要不要放弃它，由模型调 {@code task.clear} / {@code task.set} 决定。
+     * 框架不做「它大概没用了」这种判断：之前那套「未完成就挂起、有挂起物就恢复」
+     * 正是把上一个任务的清单塞进新任务的直接原因。</p>
+     *
+     * @return 是否真的发生了归档
+     */
+    public synchronized boolean archiveActive(String sessionId) {
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        List<TodoItem> list = todos.get(key);
+        if (list == null || list.isEmpty() || !allTerminal(list)) {
             return false;
         }
+        todos.put(key, new ArrayList<>());
+        persist(key, List.of());
+        log.info("todo 已归档（全部终态）session={}", key);
+        return true;
     }
 
     private static boolean allTerminal(List<TodoItem> list) {
@@ -962,68 +968,6 @@ public class TaskTodoStore {
             }
         }
         return true;
-    }
-
-    /** 活动计划为空时恢复挂起计划。 */
-    public synchronized boolean resumeSuspended(String sessionId) {
-        String key = safeKey(sessionId);
-        ensureLoaded(key);
-        List<TodoItem> active = todos.get(key);
-        if (active != null && !active.isEmpty()) {
-            return false;
-        }
-        String sus = suspendedJson.get(key);
-        if (sus == null && !useDb()) {
-            Path sf = suspendedFile(key);
-            if (!Files.exists(sf)) {
-                return false;
-            }
-            try {
-                List<TodoItem> items = readItems(sf);
-                if (items.isEmpty()) {
-                    Files.deleteIfExists(sf);
-                    return false;
-                }
-                todos.put(key, items);
-                suspendedJson.remove(key);
-                persist(key, items);
-                Files.deleteIfExists(sf);
-                log.info("todo 已恢复挂起计划: session={}, items={}", key, items.size());
-                return true;
-            } catch (Exception e) {
-                log.warn("恢复挂起 todo 失败 {}: {}", key, e.getMessage());
-                return false;
-            }
-        }
-        if (sus == null || sus.isBlank() || "[]".equals(sus.strip())) {
-            return false;
-        }
-        try {
-            List<TodoItem> items = parseItemsJson(sus);
-            if (items.isEmpty()) {
-                suspendedJson.remove(key);
-                persist(key, List.of());
-                return false;
-            }
-            todos.put(key, items);
-            suspendedJson.remove(key);
-            persist(key, items);
-            log.info("todo 已恢复挂起计划: session={}, items={}", key, items.size());
-            return true;
-        } catch (Exception e) {
-            log.warn("恢复挂起 todo 失败 {}: {}", key, e.getMessage());
-            return false;
-        }
-    }
-
-    public synchronized boolean hasSuspended(String sessionId) {
-        String key = safeKey(sessionId);
-        ensureLoaded(key);
-        String sus = suspendedJson.get(key);
-        if (sus != null && !sus.isBlank() && !"[]".equals(sus.strip())) {
-            return true;
-        }
-        return !useDb() && Files.exists(suspendedFile(key));
     }
 
     public synchronized boolean seedFromSteps(String sessionId, List<TaskStep> steps) {
@@ -1179,6 +1123,12 @@ public class TaskTodoStore {
         }
         StringBuilder sb = new StringBuilder();
         sb.append("# 当前任务计划 (todo)\n");
+        // 清单归属由模型表达，不由框架推断：目标变了就必须显式换清单。
+        // 这句话是「换任务」的唯一出口 —— 没有它，模型只能沿用旧清单，
+        // 于是 UI 上会出现「新任务配着上一个任务的计划」。
+        sb.append("清单归属当前任务。若本轮目标与下面任何一条都不符，"
+                + "必须先 todo action=clear 清空、或 action=set 重写清单，再开始新目标；"
+                + "不要沿用旧清单声称在推进。\n");
         sb.append("已存在的子任务和状态：\n");
         for (TodoItem it : list) {
             sb.append("- [").append(symbol(it.status())).append("] #")
@@ -1252,11 +1202,6 @@ public class TaskTodoStore {
         return persistDir.resolve(safe + ".json");
     }
 
-    private Path suspendedFile(String key) {
-        String safe = key.replaceAll("[^a-zA-Z0-9._-]", "_");
-        return persistDir.resolve(safe + ".suspended.json");
-    }
-
     private static long fileMtime(Path file) {
         try {
             return Files.exists(file) ? Files.getLastModifiedTime(file).toMillis() : -1L;
@@ -1270,27 +1215,16 @@ public class TaskTodoStore {
             try {
                 SessionTodoPersistence.State st = persistence.load(key);
                 List<TodoItem> active = parseItemsJson(st.activeJson());
-                // DB 空且本地文件有数据 → 一次性迁入
-                if (active.isEmpty() && (st.suspendedJson() == null || st.suspendedJson().isBlank())
-                        && Files.exists(persistFile(key))) {
+                // DB 空且本地文件有数据 → 一次性迁入。
+                // 只认 active：历史版本留在 suspended_json 里的内容不再复活，
+                // 那些是旧机制"自动捞回"的残留，读回来就是重犯同一个错误。
+                if (active.isEmpty() && Files.exists(persistFile(key))) {
                     active = readItems(persistFile(key));
-                    String sus = Files.exists(suspendedFile(key))
-                            ? Files.readString(suspendedFile(key), StandardCharsets.UTF_8) : null;
                     todos.put(key, active);
-                    if (sus != null) {
-                        suspendedJson.put(key, sus);
-                    } else {
-                        suspendedJson.remove(key);
-                    }
                     persist(key, active);
                     return;
                 }
                 todos.put(key, active);
-                if (st.suspendedJson() != null && !st.suspendedJson().isBlank()) {
-                    suspendedJson.put(key, st.suspendedJson());
-                } else {
-                    suspendedJson.remove(key);
-                }
             } catch (Exception e) {
                 log.warn("从 DB 加载 todo 失败 {}: {}", key, e.getMessage());
                 todos.putIfAbsent(key, new ArrayList<>());
@@ -1369,22 +1303,14 @@ public class TaskTodoStore {
         List<TodoItem> safe = items == null ? List.of() : items;
         try {
             if (useDb()) {
-                String active = itemsToJson(safe);
-                String sus = suspendedJson.get(key);
-                persistence.save(key, active, sus);
+                // 第二个参数是 suspended_json：挂起机制已删除，这里恒传 null。
+                // 列保留不删，避免为一次纯删除再加一条迁移；写入 null 等于把它清空。
+                persistence.save(key, itemsToJson(safe), null);
             } else {
                 Files.createDirectories(persistDir);
                 Path file = persistFile(key);
                 writeItems(file, safe);
                 fileMtimes.put(key, fileMtime(file));
-                // file 模式：挂起另写 .suspended.json
-                String sus = suspendedJson.get(key);
-                Path sf = suspendedFile(key);
-                if (sus != null && !sus.isBlank() && !"[]".equals(sus.strip())) {
-                    Files.writeString(sf, sus, StandardCharsets.UTF_8);
-                } else {
-                    Files.deleteIfExists(sf);
-                }
             }
         } catch (Exception e) {
             log.warn("持久化 todo 失败 {}: {}", key, e.getMessage());

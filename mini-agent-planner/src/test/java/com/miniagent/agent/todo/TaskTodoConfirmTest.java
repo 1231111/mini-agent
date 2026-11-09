@@ -26,30 +26,45 @@ class TaskTodoConfirmTest {
         assertTrue(TaskTodoStore.needsConfirmGate(item));
     }
 
+    /** 全部终态 = 任务客观结束，回到空清单，给下一个任务让位。 */
     @Test
-    void suspendActiveArchivesCompletedPlan(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp) {
+    void archiveActiveClearsCompletedPlan(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp) {
         TaskTodoStore store = new TaskTodoStore(tmp.toString());
         store.set("s", java.util.List.of(
                 java.util.Map.of("id", 1, "content", "定位 dataset", "status", "completed"),
                 java.util.Map.of("id", 2, "content", "复制到桌面", "status", "completed")));
         assertTrue(store.hasPlan("s"));
-        assertTrue(store.suspendActive("s"));
+        assertTrue(store.hasOnlyTerminal("s"));
+        assertTrue(store.archiveActive("s"));
         assertFalse(store.hasPlan("s"));
         assertTrue(store.get("s").isEmpty());
-        assertFalse(store.hasSuspended("s"));
     }
 
+    /**
+     * 未完成的清单**不**归档、也不"存起来等下次捞"。
+     *
+     * <p>旧实现把它压进 suspended_json，下一轮只要看到有挂起物就自动恢复 ——
+     * 于是新任务被上一个任务的清单接管。现在它原地留在当前任务里，
+     * 要不要放弃由模型 task.clear / task.set 决定。</p>
+     */
     @Test
-    void suspendActiveParksIncompleteForContinue(
+    void incompletePlanStaysInPlaceAndIsNotArchived(
             @org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp) {
         TaskTodoStore store = new TaskTodoStore(tmp.toString());
         store.set("s", java.util.List.of(
                 java.util.Map.of("id", 1, "content", "写报告", "status", "in_progress")));
-        assertTrue(store.suspendActive("s"));
-        assertFalse(store.hasPlan("s"));
-        assertTrue(store.hasSuspended("s"));
-        assertTrue(store.resumeSuspended("s"));
+        assertFalse(store.hasOnlyTerminal("s"));
+        assertFalse(store.archiveActive("s"), "未完成不得归档");
+        assertEquals(1, store.get("s").size());
         assertEquals(TaskTodoStore.Status.in_progress, store.get("s").get(0).status());
+    }
+
+    /** 空清单不算终态，否则每一轮都会白推一个新任务号。 */
+    @Test
+    void emptyPlanIsNotTerminal(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp) {
+        TaskTodoStore store = new TaskTodoStore(tmp.toString());
+        assertFalse(store.hasOnlyTerminal("s"));
+        assertFalse(store.archiveActive("s"));
     }
 
     /**
@@ -118,5 +133,70 @@ class TaskTodoConfirmTest {
         } finally {
             TaskTodoContext.clear();
         }
+    }
+    /**
+     * 历史遗留的 suspended_json 不再复活。
+     *
+     * <p>旧实现把它当成「上次没做完、这轮接着做」，于是每一轮读回来 ——
+     * 新任务被上一个任务的清单接管就是这么来的。现在只认 active_json。</p>
+     */
+    @Test
+    void legacySuspendedJsonIsNeverResurrected(
+            @org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp) {
+        TaskTodoStore store = new TaskTodoStore(tmp.toString());
+        store.setPersistence(new SessionTodoPersistence() {
+            @Override
+            public State load(String sessionId) {
+                return new State("[]",
+                        "[{\"id\":1,\"content\":\"上一任务的航班查询\",\"status\":\"pending\"}]");
+            }
+
+            @Override
+            public void save(String sessionId, String activeJson, String suspendedJson) {
+            }
+
+            @Override
+            public void delete(String sessionId) {
+            }
+        });
+
+        assertTrue(store.get("s").isEmpty(), "只读 active，不读 suspended");
+        assertFalse(store.hasPlan("s"));
+        assertFalse(store.hasOnlyTerminal("s"), "空清单不是终态");
+    }
+
+    /** 写清单时 suspended_json 恒为 null：挂起机制已删除，不该再往库里写它。 */
+    @Test
+    void saveNeverWritesSuspendedJson(
+            @org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp) {
+        final java.util.concurrent.atomic.AtomicReference<String> active =
+                new java.util.concurrent.atomic.AtomicReference<>("[]");
+        final java.util.concurrent.atomic.AtomicReference<String> suspended =
+                new java.util.concurrent.atomic.AtomicReference<>("unset");
+        TaskTodoStore store = new TaskTodoStore(tmp.toString());
+        store.setPersistence(new SessionTodoPersistence() {
+            @Override
+            public State load(String sessionId) {
+                // 用真实回读：store 每次读都会走持久化，桩必须把写进去的东西吐出来，
+                // 否则断言测的是桩的返回值，不是 store 的行为。
+                return new State(active.get(), null);
+            }
+
+            @Override
+            public void save(String sessionId, String activeJson, String suspendedJson) {
+                active.set(activeJson);
+                suspended.set(suspendedJson);
+            }
+
+            @Override
+            public void delete(String sessionId) {
+            }
+        });
+
+        store.set("s", List.of(java.util.Map.of(
+                "id", 1, "content", "写报告", "status", "pending")));
+
+        assertNull(suspended.get(), "suspended_json 必须写 null");
+        assertEquals(1, store.get("s").size());
     }
 }

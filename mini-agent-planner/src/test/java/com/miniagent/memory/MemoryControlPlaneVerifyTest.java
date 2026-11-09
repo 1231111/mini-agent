@@ -67,7 +67,7 @@ class MemoryControlPlaneVerifyTest {
      */
     @Test
     void 无挂起清单时按新任务加载而非清空() {
-        MemoryReadPolicy policy = ContextLoadPolicy.forSuspendedTodo(false).memoryPolicy();
+        MemoryReadPolicy policy = ContextLoadPolicy.defaults().memoryPolicy();
         String prompt = service.retrieveForPrompt("s1", "这图哪里不对", policy);
         assertTrue(prompt.contains("JDK 21"), prompt);
         assertTrue(prompt.contains("先结论后细节"), prompt);
@@ -77,7 +77,7 @@ class MemoryControlPlaneVerifyTest {
     @Test
     void newTask不再注入遗留midterm() {
         MemoryReadPolicy policy = ContextLoadPolicy
-                .forSuspendedTodo(false).memoryPolicy();
+                .defaults().memoryPolicy();
         String prompt = service.retrieveForPrompt("s1", "写一份方案", policy);
         assertTrue(prompt.contains("JDK 21"), prompt);
         assertFalse(prompt.contains("报表项目"), prompt);
@@ -85,7 +85,7 @@ class MemoryControlPlaneVerifyTest {
 
     @Test
     void 新任务默认打开长期记忆() {
-        ContextLoadPolicy p = ContextLoadPolicy.forSuspendedTodo(false);
+        ContextLoadPolicy p = ContextLoadPolicy.defaults();
         assertTrue(p.injectMemory());
         assertTrue(p.injectUser());
     }

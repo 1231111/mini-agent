@@ -82,38 +82,25 @@ public class ContextLoader {
     public LoadedContext load(String sessionId, String query, boolean hasMedia,
                               List<ChatMessage> memMsgs) {
         ContextReferenceDecision ref = ContextReference.detect(query);
-        boolean hasSuspendedTodo = Objects.nonNull(sessionId)
-                && taskTodoStore.hasSuspended(sessionId);
-        ContextLoadPolicy policy = resolvePolicy(hasSuspendedTodo, ref);
+        ContextLoadPolicy policy = resolvePolicy(ref);
 
-        boolean suspended = false;
-        boolean resumed = false;
+        // 任务边界只有一个客观信号：现有清单非空、且每一条都已经是终态。
+        // 这不是对用户说了什么做解读 —— 清单状态本来就存在库里，查一下就能确认。
+        // 反过来，「上一任务没做完、用户又发了新消息」这一档框架不做任何判断：
+        // 清单留在当前任务里，要不要换由模型显式 task.set / task.clear 表达。
+        boolean archived = false;
         TaskBoundary boundary = TaskBoundary.SAME;
         String boundaryReason = "same-task";
         if (Objects.nonNull(sessionId)) {
-            // 正在等人工确认时不释放，否则用户答复会被自己的挂起吃掉
             boolean waitingHuman = taskTodoStore.hasAwaitingConfirm(sessionId);
             if (waitingHuman) {
-                log.info("ContextLoader: 跳过 suspend，保留 awaiting_confirm session={}",
-                        sessionId);
-            } else {
-                if (policy.resumeSuspendedTodo()) {
-                    resumed = taskTodoStore.resumeSuspended(sessionId);
+                log.info("ContextLoader: 等待人工确认，保持当前任务 session={}", sessionId);
+            } else if (taskTodoStore.hasOnlyTerminal(sessionId)) {
+                archived = taskTodoStore.archiveActive(sessionId);
+                if (archived) {
+                    boundary = TaskBoundary.NEW;
+                    boundaryReason = "prev-plan-terminal";
                 }
-                if (policy.suspendActiveTodo()) {
-                    suspended = taskTodoStore.suspendActive(sessionId);
-                }
-            }
-            if (resumed) {
-                // 用户明确说「继续」→ 回到被挂起的那个任务，图按它自己的键取得到
-                boundary = TaskBoundary.RESUME;
-                boundaryReason = "todo-resumed";
-            } else if (suspended) {
-                // 上一任务的工作集被释放 → 开新任务。挂起的旧任务留在自己的键上，
-                // 用户说「继续」还能回来；归档的旧任务已终态，没有可回的东西。
-                boundary = TaskBoundary.NEW;
-                boundaryReason = taskTodoStore.hasSuspended(sessionId)
-                        ? "prev-plan-suspended" : "prev-plan-archived";
             }
         }
         String scopeKey = Objects.isNull(sessionId)
@@ -142,8 +129,7 @@ public class ContextLoader {
         info.put("injectMemory", policy.injectMemory());
         info.put("injectUser", policy.injectUser());
         info.put("injectSkills", policy.injectSkills());
-        info.put("todoSuspended", suspended);
-        info.put("todoResumed", resumed);
+        info.put("todoArchived", archived);
         info.put("scopeKey", scopeKey);
         info.put("taskBoundary", boundary.name());
         info.put("boundaryReason", boundaryReason);
@@ -159,21 +145,24 @@ public class ContextLoader {
         }
 
         log.info("ContextLoader: ref={}/neg={}/conf={}, "
-                        + "history={}/{}, todoInject={}, suspended={}, resumed={}, "
+                        + "history={}/{}, todoInject={}, archived={}, "
                         + "scope={}/{}, tools={}",
                 ref.hasReference(), ref.isNegated(), ref.confidence(),
                 history.size(), policy.historyMaxMessages(),
-                policy.injectTodo(), suspended, resumed,
+                policy.injectTodo(), archived,
                 scopeKey, boundaryReason, 0);
 
         return new LoadedContext(systemPrompt, history, policy, scopeKey, taskId, info);
     }
 
-    ContextLoadPolicy resolvePolicy(boolean hasSuspendedTodo, ContextReferenceDecision ref) {
-        ContextLoadPolicy base = ContextLoadPolicy.forSuspendedTodo(hasSuspendedTodo);
-        if (hasSuspendedTodo) {
-            return base;
-        }
+    /**
+     * 基础策略 + 指代场景下的历史条数覆盖。
+     *
+     * <p>本方法不再接收「有没有挂起清单」这类入参，也不再返回不同的清单动作 ——
+     * 清单归属不在这一层。见 {@link ContextLoadPolicy} 的类注释。</p>
+     */
+    ContextLoadPolicy resolvePolicy(ContextReferenceDecision ref) {
+        ContextLoadPolicy base = ContextLoadPolicy.defaults();
         boolean loadRef = ref != null && ref.shouldLoadPriorHistory();
         if (!loadRef) {
             return base;

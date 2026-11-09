@@ -5,39 +5,44 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * 本轮上下文加载策略：判据只有「会话里有没有挂起的 todo 清单」。
+ * 上下文加载策略现在只回答「加载多少历史、开哪些注入通道」。
  *
- * <p>原来这里按命中的文本词表分三档（轻问答 / 续任务 / 动手），
- * 词表层删除后收敛成两档。这些用例守住两件事：
- * 续跑必须把清单捞回来，新任务必须释放旧清单；
- * 任何一档都不许把历史或长期记忆砍到不可恢复。</p>
+ * <p>「挂起 / 恢复任务清单」已经移出本类。旧实现按「会话里有没有被挂起的清单」
+ * 分 CONTINUE / ACTION 两档，那个条件一旦成立就恒成立，于是每一轮都把旧清单捞回来，
+ * 新任务被上一个任务的计划接管。清单归属现在由 {@code TaskTodoStore} 与
+ * {@code TaskScopeRegistry} 管，本类不再参与。</p>
  */
 class ContextLoadPolicyTest {
 
     @Test
-    void 有挂起清单时续跑并恢复() {
-        ContextLoadPolicy p = ContextLoadPolicy.forSuspendedTodo(true);
-        assertTrue(p.resumeSuspendedTodo());
-        assertFalse(p.suspendActiveTodo());
+    void 默认策略全开且不裁剪历史() {
+        ContextLoadPolicy p = ContextLoadPolicy.defaults();
         assertTrue(p.injectTodo());
+        assertTrue(p.injectMemory());
+        assertTrue(p.injectUser());
         assertTrue(p.injectSkills());
-        assertTrue(p.memoryPolicy().working());
+        assertTrue(p.memoryPolicy().working(), "工作记忆跟随 todo 通道");
+        assertTrue(p.memoryPolicy().longTerm(), "长期记忆默认开启，不按文本降档");
+        assertEquals(-1, p.historyMaxMessages(), "-1 = 不裁剪");
     }
 
+    /** 覆盖历史条数不该顺手改掉其它通道（旧实现里 withXxx 最容易漏字段）。 */
     @Test
-    void 没有挂起清单时释放旧计划() {
-        ContextLoadPolicy p = ContextLoadPolicy.forSuspendedTodo(false);
-        assertTrue(p.suspendActiveTodo());
-        assertFalse(p.resumeSuspendedTodo());
+    void 覆盖历史条数不影响其它通道() {
+        ContextLoadPolicy p = ContextLoadPolicy.defaults().withHistoryMaxMessages(8);
+        assertEquals(8, p.historyMaxMessages());
         assertTrue(p.injectTodo());
-        assertTrue(p.memoryPolicy().working());
+        assertTrue(p.injectMemory());
+        assertTrue(p.injectUser());
+        assertTrue(p.injectSkills());
     }
 
-    /** 不再有「轻问答只带摘要」这一档：任何一轮都不砍长期记忆。 */
     @Test
-    void 两档都开启长期记忆() {
-        assertTrue(ContextLoadPolicy.forSuspendedTodo(false).memoryPolicy().longTerm());
-        assertTrue(ContextLoadPolicy.forSuspendedTodo(true).memoryPolicy().longTerm());
+    void 覆盖记忆开关不影响历史条数() {
+        ContextLoadPolicy p = ContextLoadPolicy.defaults().withInjectMemory(false);
+        assertFalse(p.injectMemory());
+        assertEquals(-1, p.historyMaxMessages());
+        assertTrue(p.injectTodo());
     }
 
     /**
@@ -48,7 +53,6 @@ class ContextLoadPolicyTest {
      */
     @Test
     void 历史兜底条数不为零() {
-        assertNotEquals(0, ContextLoadPolicy.forSuspendedTodo(false).historyMaxMessages());
-        assertNotEquals(0, ContextLoadPolicy.forSuspendedTodo(true).historyMaxMessages());
+        assertNotEquals(0, ContextLoadPolicy.defaults().historyMaxMessages());
     }
 }

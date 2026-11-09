@@ -7,10 +7,10 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * {@link ContextLoader} 在基础策略之上按指代做的微调。
+ * {@link ContextLoader} 在默认策略之上按指代做的微调。
  *
- * <p>指代精捞只在新任务上生效：续跑轮本来就要看完整历史，
- * 按相关度裁剪反而会丢掉刚做过的步骤。</p>
+ * <p>指代只影响<b>历史条数</b>：命中指代时按相关度精捞，而不是盲目取最近 N 条。
+ * 它不再影响任务边界，也不再决定要不要动 todo 清单 —— 那是旧实现的问题来源。</p>
  */
 class ContextLoaderPolicyTest {
 
@@ -27,38 +27,34 @@ class ContextLoaderPolicyTest {
 
     private final ContextLoader loader = new ContextLoader();
 
-    /**
-     * 新任务无指代：长期记忆照常注入。
-     *
-     * <p>删掉词表层之前，短问答走 LIGHT 策略（{@code injectMemory=false}）。
-     * 现在区分「短问题」与「动手任务」不能再靠用户文本，策略里只剩「有没有挂起的 todo」，
-     * 所以短问答也会注入长期记忆。这是删除分类层后的既定结果：多花一点 token，
-     * 换「不再按字面猜用户想干什么」。</p>
-     */
+    /** 无指代：原样用默认策略，四个通道全开。 */
     @Test
-    void 新任务无指代也注入长期记忆() {
-        ContextLoadPolicy p = loader.resolvePolicy(false, ContextReferenceDecision.none());
-        assertTrue(p.injectMemory(), "ACTION 策略 injectMemory 一直为 true，不按文本降档");
+    void 无指代时用默认策略() {
+        ContextLoadPolicy p = loader.resolvePolicy(ContextReferenceDecision.none());
+        assertEquals(ContextLoadPolicy.defaults(), p);
+        assertTrue(p.injectMemory());
         assertTrue(p.injectUser());
-        assertTrue(p.suspendActiveTodo(), "新任务要释放上一任务的活动清单");
-        assertFalse(p.resumeSuspendedTodo(), "没有挂起清单可捞");
     }
 
+    /** 有指代：只为「按相关度精捞历史」改历史条数，其它通道不变。 */
     @Test
-    void 新任务有指代打开长期记忆() {
+    void 有指代只覆盖历史条数() {
         ContextReferenceDecision ref =
                 new ContextReferenceDecision(true, 0.9, List.of("那份报告"), false);
-        ContextLoadPolicy p = loader.resolvePolicy(false, ref);
-        assertTrue(p.injectMemory());
+        ContextLoadPolicy p = loader.resolvePolicy(ref);
+        assertNotEquals(ContextLoadPolicy.defaults().historyMaxMessages(),
+                p.historyMaxMessages(), "指代场景要换成精捞上限");
+        assertTrue(p.injectTodo());
+        assertTrue(p.injectUser());
+        assertTrue(p.injectSkills());
     }
 
-    /** 续跑轮不受指代影响：本来就要看完整历史。 */
+    /** 否定指代（「别参考上面」）不加载旧历史。 */
     @Test
-    void 续跑轮的指代不改变策略() {
-        ContextLoadPolicy plain = loader.resolvePolicy(
-                true, ContextReferenceDecision.none());
-        ContextLoadPolicy withRef = loader.resolvePolicy(
-                true, new ContextReferenceDecision(true, 0.9, List.of("那个文件"), false));
-        assertEquals(plain, withRef);
+    void 否定指代不触发历史精捞() {
+        ContextReferenceDecision ref =
+                new ContextReferenceDecision(true, 0.2, List.of("上面"), true);
+        assertFalse(ref.shouldLoadPriorHistory());
+        assertEquals(ContextLoadPolicy.defaults(), loader.resolvePolicy(ref));
     }
 }

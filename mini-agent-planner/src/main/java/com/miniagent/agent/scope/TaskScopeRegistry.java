@@ -23,22 +23,18 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <h2>任务边界判据</h2>
  *
- * <p><b>不用正则猜语义。</b>边界取自<b>已经被持久化、且本来就是任务生命周期所有者</b>的那个 store ——
- * {@code TaskTodoStore}。它在动手轮释放上一任务的工作集（{@code suspendActive}），
- * 这个动作有两个出口，含义都是「上一任务不再活跃」：</p>
- * <ul>
- *   <li><b>挂起</b>：上一任务没做完，清单被压成 {@code .suspended.json} 留着等用户说「继续」；</li>
- *   <li><b>归档清空</b>：上一任务全部终态（完成/取消），没有可恢复的东西。</li>
- * </ul>
- * <p>两者都开新任务：挂起时旧图留在旧键上，用户说「继续」由 {@link TaskBoundary#RESUME} 回来拿；
- * 归档时旧图已经没有意义，自然被弃用。</p>
+ * <p><b>不用正则猜语义，也不看用户这句话像不像新任务。</b>边界只有一个来源：
+ * {@code TaskTodoStore.hasOnlyTerminal(sessionId)} —— 当前清单存在、且每一条都是
+ * completed / cancelled。这是库里的客观状态，查一下就能确认。</p>
  *
- * <p>反向的一步是 {@code TaskTodoStore.resumeSuspended} 成功（用户明确说「继续」）→
- * {@link TaskBoundary#RESUME}，把当前指针弹回被挂起的那个任务。</p>
+ * <p>未完成的清单<b>不</b>触发新任务：它留在当前任务里，要不要放弃由模型显式
+ * {@code task.clear} / {@code task.set} 表达。这里删掉过一版相反的实现：
+ * 用「会话里有没有被挂起的清单」当边界（{@code suspendActive} / {@code resumeSuspended}），
+ * 那个条件一旦成立就恒成立，于是每一轮都把旧清单捞回来，
+ * 新任务被上一个任务的计划接管。</p>
  *
- * <p>这样定边界的结果是：<b>任务边界不再由「AI 觉得用户是不是换话题了」决定</b>，
- * 而由「上一交付的工作集是被挂起还是被归档」决定 —— 一个可持久化、可复核、
- * 且与用户唯一能表达「接着做」的方式（回复「继续」）自洽的事实。</p>
+ * <p>{@link TaskBoundary#RESUME} 保留给「模型显式要求回到上一个任务」这种入口；
+ * 当前没有任何代码会自己触发它 —— 自动触发就等于又回到了猜。</p>
  *
  * <h2>恢复与多副本</h2>
  *
