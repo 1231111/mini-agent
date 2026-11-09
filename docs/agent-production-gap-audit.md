@@ -726,3 +726,89 @@ docker-compose.yml:64-65,84-85   MINIO_ACCESS_KEY/SECRET: minioadmin / minioadmi
 - CI 里的 `docker compose --env-file .env.example config --quiet` 校验步骤同步删除。
 - 与 P0-8 相关的一条约束**仍然成立**：`MYSQL_ROOT_PASSWORD` 这类口令不允许有仓库默认值，
   只是现在约束点在部署机 `.env` / 环境变量，而不是 compose 的 `${VAR:?}`。
+
+## 客户端到云端：`AUTH.03.01` 的实测根因与重试策略（2026-11-09）
+
+线上现象：客户端点登录，服务端日志只有两行，用户看到"无法连接云端账号服务：Connect timed out"。
+
+```
+WARN c.m.config.cloud.CloudAccountClient : 云端账号服务不可达: baseUrl=http://120.53.87.241:8081
+                                             path=/api/tokens cause=Connect timed out
+WARN c.m.web.MiniAgentChatPageController : 云端登录失败: user=孙彬彬 code=AUTH.03.01 ...
+```
+
+### 根因不是账号、不是密钥、不是租户
+
+同一时段从客户端所在机器对 `120.53.87.241` 连测，结论是**链路间歇性劣化**，不是应用错误：
+
+| 探测 | 结果 |
+|---|---|
+| `GET /login`（不触达 DB） | 59 ms / 80 ms / 1294 ms |
+| `GET /actuator/health` | 42 / 37 / 47 ms，但另一时段 5.7 / 8.7 / 9.2 / 11.0 s |
+| 同 IP 的 8091 | 9.3 s / 5.2 s / 0.046 s |
+| `ping 120.53.87.241` | 劣化时均值 2382 ms，恢复后均值 10 ms |
+| 连续 6 次 8081 请求 | 1 次 12 s 内无响应，其余首字节 5.7–11.0 s |
+
+关键点：**TCP 握手一直是 1 ms 完成的（`time_connect≈0.001`），慢的是响应**。
+所以不是"端口没人应答"，而是建连之后在等响应，或者干脆 SYN 丢包等不到握手。
+
+而客户端当时的配置是 `connect-timeout-ms: 3000` / `read-timeout-ms: 10000`：
+- 丢 SYN 时 3 秒必死 → `SocketTimeoutException: Connect timed out` → `AUTH.03.01`；
+- 建连成功但响应 5–11 s 时，3 秒的连接超时与它无关，10 秒读超时又刚好卡在边界上。
+
+一次能成功的登录就因为踩在劣化窗口里被判成"云连不上"，用户会去反复改密码。
+
+### 已做：按失败阶段决定能不能重试
+
+改的是 `CloudAccountClient`。**不能一律重试**，因为 `ResourceAccessException`
+的内部有两种完全不同的含义：
+
+| 失败阶段 | 根因 | 请求是否到达服务端 | 能否重发 |
+|---|---|---|---|
+| 连接阶段 | `ConnectException` / `Connect timed out` | 没有 | 任何方法都能重发 |
+| 已建连、等响应 | `Read timed out` | 已经到达 | 只有幂等操作能重发 |
+
+所以注册（`POST /api/users`）、票据兑换（`POST /api/desktop-tickets/redeem`）
+在读超时后**不重发** —— 服务端可能已经建好账号，重发会让用户看到
+"用户名已被占用"，而那次注册其实是成功的。登录（`POST /api/tokens`）与
+记忆凭证续期（`POST /internal/oauth/refresh`）幂等，可以重发。
+
+> 文档未记录（本轮实测发现）：Spring 只在**连接阶段**失败时抛
+> `ResourceAccessException`；TCP 建好之后卡在读响应头，异常是在
+> `DefaultRestClient.readWithMessageConverters` 里被包成**普通** `RestClientException`
+> 的。第一版只捕 `ResourceAccessException`，测试里那条读超时用例直接漏掉了
+> （抛出的是 `RestClientException`，重试一次都没发生）。现在按**根因是否为
+> `IOException`** 判定，而不是按异常类型。
+
+新增/修改的配置（`mini-agent-app` 与 `application-desktop.yml` 同步）：
+
+| 键 | 旧 | 新 | 说明 |
+|---|---|---|---|
+| `agent.auth.cloud.connect-timeout-ms` | 3000 | 4000 | 丢 SYN 时留出重试余量 |
+| `agent.auth.cloud.read-timeout-ms` | 10000 | 8000 | 正常 40–90 ms，8 s 已是 80 倍余量 |
+| `agent.auth.cloud.max-attempts` | 无（1 次即失败） | 3 | 含首次 |
+| `agent.auth.cloud.retry-backoff-ms` | 无 | 400 | 第 n 次失败后等 400×n ms |
+| `agent.auth.cloud.total-budget-ms` | 无 | 20000 | 退避+重试的总上限，防止登录无限转圈 |
+
+给用户的文案也变了：`无法连接云端账号服务：Connect timed out（已自动重试 2 次仍失败）`，
+一眼能看出"不是账号的问题"。
+
+### 验证
+
+`./mvnw -o -pl mini-agent-app -am -Dtest=CloudAccountClientRetryTest -DfailIfNoTests=false test`
+→ 4 项通过。四条用例分别钉住：
+
+1. 连接被拒（请求没发出）→ 连非幂等的注册也重试到上限，异常里带重试次数；
+2. 读超时（请求已发出）→ 注册只打 1 次、登录打满 `max-attempts`；
+3. `HTTP 503` → 一次都不重试，`AUTH.03.02`；
+4. `failedBeforeRequestSent` 的阶段判定本身（含"判不出来按已发出处理"）。
+
+### 仍未闭合
+
+- **需要重新打包桌面客户端才生效**。改的是 `mini-agent-app`，它打在客户端壳里，
+  Jenkins 只部署 8081 / 8091 两个服务，不会把这份改动带到客户端。
+- **链路劣化本身没解决**。这次只是让客户端在劣化窗口里不再误杀，根因仍在
+  服务端一侧（宿主 8081/8091 同时出现秒级停顿，需在部署机上取 `jstack`、
+  看 GC / 负载 / 带宽峰值，以及 Jenkins 构建是否与业务争 CPU 与带宽）。
+- `CloudMembershipClient` 的 `@Value` 默认值仍写着 3000。yaml 里有值时它不生效，
+  但两处默认值不一致是个隐患，后续统一。

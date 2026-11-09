@@ -158,8 +158,16 @@ agent:
       shared-database: true
       # 服务间密钥。账号服务侧读的是同一个环境变量名，两处必须完全一致。
       internal-key: ${ACCOUNT_INTERNAL_KEY:gMPzIKw7wTtIZOhGibpoAGkdzzXYbsEEfhUVDg0Tb1w=}
-      connect-timeout-ms: 3000
-      read-timeout-ms: 10000
+      connect-timeout-ms: 4000
+      read-timeout-ms: 8000
+      # 公网到云端是间歇性劣化的：同一个地址可能上一秒 40 ms、下一秒 SYN 丢包。
+      # 3 秒硬超时会把本来能成功的登录直接判死（AUTH.03.01），所以给有限次重试。
+      # 只对"连不上/超时"重试；4xx/5xx 与解析失败一律不重试。
+      max-attempts: 3
+      # 第 n 次失败后等 retry-backoff-ms × n（400 ms、800 ms）。
+      retry-backoff-ms: 400
+      # 退避 + 重试的总时间上限。登录在启动路径上阻塞，不能无限等。
+      total-budget-ms: 20000
   memory:
     # db=多副本真相源（agent_user_memory）；file=仅本地目录
     storage: db

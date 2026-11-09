@@ -196,8 +196,12 @@ agent:
       internal-key: ${ACCOUNT_INTERNAL_KEY:}
       # 超时必须显式给。默认是无限等待，而登录在启动路径上 ——
       # 云端不拒绝连接只丢包时，界面会无限转圈。
-      connect-timeout-ms: 3000
-      read-timeout-ms: 10000
+      # 这里比云端内部调用宽松：客户端到云端是公网，实测存在 5–12 秒的劣化窗口，
+      # 3 秒既不够连接也不够取响应，会把一次能成功的登录判成 AUTH.03.01。
+      connect-timeout-ms: 4000
+      read-timeout-ms: 8000
+      # max-attempts / retry-backoff-ms / total-budget-ms 走 application.yml 的
+      # 共用值：重试策略与部署形态无关，不必按档复制一份。
       # 云端角色（SYSTEM_ADMIN 等）是否同步到本地影子用户。默认 false：
       # 云端的权限域和本机不是一回事，自动等同等于把云端提权放大到设备上。
       adopt-role: false
