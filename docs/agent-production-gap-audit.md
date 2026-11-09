@@ -983,3 +983,53 @@ return hasSuspendedTodo ? CONTINUE : ACTION;   // CONTINUE: suspend=false, resum
   要求模型显式换清单，属于"表达权交给模型"，不是框架猜。
   彻底隔离需要 `TodoItem` 增加 `taskId` 归属（第二步）。
 - `task.resume` 未实现，中断任务无法由模型显式恢复。
+
+### TODO-01 第二步：清单按任务作用域分键 + 显式恢复（2026-11-09）
+
+第一步把「自动捞回」删掉之后，还剩一个结构性缺口：清单仍按 `sessionId` 一个槽位存，
+而规划图（`PlannerStateStore`）与压缩摘要（`ContextCompressor`）早已按
+`TaskScope.scopeKey()`（`sessionId` / `sessionId#n`）分键。同一个「任务」在两个层用两个键，
+于是"上一任务未完成、用户直接换话题"这一档，清单只能靠模型显式 `task.clear` 自救。
+
+#### 改动
+
+1. **`TaskTodoStore` 的键改成 `scopeKey`**
+   - `safeKey(sessionId)` 内部调 `TaskScopeRegistry.scopeKey(...)`，无注册表时退回 `sessionId`；
+   - 业务方法（`get` / `set` / `update` / `clear` / `hasPlan` / `render` …）一行未改 ——
+     它们全部经由 `safeKey`，键换了等于全部生效；
+2. **持久化行内分区，不改 DDL**
+   - `AgentSessionTodo` 仍按 `sessionId` 一行（主键不变长、不新增行）；
+   - `active_json` 由裸数组 `[...]` 改成 `{"0":[...],"1":[...]}`；
+   - `parsePartitions` 兼容旧裸数组：整体归 0 号任务，**无需迁移脚本**；
+   - `persist` 落盘前把内存里该会话的所有分区拼成整行；
+3. **`clear(sessionId)` 只清当前任务分区**，不再 `persistence.delete(整行)`——
+   整行删除会把其它任务的清单一起抹掉，正是"换任务即丢历史"。
+4. **显式恢复入口 `todo action=resume`**
+   - `TaskScopeRegistry.paused(sessionId)` 暴露"最近离开的任务"；
+   - `TaskTodoStore.resumePreviousTask()`：`resolve(RESUME)` 换指针 → 读该任务自己的清单；
+   - `TaskTodoStore.renderResumableHint()`：当前清单为空、且被离开的任务有未完成条目时，
+     在提示词里陈述"上一个任务 taskId=N 有 K 条未完成，需要则调用 todo action=resume"；
+   - 新增轨迹节点 `AgentStepNode.TASK_RESUME`。
+
+#### 不变量
+
+1. 任务级状态（规划图 / 压缩摘要 / 清单）**同一把 key**：`scopeKey`。
+2. 框架不判断"这是不是新任务"：边界只在清单全部终态时推进；
+   未完成清单原地保留，换任务由模型 `task.clear` / `task.set` / `task.resume` 表达。
+3. 恢复是模型的动作。框架只陈述事实（有未完成任务）与入口（`action=resume`），
+   不会因为"有挂起物"就自己恢复。
+
+#### 验证
+
+- `TaskTodoScopeTest`（7 项）：两任务互不可见；`resume` 取回被离开任务的清单；
+  无任务时返回 null；落盘为分区对象；旧裸数组归 0 号；`clear` 只清当前任务；
+  有未完成历史任务时提示词给 `action=resume`，当前任务有清单时不提示。
+- planner 全量 **371 项全绿**。
+
+#### 仍未收口
+
+- `TaskScopePersistence` 的发号与清单分区是两套持久化状态（前者用行内的
+  `current_task_id`/`paused_task_id`，后者用 `active_json` 内的分区键），
+  一致性靠"都从同一个 `TaskScopeRegistry` 取号"保证；跨副本并发切换任务时
+  清单写入不在同一个 CAS 里。当前是单机/单副本形态，可接受；多副本需要把
+  清单写入纳入 scope 的版本 CAS。

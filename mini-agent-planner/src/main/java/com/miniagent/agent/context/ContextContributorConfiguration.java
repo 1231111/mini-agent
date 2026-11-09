@@ -112,7 +112,12 @@ public class ContextContributorConfiguration {
             if (!ctx.policy().injectTodo() || StringUtils.isBlank(ctx.sessionId())) {
                 return ContextFragment.of(ContextSlot.TODO, "");
             }
-            return ContextFragment.of(ContextSlot.TODO, taskTodoStore.render(ctx.sessionId()));
+            // 清单 + 「上一个任务未完成」的事实陈述。
+            // 后者只给事实与入口（todo action=resume），不自动恢复 ——
+            // 恢复是模型的动作，框架不替用户决定要不要接着做。
+            String todoBlock = taskTodoStore.render(ctx.sessionId());
+            String resumeHint = taskTodoStore.renderResumableHint(ctx.sessionId());
+            return ContextFragment.of(ContextSlot.TODO, todoBlock + resumeHint);
         };
     }
 

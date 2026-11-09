@@ -82,6 +82,12 @@ public class TaskTodoStore {
     private final List<TodoStepValidator> validators;
     private SessionTodoPersistence persistence;
     private SessionEventCenter eventCenter;
+    /**
+     * 任务作用域来源。清单按 {@code TaskScope.scopeKey(sessionId)} 分键，
+     * 与 {@code PlannerStateStore}、{@code ContextCompressor} 同一口径 ——
+     * 任务级状态用同一个 key，才不会出现「图换了任务、清单还留在原处」。
+     */
+    private com.miniagent.agent.scope.TaskScopeRegistry scopeRegistry;
 
     /** 测试 / 无 Spring 场景 */
     public TaskTodoStore(String persistDir) {
@@ -113,6 +119,11 @@ public class TaskTodoStore {
     @Autowired(required = false)
     public void setEventCenter(SessionEventCenter eventCenter) {
         this.eventCenter = eventCenter;
+    }
+
+    @Autowired(required = false)
+    public void setScopeRegistry(com.miniagent.agent.scope.TaskScopeRegistry scopeRegistry) {
+        this.scopeRegistry = scopeRegistry;
     }
 
     private boolean useDb() {
@@ -899,23 +910,18 @@ public class TaskTodoStore {
         return null;
     }
 
+    /**
+     * 清空<b>当前任务</b>的清单。
+     *
+     * <p>只清当前作用域键那一份：其它任务的清单留在各自键上，用户之后说「接着做」
+     * 还能回来。整行删除（{@code persistence.delete}）会把所有任务一起抹掉，
+     * 那正是「换任务即丢历史」的来源。</p>
+     */
     public synchronized void clear(String sessionId) {
         String key = safeKey(sessionId);
-        todos.remove(key);
-        fileMtimes.remove(key);
-        if (useDb()) {
-            try {
-                persistence.delete(key);
-            } catch (Exception e) {
-                log.warn("删除 todo DB 行失败: {}", e.getMessage());
-            }
-            return;
-        }
-        try {
-            Files.deleteIfExists(persistFile(key));
-        } catch (Exception e) {
-            log.warn("删除 todo 文件失败: {}", e.getMessage());
-        }
+        todos.put(key, new ArrayList<>());
+        persist(key, List.of());
+        log.info("todo 已清空 session={} key={}", sessionOf(key), key);
     }
 
     /**
@@ -968,6 +974,59 @@ public class TaskTodoStore {
             }
         }
         return true;
+    }
+
+    /**
+     * 回到最近离开的任务（模型显式调用 {@code todo action=resume}）。
+     *
+     * <p>这是「接着做」唯一的入口，由模型发起，不是框架猜。指针换回后，
+     * 读清单自然走新的作用域键 —— 旧任务的条目原样还在自己那一份里，
+     * 不需要从任何「挂起槽位」里恢复。</p>
+     *
+     * @return 恢复后的清单；没有可恢复任务时返回 {@code null}
+     */
+    public synchronized List<TodoItem> resumePreviousTask(String sessionId) {
+        if (scopeRegistry == null || sessionId == null || sessionId.isBlank()) {
+            return null;
+        }
+        if (scopeRegistry.paused(sessionId) == null) {
+            return null;
+        }
+        scopeRegistry.resolve(sessionId,
+                com.miniagent.agent.scope.TaskBoundary.RESUME, "tool-resume");
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        return List.copyOf(todos.getOrDefault(key, List.of()));
+    }
+
+    /**
+     * 陈述「存在未完成的历史任务」，供提示词使用。
+     *
+     * <p>只给事实与入口，不给指令：模型看到这条自己决定要不要 resume。
+     * 当前任务已有清单时不输出 —— 两个任务的清单同时出现在提示里，
+     * 模型就又会把两件事混着做。</p>
+     */
+    public synchronized String renderResumableHint(String sessionId) {
+        if (scopeRegistry == null || sessionId == null || sessionId.isBlank()) {
+            return "";
+        }
+        com.miniagent.agent.scope.TaskScope paused = scopeRegistry.paused(sessionId);
+        if (paused == null || !get(sessionId).isEmpty()) {
+            return "";
+        }
+        String pausedKey = paused.scopeKey();
+        ensureLoaded(pausedKey);
+        List<TodoItem> items = todos.getOrDefault(pausedKey, List.of());
+        if (items.isEmpty() || allTerminal(items)) {
+            return "";
+        }
+        long open = items.stream()
+                .filter(it -> it.status() != Status.completed
+                        && it.status() != Status.cancelled)
+                .count();
+        return "上一个任务（taskId=" + paused.taskId() + "）有 " + open
+                + " 条未完成。用户要求接着做时，调用 todo action=resume 恢复该任务；"
+                + "否则按当前目标继续。\n";
     }
 
     public synchronized boolean seedFromSteps(String sessionId, List<TaskStep> steps) {
@@ -1193,8 +1252,57 @@ public class TaskTodoStore {
         return o == null ? "" : String.valueOf(o).trim();
     }
 
-    private static String safeKey(String sessionId) {
-        return sessionId == null || sessionId.isBlank() ? "default" : sessionId.trim();
+    /**
+     * 任务级存储键。
+     *
+     * <p>返回 {@code TaskScope.scopeKey()}（{@code sessionId} 或 {@code sessionId#n}），
+     * <b>不是</b> sessionId。所有 Map 操作都以它为准，因此「上一个任务的清单」
+     * 与「当前任务的清单」落在两个互不可见的键上 —— 不需要搬、也不需要判断
+     * 「这一轮算不算换任务」。</p>
+     *
+     * <p>没有 {@link com.miniagent.agent.scope.TaskScopeRegistry} 时（纯单测、
+     * 无 Spring 场景）退回 sessionId，等价于「一个会话只有一个任务」。</p>
+     */
+    private String safeKey(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return "default";
+        }
+        String raw = sessionId.trim();
+        return scopeRegistry == null ? raw : scopeRegistry.scopeKey(raw);
+    }
+
+    /** 作用域键 → 会话标识：{@code s_abc#3 → s_abc}，{@code s_abc → s_abc}。 */
+    static String sessionOf(String key) {
+        if (key == null || key.isEmpty()) {
+            return key;
+        }
+        int i = key.lastIndexOf('#');
+        if (i <= 0 || i == key.length() - 1) {
+            return key;
+        }
+        for (int j = i + 1; j < key.length(); j++) {
+            if (!Character.isDigit(key.charAt(j))) {
+                return key;
+            }
+        }
+        return key.substring(0, i);
+    }
+
+    /** 与 {@link com.miniagent.agent.scope.TaskScope#scopeKey()} 同口径。 */
+    private static String scopeKeyOf(String sessionId, long taskId) {
+        return taskId == 0L ? sessionId : sessionId + "#" + taskId;
+    }
+
+    private static long taskIdOf(String scopeKey, String sessionId) {
+        if (scopeKey == null || sessionId == null || scopeKey.equals(sessionId)) {
+            return 0L;
+        }
+        String tail = scopeKey.substring(sessionId.length() + 1);
+        try {
+            return Long.parseLong(tail);
+        } catch (NumberFormatException e) {
+            return 0L;
+        }
     }
 
     private Path persistFile(String key) {
@@ -1210,46 +1318,62 @@ public class TaskTodoStore {
         }
     }
 
+    /**
+     * 从一个会话的持久化行里加载<b>全部任务分区</b>。
+     *
+     * <p>行是按 sessionId 存的，行内的 {@code active_json} 是一个
+     * {@code {"0":[...],"1":[...]}} 形态的分区对象；旧数据是裸数组，
+     * 读取时整体归 0 号任务（{@link #parsePartitions}）。内存里则按
+     * {@code scopeKey} 拆成多份，业务方法只看到自己那一份。</p>
+     */
     private void ensureLoaded(String key) {
+        String sessionId = sessionOf(key);
         if (useDb()) {
             try {
-                SessionTodoPersistence.State st = persistence.load(key);
-                List<TodoItem> active = parseItemsJson(st.activeJson());
-                // DB 空且本地文件有数据 → 一次性迁入。
-                // 只认 active：历史版本留在 suspended_json 里的内容不再复活，
-                // 那些是旧机制"自动捞回"的残留，读回来就是重犯同一个错误。
-                if (active.isEmpty() && Files.exists(persistFile(key))) {
-                    active = readItems(persistFile(key));
-                    todos.put(key, active);
-                    persist(key, active);
+                SessionTodoPersistence.State st = persistence.load(sessionId);
+                Map<Long, List<TodoItem>> parts = parsePartitions(st.activeJson());
+                // DB 空、本地文件有数据 → 一次性迁入。
+                // 只迁 active：suspended_json 是旧机制「自动捞回」的残留，读回来就是重犯。
+                if (parts.isEmpty() && Files.exists(persistFile(sessionId))) {
+                    parts = parsePartitions(
+                            Files.readString(persistFile(sessionId), StandardCharsets.UTF_8));
+                    applyPartitions(sessionId, parts);
+                    persist(key, todos.getOrDefault(key, new ArrayList<>()));
                     return;
                 }
-                todos.put(key, active);
+                applyPartitions(sessionId, parts);
             } catch (Exception e) {
-                log.warn("从 DB 加载 todo 失败 {}: {}", key, e.getMessage());
-                todos.putIfAbsent(key, new ArrayList<>());
+                log.warn("从 DB 加载 todo 失败 {}: {}", sessionId, e.getMessage());
             }
+            todos.putIfAbsent(key, new ArrayList<>());
             return;
         }
-        Path file = persistFile(key);
+        Path file = persistFile(sessionId);
         long mtime = fileMtime(file);
-        Long cached = fileMtimes.get(key);
-        if (todos.containsKey(key) && Objects.equals(cached, mtime)) {
+        Long cached = fileMtimes.get(sessionId);
+        if (cached != null && Objects.equals(cached, mtime) && todos.containsKey(key)) {
             return;
         }
         if (!Files.exists(file)) {
-            todos.put(key, new ArrayList<>());
-            fileMtimes.put(key, -1L);
+            todos.putIfAbsent(key, new ArrayList<>());
+            fileMtimes.put(sessionId, -1L);
             return;
         }
         try {
-            todos.put(key, readItems(file));
-            fileMtimes.put(key, mtime);
+            applyPartitions(sessionId, parsePartitions(
+                    Files.readString(file, StandardCharsets.UTF_8)));
+            fileMtimes.put(sessionId, mtime);
         } catch (Exception e) {
             log.warn("加载 todo 失败 {}: {}", file, e.getMessage());
-            todos.put(key, new ArrayList<>());
-            fileMtimes.put(key, -1L);
+            fileMtimes.put(sessionId, -1L);
         }
+        todos.putIfAbsent(key, new ArrayList<>());
+    }
+
+    /** 把「任务号 → 清单」摊进内存 map，键统一成 scopeKey。 */
+    private void applyPartitions(String sessionId, Map<Long, List<TodoItem>> parts) {
+        parts.forEach((taskId, items) ->
+                todos.put(scopeKeyOf(sessionId, taskId), new ArrayList<>(items)));
     }
 
     private List<TodoItem> readItems(Path file) throws Exception {
@@ -1260,24 +1384,78 @@ public class TaskTodoStore {
         if (json == null || json.isBlank()) {
             return new ArrayList<>();
         }
-        List<PersistedItem> raw = MAPPER.readValue(json, new TypeReference<>() {});
+        return toItems(MAPPER.readValue(json, new TypeReference<List<PersistedItem>>() {}));
+    }
+
+    private static List<TodoItem> toItems(List<PersistedItem> raw) {
         List<TodoItem> items = new ArrayList<>();
-        if (raw != null) {
-            for (PersistedItem p : raw) {
-                if (p == null || p.content == null || p.content.isBlank()) {
-                    continue;
-                }
-                List<Integer> deps = p.dependsOn == null ? List.of() : List.copyOf(p.dependsOn);
-                items.add(new TodoItem(p.id, p.content, parseStatus(p.status),
-                        nullToEmpty(p.note), nullToEmpty(p.doneWhen), nullToEmpty(p.evidence),
-                        nullToEmpty(p.validationHash), deps));
+        if (raw == null) {
+            return items;
+        }
+        for (PersistedItem p : raw) {
+            if (p == null || p.content == null || p.content.isBlank()) {
+                continue;
             }
+            List<Integer> deps = p.dependsOn == null ? List.of() : List.copyOf(p.dependsOn);
+            items.add(new TodoItem(p.id, p.content, parseStatus(p.status),
+                    nullToEmpty(p.note), nullToEmpty(p.doneWhen), nullToEmpty(p.evidence),
+                    nullToEmpty(p.validationHash), deps));
         }
         return items;
     }
 
-    private String itemsToJson(List<TodoItem> items) throws Exception {
+    /**
+     * 解析一个会话行里的清单。
+     *
+     * <p>兼容两种形态：</p>
+     * <ul>
+     *   <li>旧：裸数组 {@code [...]} —— 整行属于 0 号任务，直接迁过来；</li>
+     *   <li>新：分区对象 {@code {"0":[...],"1":[...]}} —— 按任务号拆开。</li>
+     * </ul>
+     * <p>两种形态都在同一行里，所以不需要 DDL 变更，也不需要一次性数据迁移。</p>
+     */
+    private Map<Long, List<TodoItem>> parsePartitions(String json) {
+        Map<Long, List<TodoItem>> out = new LinkedHashMap<>();
+        if (json == null || json.isBlank()) {
+            return out;
+        }
+        String trimmed = json.trim();
+        try {
+            if (trimmed.startsWith("[")) {
+                List<TodoItem> items = parseItemsJson(trimmed);
+                if (!items.isEmpty()) {
+                    out.put(0L, items);
+                }
+                return out;
+            }
+            Map<String, List<PersistedItem>> raw = MAPPER.readValue(trimmed,
+                    new TypeReference<Map<String, List<PersistedItem>>>() {});
+            if (raw == null) {
+                return out;
+            }
+            raw.forEach((k, list) -> {
+                long taskId;
+                try {
+                    taskId = Long.parseLong(k.trim());
+                } catch (RuntimeException e) {
+                    taskId = 0L;
+                }
+                List<TodoItem> items = toItems(list);
+                if (!items.isEmpty()) {
+                    out.put(taskId, items);
+                }
+            });
+        } catch (Exception e) {
+            log.warn("解析 todo 分区失败: {}", e.getMessage());
+        }
+        return out;
+    }
+
+    private static List<PersistedItem> toPersisted(List<TodoItem> items) {
         List<PersistedItem> raw = new ArrayList<>();
+        if (items == null) {
+            return raw;
+        }
         for (TodoItem it : items) {
             PersistedItem p = new PersistedItem();
             p.id = it.id();
@@ -1290,7 +1468,37 @@ public class TaskTodoStore {
             p.dependsOn = it.dependsOn() == null ? List.of() : new ArrayList<>(it.dependsOn());
             raw.add(p);
         }
-        return MAPPER.writeValueAsString(raw);
+        return raw;
+    }
+
+    private String itemsToJson(List<TodoItem> items) throws Exception {
+        return MAPPER.writeValueAsString(toPersisted(items));
+    }
+
+    /**
+     * 把一个会话的全部任务分区序列化成整行 JSON。
+     *
+     * <p>遍历内存里所有 {@code belongsTo(sessionId)} 的键，拼成
+     * {@code {"任务号": [条目...]}}。空分区不写，避免行里堆积 {@code "3":[]}。</p>
+     */
+    private String partitionsToJson(String sessionId) {
+        Map<String, List<PersistedItem>> out = new LinkedHashMap<>();
+        for (Map.Entry<String, List<TodoItem>> e : todos.entrySet()) {
+            if (!com.miniagent.agent.scope.TaskScope.belongsTo(e.getKey(), sessionId)) {
+                continue;
+            }
+            List<TodoItem> items = e.getValue();
+            if (items == null || items.isEmpty()) {
+                continue;
+            }
+            out.put(String.valueOf(taskIdOf(e.getKey(), sessionId)), toPersisted(items));
+        }
+        try {
+            return MAPPER.writeValueAsString(out);
+        } catch (Exception e) {
+            log.warn("序列化 todo 分区失败 {}: {}", sessionId, e.getMessage());
+            return "{}";
+        }
     }
 
     private void writeItems(Path file, List<TodoItem> items) throws Exception {
@@ -1299,23 +1507,36 @@ public class TaskTodoStore {
                 StandardCharsets.UTF_8);
     }
 
+    /**
+     * 写入一个任务的清单。
+     *
+     * <p>落盘的最小单位是<b>会话行</b>，不是任务：这一行的 {@code active_json} 里
+     * 装着该会话所有任务的分区。所以这里先把内存里这个 key 的清单换掉，
+     * 再把整行重新序列化。{@code suspended_json} 恒写 null（挂起机制已删除，
+     * 列保留不删以免再加一次迁移）。</p>
+     */
     private void persist(String key, List<TodoItem> items) {
         List<TodoItem> safe = items == null ? List.of() : items;
+        todos.put(key, new ArrayList<>(safe));
+        String sessionId = sessionOf(key);
+        String payload = partitionsToJson(sessionId);
         try {
             if (useDb()) {
-                // 第二个参数是 suspended_json：挂起机制已删除，这里恒传 null。
-                // 列保留不删，避免为一次纯删除再加一条迁移；写入 null 等于把它清空。
-                persistence.save(key, itemsToJson(safe), null);
+                persistence.save(sessionId, payload, null);
             } else {
                 Files.createDirectories(persistDir);
-                Path file = persistFile(key);
-                writeItems(file, safe);
-                fileMtimes.put(key, fileMtime(file));
+                Path file = persistFile(sessionId);
+                Files.writeString(file,
+                        MAPPER.writerWithDefaultPrettyPrinter()
+                                .writeValueAsString(MAPPER.readTree(payload)),
+                        StandardCharsets.UTF_8);
+                fileMtimes.put(sessionId, fileMtime(file));
             }
         } catch (Exception e) {
-            log.warn("持久化 todo 失败 {}: {}", key, e.getMessage());
+            log.warn("持久化 todo 失败 {}: {}", sessionId, e.getMessage());
         }
-        publishTodoUi(key, safe);
+        // UI 按 sessionId 订阅；这里不能传作用域键，否则前端收不到
+        publishTodoUi(sessionId, safe);
     }
 
     /** SSE：把当前计划列表推给前端（完成项置灰勾选）。 */

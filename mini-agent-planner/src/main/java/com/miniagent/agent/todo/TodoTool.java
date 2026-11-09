@@ -58,7 +58,7 @@ public class TodoTool {
         Map<String, Object> params = new LinkedHashMap<>();
         params.put("action", Map.of(
                 "type", "string",
-                "description", "操作：set / update / list / clear / reopen",
+                "description", "操作：set / update / list / clear / reopen / resume",
                 "required", true
         ));
         params.put("items", Map.of(
@@ -185,10 +185,28 @@ public class TodoTool {
                     traceTodo("TASK_CLEAR", sid, "clear", List.of(), null);
                     return MAPPER.writeValueAsString(Map.of("success", true, "action", "clear"));
                 }
+                case "resume" -> {
+                    // 显式恢复：把作用域指针换回上一个任务，再读它自己那份清单。
+                    // 这里不判断「用户是不是想继续」—— 模型调了就是想了。
+                    var restored = todoStore.resumePreviousTask(sid);
+                    if (Objects.isNull(restored)) {
+                        return error("没有可恢复的上一个任务");
+                    }
+                    String out = MAPPER.writeValueAsString(Map.of(
+                            "success", true,
+                            "action", "resume",
+                            "todo", todoStore.render(sid),
+                            "stats", todoStore.stats(sid),
+                            "items", restored
+                    ));
+                    traceTodo("TASK_RESUME", sid, "resume", restored, null);
+                    maybeTraceWaitingHuman(sid, restored);
+                    return out;
+                }
                 default -> {
                     return error(
                             "未知 action: " + action
-                                    + "（支持 set/update/list/clear/reopen）");
+                                    + "（支持 set/update/list/clear/reopen/resume）");
                 }
             }
         } catch (Exception e) {

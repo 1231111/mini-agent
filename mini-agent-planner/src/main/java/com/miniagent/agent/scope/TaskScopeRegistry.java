@@ -238,6 +238,18 @@ public class TaskScopeRegistry {
     /**
      * 任务级状态的 key。没有登记过作用域的会话由 {@link #current} 兜底创建，因此永不返回 null。
      */
+    /**
+     * 最近离开的任务；没有则为 {@code null}。
+     *
+     * <p>只用于向模型陈述「有可恢复的任务」并给出 {@code todo action=resume} 入口。
+     * 框架<b>不会</b>自己拿它推进指针 —— 那等于替用户决定要不要续跑，
+     * 正是被删掉的那版实现的做法。</p>
+     */
+    public TaskScope paused(String sessionId) {
+        Holder h = holder(sessionId);
+        return h == null ? null : h.paused;
+    }
+
     public String scopeKey(String sessionId) {
         TaskScope scope = current(sessionId);
         return scope == null ? sessionId : scope.scopeKey();
