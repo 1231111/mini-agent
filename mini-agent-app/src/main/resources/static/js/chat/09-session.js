@@ -13,6 +13,9 @@ function startNewChat(doFocus = true) {
     closeWsMenu();
     $msg.innerHTML = WELCOME;
     renderSidebar();
+    // 右侧执行详情是会话级视图：新会话等于空 execution，必须重算，
+    // 否则会继续显示上一个会话的步骤。14a-inspector.js 后加载，用 typeof 兜住。
+    if (typeof scheduleInspectorRefresh === 'function') scheduleInspectorRefresh();
     if (doFocus) $inp.focus();
 }
 
@@ -34,6 +37,8 @@ async function switchConv(id, force) {
     await loadMoreMessages(id, false);
     checkAndPollTask(id);
     renderSidebar();
+    // 同上：步骤、工具、记忆三块都跟着会话走，切会话必须换数据源
+    if (typeof scheduleInspectorRefresh === 'function') scheduleInspectorRefresh();
     // 工作目录是会话级状态，切会话必须重新取，否则会把上一个会话的目录显示成当前目录
     loadWorkspace();
     // 将会话权限模式与本地选择对齐（并刷新 Plan banner）

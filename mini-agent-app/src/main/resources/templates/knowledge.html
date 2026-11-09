@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>知识库 · Mini Agent</title>
+    <script th:inline="none">
+        (function () {
+            try {
+                var t = localStorage.getItem('mini_agent_theme');
+                if (!t) t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) {
+                document.documentElement.setAttribute('data-theme', 'dark');
+            }
+        })();
+    </script>
+    <script th:inline="none">
+        (function () {
+            var tk = '';
+            try {
+                var b = window.desktopAuth;
+                tk = (b && typeof b.getToken === 'function') ? (b.getToken() || '')
+                    : (sessionStorage.getItem('ma_token') || '');
+            } catch (e) { tk = ''; }
+            if (!tk) window.location.replace('/login');
+        })();
+    </script>
+    <link rel="stylesheet" href="/css/chat.css">
+    <link rel="stylesheet" href="/css/shell.css">
+    <link rel="stylesheet" href="/css/shell-pages.css">
+</head>
+<body data-page="knowledge">
+
+<aside class="rail" id="rail">
+    <div class="rail-brand">
+        <div class="rail-brand-icon">🤖</div>
+        <div class="rail-brand-name">智能体助手</div>
+        <div class="rail-brand-sub">让 AI 帮你完成更多</div>
+    </div>
+    <nav class="rail-nav">
+        <a class="rail-item" href="/" title="对话助手">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" viewBox="0 0 24 24">
+                <path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H8l-5 3 1.2-4.2A8.5 8.5 0 1 1 21 11.5z"/>
+                <path d="M8 11h8M8 15h5"/>
+            </svg>
+            <span>对话助手</span>
+        </a>
+        <a class="rail-item" href="/trace" title="任务中心：执行轨迹与任务">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" viewBox="0 0 24 24">
+                <path d="M4 6h16M4 12h16M4 18h10"/>
+                <circle cx="19" cy="18" r="2"/>
+            </svg>
+            <span>任务中心</span>
+        </a>
+        <a class="rail-item" href="/memory" title="记忆管理">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" viewBox="0 0 24 24">
+                <path d="M12 4a3 3 0 0 0-3 3v1a3 3 0 0 0 0 6v1a3 3 0 0 0 6 0v-1a3 3 0 0 0 0-6V7a3 3 0 0 0-3-3z"/>
+                <path d="M12 4v16"/>
+            </svg>
+            <span>记忆管理</span>
+        </a>
+        <a class="rail-item active" href="/knowledge" title="知识库">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" viewBox="0 0 24 24">
+                <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H19v18H6.5A2.5 2.5 0 0 1 4 18.5z"/>
+                <path d="M8 3v18M11 8h5M11 12h5"/>
+            </svg>
+            <span>知识库</span>
+        </a>
+        <a class="rail-item" href="/apps" title="应用市场：工具与扩展">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" viewBox="0 0 24 24">
+                <rect x="3" y="3" width="7" height="7" rx="1.5"/>
+                <rect x="14" y="3" width="7" height="7" rx="1.5"/>
+                <rect x="3" y="14" width="7" height="7" rx="1.5"/>
+                <rect x="14" y="14" width="7" height="7" rx="1.5"/>
+            </svg>
+            <span>应用市场</span>
+        </a>
+    </nav>
+    <div class="rail-spacer"></div>
+    <div class="rail-foot">
+        <a class="rail-item" href="/" title="返回对话">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" viewBox="0 0 24 24">
+                <path d="M19 12H5M12 19l-7-7 7-7"/>
+            </svg>
+            <span>返回对话</span>
+        </a>
+    </div>
+</aside>
+
+<div class="page">
+    <div class="page-head">
+        <h1 class="page-title">知识库</h1>
+        <span class="page-sub">跨会话复用的长期知识：语义事实（主语 · 谓语 · 宾语）与已沉淀的流程。会话内的情节不在此列。</span>
+    </div>
+
+    <div class="page-body">
+        <div class="page-inner">
+            <div class="stat-grid" id="knStats">
+                <div class="stat"><div class="stat-num">…</div><div class="stat-key">加载中</div></div>
+            </div>
+
+            <div class="card">
+                <div class="card-head">语义事实
+                    <span class="card-count" id="knFactCount">加载中…</span>
+                </div>
+                <div class="card-body" id="knFacts">
+                    <div class="empty">加载中…</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-head">流程
+                    <span class="card-count" id="knProcCount">加载中…</span>
+                </div>
+                <div class="card-body" id="knProcedures">
+                    <div class="empty">加载中…</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="/js/security.js"></script>
+<script src="/js/shell-pages.js"></script>
+</body>
+</html>

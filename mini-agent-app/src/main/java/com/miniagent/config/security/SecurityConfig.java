@@ -76,11 +76,21 @@ public class SecurityConfig {
      * 导航请求上拿不到任何身份信息（浏览器导航无法携带自定义头），页面入口只能由前端读
      * sessionStorage 后自行分流。放行页面骨架不等于放行数据 —— 页面里的每个
      * {@code /api/**} 调用仍要带 Bearer。
+     *
+     * <p><b>页面骨架 / 数据接口的边界：</b>{@code /memory}、{@code /knowledge}、{@code /apps}
+     * 与上面几个页面同理，是 {@link com.miniagent.web.ShellPageController} 的导航路由，
+     * 只返回 HTML 外壳、不含任何用户数据，必须无条件放行。对应的数据接口在
+     * {@link com.miniagent.web.ShellApiController}（{@code /api/shell/**}），
+     * 一条都不在放行名单里，逐个要求 Bearer 并做会话归属校验。
      */
     public static final String[] PUBLIC_PATHS = {
             "/",
             "/login",
             "/trace",
+            // Shell 页面骨架（见类注释）：只放行导航外壳，不放行 /api/shell/** 数据接口。
+            "/memory",
+            "/knowledge",
+            "/apps",
             // 会员中心的页面骨架。它放行的理由和 /login 完全相同：这是个页面导航请求，
             // 带不了 Authorization 头，若在这里拦，浏览器直接看不到这个页面。
             // 页面里的 /api/membership/** 一条都不在放行名单里，仍逐个要 Bearer，

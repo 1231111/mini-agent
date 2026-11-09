@@ -37,51 +37,83 @@
         })();
     </script>
     <link rel="stylesheet" href="/css/chat.css">
+    <link rel="stylesheet" href="/css/shell.css">
 </head>
 <body>
 
-<!-- ===================== SIDEBAR ===================== -->
-<div class="sidebar" id="sidebar">
-    <div class="sb-top">
-        <div class="sb-logo">
-            <div class="sb-logo-icon">🤖</div>
-            Mini Agent
-        </div>
-        <div class="sb-top-actions">
-            <button type="button" class="sb-icon-btn sb-toggle" id="sidebarToggle"
-                    onclick="toggleSidebar()" title="收起侧栏">
-                <svg class="icon-collapse" fill="none" stroke="currentColor" stroke-width="2"
-                     stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
-                    <path d="M19 12H5M12 19l-7-7 7-7"/>
-                </svg>
-                <svg class="icon-expand" fill="none" stroke="currentColor" stroke-width="2"
-                     stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
-                    <path d="M5 12h14M12 5l7 7-7 7"/>
-                </svg>
-            </button>
-        </div>
+<!-- ===================== RAIL — 主导航 =====================
+     只放真实存在的入口：对话助手（/）、任务中心（/trace）、记忆管理（/memory）、
+     知识库（/knowledge）、应用市场（/apps）、系统设置（弹层）。
+     这六项都有落地页或真实弹层，不存在"点了没反应"的按钮。 -->
+<aside class="rail" id="rail">
+    <div class="rail-brand">
+        <div class="rail-brand-icon">🤖</div>
+        <div class="rail-brand-name">智能体助手</div>
+        <div class="rail-brand-sub">让 AI 帮你完成更多</div>
     </div>
 
-    <!-- 新会话 -->
-    <button type="button" class="sb-new" onclick="startNewChat()" title="新会话">
-        <svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
-             stroke-linejoin="round" viewBox="0 0 24 24">
-            <path d="M12 5v14M5 12h14"/>
-        </svg>
-        <span>新会话</span>
-    </button>
-
-    <!-- 导航：只放真实存在的入口，不做"点了没反应"的假按钮 -->
-    <nav class="sb-nav">
-        <button type="button" class="sb-nav-item" onclick="openSettings()" title="模型、外观、程序记忆">
+    <nav class="rail-nav">
+        <a class="rail-item active" href="/" title="对话助手">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" viewBox="0 0 24 24">
+                <path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H8l-5 3 1.2-4.2A8.5 8.5 0 1 1 21 11.5z"/>
+                <path d="M8 11h8M8 15h5"/>
+            </svg>
+            <span>对话助手</span>
+        </a>
+        <a class="rail-item" href="/trace" title="任务中心：执行轨迹与任务">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" viewBox="0 0 24 24">
+                <path d="M4 6h16M4 12h16M4 18h10"/>
+                <circle cx="19" cy="18" r="2"/>
+            </svg>
+            <span>任务中心</span>
+        </a>
+        <a class="rail-item" href="/memory" title="记忆管理">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" viewBox="0 0 24 24">
+                <path d="M12 4a3 3 0 0 0-3 3v1a3 3 0 0 0 0 6v1a3 3 0 0 0 6 0v-1a3 3 0 0 0 0-6V7a3 3 0 0 0-3-3z"/>
+                <path d="M12 4v16"/>
+            </svg>
+            <span>记忆管理</span>
+        </a>
+        <a class="rail-item" href="/knowledge" title="知识库">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" viewBox="0 0 24 24">
+                <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H19v18H6.5A2.5 2.5 0 0 1 4 18.5z"/>
+                <path d="M8 3v18M11 8h5M11 12h5"/>
+            </svg>
+            <span>知识库</span>
+        </a>
+        <a class="rail-item" href="/apps" title="应用市场：工具与扩展">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" viewBox="0 0 24 24">
+                <rect x="3" y="3" width="7" height="7" rx="1.5"/>
+                <rect x="14" y="3" width="7" height="7" rx="1.5"/>
+                <rect x="3" y="14" width="7" height="7" rx="1.5"/>
+                <rect x="14" y="14" width="7" height="7" rx="1.5"/>
+            </svg>
+            <span>应用市场</span>
+        </a>
+        <button type="button" class="rail-item" onclick="openSettings()" title="系统设置">
             <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
                  stroke-linejoin="round" viewBox="0 0 24 24">
                 <circle cx="12" cy="12" r="3"/>
                 <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.35.4.65.72.86"/>
             </svg>
-            <span>设置</span>
+            <span>系统设置</span>
         </button>
-        <button type="button" class="sb-nav-item" onclick="openMembership()" title="套餐与用量">
+    </nav>
+
+    <div class="rail-spacer"></div>
+
+    <div class="rail-foot">
+        <div class="rail-user" onclick="openSettings()" title="账号与套餐">
+            <div class="rail-avatar">👤</div>
+            <div class="rail-user-name" id="railUserName">用户</div>
+            <div class="rail-plan">专业版</div>
+        </div>
+        <button type="button" class="rail-item" onclick="openMembership()" title="套餐与用量">
             <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
                  stroke-linejoin="round" viewBox="0 0 24 24">
                 <path d="M3 8.5A2.5 2.5 0 0 1 5.5 6h13A2.5 2.5 0 0 1 21 8.5v7A2.5 2.5 0 0 1 18.5 18h-13A2.5 2.5 0 0 1 3 15.5z"/>
@@ -89,15 +121,41 @@
             </svg>
             <span>会员</span>
         </button>
-        <button type="button" class="sb-nav-item" onclick="openTraces()" title="执行轨迹与任务">
-            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+    </div>
+</aside>
+
+<!-- ===================== SIDEBAR — 历史对话 ===================== -->
+<div class="sidebar" id="sidebar">
+    <div class="sb-history-head">
+        <span class="sb-history-title">历史对话</span>
+        <button type="button" class="sb-icon-btn" onclick="startNewChat()" title="新会话">
+            <svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
                  stroke-linejoin="round" viewBox="0 0 24 24">
-                <path d="M4 19V5M4 19h16"/>
-                <path d="M8 15v-4M12 15V7M16 15v-6"/>
+                <path d="M12 5v14M5 12h14"/>
             </svg>
-            <span>轨迹</span>
         </button>
-    </nav>
+        <button type="button" class="sb-icon-btn sb-toggle" id="sidebarToggle"
+                onclick="toggleSidebar()" title="收起侧栏">
+            <svg class="icon-collapse" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+                <path d="M19 12H5M12 19l-7-7 7-7"/>
+            </svg>
+            <svg class="icon-expand" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+                <path d="M5 12h14M12 5l7 7-7 7"/>
+            </svg>
+        </button>
+    </div>
+
+    <div class="sb-search">
+        <svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+             stroke-linejoin="round" viewBox="0 0 24 24">
+            <circle cx="11" cy="11" r="7"/>
+            <path d="m20 20-3.5-3.5"/>
+        </svg>
+        <input type="text" id="convSearch" placeholder="搜索对话..."
+               oninput="filterConversations(this.value)">
+    </div>
 
     <!-- 工作区：会话级绑定目录，按图片要求挪到左侧 -->
     <div class="sb-section">
@@ -155,6 +213,16 @@
 
 <!-- ===================== MAIN ===================== -->
 <div class="main">
+
+    <!-- 窄屏时右侧栏被隐藏，用这个按钮把它拉出来（宽屏下 display:none） -->
+    <button type="button" class="inspector-toggle" id="inspectorToggle"
+            onclick="toggleInspector()" title="任务执行详情">
+        <svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+             stroke-linejoin="round" viewBox="0 0 24 24">
+            <rect x="3" y="4" width="18" height="16" rx="2"/>
+            <path d="M15 4v16"/>
+        </svg>
+    </button>
 
     <!-- 顶部任务条：随滚动切换到当前视口所属的用户任务 -->
     <div class="task-pin" id="taskPin" onclick="taskPinJump()" title="点击定位到该任务">
@@ -377,6 +445,56 @@
     </div>
 </div>
 
+<!-- ===================== INSPECTOR — 右侧检查器 =====================
+     数据全部来自真实接口（14a-inspector.js）：
+       · 任务执行详情  /api/conversations/{sid}/executions + /api/executions/{id}/steps
+       · 执行工具      同一份 steps 聚合去重
+       · 记忆与知识    /api/shell/memory-insights
+       · 系统状态      /api/shell/status
+     没有任何一块是写死的占位数字；拿不到数据就显式说"暂无"。 -->
+<aside class="inspector" id="inspector">
+    <div class="inspector-head">
+        <span class="inspector-title">任务执行详情</span>
+        <span class="inspector-state">
+            <span class="inspector-dot" id="inspStateDot"></span>
+            <span id="inspStateText">空闲</span>
+        </span>
+        <button type="button" class="inspector-close" title="收起执行详情"
+                aria-label="收起执行详情" onclick="toggleInspector(false)">×</button>
+    </div>
+
+    <div class="insp-section">
+        <div class="insp-head">执行步骤<a href="/trace" target="_self">查看全部</a></div>
+        <div class="insp-steps" id="inspSteps">
+            <div class="insp-empty">当前会话还没有执行记录。发一条消息后这里会实时显示每一步。</div>
+        </div>
+        <div class="insp-progress" id="inspProgress" hidden>
+            <div class="insp-progress-fill" id="inspProgressFill"></div>
+        </div>
+    </div>
+
+    <div class="insp-section">
+        <div class="insp-head">执行工具<a href="/apps" target="_self">查看全部</a></div>
+        <div class="insp-tools" id="inspTools">
+            <div class="insp-empty">本次任务尚未调用工具。</div>
+        </div>
+    </div>
+
+    <div class="insp-section">
+        <div class="insp-head">记忆与知识<a href="/memory" target="_self">查看全部</a></div>
+        <div class="insp-kv" id="inspMemory">
+            <div class="insp-empty">加载中…</div>
+        </div>
+    </div>
+
+    <div class="insp-section">
+        <div class="insp-head">系统状态</div>
+        <div class="insp-kv" id="inspStatus">
+            <div class="insp-empty">加载中…</div>
+        </div>
+    </div>
+</aside>
+
 <!-- Lightbox -->
 <div class="lightbox" id="lightbox" onclick="closeLightbox()" role="dialog" aria-modal="true" aria-label="图片预览">
     <div class="lb-toolbar" onclick="event.stopPropagation()" aria-label="图片操作">
@@ -406,6 +524,9 @@
         <div class="ask-actions" id="askActions">
             <button type="button" class="ask-deny" onclick="denyAskTool()">拒绝</button>
             <button type="button" class="ask-allow" onclick="grantAskTool()">批准并继续</button>
+            <!-- 与「批准并继续」的区别：这条把工具名写进会话级白名单，
+                 之后同一会话里同名工具不再逐次询问（POST /api/shell/permission/always）。 -->
+            <button type="button" class="ask-always" onclick="alwaysAllowAskTool()">本会话始终允许</button>
         </div>
         <!-- 批准已过期或服务端未接受时换成这一个按钮：那次调用的 token 已经作废，
              留一个点了没反应的「批准并继续」比不给按钮更糟。 -->
@@ -530,6 +651,7 @@
     <script src="/js/chat/12-message.js"></script>
     <script src="/js/chat/13-markdown.js"></script>
     <script src="/js/chat/14-media-src.js"></script>
+    <script src="/js/chat/14a-inspector.js"></script>
     <script src="/js/chat/15-sync.js"></script>
     <script src="/js/chat/16-init.js"></script>
 </body>

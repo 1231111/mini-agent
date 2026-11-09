@@ -231,6 +231,35 @@ async function grantAskTool() {
     }
 }
 
+/**
+ * 「本会话始终允许」：把当前工具写进会话级白名单，再放行这一次待批的调用。
+ *
+ * 顺序不能反：白名单只是让「之后的同名调用」不再询问，当前这一次仍然持有一次性
+ * grantToken，必须由 grantAskTool() 走 PUT /api/permission 才能继续跑。
+ * 白名单请求失败时不放行 —— 否则用户以为已经记住，实际下一轮还会再问一次。
+ */
+async function alwaysAllowAskTool() {
+    const tool = pendingAskTool;
+    if (!tool || !currentId) return;
+    try {
+        const resp = await fetch('/api/shell/permission/always', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: currentId, tool })
+        });
+        const body = await readApiBody(resp);
+        if (!resp.ok || !apiSuccess(body)) {
+            throw new Error(apiFailureMessage(body, resp));
+        }
+        await grantAskTool();
+    } catch (e) {
+        console.warn('always allow failed', e);
+        setAskModalText('没能记住这个工具：' + e.message + '。可以改用「批准并继续」只放行这一次。');
+        document.getElementById('askModal').classList.add('show');
+        showAskActions();
+    }
+}
+
 function showUserQuestionModal(payload) {
     const q = payload && payload.question ? String(payload.question) : '';
     const options = Array.isArray(payload && payload.options) ? payload.options : [];

@@ -1264,6 +1264,14 @@
         }
         .ask-deny { background: var(--surface2); color: var(--text); }
         .ask-allow { background: var(--accent); color: #fff; }
+        /* 三档里最"重"的一档：会写进会话级白名单，样式上弱于「批准并继续」，
+           避免用户顺手点到它。 */
+        .ask-always {
+            background: transparent; color: var(--text2);
+            border: 1px solid var(--border) !important;
+            margin-right: auto;
+        }
+        .ask-always:hover { color: var(--text); border-color: var(--border-strong) !important; }
         .ask-modal .question-options {
             display: flex; flex-wrap: wrap; gap: 8px;
             justify-content: flex-start; margin: 0 0 16px;

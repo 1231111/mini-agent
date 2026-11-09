@@ -21,7 +21,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.UnaryOperator;
 
 /**
- * 按 sessionId 保存权限模式、Plan 批准状态、带参数摘要和过期时间的 Ask 授权、待办确认策略，
+ * 按 sessionId 保存权限模式、Plan 批准状态、带参数摘要和过期时间的 Ask 授权、
+ * 用户显式点选的「本会话始终允许」工具集合、待办确认策略，
  * 以及 exec_command 策略的会话级覆盖。
  */
 @Component
@@ -39,7 +40,8 @@ public class SessionPermissionStore {
             Set<String> askGrantedTools,
             Map<String, AskGrant> askGrants,
             ConfirmPolicy confirmPolicy,
-            ExecPolicy execPolicyOverride
+            ExecPolicy execPolicyOverride,
+            Set<String> alwaysAllowedTools
     ) {
         /** Compatibility constructor for callers compiled against the old set-only state. */
         public SessionPerm(
@@ -49,7 +51,19 @@ public class SessionPermissionStore {
                 ConfirmPolicy confirmPolicy,
                 ExecPolicy execPolicyOverride) {
             this(mode, planApproved, askGrantedTools, Map.of(), confirmPolicy,
-                    execPolicyOverride);
+                    execPolicyOverride, Set.of());
+        }
+
+        /** Compatibility constructor for the pre-always state (askGrants, no always set). */
+        public SessionPerm(
+                PermissionMode mode,
+                boolean planApproved,
+                Set<String> askGrantedTools,
+                Map<String, AskGrant> askGrants,
+                ConfirmPolicy confirmPolicy,
+                ExecPolicy execPolicyOverride) {
+            this(mode, planApproved, askGrantedTools, askGrants, confirmPolicy,
+                    execPolicyOverride, Set.of());
         }
 
         public SessionPerm {
@@ -57,6 +71,9 @@ public class SessionPermissionStore {
                     ? Set.of()
                     : Set.copyOf(askGrantedTools);
             askGrants = askGrants == null ? Map.of() : Map.copyOf(askGrants);
+            alwaysAllowedTools = alwaysAllowedTools == null
+                    ? Set.of()
+                    : Set.copyOf(alwaysAllowedTools);
         }
     }
 
@@ -100,7 +117,7 @@ public class SessionPermissionStore {
     private static SessionPerm defaults() {
         return new SessionPerm(
                 PermissionMode.DEFAULT, false,
-                Set.of(), Map.of(), ConfirmPolicy.DANGEROUS, null);
+                Set.of(), Map.of(), ConfirmPolicy.DANGEROUS, null, Set.of());
     }
 
     public SessionPerm get(String sessionId) {
@@ -143,7 +160,8 @@ public class SessionPermissionStore {
                 state.askGrantedTools(),
                 state.askGrants(),
                 ConfirmPolicy.from(state.confirmPolicy()),
-                execPolicy);
+                execPolicy,
+                state.alwaysAllowedTools());
     }
 
     private SessionPermissionPersistence.State toState(
@@ -157,6 +175,7 @@ public class SessionPermissionStore {
                 Optional.ofNullable(permission.execPolicyOverride())
                         .map(ExecPolicy::wireName)
                         .orElse(null),
+                permission.alwaysAllowedTools(),
                 version);
     }
 
@@ -219,7 +238,8 @@ public class SessionPermissionStore {
                     grants,
                     old.askGrants(),
                     policy,
-                    old.execPolicyOverride());
+                    old.execPolicyOverride(),
+                    old.alwaysAllowedTools());
         });
     }
 
@@ -231,7 +251,7 @@ public class SessionPermissionStore {
             return new SessionPerm(
                     base.mode(), base.planApproved(), base.askGrantedTools(),
                     base.askGrants(), policy,
-                    base.execPolicyOverride());
+                    base.execPolicyOverride(), base.alwaysAllowedTools());
         });
     }
 
@@ -256,7 +276,7 @@ public class SessionPermissionStore {
             }
             return new SessionPerm(
                     base.mode(), base.planApproved(), grants, askGrants,
-                    base.confirmPolicy(), policy);
+                    base.confirmPolicy(), policy, base.alwaysAllowedTools());
         });
     }
 
@@ -288,7 +308,8 @@ public class SessionPermissionStore {
                     grants,
                     old.askGrants(),
                     policy,
-                    old.execPolicyOverride());
+                    old.execPolicyOverride(),
+                    old.alwaysAllowedTools());
         });
     }
 
@@ -323,7 +344,8 @@ public class SessionPermissionStore {
                     grants,
                     askGrants,
                     old.confirmPolicy(),
-                    old.execPolicyOverride());
+                    old.execPolicyOverride(),
+                    old.alwaysAllowedTools());
         });
     }
 
@@ -665,7 +687,8 @@ public class SessionPermissionStore {
                 }
                 persisted.put(pending.token(), pending);
                 return new SessionPerm(old.mode(), old.planApproved(), names, persisted,
-                        old.confirmPolicy(), old.execPolicyOverride());
+                        old.confirmPolicy(), old.execPolicyOverride(),
+                        old.alwaysAllowedTools());
             });
         }
         return Optional.of(approved);
@@ -675,6 +698,14 @@ public class SessionPermissionStore {
     public boolean isAskGranted(String sessionId, String toolName, String arguments) {
         if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(toolName)) {
             return false;
+        }
+        // 「始终允许」是会话级、按工具名的显式授权：命中后本会话内该工具不再逐次弹窗，
+        // 因此这里直接放行，**不再要求 argumentDigest 精确匹配**。这不会削弱一次性授权
+        // 的安全性 —— 那条判据仍然只作用于 askGrants（精确参数摘要 + TTL + 单次令牌），
+        // alwaysAllowedTools 是用户另一次显式点选、可随时撤销、作用域仅限本会话的独立维度，
+        // 两者互不替代：askGrants 管「这一次具体调用」，alwaysAllowedTools 管「这个工具以后都别问」。
+        if (isAlwaysAllowed(sessionId, toolName)) {
+            return true;
         }
         SessionPerm permission = get(sessionId);
         String digest = argumentDigest(toolName, arguments);
@@ -702,6 +733,62 @@ public class SessionPermissionStore {
             return false;
         }
         return get(sessionId).askGrantedTools().contains(toolName);
+    }
+
+    // ==================== 「始终允许」（会话级，按工具名） ====================
+
+    /**
+     * 该工具在<strong>本会话</strong>内是否被用户点过「始终允许」。
+     * 作用域只到 sessionId，会话结束/被清空即失效。
+     */
+    public boolean isAlwaysAllowed(String sessionId, String toolName) {
+        if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(toolName)) {
+            return false;
+        }
+        return get(sessionId).alwaysAllowedTools().contains(toolName.trim());
+    }
+
+    /** 返回当前「始终允许」列表（不可变快照）。 */
+    public Set<String> alwaysAllowedTools(String sessionId) {
+        if (StringUtils.isBlank(sessionId)) {
+            return Set.of();
+        }
+        return get(sessionId).alwaysAllowedTools();
+    }
+
+    /**
+     * 把工具加入本会话的「始终允许」集合。走 {@link #update} 的 CAS 链路，
+     * 不绕过版本号；重复添加幂等。
+     */
+    public void alwaysAllow(String sessionId, String tool) {
+        if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(tool)) {
+            return;
+        }
+        String name = tool.trim();
+        update(sessionId, old -> {
+            Set<String> always = new HashSet<>(old.alwaysAllowedTools());
+            always.add(name);
+            return new SessionPerm(
+                    old.mode(), old.planApproved(), old.askGrantedTools(),
+                    old.askGrants(), old.confirmPolicy(),
+                    old.execPolicyOverride(), always);
+        });
+    }
+
+    /** 撤销本会话某工具的「始终允许」，之后该工具恢复逐次询问。 */
+    public void revokeAlwaysAllow(String sessionId, String tool) {
+        if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(tool)) {
+            return;
+        }
+        String name = tool.trim();
+        update(sessionId, old -> {
+            Set<String> always = new HashSet<>(old.alwaysAllowedTools());
+            always.remove(name);
+            return new SessionPerm(
+                    old.mode(), old.planApproved(), old.askGrantedTools(),
+                    old.askGrants(), old.confirmPolicy(),
+                    old.execPolicyOverride(), always);
+        });
     }
 
     /** Digest shared with ToolPipeline and the approval audit path. */
@@ -745,6 +832,7 @@ public class SessionPermissionStore {
         view.put("planApproved", p.planApproved());
         view.put("planActive", p.mode() == PermissionMode.PLAN && !p.planApproved());
         view.put("askGrantedTools", Set.copyOf(p.askGrantedTools()));
+        view.put("alwaysAllowedTools", Set.copyOf(p.alwaysAllowedTools()));
         long now = System.currentTimeMillis();
         view.put("askGrants", p.askGrants().values().stream()
                 .filter(g -> !g.expired(now))

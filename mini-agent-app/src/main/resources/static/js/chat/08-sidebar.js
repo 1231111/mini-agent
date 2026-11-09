@@ -5,6 +5,52 @@
 const sidebarRunningSessions = new Set();
 let sidebarRefreshTimer = null;
 let sidebarRenderEpoch = 0;
+/** 历史对话搜索框的当前关键词（小写）。renderSidebar() 重建 DOM 后要据此重新过滤。 */
+let convSearchQuery = '';
+
+/**
+ * 搜索框 oninput 入口。只做前端过滤，不发请求 —— 会话列表本来就已经全量取回来了，
+ * 再打一个后端搜索接口属于重复往返。
+ */
+function filterConversations(value) {
+    convSearchQuery = String(value == null ? '' : value).trim().toLowerCase();
+    applyConvFilter();
+}
+
+/** 按 convSearchQuery 显隐 .sb-item，并把整组都无命中的日期分组标题一起藏掉。 */
+function applyConvFilter() {
+    const el = document.getElementById('sbHistory');
+    if (!el) return;
+    const rows = [...el.querySelectorAll('.sb-item')];
+    let visible = 0;
+    rows.forEach(row => {
+        const title = (row.title || row.textContent || '').toLowerCase();
+        const hit = !convSearchQuery || title.includes(convSearchQuery);
+        row.hidden = !hit;
+        if (hit) visible++;
+    });
+    [...el.querySelectorAll('.sb-date-label')].forEach(label => {
+        let node = label.nextElementSibling;
+        let count = 0;
+        while (node && !node.classList.contains('sb-date-label')) {
+            if (node.classList.contains('sb-item') && !node.hidden) count++;
+            node = node.nextElementSibling;
+        }
+        label.hidden = count === 0;
+    });
+    let hint = document.getElementById('sbNoMatch');
+    if (convSearchQuery && visible === 0 && rows.length) {
+        if (!hint) {
+            hint = document.createElement('div');
+            hint.id = 'sbNoMatch';
+            hint.className = 'sb-no-match';
+            el.appendChild(hint);
+        }
+        hint.textContent = '没有匹配「' + convSearchQuery + '」的对话';
+    } else if (hint) {
+        hint.remove();
+    }
+}
 
 async function refreshSidebarRunningSessions() {
     const rows = [...document.querySelectorAll('.sb-item[data-session-id]')];
@@ -70,6 +116,7 @@ async function renderSidebar() {
     });
     if (list.length === 0) {
         el.innerHTML = '<div style="padding:10px 8px;font-size:12px;color:var(--text3)">暂无历史对话</div>';
+        applyConvFilter();
         if (renderEpoch === sidebarRenderEpoch) startSidebarRunningRefresh();
         return;
     }
@@ -106,6 +153,8 @@ async function renderSidebar() {
             updateSidebarRunningIndicator(row);
         });
     });
+    // 重建 DOM 会丢掉搜索过滤，这里按当前关键词重放一次
+    applyConvFilter();
     if (renderEpoch === sidebarRenderEpoch) {
         refreshSidebarRunningSessions();
         startSidebarRunningRefresh();

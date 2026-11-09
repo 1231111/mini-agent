@@ -1,0 +1,619 @@
+/* =============================================================================
+   SHELL — 四栏骨架（主导航 / 历史对话 / 主对话区 / 右侧检查器）
+
+   和历史文件的分工：
+     chat.css        页面存在以来的两栏布局与消息区样式，本次不改（改动面太大、
+                     16 个 /js/chat/*.js 都依赖它的类名）。本文件在它之后加载，
+                     只负责「把两栏扩成四栏」以及两块新面板。
+     shell.css       本文件：rail / inspector / 窄屏断点 / 新页面共用外壳。
+
+   为什么不直接改 chat.css 的 body 布局：body 已经是 display:flex，
+   新增的两个兄弟节点天然排在两侧，不需要重写既有的 .sidebar / .main 规则。
+   ========================================================================== */
+
+:root {
+    --rail-w: 92px;
+    --inspector-w: 300px;
+    /* 导航栏在明暗两套主题下都保持深色：它是「外壳」不是内容区，
+       跟着主题变浅会和截图里的形态不一致，也会让图标对比度不足。
+       因此这里单独给一组不随 data-theme 变化的色值。 */
+    --rail-bg-top: #1d2a4d;
+    --rail-bg-bottom: #151d33;
+    --rail-text: #dbe3f4;
+    --rail-text-dim: #8f9bb5;
+    --rail-active: #2f6fed;
+    --inspector-bg: var(--sidebar-bg);
+}
+
+/* =====================================================================
+   主导航（最左）
+   ===================================================================== */
+.rail {
+    width: var(--rail-w);
+    flex-shrink: 0;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding: 14px 8px 10px;
+    background: linear-gradient(180deg, var(--rail-bg-top), var(--rail-bg-bottom));
+    color: var(--rail-text);
+    overflow: hidden;
+    transition: width .18s ease;
+}
+
+.rail-brand {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 18px;
+    text-align: center;
+}
+
+.rail-brand-icon {
+    width: 38px;
+    height: 38px;
+    border-radius: 11px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    background: rgba(255, 255, 255, .1);
+    border: 1px solid rgba(255, 255, 255, .16);
+}
+
+.rail-brand-name {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: .02em;
+    white-space: nowrap;
+}
+
+.rail-brand-sub {
+    font-size: 10px;
+    color: var(--rail-text-dim);
+    white-space: nowrap;
+}
+
+.rail-nav {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.rail-item {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 5px;
+    padding: 9px 4px;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    color: var(--rail-text-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background .15s, color .15s;
+}
+
+.rail-item svg {
+    width: 19px;
+    height: 19px;
+    flex-shrink: 0;
+}
+
+.rail-item:hover {
+    background: rgba(255, 255, 255, .08);
+    color: var(--rail-text);
+}
+
+.rail-item.active {
+    background: var(--rail-active);
+    color: #fff;
+}
+
+.rail-item .rail-badge {
+    position: absolute;
+    transform: translate(16px, -6px);
+    min-width: 15px;
+    height: 15px;
+    padding: 0 4px;
+    border-radius: 8px;
+    background: #e5484d;
+    color: #fff;
+    font-size: 10px;
+    line-height: 15px;
+    text-align: center;
+}
+
+.rail-spacer {
+    flex: 1;
+}
+
+.rail-foot {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(255, 255, 255, .1);
+}
+
+.rail-user {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    max-width: 100%;
+}
+
+.rail-avatar {
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, .14);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 15px;
+}
+
+.rail-user-name {
+    font-size: 11px;
+    max-width: 76px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.rail-plan {
+    font-size: 10px;
+    color: var(--rail-text-dim);
+}
+
+/* =====================================================================
+   历史对话栏：顶部换标题，不再放导航
+   ===================================================================== */
+.sb-history-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 12px 10px;
+}
+
+.sb-history-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--heading);
+    flex: 1;
+    white-space: nowrap;
+}
+
+.sb-history-head .sb-icon-btn {
+    color: var(--text2);
+}
+
+.sb-search {
+    margin: 0 12px 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 9px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+}
+
+.sb-search svg {
+    width: 13px;
+    height: 13px;
+    color: var(--text3);
+    flex-shrink: 0;
+}
+
+.sb-search input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: 12px;
+}
+
+.sb-search input::placeholder {
+    color: var(--text3);
+}
+
+/* 搜索过滤：.sb-item 自己带 display:flex，作者样式优先级高于 [hidden] 的 UA 规则，
+   所以必须显式再写一条 display:none，否则 hidden 属性不生效。 */
+.sb-item[hidden],
+.sb-date-label[hidden] {
+    display: none !important;
+}
+
+.sb-no-match {
+    padding: 10px 8px;
+    font-size: 12px;
+    color: var(--text3);
+    line-height: 1.5;
+}
+
+/* =====================================================================
+   主对话区：给固定定位元素一个相对锚点
+   ===================================================================== */
+.main {
+    position: relative;
+}
+
+/* 原实现是 position:fixed + left:50%，在四栏下会偏到整个窗口的中心。
+   改成相对 .main 绝对定位，跟随对话列居中。 */
+#scrollBtn {
+    position: absolute;
+    left: 50%;
+    bottom: 120px;
+}
+
+/* 主区顶部的右侧栏开关：窄屏时右侧栏隐藏，靠它拉出来 */
+.inspector-toggle {
+    display: none;
+    position: absolute;
+    top: 10px;
+    right: 12px;
+    z-index: 30;
+    width: 30px;
+    height: 30px;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text2);
+    cursor: pointer;
+}
+
+.inspector-toggle svg {
+    width: 15px;
+    height: 15px;
+}
+
+/* =====================================================================
+   右侧检查器
+   ===================================================================== */
+.inspector {
+    width: var(--inspector-w);
+    flex-shrink: 0;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    border-left: 1px solid var(--border);
+    background: var(--inspector-bg);
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+
+.inspector.hidden {
+    display: none;
+}
+
+.inspector-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 14px 10px;
+    position: sticky;
+    top: 0;
+    background: var(--inspector-bg);
+    z-index: 2;
+}
+
+.inspector-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--heading);
+    flex: 1;
+}
+
+.inspector-state {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: var(--text2);
+}
+
+.inspector-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--text3);
+}
+
+.inspector-dot.running {
+    background: #2f6fed;
+    box-shadow: 0 0 0 3px rgba(47, 111, 237, .18);
+}
+
+.inspector-dot.done {
+    background: #22c55e;
+}
+
+.inspector-dot.failed {
+    background: #ef4444;
+}
+
+/* 宽屏时右侧栏是常驻列，顶部那个 .inspector-toggle 被 display:none 掉了，
+   所以栏内自留一个收起按钮，两种宽度下都能关。 */
+.inspector-close {
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text3);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.inspector-close:hover {
+    background: var(--surface2);
+    color: var(--text);
+}
+
+.insp-section {
+    padding: 0 14px 14px;
+}
+
+.insp-section + .insp-section {
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+}
+
+.insp-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text2);
+}
+
+.insp-head a {
+    margin-left: auto;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--accent);
+    text-decoration: none;
+    white-space: nowrap;
+}
+
+.insp-head a:hover {
+    text-decoration: underline;
+}
+
+.insp-empty {
+    font-size: 12px;
+    color: var(--text3);
+    line-height: 1.6;
+}
+
+/* 步骤时间线 */
+.insp-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+}
+
+.insp-step {
+    display: flex;
+    gap: 8px;
+    position: relative;
+    padding-bottom: 12px;
+}
+
+.insp-step:last-child {
+    padding-bottom: 0;
+}
+
+.insp-step:not(:last-child)::before {
+    content: '';
+    position: absolute;
+    left: 6px;
+    top: 16px;
+    bottom: 0;
+    width: 1px;
+    background: var(--border);
+}
+
+.insp-step-icon {
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    border: 1px solid var(--border-strong);
+    flex-shrink: 0;
+    margin-top: 2px;
+    background: var(--surface);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    color: #fff;
+    z-index: 1;
+}
+
+.insp-step.done .insp-step-icon {
+    background: #22c55e;
+    border-color: #22c55e;
+}
+
+.insp-step.running .insp-step-icon {
+    background: #2f6fed;
+    border-color: #2f6fed;
+}
+
+.insp-step.failed .insp-step-icon {
+    background: #ef4444;
+    border-color: #ef4444;
+}
+
+.insp-step-body {
+    flex: 1;
+    min-width: 0;
+}
+
+.insp-step-title {
+    font-size: 12px;
+    color: var(--text);
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+.insp-step.running .insp-step-title {
+    color: #2f6fed;
+    font-weight: 500;
+}
+
+.insp-step-meta {
+    font-size: 11px;
+    color: var(--text3);
+    margin-top: 2px;
+}
+
+.insp-progress {
+    height: 4px;
+    border-radius: 3px;
+    background: var(--border);
+    overflow: hidden;
+    margin-top: 8px;
+}
+
+.insp-progress-fill {
+    height: 100%;
+    width: 0;
+    border-radius: 3px;
+    background: var(--accent);
+    transition: width .35s ease;
+}
+
+/* 工具列表 */
+.insp-tools {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.insp-tool {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    font-size: 12px;
+}
+
+.insp-tool-icon {
+    width: 20px;
+    height: 20px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    flex-shrink: 0;
+}
+
+.insp-tool-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text);
+}
+
+.insp-tool-state {
+    font-size: 11px;
+    color: var(--text3);
+    white-space: nowrap;
+}
+
+/* 状态表 */
+.insp-kv {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 12px;
+}
+
+.insp-kv-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.insp-kv-key {
+    color: var(--text3);
+    width: 62px;
+    flex-shrink: 0;
+}
+
+.insp-kv-val {
+    color: var(--text);
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* =====================================================================
+   窄屏断点
+   ===================================================================== */
+@media (max-width: 1440px) {
+    :root { --inspector-w: 272px; }
+}
+
+@media (max-width: 1180px) {
+    .inspector {
+        position: absolute;
+        right: 0;
+        top: 0;
+        bottom: 0;
+        z-index: 40;
+        box-shadow: -8px 0 24px rgba(0, 0, 0, .18);
+    }
+    .inspector.hidden { display: none; }
+    .inspector-toggle { display: flex; }
+}
+
+@media (max-width: 820px) {
+    :root { --rail-w: 58px; }
+    .rail-brand-name,
+    .rail-brand-sub,
+    .rail-item span,
+    .rail-user-name,
+    .rail-plan { display: none; }
+    .rail-item { padding: 10px 4px; }
+}
+
+/* 极窄窗口沿用 chat.css 的 .sidebar{display:none}，这里只处理 rail 文字与间距 */
+@media (max-width: 700px) {
+    :root { --rail-w: 52px; }
+}
