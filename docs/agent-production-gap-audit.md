@@ -1106,3 +1106,33 @@ return hasSuspendedTodo ? CONTINUE : ACTION;   // CONTINUE: suspend=false, resum
 - `TaskTodoScopeTest` 增至 13 项：新增"清空后可恢复"、"作废清单落盘后仍可恢复"
   （换实例模拟重启）、"没有作废内容时恢复为空"、"resume 回到被作废任务时自动恢复"。
 - planner 全量 **377 项全绿**。
+
+### TODO-01 第五步：in_progress 不是「正在执行」，是本轮指针（调查后回退）
+
+原判断：中断后条目停在 `in_progress` 是缺陷 —— 恢复后模型会以为这一步还在跑。
+据此加了 `demoteInProgress`（跨轮降级为 `pending` + 中断提示），并在
+`overwrite` 里加「带中断标记就不写回 in_progress」的压制。
+
+**实测证伪，已全部回退。**
+
+证伪过程（`todo 落盘 payload` 日志）：
+
+1. 降级写入的是 `"status":"pending"`；
+2. **40 毫秒后**又落盘一次 `"status":"in_progress"`，note 保留；
+3. 调用链是 `TaskTodoStore.promoteReadyItems`（`TaskTodoStore:716`）：
+   只要清单里没有 `in_progress` / `awaiting_confirm` 的条目，它就把第一个
+   依赖已满足的 `pending` 自动提升为 `in_progress`。
+
+结论：在这个系统里 `in_progress` 的语义是**「当前指向的步骤」**，不是
+「正在执行的步骤」，由 `promoteReadyItems` 自动维护。中断/重启后它保留是
+**正确行为** —— 恢复就该从那条继续。强行降级会立刻被自动推进改回来，
+等于和既有状态机对抗。
+
+真正的问题只在展示层：UI 把 `in_progress` 渲染成「进行中」，让人以为它还在跑。
+要改应该改文案（「待继续 / 当前步骤」）或按 execution 是否在跑区分显示，
+而不是改状态机。
+
+已回退：`demoteInProgress`、`INTERRUPT_NOTE`、`overwrite` 里的压制分支、
+`CONTEXT_LOAD.todoDemoted`，以及对应 5 条测试。
+
+保留这条记录，是因为「把 in_progress 当缺陷」这个误判很可能会再犯一次。
