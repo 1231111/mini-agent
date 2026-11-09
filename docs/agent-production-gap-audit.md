@@ -721,8 +721,8 @@ docker-compose.yml:64-65,84-85   MINIO_ACCESS_KEY/SECRET: minioadmin / minioadmi
   `docker/mysql-init/01-memory-database.sql`。
 - 部署形态改为宿主机直跑 jar：MySQL / Redis 由系统安装并常驻，
   `scripts/run-app.sh` 与 `scripts/run-app.ps1` 只探测 3306 / 6379 端口，不再查询容器。
-- `scripts/ensure-deploy-secrets.sh` 仍在，但在密钥已内置到 `application.yml`
-  默认值之后只用于需要轮换密钥的场景。
+- `scripts/ensure-deploy-secrets.sh`（把密钥写进 `.env` 的工具）已删除：密钥只存在于
+  两个服务的 `application.yml`，不再有 `.env` 这个载体。
 - CI 里的 `docker compose --env-file .env.example config --quiet` 校验步骤同步删除。
 - 与 P0-8 相关的一条约束**仍然成立**：`MYSQL_ROOT_PASSWORD` 这类口令不允许有仓库默认值，
   只是现在约束点在部署机 `.env` / 环境变量，而不是 compose 的 `${VAR:?}`。
