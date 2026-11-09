@@ -5,9 +5,9 @@ server:
 
 spring:
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USERNAME}
-    password: ${DB_PASSWORD}
+    url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:KGEnrzNNVB4bwaJPC7x6LcoZ8NbZ}
   jpa:
     hibernate:
       ddl-auto: validate
@@ -36,5 +36,5 @@ agent:
     registration-enabled: true
     password-min-length: 12
     bcrypt-strength: 12
-    internal-key: ${ACCOUNT_INTERNAL_KEY:}
-    memory-token-key: ${ACCOUNT_MEMORY_TOKEN_KEY:}
+    internal-key: ${ACCOUNT_INTERNAL_KEY:gMPzIKw7wTtIZOhGibpoAGkdzzXYbsEEfhUVDg0Tb1w=}
+    memory-token-key: ${ACCOUNT_MEMORY_TOKEN_KEY:mMdxSRXpWYc8ApX3ejLKFsxzUN0ZBMW5GkE7Rjv5QmI=}

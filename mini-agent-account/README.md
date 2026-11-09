@@ -28,11 +28,8 @@ mysql -uroot -p -e "CREATE DATABASE IF NOT EXISTS mini_agent CHARACTER SET utf8m
 
 ./mvnw -pl mini-agent-account -am -DskipTests package
 
-DB_URL='jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8' \
-DB_USERNAME=root \
-DB_PASSWORD='<root 口令>' \
 java -jar mini-agent-account/target/mini-agent-account-0.0.1-SNAPSHOT.jar \
-  --spring.profiles.active=prod --server.port=8081
+  --spring.profiles.active=prod
 ```
 
 注册页是 `http://<主机>:8081/login`，套餐和订单是 `http://<主机>:8081/account`。空库由本服务自己的 V1、V2 建表。
@@ -49,17 +46,13 @@ mysql -uroot -p -e "CREATE DATABASE IF NOT EXISTS mini_agent_memory CHARACTER SE
 
 ./mvnw -pl mini-agent-memory-service -am -DskipTests package
 
-MEMORY_SERVICE_ROLE=all \
-MEMORY_SERVICE_ADDRESS=0.0.0.0 \
-MEMORY_SERVICE_PORT=8091 \
-DB_URL='jdbc:mysql://127.0.0.1:3306/mini_agent_memory?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8' \
-DB_USERNAME=root \
-DB_PASSWORD='<root 口令>' \
-ACCOUNT_BASE_URL=http://127.0.0.1:8081 \
+MEMORY_SERVICE_ROLE=all MEMORY_SERVICE_PORT=8091 \
 java -jar mini-agent-memory-service/target/mini-agent-memory-service-0.0.1-SNAPSHOT.jar
 ```
 
-`ACCOUNT_INTERNAL_KEY` 与 `ACCOUNT_MEMORY_TOKEN_KEY` 已内置在两个服务的 `application.yml` 默认值里，两边天然一致，不需要额外注入。
+MySQL 地址、root 口令、Redis 地址与口令、`ACCOUNT_INTERNAL_KEY`、`ACCOUNT_MEMORY_TOKEN_KEY`
+全部内置在两个服务的 `application.yml` 默认值里，启动不需要再传任何环境变量。
+换机器或换口令时改 yml 里对应那一行即可。
 
 ### 本地
 

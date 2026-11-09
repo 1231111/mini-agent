@@ -24,7 +24,7 @@ spring:
     # 原来兜底是空字符串，于是"没配"和"配成空"无法区分，报错落在 MySQL 握手的
     # "using password: NO"（看着像权限问题），而不是"缺配置"。
     # 需要覆盖时照旧用环境变量；prod 档是裸的 ${DB_PASSWORD}，生产不走这个默认值。
-    password: ${DB_PASSWORD:mysql_root_pass}
+    password: ${DB_PASSWORD:KGEnrzNNVB4bwaJPC7x6LcoZ8NbZ}
     driver-class-name: com.mysql.cj.jdbc.Driver
   data:
     redis:
@@ -33,7 +33,7 @@ spring:
       # 同上。本机 Redis 的 requirepass 必须与此同值，
       # 所以这里兜底必须是同一个值：留空的话 Redis 会回 "NOAUTH Authentication required."，
       # 而 /actuator/health 只会显示 redis DOWN，看不出是密码没给。
-      password: ${REDIS_PASSWORD:miniagent_redis_pass}
+      password: ${REDIS_PASSWORD:DbNNvoUSY7F1v9o4dhd0WjoEyE11}
       timeout: 3s
   flyway:
     enabled: false

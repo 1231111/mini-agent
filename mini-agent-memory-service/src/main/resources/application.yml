@@ -6,9 +6,12 @@ spring:
   application:
     name: mini-agent-memory-service
   datasource:
-    url: ${DB_URL:jdbc:h2:file:./data/memory-service;MODE=MySQL;DB_CLOSE_DELAY=-1}
-    username: ${DB_USERNAME:sa}
-    password: ${DB_PASSWORD:}
+    # 默认连本机 MySQL 的 mini_agent_memory 库（由 Flyway 建表）。
+    # 早先默认是 H2 文件库，那是"本机单跑"的形态；改为 MySQL 后与 account 用同一套
+    # 口令和地址，部署时不再需要额外注入 DB_*。
+    url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/mini_agent_memory?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:KGEnrzNNVB4bwaJPC7x6LcoZ8NbZ}
   flyway:
     enabled: true
     # 与 App 的 db/migration 路径隔离：两条链各自从 V1 编号，指向两个库（见 db/migration-memory/README.md）
