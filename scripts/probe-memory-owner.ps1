@@ -86,7 +86,7 @@ FROM agent_semantic_facts
 WHERE object_value LIKE '%$marker%' OR subject LIKE '%$marker%'
 ORDER BY id DESC LIMIT 8;
 "@
-docker exec miniagent-mysql mysql -uroot -pmysql_root_pass --default-character-set=utf8mb4 mini_agent -e $sql 2>$null
+mysql -uroot -pmysql_root_pass --default-character-set=utf8mb4 mini_agent -e $sql 2>$null
 
 $userMd = Join-Path $env:USERPROFILE (".miniagent\memory\users\" + $userId + "\USER.md")
 Write-Host ("USER.md exists=" + (Test-Path $userMd))

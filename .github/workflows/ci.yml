@@ -50,9 +50,6 @@ jobs:
       - name: Validate Flyway migration sequence
         run: bash scripts/verify-migrations.sh
 
-      - name: Validate production Compose
-        run: docker compose --env-file .env.example config --quiet
-
       - name: Scan tracked files for high-signal secrets
         shell: bash
         run: |

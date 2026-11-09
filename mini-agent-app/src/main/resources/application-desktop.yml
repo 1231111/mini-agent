@@ -4,7 +4,7 @@
 # 激活方式：由 mini-agent-desktop/main.js 在启动后端时传入
 #   java -jar mini-agent-app.jar --spring.profiles.active=desktop
 #
-# 与 prod 档的区别（一句话）：prod 是 Docker Compose 形态，依赖 MySQL + Redis +
+# 与 prod 档的区别（一句话）：prod 是服务器形态，依赖 MySQL + Redis +
 # Milvus + 独立 embedding 服务；desktop 是单机形态，只依赖本机文件系统。
 #
 # 密钥一律来自 ${MINI_AGENT_HOME}/config.yml（由 application.yml 的

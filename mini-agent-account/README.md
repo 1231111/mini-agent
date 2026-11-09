@@ -21,21 +21,45 @@
 
 ### 只部署账号服务
 
+宿主机需要已有 MySQL（3306）。建库后直接起 jar：
+
 ```bash
-docker compose -f docker-compose.account.yml up -d --build
+mysql -uroot -p -e "CREATE DATABASE IF NOT EXISTS mini_agent CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+
+./mvnw -pl mini-agent-account -am -DskipTests package
+
+DB_URL='jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8' \
+DB_USERNAME=root \
+DB_PASSWORD='<root 口令>' \
+java -jar mini-agent-account/target/mini-agent-account-0.0.1-SNAPSHOT.jar \
+  --spring.profiles.active=prod --server.port=8081
 ```
 
-这一份只起 MySQL 和 `mini-agent-account`。注册页是 `http://<主机>:8081/login`，套餐和订单是 `http://<主机>:8081/account`。空库由本服务自己的 V1、V2 建表。
+注册页是 `http://<主机>:8081/login`，套餐和订单是 `http://<主机>:8081/account`。空库由本服务自己的 V1、V2 建表。
 
 桌面端把 `CLOUD_AUTH_BASE_URL` 和 `MINIAGENT_PORTAL_URL` 都设成同一个地址。
 
 ### 和云端记忆一起
 
+两个库先建好，然后分别起两个 jar：
+
 ```bash
-docker compose up -d --build
+mysql -uroot -p -e "CREATE DATABASE IF NOT EXISTS mini_agent CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+mysql -uroot -p -e "CREATE DATABASE IF NOT EXISTS mini_agent_memory CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+
+./mvnw -pl mini-agent-memory-service -am -DskipTests package
+
+MEMORY_SERVICE_ROLE=all \
+MEMORY_SERVICE_ADDRESS=0.0.0.0 \
+MEMORY_SERVICE_PORT=8091 \
+DB_URL='jdbc:mysql://127.0.0.1:3306/mini_agent_memory?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8' \
+DB_USERNAME=root \
+DB_PASSWORD='<root 口令>' \
+ACCOUNT_BASE_URL=http://127.0.0.1:8081 \
+java -jar mini-agent-memory-service/target/mini-agent-memory-service-0.0.1-SNAPSHOT.jar
 ```
 
-这一份起 MySQL、账号（8081）、记忆服务（127.0.0.1:8091）。没有 agent 容器。
+`ACCOUNT_INTERNAL_KEY` 与 `ACCOUNT_MEMORY_TOKEN_KEY` 已内置在两个服务的 `application.yml` 默认值里，两边天然一致，不需要额外注入。
 
 ### 本地
 

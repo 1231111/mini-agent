@@ -709,3 +709,20 @@ docker-compose.yml:64-65,84-85   MINIO_ACCESS_KEY/SECRET: minioadmin / minioadmi
   （首轮本地估算 3304，真实 input 12727 含 schema，扣掉 schema 6630 后仍有 6097）。
   判据取 `max(本地, 真实)` 所以第 2 轮起由真实值主导，但**首轮没有真实值可用**，
   首轮若本身超窗仍会被上游拒绝。这是估算器与具体 tokenizer 的偏差，不是阈值问题，暂不改。
+
+## 部署形态变更：移除 Docker（2026-11-09）
+
+上文的 P0-8、E-4 等条目是在「用 compose 部署」的前提下写的，其中引用的
+`docker-compose.yml:6`、`Dockerfile:61`、`docker-compose.yml:225-226` 等行号
+**对应的文件已从仓库删除**，保留原文是为了不改写历史结论，不要据此去找文件。
+
+- 删除：`Dockerfile`、`.dockerignore`、`docker-compose.yml`、
+  `docker-compose.account.yml`、`docker-compose.middleware.yml`、
+  `docker/mysql-init/01-memory-database.sql`。
+- 部署形态改为宿主机直跑 jar：MySQL / Redis 由系统安装并常驻，
+  `scripts/run-app.sh` 与 `scripts/run-app.ps1` 只探测 3306 / 6379 端口，不再查询容器。
+- `scripts/ensure-deploy-secrets.sh` 仍在，但在密钥已内置到 `application.yml`
+  默认值之后只用于需要轮换密钥的场景。
+- CI 里的 `docker compose --env-file .env.example config --quiet` 校验步骤同步删除。
+- 与 P0-8 相关的一条约束**仍然成立**：`MYSQL_ROOT_PASSWORD` 这类口令不允许有仓库默认值，
+  只是现在约束点在部署机 `.env` / 环境变量，而不是 compose 的 `${VAR:?}`。

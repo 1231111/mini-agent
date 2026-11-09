@@ -6,8 +6,8 @@
 #   ./scripts/run-app.sh --daemon         # 后台启动，日志到 ~/.miniagent/logs/app.log
 #   ./scripts/run-app.sh --port 8080      # 指定端口（默认 8080）
 #
-# 中间件由 docker-compose.middleware.yml 单独起：
-#   docker compose -f docker-compose.middleware.yml up -d
+# 中间件（MySQL / Redis）在宿主机上直接安装并运行，不由本脚本拉起。
+# 只校验端口是否在监听，不假设任何容器运行时。
 #
 # 本脚本只负责三件事：校验必需变量 → 确认中间件可达 → 起 java。
 # 它不改任何配置，所有值来自环境变量 + 仓库根的 .env + ~/.miniagent/config.yml。
@@ -47,7 +47,7 @@ while [ $# -gt 0 ]; do
 done
 
 # ── 1. 读中间件口令 ──────────────────────────────────────────────
-# .env 是 docker compose 读的那一份，这里复用，避免同一口令写两处。
+# .env 是部署机上的一份本地变量文件（已在 .gitignore 里），这里直接复用，避免同一口令写两处。
 if [ -f .env ]; then
   # set -a 让读进来的变量自动 export 给子进程；注释行与空行会被 shell 正确处理。
   set -a
@@ -65,8 +65,8 @@ require() {
     missing=1
   fi
 }
-require MYSQL_ROOT_PASSWORD "在 .env 里设置，与 docker-compose.middleware.yml 同值"
-require REDIS_PASSWORD       "在 .env 里设置，与 docker-compose.middleware.yml 同值"
+require MYSQL_ROOT_PASSWORD "在 .env 里设置，与宿主机 MySQL 的 root 口令一致"
+require REDIS_PASSWORD       "在 .env 里设置，与宿主机 Redis 的 requirepass 一致"
 # 下面两项只有 prod 断言在读，且读的是 Environment.getProperty(key) ——
 # 键名必须与断言里的一致。MIMO_API_KEY 顶替不了 LLM_API_KEY：前者喂给
 # langchain4j 客户端，后者是断言单独检查的那一个键。
@@ -139,21 +139,19 @@ if [ ! -f "$JAR" ]; then
   exit 1
 fi
 
-if command -v docker >/dev/null 2>&1; then
-  # docker compose ps 在引擎没起来时返回非零；set -e 下直接赋值会让脚本静默退出，
-  # 所以用 || true 兜住 —— 中间件不可达是"警告"，不是"脚本自身出错"。
-  running="$(docker compose -f docker-compose.middleware.yml ps --status running --services 2>/dev/null || true)"
-  running="$(printf '%s' "$running" | tr '\n' ' ')"
-  case "$running" in
-    *mysql*) : ;;
-    *) echo "警告: mysql 容器未在运行。先执行：" >&2
-       echo "      docker compose -f docker-compose.middleware.yml up -d" >&2 ;;
-  esac
-  case "$running" in
-    *redis*) : ;;
-    *) echo "警告: redis 容器未在运行。prod 档会因连不上 Redis 而启动失败。" >&2 ;;
-  esac
-fi
+# 中间件直连探测：只看 127.0.0.1 上端口是否在监听，不假设任何容器运行时。
+# 用 /dev/tcp 而不是 nc：目标机器不一定装了 netcat，bash 内建的能力更可靠。
+# 子 shell 里 exec 打开的 fd 随子 shell 退出关闭，不会泄漏到父进程。
+probe_port() {
+  local port="$1" name="$2" hint="$3"
+  if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    return 0
+  fi
+  echo "警告: $name 未在 127.0.0.1:$port 监听。$hint" >&2
+}
+
+probe_port 3306 mysql "prod 档在启动断言阶段就会因连不上 MySQL 而拒绝启动。"
+probe_port 6379 redis "prod 档会因连不上 Redis 而启动失败。"
 
 # ── 4. 启动 ──────────────────────────────────────────────────────
 # 端口占用不要静默切端口：壳/反代/文档里写的都是 8080，悄悄换端口会让人查半天。

@@ -1,10 +1,11 @@
-# Start the MiniAgent backend as a standalone jar (middleware runs in Docker).
+# Start the MiniAgent backend as a standalone jar (middleware runs natively on the host).
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\run-app.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\run-app.ps1 -Port 8080
 #
 # Middleware:
-#   docker compose -f docker-compose.middleware.yml up -d
+#   Install MySQL on 127.0.0.1:3306 and Redis on 127.0.0.1:6379.
+#   This script only probes those ports; it does not start them.
 #
 # This file is deliberately ASCII-only. PowerShell 5.1 decodes .ps1 files without
 # a BOM using the system ANSI code page, so non-ASCII strings would turn into
@@ -46,7 +47,7 @@ foreach ($name in @('MYSQL_ROOT_PASSWORD', 'REDIS_PASSWORD', 'MODEL_CONFIG_ENCRY
 }
 if ($missing.Count -gt 0) {
     Write-Host ("Missing " + ($missing -join ', ')) -ForegroundColor Red
-    Write-Host "MYSQL_ROOT_PASSWORD / REDIS_PASSWORD must match docker-compose.middleware.yml." -ForegroundColor Red
+    Write-Host "MYSQL_ROOT_PASSWORD / REDIS_PASSWORD must match the local MySQL and Redis." -ForegroundColor Red
     Write-Host "MODEL_CONFIG_ENCRYPTION_KEY: 32-byte Base64 (openssl rand -base64 32)." -ForegroundColor Red
     Write-Host "LLM_API_KEY: chat model key; the MIMO_API_KEY value works, but the key name must be LLM_API_KEY." -ForegroundColor Red
     exit 1
@@ -100,14 +101,20 @@ if (-not (Test-Path $jarPath)) {
     exit 1
 }
 
-if (Get-Command docker -ErrorAction SilentlyContinue) {
-    $running = & docker compose -f docker-compose.middleware.yml ps --status running --services 2>$null
-    if (-not ($running -match 'mysql')) {
-        Write-Host "Warning: mysql container is not running." -ForegroundColor Yellow
-        Write-Host "         docker compose -f docker-compose.middleware.yml up -d" -ForegroundColor Yellow
+# Port probe instead of a container lookup: the deployment shape is a jar on the
+# host, so the only thing worth checking is whether something listens on 3306/6379.
+foreach ($probe in @(@{ Port = 3306; Name = 'mysql' }, @{ Port = 6379; Name = 'redis' })) {
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $connected = $client.ConnectAsync('127.0.0.1', $probe.Port).Wait(1000)
+    } catch {
+        $connected = $false
+    } finally {
+        $client.Dispose()
     }
-    if (-not ($running -match 'redis')) {
-        Write-Host "Warning: redis container is not running; the prod profile requires it." -ForegroundColor Yellow
+    if (-not $connected) {
+        Write-Host "Warning: $($probe.Name) is not listening on 127.0.0.1:$($probe.Port)." -ForegroundColor Yellow
+        Write-Host "         The prod profile refuses to start without it." -ForegroundColor Yellow
     }
 }
 

@@ -24,15 +24,14 @@ spring:
     #     Access denied for user 'root'@'172.19.0.1' (using password: NO)
     # —— 报错落在握手层，指向"权限"，而真实原因是"密码变量不存在"。
     #
-    # 更要命的是同一个服务的配置有三个入口（IDEA 运行配置 / docker compose /
+    # 更要命的是同一个服务的配置有三个入口（IDEA 运行配置 / 部署脚本 /
     # 命令行 java -jar），三个入口互不知道对方，于是每换一个入口就要重踩一次。
     # 把默认值写在这里 = 一处生效、所有入口可用；IDEA 里无论点哪个运行配置都能起来。
     #
-    # 默认值取自 docker-compose.yml 里 MYSQL_ROOT_PASSWORD 的默认值（本来就明文在
-    # compose 文件里，不是新增暴露）。它是**本地开发兜底**，不是生产凭据：
+    # 它是**本地开发兜底**，不是生产凭据：
     #   - 需要覆盖时照旧用环境变量，前缀形式 ${VAR:default} 保留了覆盖能力；
     #   - prod 档 application-prod.yml 里是裸的 ${DB_PASSWORD}（无默认值），
-    #     且容器部署时 compose 显式注入，所以生产不走这两个默认值。
+    #     部署时由部署机 .env 或 Jenkins 注入，所以生产不走这两个默认值。
     url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
     username: ${DB_USERNAME:root}
     password: ${DB_PASSWORD:mysql_root_pass}

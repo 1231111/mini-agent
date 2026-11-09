@@ -1,4 +1,4 @@
-# Docker / 生产覆盖：MySQL + Redis + Milvus
+# 生产覆盖（宿主机直跑 jar）：MySQL + Redis + Milvus
 spring:
   lifecycle:
     # 先停止接收新请求，再给在途 agent run / SSE 一个确定的排空窗口。

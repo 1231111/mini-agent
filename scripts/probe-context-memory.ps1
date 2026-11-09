@@ -195,7 +195,7 @@ $userBlobHasJava = (Test-Path $userMd) -and ([IO.File]::ReadAllText($userMd, $en
 $factHasJava = $false
 try {
     $sql = 'SELECT id, tenant_id, scope_id, predicate, object_value FROM agent_semantic_facts WHERE object_value LIKE "%Java 21%" OR subject LIKE "%Java 21%" ORDER BY id DESC LIMIT 8;'
-    $factRows = docker exec miniagent-mysql mysql -uroot -pmysql_root_pass mini_agent -N -e $sql 2>$null
+    $factRows = mysql -uroot -pmysql_root_pass mini_agent -N -e $sql 2>$null
     Add-Line "=== facts ==="
     if ($factRows) {
         Add-Line ([string]$factRows)

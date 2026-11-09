@@ -20,7 +20,7 @@ spring:
   datasource:
     url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
     username: ${DB_USERNAME:root}
-    # 默认值取自 docker-compose.yml 里 MYSQL_ROOT_PASSWORD 的默认值。
+    # 本地开发兜底默认值；需要覆盖时用环境变量 DB_PASSWORD。
     # 原来兜底是空字符串，于是"没配"和"配成空"无法区分，报错落在 MySQL 握手的
     # "using password: NO"（看着像权限问题），而不是"缺配置"。
     # 需要覆盖时照旧用环境变量；prod 档是裸的 ${DB_PASSWORD}，生产不走这个默认值。
@@ -30,7 +30,7 @@ spring:
     redis:
       host: 127.0.0.1
       port: 6379
-      # 同上。docker-compose.yml 的 redis 已带 --requirepass（与之同源同默认值），
+      # 同上。本机 Redis 的 requirepass 必须与此同值，
       # 所以这里兜底必须是同一个值：留空的话 Redis 会回 "NOAUTH Authentication required."，
       # 而 /actuator/health 只会显示 redis DOWN，看不出是密码没给。
       password: ${REDIS_PASSWORD:miniagent_redis_pass}
