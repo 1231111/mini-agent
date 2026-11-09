@@ -1136,3 +1136,38 @@ return hasSuspendedTodo ? CONTINUE : ACTION;   // CONTINUE: suspend=false, resum
 `CONTEXT_LOAD.todoDemoted`，以及对应 5 条测试。
 
 保留这条记录，是因为「把 in_progress 当缺陷」这个误判很可能会再犯一次。
+
+### TODO-01 第六步：展示层区分「当前指向」与「正在执行」（2026-11-09）
+
+第五步证伪后确认：`in_progress` 是「当前指向的步骤」，由 `promoteReadyItems`
+自动维护，中断/重启后保留是正确的。真正误导人的是**展示**——计划卡片把它画成
+绿色高亮 + 实心圆点，看起来像还在跑。
+
+#### 改动（只碰模板/JS/CSS，不碰状态机）
+
+- `11-send.js` 的 `paintTodo`：`isStreaming` 为假时，`in_progress` 项加 `idle` 类，
+  并在行尾渲染一个「待继续」标记。
+- 新增全局 `refreshTodoIdleState()`：按当前 `isStreaming` 给已渲染的卡片
+  切换 `idle` 类与标记。由 `10-stream.js` 的 `setStreaming()` 调用 ——
+  卡片只在收到 `todo` 事件时重绘，一轮结束不会自己刷新。
+- `chat.css` / `agent.css` 各加一组规则：`.todo-item.in_progress.idle` 去掉
+  绿色背景、去掉 `::after` 实心点、边框转中性色；`.todo-hint` 是行尾小字。
+
+#### 两态对照
+
+| 状态 | 类 | 视觉 | 行尾 |
+|---|---|---|---|
+| 本轮正在跑 | `todo-item in_progress` | 绿色底 + 实心绿点 | 无 |
+| 没在跑（回放 / 中断后重开） | `todo-item in_progress idle` | 中性边框、无实心点 | 「待继续」 |
+
+#### 验证
+
+无头 Edge 加载真实 `chat.css` + `11-send.js`，注入一条 `in_progress` 后调用
+`refreshTodoIdleState()`，读计算样式：
+
+- `isStreaming=false` → `idle=true`、`hint=待继续`、`::after.content=none`、
+  `background=rgba(0,0,0,0)`
+- `isStreaming=true` → `idle=false`、`hint=none`、`::after.content=""`（实心点在）、
+  `background=rgba(16,163,127,0.08)`
+
+探针页验证后删除，未入库。

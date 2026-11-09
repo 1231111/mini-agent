@@ -1594,6 +1594,26 @@
             width: 6px; height: 6px; border-radius: 50%;
             background: var(--accent);
         }
+        /* 「当前指向的步骤」不等于「正在执行」。
+           本轮没在跑（历史回放、中断后重开）时，不画绿色高亮和实心点，
+           否则看起来像还在运行。 */
+        .todo-panel .todo-item.in_progress.idle {
+            background: transparent;
+        }
+        .todo-panel .todo-item.in_progress.idle .todo-mark {
+            border-color: var(--border-strong);
+            box-shadow: none;
+        }
+        .todo-panel .todo-item.in_progress.idle .todo-mark::after {
+            content: none;
+        }
+        .todo-panel .todo-hint {
+            flex: 0 0 auto;
+            margin-left: 8px;
+            font-size: 11px;
+            color: var(--text3);
+            white-space: nowrap;
+        }
         .todo-panel .todo-item.awaiting_confirm .todo-mark {
             border-color: #e6a23c;
             box-shadow: 0 0 0 2px rgba(230, 162, 60, 0.2);

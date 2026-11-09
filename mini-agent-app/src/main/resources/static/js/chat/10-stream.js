@@ -32,6 +32,9 @@ function setStreaming(on) {
     // 这样中途重连（再次进 consumeStream）不会把计时清零。
     if (on && !isStreaming) { turnStartedAt = Date.now(); turnFinishedAt = 0; }
     isStreaming = on;
+    // 计划卡片只在收到 todo 事件时重绘；一轮结束时不会自己刷新，
+    // 不主动降下来就会一直显示成「进行中」。
+    if (typeof refreshTodoIdleState === 'function') refreshTodoIdleState();
     if (!on && thinkTickTimer) {
         // 兜底：取消/断流路径不走 finish()，秒表不能继续空转
         clearInterval(thinkTickTimer);

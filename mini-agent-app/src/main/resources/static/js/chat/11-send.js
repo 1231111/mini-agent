@@ -440,9 +440,13 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 if (it.status === 'completed' || it.status === 'cancelled') doneN++;
             todoMetaEl.textContent = doneN + '/' + todoItems.length;
             todoListEl.innerHTML = '';
+            // 「当前指向的步骤」不等于「正在执行」：只有本轮真在跑时，
+            // in_progress 才画成进行中；否则只是指针停在这一步。
+            const idle = !isStreaming;
             for (const it of todoItems) {
+                const st = (it.status || 'pending').toLowerCase();
                 const li = document.createElement('li');
-                li.className = 'todo-item ' + (it.status || 'pending').toLowerCase();
+                li.className = 'todo-item ' + st + (idle && st === 'in_progress' ? ' idle' : '');
                 const mark = document.createElement('span');
                 mark.className = 'todo-mark';
                 const text = document.createElement('span');
@@ -450,7 +454,13 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 text.textContent = (it.id != null ? it.id + '. ' : '') + (it.content || '');
                 li.appendChild(mark);
                 li.appendChild(text);
-                if (String(it.status || '').toLowerCase() === 'awaiting_confirm') {
+                if (idle && st === 'in_progress') {
+                    const hint = document.createElement('span');
+                    hint.className = 'todo-hint';
+                    hint.textContent = '待继续';
+                    li.appendChild(hint);
+                }
+                if (st === 'awaiting_confirm') {
                     const btn = document.createElement('button');
                     btn.type = 'button';
                     btn.className = 'todo-confirm-btn';
@@ -765,3 +775,27 @@ function addMsgToConv(role, text, html, imgSrc) {
     // Sidebar refresh is handled by switchConv and send completion.
 }
 
+/**
+ * 把计划卡片里「进行中」的视觉与实际执行状态对齐。
+ *
+ * <p>{@code in_progress} 在服务端是「当前指向的步骤」，不是「正在执行」：
+ * 中断或本轮结束后它还停在那条上，但页面不该继续画成绿色实心点在转。</p>
+ *
+ * <p>卡片只在收到 {@code todo} 事件时重绘，一轮结束不会自动刷新，
+ * 所以由 {@code setStreaming()} 主动调这里。</p>
+ */
+function refreshTodoIdleState() {
+    const idle = !isStreaming;
+    document.querySelectorAll('.todo-panel .todo-item.in_progress').forEach(li => {
+        li.classList.toggle('idle', idle);
+        const existing = li.querySelector('.todo-hint');
+        if (idle && !existing) {
+            const hint = document.createElement('span');
+            hint.className = 'todo-hint';
+            hint.textContent = '待继续';
+            li.appendChild(hint);
+        } else if (!idle && existing) {
+            existing.remove();
+        }
+    });
+}
