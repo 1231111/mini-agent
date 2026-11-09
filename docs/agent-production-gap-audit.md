@@ -812,3 +812,39 @@ WARN c.m.web.MiniAgentChatPageController : 云端登录失败: user=孙彬彬 co
   看 GC / 负载 / 带宽峰值，以及 Jenkins 构建是否与业务争 CPU 与带宽）。
 - `CloudMembershipClient` 的 `@Value` 默认值仍写着 3000。yaml 里有值时它不生效，
   但两处默认值不一致是个隐患，后续统一。
+
+## 侧栏「轨迹」点开就变登录页（2026-11-09，已修）
+
+**表现**：客户端已登录，点侧栏「轨迹」，`window.location.href = '/trace'` 后
+地址栏是 `/trace`，页面内容却是登录页，看起来像"被踢下线"。token 其实一直在壳里。
+
+**根因（已记仍未修 → 本轮修掉）**：`MiniAgentChatPageController#showTracePage` 里
+留了一句 `if (resolveUserId(request) == null) return "login";`。但本服务已改成
+无状态：只认 `Authorization: Bearer`（`JwtSessionService#extractBearerToken` 只读这个头，
+cookie 与 `access_token` 查询参数两条通路都已移除），而**浏览器发起整页导航时不会带
+任何自定义头**。`security.js` 包装的是 `window.fetch`，管不到导航请求。
+所以这句判断在任何一次整页跳转里都必然为假 → 必然渲染 login 模板。
+
+这不是新发现的设计约束。`SecurityConfig.PUBLIC_PATHS` 的注释已经写明了
+「`/`、`/login`、`/trace`、`/membership` 必须放行……页面入口只能由前端读
+sessionStorage 后自行分流」，且 `/` `/login` `/membership` 三个路由早就
+不查身份，只有 `/trace` 这一处漏改 —— 属于无状态改造的残留。
+`chat.html` 与 `trace.html` 的 `<head>` 内联脚本也写了同一句：
+「不再等服务端把 login 模板发回来」。
+
+**修法**：`showTracePage()` 无条件返回 `"trace"`。放行的是页面骨架，不含数据：
+页面加载后 `/api/conversations`、`/api/conversations/{sid}/executions`、
+`/api/executions/{id}/steps` 与 `/summary` 仍逐条要 Bearer，由 `security.js` 注入；
+真没登录时第一个 401 由它清凭证并跳 `/login`。前端 `<head>` 那道提前分流保留
+（与 `chat.html` 完全一致，避免闪一下骨架），没有动它。
+
+**验证**：新增 `TracePageNavigationTest`（3 项）+ 既有 `CloudAccountClientRetryTest`（4 项）
+→ 7 项全过。三条断言分别钉住：不带 Bearer 的 `GET /trace` 返回 `trace` 视图而不是 `login`；
+四个页面骨架都不在导航阶段被 Bearer 卡住；`PUBLIC_PATHS` 放行页面但不放行
+`/api/conversations`、`/api/executions`、`/api/traces`（防止有人为了"让页能用"
+顺手把数据接口也加白名单）。
+
+> 测试脚手架踩坑：standalone MockMvc 默认装 `InternalResourceViewResolver`，
+> `GET /trace` 返回 `"trace"` 时它会 forward 回 `/trace`，报
+> `Circular view path [trace]`。那是测试没配视图解析器，不是控制器错。
+> 用 `setViewResolvers` 塞一个空渲染器，只断言视图名即可。

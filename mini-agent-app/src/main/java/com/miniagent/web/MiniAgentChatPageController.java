@@ -1002,12 +1002,26 @@ public class MiniAgentChatPageController {
 
     // ========== 轨迹监控 ==========
 
+    /**
+     * 轨迹页骨架。这里<b>不能</b>做服务端鉴权，原因见
+     * {@link SecurityConfig#PUBLIC_PATHS} 的注释：去掉 cookie 之后，
+     * 浏览器发起整页导航时不会携带 {@code Authorization: Bearer}，
+     * 而 {@code resolveUserId(request)} 只认这个头（见
+     * {@code JwtSessionService#extractBearerToken}）。
+     *
+     * <p>以前这里写了 {@code if (userId == null) return "login";}，
+     * 结果就是：壳里 token 好好存着，点侧栏「轨迹」用
+     * {@code window.location.href = '/trace'} 整页跳过去，服务端却拿不到任何身份，
+     * 直接在 {@code /trace} 这个地址上渲染出登录页 —— 看起来像"被踢下线"，
+     * 实际是一次必然发生的误判。登录页与会员页早就不做这个检查，只有这里漏改了。
+     *
+     * <p>放行骨架不等于放行数据：页面加载后 {@code /api/conversations}、
+     * {@code /api/conversations/{sid}/executions}、{@code /api/executions/{id}/steps}
+     * 每条都仍要 Bearer，由 {@code security.js} 统一注入；真没登录时第一个 401
+     * 就会由它清凭证并跳 {@code /login}。
+     */
     @GetMapping("/trace")
-    public String showTracePage(HttpServletRequest request) {
-        Long userId = resolveUserId(request);
-        if (Objects.isNull(userId)) {
-            return "login";
-        }
+    public String showTracePage() {
         return "trace";
     }
 
