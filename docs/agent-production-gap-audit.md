@@ -1070,3 +1070,39 @@ return hasSuspendedTodo ? CONTINUE : ACTION;   // CONTINUE: suspend=false, resum
 - `TaskTodoConfirmTest` 10 项：`archiveActiveClearsCompletedPlan` 改为
   `全终态判定为真但清单保留`。
 - planner 全量 **373 项全绿**。
+
+### TODO-01 第四步：task.clear 改为作废而非删除（2026-11-09）
+
+第三步让"收尾不清空"，但用户主动清空（`task.clear`）仍是物理删除：
+`clear` 把分区内容抹掉，之后没有任何入口能取回。用户点"清空"的意思是
+"这次不按这份清单做了"，不是"把它彻底删掉"。
+
+#### 改动
+
+- `TaskTodoStore` 新增 `archived` 集合：`clear(sessionId)` 把当前分区从 `todos`
+  移进 `archived`，对外表现仍是"当前任务没有清单"（注入、UI、统计都读 `todos`，
+  天然看不到），但内容还在。
+- 持久化格式新增第三种分区形态：
+  `{"0":{"archived":true,"items":[...]}}`。裸数组（旧）与分区数组（第二步）
+  仍然可读；`parsePartitions` 改为基于 `JsonNode` 判断类型。
+- 新增 `restoreCleared(sessionId)` 与 `todo action=restore`（轨迹节点 `TASK_RESTORE`）。
+- **`resume` 自动撤销作废**：`resumePreviousTask` 换指针后，若目标任务在
+  `archived` 里则先 restore —— 显式回到一个任务就等于说"我还要用它"，
+  否则恢复又变成空操作。
+- `persist` 拆分出 `persistRow`：前者负责"写清单并撤销作废标记"，
+  后者只负责整行落盘（`clear`/`restore` 用）。
+
+#### 语义对照
+
+| 动作 | 旧行为 | 新行为 |
+|---|---|---|
+| `task.clear` | 删除清单，不可恢复 | 作废，`get` 返回空，内容保留 |
+| `task.restore` | 不存在 | 取回被作废的清单 |
+| `task.resume` 到被清空的任务 | 空清单 | 自动撤销作废，返回原清单 |
+| 作废分区是否进 prompt / UI | — | 否（只在 `todos` 里找，作废的在 `archived`） |
+
+#### 验证
+
+- `TaskTodoScopeTest` 增至 13 项：新增"清空后可恢复"、"作废清单落盘后仍可恢复"
+  （换实例模拟重启）、"没有作废内容时恢复为空"、"resume 回到被作废任务时自动恢复"。
+- planner 全量 **377 项全绿**。

@@ -58,7 +58,7 @@ public class TodoTool {
         Map<String, Object> params = new LinkedHashMap<>();
         params.put("action", Map.of(
                 "type", "string",
-                "description", "操作：set / update / list / clear / reopen / resume",
+                "description", "操作：set / update / list / clear / reopen / resume / restore",
                 "required", true
         ));
         params.put("items", Map.of(
@@ -185,6 +185,23 @@ public class TodoTool {
                     traceTodo("TASK_CLEAR", sid, "clear", List.of(), null);
                     return MAPPER.writeValueAsString(Map.of("success", true, "action", "clear"));
                 }
+                case "restore" -> {
+                    // 撤销 task.clear：把作废的清单取回来。
+                    var restoredItems = todoStore.restoreCleared(sid);
+                    if (restoredItems.isEmpty()) {
+                        return error("没有可恢复的作废清单");
+                    }
+                    String out = MAPPER.writeValueAsString(Map.of(
+                            "success", true,
+                            "action", "restore",
+                            "todo", todoStore.render(sid),
+                            "stats", todoStore.stats(sid),
+                            "items", restoredItems
+                    ));
+                    traceTodo("TASK_RESTORE", sid, "restore", restoredItems, null);
+                    maybeTraceWaitingHuman(sid, restoredItems);
+                    return out;
+                }
                 case "resume" -> {
                     // 显式恢复：把作用域指针换回上一个任务，再读它自己那份清单。
                     // 这里不判断「用户是不是想继续」—— 模型调了就是想了。
@@ -206,7 +223,7 @@ public class TodoTool {
                 default -> {
                     return error(
                             "未知 action: " + action
-                                    + "（支持 set/update/list/clear/reopen/resume）");
+                                    + "（支持 set/update/list/clear/reopen/resume/restore）");
                 }
             }
         } catch (Exception e) {

@@ -166,4 +166,64 @@ class TaskTodoScopeTest {
 
         assertEquals("", s.renderResumableHint("s9"));
     }
+    /**
+     * {@code task.clear} 是作废，不是删除：内容还在，可以 restore 回来。
+     *
+     * <p>用户点「清空」的意思是「这次不按这份清单做了」，不是「把它彻底抹掉」。
+     * 旧实现直接 clear 掉列表，清完就再也拿不回来。</p>
+     */
+    @Test
+    void 清空后可恢复(@TempDir Path tmp) {
+        TaskScopeRegistry registry = new TaskScopeRegistry();
+        TaskTodoStore s = store(tmp, registry);
+
+        s.set("s10", item("要作废的"));
+        s.clear("s10");
+        assertTrue(s.get("s10").isEmpty(), "对外表现是清空");
+
+        List<TaskTodoStore.TodoItem> restored = s.restoreCleared("s10");
+        assertEquals(1, restored.size());
+        assertEquals("要作废的", restored.get(0).content());
+        assertEquals(1, s.get("s10").size(), "恢复后重新可见");
+    }
+
+    /** 作废状态与内容都要落盘：换一个实例（模拟重启）仍能恢复。 */
+    @Test
+    void 作废清单落盘后仍可恢复(@TempDir Path tmp) {
+        TaskScopeRegistry registry = new TaskScopeRegistry();
+        TaskTodoStore first = store(tmp, registry);
+        first.set("s11", item("要作废的"));
+        first.clear("s11");
+
+        TaskTodoStore second = store(tmp, registry);
+        assertTrue(second.get("s11").isEmpty(), "作废状态必须落盘");
+        List<TaskTodoStore.TodoItem> restored = second.restoreCleared("s11");
+        assertEquals("要作废的", restored.get(0).content(), "作废内容必须还在盘上");
+    }
+
+    /** 没被清空过的任务，restore 返回空（不能凭空造清单）。 */
+    @Test
+    void 没有作废内容时恢复为空(@TempDir Path tmp) {
+        TaskScopeRegistry registry = new TaskScopeRegistry();
+        TaskTodoStore s = store(tmp, registry);
+        s.set("s12", item("正常清单"));
+        assertTrue(s.restoreCleared("s12").isEmpty());
+        assertEquals(1, s.get("s12").size(), "不能把正常清单当成作废内容");
+    }
+
+    /** resume 回到一个被清空过的任务，自动撤销作废标记。 */
+    @Test
+    void resume回到被作废任务时自动恢复(@TempDir Path tmp) {
+        TaskScopeRegistry registry = new TaskScopeRegistry();
+        TaskTodoStore s = store(tmp, registry);
+
+        s.set("s13", item("A"));
+        s.clear("s13");
+        registry.resolve("s13", TaskBoundary.NEW, "test");
+        s.set("s13", item("B"));
+
+        List<TaskTodoStore.TodoItem> back = s.resumePreviousTask("s13");
+        assertNotNull(back);
+        assertEquals("A", back.get(0).content(), "显式回来就该看到原清单");
+    }
 }

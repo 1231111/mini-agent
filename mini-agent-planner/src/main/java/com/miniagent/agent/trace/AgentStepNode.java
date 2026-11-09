@@ -48,6 +48,7 @@ public enum AgentStepNode {
     TASK_CONFIRM("任务拆分", "人工确认", "task.confirm", true, true),
     TASK_CLEAR("任务拆分", "清空任务清单", "task.clear", true, true),
     TASK_RESUME("任务拆分", "恢复上一个任务", "task.resume：切回上一任务并取回它的清单", true, true),
+    TASK_RESTORE("任务拆分", "取回作废清单", "task.restore：撤销 task.clear，恢复被作废的清单", true, true),
 
     WAITING_FOR_HUMAN("人机协作", "等待人工", "已抛出确认/审批请求，阻塞等待用户回复", true, true),
     HUMAN_CONFIRM_REJECTED("人机协作", "人工驳回", "用户拒绝确认，任务未按原计划继续", true, true),

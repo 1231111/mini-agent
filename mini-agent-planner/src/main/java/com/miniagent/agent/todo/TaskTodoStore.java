@@ -1,6 +1,7 @@
 package com.miniagent.agent.todo;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.core.SessionEventCenter;
 import com.miniagent.agent.task.TaskStep;
@@ -38,6 +39,9 @@ public class TaskTodoStore {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     public enum Status { pending, in_progress, awaiting_confirm, completed, cancelled, blocked }
+
+    /** 一个任务的清单分区：内容 + 是否已作废（作废后仍保留，可 restore）。 */
+    private record Partition(List<TodoItem> items, boolean archived) {}
 
     /** 危险操作确认：上线/部署，不含「生成并发布 Excel」这类写盘标题 */
     private static final java.util.regex.Pattern DANGEROUS_GOAL =
@@ -84,6 +88,14 @@ public class TaskTodoStore {
     }
 
     private final Map<String, List<TodoItem>> todos = new ConcurrentHashMap<>();
+    /**
+     * 已作废但保留的清单（{@code task.clear} 的产物）。
+     *
+     * <p>作废与删除的区别：作废只是「当前任务不再使用这份清单」，
+     * 内容仍在，{@code task.restore} 或 {@code task.resume} 回到该任务时能取回。
+     * 删除则不可逆 —— 用户按「清空」时想的是前者。</p>
+     */
+    private final Map<String, List<TodoItem>> archived = new ConcurrentHashMap<>();
     /** 文件 mtime：仅 file 回退模式 */
     private final Map<String, Long> fileMtimes = new ConcurrentHashMap<>();
     private final Path persistDir;
@@ -919,17 +931,42 @@ public class TaskTodoStore {
     }
 
     /**
-     * 清空<b>当前任务</b>的清单。
+     * 作废当前任务的清单（{@code task.clear}）。
      *
-     * <p>只清当前作用域键那一份：其它任务的清单留在各自键上，用户之后说「接着做」
-     * 还能回来。整行删除（{@code persistence.delete}）会把所有任务一起抹掉，
-     * 那正是「换任务即丢历史」的来源。</p>
+     * <p><b>不是删除。</b>清空的清单移进 {@link #archived} 继续保留，
+     * 对外表现是「当前任务没有清单」（注入、UI、统计都看不到），
+     * 但 {@code task.restore} 或 {@code task.resume} 回到这个任务时能原样取回。
+     * 之前那版直接抹掉内容，用户点了「清空」就再也拿不回来。</p>
      */
     public synchronized void clear(String sessionId) {
         String key = safeKey(sessionId);
-        todos.put(key, new ArrayList<>());
-        persist(key, List.of());
-        log.info("todo 已清空 session={} key={}", sessionOf(key), key);
+        ensureLoaded(key);
+        List<TodoItem> items = todos.remove(key);
+        if (items != null && !items.isEmpty()) {
+            archived.put(key, new ArrayList<>(items));
+        }
+        persistRow(sessionOf(key));
+        log.info("todo 已作废（保留可恢复）session={} key={} items={}",
+                sessionOf(key), key, items == null ? 0 : items.size());
+    }
+
+    /**
+     * 取回被 {@code task.clear} 作废的清单。
+     *
+     * @return 恢复后的清单；没有可恢复内容时返回空列表
+     */
+    public synchronized List<TodoItem> restoreCleared(String sessionId) {
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        List<TodoItem> items = archived.remove(key);
+        if (items == null) {
+            return List.of();
+        }
+        todos.put(key, new ArrayList<>(items));
+        persistRow(sessionOf(key));
+        log.info("todo 已恢复作废清单 session={} key={} items={}",
+                sessionOf(key), key, items.size());
+        return List.copyOf(items);
     }
 
     /**
@@ -988,6 +1025,11 @@ public class TaskTodoStore {
                 com.miniagent.agent.scope.TaskBoundary.RESUME, "tool-resume");
         String key = safeKey(sessionId);
         ensureLoaded(key);
+        // 显式回到一个任务 = 撤销它之前的「清空」。否则用户 resume 回来
+        // 看到的还是空清单，恢复又成了空操作。
+        if (archived.containsKey(key)) {
+            restoreCleared(sessionId);
+        }
         return List.copyOf(todos.getOrDefault(key, List.of()));
     }
 
@@ -1323,7 +1365,7 @@ public class TaskTodoStore {
         if (useDb()) {
             try {
                 SessionTodoPersistence.State st = persistence.load(sessionId);
-                Map<Long, List<TodoItem>> parts = parsePartitions(st.activeJson());
+                Map<Long, Partition> parts = parsePartitions(st.activeJson());
                 // DB 空、本地文件有数据 → 一次性迁入。
                 // 只迁 active：suspended_json 是旧机制「自动捞回」的残留，读回来就是重犯。
                 if (parts.isEmpty() && Files.exists(persistFile(sessionId))) {
@@ -1362,10 +1404,23 @@ public class TaskTodoStore {
         todos.putIfAbsent(key, new ArrayList<>());
     }
 
-    /** 把「任务号 → 清单」摊进内存 map，键统一成 scopeKey。 */
-    private void applyPartitions(String sessionId, Map<Long, List<TodoItem>> parts) {
-        parts.forEach((taskId, items) ->
-                todos.put(scopeKeyOf(sessionId, taskId), new ArrayList<>(items)));
+    /**
+     * 把「任务号 → 分区」摊进内存 map，键统一成 scopeKey。
+     *
+     * <p>作废的分区进 {@link #archived}，不进 {@link #todos} ——
+     * 这样所有既有读取路径（注入、UI、统计）天然看不到它，不需要逐处加判断。</p>
+     */
+    private void applyPartitions(String sessionId, Map<Long, Partition> parts) {
+        parts.forEach((taskId, partition) -> {
+            String key = scopeKeyOf(sessionId, taskId);
+            if (partition.archived()) {
+                archived.put(key, new ArrayList<>(partition.items()));
+                todos.remove(key);
+            } else {
+                todos.put(key, new ArrayList<>(partition.items()));
+                archived.remove(key);
+            }
+        });
     }
 
     private List<TodoItem> readItems(Path file) throws Exception {
@@ -1399,48 +1454,73 @@ public class TaskTodoStore {
     /**
      * 解析一个会话行里的清单。
      *
-     * <p>兼容两种形态：</p>
+     * <p>兼容三种形态，都不需要 DDL 变更或一次性迁移：</p>
      * <ul>
-     *   <li>旧：裸数组 {@code [...]} —— 整行属于 0 号任务，直接迁过来；</li>
-     *   <li>新：分区对象 {@code {"0":[...],"1":[...]}} —— 按任务号拆开。</li>
+     *   <li>旧：裸数组 {@code [...]} —— 整行属于 0 号任务，未作废；</li>
+     *   <li>分区数组：{@code {"0":[...],"1":[...]}}；</li>
+     *   <li>作废分区：{@code {"0":{"archived":true,"items":[...]}}} ——
+     *       内容保留，但当前任务不使用。</li>
      * </ul>
-     * <p>两种形态都在同一行里，所以不需要 DDL 变更，也不需要一次性数据迁移。</p>
      */
-    private Map<Long, List<TodoItem>> parsePartitions(String json) {
-        Map<Long, List<TodoItem>> out = new LinkedHashMap<>();
+    private Map<Long, Partition> parsePartitions(String json) {
+        Map<Long, Partition> out = new LinkedHashMap<>();
         if (json == null || json.isBlank()) {
             return out;
         }
-        String trimmed = json.trim();
         try {
-            if (trimmed.startsWith("[")) {
-                List<TodoItem> items = parseItemsJson(trimmed);
+            JsonNode root = MAPPER.readTree(json.trim());
+            if (root == null || root.isNull()) {
+                return out;
+            }
+            if (root.isArray()) {
+                List<TodoItem> items = toItems(MAPPER.convertValue(root,
+                        new TypeReference<List<PersistedItem>>() {}));
                 if (!items.isEmpty()) {
-                    out.put(0L, items);
+                    out.put(0L, new Partition(items, false));
                 }
                 return out;
             }
-            Map<String, List<PersistedItem>> raw = MAPPER.readValue(trimmed,
-                    new TypeReference<Map<String, List<PersistedItem>>>() {});
-            if (raw == null) {
+            if (!root.isObject()) {
                 return out;
             }
-            raw.forEach((k, list) -> {
-                long taskId;
-                try {
-                    taskId = Long.parseLong(k.trim());
-                } catch (RuntimeException e) {
-                    taskId = 0L;
+            var fields = root.fields();
+            while (fields.hasNext()) {
+                var entry = fields.next();
+                long taskId = parseTaskIdKey(entry.getKey());
+                JsonNode value = entry.getValue();
+                if (value == null || value.isNull()) {
+                    continue;
                 }
-                List<TodoItem> items = toItems(list);
-                if (!items.isEmpty()) {
-                    out.put(taskId, items);
+                if (value.isArray()) {
+                    List<TodoItem> items = toItems(MAPPER.convertValue(value,
+                            new TypeReference<List<PersistedItem>>() {}));
+                    if (!items.isEmpty()) {
+                        out.put(taskId, new Partition(items, false));
+                    }
+                } else if (value.isObject()) {
+                    boolean isArchived = value.path("archived").asBoolean(false);
+                    JsonNode arr = value.get("items");
+                    List<TodoItem> items = arr == null || arr.isNull()
+                            ? List.of()
+                            : toItems(MAPPER.convertValue(arr,
+                                    new TypeReference<List<PersistedItem>>() {}));
+                    if (!items.isEmpty()) {
+                        out.put(taskId, new Partition(items, isArchived));
+                    }
                 }
-            });
+            }
         } catch (Exception e) {
             log.warn("解析 todo 分区失败: {}", e.getMessage());
         }
         return out;
+    }
+
+    private static long parseTaskIdKey(String raw) {
+        try {
+            return Long.parseLong(raw == null ? "" : raw.trim());
+        } catch (RuntimeException e) {
+            return 0L;
+        }
     }
 
     private static List<PersistedItem> toPersisted(List<TodoItem> items) {
@@ -1474,17 +1554,9 @@ public class TaskTodoStore {
      * {@code {"任务号": [条目...]}}。空分区不写，避免行里堆积 {@code "3":[]}。</p>
      */
     private String partitionsToJson(String sessionId) {
-        Map<String, List<PersistedItem>> out = new LinkedHashMap<>();
-        for (Map.Entry<String, List<TodoItem>> e : todos.entrySet()) {
-            if (!com.miniagent.agent.scope.TaskScope.belongsTo(e.getKey(), sessionId)) {
-                continue;
-            }
-            List<TodoItem> items = e.getValue();
-            if (items == null || items.isEmpty()) {
-                continue;
-            }
-            out.put(String.valueOf(taskIdOf(e.getKey(), sessionId)), toPersisted(items));
-        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        collectPartitions(sessionId, todos, out, false);
+        collectPartitions(sessionId, archived, out, true);
         trimPartitions(sessionId, out);
         try {
             return MAPPER.writeValueAsString(out);
@@ -1495,11 +1567,42 @@ public class TaskTodoStore {
     }
 
     /**
+     * 收集某一类分区。
+     *
+     * <p>未作废的分区写成裸数组（与历史格式一致）；已作废的写成
+     * {@code {"archived":true,"items":[...]}} —— 内容还在，只是当前任务不用它。
+     * 这样旧版本读到作废分区时会当成普通清单，属于可接受降级（它至少不会丢数据）。</p>
+     */
+    private void collectPartitions(String sessionId,
+                                   Map<String, List<TodoItem>> source,
+                                   Map<String, Object> out,
+                                   boolean archivedFlag) {
+        for (Map.Entry<String, List<TodoItem>> e : source.entrySet()) {
+            if (!com.miniagent.agent.scope.TaskScope.belongsTo(e.getKey(), sessionId)) {
+                continue;
+            }
+            List<TodoItem> items = e.getValue();
+            if (items == null || items.isEmpty()) {
+                continue;
+            }
+            String taskId = String.valueOf(taskIdOf(e.getKey(), sessionId));
+            if (archivedFlag) {
+                Map<String, Object> box = new LinkedHashMap<>();
+                box.put("archived", true);
+                box.put("items", toPersisted(items));
+                out.put(taskId, box);
+            } else {
+                out.put(taskId, toPersisted(items));
+            }
+        }
+    }
+
+    /**
      * 分区数超限时按任务号升序丢弃最早的分区，当前任务永不丢。
      *
      * <p>丢掉的同步从内存移除，避免内存与库里不一致（下次读会以为它还在）。</p>
      */
-    private void trimPartitions(String sessionId, Map<String, List<PersistedItem>> out) {
+    private void trimPartitions(String sessionId, Map<String, Object> out) {
         if (out.size() <= MAX_TASK_PARTITIONS) {
             return;
         }
@@ -1525,7 +1628,9 @@ public class TaskTodoStore {
             }
             keys.remove(dropped);
             out.remove(dropped);
-            todos.remove(scopeKeyOf(sessionId, Long.parseLong(dropped)));
+            String droppedKey = scopeKeyOf(sessionId, Long.parseLong(dropped));
+            todos.remove(droppedKey);
+            archived.remove(droppedKey);
             log.info("todo 分区超限，丢弃最早的任务 session={} taskId={}", sessionId, dropped);
         }
     }
@@ -1547,7 +1652,15 @@ public class TaskTodoStore {
     private void persist(String key, List<TodoItem> items) {
         List<TodoItem> safe = items == null ? List.of() : items;
         todos.put(key, new ArrayList<>(safe));
-        String sessionId = sessionOf(key);
+        // 重新写入清单 = 撤销作废标记，否则同一任务会同时出现在两个 map 里
+        archived.remove(key);
+        persistRow(sessionOf(key));
+        // UI 按 sessionId 订阅；这里不能传作用域键，否则前端收不到
+        publishTodoUi(sessionOf(key), safe);
+    }
+
+    /** 把整个会话行（含未作废与已作废两类分区）落盘。 */
+    private void persistRow(String sessionId) {
         String payload = partitionsToJson(sessionId);
         try {
             if (useDb()) {
@@ -1564,8 +1677,6 @@ public class TaskTodoStore {
         } catch (Exception e) {
             log.warn("持久化 todo 失败 {}: {}", sessionId, e.getMessage());
         }
-        // UI 按 sessionId 订阅；这里不能传作用域键，否则前端收不到
-        publishTodoUi(sessionId, safe);
     }
 
     /** SSE：把当前计划列表推给前端（完成项置灰勾选）。 */
