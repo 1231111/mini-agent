@@ -848,3 +848,56 @@ sessionStorage 后自行分流」，且 `/` `/login` `/membership` 三个路由�
 > `GET /trace` 返回 `"trace"` 时它会 forward 回 `/trace`，报
 > `Circular view path [trace]`。那是测试没配视图解析器，不是控制器错。
 > 用 `setViewResolvers` 塞一个空渲染器，只断言视图名即可。
+
+## 冷启动实测：合并 profile 后的两个新装机阻塞（2026-11-09，已修）
+
+上面「合并 application-prod.yml 到 application.yml」之后，用
+`--spring.profiles.active=desktop` + 一个全新的 `MINI_AGENT_HOME` 冷启动，
+连撞两个启动失败。09:45 打出来的 1.0.1 安装包是合并之前构建的，所以旧包能跑，
+**任何一次重新打包都会踩到**。两条都是配置/迁移层，与轨迹页无关。
+
+### 阻塞一：readiness 健康组引用了桌面档不存在的 redis
+
+```
+APPLICATION FAILED TO START
+Included health contributor 'redis' in group 'readiness' does not exist
+```
+
+统一档 `application.yml` 的 `management.endpoint.health.group.readiness.include`
+是 `readinessState,db,redis`（云端多副本确实要探 Redis）。桌面档
+`application-desktop.yml` 把 `RedisAutoConfiguration` exclude 掉了，
+也明确写了 `management.health.redis.enabled: false`，于是 Spring Boot
+在启动时校验健康组成员直接失败。
+
+修法：在桌面档覆盖 `group.readiness.include: readinessState,db`。
+**没有**用 `validate-group-membership=false` —— 那会把同类配置漂移永久藏起来。
+
+### 阻塞二：全新空库上 V23 把 H2 系统表当成业务表
+
+```
+Migration of schema "PUBLIC" to version "23 - store cloud memory access identity" failed
+Caused by: Table "USERS" not found
+ALTER TABLE users ADD COLUMN cloud_tenant_id VARCHAR(128)
+```
+
+桌面档的建表靠 `ddl-auto: update`（Hibernate 从实体反推），而 Flyway 迁移跑在
+EntityManagerFactory 之前，所以首次启动时 `PUBLIC.users` 还不存在。
+V23 的 `tableExists` 用
+`getTables(connection.getCatalog(), null, "%", ...)` —— schemaPattern 为 null
+意味着**不过滤 schema**，而 H2 的 `INFORMATION_SCHEMA` 里恰好有一张 `USERS`
+系统表。于是判成"表已存在"，接着对 `PUBLIC.users` 发 ALTER，必炸。
+
+修法：`tableExists` / `columnExists` 增加 `inCurrentSchema` 过滤，
+只认当前 schema 的对象；MySQL 元数据里 `TABLE_SCHEM` 常为 null（catalog 才是库），
+拿不到就按同库放行，不能因为 null 把 MySQL 上所有表都判成不存在。
+V9~V13 本来就是这套写法（传 `connection.getSchema()`），V15 之后才退化成 null；
+本轮只修触发故障的 V23，其余迁移的同类写法仍是待收口项。
+
+### 验证
+
+- `V23CloudMemoryAccessTokenTest`（3 项）：先断言 H2 确实有 `INFORMATION_SCHEMA.USERS`
+  （反向验证前提），再断言空库上 `tableExists=false`、`migrate()` 安静跳过，
+  以及真实 `users` 表上补出三列且重复迁移幂等。
+- `DesktopHealthGroupTest`（3 项）：统一档确实含 redis（说明覆盖有必要）、
+  桌面档 readiness 不含 redis、桌面档 redis indicator 仍为 false。
+- 连同 `TracePageNavigationTest`(3) 与 `CloudAccountClientRetryTest`(4) 共 13 项全过。

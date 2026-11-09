@@ -323,6 +323,15 @@ management:
   endpoint:
     health:
       show-details: never
+      # application.yml（统一档）把 redis 列进了 readiness 组，云端多副本要用。
+      # 桌面档没有 RedisHealthIndicator（下面 enabled: false），若不在这里覆盖
+      # include，Spring Boot 启动时会直接失败：
+      #   Included health contributor 'redis' in group 'readiness' does not exist
+      # 2026-11-09 冷启动实测。这里只保留真实存在的两个 contributor。
+      # 刻意不改 validate-group-membership=false —— 那会把这类配置漂移藏起来。
+      group:
+        readiness:
+          include: readinessState,db
   health:
     # 必须关。RedisHealthIndicator 会去连 127.0.0.1:6379，
     # 桌面档不提供 Redis，不关的话 /actuator/health 永远 DOWN，
