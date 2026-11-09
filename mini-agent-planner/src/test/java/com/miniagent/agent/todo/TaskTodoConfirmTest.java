@@ -26,18 +26,21 @@ class TaskTodoConfirmTest {
         assertTrue(TaskTodoStore.needsConfirmGate(item));
     }
 
-    /** 全部终态 = 任务客观结束，回到空清单，给下一个任务让位。 */
+    /**
+     * 全部终态 = 任务客观结束，但清单<b>保留</b>。
+     *
+     * <p>收尾只推进作用域键，不清空条目 —— 用户之后 resume 回来还要看到做过什么。
+     * 之前那版在这里清空，结果 resume 只能拿到空清单。</p>
+     */
     @Test
-    void archiveActiveClearsCompletedPlan(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp) {
+    void 全终态判定为真但清单保留(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp) {
         TaskTodoStore store = new TaskTodoStore(tmp.toString());
         store.set("s", java.util.List.of(
                 java.util.Map.of("id", 1, "content", "定位 dataset", "status", "completed"),
                 java.util.Map.of("id", 2, "content", "复制到桌面", "status", "completed")));
         assertTrue(store.hasPlan("s"));
         assertTrue(store.hasOnlyTerminal("s"));
-        assertTrue(store.archiveActive("s"));
-        assertFalse(store.hasPlan("s"));
-        assertTrue(store.get("s").isEmpty());
+        assertEquals(2, store.get("s").size(), "收尾不清空清单");
     }
 
     /**
@@ -53,8 +56,7 @@ class TaskTodoConfirmTest {
         TaskTodoStore store = new TaskTodoStore(tmp.toString());
         store.set("s", java.util.List.of(
                 java.util.Map.of("id", 1, "content", "写报告", "status", "in_progress")));
-        assertFalse(store.hasOnlyTerminal("s"));
-        assertFalse(store.archiveActive("s"), "未完成不得归档");
+        assertFalse(store.hasOnlyTerminal("s"), "未完成不算终态");
         assertEquals(1, store.get("s").size());
         assertEquals(TaskTodoStore.Status.in_progress, store.get("s").get(0).status());
     }
@@ -64,7 +66,6 @@ class TaskTodoConfirmTest {
     void emptyPlanIsNotTerminal(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp) {
         TaskTodoStore store = new TaskTodoStore(tmp.toString());
         assertFalse(store.hasOnlyTerminal("s"));
-        assertFalse(store.archiveActive("s"));
     }
 
     /**

@@ -956,7 +956,7 @@ return hasSuspendedTodo ? CONTINUE : ACTION;   // CONTINUE: suspend=false, resum
   （reason=`prev-plan-terminal`）+ 归档；其余一律 `SAME`。
   未完成清单**留在原地**，换任务由模型显式 `task.clear` / `task.set` 表达。
 - `ContextLoader` 的 `CONTEXT_LOAD` 事件字段：`todoSuspended`/`todoResumed`
-  替换为 `todoArchived`。
+  替换为 `todoClosed`。
 - `TaskTodoStore.render` 增加硬约束：本轮目标与清单不符时必须先
   `todo action=clear` 或 `action=set`，不得沿用旧清单。
 
@@ -1033,3 +1033,40 @@ return hasSuspendedTodo ? CONTINUE : ACTION;   // CONTINUE: suspend=false, resum
   一致性靠"都从同一个 `TaskScopeRegistry` 取号"保证；跨副本并发切换任务时
   清单写入不在同一个 CAS 里。当前是单机/单副本形态，可接受；多副本需要把
   清单写入纳入 scope 的版本 CAS。
+
+### TODO-01 第三步：收尾不清空清单（2026-11-09）
+
+第二步做完后发现一个自相矛盾：`ContextLoader` 在清单全终态时调
+`TaskTodoStore.archiveActive()`，后者把当前清单**清空**，然后才 `resolve(NEW)`。
+而同一版新增的 `todo action=resume` 会换指针回到那个任务 —— 回去只拿到空清单，
+恢复等于空操作。
+
+问题的本质是"归档"被实现成了"删除"。归档要表达的是"这个任务结束了，
+不要再当成当前任务"，不是"它做过什么不重要了"。
+
+#### 改动
+
+- `ContextLoader`：全终态时只置 `boundary=NEW`（reason=`prev-plan-terminal`），
+  **不再调用任何清空动作**；`CONTEXT_LOAD.todoArchived` 改名 `todoClosed`
+  （语义从"已归档清空"变成"上一任务已收尾"）。
+- `TaskTodoStore`：删除 `archiveActive`。收尾只由作用域键体现 ——
+  新任务用新键，旧清单留在旧键上，恢复时原样可见。
+- `partitionsToJson` 增加分区上限 `MAX_TASK_PARTITIONS = 24`：超限按任务号升序
+  丢弃最早的分区（当前任务永不丢），避免 `active_json` 随任务数无限增长。
+
+#### 行为对照
+
+| 场景 | 改之前 | 改之后 |
+|---|---|---|
+| 中断未完成，同 scope 继续 | 清单在，能接着做 | 同（这条本来就不需要 resume） |
+| 任务全终态，自动进新任务 | 旧清单被清空 | 旧清单保留在旧键上 |
+| 全终态后 `task.resume` 回去 | 空清单，无法继续 | 看到完整历史，可 `task.reopen` 继续 |
+| 会话跑了几十个任务 | 同（清空） | 只保留最近 24 个分区 |
+
+#### 验证
+
+- `TaskTodoScopeTest` 增至 9 项：新增"全终态任务恢复后仍能看到清单"、
+  "全终态历史任务不提示恢复"。
+- `TaskTodoConfirmTest` 10 项：`archiveActiveClearsCompletedPlan` 改为
+  `全终态判定为真但清单保留`。
+- planner 全量 **373 项全绿**。

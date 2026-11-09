@@ -88,7 +88,7 @@ public class ContextLoader {
         // 这不是对用户说了什么做解读 —— 清单状态本来就存在库里，查一下就能确认。
         // 反过来，「上一任务没做完、用户又发了新消息」这一档框架不做任何判断：
         // 清单留在当前任务里，要不要换由模型显式 task.set / task.clear 表达。
-        boolean archived = false;
+        boolean closed = false;
         TaskBoundary boundary = TaskBoundary.SAME;
         String boundaryReason = "same-task";
         if (Objects.nonNull(sessionId)) {
@@ -96,11 +96,13 @@ public class ContextLoader {
             if (waitingHuman) {
                 log.info("ContextLoader: 等待人工确认，保持当前任务 session={}", sessionId);
             } else if (taskTodoStore.hasOnlyTerminal(sessionId)) {
-                archived = taskTodoStore.archiveActive(sessionId);
-                if (archived) {
-                    boundary = TaskBoundary.NEW;
-                    boundaryReason = "prev-plan-terminal";
-                }
+                // 清单全终态 = 这个任务做完了，下一轮开新作用域。
+                // 注意这里**不清空**旧清单：它留在自己的作用域键上，
+                // 用户之后用 todo action=resume 回来还能看见做过什么。
+                // 清空等于「换任务即丢历史」，和 resume 直接冲突。
+                closed = true;
+                boundary = TaskBoundary.NEW;
+                boundaryReason = "prev-plan-terminal";
             }
         }
         String scopeKey = Objects.isNull(sessionId)
@@ -129,7 +131,7 @@ public class ContextLoader {
         info.put("injectMemory", policy.injectMemory());
         info.put("injectUser", policy.injectUser());
         info.put("injectSkills", policy.injectSkills());
-        info.put("todoArchived", archived);
+        info.put("todoClosed", closed);
         info.put("scopeKey", scopeKey);
         info.put("taskBoundary", boundary.name());
         info.put("boundaryReason", boundaryReason);
@@ -145,11 +147,11 @@ public class ContextLoader {
         }
 
         log.info("ContextLoader: ref={}/neg={}/conf={}, "
-                        + "history={}/{}, todoInject={}, archived={}, "
+                        + "history={}/{}, todoInject={}, closed={}, "
                         + "scope={}/{}, tools={}",
                 ref.hasReference(), ref.isNegated(), ref.confidence(),
                 history.size(), policy.historyMaxMessages(),
-                policy.injectTodo(), archived,
+                policy.injectTodo(), closed,
                 scopeKey, boundaryReason, 0);
 
         return new LoadedContext(systemPrompt, history, policy, scopeKey, taskId, info);

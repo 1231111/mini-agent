@@ -47,6 +47,14 @@ public class TaskTodoStore {
     private static final int YIELD_NOTE_MAX_CHARS = 200;
 
     /**
+     * 一个会话最多保留多少个任务分区。
+     *
+     * <p>分区直接拼进同一行的 {@code active_json}，不设上限的话这个字段会随
+     * 任务数无限增长（每个任务一份清单）。超限时丢最早的任务，且绝不丢当前任务。</p>
+     */
+    private static final int MAX_TASK_PARTITIONS = 24;
+
+    /**
      * @param dependsOn 依赖的上游 todo id；未满足前不可推进/勾选
      */
     public record TodoItem(int id, String content, Status status, String note,
@@ -942,28 +950,12 @@ public class TaskTodoStore {
     }
 
     /**
-     * 归档已终态的计划：清空当前清单，给下一个任务让位。
+     * 是否全部终态（completed / cancelled）。
      *
-     * <p>只处理「全部 completed / cancelled」的情况。未完成的清单原样留在当前任务里 ——
-     * 要不要放弃它，由模型调 {@code task.clear} / {@code task.set} 决定。
-     * 框架不做「它大概没用了」这种判断：之前那套「未完成就挂起、有挂起物就恢复」
-     * 正是把上一个任务的清单塞进新任务的直接原因。</p>
-     *
-     * @return 是否真的发生了归档
+     * <p>判定「任务收尾」用的客观条件。收尾时<b>不清空</b>清单 ——
+     * 曾有一版在这里清空，结果与 {@code todo action=resume} 直接冲突：
+     * 恢复回去只拿到空清单。旧清单留在自己的作用域键上，恢复时原样可见。</p>
      */
-    public synchronized boolean archiveActive(String sessionId) {
-        String key = safeKey(sessionId);
-        ensureLoaded(key);
-        List<TodoItem> list = todos.get(key);
-        if (list == null || list.isEmpty() || !allTerminal(list)) {
-            return false;
-        }
-        todos.put(key, new ArrayList<>());
-        persist(key, List.of());
-        log.info("todo 已归档（全部终态）session={}", key);
-        return true;
-    }
-
     private static boolean allTerminal(List<TodoItem> list) {
         if (list == null || list.isEmpty()) {
             return false;
@@ -1493,11 +1485,48 @@ public class TaskTodoStore {
             }
             out.put(String.valueOf(taskIdOf(e.getKey(), sessionId)), toPersisted(items));
         }
+        trimPartitions(sessionId, out);
         try {
             return MAPPER.writeValueAsString(out);
         } catch (Exception e) {
             log.warn("序列化 todo 分区失败 {}: {}", sessionId, e.getMessage());
             return "{}";
+        }
+    }
+
+    /**
+     * 分区数超限时按任务号升序丢弃最早的分区，当前任务永不丢。
+     *
+     * <p>丢掉的同步从内存移除，避免内存与库里不一致（下次读会以为它还在）。</p>
+     */
+    private void trimPartitions(String sessionId, Map<String, List<PersistedItem>> out) {
+        if (out.size() <= MAX_TASK_PARTITIONS) {
+            return;
+        }
+        List<String> keys = new ArrayList<>(out.keySet());
+        keys.sort(java.util.Comparator.comparingLong(k -> {
+            try {
+                return Long.parseLong(k);
+            } catch (NumberFormatException e) {
+                return 0L;
+            }
+        }));
+        String current = String.valueOf(taskIdOf(safeKey(sessionId), sessionId));
+        while (out.size() > MAX_TASK_PARTITIONS) {
+            String dropped = null;
+            for (String k : keys) {
+                if (!k.equals(current) && out.containsKey(k)) {
+                    dropped = k;
+                    break;
+                }
+            }
+            if (dropped == null) {
+                return;
+            }
+            keys.remove(dropped);
+            out.remove(dropped);
+            todos.remove(scopeKeyOf(sessionId, Long.parseLong(dropped)));
+            log.info("todo 分区超限，丢弃最早的任务 session={} taskId={}", sessionId, dropped);
         }
     }
 

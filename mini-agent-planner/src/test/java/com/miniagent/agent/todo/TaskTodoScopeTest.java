@@ -130,4 +130,40 @@ class TaskTodoScopeTest {
         s.set("s7", item("B"));
         assertEquals("", s.renderResumableHint("s7"));
     }
+    /**
+     * 收尾不清空：全终态任务推进作用域后，resume 回去仍能看到做过什么。
+     *
+     * <p>这是「能不能接着做」的关键一环 —— 如果收尾时把清单清了，
+     * resume 只能拿到空清单，恢复就成了空操作。</p>
+     */
+    @Test
+    void 全终态任务恢复后仍能看到清单(@TempDir Path tmp) {
+        TaskScopeRegistry registry = new TaskScopeRegistry();
+        TaskTodoStore s = store(tmp, registry);
+
+        s.set("s8", List.of(Map.of(
+                "id", 1, "content", "已完成项", "status", "completed")));
+        assertTrue(s.hasOnlyTerminal("s8"));
+
+        // ContextLoader 在全终态时做的事：只推进作用域，不清空清单
+        registry.resolve("s8", TaskBoundary.NEW, "prev-plan-terminal");
+        assertTrue(s.get("s8").isEmpty(), "新任务从空清单开始");
+
+        List<TaskTodoStore.TodoItem> restored = s.resumePreviousTask("s8");
+        assertNotNull(restored);
+        assertEquals("已完成项", restored.get(0).content(), "收尾不能清空旧清单");
+    }
+
+    /** 全终态的历史任务不提示恢复：没有未完成的事要做。 */
+    @Test
+    void 全终态历史任务不提示恢复(@TempDir Path tmp) {
+        TaskScopeRegistry registry = new TaskScopeRegistry();
+        TaskTodoStore s = store(tmp, registry);
+
+        s.set("s9", List.of(Map.of(
+                "id", 1, "content", "已完成项", "status", "completed")));
+        registry.resolve("s9", TaskBoundary.NEW, "prev-plan-terminal");
+
+        assertEquals("", s.renderResumableHint("s9"));
+    }
 }
