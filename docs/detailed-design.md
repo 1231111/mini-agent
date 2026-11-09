@@ -1179,4 +1179,4 @@ V7 已删意图规则表，不要再建。
 
 ---
 
-*Mini Agent · 本文只描述仓库已实现行为。配置默认值以 `application.yml` 为准；yml 没写的键以对应 Java 字段为准。生产差异见 `application-prod.yml`。*
+*Mini Agent · 本文只描述仓库已实现行为。配置默认值以 `application.yml` 为准；yml 没写的键以对应 Java 字段为准。不再有 `application-prod.yml`：生产与测试的差异靠网络隔离，不靠配置文件分叉。*

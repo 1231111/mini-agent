@@ -28,8 +28,7 @@ mysql -uroot -p -e "CREATE DATABASE IF NOT EXISTS mini_agent CHARACTER SET utf8m
 
 ./mvnw -pl mini-agent-account -am -DskipTests package
 
-java -jar mini-agent-account/target/mini-agent-account-0.0.1-SNAPSHOT.jar \
-  --spring.profiles.active=prod
+java -jar mini-agent-account/target/mini-agent-account-0.0.1-SNAPSHOT.jar
 ```
 
 注册页是 `http://<主机>:8081/login`，套餐和订单是 `http://<主机>:8081/account`。空库由本服务自己的 V1、V2 建表。
@@ -134,7 +133,7 @@ agent 侧的配额闸门 `DbTenantTokenQuota.check/consume(tenantId)` 只读这�
 
 ### `shared-database`
 
-`application-prod.yml` 里 `agent.auth.cloud.shared-database: true`。当前 compose 不启动这个档。桌面端是另一个库，保持默认 `false`，登录后在本地造一条影子用户。
+`application.yml` 里 `agent.auth.cloud.shared-database: true`。桌面端是另一个库，保持默认 `false`，登录后在本地造一条影子用户。
 
 若有人把 agent 的 prod 档和账号指到同一个库，却把这个开关关掉，会再插一条影子行：
 
@@ -146,7 +145,7 @@ users 表（同一个库）
 
 后果是同一人两条记录，而会员配额写在 **id=1 的租户**上、agent 读的是 **id=2 的租户**——症状是「买了会员但额度没变」，且日志里一切正常。
 
-`application-prod.yml` 里因此写着：
+`application.yml` 里因此写着：
 
 ```yaml
 agent:

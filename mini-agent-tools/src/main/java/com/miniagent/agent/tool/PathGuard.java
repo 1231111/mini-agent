@@ -17,7 +17,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p><b>为什么需要它</b>：这些工具此前对绝对路径直通 —— 解析器里就是
  * {@code if (p.isAbsolute()) return p.normalize();}。后果是模型（或被提示注入的模型）
  * 可以直接读写主机上的任意文件：{@code ~/.ssh/authorized_keys}、{@code ~/.aws/credentials}、
- * 应用自己的 {@code .env} 与 {@code application-prod.yml}。而 {@code read_file} 属于
+ * 应用自己的 {@code .env} 与 {@code application.yml}。而 {@code read_file} 属于
  * {@code PLAN_SAFE_TOOLS}，在最严格的只读模式下**无需任何批准**即可调用，
  * 于是"读任意文件"成了最好用的一条越权通道；{@code edit_file} 的写侧同理，
  * 一次调用就能把公钥写进 authorized_keys，从此主机长期驻留。</p>

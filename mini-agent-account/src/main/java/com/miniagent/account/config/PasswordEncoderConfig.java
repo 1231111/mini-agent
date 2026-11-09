@@ -18,7 +18,7 @@ import org.springframework.security.crypto.password.PasswordEncoder;
  * {@code agent.auth.bcrypt-strength} 是<b>两个独立的值</b> —— 这一点要清楚：
  * 同一个账号的密码只由本服务校验（云端 agent 从不验密码，它只验 token），
  * 所以两处强度不同不会造成"在 A 能登录、在 B 登不上"。
- * 但 prod 档两处都必须是 12，见各自的 application-prod.yml。
+ * 两处都必须是 12，见各自的 application.yml。
  */
 @Configuration
 public class PasswordEncoderConfig {

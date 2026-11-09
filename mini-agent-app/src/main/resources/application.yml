@@ -6,7 +6,7 @@ spring:
     import:
       - optional:file:${MINI_AGENT_HOME:${user.home}/.miniagent}/config.yml
   thymeleaf:
-    cache: false   # 开发期关闭模板缓存：改完 .html 刷新页面即可生效，无需重启
+    cache: true    # 生产形态：模板缓存常开，改模板需重启；开发用 dev 档关闭
   servlet:
     multipart:
       max-file-size: 1000MB
@@ -14,6 +14,9 @@ spring:
       enabled: true
   application:
     name: mini-agent-springboot
+  lifecycle:
+    # 先停止接收新请求，再给在途 agent run / SSE 一个确定的排空窗口。
+    timeout-per-shutdown-phase: 30s
   mvc:
     async:
       request-timeout: 1800000
@@ -36,7 +39,8 @@ spring:
       password: ${REDIS_PASSWORD:DbNNvoUSY7F1v9o4dhd0WjoEyE11}
       timeout: 3s
   flyway:
-    enabled: false
+    enabled: true
+    baseline-on-migrate: true
     # 两处来源：SQL 迁移（db/migration，V1~V8，MySQL 方言）与 Java 迁移
     # （com.miniagent.migration，V9 起，H2/MySQL 通用）。Java 迁移必须把包路径
     # 加进 locations —— Flyway 是拿 location 当包名扫描的，默认的
@@ -45,7 +49,7 @@ spring:
     locations: classpath:db/migration,classpath:com/miniagent/migration
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: validate
     show-sql: false
     properties:
       hibernate:
@@ -55,6 +59,7 @@ spring:
 
 server:
   port: 8080
+  shutdown: graceful
   tomcat:
     connection-timeout: 1800000
     max-http-form-post-size: 710MB
@@ -69,11 +74,21 @@ management:
         include: health,info,metrics
   endpoint:
     health:
-      show-details: when_authorized
+      show-details: never
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,db,redis
+        liveness:
+          include: livenessState
   health:
-    # local 默认不依赖 Redis；prod/redis 模式再开
     redis:
-      enabled: false
+      enabled: true
+    readinessstate:
+      enabled: true
+    livenessstate:
+      enabled: true
 
 # LangChain4j OpenAI 兼容客户端
 langchain4j:
@@ -122,18 +137,29 @@ agent:
     # JWT HS256 签名密钥。旧名 cookie-secret —— cookie 通路已随无状态改造整体移除，
     # 但这份值一直在给 JWT 签名，名字留着会误导（以为还有个 cookie 在用）。
     # 仍接受 COOKIE_SECRET 回退，已部署环境不用改环境变量也能起来。
-    jwt-secret: ${JWT_SECRET:${COOKIE_SECRET:local-dev-jwt-secret-not-for-production}}
+    jwt-secret: ${JWT_SECRET:F4M4Z99WfVgHf9CTKYO3NXCF2shQglNdKNHTcLuxv1LwJfigPi6yQRNneRcXyzmO}
     # JWT 方案：exp 仅为硬性上限；真实滑动超时由 Redis TTL 控制
     jwt-exp-seconds: 604800      # JWT 有效期上限（7 天），兜底用
     jwt-ttl-seconds: 1800       # Redis 滑动会话窗口（30 分钟），每次鉴权刷新
-    registration-enabled: true
-    password-min-length: 8
-    bcrypt-strength: 10
+    registration-enabled: false
+    password-min-length: 12
+    bcrypt-strength: 12
     # CORS 白名单。生产用 ALLOWED_ORIGINS 覆盖（ProductionReadinessValidator 要求
     # 每一项都是精确 HTTPS origin，不能带 path/query/凭据）。
     # 不设该环境变量时退回下面这组本地 origin，dev 档行为不变。
     # desktop 档会显式钉死本地值，不吃这个变量 —— 见 application-desktop.yml。
     allowed-origins: ${ALLOWED_ORIGINS:http://localhost:*,http://127.0.0.1:*,file://}
+    cloud:
+      # 账号与会员由独立服务承担（mini-agent-account，默认 127.0.0.1:8081）。
+      base-url: ${ACCOUNT_BASE_URL:http://127.0.0.1:8081}
+      # 云端 agent 与账号服务共用同一个 MySQL 库，账号行就是本机行。
+      # 置 false 会让 ShadowUserService 为每个账号再插一条影子行 —— 同一人两条记录，
+      # 且会员配额写在账号的租户上、agent 读影子行的租户，表现是"买了会员额度不变"。
+      shared-database: true
+      # 服务间密钥。账号服务侧读的是同一个环境变量名，两处必须完全一致。
+      internal-key: ${ACCOUNT_INTERNAL_KEY:gMPzIKw7wTtIZOhGibpoAGkdzzXYbsEEfhUVDg0Tb1w=}
+      connect-timeout-ms: 3000
+      read-timeout-ms: 10000
   memory:
     # db=多副本真相源（agent_user_memory）；file=仅本地目录
     storage: db
@@ -165,7 +191,7 @@ agent:
     vector:
       enabled: true
       # local=本机 InMemory+JSON；milvus=生产向量库（compose/prod）
-      backend: local
+      backend: milvus
       top-k: 6
       min-score: 0.4
       milvus:
@@ -180,6 +206,8 @@ agent:
   # 聊天模型预设（前端可选；空字段回退 langchain4j.open-ai.chat-model.*）
   models:
     default-preset: default
+    # 生产形态：禁止用户自定义 base-url（否则可把请求指向任意主机）。
+    custom-base-url-enabled: false
     presets:
       - id: default
         label: mimo-v2.6-pro
@@ -252,7 +280,7 @@ agent:
         collection: agent_session_history
   # local=单机不启 Redis 热存储/跨实例事件；redis=写穿热存储+任务并发+发布订阅（生产/compose）
   replica:
-    mode: local
+    mode: redis
     todo-ttl-seconds: 86400
     memory-ttl-seconds: 86400
     planner-ttl-seconds: 86400
@@ -290,6 +318,7 @@ agent:
     index-file: ${agent.data-dir}/workspace/.codebase-index.json
   browser:
     headless: true
+    evaluate-enabled: false
   permissions:
     # Ask approvals are exact tool+argument grants and expire automatically.
     ask-grant-ttl-seconds: 300
@@ -300,6 +329,9 @@ agent:
     # 命令级安全过滤（黑名单 / 危险模式 / 注入检测 / 常驻服务器拦截）不受本档位影响，永远生效。
     exec-policy: ask
     allow-absolute-write: false
+    # 出站只允许标准端口，且跳转次数受限，避免被用来做端口扫描/绕过 SSRF 拦截。
+    allowed-http-ports: 80,443
+    max-http-redirects: 3
     block-private-network: true
     # 同时执行的工具调用数上限
     max-concurrency: 8
@@ -321,7 +353,7 @@ agent:
     # delegate_task 内层循环上限
     subagent-max-iterations: 25
   rate-limit:
-    per-minute: 60
+    per-minute: 30
   concurrency:
     max-tasks-per-user: 2
   quota:
@@ -381,8 +413,8 @@ agent:
 
 logging:
   level:
-    com.miniagent: DEBUG
-    root: INFO
+    com.miniagent: INFO
+    root: WARN
 
 # Web 搜索配置（密钥见 ${MINI_AGENT_HOME}/config.yml，模板 config.example.yml）
 web:

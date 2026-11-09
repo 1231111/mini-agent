@@ -10,14 +10,13 @@
 # 只校验端口是否在监听，不假设任何容器运行时。
 #
 # 本脚本只负责三件事：校验必需变量 → 确认中间件可达 → 起 java。
-# 它不改任何配置，所有值来自环境变量 + 仓库根的 .env + ~/.miniagent/config.yml。
+# 它不改任何配置：连接地址与口令在 application.yml，敏感值可由环境变量或
+# ~/.miniagent/config.yml 覆盖。
 #
-# 为什么用 prod 档而不是 desktop 档：
-#   desktop 档绑 127.0.0.1、用 H2 文件库、排除 Redis 自动配置 —— 它是给
-#   Electron 客户端用的单机形态。要在服务器上给多人访问，必须走 prod 档：
-#   MySQL 真相源 + Redis 分布式状态 + Flyway 校验表结构。
-#   代价是 prod 档有一组启动断言（ProductionReadinessValidator），缺一个就拒绝启动，
-#   所以下面每个变量都不是可选的。
+# 不带任何 profile：默认档就是服务器形态（MySQL 真相源 + Redis 分布式状态 +
+# Flyway 校验表结构）。desktop 档是另一条线，只给 Electron 客户端用
+# （绑 127.0.0.1、H2 文件库、排除 Redis 自动配置）。
+# 部署环境之间的差异靠网络隔离，不靠配置文件分叉。
 #
 # 向量与 embedding 走本地：
 #   省掉 milvus / etcd / minio / embedding-server 四个容器。
@@ -67,9 +66,8 @@ require() {
 }
 require MYSQL_ROOT_PASSWORD "在 .env 里设置，与宿主机 MySQL 的 root 口令一致"
 require REDIS_PASSWORD       "在 .env 里设置，与宿主机 Redis 的 requirepass 一致"
-# 下面两项只有 prod 断言在读，且读的是 Environment.getProperty(key) ——
-# 键名必须与断言里的一致。MIMO_API_KEY 顶替不了 LLM_API_KEY：前者喂给
-# langchain4j 客户端，后者是断言单独检查的那一个键。
+# LLM_API_KEY 是对话模型密钥，MIMO_API_KEY 顶替不了它：前者喂 langchain4j
+# 客户端，后者是另一条通路。
 require MODEL_CONFIG_ENCRYPTION_KEY "32 字节 Base64（openssl rand -base64 32），用于加密用户填的模型配置"
 require LLM_API_KEY                "对话模型密钥，可直接用 MIMO_API_KEY 的值：export LLM_API_KEY=..."
 if [ "$missing" -eq 1 ]; then
@@ -81,10 +79,10 @@ fi
 # spring.config.import 把它作为属性加载；这里只在两边都没有时提示。
 if [ -z "${JWT_SECRET:-}" ] && ! grep -q '^JWT_SECRET:' "$HOME/.miniagent/config.yml" 2>/dev/null; then
   echo "警告: 没有 JWT_SECRET（环境变量与 ~/.miniagent/config.yml 都没有）。" >&2
-  echo "      prod 断言要求它至少 32 字节，否则拒绝启动：openssl rand -base64 48" >&2
+  echo "      没配则沿用 application.yml 里的默认值；要换就 openssl rand -base64 48" >&2
 fi
 
-# ── 2. 组装 prod 档需要的变量 ────────────────────────────────────
+# ── 2. 组装运行期变量 ────────────────────────────────────────────
 # JWT_SECRET / LLM_API_KEY 等密钥可以从 ~/.miniagent/config.yml 来（Spring 的
 # spring.config.import 会加载它），但断言读的是 Environment 属性，两处都认。
 # 这里只在环境变量缺失时提示，不去解析 config.yml —— 解析错了会静默用空值。
@@ -106,14 +104,12 @@ if [ ! -f "$MODELS_DIR/yuan-embedding-2.0-zh.int8.onnx" ] || [ ! -f "$MODELS_DIR
   echo "      MINI_AGENT_MODELS_DIR 指向已有目录。" >&2
 fi
 
-export SPRING_PROFILES_ACTIVE=prod
 
 export DB_URL="${DB_URL:-jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}"
 export DB_USERNAME="${DB_USERNAME:-root}"
 export DB_PASSWORD="${DB_PASSWORD:-$MYSQL_ROOT_PASSWORD}"
 
-# application-prod.yml 里写的是 host: redis（容器名）。jar 在宿主机跑，必须覆盖成
-# 127.0.0.1，否则 DNS 解析失败、启动卡在 Redis 连接上。
+# Redis 地址在 application.yml 里已是 127.0.0.1；这两个变量只用于换机器时覆盖。
 export SPRING_DATA_REDIS_HOST="${SPRING_DATA_REDIS_HOST:-127.0.0.1}"
 export SPRING_DATA_REDIS_PORT="${SPRING_DATA_REDIS_PORT:-6379}"
 
@@ -122,7 +118,7 @@ export SPRING_DATA_REDIS_PORT="${SPRING_DATA_REDIS_PORT:-6379}"
 export ALLOWED_ORIGINS="${ALLOWED_ORIGINS:-https://localhost}"
 
 # 账号走本地，不连云端账号服务。
-# 注意：prod 档 registration-enabled=false，所以本地模式下没有注册入口，
+# 注意：默认档 registration-enabled=false，本地模式下没有注册入口，
 # 首个账号必须靠 BOOTSTRAP_ADMIN_USERNAME / BOOTSTRAP_ADMIN_PASSWORD 创建。
 # 不想要这套就改成指向真实的账号服务：ACCOUNT_BASE_URL=http://<host>:8081
 export ACCOUNT_BASE_URL="${ACCOUNT_BASE_URL:-}"
@@ -150,8 +146,8 @@ probe_port() {
   echo "警告: $name 未在 127.0.0.1:$port 监听。$hint" >&2
 }
 
-probe_port 3306 mysql "prod 档在启动断言阶段就会因连不上 MySQL 而拒绝启动。"
-probe_port 6379 redis "prod 档会因连不上 Redis 而启动失败。"
+probe_port 3306 mysql "连不上 MySQL 会在 Flyway 初始化阶段失败。"
+probe_port 6379 redis "连不上 Redis 会让会话存储初始化失败。"
 
 # ── 4. 启动 ──────────────────────────────────────────────────────
 # 端口占用不要静默切端口：壳/反代/文档里写的都是 8080，悄悄换端口会让人查半天。
@@ -160,7 +156,7 @@ if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":$PORT "; the
   exit 1
 fi
 
-echo "启动 MiniAgent: profile=prod port=$PORT jar=$JAR"
+echo "启动 MiniAgent: port=$PORT jar=$JAR"
 echo "  数据目录: $MINI_AGENT_HOME"
 echo "  模型目录: $MODELS_DIR"
 

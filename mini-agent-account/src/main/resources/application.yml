@@ -11,8 +11,6 @@ server:
 spring:
   application:
     name: mini-agent-account
-  profiles:
-    active: dev
 
   datasource:
     # 默认连本机 127.0.0.1:3306。
@@ -30,7 +28,7 @@ spring:
     #
     # 它是**本地开发兜底**，不是生产凭据：
     #   - 需要覆盖时照旧用环境变量，前缀形式 ${VAR:default} 保留了覆盖能力；
-    #   - prod 档 application-prod.yml 里也写了同一个默认值，两边一致，
+    #   - 默认档与部署环境用的是同一个值，两边一致，
     #     所以生产与本地连的是同一套口令，不会出现"本地能跑、部署报 Access denied"。
     url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
     username: ${DB_USERNAME:root}
@@ -68,8 +66,8 @@ management:
 agent:
   account:
     registration-enabled: true
-    password-min-length: 8
-    bcrypt-strength: 10
+    password-min-length: 12
+    bcrypt-strength: 12
 
     # 浏览器自助"确认支付"入口（POST /api/portal/orders/{no}/confirm）。
     #
@@ -93,3 +91,8 @@ agent:
     # 版本库 —— 能读仓库的人可以伪造任意 tenantId 的令牌。要收紧就换掉本行、改用
     # ACCOUNT_MEMORY_TOKEN_KEY 注入，并确认两个服务同时更新（换密钥会让已签发令牌失效）。
     memory-token-key: ${ACCOUNT_MEMORY_TOKEN_KEY:mMdxSRXpWYc8ApX3ejLKFsxzUN0ZBMW5GkE7Rjv5QmI=}
+
+logging:
+  level:
+    com.miniagent: INFO
+    root: WARN
