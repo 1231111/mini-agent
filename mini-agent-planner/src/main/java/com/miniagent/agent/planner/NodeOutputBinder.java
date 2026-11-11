@@ -49,11 +49,25 @@ final class NodeOutputBinder {
 
     static Bound bind(TaskNode node, String todoEvidence,
                       List<ChatMessage> messages, String judgeAnswer) {
+        return bind(node, todoEvidence, messages, judgeAnswer, null);
+    }
+
+    static Bound bind(TaskNode node, String todoEvidence, List<ChatMessage> messages,
+                      String judgeAnswer, com.miniagent.agent.tool.ToolResult structuredResult) {
         if (node == null) {
             return new Bound("", Map.of());
         }
         String todo = usable(todoEvidence);
-        String tools = lastUsefulToolText(messages);
+        if (structuredResult != null && !structuredResult.isSuccess()) {
+            return new Bound(structuredResult.legacyText(), Map.of());
+        }
+        String tools = structuredResult == null
+                ? lastUsefulToolText(messages) : usable(structuredResult.legacyText());
+        if (structuredResult == null && StepEvaluator.looksLikeToolError(tools)) {
+            // Do not let an old file path or earlier successful tool hide a failed
+            // final action. The evaluator must see the failure before world checks.
+            return new Bound(tools, Map.of());
+        }
         String evidence = firstNonBlank(todo, tools);
         Map<String, String> bindings = new LinkedHashMap<>();
         mergeJsonPorts(bindings, node, todo);
@@ -105,7 +119,7 @@ final class NodeOutputBinder {
                 continue;
             }
             String t = usable(tr.text());
-            if (t.isEmpty() || StepEvaluator.looksLikeToolError(t)) {
+            if (t.isEmpty()) {
                 continue;
             }
             last = t;

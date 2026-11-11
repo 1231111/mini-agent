@@ -47,8 +47,20 @@ function fillInput(t) {
    SIDEBAR TOGGLE
    ========================================================================= */
 function toggleSidebar() {
+    const sidebar = document.getElementById('sidebar');
+    if (window.matchMedia('(max-width: 700px)').matches) {
+        const open = !sidebar.classList.contains('mobile-open');
+        sidebar.classList.remove('collapsed');
+        sidebar.classList.toggle('mobile-open', open);
+        sidebarOpen = open;
+        const backdrop = document.getElementById('sidebarBackdrop');
+        if (backdrop) backdrop.hidden = !open;
+        const toggle = document.getElementById('sidebarToggle');
+        if (toggle) toggle.title = open ? '关闭导航' : '打开导航';
+        return;
+    }
     sidebarOpen = !sidebarOpen;
-    document.getElementById('sidebar').classList.toggle('collapsed', !sidebarOpen);
+    sidebar.classList.toggle('collapsed', !sidebarOpen);
     const btn = document.getElementById('sidebarToggle');
     if (btn) {
         btn.title = sidebarOpen ? '收起侧栏' : '展开侧栏';

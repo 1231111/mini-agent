@@ -37,8 +37,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('backend-error', handler);
   },
 
-  // 仙鹤炸开播完。主进程等到这一下再把窗口撑开并载入聊天页。
-  bootBurstDone: () => ipcRenderer.send('boot:burst-done'),
+  // 启动画面收尾动画结束，主进程随后展开窗口并载入聊天页。
+  bootAnimationDone: () => ipcRenderer.send('boot:animation-done'),
   bootReveal: () => ipcRenderer.send('boot:reveal'),
 
   // 启动进度（阶段 + 已用时间）。主进程每秒钟推一次，启动画面据此显示

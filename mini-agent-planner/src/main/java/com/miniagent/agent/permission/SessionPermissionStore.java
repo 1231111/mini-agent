@@ -482,15 +482,40 @@ public class SessionPermissionStore {
      */
     public Optional<AskGrant> awaitAskApproval(String sessionId, String token, long timeoutMillis)
             throws InterruptedException {
+        return awaitAskApproval(sessionId, token, timeoutMillis, null);
+    }
+
+    /** Stop-aware wait used by both ReAct and directly bound DAG actions. */
+    public Optional<AskGrant> awaitAskApproval(String sessionId, String token, long timeoutMillis,
+                                             java.util.function.BooleanSupplier stopRequested)
+            throws InterruptedException {
         if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(token)) {
             return Optional.empty();
         }
         String key = pendingKey(sessionId, token.trim());
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(1L, timeoutMillis));
-        synchronized (approvedAskWaiters) {
-            while (true) {
+        while (true) {
+            // A stop predicate may perform a Redis read. Never call it while
+            // holding the monitor shared by every session's approval waiters.
+            boolean stop = false;
+            if (stopRequested != null) {
+                try {
+                    stop = stopRequested.getAsBoolean();
+                } catch (RuntimeException e) {
+                    synchronized (approvedAskWaiters) {
+                        ApprovedAsk waiting = approvedAskWaiters.get(key);
+                        if (waiting != null) abandonLocked(key, waiting);
+                    }
+                    throw e;
+                }
+            }
+            synchronized (approvedAskWaiters) {
                 ApprovedAsk waiting = approvedAskWaiters.get(key);
                 if (waiting == null) {
+                    return Optional.empty();
+                }
+                if (stop) {
+                    abandonLocked(key, waiting);
                     return Optional.empty();
                 }
                 long now = System.currentTimeMillis();
@@ -508,7 +533,9 @@ public class SessionPermissionStore {
                     return Optional.empty();
                 }
                 try {
-                    TimeUnit.NANOSECONDS.timedWait(approvedAskWaiters, remain);
+                    long wait = stopRequested == null ? remain
+                            : Math.min(remain, TimeUnit.MILLISECONDS.toNanos(100L));
+                    TimeUnit.NANOSECONDS.timedWait(approvedAskWaiters, wait);
                 } catch (InterruptedException e) {
                     // 取消/中断也是终态：不清理的话，用户稍后批准会命中一条
                     // 已经没有线程在等的 waiter，看起来像「批了没反应」。

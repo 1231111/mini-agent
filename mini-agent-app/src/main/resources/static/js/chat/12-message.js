@@ -1,7 +1,124 @@
 /* =========================================================================
    MESSAGE DOM BUILDERS
    ========================================================================= */
-function renderUserMsg(text, imgSrc, imgCount = imgSrc ? 1 : 0, fileNames = [], isInject = false) {
+function attachmentExtension(name) {
+    return fileExt(String(name || '').split('?')[0].split('#')[0]).toLowerCase();
+}
+
+function attachmentNameFromSource(src) {
+    try {
+        const url = new URL(String(src || ''), window.location.href);
+        const provided = url.searchParams.get('name');
+        if (provided) return provided;
+        return decodeURIComponentSafe(url.pathname.split('/').pop() || '附件');
+    } catch (_) {
+        return decodeURIComponentSafe(String(src || '').split('/').pop().split('?')[0] || '附件');
+    }
+}
+
+function createAttachmentPreview(attachment) {
+    const item = typeof attachment === 'string'
+        ? { src: attachment, name: attachmentNameFromSource(attachment) }
+        : (attachment || {});
+    const src = String(item.src || item.url || '');
+    const name = String(item.name || '附件');
+    const ext = attachmentExtension(name || src).toUpperCase() || 'FILE';
+    const type = String(item.type || '').toLowerCase();
+    const mediaExt = ext.toLowerCase();
+    const isImage = type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif'].includes(mediaExt);
+    const isVideo = type.startsWith('video/') || VIDEO_EXTS.has(mediaExt);
+    const isAudio = type.startsWith('audio/') || AUDIO_EXTS.has(mediaExt);
+    const card = document.createElement('div');
+    card.className = 'attachment-preview' + (isImage ? ' image' : isVideo ? ' video' : isAudio ? ' audio' : ' file');
+    if (src.startsWith('blob:')) card.dataset.objectUrl = src;
+
+    if (isImage || isVideo || isAudio) {
+        const media = document.createElement(isImage ? 'img' : isVideo ? 'video' : 'audio');
+        media.className = 'attachment-media';
+        if (isVideo) {
+            media.controls = true;
+            media.playsInline = true;
+            media.preload = 'metadata';
+        } else if (isAudio) {
+            media.controls = true;
+            media.preload = 'metadata';
+        } else {
+            media.alt = name;
+            media.loading = 'lazy';
+            media.referrerPolicy = 'no-referrer';
+        }
+        if (/^\/api\//i.test(src)) media.dataset.authSrc = src;
+        else if (src) media.src = src;
+        card.appendChild(media);
+        if (isVideo || isAudio) {
+            const label = document.createElement('div');
+            label.className = 'attachment-caption';
+            label.textContent = name;
+            card.appendChild(label);
+        }
+    } else {
+        const badge = document.createElement('span');
+        badge.className = 'attachment-file-ext';
+        badge.textContent = ext.slice(0, 5);
+        const meta = document.createElement('span');
+        meta.className = 'attachment-file-meta';
+        const title = document.createElement('strong');
+        title.textContent = name;
+        meta.appendChild(title);
+        const hint = document.createElement('small');
+        hint.textContent = item.size ? formatBytes(item.size) : (src.startsWith('/api/conversation-media/') ? '点击下载' : '已附加');
+        meta.appendChild(hint);
+        card.append(badge, meta);
+        if (src.startsWith('/api/conversation-media/')) {
+            const download = document.createElement('a');
+            download.href = '#';
+            download.className = 'conversation-download-link';
+            download.dataset.authDownload = src.replace('/api/conversation-media/', '/api/conversation-download/');
+            download.dataset.downloadName = name;
+            download.setAttribute('aria-label', '下载 ' + name);
+            card.appendChild(download);
+        } else if (src.startsWith('/api/user-upload-download/')) {
+            const download = document.createElement('a');
+            download.href = '#';
+            download.className = 'conversation-download-link';
+            download.dataset.authDownload = src;
+            download.dataset.downloadName = name;
+            download.setAttribute('aria-label', '下载 ' + name);
+            card.appendChild(download);
+        } else if (src.startsWith('blob:')) {
+            const download = document.createElement('a');
+            download.href = src;
+            download.download = name;
+            download.className = 'attachment-local-download';
+            download.setAttribute('aria-label', '下载 ' + name);
+            card.appendChild(download);
+        }
+    }
+    if (item.size) card.dataset.size = String(item.size);
+    return card;
+}
+
+function decodeURIComponentSafe(value) {
+    try { return decodeURIComponent(value); } catch (_) { return value; }
+}
+
+function formatBytes(value) {
+    const bytes = Number(value);
+    if (!Number.isFinite(bytes) || bytes <= 0) return '';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function releaseAttachmentObjectUrls(root) {
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll('[data-object-url]').forEach(card => {
+        URL.revokeObjectURL(card.dataset.objectUrl);
+        card.removeAttribute('data-object-url');
+    });
+}
+
+function renderUserMsg(text, imgSrc, imgCount = imgSrc ? 1 : 0, fileNames = [], isInject = false, attachments = null) {
     // 系统控制语（前端自己拼、当用户消息发回后端的那几条）不装成用户气泡：
     // 它不是用户打的字。装成气泡有两个后果 —— 用户以为「系统批注成了我的输入」，
     // 以及 row.dataset.task 会让顶部任务条把它读成任务标题。
@@ -13,18 +130,35 @@ function renderUserMsg(text, imgSrc, imgCount = imgSrc ? 1 : 0, fileNames = [], 
     const row = document.createElement('div');
     row.className = 'msg-row user-row';
     row.dataset.task = text || '';   // 顶部任务条读这里，避免从 DOM 反推被图片/附件污染
-    const moreCount = imgCount > 1 ? `<div style="font-size:11px;color:var(--text2);margin-top:4px">附 ${imgCount} 张图片</div>` : '';
-    const fileList = fileNames.length > 0 ? `<div style="font-size:11px;color:var(--text2);margin-top:4px">附文件: ${fileNames.map(esc).join(', ')}</div>` : '';
     const injectBadge = isInject ? `<span style="font-size:10px;background:var(--accent);color:#fff;padding:1px 6px;border-radius:8px;margin-right:6px;vertical-align:middle">补充</span>` : '';
     row.innerHTML = `
         <div class="msg-inner">
             <div class="user-bubble">
-                ${imgSrc ? `<img src="${escA(imgSrc)}" alt="上传图片">${moreCount}` : ''}
-                ${fileList}
                 ${injectBadge}${text ? esc(text).replace(/\n/g, '<br>') : ''}
             </div>
+            <div class="user-avatar" aria-label="用户">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4.2 4.2 0 1 0 0-8.4A4.2 4.2 0 0 0 12 12Zm0 2.1c-4.3 0-7.8 2.2-7.8 4.9v1h15.6v-1c0-2.7-3.5-4.9-7.8-4.9Z"/></svg>
+            </div>
         </div>`;
+    const bubble = row.querySelector('.user-bubble');
+    const mediaItems = Array.isArray(attachments) ? attachments.filter(Boolean) : [];
+    if (!mediaItems.length && imgSrc) mediaItems.push({ src: imgSrc, name: '上传图片' });
+    if (mediaItems.length || fileNames.length) {
+        const grid = document.createElement('div');
+        grid.className = 'attachment-preview-grid';
+        mediaItems.forEach(item => grid.appendChild(createAttachmentPreview(item)));
+        fileNames.forEach(name => grid.appendChild(createAttachmentPreview({ name })));
+        bubble.insertBefore(grid, bubble.firstChild);
+    }
+    if (!Array.isArray(attachments) && imgSrc && imgCount > 1) {
+        const count = document.createElement('div');
+        count.className = 'attachment-count';
+        count.textContent = '另附 ' + (imgCount - 1) + ' 张图片';
+        bubble.insertBefore(count, bubble.firstChild);
+    }
     $msg.appendChild(row);
+    bindLightbox(row);
+    hydrateProtectedMedia(row);
     return row;
 }
 
@@ -44,11 +178,13 @@ function renderBotMsg(initHtml, streaming = true) {
     const row = document.createElement('div');
     row.className = 'msg-row bot-row';
     const bid = 'bb_' + Date.now();
+    const initialContent = streaming ? initHtml
+        : `<div class="answer-stream md-body has-content">${initHtml}</div>`;
     row.innerHTML = `
         <div class="msg-inner">
-            <div class="bot-avatar">🤖</div>
+            <div class="bot-avatar" aria-label="MiniAgent"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="ai-mark" d="M12 2.5 14.25 9.75 21.5 12l-7.25 2.25L12 21.5l-2.25-7.25L2.5 12l7.25-2.25L12 2.5Z"/><path d="M19.5 3.5v4M17.5 5.5h4M5 17v4M3 19h4"/></svg></div>
             <div class="bot-content">
-                <div class="bot-body ${streaming ? 'streaming' : ''}" id="${bid}">${initHtml}</div>
+                <div class="bot-body ${streaming ? 'streaming' : ''}" id="${bid}">${initialContent}</div>
                 <div class="bot-actions">
                     <button class="ba-btn" onclick="copyBotMsg(this)" title="复制">
                         <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -73,10 +209,11 @@ function bindLightbox(row) {
 }
 
 document.addEventListener('click', async event => {
-    const link = event.target.closest('a[data-auth-download]');
+    const link = event.target.closest('a[data-auth-download], a.workspace-download-link[aria-disabled="true"]');
     if (!link) return;
     event.preventDefault();
     const url = link.getAttribute('data-auth-download');
+    if (!url || link.getAttribute('aria-busy') === 'true') return;
     const name = link.getAttribute('data-download-name') || 'download';
     const token = window.MiniAuth?.token();
     if (!token) {
@@ -89,7 +226,11 @@ document.addEventListener('click', async event => {
             headers: { Authorization: 'Bearer ' + token },
             credentials: 'same-origin'
         });
-        if (!response.ok) throw new Error('HTTP ' + response.status);
+        if (!response.ok) {
+            const error = new Error(fileDownloadErrorMessage(response.status));
+            error.status = response.status;
+            throw error;
+        }
         const objectUrl = URL.createObjectURL(await response.blob());
         const anchor = document.createElement('a');
         anchor.href = objectUrl;
@@ -100,11 +241,37 @@ document.addEventListener('click', async event => {
         setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
     } catch (error) {
         console.warn('工作区文件下载失败:', url, error);
-        window.alert('文件下载失败，请确认登录状态后重试。');
+        const message = error.status ? error.message : '下载连接失败，请检查网络后重试。';
+        const hint = link.querySelector('small');
+        if (hint) {
+            hint.textContent = message;
+            hint.setAttribute('role', 'alert');
+        } else {
+            const notice = document.createElement('span');
+            notice.className = 'file-download-error';
+            notice.textContent = message;
+            notice.setAttribute('role', 'alert');
+            link.after(notice);
+        }
+        link.title = message;
+        if ([400, 403, 404].includes(error.status)) {
+            link.removeAttribute('data-auth-download');
+            link.removeAttribute('href');
+            link.setAttribute('aria-disabled', 'true');
+        }
     } finally {
         link.removeAttribute('aria-busy');
     }
 });
+
+function fileDownloadErrorMessage(status) {
+    if (status === 401) return '登录已失效，请重新登录后下载。';
+    if (status === 403) return '当前账号无权下载这个文件。';
+    if (status === 404) return '当前会话工作区中没有这个文件；回复中的文件引用未提供下载。';
+    if (status === 400) return '文件引用无效，请使用具体文件路径，不能包含通配符。';
+    if (status === 429) return '下载请求过于频繁，请稍后重试。';
+    return '服务暂时无法读取文件，请稍后重试（HTTP ' + status + '）。';
+}
 
 function copyBotMsg(btn) {
     const bd = btn.closest('.bot-content').querySelector('.bot-body');

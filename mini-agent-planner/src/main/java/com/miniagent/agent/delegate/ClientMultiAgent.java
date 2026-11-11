@@ -127,23 +127,31 @@ public class ClientMultiAgent {
         if (StringUtils.isNotBlank(parentSid)) {
             attachWorker(parentSid, subSid);
         }
-        String answer;
+        AgentLoop.LoopOutcome outcome;
         try (SubagentScope scope = SubagentScope.enter(subSid, role, false)) {
-            answer = agentLoop.run(model, systemPrompt, userMessage, List.of(),
+            outcome = agentLoop.runOutcome(model, systemPrompt, userMessage, List.of(),
                     executionProperties.getSubagentMaxIterations(),
                     new TaskPlan(goal, tools, List.of(),
-                            "subagent:" + (role.isEmpty() ? "general" : role)));
+                            "subagent:" + (role.isEmpty() ? "general" : role)), null);
         } catch (Exception e) {
             return error("子 Agent 执行失败: " + e.getMessage());
         } finally {
             detachWorker(subSid);
         }
         try {
-            return MAPPER.writeValueAsString(Map.of(
-                    "success", true,
-                    "role", roleLabel,
-                    "goal", goal,
-                    "summary", clamp(answer, SUMMARY_MAX_CHARS)));
+            boolean success = outcome != null && outcome.successful();
+            String reason = outcome == null || StringUtils.isBlank(outcome.endReason())
+                    ? "UNKNOWN" : outcome.endReason();
+            Map<String, Object> result = new java.util.LinkedHashMap<>();
+            result.put("success", success);
+            result.put("role", roleLabel);
+            result.put("goal", goal);
+            result.put("summary", clamp(outcome == null ? null : outcome.text(), SUMMARY_MAX_CHARS));
+            result.put("endReason", reason);
+            if (!success) {
+                result.put("error", "子 Agent 未完成目标：" + reason);
+            }
+            return MAPPER.writeValueAsString(result);
         } catch (Exception e) {
             return error(e.getMessage());
         }

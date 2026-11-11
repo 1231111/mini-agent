@@ -1,6 +1,7 @@
 package com.miniagent.agent.core;
 
 import com.miniagent.common.event.SessionEvictedEvent;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.event.EventListener;
@@ -13,10 +14,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** 会话执行控制面：取消、deadline、心跳和资源预算都在这里收敛。 */
 @Component
 @EnableConfigurationProperties(ExecutionProperties.class)
+@Slf4j
 public class ExecutionControl {
     /**
      * 停止原因。
@@ -44,7 +47,13 @@ public class ExecutionControl {
         /** 累计 token 的告警线，不是终止线。 */
         private final long tokenSoftLimit;
         private final Long tenantId;
-        private final AtomicBoolean cancelled = new AtomicBoolean();
+        private final String signalId;
+        private final String runToken;
+        private boolean started;
+        private final AtomicBoolean cancelled;
+        private final AtomicBoolean pauseRequested;
+        private final AtomicBoolean pausedAtCheckpoint = new AtomicBoolean();
+        private final AtomicBoolean humanWaitpoint = new AtomicBoolean();
         private final AtomicBoolean tenantQuotaDenied = new AtomicBoolean();
         private final AtomicInteger toolCalls = new AtomicInteger();
         private final AtomicLong estimatedTokens = new AtomicLong();
@@ -62,14 +71,25 @@ public class ExecutionControl {
 
         private Lease(long deadlineEpochMillis, int maxToolCalls, long tokenSoftLimit,
                       Long tenantId) {
+            this(deadlineEpochMillis, maxToolCalls, tokenSoftLimit, tenantId, null, null, null);
+        }
+
+        private Lease(long deadlineEpochMillis, int maxToolCalls, long tokenSoftLimit,
+                      Long tenantId, String signalId, String runToken, Lease pending) {
             this.deadlineEpochMillis = deadlineEpochMillis;
             this.maxToolCalls = maxToolCalls;
             this.tokenSoftLimit = tokenSoftLimit;
             this.tenantId = tenantId;
+            this.signalId = signalId;
+            this.runToken = runToken;
+            this.cancelled = pending == null ? new AtomicBoolean() : pending.cancelled;
+            this.pauseRequested = pending == null ? new AtomicBoolean() : pending.pauseRequested;
         }
     }
 
     private final Map<String, Lease> leases = new ConcurrentHashMap<>();
+    /** Also holds controls received after admission but before the worker starts. */
+    private final Map<String, Lease> runLeases = new ConcurrentHashMap<>();
     /** 子会话查预算、取消时用父会话那一份租约。 */
     private final Map<String, String> childToParent = new ConcurrentHashMap<>();
     private final long deadlineMillis;
@@ -141,10 +161,49 @@ public class ExecutionControl {
         return lease;
     }
 
+    public Lease start(String sessionId, Long tenantId, String runToken) {
+        String sid = key(sessionId);
+        String scoped = scopedKey(sid, runToken);
+        prunePendingRuns();
+        Lease lease = runLeases.compute(scoped, (ignored, pending) -> {
+            if (pending != null && pending.started) return pending;
+            Lease active = new Lease(System.currentTimeMillis() + deadlineMillis,
+                    maxToolCalls, tokenSoftLimit, tenantId, scoped, runToken, pending);
+            if (tenantId != null && tenantTokenQuota.isPresent()
+                    && !tenantTokenQuota.get().check(tenantId).allowed()) {
+                active.tenantQuotaDenied.set(true);
+            }
+            // Same scoped key is serialized with pre-start cancel/pause/resume.
+            signalStore.ifPresent(store -> store.startPreservingControls(
+                    scoped, active.deadlineEpochMillis, signalTtlMillis()));
+            active.started = true;
+            leases.put(sid, active);
+            return active;
+        });
+        return lease;
+    }
+
+    public void finish(String sessionId, String runToken) {
+        String scoped = scopedKey(key(sessionId), runToken);
+        runLeases.compute(scoped, (ignored, lease) -> {
+            if (lease != null) leases.remove(key(sessionId), lease);
+            // Remote signals expire on their own. A Redis failure must not keep
+            // local state alive or interrupt the caller's remaining cleanup.
+            try {
+                signalStore.ifPresent(store -> store.finish(scoped));
+            } catch (RuntimeException e) {
+                log.warn("Failed to clear execution signal for completed run: session={}, runToken={}",
+                        key(sessionId), runToken, e);
+            }
+            return null;
+        });
+    }
+
     public void finish(String sessionId) {
         String key = key(sessionId);
-        leases.remove(key);
-        signalStore.ifPresent(store -> store.finish(key));
+        Lease lease = leases.remove(key);
+        if (lease != null && lease.signalId != null) runLeases.remove(lease.signalId, lease);
+        signalStore.ifPresent(store -> store.finish(signalId(key, lease)));
     }
 
     /**
@@ -158,11 +217,12 @@ public class ExecutionControl {
             return;
         }
         String key = key(sessionId);
-        leases.remove(key);
+        Lease lease = leases.remove(key);
+        runLeases.entrySet().removeIf(e -> e.getKey().startsWith(scopedPrefix(key)));
         childToParent.remove(key);
         childToParent.entrySet().removeIf(e -> key.equals(e.getValue()));
         if (dropSignals) {
-            signalStore.ifPresent(store -> store.finish(key));
+            signalStore.ifPresent(store -> store.finish(signalId(key, lease)));
         }
     }
 
@@ -178,16 +238,197 @@ public class ExecutionControl {
     }
 
     public void cancel(String sessionId) {
-        String key = key(sessionId);
-        leases.computeIfAbsent(key, ignored -> fallbackLease()).cancelled.set(true);
-        signalStore.ifPresent(store -> store.cancel(key, signalTtlMillis()));
+        String resolved = resolve(key(sessionId));
+        Lease lease = lease(sessionId);
+        lease.cancelled.set(true);
+        signalStore.ifPresent(store -> store.cancel(signalId(resolved, lease), signalTtlMillis()));
+    }
+
+    public void cancel(String sessionId, String runToken) {
+        controlRun(sessionId, runToken, (scoped, lease) -> {
+            lease.cancelled.set(true);
+            signalStore.ifPresent(store -> store.cancel(scoped, signalTtlMillis()));
+        });
+    }
+
+    public boolean isCancelled(String sessionId, String runToken) {
+        String scoped = scopedKey(key(sessionId), runToken);
+        Lease lease = runLeases.get(scoped);
+        return (lease != null && lease.cancelled.get())
+                || signalStore.map(store -> store.isCancelled(scoped)).orElse(false);
+    }
+
+    /**
+     * Read the current run's stop state without waiting at a pause checkpoint.
+     * Blocking operations (such as tool handlers) use this to observe cancellation
+     * and the overall run deadline while preserving the normal pause semantics.
+     */
+    public StopReason stopReason(String sessionId) {
+        Lease lease = lease(sessionId);
+        if (isCancelled(sessionId)) return StopReason.CANCELLED;
+        if (System.currentTimeMillis() > lease.deadlineEpochMillis) {
+            return StopReason.DEADLINE_EXCEEDED;
+        }
+        return StopReason.NONE;
+    }
+
+    public void pause(String sessionId, String runToken) {
+        controlRun(sessionId, runToken, (scoped, lease) -> {
+            lease.pauseRequested.set(true);
+            signalStore.ifPresent(store -> store.pause(scoped, signalTtlMillis()));
+            if (lease.humanWaitpoint.get()
+                    || signalStore.map(store -> store.isAtHumanWaitpoint(scoped)).orElse(false)) {
+                lease.pausedAtCheckpoint.set(true);
+                signalStore.ifPresent(store -> store.markPausedAtCheckpoint(scoped, true, signalTtlMillis()));
+            }
+        });
+    }
+
+    public void resume(String sessionId, String runToken) {
+        controlRun(sessionId, runToken, (scoped, lease) -> {
+            lease.pauseRequested.set(false);
+            lease.pausedAtCheckpoint.set(false);
+            signalStore.ifPresent(store -> store.resume(scoped, signalTtlMillis()));
+        });
+    }
+
+    public boolean isPauseRequested(String sessionId, String runToken) {
+        String scoped = scopedKey(key(sessionId), runToken);
+        Lease lease = runLeases.get(scoped);
+        return signalStore.map(store -> store.isPaused(scoped))
+                .orElseGet(() -> lease != null && lease.pauseRequested.get());
+    }
+
+    public boolean isPausedAtCheckpoint(String sessionId, String runToken) {
+        if (!isPauseRequested(sessionId, runToken)) return false;
+        String scoped = scopedKey(key(sessionId), runToken);
+        Lease lease = runLeases.get(scoped);
+        return signalStore.map(store -> store.isPausedAtCheckpoint(scoped))
+                .orElseGet(() -> lease != null && lease.pausedAtCheckpoint.get());
+    }
+
+    private void controlRun(String sessionId, String runToken,
+                            java.util.function.BiConsumer<String, Lease> control) {
+        String scoped = scopedKey(key(sessionId), runToken);
+        prunePendingRuns();
+        AtomicReference<RuntimeException> failure = new AtomicReference<>();
+        runLeases.compute(scoped, (ignored, previous) -> {
+            Lease lease = previous == null ? new Lease(System.currentTimeMillis() + deadlineMillis,
+                    maxToolCalls, tokenSoftLimit, null, scoped, runToken, null) : previous;
+            // Install the local control first. A remote signal-store failure must
+            // not discard a pre-start cancel/pause/resume when compute returns.
+            try {
+                control.accept(scoped, lease);
+            } catch (RuntimeException e) {
+                failure.set(e);
+            }
+            return lease;
+        });
+        // The API must still report a failed cross-replica write, but rethrow
+        // only after compute committed the local pre-start control.
+        if (failure.get() != null) throw failure.get();
+    }
+
+    private void prunePendingRuns() {
+        long now = System.currentTimeMillis();
+        runLeases.entrySet().removeIf(e -> now > e.getValue().deadlineEpochMillis + 60_000L
+                && !leases.containsValue(e.getValue()));
+    }
+
+    /** 请求在下一个安全检查点暂停；正在运行的外部工具会先完成当前调用。 */
+    public void pause(String sessionId) {
+        String resolved = resolve(key(sessionId));
+        Lease lease = lease(sessionId);
+        lease.pauseRequested.set(true);
+        signalStore.ifPresent(store -> store.pause(signalId(resolved, lease), signalTtlMillis()));
+        if (isAtHumanWaitpoint(sessionId)) {
+            lease.pausedAtCheckpoint.set(true);
+            signalStore.ifPresent(store -> store.markPausedAtCheckpoint(
+                    signalId(resolved, lease), true, signalTtlMillis()));
+        }
+    }
+
+    /** 清除暂停请求；阻塞在检查点的执行线程会继续。 */
+    public void resume(String sessionId) {
+        String resolved = resolve(key(sessionId));
+        Lease lease = lease(sessionId);
+        lease.pauseRequested.set(false);
+        lease.pausedAtCheckpoint.set(false);
+        signalStore.ifPresent(store -> store.resume(signalId(resolved, lease), signalTtlMillis()));
+    }
+
+    public boolean isPauseRequested(String sessionId) {
+        String resolved = resolve(key(sessionId));
+        Lease lease = lease(sessionId);
+        return signalStore.map(store -> store.isPaused(signalId(resolved, lease)))
+                .orElseGet(lease.pauseRequested::get);
+    }
+
+    public boolean isPausedAtCheckpoint(String sessionId) {
+        String resolved = resolve(key(sessionId));
+        Lease lease = lease(sessionId);
+        if (!isPauseRequested(sessionId)) return false;
+        return signalStore.map(store -> store.isPausedAtCheckpoint(signalId(resolved, lease)))
+                .orElseGet(lease.pausedAtCheckpoint::get);
+    }
+
+    /** 标记当前执行线程正在等待用户审批；该等待本身是可暂停安全点。 */
+    public void markHumanWaitpoint(String sessionId, boolean waiting) {
+        String resolved = resolve(key(sessionId));
+        Lease lease = lease(sessionId);
+        lease.humanWaitpoint.set(waiting);
+        signalStore.ifPresent(store -> store.markHumanWaitpoint(
+                signalId(resolved, lease), waiting, signalTtlMillis()));
+    }
+
+    public boolean isAtHumanWaitpoint(String sessionId) {
+        String resolved = resolve(key(sessionId));
+        Lease lease = lease(sessionId);
+        return signalStore.map(store -> store.isAtHumanWaitpoint(signalId(resolved, lease)))
+                .orElseGet(lease.humanWaitpoint::get);
+    }
+
+    /**
+     * 阻塞在可中断的执行边界，直到用户恢复、取消或任务超时。
+     * Redis 状态以短间隔轮询，允许 API 请求由另一应用副本接收。
+     */
+    public StopReason awaitIfPaused(String sessionId) {
+        String resolved = resolve(key(sessionId));
+        Lease lease = lease(sessionId);
+        boolean markedPaused = false;
+        try {
+            while (isPauseRequested(sessionId)) {
+                if (isCancelled(sessionId)) return StopReason.CANCELLED;
+                if (System.currentTimeMillis() > lease.deadlineEpochMillis) {
+                    return StopReason.DEADLINE_EXCEEDED;
+                }
+                if (!markedPaused) {
+                    lease.pausedAtCheckpoint.set(true);
+                    signalStore.ifPresent(store -> store.markPausedAtCheckpoint(
+                            signalId(resolved, lease), true, signalTtlMillis()));
+                    markedPaused = true;
+                }
+                Thread.sleep(200L);
+                heartbeat(sessionId);
+            }
+            return isCancelled(sessionId) ? StopReason.CANCELLED : StopReason.NONE;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return StopReason.CANCELLED;
+        } finally {
+            if (markedPaused) {
+                lease.pausedAtCheckpoint.set(false);
+                signalStore.ifPresent(store -> store.markPausedAtCheckpoint(
+                        signalId(resolved, lease), false, signalTtlMillis()));
+            }
+        }
     }
 
     public boolean isCancelled(String sessionId) {
         String resolved = resolve(key(sessionId));
         Lease lease = lease(sessionId);
         return lease.cancelled.get()
-                || signalStore.map(store -> store.isCancelled(resolved)).orElse(false);
+                || signalStore.map(store -> store.isCancelled(signalId(resolved, lease))).orElse(false);
     }
 
     /**
@@ -256,32 +497,34 @@ public class ExecutionControl {
     public void heartbeat(String sessionId) {
         String resolved = resolve(key(sessionId));
         long now = System.currentTimeMillis();
-        lease(sessionId).heartbeatEpochMillis.set(now);
-        signalStore.ifPresent(store -> store.heartbeat(resolved, now, signalTtlMillis()));
+        Lease lease = lease(sessionId);
+        lease.heartbeatEpochMillis.set(now);
+        signalStore.ifPresent(store -> store.heartbeat(signalId(resolved, lease), now, signalTtlMillis()));
     }
     public long heartbeatEpochMillis(String sessionId) { return lease(sessionId).heartbeatEpochMillis.get(); }
 
     public StopReason beforeTool(String sessionId) {
         Lease lease = lease(sessionId);
-        heartbeat(sessionId);
-        if (isCancelled(sessionId)) {
-            return StopReason.CANCELLED;
-        }
-        if (System.currentTimeMillis() > lease.deadlineEpochMillis) {
-            return StopReason.DEADLINE_EXCEEDED;
-        }
+        StopReason checkpoint = checkpoint(sessionId);
+        if (checkpoint != StopReason.NONE) return checkpoint;
         return lease.toolCalls.incrementAndGet() > lease.maxToolCalls ? StopReason.TOOL_BUDGET_EXCEEDED : StopReason.NONE;
+    }
+
+    /** 可重入的暂停/取消/超时安全边界，不会消耗工具调用预算。 */
+    public StopReason checkpoint(String sessionId) {
+        Lease lease = lease(sessionId);
+        StopReason pauseStop = awaitIfPaused(sessionId);
+        if (pauseStop != StopReason.NONE) return pauseStop;
+        heartbeat(sessionId);
+        if (isCancelled(sessionId)) return StopReason.CANCELLED;
+        if (System.currentTimeMillis() > lease.deadlineEpochMillis) return StopReason.DEADLINE_EXCEEDED;
+        return StopReason.NONE;
     }
 
     public StopReason afterModelTokens(String sessionId, long estimated) {
         Lease lease = lease(sessionId);
-        heartbeat(sessionId);
-        if (isCancelled(sessionId)) {
-            return StopReason.CANCELLED;
-        }
-        if (System.currentTimeMillis() > lease.deadlineEpochMillis) {
-            return StopReason.DEADLINE_EXCEEDED;
-        }
+        StopReason checkpoint = checkpoint(sessionId);
+        if (checkpoint != StopReason.NONE) return checkpoint;
         if (lease.tenantQuotaDenied.get()) {
             return StopReason.TENANT_QUOTA_EXCEEDED;
         }
@@ -298,7 +541,32 @@ public class ExecutionControl {
     }
 
     private Lease lease(String sessionId) {
-        return leases.computeIfAbsent(resolve(key(sessionId)), ignored -> fallbackLease());
+        String resolved = resolve(key(sessionId));
+        String token = TaskExecutionContext.currentRunToken();
+        if (token != null && !token.isBlank()) {
+            Lease scoped = runLeases.get(scopedKey(resolved, token));
+            Lease current = leases.get(resolved);
+            if (scoped != null && (current == null || token.equals(current.runToken))) return scoped;
+            // A finished worker must never adopt the next run's budget or controls.
+            Lease stale = new Lease(System.currentTimeMillis() + deadlineMillis,
+                    maxToolCalls, tokenSoftLimit, null, scopedKey(resolved, token), token, null);
+            stale.cancelled.set(true);
+            return stale;
+        }
+        return leases.computeIfAbsent(resolved, ignored -> fallbackLease());
+    }
+
+    private static String signalId(String sessionId, Lease lease) {
+        return lease == null || lease.signalId == null ? sessionId : lease.signalId;
+    }
+
+    private static String scopedPrefix(String sessionId) {
+        return "run:" + sessionId.length() + ":" + sessionId + ":";
+    }
+
+    private static String scopedKey(String sessionId, String runToken) {
+        if (runToken == null || runToken.isBlank()) throw new IllegalArgumentException("runToken required");
+        return scopedPrefix(sessionId) + runToken;
     }
 
     private String resolve(String key) {

@@ -32,6 +32,17 @@ function setStreaming(on) {
     // 这样中途重连（再次进 consumeStream）不会把计时清零。
     if (on && !isStreaming) { turnStartedAt = Date.now(); turnFinishedAt = 0; }
     isStreaming = on;
+    if (on && (!taskIsActive || taskRunningSessionId !== currentId)) {
+        taskIsActive = true;
+        taskRunningSessionId = currentId;
+        taskPauseRequested = false;
+        taskPausedAtCheckpoint = false;
+    }
+    if (!on) {
+        if (taskPausePollTimer) clearInterval(taskPausePollTimer);
+        taskPausePollTimer = null;
+    }
+    if (typeof syncTaskControlButton === 'function') syncTaskControlButton();
     // 计划卡片只在收到 todo 事件时重绘；一轮结束时不会自己刷新，
     // 不主动降下来就会一直显示成「进行中」。
     if (typeof refreshTodoIdleState === 'function') refreshTodoIdleState();
@@ -49,6 +60,25 @@ function setStreaming(on) {
     }
     onInputChange();
     refreshConfirmBanner();
+    if (typeof syncConversationHeader === 'function') syncConversationHeader();
+}
+
+function syncTaskControlButton() {
+    const button = document.getElementById('taskPauseBtn');
+    const label = document.getElementById('taskPauseLabel');
+    if (!button) return;
+    button.hidden = !(taskIsActive && currentId && taskRunningSessionId === currentId);
+    button.classList.toggle('is-paused', taskPauseRequested);
+    if (taskPauseRequested && taskPausedAtCheckpoint) {
+        if (label) label.textContent = '继续任务';
+        button.title = '任务已暂停，点击继续执行';
+    } else if (taskPauseRequested) {
+        if (label) label.textContent = '正在暂停';
+        button.title = '将在当前模型或工具调用结束后暂停；点击可继续';
+    } else {
+        if (label) label.textContent = '暂停任务';
+        button.title = '暂停当前任务';
+    }
 }
 
 function setLiveStatus(text) {
@@ -104,7 +134,8 @@ function unlockComposer() {
  * 生效可能晚上几分钟（实测有一条等了 5 分半）。所以提示语要说清「当前步骤结束后生效」，
  * 不能让用户以为已经生效了。
  */
-async function appendUserMessage(text, sessionId) {
+async function appendUserMessage(text, sessionId, questionCard) {
+    beginUserQuestionAnswer(questionCard);
     const row = renderUserMsg(text, null, 0, [], true);
     const status = setInjectStatus(row, 'sending', '发送中…');
     $inp.value = '';
@@ -121,12 +152,15 @@ async function appendUserMessage(text, sessionId) {
         const data = await resp.json().catch(() => null);
         if (data && data.success) {
             setInjectStatus(status, 'ok', '已加入，将在当前步骤结束后生效');
+            if (questionCard) markUserQuestionAnswered(text, questionCard);
         } else {
             const why = (data && (data.message || data.error)) || ('HTTP ' + resp.status);
             setInjectStatus(status, 'failed', '未送达：' + why + '。请直接重新发送。');
+            resetUserQuestionCard(questionCard, '回复未送达，请重试。');
         }
     } catch (e) {
         setInjectStatus(status, 'failed', '未送达（网络异常）。请直接重新发送。');
+        resetUserQuestionCard(questionCard, '回复未送达，请检查网络后重试。');
     }
 }
 

@@ -135,7 +135,11 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
         if (lower.startsWith(EXEC_CONTRACT_PREFIX)) {
             return fromExecContract(lower, rawText);
         }
-        ToolErrorCode code = classifyLegacyFailure(lower);
+        // Legacy tools may return arbitrary successful prose (for example a skill or
+        // document that discusses "unavailable" fields). Only interpret known failure
+        // phrases when the text is itself shaped like an error response.
+        ToolErrorCode code = isExplicitLegacyFailure(trimmed)
+                ? classifyLegacyFailure(lower) : ToolErrorCode.NONE;
         if (code != ToolErrorCode.NONE) {
             return failure(code, rawText, isRetriable(code));
         }
@@ -194,6 +198,30 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
             return ToolErrorCode.DEPENDENCY_UNAVAILABLE;
         }
         return ToolErrorCode.NONE;
+    }
+
+    private static boolean isExplicitLegacyFailure(String raw) {
+        String lower = Objects.requireNonNullElse(raw, "").strip().toLowerCase(Locale.ROOT);
+        if (lower.startsWith("error:") || lower.startsWith("error ")
+                || lower.startsWith("错误:") || lower.startsWith("错误：")
+                || lower.startsWith("exception:") || lower.startsWith("exception ")
+                || lower.startsWith("failed:") || lower.startsWith("failure:")
+                || lower.startsWith("fatal:")) {
+            return true;
+        }
+        if (lower.equals("request timeout") || lower.startsWith("request timeout:")
+                || lower.startsWith("request timeout after")
+                || lower.startsWith("connection timeout:") || lower.startsWith("connect timeout:")
+                || lower.startsWith("read timeout:") || lower.startsWith("timed out:")
+                || lower.startsWith("connection timed out:")
+                || lower.startsWith("连接超时:") || lower.startsWith("连接超时：")
+                || lower.startsWith("请求超时:") || lower.startsWith("请求超时：")
+                || lower.startsWith("网络超时:") || lower.startsWith("网络超时：")) {
+            return true;
+        }
+        // Plain HTTP error lines remain a supported legacy protocol. In longer prose,
+        // status-like numbers are content and must not be treated as transport failures.
+        return lower.matches("(?s)^(?:http\\s*)?(?:429|502|503|504)\\b.*");
     }
 
     private static boolean isRetriable(ToolErrorCode code) {

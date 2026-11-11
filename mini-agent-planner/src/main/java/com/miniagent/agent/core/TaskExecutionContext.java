@@ -2,21 +2,23 @@ package com.miniagent.agent.core;
 
 /** Task identity captured for one execution and propagated by {@link RunScope}. */
 public final class TaskExecutionContext {
-    private static final ThreadLocal<Long> CURRENT = ThreadLocal.withInitial(() -> 0L);
+    private record Identity(long taskId, String runToken) {}
+    private static final ThreadLocal<Identity> CURRENT =
+            ThreadLocal.withInitial(() -> new Identity(0L, null));
 
     private TaskExecutionContext() {}
 
     public static Scope bind(long taskId) {
-        long previous = currentTaskId();
+        Identity previous = CURRENT.get();
         set(taskId);
         return new Scope(previous);
     }
 
     public static final class Scope implements AutoCloseable {
-        private final long previous;
+        private final Identity previous;
         private boolean closed;
 
-        private Scope(long previous) {
+        private Scope(Identity previous) {
             this.previous = previous;
         }
 
@@ -24,18 +26,29 @@ public final class TaskExecutionContext {
         public void close() {
             if (!closed) {
                 closed = true;
-                set(previous);
+                CURRENT.set(previous);
             }
         }
     }
 
     public static long currentTaskId() {
-        Long taskId = CURRENT.get();
-        return taskId == null ? 0L : taskId;
+        return CURRENT.get().taskId();
+    }
+
+    public static String currentRunToken() { return CURRENT.get().runToken(); }
+
+    public static Scope bindRun(String runToken) {
+        Identity previous = CURRENT.get();
+        set(previous.taskId(), runToken);
+        return new Scope(previous);
     }
 
     public static void set(long taskId) {
-        CURRENT.set(Math.max(0L, taskId));
+        set(taskId, currentRunToken());
+    }
+
+    static void set(long taskId, String runToken) {
+        CURRENT.set(new Identity(Math.max(0L, taskId), runToken));
     }
 
     public static void clear() {

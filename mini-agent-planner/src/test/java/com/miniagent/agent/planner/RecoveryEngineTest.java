@@ -3,6 +3,7 @@ package com.miniagent.agent.planner;
 import com.miniagent.agent.tool.CapabilityRegistry;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.ToolRegistry;
+import com.miniagent.agent.tool.ToolStatus;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -12,6 +13,39 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RecoveryEngineTest {
+
+    @Test
+    void unknownOutcomeCannotBeRevivedByRecovery() {
+        for (TaskNodeStatus status : List.of(TaskNodeStatus.OUTCOME_UNKNOWN, TaskNodeStatus.RUNNING)) {
+            PlannerStateStore store = new PlannerStateStore();
+            RecoveryEngine engine = new RecoveryEngine(store, new CapabilityRegistry(new ToolRegistry()),
+                    new PlannerProperties());
+            TaskNode unknown = new TaskNode("n1", "提交订单", "web", List.of(), List.of(), List.of(),
+                    status, 10, DoneWhen.note(), "", "connection lost", 0, "")
+                    .withToolStatus(ToolStatus.UNKNOWN);
+            store.init("s", "e", null, new TaskGraph(List.of(unknown)));
+            FailureDiagnosis dx = engine.diagnose(unknown, "web_search", "connection lost");
+
+            assertTrue(engine.recover("s", dx).isEmpty());
+            assertEquals(status, store.get("s").orElseThrow().graph().byId("n1").status());
+            assertEquals(0, store.get("s").orElseThrow().recoveryCount());
+        }
+    }
+
+    @Test
+    void legacyRunningNodeCannotBeRevivedWithoutAnExecutionReceipt() {
+        PlannerStateStore store = new PlannerStateStore();
+        RecoveryEngine engine = new RecoveryEngine(store, new CapabilityRegistry(new ToolRegistry()),
+                new PlannerProperties());
+        TaskNode interrupted = new TaskNode("n1", "提交订单", "web", List.of(), List.of(), List.of(),
+                TaskNodeStatus.RUNNING, 10, DoneWhen.note(), "", "connection lost", 0, "");
+        store.init("s", "e", null, new TaskGraph(List.of(interrupted)));
+        FailureDiagnosis dx = engine.diagnose(interrupted, "web_search", "connection lost");
+
+        assertTrue(engine.recover("s", dx).isEmpty());
+        assertEquals(TaskNodeStatus.RUNNING, store.get("s").orElseThrow().graph().byId("n1").status());
+        assertEquals(0, store.get("s").orElseThrow().recoveryCount());
+    }
 
     @Test
     void replaceToolBlocksFailedToolInsteadOfLockingAlternate() {

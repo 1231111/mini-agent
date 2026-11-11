@@ -160,6 +160,29 @@
     background: var(--surface2);
 }
 
+.row--fact {
+    align-items: flex-start;
+    gap: 10px;
+    padding: 11px 15px;
+}
+
+.knowledge-row-icon {
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    flex: 0 0 28px;
+    margin-top: 1px;
+    border-radius: 9px;
+    color: #2770e7;
+    background: #eaf1ff;
+}
+
+.knowledge-row-icon svg { width: 16px; height: 16px; }
+.row--fact .row-main { display: block; line-height: 1.55; }
+.row--fact .row-tag { margin-top: 1px; vertical-align: top; color: #2863c8; background: #edf3ff; }
+.knowledge-row-content { overflow-wrap: anywhere; }
+
 .empty {
     padding: 16px 15px;
     font-size: 12.5px;

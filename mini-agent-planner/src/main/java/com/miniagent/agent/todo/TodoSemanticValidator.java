@@ -11,6 +11,12 @@ import java.util.Objects;
 import java.util.Optional;
 import org.apache.commons.lang3.StringUtils;
 import com.miniagent.agent.tool.BuiltinTools;
+import org.apache.pdfbox.Loader;
+import org.apache.poi.hssf.usermodel.HSSFWorkbook;
+import org.apache.poi.poifs.filesystem.POIFSFileSystem;
+import org.apache.poi.xslf.usermodel.XMLSlideShow;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
 
 /**
  * 语义层验收（双轨制第二轨）：在 file_exists / media 等存在性检查通过后，
@@ -76,6 +82,10 @@ public final class TodoSemanticValidator {
                 return Result.fail("语义验收失败：文件为空 " + p);
             }
             String name = p.getFileName().toString().toLowerCase(Locale.ROOT);
+            Result structured = validateStructuredDocument(p, name);
+            if (structured != null) {
+                return structured;
+            }
 
             if (name.endsWith(".md") || name.endsWith(".markdown") || name.endsWith(".txt")) {
                 if (size < 40) {
@@ -116,6 +126,51 @@ public final class TodoSemanticValidator {
         } catch (Exception e) {
             return Result.fail("语义验收异常: " + e.getMessage());
         }
+    }
+
+    /** 扩展名和大小无法证明 Office/PDF 有效，必须能按目标格式打开。 */
+    private static Result validateStructuredDocument(Path path, String name) throws Exception {
+        if (name.endsWith(".docx") || name.endsWith(".docm")) {
+            try (var in = Files.newInputStream(path); var document = new XWPFDocument(in)) {
+                if (document.getDocument().getBody() == null) {
+                    return Result.fail("语义验收失败：Word 文档缺少正文 " + path);
+                }
+            }
+        } else if (name.endsWith(".xlsx") || name.endsWith(".xlsm")) {
+            try (var in = Files.newInputStream(path); var workbook = new XSSFWorkbook(in)) {
+                if (workbook.getNumberOfSheets() == 0) {
+                    return Result.fail("语义验收失败：Excel 工作簿没有工作表 " + path);
+                }
+            }
+        } else if (name.endsWith(".pptx") || name.endsWith(".pptm")) {
+            try (var in = Files.newInputStream(path); var slides = new XMLSlideShow(in)) {
+                if (slides.getSlides().isEmpty()) {
+                    return Result.fail("语义验收失败：PowerPoint 没有幻灯片 " + path);
+                }
+            }
+        } else if (name.endsWith(".pdf")) {
+            try (var document = Loader.loadPDF(path.toFile())) {
+                if (document.getNumberOfPages() == 0) {
+                    return Result.fail("语义验收失败：PDF 没有页面 " + path);
+                }
+            }
+        } else if (name.endsWith(".xls")) {
+            try (var in = Files.newInputStream(path); var workbook = new HSSFWorkbook(in)) {
+                if (workbook.getNumberOfSheets() == 0) {
+                    return Result.fail("语义验收失败：Excel 工作簿没有工作表 " + path);
+                }
+            }
+        } else if (name.endsWith(".doc") || name.endsWith(".ppt")) {
+            try (var in = Files.newInputStream(path); var compound = new POIFSFileSystem(in)) {
+                String required = name.endsWith(".doc") ? "WordDocument" : "PowerPoint Document";
+                if (!compound.getRoot().hasEntry(required)) {
+                    return Result.fail("语义验收失败：Office 文件缺少格式数据流 " + path);
+                }
+            }
+        } else {
+            return null;
+        }
+        return Result.pass(sha256(Files.readAllBytes(path)));
     }
 
     /** 本地已生成的图片（含 render_diagram 的绝对路径和工具 JSON 里的 path）算交付。 */

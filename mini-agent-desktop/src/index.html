@@ -5,30 +5,50 @@
   <title>MiniAgent</title>
   <style>
     * { box-sizing: border-box; }
-    html, body { margin: 0; height: 100%; background: transparent; color: #d7f6ff;
-      font: 14px/1.45 "Segoe UI", sans-serif; overflow: hidden; }
-    /* 启动时只留仙鹤。失败才铺一层底，把原因写出来。 */
-    #boot { position: relative; height: 100%; background: transparent;
-      display: flex; flex-direction: column; align-items: center; justify-content: flex-end; }
-    #c { position: absolute; inset: 0; width: 100%; height: 100%; }
-    .scan { display: none; }
-    #boot { overflow: hidden; isolation: isolate; }
-    #c { z-index: 0; }
-    .boot-box { position: relative; z-index: 1; }
-    .boot-box { display: none; }
-    #boot.boot-failed { background: rgba(7, 11, 16, 0.94); justify-content: center; }
-    #boot.boot-failed .boot-box { position: relative; z-index: 1; display: flex;
-      flex-direction: column; align-items: center; padding: 28px 24px; }
-    .boot-name { font-size: 13px; letter-spacing: .28em; color: rgba(180, 245, 255, .92);
-      margin-bottom: 10px; }
-    /* 「请稍候」是启动中的话术，失败时收掉，避免红字下面还在劝等待。 */
-    .boot-done .boot-tip { display: none; }
-    .boot-stage { font-size: 13px; color: #9ad7e6; min-height: 1.4em; text-align: center; }
-    .boot-elapsed { margin-top: 6px; font-size: 12px; color: #6f93a0;
-      font-variant-numeric: tabular-nums; }
-    .boot-tip { margin-top: 16px; font-size: 12px; color: #5c7a86;
-      max-width: 320px; text-align: center; line-height: 1.65; }
-    .bursting .boot-box { opacity: 0; transition: opacity .25s ease; }
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden;
+      background: #0b1020; color: #eef2ff; font: 14px/1.45 "Segoe UI", sans-serif; }
+    #boot { position: relative; isolation: isolate; display: grid; place-items: center;
+      width: 100%; height: 100%; overflow: hidden;
+      background: radial-gradient(ellipse at 50% 37%, rgba(79, 105, 214, .2), transparent 42%),
+        radial-gradient(ellipse at 50% 110%, rgba(43, 65, 133, .18), transparent 50%), #0b1020; }
+    #boot::before { content: ""; position: absolute; inset: 0; z-index: 0; opacity: .22;
+      background-image: linear-gradient(rgba(164, 180, 255, .045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(164, 180, 255, .045) 1px, transparent 1px);
+      background-size: 36px 36px; mask-image: linear-gradient(to bottom, transparent, #000 30%, #000 82%, transparent); }
+    .boot-box { position: relative; z-index: 1; width: 100%; height: 100%; padding: 30px 34px 24px; display: flex;
+      flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+    .boot-mark { position: relative; display: grid; place-items: center; width: 92px; height: 92px;
+      margin-bottom: 22px; border-radius: 28px; background: rgba(255,255,255,.055);
+      box-shadow: 0 16px 55px rgba(44, 74, 180, .2), inset 0 1px 0 rgba(255,255,255,.08); }
+    .boot-mark::before { content: ""; position: absolute; inset: -9px; border-radius: 34px;
+      border: 1px solid rgba(140, 162, 255, .18); animation: mark-pulse 2.8s ease-in-out infinite; }
+    .boot-mark img { width: 76px; height: 76px; border-radius: 19px; animation: mark-float 3.4s ease-in-out infinite; }
+    .boot-name { font-size: 19px; line-height: 1.2; letter-spacing: .16em; font-weight: 650; }
+    .boot-subtitle { margin-top: 8px; color: #8994b8; font-size: 12px; letter-spacing: .04em; }
+    .boot-progress { width: 250px; height: 3px; margin-top: 28px; overflow: hidden;
+      border-radius: 99px; background: rgba(151, 166, 218, .14); }
+    .boot-progress span { display: block; width: 34%; height: 100%; border-radius: inherit;
+      background: linear-gradient(90deg, #727ff1, #72d4ff); box-shadow: 0 0 14px rgba(113, 164, 255, .65);
+      animation: progress-run 1.6s ease-in-out infinite; }
+    .boot-stage { min-height: 1.5em; margin-top: 16px; color: #c4cbea; font-size: 13px; }
+    .boot-elapsed { margin-top: 5px; color: #7480a5; font-size: 11px; font-variant-numeric: tabular-nums; }
+    .boot-tip { position: absolute; bottom: 21px; max-width: 360px; color: #677394;
+      font-size: 11px; line-height: 1.5; }
+    #boot.boot-failed { background: radial-gradient(ellipse at 50% 25%, rgba(120, 44, 63, .23), transparent 52%), #0b1020; }
+    #boot.boot-failed .boot-box { justify-content: center; }
+    #boot.boot-failed .boot-mark, .boot-done .boot-tip { display: none; }
+    #boot.boot-failed .boot-name { margin-bottom: 18px; }
+    #boot.boot-failed .boot-stage { color: #ff9eaa; }
+    #boot.boot-failed .boot-progress { display: none; }
+    #boot.boot-ready .boot-box { opacity: 0; transform: translateY(-8px) scale(.97);
+      transition: opacity .32s ease, transform .32s ease; }
+    #boot.boot-ready .boot-progress span { width: 100%; animation: none; transition: width .2s ease; }
+    @keyframes mark-pulse { 0%,100% { transform: scale(.98); opacity: .45; } 50% { transform: scale(1.04); opacity: .9; } }
+    @keyframes mark-float { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
+    @keyframes progress-run { 0% { transform: translateX(-120%); } 100% { transform: translateX(390%); } }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+    }
   </style>
 </head>
 <body>
@@ -49,16 +69,16 @@
     路径上，2026-10-09 整段删除，只留启动画面。
   -->
   <div id="boot">
-    <canvas id="c"></canvas>
     <div class="boot-box">
+      <div class="boot-mark"><img src="../assets/icon.svg" alt="MiniAgent AI"></div>
       <div class="boot-name">MINIAGENT</div>
+      <div class="boot-subtitle">你的本地智能工作台</div>
+      <div class="boot-progress" aria-hidden="true"><span></span></div>
       <div class="boot-stage" id="bootStage" role="status" aria-live="polite">正在启动本地服务</div>
       <div class="boot-elapsed" id="bootElapsed">已用 0 秒</div>
       <div class="boot-tip">首次启动需要加载本地模型，会比之后再启动慢一些。请稍候，不要重复双击图标。</div>
     </div>
   </div>
-  <script src="vendor/three.min.js"></script>
-  <script src="crane-scene.js"></script>
   <script>
   /* 看门狗。只做一件事：绝不让界面无声地停在启动页。
      为什么必须有它：这类"脚本压根没跑起来"的故障是解析期失败，一行都不执行，
@@ -107,7 +127,7 @@
 
     // 主进程推来的阶段是权威的：只有它知道后端是真在起、还是已经失败了。
     var gotStage = false;
-    var bursting = false;
+    var finishingAnimation = false;
     if (window.electronAPI && window.electronAPI.onBootStage) {
       window.electronAPI.onBootStage(function (s) {
         if (!s) return;
@@ -122,20 +142,15 @@
           reveal();
           clearInterval(tick);
         }
-        if (s.stage === 'ready' && !bursting) {
-          bursting = true;
-          if (bootEl) bootEl.classList.add('bursting');
-          var scene = window.craneScene;
+        if (s.stage === 'ready' && !finishingAnimation) {
+          finishingAnimation = true;
           var finish = function () {
-            if (window.electronAPI && window.electronAPI.bootBurstDone) {
-              window.electronAPI.bootBurstDone();
+            if (window.electronAPI && window.electronAPI.bootAnimationDone) {
+              window.electronAPI.bootAnimationDone();
             }
           };
-          if (scene && scene.burst) {
-            scene.burst().then(finish);
-          } else {
-            finish();
-          }
+          if (bootEl) bootEl.classList.add('boot-ready');
+          setTimeout(finish, 360);
         }
       });
     }

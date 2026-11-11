@@ -53,7 +53,8 @@ public class FileContentExtractor {
 
     private static final Set<String> TEXT_MIME_TYPES = Set.of(
             "text/plain", "text/html", "text/css", "text/csv", "text/markdown", "text/xml",
-            "application/json", "application/xml", "application/javascript", "application/typescript",
+            "application/json", "application/xml", "application/xhtml+xml", "application/javascript",
+            "application/x-javascript", "application/typescript",
             "application/x-yaml", "application/yaml", "application/sql",
             "application/x-sh", "application/x-shellscript"
     );
@@ -234,10 +235,12 @@ public class FileContentExtractor {
         if (Objects.isNull(lowerFilename)) {
             return false;
         }
-        String[] textExts = {".txt", ".csv", ".json", ".md", ".markdown", ".xml", ".html", ".htm",
-                ".css", ".js", ".ts", ".py", ".java", ".sql", ".sh", ".bat",
-                ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".log",
-                ".c", ".cpp", ".h", ".hpp", ".go", ".rs", ".rb", ".php"};
+        String[] textExts = {".txt", ".text", ".csv", ".tsv", ".json", ".jsonl", ".md", ".markdown", ".rst",
+                ".xml", ".xhtml", ".xsd", ".xsl", ".xslt", ".html", ".htm", ".svg",
+                ".css", ".scss", ".less", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".vue",
+                ".py", ".ipynb", ".java", ".kt", ".kts", ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".hpp",
+                ".cs", ".php", ".rb", ".swift", ".sql", ".sh", ".bash", ".zsh", ".bat", ".cmd", ".ps1",
+                ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".properties", ".env", ".log"};
         for (String ext : textExts) {
             if (lowerFilename.endsWith(ext)) {
                 return true;

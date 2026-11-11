@@ -164,12 +164,20 @@ async function renderKnowledgePage() {
     const facts = related.filter(r => r && r.type === 'fact');
     const procs = related.filter(r => r && r.type === 'procedure');
 
-    setHtml('knFacts', facts.length ? facts.map(f => `<div class="row">
-        <span class="row-main">
-            <span class="row-tag">事实</span>${pe(f.subject)} · ${pe(f.predicate)}
-            → ${pe(f.object)}
-        </span>
-    </div>`).join('') : emptyHtml('还没有沉淀语义事实。'));
+    setHtml('knFacts', facts.length ? facts.map(f => {
+        const subject = String(f.subject || '').trim();
+        const object = String(f.object || '').trim();
+        const predicate = String(f.predicate || '').trim();
+        const duplicate = subject && object && subject.localeCompare(object, 'zh-CN', { sensitivity: 'base' }) === 0;
+        const content = duplicate ? subject : subject
+            + (predicate ? ' · ' + predicate : '')
+            + (object ? ' → ' + object : '');
+        const kind = /preference|偏好/i.test(predicate) ? '偏好' : /learned|learned_from|经验/i.test(predicate) ? '经验' : (predicate || '事实');
+        return `<div class="row row--fact">
+            <span class="knowledge-row-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4a3 3 0 0 0-3 3v1a3 3 0 0 0 0 6v1a3 3 0 0 0 6 0v-1a3 3 0 0 0 0-6V7a3 3 0 0 0-3-3z"/><path d="M12 4v16"/></svg></span>
+            <span class="row-main"><span class="row-tag">${pe(kind)}</span><span class="knowledge-row-content">${pe(content || predicate)}</span></span>
+        </div>`;
+    }).join('') : emptyHtml('还没有沉淀语义事实。'));
 
     setHtml('knProcedures', procs.length ? procs.map(p => `<div class="row">
         <span class="row-main"><span class="row-tag">流程</span>${pe(p.name)}</span>

@@ -48,6 +48,21 @@ class ToolResultTest {
         assertTrue(ToolResult.fromLegacy("{\"path\":\"a.txt\"}").isSuccess());
     }
 
+    @Test
+    void successfulTextMayDiscussUnavailableAndTimeout() {
+        assertTrue(ToolResult.fromLegacy("Mark unavailable fields as unknown.").isSuccess());
+        assertTrue(ToolResult.fromLegacy("The guide explains what to do after a request timeout.").isSuccess());
+        assertTrue(ToolResult.fromLegacy("Build output mentions HTTP 503 in a test fixture.").isSuccess());
+    }
+
+    @Test
+    void explicitLegacyHttpErrorLineRemainsClassified() {
+        ToolResult result = ToolResult.fromLegacy("HTTP 503 Service Unavailable");
+        assertEquals(ToolStatus.FAILED, result.status());
+        assertEquals(ToolErrorCode.DEPENDENCY_UNAVAILABLE, result.errorCode());
+        assertTrue(result.retriable());
+    }
+
     /**
      * 失败结果必须**原样保留**调用方给的文本。
      *

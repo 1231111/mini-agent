@@ -42,6 +42,22 @@ class TodoStateProjectorTest {
         assertSame(graph, projector.confirmByTodoId(graph, 99));
     }
 
+    @Test
+    void unknownOutcomeRemainsVisibleAndIsNotAnApprovalRequest() {
+        TaskTodoStore store = new TaskTodoStore(tmp.toString());
+        TodoStateProjector projector = new TodoStateProjector(store);
+        TaskNode unknown = node("n1", "提交订单", TaskNodeStatus.OUTCOME_UNKNOWN)
+                .withToolStatus(com.miniagent.agent.tool.ToolStatus.UNKNOWN)
+                .withError("实际副作用尚未核验");
+        TaskGraph graph = new TaskGraph(List.of(unknown));
+
+        projector.project("s", graph);
+
+        assertEquals(1, store.get("s").size());
+        assertEquals(TaskTodoStore.Status.blocked, store.get("s").get(0).status());
+        assertSame(graph, projector.confirmByTodoId(graph, 1));
+    }
+
     private static TaskNode node(String id, String name, TaskNodeStatus status) {
         return new TaskNode(
                 id, name, "web", null, null, null, status, 0,

@@ -76,15 +76,18 @@ public record TaskGraph(List<TaskNode> nodes) {
     }
 
     /**
-     * 调度前规范化：孤儿 RUNNING→FAILED；再将依赖满足的 PENDING/FAILED/RECOVERING→READY。
+     * 调度前规范化：RUNNING 表示工具可能已派发，进程中断后无法证明副作用未发生，
+     * 因而必须隔离为结果未知；再将依赖满足的 PENDING/FAILED/RECOVERING→READY。
      */
     @JsonIgnore
     public TaskGraph normalizeForScheduling() {
         List<TaskNode> phase1 = new ArrayList<>(nodes.size());
         for (TaskNode n : nodes) {
-            if (n.status() == TaskNodeStatus.RUNNING)
-                phase1.add(n.withStatus(TaskNodeStatus.FAILED)
-                        .withError(n.lastError().isBlank() ? "orphan_running" : n.lastError()));
+            if (n.toolStatus() == com.miniagent.agent.tool.ToolStatus.UNKNOWN
+                    || n.status() == TaskNodeStatus.RUNNING)
+                phase1.add(n.withStatus(TaskNodeStatus.OUTCOME_UNKNOWN)
+                        .withError(n.lastError().isBlank()
+                                ? "OUTCOME_UNKNOWN: 执行中断，实际副作用尚未核验" : n.lastError()));
             else
                 phase1.add(n);
         }
@@ -95,7 +98,7 @@ public record TaskGraph(List<TaskNode> nodes) {
         List<TaskNode> phase2 = new ArrayList<>(phase1.size());
         for (TaskNode n : phase1) {
             TaskNodeStatus s = n.status();
-            if (s == TaskNodeStatus.PENDING || s == TaskNodeStatus.FAILED
+            if (s == TaskNodeStatus.PENDING || s == TaskNodeStatus.READY || s == TaskNodeStatus.FAILED
                     || s == TaskNodeStatus.RECOVERING) {
                 boolean depsOk = true;
                 for (String d : n.dependsOn()) {

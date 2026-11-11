@@ -368,6 +368,13 @@ public class PlanningLoop {
                     compiled.intent(), compiled.source(), compiled.degraded());
         }
         todoProjector.project(sessionId, snap.graph());
+        // A tool whose outcome was unknown may have applied a side effect even though
+        // the caller never received the result.  Keep it terminal until an explicit
+        // reconciliation/reset; normalization must never replay it automatically.
+        TaskNode unknownNode = unknownOutcomeNode(snap.graph());
+        if (unknownNode != null) {
+            return stopUnknownOutcome(sessionId, snap, unknownNode);
+        }
         trace(sessionId, AgentStepNode.GOAL_COMPILED,
                 "{\"goalId\":\"" + compiled.goal().goalId()
                         + "\",\"nodes\":" + compiled.graph().nodes().size()
@@ -420,6 +427,10 @@ public class PlanningLoop {
                 return RunOutcome.failed(answer, "SESSION_LOCK_LOST");
             }
             snap = stateStore.get(sessionId).orElse(snap);
+            unknownNode = unknownOutcomeNode(snap.graph());
+            if (unknownNode != null) {
+                return stopUnknownOutcome(sessionId, snap, unknownNode);
+            }
             TaskGraph normalized = snap.graph().normalizeForScheduling();
             if (!sameNodeStatuses(normalized, snap.graph())) {
                 try {
@@ -430,6 +441,10 @@ public class PlanningLoop {
                     continue;
                 }
                 todoProjector.project(sessionId, snap.graph());
+            }
+            unknownNode = unknownOutcomeNode(snap.graph());
+            if (unknownNode != null) {
+                return stopUnknownOutcome(sessionId, snap, unknownNode);
             }
             if (snap.graph().allTerminalSuccess()) {
                 StepEvaluator.GraphEval acc = stepEvaluator.evaluateGraph(
@@ -566,6 +581,34 @@ public class PlanningLoop {
                         sessionId, proposal.proposalId(), proposal.basedOnPlanVersion(), snap.planVersion());
                 continue;
             }
+            if (AgentLoop.OUTCOME_UNKNOWN.equals(step.endReason())
+                    || (step.structuredResult() != null
+                    && step.structuredResult().status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN)) {
+                TaskGraph stopped = snap.graph();
+                for (ActionSpec action : proposal.actions()) {
+                    TaskNode node = stopped.byId(action.taskId());
+                    if (node != null) {
+                        String reason = "OUTCOME_UNKNOWN: " + clip(step.text(), 400);
+                        stopped = stopped.replace(node.withStatus(TaskNodeStatus.OUTCOME_UNKNOWN)
+                                .withToolStatus(com.miniagent.agent.tool.ToolStatus.UNKNOWN)
+                                .withError(reason));
+                        settleNode(sessionId, action.actionId(), node,
+                                NodeTerminalCommitPort.Result.FAILURE,
+                                failureDetail(ToolErrorCode.OUTCOME_UNKNOWN, reason, userMessage));
+                    }
+                }
+                try {
+                    snap = stateStore.commit(sessionId, snap.version(), snap.withGraph(stopped));
+                } catch (PlannerStateStore.VersionConflictException e) {
+                    // The dispatch receipt already persisted UNKNOWN before calling
+                    // the executor, so even a conflicting completion cannot replay it.
+                    metrics.casConflict();
+                }
+                todoProjector.project(sessionId,
+                        stateStore.get(sessionId).map(StateSnapshot::graph).orElse(stopped));
+                return RunOutcome.failed("本次工具执行结果未知，已停止自动重试，请先核验实际状态。",
+                        "OUTCOME_UNKNOWN");
+            }
             boolean anyFail = false;
             TaskGraph g = snap.graph();
             for (ActionSpec action : proposal.actions()) {
@@ -574,13 +617,14 @@ public class PlanningLoop {
                     continue;
                 }
                 if (humanWait) {
-                    g = g.replace(node.withStatus(TaskNodeStatus.READY).withError(""));
+                    g = g.replace(node.withStatus(TaskNodeStatus.READY).withToolStatus(null).withError(""));
                     continue;
                 }
                 boolean awaiting = todoProjector.isTodoAwaiting(
                         sessionId, g, action.taskId());
                 if (awaiting) {
                     g = g.replace(node.withStatus(TaskNodeStatus.AWAITING_CONFIRM)
+                            .withToolStatus(null)
                             .withError(clip(lastAnswer, AWAITING_HINT_CHARS)));
                     continue;
                 }
@@ -589,7 +633,7 @@ public class PlanningLoop {
                     metrics.nodeFailed();
                     recordToolOutcome(node, false);
                     String reason = "drift:偏离子目标 " + node.name();
-                    g = g.replace(node.withStatus(TaskNodeStatus.FAILED).withError(reason));
+                    g = g.replace(node.withStatus(TaskNodeStatus.FAILED).withToolStatus(null).withError(reason));
                     stateStore.appendEvent(sessionId, new DomainEvent(
                             "ev_" + UUID.randomUUID().toString().substring(0, 8),
                             DomainEventType.NODE_FAILED, action.actionId(), action.taskId(),
@@ -614,16 +658,22 @@ public class PlanningLoop {
                 String judgeAnswer = node.doneWhen() != null && node.doneWhen().isJudge()
                         ? step.text() : "";
                 NodeOutputBinder.Bound bound = NodeOutputBinder.bind(
-                        node, "", step.messages(), judgeAnswer);
+                        node, "", step.messages(), judgeAnswer, step.structuredResult());
                 StepEvaluator.EvalResult ev;
-                if (!bound.complete(node)) {
+                if (RunStatus.FAILURE.name().equals(step.endReason())) {
+                    ev = StepEvaluator.EvalResult.fail("tool execution failed: " + clip(step.text(), 400));
+                } else if (!bound.complete(node)) {
                     ev = StepEvaluator.EvalResult.fail("declared outputs 未绑定");
                 } else {
-                    ev = stepEvaluator.evaluateAfterLoop(node, bound.evidence());
+                    ev = step.structuredResult() == null
+                            ? stepEvaluator.evaluateAfterLoop(node, bound.evidence())
+                            : stepEvaluator.evaluate(node, step.structuredResult(), bound.evidence());
                 }
                 TaskNodeStatus next = statusAfterChunk(ev.ok(), quotaAbort);
                 if (next == TaskNodeStatus.SUCCESS) {
                     g = g.replace(node.withStatus(TaskNodeStatus.SUCCESS).withError("")
+                            .withToolStatus(step.structuredResult() == null
+                                    ? null : step.structuredResult().status())
                             .withOutput(clip(bound.evidence(), PRIOR_OUTPUT_CHARS),
                                     clipBindings(bound.bindings())));
                     metrics.nodeSuccess();
@@ -636,12 +686,14 @@ public class PlanningLoop {
                             NodeTerminalCommitPort.Result.SUCCESS,
                             new NodeTerminalCommitPort.Detail(null, null, userMessage));
                 } else if (next == TaskNodeStatus.READY) {
-                    g = g.replace(node.withStatus(TaskNodeStatus.READY).withError(""));
+                    g = g.replace(node.withStatus(TaskNodeStatus.READY).withToolStatus(null).withError(""));
                 } else {
                     anyFail = true;
                     metrics.nodeFailed();
                     recordToolOutcome(node, false);
-                    g = g.replace(node.withStatus(TaskNodeStatus.FAILED).withError(ev.reason()));
+                    g = g.replace(node.withStatus(TaskNodeStatus.FAILED)
+                            .withToolStatus(step.structuredResult() == null
+                                    ? null : step.structuredResult().status()).withError(ev.reason()));
                     stateStore.appendEvent(sessionId, new DomainEvent(
                             "ev_" + UUID.randomUUID().toString().substring(0, 8),
                             DomainEventType.NODE_FAILED, action.actionId(), action.taskId(),
@@ -824,7 +876,7 @@ public class PlanningLoop {
 
     private record StepExec(String text, String endReason, boolean drifted,
                             String lastTool, ToolErrorCode lastErrorCode,
-                            List<ChatMessage> messages) {
+                            List<ChatMessage> messages, ToolResult structuredResult) {
         StepExec {
             messages = messages == null ? List.of() : List.copyOf(messages);
         }
@@ -838,6 +890,45 @@ public class PlanningLoop {
 
     private static boolean isLoopLimit(String endReason) {
         return endReason != null && AgentLoop.LOOP_MAX_ITERATIONS.equalsIgnoreCase(endReason);
+    }
+
+    private static TaskNode unknownOutcomeNode(TaskGraph graph) {
+        if (graph == null) {
+            return null;
+        }
+        for (TaskNode node : graph.nodes()) {
+            if (node.toolStatus() == com.miniagent.agent.tool.ToolStatus.UNKNOWN
+                    || node.status() == TaskNodeStatus.RUNNING
+                    || node.status() == TaskNodeStatus.OUTCOME_UNKNOWN) {
+                return node;
+            }
+        }
+        return null;
+    }
+
+    private RunOutcome stopUnknownOutcome(String sessionId, StateSnapshot snapshot, TaskNode unknown) {
+        TaskGraph stopped = snapshot.graph();
+        boolean changed = false;
+        for (TaskNode node : stopped.nodes()) {
+            if ((node.toolStatus() == com.miniagent.agent.tool.ToolStatus.UNKNOWN
+                    || node.status() == TaskNodeStatus.RUNNING)
+                    && node.status() != TaskNodeStatus.OUTCOME_UNKNOWN) {
+                stopped = stopped.replace(node.withStatus(TaskNodeStatus.OUTCOME_UNKNOWN)
+                        .withError("OUTCOME_UNKNOWN: 执行中断，实际副作用尚未核验"));
+                changed = true;
+            }
+        }
+        if (changed) {
+            try {
+                snapshot = stateStore.commit(sessionId, snapshot.version(), snapshot.withGraph(stopped));
+            } catch (PlannerStateStore.VersionConflictException e) {
+                metrics.casConflict();
+                snapshot = stateStore.get(sessionId).orElse(snapshot);
+            }
+        }
+        todoProjector.project(sessionId, snapshot.graph());
+        return RunOutcome.failed("节点「" + unknown.name()
+                + "」执行结果未知，已停止自动重试，请先核验实际状态。", "OUTCOME_UNKNOWN");
     }
 
     static TaskNodeStatus statusAfterChunk(boolean evalOk, boolean quotaAbort) {
@@ -1025,21 +1116,32 @@ public class PlanningLoop {
                     break;
                 }
             }
-            AgentLoop.LoopOutcome out;
-            out = nodeExecutor.execute(chat, focus, userMessage, multimodalUser,
-                    history, maxIter, taskPlan, streamSink);
-            int chunks = 1;
-            int maxChunks = Math.max(1, properties.getProposalMaxChunks());
-            while (shouldResumeChunk(out.endReason(), chunks, maxChunks)) {
-                log.info("配额续跑 chunk={}/{} task={}", chunks + 1, maxChunks, focusTask);
-                ArrayList<ChatMessage> live = new ArrayList<>(out.messages());
-                live.add(new SystemMessage(MessageConstants.PLANNER_CONTINUE_HINT));
-                out = nodeExecutor.continueNode(chat, live, userMessage,
-                        maxIter, taskPlan, streamSink);
-                chunks++;
+            try {
+                AgentLoop.LoopOutcome out = nodeExecutor.execute(chat, focus, userMessage, multimodalUser,
+                        history, maxIter, taskPlan, streamSink);
+                ToolResult lastToolResult = out.lastToolResult();
+                int chunks = 1;
+                int maxChunks = Math.max(1, properties.getProposalMaxChunks());
+                while (shouldResumeChunk(out.endReason(), chunks, maxChunks)) {
+                    log.info("配额续跑 chunk={}/{} task={}", chunks + 1, maxChunks, focusTask);
+                    ArrayList<ChatMessage> live = new ArrayList<>(out.messages());
+                    live.add(new SystemMessage(MessageConstants.PLANNER_CONTINUE_HINT));
+                    out = nodeExecutor.continueNode(chat, live, userMessage,
+                            maxIter, taskPlan, streamSink);
+                    if (out.lastToolResult() != null) lastToolResult = out.lastToolResult();
+                    chunks++;
+                }
+                return new StepExec(out.text(), out.endReason(), policy.consumeDrift(),
+                        lastInvokedTool(out), lastToolResult == null ? out.lastErrorCode()
+                        : lastToolResult.errorCode(), out.messages(), lastToolResult);
+            } catch (RuntimeException ex) {
+                // A ReAct turn may already have dispatched tools before the caller
+                // failed. Without a complete result, replay cannot be assumed safe.
+                log.warn("节点执行异常，停止自动重试 task={}", focusTask, ex);
+                String message = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
+                return new StepExec("节点执行结果未知：" + message, AgentLoop.OUTCOME_UNKNOWN,
+                        policy.consumeDrift(), "", ToolErrorCode.OUTCOME_UNKNOWN, List.of(), null);
             }
-            return new StepExec(out.text(), out.endReason(), policy.consumeDrift(),
-                    lastInvokedTool(out), out.lastErrorCode(), out.messages());
         } finally {
             ExecutionTurnContext.clear();
             LoopTurnContext.clear();
@@ -1054,16 +1156,27 @@ public class PlanningLoop {
             log.warn("绑定参数序列化失败，回退 ReAct tool={}", action.tool());
             return null;
         }
-        ToolResult result = nodeExecutor.executeBound(action.tool(), json);
-        String text = result == null ? "" : result.legacyText();
-        boolean ok = result != null && result.isSuccess()
-                && !StepEvaluator.looksLikeToolError(text);
+        ToolResult result;
+        try {
+            result = nodeExecutor.executeBound(action.tool(), json);
+        } catch (RuntimeException ex) {
+            log.warn("绑定工具执行异常，停止自动重试 tool={} task={}", action.tool(), action.taskId(), ex);
+            String msg = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
+            result = ToolResult.unknown("工具执行结果未知：" + msg, null);
+        }
+        if (result == null) {
+            result = ToolResult.unknown("工具执行器未返回结果", null);
+        }
+        String text = result.legacyText();
+        boolean ok = result.isSuccess();
         ToolExecutionResultMessage msg = ToolExecutionResultMessage.from(
                 action.actionId(), action.tool(), text);
-        ToolErrorCode code = result == null ? ToolErrorCode.INTERNAL_ERROR : result.errorCode();
-        String end = ok ? AgentLoop.STEP_SEGMENT_DONE : RunStatus.FAILURE.name();
+        ToolErrorCode code = result.errorCode();
+        String end = ok ? AgentLoop.STEP_SEGMENT_DONE
+                : result.status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN
+                ? AgentLoop.OUTCOME_UNKNOWN : RunStatus.FAILURE.name();
         return new StepExec(ok ? AgentLoop.STEP_SEGMENT_DONE : text, end, false,
-                action.tool(), code, List.of(msg));
+                action.tool(), code, List.of(msg), result);
     }
 
     private boolean dispatchFenceValid(String sessionId, ActionProposal proposal) {
@@ -1387,31 +1500,34 @@ public class PlanningLoop {
             }
         }
         String prefix = "rp" + gen + "_";
-        Set<String> newIds = new HashSet<>();
+        Map<String, String> newIds = new LinkedHashMap<>();
         for (TaskNode n : neu.nodes()) {
-            newIds.add(prefix + n.id());
+            if (StringUtils.isBlank(n.id())) {
+                return null;
+            }
+            String mapped = prefix + n.id();
+            if (newIds.putIfAbsent(n.id(), mapped) != null || successIds.contains(mapped)) {
+                return null;
+            }
         }
-        boolean first = true;
         for (TaskNode n : neu.nodes()) {
-            String newId = prefix + n.id();
-            List<String> deps = new ArrayList<>();
-            if (first) {
-                deps.addAll(successIds);
-                first = false;
-            } else {
-                for (String d : n.dependsOn()) {
-                    String mapped = prefix + d;
-                    if (newIds.contains(mapped)) {
-                        deps.add(mapped);
-                    }
-                }
-                if (deps.isEmpty()) {
-                    deps.addAll(successIds);
+            Set<String> deps = new LinkedHashSet<>();
+            for (String dependency : n.dependsOn()) {
+                String mapped = newIds.get(dependency);
+                if (mapped != null) {
+                    deps.add(mapped);
+                } else if (successIds.contains(dependency)) {
+                    deps.add(dependency);
+                } else {
+                    // 无法解析的依赖不能静默删除，否则会提前执行有副作用的动作。
+                    return null;
                 }
             }
-            out.add(new TaskNode(newId, n.name(), n.capability(), deps,
-                    n.inputs(), n.outputs(), TaskNodeStatus.PENDING, n.priority(),
-                    n.doneWhen(), n.toolHint(), "", 0, "").withProcedure(n.procedureId(), n.procedureVersion()));
+            if (deps.isEmpty()) {
+                deps.addAll(successIds);
+            }
+            out.add(n.withIdentityAndDependencies(newIds.get(n.id()), List.copyOf(deps))
+                    .withStatus(TaskNodeStatus.PENDING));
         }
         TaskGraph g = new TaskGraph(out);
         if (g.hasCycle()) {
@@ -1430,7 +1546,10 @@ public class PlanningLoop {
             if (n == null || n.status() != TaskNodeStatus.READY) {
                 return current;
             }
-            g = g.replace(n.withStatus(TaskNodeStatus.RUNNING));
+            // Persist an in-flight receipt before dispatch. If the process dies,
+            // the next run must reconcile the outcome instead of replaying a side effect.
+            g = g.replace(n.withStatus(TaskNodeStatus.RUNNING)
+                    .withToolStatus(com.miniagent.agent.tool.ToolStatus.UNKNOWN));
         }
         try {
             return stateStore.commit(sessionId, current.version(), current.withGraph(g));
@@ -1677,11 +1796,18 @@ public class PlanningLoop {
             long failedNodes = snap.graph().nodes().stream()
                     .filter(n -> n.status() == TaskNodeStatus.FAILED)
                     .count();
-            long pendingNodes = totalNodes - completedNodes - failedNodes;
+            long unknownNodes = snap.graph().nodes().stream()
+                    .filter(n -> n.status() == TaskNodeStatus.OUTCOME_UNKNOWN
+                            || n.toolStatus() == com.miniagent.agent.tool.ToolStatus.UNKNOWN)
+                    .count();
+            long pendingNodes = totalNodes - completedNodes - failedNodes - unknownNodes;
 
             sb.append("任务进度：").append(completedNodes).append("/").append(totalNodes).append(" 已完成");
             if (failedNodes > 0) {
                 sb.append("，").append(failedNodes).append(" 个失败");
+            }
+            if (unknownNodes > 0) {
+                sb.append("，").append(unknownNodes).append(" 个执行结果未知，需核验");
             }
             if (pendingNodes > 0) {
                 sb.append("，").append(pendingNodes).append(" 个待执行");
@@ -1727,7 +1853,9 @@ public class PlanningLoop {
         boolean hasRunning = snap.graph().nodes().stream()
                 .anyMatch(n -> n.status() == TaskNodeStatus.RUNNING);
 
-        if (allSuccess) {
+        if (unknownOutcomeNode(snap.graph()) != null) {
+            return "上一个任务存在执行结果未知的步骤，核验实际状态前不会自动重试";
+        } else if (allSuccess) {
             return "上一个任务已全部完成";
         } else if (hasFailed) {
             return "上一个任务存在失败步骤，将重新尝试执行";

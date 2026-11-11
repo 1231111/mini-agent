@@ -192,6 +192,14 @@ public class RecoveryEngine {
         if (node == null) {
             return Optional.empty();
         }
+        // This is not a failed attempt: it may already have applied a side effect.
+        // Only an explicit reconciliation/reset may make the node executable again.
+        if (node.status() == TaskNodeStatus.OUTCOME_UNKNOWN
+                || node.status() == TaskNodeStatus.RUNNING
+                || node.toolStatus() == com.miniagent.agent.tool.ToolStatus.UNKNOWN) {
+            log.warn("Recovery 拒绝恢复结果未知节点 session={} task={}", sessionId, node.id());
+            return Optional.empty();
+        }
 
         String recoveryContext = "上一轮失败: " + abbreviate(dx.reason(), 600)
                 + "\n建议处置: " + dx.suggestedFix();

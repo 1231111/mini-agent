@@ -2,13 +2,18 @@ package com.miniagent.agent.planner;
 
 import com.miniagent.agent.core.AgentLoop;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class StepEvaluatorTest {
+    @TempDir
+    Path dir;
 
     @Test
     void hollowEvidenceDetectedForFileDeliveryNode() {
@@ -186,9 +191,49 @@ class StepEvaluatorTest {
 
     @Test
     void checkValidationNeedsExitCodeOrJson() {
-        assertTrue(StepEvaluator.checkValidation("cmd done exit_code=0").ok());
+        assertTrue(StepEvaluator.checkValidation("exit_code=0\ncmd done").ok());
         assertFalse(StepEvaluator.checkValidation("构建通过了").ok());
         assertTrue(StepEvaluator.checkValidation("{\"success\":true}").ok());
         assertFalse(StepEvaluator.checkValidation("exit_code=1").ok());
+    }
+
+    @Test
+    void successfulCommandTextMayMentionTimeoutAndErrorAsContent() {
+        assertTrue(StepEvaluator.checkCommand(
+                "exit_code=0\nconfig: timeout=30 seconds\nsource: \"error\" is documented").ok());
+        assertTrue(StepEvaluator.checkValidation(
+                "exit_code=0\nlog: the retry policy describes a timeout error").ok());
+    }
+
+    @Test
+    void nestedErrorFieldDoesNotTurnSuccessfulJsonIntoFailure() {
+        String evidence = "{\"success\":true,\"data\":{\"error\":\"timeout is documented\"}}";
+        assertFalse(StepEvaluator.looksLikeToolError(evidence));
+        assertTrue(StepEvaluator.checkValidation(evidence).ok());
+    }
+
+    @Test
+    void explicitStructuredFailureStillRejects() {
+        assertTrue(StepEvaluator.looksLikeToolError(
+                "{\"success\":false,\"status\":\"failed\",\"error\":\"permission denied\"}"));
+        assertFalse(StepEvaluator.checkValidation(
+                "{\"success\":false,\"status\":\"failed\",\"error\":\"permission denied\"}").ok());
+        assertFalse(StepEvaluator.checkCommand("exit_code=2\nerror output").ok());
+    }
+
+    @Test
+    void failedWriteCannotPassBecauseAnOldValidFileAlreadyExists() throws Exception {
+        Path output = dir.resolve("notes.md");
+        Files.writeString(output, "# Previous report\n\nThis valid old document existed before the failed write.");
+        TaskNode node = new TaskNode("write", "更新报告", "file_write", List.of(),
+                List.of(), List.of(), TaskNodeStatus.RUNNING, 0,
+                DoneWhen.file(output.toString()), "", "", 0, "");
+        StepEvaluator evaluator = new StepEvaluator(new PlannerProperties(), new PlannerMetrics(), null);
+
+        StepEvaluator.EvalResult result = evaluator.evaluate(node,
+                "{\"success\":false,\"error\":\"disk full\"}", output.toString());
+
+        assertFalse(result.ok());
+        assertTrue(result.reason().startsWith("tool error:"));
     }
 }

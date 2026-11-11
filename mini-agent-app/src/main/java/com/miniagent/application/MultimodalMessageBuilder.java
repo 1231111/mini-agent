@@ -4,6 +4,7 @@ import com.miniagent.agent.web.MultimodalMedia;
 import com.miniagent.common.MessageConstants;
 import com.miniagent.config.storage.MediaStorage;
 import com.miniagent.web.dto.MediaRef;
+import com.miniagent.web.dto.FileRef;
 import dev.langchain4j.data.message.AudioContent;
 import dev.langchain4j.data.message.ImageContent;
 import dev.langchain4j.data.message.TextContent;
@@ -16,8 +17,10 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
+import java.net.URLEncoder;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -55,6 +58,25 @@ public class MultimodalMessageBuilder {
                 }
             } catch (Exception e) {
                 log.warn("复制音视频到会话失败: {}", e.getMessage());
+            }
+        }
+        return keys;
+    }
+
+    /** 引用已归属当前用户的上传文件，避免为历史卡片再复制一份大文件。 */
+    public List<String> referenceFilesForConversation(Long userId, List<FileRef> files) {
+        List<String> keys = new ArrayList<>();
+        for (FileRef ref : Optional.ofNullable(files).orElseGet(List::of)) {
+            if (ref == null || StringUtils.isBlank(ref.getFilePath())) continue;
+            try {
+                Path src = resolveOwnedUpload(userId, ref.getFilePath());
+                Path userRoot = mediaStorage.uploadsDir().resolve(String.valueOf(userId)).toAbsolutePath().normalize();
+                if (!src.startsWith(userRoot)) throw new IOException("上传附件不属于当前用户目录");
+                String displayName = StringUtils.defaultIfBlank(ref.getFilename(), src.getFileName().toString());
+                keys.add("user-uploads/" + src.getFileName()
+                        + "?name=" + URLEncoder.encode(displayName, StandardCharsets.UTF_8));
+            } catch (Exception e) {
+                log.warn("记录上传文档附件失败: {}", e.getMessage());
             }
         }
         return keys;

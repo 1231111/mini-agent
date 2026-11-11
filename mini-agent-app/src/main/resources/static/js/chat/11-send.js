@@ -3,6 +3,9 @@
    ========================================================================= */
 async function send() {
     const text = $inp.value.trim();
+    const questionCard = activeUserQuestionCard && activeUserQuestionCard.isConnected
+            && activeUserQuestionCard.dataset.sessionId === currentId
+        ? activeUserQuestionCard : null;
     if (!text && selectedFiles.length === 0) return;
     if (uploadingCount > 0) { alert('文件上传中，请等待'); return; }
     // 发出任何消息（包括批准）都算离开「待确认」状态：确认条只是当轮的动作入口。
@@ -11,7 +14,11 @@ async function send() {
 
     // 执行中追加模式：agent 正在运行时，发送追加消息
     if (isStreaming && currentId && text) {
-        appendUserMessage(text, currentId);
+        if (questionCard && selectedFiles.length === 0) {
+            answerUserQuestion(text, questionCard);
+        } else {
+            appendUserMessage(text, currentId, questionCard);
+        }
         return;
     }
     if (isStreaming) return;
@@ -31,8 +38,15 @@ async function send() {
     document.getElementById('welcomeScreen')?.remove();
 
     const imgSrcs = previewSrcs.slice();
-    const fileNames = selectedFiles.filter(f => !f.type.startsWith('image/')).map(f => f.name);
-    renderUserMsg(text, imgSrcs[0] || null, imgSrcs.length, fileNames);
+    const attachments = selectedFiles.map((file, index) => ({
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        src: file.type.startsWith('image/')
+            ? (imgSrcs[index] || '')
+            : URL.createObjectURL(file)
+    }));
+    renderUserMsg(text, null, 0, [], false, attachments);
     addMsgToConv('user', text, null, imgSrcs[0] || null);
 
     const filesCopy = selectedFiles.slice();
@@ -48,12 +62,43 @@ async function send() {
     setStreaming(true);
 
     // POST JSON 交互 — 替代 SSE 流式
-    sendChatPost(text, sid, filesCopy, refsCopy, botBody);
+    sendChatPost(text, sid, filesCopy, refsCopy, botBody, questionCard);
+}
+
+/** 把非 2xx 响应正文带回聊天区，便于分辨应用限流和网关/服务端错误。 */
+async function chatHttpErrorMessage(resp) {
+    let raw = '';
+    try { raw = await resp.text(); } catch (_) { /* 状态码仍足以说明失败 */ }
+    let detail = '';
+    const contentType = (resp.headers.get('Content-Type') || '').toLowerCase();
+    if (raw && contentType.includes('json')) {
+        try {
+            const body = JSON.parse(raw);
+            const value = body && (body.message || body.error_description || body.error || body.detail);
+            detail = typeof value === 'string' ? value
+                : value && typeof value === 'object' ? (value.message || JSON.stringify(value)) : '';
+        } catch (_) { /* malformed JSON; show the bounded plain response below */ }
+    } else if (raw && !/^\s*</.test(raw)) {
+        detail = raw.trim();
+    }
+    if (/^rate limit exceeded$/i.test(detail)) {
+        detail = resp.headers.get('X-RateLimit-Source') === 'miniagent-api'
+            ? '本地接口请求过于频繁，请稍后重试。'
+            : '请求过于频繁，请稍后重试。';
+    } else if (!detail && resp.status === 429) {
+        detail = '请求过于频繁，请稍后重试。';
+    }
+    detail = String(detail || '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 320);
+    const retryAfter = Number(resp.headers.get('Retry-After'));
+    const retryHint = Number.isFinite(retryAfter) && retryAfter > 0
+        ? '（建议 ' + Math.ceil(retryAfter) + ' 秒后重试）' : '';
+    return '❌ HTTP ' + resp.status + (detail ? '：' + detail : '') + retryHint;
 }
 
 /** POST /api/conversations/{id}/messages/stream，读 SSE 流式响应 */
-async function sendChatPost(text, sessionId, files, refs, botBody) {
+async function sendChatPost(text, sessionId, files, refs, botBody, questionCard) {
     const epoch = ++streamEpoch;
+    beginUserQuestionAnswer(questionCard);
     try {
         let images = [];
         let fileAttachments = [];
@@ -88,13 +133,16 @@ async function sendChatPost(text, sessionId, files, refs, botBody) {
         });
 
         if (!resp.ok || !resp.body) {
-            botBody.innerHTML = renderMD('❌ HTTP ' + resp.status);
+            botBody.textContent = await chatHttpErrorMessage(resp);
             botBody.classList.remove('streaming');
+            resetUserQuestionCard(questionCard, '回复未发送，请检查原因后重试。');
             if (epoch === streamEpoch) {
                 setStreaming(false); onInputChange(); scrollToBottom();
             }
             return;
         }
+
+        if (questionCard) markUserQuestionAnswered(text, questionCard);
 
         // 读 SSE 流
         await consumeStream(resp.body.getReader(), botBody, sessionId);
@@ -102,6 +150,7 @@ async function sendChatPost(text, sessionId, files, refs, botBody) {
     } catch (err) {
         botBody.innerHTML = renderMD('❌ ' + err.message);
         botBody.classList.remove('streaming');
+        resetUserQuestionCard(questionCard, '回复未发送，请检查网络后重试。');
         if (epoch === streamEpoch) {
             setStreaming(false); onInputChange(); scrollToBottom();
         }
@@ -114,9 +163,19 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
   try {
         const decoder = new TextDecoder('utf-8');
         let buffer = '', answer = '', done = false;
-        let thinkText = '', thinkCollapsed = false;
+        let thinkText = '', thinkCollapsed = true;
+        let waitingOnQuestion = false;
+        let waitingOnPermission = false, waitingOnPlanApproval = false;
+        // Approval is settled in 07-permission.js, outside this stream closure.
+        // pendingAskTool is cleared there on approve/deny/expiry; the local flag alone
+        // would stay true and discard every subsequent token and the final answer.
+        const waitingForInteraction = () => waitingOnQuestion
+            || (waitingOnPermission && !!pendingAskTool) || waitingOnPlanApproval;
         // 本 turn 是否由失败/取消收尾，只影响折叠条的「已取消 / 已完成」用词
         let turnCancelled = false;
+        let turnIncomplete = false;
+        let turnFailed = false, turnWaiting = false;
+        let taskOutcomeStatus = null, taskOutcomeReason = '';
         const MAX_THINK_CHARS = 12000;
         let thinkPaintTimer = null;
         // 增量渲染的 DOM 引用与已渲染游标（避免每个 token 重建整棵子树导致闪烁）
@@ -126,24 +185,15 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         // 流式正文的两个渲染游标：定稿块（frozen）与末尾未闭合块（tail）
         let renderedFrozen = '', renderedTail = '';
         let answerPaintTimer = null;
-        // 任务计划钉在用户提问下方；sub-goal 仍可回退到 bot 内
+        // Only real decomposed task nodes produce a progress card. Model turns and
+        // free-form subgoal messages do not imply a measurable task percentage.
         let todoItems = null;
-        let todoEl = null, todoListEl = null, todoMetaEl = null, planRowEl = null;
-        let subGoalText = '', subGoalDone = 0, subGoalTotal = 0;
-        let progressEl = null, progressLabelEl = null, progressFillEl = null;
+        let todoEl = null, todoListEl = null;
+        let todoProgressTitleEl = null;
+        let todoProgressMetaEl = null, todoProgressFillEl = null;
         function clearOnce() { if (!cleared) { botBody.innerHTML = ''; cleared = true; } }
-        function findUserRowForBot() {
-            const botRow = botBody.closest('.bot-row');
-            let el = botRow ? botRow.previousElementSibling : null;
-            while (el) {
-                if (el.classList.contains('user-row')) return el;
-                if (el.classList.contains('plan-row')) {
-                    el = el.previousElementSibling;
-                    continue;
-                }
-                break;
-            }
-            return null;
+        function firstInteractionCard() {
+            return botBody.querySelector('.user-question-card, .permission-request-card');
         }
         function schedulePaintAnswer() {
             if (answerPaintTimer) return;
@@ -169,6 +219,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         function paintAnswerNow() {
             removeTyping();
             ensureAnswer();
+            answerEl.classList.toggle('has-content', !!answer.trim());
             // 自愈：正文容器被整段替换过（finish / 历史回放）时 .md-tail 已经脱离 DOM，
             // 此时游标全部作废，重建结构后从头画。
             if (!answerTailEl || !answerTailEl.isConnected) {
@@ -220,7 +271,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             // 位次不变式：panelEl 永远是 bot-body 的最后一个子节点，其余元素插到它前面。
             // 顺序：时间线 → 答案 → 思考（思考钉底，对齐 WorkBuddy）。工具过程行已下线。
             // ref 必须落在 botBody 里，否则 insertAt 会静默降级成 append 跑到思考后面去。
-            insertAt(botBody, timelineEl, answerEl || panelEl);
+            insertAt(botBody, timelineEl, todoEl || answerEl || firstInteractionCard() || panelEl);
         }
         /**
          * 清空正文容器，并**按固定结构重建** .md-tail。
@@ -239,39 +290,42 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             }
             if (!answerEl) return;
             answerEl.innerHTML = '';
+            answerEl.classList.remove('has-content');
             answerTailEl = document.createElement('div');
             answerTailEl.className = 'md-tail';
             answerEl.appendChild(answerTailEl);
         }
-        /** 把当前流式正文封存为过程说明，再开新一段（不抹掉可见历史） */
+        /** 工具调用或重试会撤销这一轮草稿；只保留任务卡，不把模型的过程文案堆进聊天记录。 */
         function sealAnswerToTimeline() {
-            const text = (answer || '').trim();
-            if (text) {
-                ensureTimeline();
-                const note = document.createElement('div');
-                note.className = 'tl-note';
-                const lab = document.createElement('div');
-                lab.className = 'tl-note-label';
-                lab.textContent = '过程说明';
-                const body = document.createElement('div');
-                body.className = 'tl-note-body';
-                body.innerHTML = renderMDStreaming(text);
-                note.appendChild(lab);
-                note.appendChild(body);
-                timelineEl.appendChild(note);
-            }
             answer = '';
             resetAnswerDom();
-            thinkCollapsed = false;
-            if (panelEl) {
-                panelEl.classList.remove('collapsed', 'done');
-                appliedCollapsed = false;
-            }
+            thinkCollapsed = true;
+            if (panelEl) panelEl.classList.add('collapsed');
         }
-        function finish(html, cancelled) {
+        function finish(html, cancelled, incomplete) {
             if (done) return; done = true;
+            turnWaiting = taskOutcomeStatus === 'WAITING';
+            turnCancelled = taskOutcomeStatus === 'CANCELED' || (!taskOutcomeStatus && !!cancelled);
+            turnIncomplete = !!incomplete;
+            turnFailed = taskOutcomeStatus === 'FAILURE';
+            botBody.dataset.taskStatus = taskOutcomeStatus
+                || (turnCancelled ? 'CANCELED' : turnIncomplete ? 'INCOMPLETE' : 'SUCCESS');
+            if (taskOutcomeReason) botBody.dataset.taskReason = taskOutcomeReason;
+            if (taskRunningSessionId === sessionId) {
+                taskIsActive = false;
+                taskRunningSessionId = null;
+                taskPauseRequested = false;
+                taskPausedAtCheckpoint = false;
+            }
+            if (!turnWaiting) {
+                waitingOnQuestion = false;
+                waitingOnPermission = false;
+                waitingOnPlanApproval = false;
+            }
+            if (!turnWaiting && typeof settlePendingAskOnTerminal === 'function') {
+                settlePendingAskOnTerminal('任务已结束，授权请求已失效。');
+            }
             turnFinishedAt = Date.now();
-            turnCancelled = !!cancelled;
             if (thinkTickTimer) {
                 clearInterval(thinkTickTimer);
                 thinkTickTimer = null;
@@ -281,9 +335,12 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 answerPaintTimer = null;
             }
             botBody.classList.remove('streaming');
-            // 保留思考 / 时间线；计划已在用户提问下，不塞进 bot
+            // 保留助手气泡里的执行卡片、思考与时间线，只定稿答案区域
             ensureAnswer();
             answerEl.innerHTML = html;
+            // Errors and stop notices may have no streamed answer, but their
+            // terminal content still needs to be visible after removing status cards.
+            answerEl.classList.toggle('has-content', !!String(html || '').trim());
             // 定稿后正文结构由 html 决定，不再有 .md-tail；游标一并作废
             answerTailEl = null;
             renderedAnswer = answer;
@@ -297,12 +354,17 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 appliedCollapsed = true;
                 paintThinkHead();
             }
+            setStreaming(false);
+            onInputChange();
+            if (todoItems && todoItems.length) paintTodo();
             const finalHtml = botBody.innerHTML;
             bindLightbox(botBody.closest('.bot-row'));
             addMsgToConv('assistant', answer, finalHtml, null);
-            setStreaming(false); onInputChange(); scrollToBottom();
+            scrollToBottom();
             stopPolling(sessionId);
             removeTaskRunningHint();
+            if (typeof renderSidebar === 'function') renderSidebar();
+            if (typeof syncConversationHeader === 'function') syncConversationHeader();
         }
 
         /**
@@ -313,7 +375,9 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         function thinkHeadText() {
             if (!turnStartedAt) return '深度思考';
             const span = fmtDuration((turnFinishedAt || Date.now()) - turnStartedAt);
-            const state = turnFinishedAt ? (turnCancelled ? '已取消 ' : '已完成 ') : '已处理 ';
+            const state = turnFinishedAt ? (turnWaiting ? '等待你的操作 '
+                : turnCancelled ? '已取消 ' : turnIncomplete ? '未完成 '
+                : turnFailed ? '失败 ' : '已完成 ') : '已处理 ';
             return '深度思考 · ' + state + span;
         }
         function paintThinkHead() {
@@ -348,7 +412,10 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             panelEl.className = 'think-panel';
             const head = document.createElement('div');
             head.className = 'think-head';
-            head.onclick = function () { panelEl.classList.toggle('collapsed'); };
+            head.onclick = function () {
+                panelEl.classList.toggle('collapsed');
+                thinkCollapsed = panelEl.classList.contains('collapsed');
+            };
             headLabelEl = document.createElement('span');
             headLabelEl.className = 'think-label';
             headLabelEl.textContent = '深度思考';
@@ -362,7 +429,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             panelEl.appendChild(head); panelEl.appendChild(body);
             // 钉在 bot-body 最底：工具时间线与正文都在它上面（WorkBuddy 的位次）。
             // 不变式：panelEl 是 botBody 的最后一个子节点，其余元素插到它前面。
-            // 别改回插到 progressEl/timelineEl/answerEl 前面 —— 那样流式期间思考
+            // 别改回插到 timelineEl/answerEl 前面 —— 那样流式期间思考
             // 会落到 .tl-stream 之上（实测 DOM: think-panel, tl-stream, answer-stream）。
             insertAt(botBody, panelEl, null);
             // 有思考面板后不再用底部 liveDock 重复挂「思考中」
@@ -383,129 +450,131 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             answerEl.appendChild(answerTailEl);
             renderedFrozen = '';
             renderedTail = '';
-            // 答案插到思考条前面：思考恒在链尾，正文在它之上。
-            insertAt(botBody, answerEl, panelEl);
+            // 回复正文排在任务进度卡前；思考恒在链尾，正文与进度都在它之上。
+            insertAt(botBody, answerEl, todoEl || firstInteractionCard() || panelEl);
         }
-        /** 任务计划钉在用户提问与 bot 之间 */
+        /** The DAG/todo snapshot is the only source of node progress. */
         function paintTodo() {
-            if (!todoItems || !todoItems.length) return;
-            const userRow = findUserRowForBot();
-            planRowEl = null;
-            todoEl = null;
-            todoListEl = null;
-            todoMetaEl = null;
-            if (userRow) {
-                const next = userRow.nextElementSibling;
-                if (next && next.classList.contains('plan-row'))
-                    planRowEl = next;
+            if (!todoItems) return;
+            botBody.querySelectorAll('.task-status-card').forEach(card => card.remove());
+            const botRow = botBody.closest('.bot-row');
+            const previousRow = botRow && botRow.previousElementSibling;
+            if (previousRow && previousRow.classList.contains('plan-row')) previousRow.remove();
+
+            if (!todoItems.length) {
+                if (todoEl) todoEl.remove();
+                todoEl = todoListEl = null;
+                todoProgressTitleEl = todoProgressMetaEl = todoProgressFillEl = null;
+                return;
             }
-            if (planRowEl) {
-                todoEl = planRowEl.querySelector('.todo-panel');
-                todoListEl = planRowEl.querySelector('.todo-list');
-                todoMetaEl = planRowEl.querySelector('.todo-head-meta');
-            }
-            if (!todoEl || !todoListEl || !todoMetaEl) {
-                if (!planRowEl) {
-                    planRowEl = document.createElement('div');
-                    planRowEl.className = 'msg-row plan-row';
-                    if (userRow) userRow.after(planRowEl);
-                    else {
-                        clearOnce();
-                        // 无用户行时退到 bot 体内，同样走收口、锚链上下一个元素
-                        insertAt(botBody, planRowEl, progressEl || timelineEl || answerEl || panelEl);
-                    }
-                }
-                planRowEl.innerHTML = '';
-                const inner = document.createElement('div');
-                inner.className = 'msg-inner';
-                todoEl = document.createElement('div');
+
+            if (!todoEl) {
+                clearOnce();
+                botBody.querySelectorAll('.todo-panel').forEach(card => card.remove());
+                todoEl = document.createElement('section');
                 todoEl.className = 'todo-panel';
-                const head = document.createElement('div');
-                head.className = 'todo-head';
-                const title = document.createElement('span');
-                title.textContent = '任务计划';
-                todoMetaEl = document.createElement('span');
-                todoMetaEl.className = 'todo-head-meta';
-                head.appendChild(title);
-                head.appendChild(todoMetaEl);
+                todoEl.setAttribute('aria-label', '任务节点进度');
+
+                const progressCard = document.createElement('div');
+                progressCard.className = 'todo-progress-card';
+                const top = document.createElement('div');
+                top.className = 'todo-progress-top';
+                todoProgressTitleEl = document.createElement('div');
+                todoProgressTitleEl.className = 'todo-progress-title';
+                todoProgressMetaEl = document.createElement('span');
+                todoProgressMetaEl.className = 'todo-progress-meta';
+                top.append(todoProgressTitleEl, todoProgressMetaEl);
+                const track = document.createElement('div');
+                track.className = 'todo-progress-track';
+                track.setAttribute('role', 'progressbar');
+                track.setAttribute('aria-label', '已完成的任务节点');
+                track.setAttribute('aria-valuemin', '0');
+                track.setAttribute('aria-valuemax', '100');
+                todoProgressFillEl = document.createElement('div');
+                todoProgressFillEl.className = 'todo-progress-fill';
+                track.appendChild(todoProgressFillEl);
+                progressCard.append(top, track);
                 todoListEl = document.createElement('ol');
                 todoListEl.className = 'todo-list';
-                todoEl.appendChild(head);
-                todoEl.appendChild(todoListEl);
-                inner.appendChild(todoEl);
-                planRowEl.appendChild(inner);
+                todoEl.append(progressCard, todoListEl);
+                insertAt(botBody, todoEl, firstInteractionCard() || panelEl);
             }
-            let doneN = 0;
-            for (const it of todoItems)
-                if (it.status === 'completed' || it.status === 'cancelled') doneN++;
-            todoMetaEl.textContent = doneN + '/' + todoItems.length;
+
+            // Cancelled nodes remain visible, but are never counted as completed.
+            const scheduled = todoItems.filter(item => item.status !== 'cancelled');
+            const completed = scheduled.filter(item => item.status === 'completed').length;
+            const total = scheduled.length;
+            const percent = total ? Math.round(completed * 100 / total) : 0;
+            const live = isStreaming && !done;
+            const current = todoItems.find(item => item.status === 'awaiting_confirm')
+                || todoItems.find(item => item.status === 'in_progress')
+                || todoItems.find(item => item.status === 'blocked')
+                || todoItems.find(item => item.status === 'pending');
+            let heading, state;
+            if (turnWaiting) {
+                heading = current ? '等待你的操作：' + current.content : '任务等待你的操作'; state = 'waiting';
+            } else if (turnIncomplete) {
+                heading = '任务未完成，连接已中断'; state = 'blocked';
+            } else if (turnFailed) {
+                heading = '任务执行失败'; state = 'blocked';
+            } else if (turnCancelled && taskOutcomeStatus === 'CANCELED') {
+                heading = '任务已取消'; state = 'idle';
+            } else if (!total) {
+                heading = '任务步骤已取消'; state = 'idle';
+            } else if (completed === total) {
+                heading = '所有任务节点已完成'; state = 'done';
+            } else if (current && current.status === 'awaiting_confirm') {
+                heading = '等待确认：' + current.content; state = 'waiting';
+            } else if (current && current.status === 'blocked') {
+                heading = '步骤受阻：' + current.content; state = 'blocked';
+            } else if (live && current) {
+                heading = (current.status === 'in_progress' ? '正在执行：' : '准备执行：') + current.content;
+                state = 'running';
+            } else {
+                heading = turnCancelled ? '任务已停止' : '任务步骤待继续';
+                state = 'idle';
+            }
+            todoEl.dataset.state = state;
+            todoProgressTitleEl.textContent = heading;
+            todoProgressMetaEl.textContent = completed + '/' + total + ' 已完成';
+            todoProgressFillEl.style.width = percent + '%';
+            todoProgressFillEl.parentElement.setAttribute('aria-valuenow', String(percent));
             todoListEl.innerHTML = '';
-            // 「当前指向的步骤」不等于「正在执行」：只有本轮真在跑时，
-            // in_progress 才画成进行中；否则只是指针停在这一步。
-            const idle = !isStreaming;
-            for (const it of todoItems) {
-                const st = (it.status || 'pending').toLowerCase();
+            const labels = {
+                completed: '已完成', in_progress: live ? '进行中' : '待继续',
+                pending: '待执行', awaiting_confirm: '待确认',
+                blocked: '受阻', cancelled: '已取消'
+            };
+            for (const item of todoItems) {
+                const status = item.status || 'pending';
                 const li = document.createElement('li');
-                li.className = 'todo-item ' + st + (idle && st === 'in_progress' ? ' idle' : '');
+                li.className = 'todo-item ' + status + (!live && status === 'in_progress' ? ' idle' : '');
+                li.dataset.nodeId = String(item.id);
                 const mark = document.createElement('span');
                 mark.className = 'todo-mark';
+                mark.setAttribute('aria-hidden', 'true');
                 const text = document.createElement('span');
                 text.className = 'todo-text';
-                text.textContent = (it.id != null ? it.id + '. ' : '') + (it.content || '');
-                li.appendChild(mark);
-                li.appendChild(text);
-                if (idle && st === 'in_progress') {
-                    const hint = document.createElement('span');
-                    hint.className = 'todo-hint';
-                    hint.textContent = '待继续';
-                    li.appendChild(hint);
-                }
-                if (st === 'awaiting_confirm') {
-                    const btn = document.createElement('button');
-                    btn.type = 'button';
-                    btn.className = 'todo-confirm-btn';
-                    btn.textContent = '确认并继续';
-                    btn.disabled = isStreaming;
-                    const todoId = it.id;
-                    btn.onclick = function (ev) {
-                        ev.preventDefault();
-                        ev.stopPropagation();
-                        confirmTodoAndContinue(todoId);
+                text.textContent = item.content || '';
+                const label = document.createElement('span');
+                label.className = 'todo-node-state';
+                label.textContent = labels[status] || '待执行';
+                li.append(mark, text, label);
+                if (status === 'awaiting_confirm') {
+                    const button = document.createElement('button');
+                    button.type = 'button';
+                    button.className = 'todo-confirm-btn';
+                    button.textContent = '确认并继续';
+                    button.disabled = live;
+                    button.onclick = function (event) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        confirmTodoAndContinue(item.id);
                     };
-                    li.appendChild(btn);
+                    li.appendChild(button);
                 }
                 todoListEl.appendChild(li);
             }
-            if (progressEl) { progressEl.remove(); progressEl = null; }
-        }
-        function ensureProgress() {
-            if (todoItems && todoItems.length) return; // 有计划列表时不再画单行进度条
-            if (progressEl) return;
-            clearOnce();
-            progressEl = document.createElement('div');
-            progressEl.className = 'subgoal-bar';
-            progressLabelEl = document.createElement('div');
-            progressLabelEl.className = 'subgoal-label';
-            const track = document.createElement('div');
-            track.className = 'subgoal-track';
-            progressFillEl = document.createElement('div');
-            progressFillEl.className = 'subgoal-fill';
-            track.appendChild(progressFillEl);
-            progressEl.appendChild(progressLabelEl);
-            progressEl.appendChild(track);
-            // 进度条在时间线/答案/思考之前
-            insertAt(botBody, progressEl, timelineEl || answerEl || panelEl);
-        }
-        function paintProgress() {
-            if (todoItems && todoItems.length) return;
-            if (!subGoalTotal) return;
-            ensureProgress();
-            const stepNo = Math.min(subGoalDone + 1, subGoalTotal);
-            const label = '步骤 ' + stepNo + '/' + subGoalTotal + '：' + subGoalText;
-            if (progressLabelEl.textContent !== label) progressLabelEl.textContent = label;
-            const pct = Math.round((subGoalDone / subGoalTotal) * 100);
-            const w = pct + '%';
-            if (progressFillEl.style.width !== w) progressFillEl.style.width = w;
         }
         function removeTyping() {
             const t = botBody.querySelector('.typing-dots');
@@ -513,7 +582,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         }
         function paint() {
             // 思考只有一条出口：.think-panel，钉在本轮气泡最上方。
-            // 与「任务计划」卡片、sub-goal 进度条无关，那两处只放计划本身。
+            // 与任务节点进度无关，节点卡片只展示结构化的执行步骤。
             if (thinkText) {
                 ensurePanel();
                 if (thinkText !== renderedThink) {
@@ -585,9 +654,116 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             if (card) card.classList.remove('show');
         }
 
+        function showUserQuestionCard(payload) {
+            removeTyping();
+            clearOnce();
+            const old = botBody.querySelector('.user-question-card:not(.answered)');
+            if (old) old.remove();
+            const card = document.createElement('section');
+            card.className = 'user-question-card';
+            card.dataset.sessionId = sessionId;
+            card.setAttribute('aria-live', 'polite');
+            const title = document.createElement('div');
+            title.className = 'user-question-title';
+            title.textContent = '需要你补充信息';
+            const question = document.createElement('div');
+            question.className = 'user-question-text';
+            question.textContent = payload && payload.question
+                ? String(payload.question) : '需要你补充一点信息才能继续。';
+            const optionsBox = document.createElement('div');
+            optionsBox.className = 'user-question-options';
+            const status = document.createElement('div');
+            status.className = 'user-question-status';
+            const options = Array.isArray(payload && payload.options)
+                ? payload.options.map(option => String(option || '').trim()).filter(Boolean) : [];
+            const multiSelect = !!(payload && payload.multiSelect);
+            if (options.length) {
+                status.textContent = multiSelect
+                    ? '可多选，选择后点击提交；也可以直接在输入框回复。'
+                    : '点选一个选项，或直接在输入框回复。';
+            const selected = new Set();
+            let submit = null;
+            if (multiSelect) {
+                submit = document.createElement('button');
+                submit.type = 'button';
+                submit.className = 'user-question-submit';
+                submit.textContent = '提交选择';
+                submit.disabled = true;
+                submit.setAttribute('aria-disabled', 'true');
+                submit.onclick = () => answerUserQuestion([...selected].join('、'), card);
+            }
+                options.forEach((label, index) => {
+                    const button = document.createElement('button');
+                    button.type = 'button';
+                    button.className = 'user-question-option';
+                    button.textContent = label;
+                    button.setAttribute('aria-pressed', 'false');
+                    if (multiSelect) {
+                        button.onclick = () => {
+                            if (selected.has(label)) selected.delete(label);
+                            else selected.add(label);
+                            button.classList.toggle('selected', selected.has(label));
+                            button.setAttribute('aria-pressed', selected.has(label) ? 'true' : 'false');
+                            submit.disabled = selected.size === 0;
+                            submit.setAttribute('aria-disabled', submit.disabled ? 'true' : 'false');
+                        };
+                    } else {
+                        button.onclick = () => answerUserQuestion(label, card);
+                    }
+                    optionsBox.appendChild(button);
+                });
+            if (submit) optionsBox.appendChild(submit);
+            } else {
+                status.textContent = '请在下方输入框补充信息后发送。';
+            }
+            card.appendChild(title);
+            card.appendChild(question);
+            if (options.length) card.appendChild(optionsBox);
+            card.appendChild(status);
+            insertAt(botBody, card, panelEl);
+            registerUserQuestionCard(card);
+            scrollToBottom();
+        }
+
+        function showPermissionAskCard(payload) {
+            removeTyping();
+            clearOnce();
+            const card = document.createElement('section');
+            card.className = 'permission-request-card';
+            const title = document.createElement('div');
+            title.className = 'permission-request-title';
+            const detail = document.createElement('div');
+            detail.className = 'permission-request-detail';
+            const status = document.createElement('div');
+            status.className = 'permission-request-status';
+            const actions = document.createElement('div');
+            actions.className = 'permission-request-actions';
+            const once = document.createElement('button');
+            once.type = 'button';
+            once.className = 'permission-allow-once';
+            once.innerHTML = '<span aria-hidden="true">✓</span> 允许一次';
+            once.onclick = () => grantAskTool();
+            const always = document.createElement('button');
+            always.type = 'button';
+            always.className = 'permission-allow-always';
+            always.innerHTML = '<span aria-hidden="true">◷</span> 始终允许';
+            always.onclick = () => alwaysAllowAskTool();
+            const deny = document.createElement('button');
+            deny.type = 'button';
+            deny.className = 'permission-deny';
+            deny.innerHTML = '<span aria-hidden="true">⊘</span> 拒绝';
+            deny.onclick = () => denyAskTool();
+            actions.append(once, always, deny);
+            card.append(title, detail, status, actions);
+            insertAt(botBody, card, panelEl);
+            registerInlineAskCard(card, payload && (payload.tool || payload.name),
+                payload && payload.display, payload && payload.grantToken,
+                payload && payload.expiresAt);
+            scrollToBottom();
+        }
+
         function onEvent(name, data) {
             if (name === 'thinking') {
-                if (thinkCollapsed && !answer) thinkCollapsed = false;
                 thinkText += data;
                 if (thinkText.length > MAX_THINK_CHARS)
                     thinkText = thinkText.slice(thinkText.length - MAX_THINK_CHARS);
@@ -601,34 +777,56 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                     syncPendingConfirm(todoItems);
                 } catch (e) { /* 忽略坏 payload */ }
             } else if (name === 'subgoal') {
-                try {
-                    const sg = typeof data === 'string' ? JSON.parse(data) : data;
-                    subGoalText = sg.text || '';
-                    subGoalDone = sg.done || 0;
-                    subGoalTotal = sg.total || 0;
-                    paintProgress();
-                } catch (e) { /* 容错 */ }
+                // A loop's subgoal counter is not a decomposed task graph. The
+                // dedicated node snapshot above drives the card and its percentage.
             } else if (name === 'seal' || name === 'reset') {
                 // 封存过程正文进时间线，再开下一段（兼容旧 reset）
                 sealAnswerToTimeline();
                 paint();
             } else if (name === 'start') {
-                answer = data; paint();
+                if (!waitingForInteraction()) { answer = data; paint(); }
             } else if (name === 'token') {
-                if (!answer && !thinkCollapsed) thinkCollapsed = true;
-                answer += data; paint();
+                if (!waitingForInteraction()) {
+                    if (!answer && !thinkCollapsed) thinkCollapsed = true;
+                    answer += data; paint();
+                }
             } else if (name === 'context') {
                 try {
                     const ctx = typeof data === 'string' ? JSON.parse(data) : data;
                     paintContext(ctx.used || 0, ctx.limit || 0);
                 } catch (e) { /* 忽略坏 payload */ }
+            } else if (name === 'task_outcome') {
+                try {
+                    const payload = typeof data === 'string' ? JSON.parse(data) : data;
+                    const rawStatus = String(payload && payload.status || '').toUpperCase();
+                    const aliases = { COMPLETED: 'SUCCESS', FAILED: 'FAILURE', CANCELLED: 'CANCELED' };
+                    const status = aliases[rawStatus] || rawStatus;
+                    if (['SUCCESS', 'WAITING', 'CANCELED', 'FAILURE'].includes(status)) {
+                        taskOutcomeStatus = status;
+                        taskOutcomeReason = String(payload.reason || '');
+                    }
+                } catch (_) { /* Legacy streams may not carry a structured outcome. */ }
             } else if (name === 'end') {
                 // 最终定稿：只覆盖当前答案段，保留时间线
-                if (data) answer = data;
-                finish(renderMD(answer));
+                const missingFinalAnswer = !String(data || '').trim() && !String(answer || '').trim();
+                if (taskOutcomeStatus === 'WAITING') {
+                    answer = String(data || '').trim() || answer || '等待你的操作后继续。';
+                } else if (taskOutcomeStatus === 'CANCELED') {
+                    answer = String(data || '').trim() || answer || '任务已取消。';
+                } else if (taskOutcomeStatus === 'FAILURE') {
+                    answer = String(data || '').trim() || answer || '任务执行失败，请查看执行日志。';
+                } else {
+                    answer = resolveStreamFinalAnswer(data, answer);
+                }
+                finish(renderMD(answer), false, missingFinalAnswer && !taskOutcomeStatus);
             } else if (name === 'error') {
-                // 失败/取消收尾：折叠条表头用「已取消 Ns」而不是「已完成 Ns」
-                finish(renderMD('❌ ' + (data || '服务处理出错')), true);
+                if (!taskOutcomeStatus) {
+                    turnCancelled = /取消|停止|cancel(?:led|ed)?/i.test(String(data || ''));
+                    if (!turnCancelled) taskOutcomeStatus = 'FAILURE';
+                }
+                answer = (taskOutcomeStatus === 'WAITING' ? '' : '❌ ')
+                    + (data || (taskOutcomeStatus === 'WAITING' ? '等待你的操作后继续。' : '服务处理出错'));
+                finish(renderMD(answer), turnCancelled);
             } else if (name === 'user') {
                 renderUserEchoIfNeeded(botBody, data);
             } else if (name === 'gone') {
@@ -636,34 +834,49 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             } else if (name === 'permission_ask') {
                 try {
                     const payload = typeof data === 'string' ? JSON.parse(data) : data;
-                    const tool = payload && (payload.tool || payload.name);
-                    if (tool) showAskModal(tool, payload.display || '',
-                        payload.grantToken || '', payload.expiresAt || 0);
+                    waitingOnPermission = true;
+                    answer = '';
+                    resetAnswerDom();
+                    showPermissionAskCard(payload || {});
                 } catch (_) {
-                    if (data) showAskModal(String(data));
+                    waitingOnPermission = true;
+                    answer = '';
+                    resetAnswerDom();
+                    showPermissionAskCard({ display: String(data || '') });
                 }
             } else if (name === 'permission_ask_released') {
                 // 全自动（自动编辑 + 自动确认）在任务运行中生效：后端已经把本会话
                 // 所有等待点放行并继续执行。弹窗必须跟着收起 —— 后端在跑、页面还停在
                 // 「等一个不会再被消费的点击」，就是用户说的「开了自动还卡在授权上」。
                 pendingAskTool = null;
+                waitingOnPermission = false;
                 pendingAskGrantToken = null;
                 clearTimeout(pendingAskExpiryTimer);
                 pendingAskExpiryTimer = null;
+                completeInlineAskCard('权限策略已更新，Agent 正在继续执行。', 'approved');
                 document.getElementById('askModal').classList.remove('show');
                 setAskModalText('工具待确认');
                 showAskActions();
             } else if (name === 'user_question') {
                 try {
                     const payload = typeof data === 'string' ? JSON.parse(data) : data;
-                    showUserQuestionModal(payload);
+                    waitingOnQuestion = true;
+                    answer = '';
+                    resetAnswerDom();
+                    showUserQuestionCard(payload || {});
                 } catch (_) {
-                    showUserQuestionModal({ question: String(data || ''), options: [] });
+                    waitingOnQuestion = true;
+                    answer = '';
+                    resetAnswerDom();
+                    showUserQuestionCard({ question: String(data || ''), options: [] });
                 }
             } else if (name === 'session') { /* 忽略 */
             } else if (name === 'plan_approval') {
                 // 规则计划需要用户确认：由后端在 PLAN_APPROVAL_REQUIRED 时发出。
                 // 必须在这里接上 —— showPlanApproval 只定义、不接事件，卡片永远不会出现。
+                waitingOnPlanApproval = true;
+                answer = '';
+                resetAnswerDom();
                 showPlanApproval(data);
             } else if (name === 'append_ack') {
                 // 入队回执。这里**有意不处理**：同一次追加还有 POST /messages 的 JSON 响应，
@@ -679,8 +892,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
          */
         async function tryResumeOrFinish(err) {
             if (reconnectAttempt >= MAX_STREAM_RECONNECTS) {
-                if (answer) finish(renderMD(answer));
-                else finish(renderMD('❌ 连接多次中断，请重试' + (err ? '：' + err.message : '')));
+                if (answer) finish(renderMD(answer), false, true);
+                else finish(renderMD('❌ 连接多次中断，请重试' + (err ? '：' + err.message : '')), false, true);
                 return;
             }
             // 确认后台任务还在跑，才值得重连
@@ -691,12 +904,12 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             } catch (e) { /* 探测失败按未运行处理 */ }
 
             if (!stillRunning) {
-                if (answer) finish(renderMD(answer));
+                if (answer) finish(renderMD(answer), false, true);
                 else if (sessionId === currentId) {
                     done = true;
                     unlockComposer();
                     await switchConv(sessionId, true);
-                } else finish(renderMD('❌ 连接中断' + (err ? '：' + err.message : '')));
+                } else finish(renderMD('❌ 连接中断' + (err ? '：' + err.message : '')), false, true);
                 return;
             }
 
@@ -709,7 +922,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 await consumeStream(resp.body.getReader(), botBody, sessionId, reconnectAttempt + 1);
             } catch (e) {
                 console.warn('resume stream failed:', e);
-                if (answer) finish(renderMD(answer));
+                if (answer) finish(renderMD(answer), false, true);
                 else {
                     unlockComposer();
                     showTaskRunningHint(sessionId);
@@ -718,6 +931,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             }
         }
 
+        botBody.querySelectorAll('.task-status-card').forEach(card => card.remove());
         try {
             while (true) {
                 const { value, done: streamDone } = await reader.read();
@@ -770,6 +984,14 @@ function fileToBase64(file) {
     });
 }
 
+/** The server's final answer takes precedence over stale local interaction flags. */
+function resolveStreamFinalAnswer(data, streamedAnswer) {
+    const finalAnswer = typeof data === 'string' ? data : '';
+    if (finalAnswer.trim()) return finalAnswer;
+    if (String(streamedAnswer || '').trim()) return streamedAnswer;
+    return '任务已结束，但智能体没有生成最终回复。请查看右侧任务详情中的执行记录和已生成文件。';
+}
+
 function addMsgToConv(role, text, html, imgSrc) {
     // Messages are persisted by the backend; no local storage needed.
     // Sidebar refresh is handled by switchConv and send completion.
@@ -789,6 +1011,12 @@ function refreshTodoIdleState() {
     document.querySelectorAll('.todo-panel .todo-item.in_progress').forEach(li => {
         li.classList.toggle('idle', idle);
         const existing = li.querySelector('.todo-hint');
+        const nodeState = li.querySelector('.todo-node-state');
+        if (nodeState) {
+            nodeState.textContent = idle ? '待继续' : '进行中';
+            if (existing) existing.remove();
+            return;
+        }
         if (idle && !existing) {
             const hint = document.createElement('span');
             hint.className = 'todo-hint';
@@ -798,4 +1026,52 @@ function refreshTodoIdleState() {
             existing.remove();
         }
     });
+}
+
+async function toggleTaskPause() {
+    if (!currentId || !taskIsActive || taskRunningSessionId !== currentId) return;
+    const sessionId = currentId;
+    const action = taskPauseRequested ? 'resume' : 'pause';
+    const button = document.getElementById('taskPauseBtn');
+    if (button) button.disabled = true;
+    try {
+        const response = await fetch('/api/conversations/' + encodeURIComponent(sessionId)
+            + '/task/' + action, { method: 'PUT' });
+        const body = await response.json();
+        if (!response.ok || !apiSuccess(body)) {
+            throw new Error(apiFailureMessage(body, response));
+        }
+        if (sessionId !== currentId || !isStreaming) return;
+        taskPauseRequested = action === 'pause';
+        taskPausedAtCheckpoint = false;
+        syncTaskControlButton();
+        if (taskPausePollTimer) clearInterval(taskPausePollTimer);
+        taskPausePollTimer = action === 'pause'
+            ? setInterval(() => refreshTaskPauseState(sessionId), 500) : null;
+    } catch (error) {
+        console.warn('task pause control failed:', error);
+        alert((action === 'pause' ? '暂停' : '继续') + '任务失败：' + error.message);
+    } finally {
+        if (button) button.disabled = false;
+    }
+}
+
+async function refreshTaskPauseState(sessionId) {
+    if (!sessionId || sessionId !== currentId || !taskIsActive
+            || taskRunningSessionId !== sessionId) return;
+    try {
+        const response = await fetch('/api/conversations/' + encodeURIComponent(sessionId) + '/task');
+        if (!response.ok) return;
+        const status = await apiJson(response) || {};
+        if (sessionId !== currentId || !taskIsActive || taskRunningSessionId !== sessionId) return;
+        taskPauseRequested = status.pauseRequested === true;
+        taskPausedAtCheckpoint = status.pausedAtCheckpoint === true;
+        syncTaskControlButton();
+        if (taskPauseRequested && !taskPausePollTimer) {
+            taskPausePollTimer = setInterval(() => refreshTaskPauseState(sessionId), 500);
+        } else if (!taskPauseRequested && taskPausePollTimer) {
+            clearInterval(taskPausePollTimer);
+            taskPausePollTimer = null;
+        }
+    } catch (_) { /* 状态查询失败时保留当前 UI 状态，后续间隔重试 */ }
 }

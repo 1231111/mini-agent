@@ -9,8 +9,10 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.core.annotation.Order;
+import org.springframework.beans.factory.annotation.Value;
 
-import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
@@ -27,6 +29,9 @@ import java.util.Set;
 @Configuration
 @EnableConfigurationProperties(ContextBudgetProperties.class)
 public class ContextContributorConfiguration {
+
+    @Value("${web.search.time-zone:Asia/Shanghai}")
+    private String configuredTimeZone = "Asia/Shanghai";
 
     private static final DateTimeFormatter CLOCK =
             DateTimeFormatter.ofPattern("yyyy年MM月dd日 HH:mm:ss");
@@ -125,12 +130,17 @@ public class ContextContributorConfiguration {
     @Order(90)
     SystemContextContributor closingContributor() {
         return ctx -> {
-            String now = LocalDateTime.now().format(CLOCK);
+            ZoneId zone;
+            try { zone = ZoneId.of(configuredTimeZone); }
+            catch (Exception ignored) { zone = ZoneId.systemDefault(); }
+            ZonedDateTime now = ZonedDateTime.now(zone);
             return ContextFragment.of(ContextSlot.CLOSING,
                     PromptTemplates.UNTRUSTED_DATA_RULES + "\n\n"
                             + (ctx.fullAuto() ? PromptTemplates.FULL_AUTO_CONFIRMATION
                                               : PromptTemplates.CONFIRMATION) + "\n\n"
-                            + PromptTemplates.OUTPUT + "\n\n当前时间：" + now);
+                            + PromptTemplates.OUTPUT + "\n\n"
+                            + RelativeDateGuidance.render(now) + "\n当前时间："
+                            + now.format(CLOCK) + "（" + now.getZone().getId() + "）");
         };
     }
 

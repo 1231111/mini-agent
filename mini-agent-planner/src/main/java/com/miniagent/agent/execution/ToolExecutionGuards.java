@@ -186,6 +186,11 @@ public class ToolExecutionGuards implements SmartInitializingSingleton {
      */
     public <T> T executeGuarded(String toolName, String args, String sessionId, Callable<T> operation)
             throws Exception {
+        return executeGuarded(toolName, args, sessionId, null, operation);
+    }
+
+    public <T> T executeGuarded(String toolName, String args, String sessionId,
+                              ToolInvocationBudget budget, Callable<T> operation) throws Exception {
         ToolDescriptor descriptor = descriptor(toolName, args);
         String resourceKey = resourceKey(descriptor, args, sessionId);
         Semaphore resource = resourceKey.isEmpty() ? null
@@ -203,7 +208,12 @@ public class ToolExecutionGuards implements SmartInitializingSingleton {
                 }
                 resourceAcquired = true;
             }
-            return operation.call();
+            if (budget != null) budget.start();
+            try {
+                return operation.call();
+            } finally {
+                if (budget != null) budget.finish();
+            }
         } finally {
             if (resourceAcquired) {
                 resource.release();

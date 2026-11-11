@@ -130,7 +130,7 @@ public class TodoStateProjector {
             case SUCCESS -> "completed";
             case RUNNING, READY -> "in_progress";
             case AWAITING_CONFIRM -> "awaiting_confirm";
-            case FAILED, RECOVERING -> "blocked";
+            case FAILED, RECOVERING, OUTCOME_UNKNOWN -> "blocked";
             case CANCELLED -> "cancelled";
             case PENDING -> "pending";
         };

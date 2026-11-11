@@ -5,6 +5,8 @@ import com.miniagent.config.repository.AgentTraceStepRepository;
 import lombok.extern.slf4j.Slf4j;
 import com.miniagent.common.MessageConstants;
 import com.miniagent.common.RunStatus;
+import com.miniagent.agent.tool.ToolResult;
+import com.miniagent.agent.tool.ToolStatus;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -150,6 +152,16 @@ public class TraceRecorder {
         save(build(sessionId, turn, type, toolName, null,
                 truncate(result, 8000), null, 0, 0,
                 fail ? RunStatus.FAILURE.name() : (StringUtils.isBlank(status) ? RunStatus.SUCCESS.name() : status), durationMs));
+    }
+
+    /** Structured execution status is authoritative over arbitrary business payload fields. */
+    public void recordToolResult(String sessionId, int turn, String toolName, ToolResult result, long durationMs) {
+        ToolResult actual = result == null ? ToolResult.fromLegacy(null) : result;
+        boolean failed = !actual.isSuccess() && actual.status() != ToolStatus.AWAITING_USER;
+        String status = actual.status() == ToolStatus.AWAITING_USER ? RunStatus.WAITING.name()
+                : failed ? RunStatus.FAILURE.name() : RunStatus.SUCCESS.name();
+        save(build(sessionId, turn, failed ? AgentStepNode.TOOL_ERROR.name() : AgentStepNode.TOOL_RESULT.name(),
+                toolName, null, truncate(actual.legacyText(), 8000), null, 0, 0, status, durationMs));
     }
 
     public void recordToolRetry(String sessionId, int turn, String toolName, String reason, int attempt) {

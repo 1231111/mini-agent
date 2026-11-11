@@ -45,6 +45,7 @@ import com.miniagent.web.dto.resp.TaskStatusDTO;
 import com.miniagent.web.dto.resp.TodoConfirmDTO;
 import com.miniagent.web.dto.resp.TokenUsageAllDTO;
 import com.miniagent.web.dto.resp.TraceExecutionDTO;
+import com.miniagent.web.dto.resp.InspectorSnapshotDTO;
 import com.miniagent.web.dto.resp.TraceSummaryDTO;
 import com.miniagent.web.dto.resp.UploadResultDTO;
 import com.miniagent.web.dto.resp.UserDTO;
@@ -79,6 +80,7 @@ import java.util.*;
 import com.miniagent.config.repository.ChatMessageRepository;
 import com.miniagent.config.repository.ChatTaskRepository;
 import com.miniagent.config.entity.ChatTask;
+import com.miniagent.config.entity.FileUpload;
 import com.miniagent.config.repository.AgentTraceStepRepository;
 import com.miniagent.config.entity.AgentTraceStep;
 import org.apache.commons.lang3.StringUtils;
@@ -439,6 +441,38 @@ public class MiniAgentChatPageController {
         return ApiResponse.ok();
     }
 
+    @PutMapping(value = "/api/conversations/{sessionId}/task/pause",
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<Void> pauseChat(@PathVariable("sessionId") String sessionId,
+                                       HttpServletRequest request) {
+        Long userId = resolveUserId(request);
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        if (StringUtils.isBlank(sessionId))
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "sessionId required");
+        if (!ownsSession(userId, sessionId)) return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN);
+        if (!streamingService.isTaskRunning(sessionId))
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "当前没有正在运行的任务");
+        agentService.pause(sessionId);
+        return ApiResponse.ok();
+    }
+
+    @PutMapping(value = "/api/conversations/{sessionId}/task/resume",
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<Void> resumeChat(@PathVariable("sessionId") String sessionId,
+                                        HttpServletRequest request) {
+        Long userId = resolveUserId(request);
+        if (Objects.isNull(userId)) return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        if (StringUtils.isBlank(sessionId))
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "sessionId required");
+        if (!ownsSession(userId, sessionId)) return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN);
+        if (!streamingService.isTaskRunning(sessionId))
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "当前没有正在运行的任务");
+        agentService.resume(sessionId);
+        return ApiResponse.ok();
+    }
+
     // ========== SSE streaming ==========
 
     @PostMapping(value = "/api/conversations/{sessionId}/messages/stream",
@@ -461,6 +495,7 @@ public class MiniAgentChatPageController {
             return emitter;
         }
         String message = req.getMessage();
+        String displayMessage = Objects.requireNonNullElse(message, "");
         // 归属校验。会话 id 现在由 POST /api/conversations 签发，签发时就已经把
         // userId 写进 chat_conversations，所以这里可以做严格判等：不是自己的会话一律拒。
         // 此前的放行条件里带了 occupiedByAnyone —— 那是「客户端自造 id」时代的补丁，
@@ -483,6 +518,8 @@ public class MiniAgentChatPageController {
         List<String> images = Objects.isNull(req.getImages()) ? List.of() : req.getImages();
         List<FileAttachment> files = Objects.isNull(req.getFiles()) ? List.of() : req.getFiles();
         List<MediaRef> mediaRefs = Objects.isNull(req.getMediaRefs()) ? List.of() : req.getMediaRefs();
+        List<com.miniagent.web.dto.FileRef> fileRefs = Objects.isNull(req.getFileRefs())
+                ? List.of() : req.getFileRefs();
         StringBuilder queryTask = new StringBuilder(Optional.ofNullable(message).orElse(""));
         // 预上传附件：统一走安全提取 + 侧车 + 上下文预算（docx/pptx/pdf/md 等）
         if (Objects.nonNull(req.getFileRefs()) && !req.getFileRefs().isEmpty()) {
@@ -492,7 +529,8 @@ public class MiniAgentChatPageController {
             }
         }
         return agentService.chatStreamMultimodal(
-                userId, sessionId, queryTask.toString(), images, files, mediaRefs, role);
+                userId, sessionId, queryTask.toString(), displayMessage, images, files,
+                mediaRefs, fileRefs, role);
     }
 
     /**
@@ -577,6 +615,124 @@ public class MiniAgentChatPageController {
         }
     }
 
+    /** 会话附件下载口：图片/音视频走 inline 媒体口，其它上传文件作为附件下载。 */
+    @GetMapping("/api/conversation-download/{sessionId}/{filename}")
+    @ResponseBody
+    public ResponseEntity<?> downloadConversationFile(@PathVariable("sessionId") String sessionId,
+                                                      @PathVariable("filename") String filename,
+                                                      HttpServletRequest request) {
+        Object rawPrincipal = request == null ? null
+                : request.getAttribute(JwtSessionService.ATTR_PRINCIPAL);
+        if (!(rawPrincipal instanceof AuthenticatedUser principal)) {
+            return ResponseEntity.status(401).body("Authentication required");
+        }
+        if (!safePathSegment(sessionId) || !safeFlatFileName(filename)) {
+            return ResponseEntity.badRequest().body("Illegal path");
+        }
+        if (principal.role() != com.miniagent.config.entity.UserRole.SYSTEM_ADMIN
+                && !ownsSession(principal.userId(), sessionId)) {
+            return ResponseEntity.status(404).build();
+        }
+        try {
+            Path root = mediaStorage.conversationsDir().toAbsolutePath().normalize()
+                    .resolve(sessionId).normalize();
+            Path file = resolveWorkspaceDownload(root, filename);
+            if (file == null) return ResponseEntity.notFound().build();
+            String contentType = Optional.ofNullable(Files.probeContentType(file))
+                    .orElse(MediaType.APPLICATION_OCTET_STREAM_VALUE);
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.parseMediaType(contentType));
+            headers.setContentLength(Files.size(file));
+            headers.setContentDisposition(ContentDisposition.attachment()
+                    .filename(filename, StandardCharsets.UTF_8).build());
+            headers.set("X-Content-Type-Options", "nosniff");
+            headers.set(HttpHeaders.CACHE_CONTROL, "private, no-store");
+            return ResponseEntity.ok().headers(headers).body(new UrlResource(file.toUri()));
+        } catch (Exception e) {
+            log.warn("会话附件下载失败 sessionId={} filename={}", sessionId, filename, e);
+            return ResponseEntity.internalServerError().body("Failed to read file");
+        }
+    }
+
+    /** 已上传文档按上传用户归属提供下载，不复制大文件到每条会话目录。 */
+    @GetMapping("/api/user-upload-download/{filename}")
+    @ResponseBody
+    public ResponseEntity<?> downloadUserUpload(@PathVariable("filename") String filename,
+                                                @RequestParam(value = "name", required = false) String displayName,
+                                                HttpServletRequest request) {
+        Object rawPrincipal = request == null ? null
+                : request.getAttribute(JwtSessionService.ATTR_PRINCIPAL);
+        if (!(rawPrincipal instanceof AuthenticatedUser principal)) {
+            return ResponseEntity.status(401).body("Authentication required");
+        }
+        if (!safeFlatFileName(filename)) {
+            return ResponseEntity.badRequest().body("Illegal path");
+        }
+        try {
+            Path uploads = mediaStorage.uploadsDir().toAbsolutePath().normalize();
+            Path userRoot = uploads.resolve(String.valueOf(principal.userId())).normalize();
+            Path file = resolveWorkspaceDownload(userRoot, filename);
+            if (file == null) return ResponseEntity.notFound().build();
+            String downloadName = safeDownloadName(displayName, filename);
+            String contentType = Optional.ofNullable(Files.probeContentType(file))
+                    .orElse(MediaType.APPLICATION_OCTET_STREAM_VALUE);
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.parseMediaType(contentType));
+            headers.setContentLength(Files.size(file));
+            headers.setContentDisposition(ContentDisposition.attachment()
+                    .filename(downloadName, StandardCharsets.UTF_8).build());
+            headers.set("X-Content-Type-Options", "nosniff");
+            headers.set(HttpHeaders.CACHE_CONTROL, "private, no-store");
+            return ResponseEntity.ok().headers(headers).body(new UrlResource(file.toUri()));
+        } catch (Exception e) {
+            log.warn("用户上传附件下载失败 userId={} filename={}", principal.userId(), filename, e);
+            return ResponseEntity.internalServerError().body("Failed to read file");
+        }
+    }
+
+    /** 历史消息中的用户上传图片使用 inline 媒体响应，避免把图片 URL 指向 attachment 下载端点。 */
+    @GetMapping("/api/user-upload-media/{filename}")
+    @ResponseBody
+    public ResponseEntity<?> serveUserUploadedImage(@PathVariable("filename") String filename,
+                                                     HttpServletRequest request) {
+        Object rawPrincipal = request == null ? null
+                : request.getAttribute(JwtSessionService.ATTR_PRINCIPAL);
+        if (!(rawPrincipal instanceof AuthenticatedUser principal)) {
+            return ResponseEntity.status(401).body("Authentication required");
+        }
+        if (!safeFlatFileName(filename) || !isInlineImageFilename(filename)) {
+            return ResponseEntity.badRequest().body("Illegal image filename");
+        }
+        try {
+            Path uploads = mediaStorage.uploadsDir().toAbsolutePath().normalize();
+            Path userRoot = uploads.resolve(String.valueOf(principal.userId())).normalize();
+            Path file = resolveWorkspaceDownload(userRoot, filename);
+            if (file == null) return ResponseEntity.notFound().build();
+            String contentType = approvedInlineMediaType(filename, file);
+            if (contentType == null || !contentType.startsWith("image/")) {
+                return ResponseEntity.status(415).body("Unsupported image type");
+            }
+            return MediaResponses.serve(file, filename, contentType, request);
+        } catch (Exception e) {
+            log.warn("用户上传图片预览失败 userId={} filename={}", principal.userId(), filename, e);
+            return ResponseEntity.internalServerError().body("Failed to read image");
+        }
+    }
+
+    private static boolean isInlineImageFilename(String filename) {
+        String lower = Objects.requireNonNullElse(filename, "").toLowerCase(Locale.ROOT);
+        return lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+                || lower.endsWith(".gif") || lower.endsWith(".webp") || lower.endsWith(".svg")
+                || lower.endsWith(".bmp") || lower.endsWith(".avif");
+    }
+
+    private static String safeDownloadName(String requested, String fallback) {
+        if (StringUtils.isBlank(requested)) return fallback;
+        String basename = requested.replace('\\', '/');
+        basename = basename.substring(basename.lastIndexOf('/') + 1);
+        return safeFlatFileName(basename) ? basename : fallback;
+    }
+
     /**
      * 工作区图片的受控读端点。
      *
@@ -592,8 +748,7 @@ public class MiniAgentChatPageController {
      * <ul>
      *   <li>只认工作区<b>根目录下的扁平文件名</b>：解析后父目录必须就是根（{@link Path#getParent()}
      *       精确相等），{@code ../} 与子目录一律 404，端点不能被用来遍历目录树。</li>
-     *   <li>只放行图片类：{@link #approvedInlineMediaType} 判定结果必须 {@code startsWith("image/")}，
-     *       工作区里的 md / java / 配置文本一律 415。</li>
+     *   <li>只放行图片与视频，工作区里的 md / java / 配置文本一律 415。</li>
      *   <li>必须登录（{@code anyRequest().authenticated()}），响应仍走 {@link MediaResponses}，
      *       自带 {@code X-Content-Type-Options: nosniff} 与
      *       {@code Content-Security-Policy: default-src 'none'; sandbox}。</li>
@@ -627,7 +782,8 @@ public class MiniAgentChatPageController {
                 return ResponseEntity.notFound().build();
             }
             String contentType = approvedInlineMediaType(filename, media);
-            if (contentType == null || !contentType.startsWith("image/")) {
+            if (contentType == null
+                    || !(contentType.startsWith("image/") || contentType.startsWith("video/"))) {
                 return ResponseEntity.status(415).body("Unsupported media type");
             }
             return MediaResponses.serve(media, filename, contentType, request);
@@ -678,9 +834,60 @@ public class MiniAgentChatPageController {
                     .build());
             headers.set("X-Content-Type-Options", "nosniff");
             headers.set(HttpHeaders.CACHE_CONTROL, "private, no-store");
+            if ("HEAD".equalsIgnoreCase(request.getMethod())) {
+                return ResponseEntity.ok().headers(headers).build();
+            }
             return ResponseEntity.ok().headers(headers).body(new UrlResource(file.toUri()));
         } catch (Exception e) {
             log.warn("工作区文件下载失败 filename={}", filename, e);
+            return ResponseEntity.internalServerError().body("Failed to read file");
+        }
+    }
+
+    /**
+     * Resolve a concrete file reference inside the authenticated session workspace.
+     * Query parameters preserve nested paths and Windows drive paths without turning
+     * them into route segments. Absolute paths never grant access outside that root.
+     */
+    @GetMapping("/api/workspace-download")
+    @ResponseBody
+    public ResponseEntity<?> downloadWorkspaceReference(
+            @RequestParam("path") String path,
+            @RequestParam(value = "sid", required = false) String sid,
+            HttpServletRequest request) {
+        Object rawPrincipal = request == null ? null
+                : request.getAttribute(JwtSessionService.ATTR_PRINCIPAL);
+        if (!(rawPrincipal instanceof AuthenticatedUser principal)) {
+            return ResponseEntity.status(401).body("Authentication required");
+        }
+        if (StringUtils.isBlank(sid) || !safeWorkspaceReferencePath(path)) {
+            return ResponseEntity.badRequest().body("Invalid file reference");
+        }
+        Path root;
+        try {
+            root = workspaceRootForRequest(principal.userId(), sid);
+        } catch (SecurityException e) {
+            return ResponseEntity.notFound().build();
+        }
+        Path file = resolveWorkspaceReference(root, path);
+        if (file == null) return ResponseEntity.notFound().build();
+        try {
+            String filename = file.getFileName().toString();
+            String type = Optional.ofNullable(Files.probeContentType(file))
+                    .orElse(MediaType.APPLICATION_OCTET_STREAM_VALUE);
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.parseMediaType(type));
+            headers.setContentLength(Files.size(file));
+            headers.setContentDisposition(ContentDisposition.attachment()
+                    .filename(filename, StandardCharsets.UTF_8).build());
+            headers.set("X-Content-Type-Options", "nosniff");
+            headers.set(HttpHeaders.CACHE_CONTROL, "private, no-store");
+            if ("HEAD".equalsIgnoreCase(request.getMethod())) {
+                return ResponseEntity.ok().headers(headers).build();
+            }
+            return ResponseEntity.ok().headers(headers).body(new UrlResource(file.toUri()));
+        } catch (Exception e) {
+            log.warn("会话文件引用下载失败 sid={}", sid, e);
             return ResponseEntity.internalServerError().body("Failed to read file");
         }
     }
@@ -752,6 +959,34 @@ public class MiniAgentChatPageController {
         return media;
     }
 
+    static Path resolveWorkspaceReference(Path workspaceRoot, String value) {
+        if (workspaceRoot == null || !safeWorkspaceReferencePath(value)) return null;
+        try {
+            Path root = workspaceRoot.toAbsolutePath().normalize();
+            Path supplied = Path.of(value);
+            Path file = (supplied.isAbsolute() ? supplied : root.resolve(supplied)).normalize();
+            if (!file.startsWith(root) || file.equals(root)) return null;
+            for (Path part : root.relativize(file)) {
+                if (part.toString().startsWith(".")) return null;
+            }
+            if (!Files.isRegularFile(file)) return null;
+            Path realRoot = root.toRealPath();
+            Path realFile = file.toRealPath();
+            return realFile.startsWith(realRoot) ? realFile : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static boolean safeWorkspaceReferencePath(String value) {
+        if (value == null || value.isBlank() || value.length() > 4000) return false;
+        String normalized = value.replace('\\', '/');
+        if (normalized.startsWith("//")) return false;
+        String withoutDrive = normalized.replaceFirst("^[A-Za-z]:/", "");
+        if (withoutDrive.chars().anyMatch(c -> c < 0x20 || "<>:\"|?*".indexOf(c) >= 0)) return false;
+        return java.util.Arrays.stream(normalized.split("/")).noneMatch(".."::equals);
+    }
+
     /**
      * 工作区文件名：允许中文（模型常按内容起名，如 {@code 秋日不打烊-封面.svg}），
      * 但禁止路径分隔符、{@code ..}、控制字符与隐藏文件。
@@ -764,7 +999,8 @@ public class MiniAgentChatPageController {
         if (value.contains("..") || value.charAt(0) == '.') {
             return false;
         }
-        if (value.indexOf('/') >= 0 || value.indexOf('\\') >= 0) {
+        if (value.indexOf('/') >= 0 || value.indexOf('\\') >= 0
+                || value.chars().anyMatch(c -> "<>:\"|?*".indexOf(c) >= 0)) {
             return false;
         }
         return value.chars().noneMatch(c -> c < 0x20);
@@ -796,10 +1032,15 @@ public class MiniAgentChatPageController {
                 : lower.endsWith(".jpg") || lower.endsWith(".jpeg") ? "image/jpeg"
                 : lower.endsWith(".gif") ? "image/gif"
                 : lower.endsWith(".webp") ? "image/webp"
+                : lower.endsWith(".bmp") ? "image/bmp"
+                : lower.endsWith(".avif") ? "image/avif"
                 : lower.endsWith(".svg") ? "image/svg+xml"
                 : lower.endsWith(".mp3") ? "audio/mpeg"
                 : lower.endsWith(".wav") ? "audio/wav"
                 : lower.endsWith(".mp4") ? "video/mp4"
+                : lower.endsWith(".mov") ? "video/quicktime"
+                : lower.endsWith(".avi") ? "video/x-msvideo"
+                : lower.endsWith(".wmv") ? "video/x-ms-wmv"
                 : null;
         if (expected == null || "image/svg+xml".equals(expected)) {
             return expected;
@@ -823,7 +1064,9 @@ public class MiniAgentChatPageController {
             return ApiResponse.ok(new TaskStatusDTO(sessionId, false));
         }
         boolean running = streamingService.isTaskRunning(sessionId);
-        return ApiResponse.ok(new TaskStatusDTO(sessionId, running));
+        return ApiResponse.ok(new TaskStatusDTO(sessionId, running,
+                running && agentService.isPauseRequested(sessionId),
+                running && agentService.isPausedAtCheckpoint(sessionId)));
     }
 
     /**
@@ -911,16 +1154,64 @@ public class MiniAgentChatPageController {
                 userId, sessionId, org.springframework.data.domain.PageRequest.of(page, size));
         var list = new ArrayList<>(tasks.getContent());
         Collections.reverse(list);
+        Map<Long, List<String>> legacyUploadsByTask = legacyUploadsByTask(list,
+                fileStorageService.getUserSessionFiles(userId, sessionId));
         List<ConversationMessagesDTO.Task> mapped = new ArrayList<>();
         for (var t : list) {
+            List<String> attachments = new ArrayList<>(toConversationImageUrls(sessionId, t.getImages()));
+            attachments.addAll(legacyUploadsByTask.getOrDefault(t.getId(), List.of()));
             mapped.add(new ConversationMessagesDTO.Task(
                     t.getId(),
                     t.getQuestion(),
                     Optional.ofNullable(t.getAnswer()).orElse(""),
                     Objects.nonNull(t.getCreatedAt()) ? t.getCreatedAt().toString() : "",
-                    toConversationImageUrls(sessionId, t.getImages())));
+                    attachments));
         }
         return ApiResponse.ok(new ConversationMessagesDTO(mapped, tasks.hasNext()));
+    }
+
+    /**
+     * 兼容旧版本：当时普通附件只写入 file_uploads.session_id，没有写入 chat_tasks.images。
+     * 依据上传时间把它回挂到同会话中最近的后续消息；限制 30 分钟，避免把未发送的孤立上传
+     * 错挂到很久之后的任务。新版本已经写入 images 的附件不会重复添加。
+     */
+    static Map<Long, List<String>> legacyUploadsByTask(List<ChatTask> tasks, List<FileUpload> uploads) {
+        if (tasks == null || tasks.isEmpty() || uploads == null || uploads.isEmpty()) return Map.of();
+        Map<Long, List<String>> result = new HashMap<>();
+        Set<String> alreadyReferenced = new HashSet<>();
+        for (ChatTask task : tasks) {
+            String images = task.getImages();
+            if (StringUtils.isBlank(images)) continue;
+            for (String part : images.split(",")) {
+                String key = part.trim().replace('\\', '/');
+                if (key.startsWith("user-uploads/")) {
+                    String filename = key.substring("user-uploads/".length()).split("\\?", 2)[0];
+                    if (!filename.isBlank()) alreadyReferenced.add(filename);
+                }
+            }
+        }
+        for (FileUpload upload : uploads) {
+            if (upload == null || StringUtils.isBlank(upload.getStoredFilename())
+                    || StringUtils.isBlank(upload.getOriginalFilename())
+                    || alreadyReferenced.contains(upload.getStoredFilename())
+                    || !safeFlatFileName(upload.getStoredFilename())
+                    || upload.getCreatedAt() == null) continue;
+            ChatTask matched = tasks.stream()
+                    .filter(task -> task.getCreatedAt() != null
+                            && !task.getCreatedAt().isBefore(upload.getCreatedAt()))
+                    .min(Comparator.comparing(task -> java.time.Duration.between(
+                            upload.getCreatedAt(), task.getCreatedAt())))
+                    .orElse(null);
+            if (matched == null || java.time.Duration.between(upload.getCreatedAt(), matched.getCreatedAt())
+                    .compareTo(java.time.Duration.ofMinutes(30)) > 0) continue;
+            String mediaPath = isInlineImageFilename(upload.getStoredFilename())
+                    ? "/api/user-upload-media/" : "/api/user-upload-download/";
+            String url = mediaPath + upload.getStoredFilename()
+                    + "?name=" + java.net.URLEncoder.encode(upload.getOriginalFilename(), StandardCharsets.UTF_8);
+            result.computeIfAbsent(matched.getId(), ignored -> new ArrayList<>()).add(url);
+            alreadyReferenced.add(upload.getStoredFilename());
+        }
+        return result;
     }
 
     /** chat_tasks.images 逗号分隔相对键 → 可回显的 HTTP 路径 */
@@ -932,6 +1223,17 @@ public class MiniAgentChatPageController {
         for (String part : imagesCsv.split(",")) {
             String p = part == null ? "" : part.trim().replace('\\', '/');
             if (p.isEmpty()) {
+                continue;
+            }
+            if (p.startsWith("user-uploads/")) {
+                int query = p.indexOf('?');
+                String key = query < 0 ? p : p.substring(0, query);
+                String filename = key.substring("user-uploads/".length());
+                String queryPart = query < 0 ? "" : p.substring(query);
+                if (safeFlatFileName(filename)) {
+                    out.add((isInlineImageFilename(filename)
+                            ? "/api/user-upload-media/" : "/api/user-upload-download/") + filename + queryPart);
+                }
                 continue;
             }
             if (p.startsWith("http://") || p.startsWith("https://")
@@ -1049,6 +1351,23 @@ public class MiniAgentChatPageController {
         return emitter;
     }
 
+    /** 当前任务的 todo 清单；会话所有权校验后才读取任务级状态。 */
+    @GetMapping(value = "/api/conversations/{sessionId}/todos",
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<List<TaskTodoStore.TodoItem>> listTodos(
+            @PathVariable("sessionId") String sessionId,
+            HttpServletRequest request) {
+        Long userId = resolveUserId(request);
+        if (Objects.isNull(userId)) {
+            return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        }
+        if (!ownsSession(userId, sessionId)) {
+            return ApiResponse.ok(List.of());
+        }
+        return ApiResponse.ok(todoStore.get(sessionId));
+    }
+
     /** Agent 节点全集目录（与 AgentStepNode 同步） */
     @GetMapping(value = "/api/trace-nodes", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
@@ -1123,6 +1442,56 @@ public class MiniAgentChatPageController {
             return ApiResponse.ok(List.of());
         return ApiResponse.ok(com.miniagent.agent.planner.PlannerDecisionNodes.filter(
                 all, AgentTraceStep::getStepType));
+    }
+
+    /** 获取某 session 下所有执行任务的列表（按 executionId 分组） */
+    @GetMapping(value = "/api/conversations/{sessionId}/inspector-snapshot",
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<InspectorSnapshotDTO> inspectorSnapshot(
+            @PathVariable("sessionId") String sessionId,
+            HttpServletRequest request) {
+        Long userId = resolveUserId(request);
+        if (Objects.isNull(userId)) {
+            return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        }
+        if (!ownsSession(userId, sessionId)) {
+            return ApiResponse.ok(new InspectorSnapshotDTO(List.of(), false, null, List.of()));
+        }
+
+        List<TaskTodoStore.TodoItem> todos = todoStore.get(sessionId);
+        boolean running = streamingService.isTaskRunning(sessionId);
+        List<AgentTraceStep> sessionSteps = agentTraceStepRepository
+                .findBySessionIdOrderByTurnIndexAscIdAsc(sessionId);
+        Map<String, List<AgentTraceStep>> grouped = new LinkedHashMap<>();
+        for (AgentTraceStep step : sessionSteps) {
+            if (StringUtils.isBlank(step.getExecutionId())) continue;
+            grouped.computeIfAbsent(step.getExecutionId(), ignored -> new ArrayList<>()).add(step);
+        }
+        Map.Entry<String, List<AgentTraceStep>> latest = grouped.entrySet().stream()
+                .max(Comparator.comparingLong(entry -> entry.getValue().stream()
+                        .map(AgentTraceStep::getId)
+                        .filter(Objects::nonNull)
+                        .mapToLong(Long::longValue)
+                        .max().orElse(0L)))
+                .orElse(null);
+        if (latest == null) {
+            return ApiResponse.ok(new InspectorSnapshotDTO(todos, running, null, List.of()));
+        }
+
+        List<AgentTraceStep> steps = latest.getValue();
+        AgentTraceStep first = steps.get(0);
+        AgentTraceStep last = steps.get(steps.size() - 1);
+        String answerSummary = steps.stream()
+                .filter(step -> "ANSWER".equals(step.getStepType()))
+                .map(AgentTraceStep::getContent)
+                .filter(Objects::nonNull)
+                .findFirst().orElse("");
+        if (answerSummary.length() > 100) answerSummary = answerSummary.substring(0, 100) + "...";
+        TraceExecutionDTO execution = new TraceExecutionDTO(
+                latest.getKey(), sessionId, Optional.ofNullable(first.getUserQuestion()).orElse(""),
+                answerSummary, steps.size(), first.getCreatedAt(), last.getCreatedAt(), last.getStatus());
+        return ApiResponse.ok(new InspectorSnapshotDTO(todos, running, execution, steps));
     }
 
     /** 获取某 session 下所有执行任务的列表（按 executionId 分组） */

@@ -128,6 +128,15 @@ public class MediaStorage {
                         else if (header.contains("gif")) {
                             ext = "gif";
                         }
+                        else if (header.contains("avif")) {
+                            ext = "avif";
+                        }
+                        else if (header.contains("bmp")) {
+                            ext = "bmp";
+                        }
+                        else if (header.contains("svg+xml")) {
+                            ext = "svg";
+                        }
                     }
                 }
                 String filename = ts + "_" + i + "." + ext;

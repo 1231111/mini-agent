@@ -12,6 +12,7 @@ import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
+import org.springframework.util.AntPathMatcher;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
@@ -23,15 +24,27 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Simple sliding-window rate limit per authenticated user (or IP if anonymous).
+ * Sliding-window rate limit per authenticated user (or IP if anonymous).
+ * Frequent read-only task polling has a separate budget so UI refreshes cannot consume
+ * the same budget as user-triggered requests.
  */
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE + 20)
 public class RateLimitFilter extends OncePerRequestFilter {
 
+    private static final AntPathMatcher PATH_MATCHER = new AntPathMatcher();
+    /** 高频只读接口走单独额度；流订阅仍走普通限流，避免开放无限 SSE 连接。 */
+    private static final String[] BACKGROUND_READ_PATHS = {
+            "/api/conversations/*/task",
+            "/api/conversations/*/inspector-snapshot"
+    };
+
     @Value("${agent.rate-limit.per-minute:60}")
     private int perMinuteConfig;
     private int perMinute = 60;
+    @Value("${agent.rate-limit.background-read-per-minute:180}")
+    private int backgroundReadPerMinuteConfig;
+    private int backgroundReadPerMinute = 180;
     @Autowired
     private JwtSessionService jwtSessionService;
     /** 最大限流窗口数，防止 OOM */
@@ -49,11 +62,12 @@ public class RateLimitFilter extends OncePerRequestFilter {
     @PostConstruct
     private void initRate() {
         this.perMinute = Math.max(1, perMinuteConfig);
+        this.backgroundReadPerMinute = Math.max(1, backgroundReadPerMinuteConfig);
     }
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        String path = request.getRequestURI();
+        String path = applicationPath(request);
         // 放行 OPTIONS 预检请求，避免干扰 CORS
         if ("OPTIONS".equalsIgnoreCase(request.getMethod())) {
             return true;
@@ -63,10 +77,21 @@ public class RateLimitFilter extends OncePerRequestFilter {
                 || path.startsWith("/js");
     }
 
+    private static String applicationPath(HttpServletRequest request) {
+        String path = request.getRequestURI();
+        String contextPath = request.getContextPath();
+        if (contextPath != null && !contextPath.isEmpty() && path.startsWith(contextPath)) {
+            return path.substring(contextPath.length());
+        }
+        return path;
+    }
+
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
-        String key = rateKey(request);
+        boolean backgroundRead = isBackgroundRead(request);
+        String key = rateKey(request, backgroundRead);
+        int requestLimit = backgroundRead ? backgroundReadPerMinute : perMinute;
         long now = System.currentTimeMillis();
         long cutoff = now - WINDOW_IDLE_MILLIS;
 
@@ -96,9 +121,14 @@ public class RateLimitFilter extends OncePerRequestFilter {
             while (!q.isEmpty() && q.peekFirst() < cutoff) {
                 q.pollFirst();
             }
-            if (q.size() >= perMinute) {
+            if (q.size() >= requestLimit) {
                 response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
                 response.setContentType("application/json;charset=UTF-8");
+                response.setHeader("X-RateLimit-Source", "miniagent-api");
+                long retryAfterMillis = q.peekFirst() + WINDOW_IDLE_MILLIS - now;
+                long retryAfterSeconds = Math.max(1L,
+                        (retryAfterMillis + 999L) / 1_000L);
+                response.setHeader("Retry-After", Long.toString(retryAfterSeconds));
                 response.getWriter().write("{\"error\":\"rate limit exceeded\"}");
                 return;
             }
@@ -152,12 +182,22 @@ public class RateLimitFilter extends OncePerRequestFilter {
         }
     }
 
-    private String rateKey(HttpServletRequest request) {
+    private boolean isBackgroundRead(HttpServletRequest request) {
+        if (!"GET".equalsIgnoreCase(request.getMethod())) return false;
+        String path = applicationPath(request);
+        for (String pattern : BACKGROUND_READ_PATHS) {
+            if (PATH_MATCHER.match(pattern, path)) return true;
+        }
+        return false;
+    }
+
+    private String rateKey(HttpServletRequest request, boolean backgroundRead) {
         Long uid = jwtSessionService.resolveUserIdAndRefresh(request);
+        String bucket = backgroundRead ? "background-read:" : "request:";
         if (uid != null) {
-            return "u:" + uid;
+            return bucket + "u:" + uid;
         }
         String ip = request.getRemoteAddr();
-        return "ip:" + (ip == null ? "unknown" : ip);
+        return bucket + "ip:" + (ip == null ? "unknown" : ip);
     }
 }

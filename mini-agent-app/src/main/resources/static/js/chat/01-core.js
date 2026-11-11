@@ -96,9 +96,16 @@ let confirmPolicy = localStorage.getItem('mini_agent_confirm_policy') || 'danger
 let pendingTodoConfirm = null;
 let pendingAskTool = null;
 let pendingAskGrantToken = null;
-/** 审批弹窗的过期定时器：服务端 token 过期后再点「批准」只会拿到 403，所以到点就自动收起。 */
+let pendingAskCard = null;
+let activeUserQuestionCard = null;
+/** 审批 token 的过期定时器：过期后卡片会撤下操作按钮并显示状态。 */
 let pendingAskExpiryTimer = null;
 let isStreaming  = false;
+let taskIsActive = false;
+let taskRunningSessionId = null;
+let taskPauseRequested = false;
+let taskPausedAtCheckpoint = false;
+let taskPausePollTimer = null;
 let streamEpoch  = 0;
 // 本 turn 的起止时间戳，只给思考折叠条的表头文案用（「已处理 12s」/「已完成 12s」）。
 // 口径对齐 WorkBuddy 的 turnDurationMs：那次是「本 turn 最后一条 assistant 的

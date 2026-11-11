@@ -159,6 +159,10 @@ public class SessionEventCenter {
         final StringBuilder think = new StringBuilder();
         final StringBuilder answer = new StringBuilder();
         volatile Object planApproval = null;
+        volatile Object permissionAsk = null;
+        volatile Object userQuestion = null;
+        /** Structured task status must precede end/error when a client reconnects. */
+        volatile Object taskOutcome = null;
         volatile String subgoalText = "";
         volatile int subgoalDone = 0;
         volatile int subgoalTotal = 0;
@@ -181,6 +185,11 @@ public class SessionEventCenter {
     }
 
     public void start(String sessionId, String userMessage) {
+        startRun(sessionId, userMessage);
+    }
+
+    /** Identifies one execution, so delayed producers cannot finish its successor. */
+    public String startRun(String sessionId, String userMessage) {
         String k = key(sessionId);
         SessionChannel channel = new SessionChannel();
         channel.sessionId = k;
@@ -196,24 +205,32 @@ public class SessionEventCenter {
                 log.warn("Redis 追加消息状态初始化失败: sessionId={}, err={}", k, e.getMessage());
             }
         }
-        publishToOtherInstances(k, "start", "user", channel.userMessage);
+        publishToOtherInstances(k, "start", "user", channel.userMessage, channel.runToken);
+        return channel.runToken;
     }
 
     public void publish(String sessionId, String name, Object data) {
+        publish(sessionId, name, data, null);
+    }
+
+    public void publish(String sessionId, String name, Object data, String expectedRunToken) {
         SessionChannel channel = channels.get(key(sessionId));
         if (Objects.isNull(channel)) {
             return;
         }
-        if ("plan_approval".equals(name)) {
-            channel.planApproval = data;
+        synchronized (channel.bufferLock) {
+            if (!matchesRun(channel, expectedRunToken) || channel.status != Status.running) {
+                return;
+            }
+            applyPayload(channel, name, data);
             sendToLocalClients(channel, name, data);
-            publishToOtherInstances(key(sessionId), "event", name, data);
-            return;
+            publishToOtherInstances(key(sessionId), "event", name, data, channel.runToken);
         }
-        String text = Objects.isNull(data) ? "" : String.valueOf(data);
-        applyEvent(channel, name, text);
-        sendToLocalClients(channel, name, data);
-        publishToOtherInstances(key(sessionId), "event", name, data);
+    }
+
+    private static boolean matchesRun(SessionChannel channel, String expectedRunToken) {
+        // Null is reserved for legacy callers/envelopes during rolling upgrades.
+        return expectedRunToken == null || expectedRunToken.equals(channel.runToken);
     }
 
     public void publishSubGoal(String sessionId, String subText, int done, int total) {
@@ -226,7 +243,7 @@ public class SessionEventCenter {
         channel.subgoalTotal = total;
         Object payload = subgoalPayload(subText, done, total);
         sendToLocalClients(channel, "subgoal", payload);
-        publishToOtherInstances(key(sessionId), "event", "subgoal", payload);
+        publishToOtherInstances(key(sessionId), "event", "subgoal", payload, channel.runToken);
     }
 
     /** 推送完整 todo/计划列表（前端勾选列表）。 */
@@ -239,7 +256,7 @@ public class SessionEventCenter {
         channel.todoItems = copy;
         Map<String, Object> payload = todoPayload(copy);
         sendToLocalClients(channel, "todo", payload);
-        publishToOtherInstances(key(sessionId), "event", "todo", payload);
+        publishToOtherInstances(key(sessionId), "event", "todo", payload, channel.runToken);
     }
 
     private static Map<String, Object> subgoalPayload(String text, int done, int total) {
@@ -285,44 +302,57 @@ public class SessionEventCenter {
         if (Objects.isNull(channel)) {
             return false;
         }
-        sendEvent(emitter, "session", Optional.ofNullable(channel.sessionId).orElse(""));
-        if (Objects.nonNull(channel.userMessage) && !channel.userMessage.isEmpty()) {
-            sendEvent(emitter, "user", channel.userMessage);
-        }
-        String thinkSnapshot = snapshot(channel, channel.think);
-        if (!thinkSnapshot.isEmpty()) {
-            sendEvent(emitter, "thinking", thinkSnapshot);
-        }
-        if (channel.planApproval != null) {
-            sendEvent(emitter, "plan_approval", channel.planApproval);
-        }
-        if (channel.todoItems != null && !channel.todoItems.isEmpty()) {
-            sendEvent(emitter, "todo", todoPayload(channel.todoItems));
-        } else if (channel.subgoalTotal > 0) {
-            sendEvent(emitter, "subgoal", subgoalPayload(
-                    channel.subgoalText, channel.subgoalDone, channel.subgoalTotal));
-        }
-        String answerSnapshot = snapshot(channel, channel.answer);
-        if (!answerSnapshot.isEmpty()) {
-            sendEvent(emitter, "token", answerSnapshot);
-        }
-
-        if (channel.status == Status.done) {
-            sendEvent(emitter, "end", Optional.ofNullable(channel.finalAnswer).orElse(""));
-            try { emitter.complete(); } catch (Exception ignored) {}
-        } else if (channel.status == Status.error) {
-            sendEvent(emitter, "error", Optional.ofNullable(channel.errorMsg).orElse("处理出错"));
-            try { emitter.complete(); } catch (Exception ignored) {}
-        } else {
-            if (Objects.nonNull(userId)) {
-                emitterOwner.put(emitter, userId);
+        // Replay and registration share the terminal lock: no end/error can fall
+        // between the status check and adding a reconnecting client.
+        synchronized (channel.bufferLock) {
+            sendEvent(emitter, "session", Optional.ofNullable(channel.sessionId).orElse(""));
+            if (Objects.nonNull(channel.userMessage) && !channel.userMessage.isEmpty()) {
+                sendEvent(emitter, "user", channel.userMessage);
             }
-            emitter.onCompletion(() -> detachClient(channel, emitter));
-            emitter.onTimeout(() -> detachClient(channel, emitter));
-            emitter.onError(e -> detachClient(channel, emitter));
-            channel.clients.add(emitter);
+            String thinkSnapshot = snapshot(channel, channel.think);
+            if (!thinkSnapshot.isEmpty()) {
+                sendEvent(emitter, "thinking", thinkSnapshot);
+            }
+            if (channel.planApproval != null) {
+                sendEvent(emitter, "plan_approval", channel.planApproval);
+            }
+            if (channel.permissionAsk != null) {
+                sendEvent(emitter, "permission_ask", channel.permissionAsk);
+            }
+            if (channel.userQuestion != null) {
+                sendEvent(emitter, "user_question", channel.userQuestion);
+            }
+            if (channel.todoItems != null && !channel.todoItems.isEmpty()) {
+                sendEvent(emitter, "todo", todoPayload(channel.todoItems));
+            } else if (channel.subgoalTotal > 0) {
+                sendEvent(emitter, "subgoal", subgoalPayload(
+                        channel.subgoalText, channel.subgoalDone, channel.subgoalTotal));
+            }
+            String answerSnapshot = snapshot(channel, channel.answer);
+            if (!answerSnapshot.isEmpty()) {
+                sendEvent(emitter, "token", answerSnapshot);
+            }
+            if (channel.taskOutcome != null) {
+                sendEvent(emitter, "task_outcome", channel.taskOutcome);
+            }
+
+            if (channel.status == Status.done) {
+                sendEvent(emitter, "end", Optional.ofNullable(channel.finalAnswer).orElse(""));
+                try { emitter.complete(); } catch (Exception ignored) {}
+            } else if (channel.status == Status.error) {
+                sendEvent(emitter, "error", Optional.ofNullable(channel.errorMsg).orElse("处理出错"));
+                try { emitter.complete(); } catch (Exception ignored) {}
+            } else {
+                if (Objects.nonNull(userId)) {
+                    emitterOwner.put(emitter, userId);
+                }
+                emitter.onCompletion(() -> detachClient(channel, emitter));
+                emitter.onTimeout(() -> detachClient(channel, emitter));
+                emitter.onError(e -> detachClient(channel, emitter));
+                channel.clients.add(emitter);
+            }
+            return true;
         }
-        return true;
     }
 
     /** 摘掉一个 emitter：从通道列表移除，同时清掉归属登记。 */
@@ -370,41 +400,61 @@ public class SessionEventCenter {
     }
 
     public void complete(String sessionId, String finalAnswer) {
+        complete(sessionId, finalAnswer, null);
+    }
+
+    public void complete(String sessionId, String finalAnswer, String expectedRunToken) {
         SessionChannel channel = channels.get(key(sessionId));
         if (Objects.isNull(channel)) {
             return;
         }
-        synchronized (channel.pendingUserMessageLock) {
-            channel.status = Status.done;
-            channel.finalAnswer = Optional.ofNullable(finalAnswer).orElse("");
-            closeRedisAcceptance(sessionId);
+        synchronized (channel.bufferLock) {
+            if (!matchesRun(channel, expectedRunToken) || channel.status != Status.running) {
+                return;
+            }
+            synchronized (channel.pendingUserMessageLock) {
+                channel.status = Status.done;
+                channel.finalAnswer = Optional.ofNullable(finalAnswer).orElse("");
+                channel.acceptingUserMessages = false;
+                closeRedisAcceptance(key(sessionId), channel.runToken);
+            }
+            channel.doneAt = System.currentTimeMillis();
+            for (SseEmitter client : channel.clients) {
+                sendEvent(client, "end", channel.finalAnswer);
+                try { client.complete(); } catch (Exception ignored) {}
+            }
+            channel.clients.clear();
+            publishToOtherInstances(key(sessionId), "complete", "end", channel.finalAnswer, channel.runToken);
         }
-        channel.doneAt = System.currentTimeMillis();
-        for (SseEmitter client : channel.clients) {
-            sendEvent(client, "end", channel.finalAnswer);
-            try { client.complete(); } catch (Exception ignored) {}
-        }
-        channel.clients.clear();
-        publishToOtherInstances(key(sessionId), "complete", "end", channel.finalAnswer);
     }
 
     public void error(String sessionId, String message) {
+        error(sessionId, message, null);
+    }
+
+    public void error(String sessionId, String message, String expectedRunToken) {
         SessionChannel channel = channels.get(key(sessionId));
         if (Objects.isNull(channel)) {
             return;
         }
-        synchronized (channel.pendingUserMessageLock) {
-            channel.errorMsg = Optional.ofNullable(message).orElse("处理出错");
-            channel.status = Status.error;
-            closeRedisAcceptance(sessionId);
+        synchronized (channel.bufferLock) {
+            if (!matchesRun(channel, expectedRunToken) || channel.status != Status.running) {
+                return;
+            }
+            synchronized (channel.pendingUserMessageLock) {
+                channel.errorMsg = Optional.ofNullable(message).orElse("处理出错");
+                channel.status = Status.error;
+                channel.acceptingUserMessages = false;
+                closeRedisAcceptance(key(sessionId), channel.runToken);
+            }
+            channel.doneAt = System.currentTimeMillis();
+            for (SseEmitter client : channel.clients) {
+                sendEvent(client, "error", channel.errorMsg);
+                try { client.complete(); } catch (Exception ignored) {}
+            }
+            channel.clients.clear();
+            publishToOtherInstances(key(sessionId), "error", "error", channel.errorMsg, channel.runToken);
         }
-        channel.doneAt = System.currentTimeMillis();
-        for (SseEmitter client : channel.clients) {
-            sendEvent(client, "error", channel.errorMsg);
-            try { client.complete(); } catch (Exception ignored) {}
-        }
-        channel.clients.clear();
-        publishToOtherInstances(key(sessionId), "error", "error", channel.errorMsg);
     }
 
     /** 执行中追加用户消息；只有完成原子入队后才向调用方确认成功。 */
@@ -440,7 +490,7 @@ public class SessionEventCenter {
         String value = Objects.requireNonNullElse(message, "");
         String ack = value.length() > 50 ? value.substring(0, 50) + "..." : value;
         sendToLocalClients(channel, "append_ack", ack);
-        publishToOtherInstances(k, "event", "append_ack", ack);
+        publishToOtherInstances(k, "event", "append_ack", ack, channel.runToken);
         log.info("用户追加消息入队: sessionId={}, length={}", sessionId, value.length());
         return true;
     }
@@ -547,11 +597,15 @@ public class SessionEventCenter {
     }
 
     private void closeRedisAcceptance(String sessionId) {
+        SessionChannel channel = channels.get(key(sessionId));
+        closeRedisAcceptance(key(sessionId), channel == null ? null : channel.runToken);
+    }
+
+    private void closeRedisAcceptance(String sessionId, String runToken) {
         if (!redisMode()) {
             return;
         }
-        SessionChannel channel = channels.get(key(sessionId));
-        if (channel == null || channel.runToken == null) {
+        if (runToken == null) {
             return;
         }
         try {
@@ -559,14 +613,14 @@ public class SessionEventCenter {
                     List.of(redisRunKey(sessionId)),
                     PENDING_USER_MSG_STATE_PREFIX,
                     sessionId,
-                    channel.runToken,
+                    runToken,
                     String.valueOf(PENDING_USER_MSG_TTL.toSeconds()));
         } catch (Exception e) {
             log.debug("关闭 Redis 追加消息接收失败 session={}: {}", sessionId, e.getMessage());
         }
     }
 
-    private void publishToOtherInstances(String sessionId, String type, String name, Object data) {
+    private void publishToOtherInstances(String sessionId, String type, String name, Object data, String runToken) {
         if (!redisMode()) {
             return;
         }
@@ -576,6 +630,7 @@ public class SessionEventCenter {
             node.put("type", type);
             node.put("name", name == null ? "" : name);
             node.put("sessionId", sessionId);
+            if (runToken != null) node.put("runToken", runToken);
             if (data instanceof Map<?, ?> || data instanceof List<?>) {
                 node.set("data", JSON.valueToTree(data));
             } else {
@@ -604,6 +659,8 @@ public class SessionEventCenter {
             }
             String type = node.path("type").asText("");
             String name = node.path("name").asText("");
+            String runToken = node.path("runToken").asText(null);
+            if (StringUtils.isBlank(runToken)) runToken = null;
             JsonNode dataNode = node.get("data");
             Object data = dataNode == null || dataNode.isNull() ? ""
                     : (dataNode.isTextual() ? dataNode.asText() : JSON.convertValue(dataNode, Object.class));
@@ -614,58 +671,92 @@ public class SessionEventCenter {
                 return c;
             });
 
-            switch (type) {
-                case "start" -> {
-                    channel.status = Status.running;
-                    channel.runToken = null;
-                    channel.userMessage = String.valueOf(data);
-                    synchronized (channel.bufferLock) {
-                        channel.think.setLength(0);
-                        channel.answer.setLength(0);
-                    }
-                    channel.doneAt = 0L;
-                    sendToLocalClients(channel, "user", channel.userMessage);
+            synchronized (channel.bufferLock) {
+                if (!"start".equals(type) && runToken != null) {
+                    if (channel.runToken != null && !matchesRun(channel, runToken)) return;
+                    channel.runToken = runToken;
                 }
-                case "complete" -> {
-                    channel.finalAnswer = String.valueOf(data);
-                    channel.status = Status.done;
-                    channel.doneAt = System.currentTimeMillis();
-                    for (SseEmitter client : channel.clients) {
-                        sendEvent(client, "end", channel.finalAnswer);
-                        try { client.complete(); } catch (Exception ignored) {}
+                switch (type) {
+                    case "start" -> {
+                        // Duplicate start delivery must not erase already buffered output.
+                        if (runToken != null && runToken.equals(channel.runToken)) return;
+                        channel.status = Status.running;
+                        channel.runToken = runToken;
+                        channel.userMessage = String.valueOf(data);
+                        synchronized (channel.bufferLock) {
+                            channel.think.setLength(0);
+                            channel.answer.setLength(0);
+                        }
+                        channel.planApproval = null;
+                        channel.permissionAsk = null;
+                        channel.userQuestion = null;
+                        channel.taskOutcome = null;
+                        channel.todoItems = List.of();
+                        channel.subgoalText = "";
+                        channel.subgoalDone = channel.subgoalTotal = 0;
+                        channel.finalAnswer = channel.errorMsg = "";
+                        synchronized (channel.pendingUserMessageLock) {
+                            channel.acceptingUserMessages = true;
+                            channel.pendingUserMessages.clear();
+                        }
+                        channel.doneAt = 0L;
+                        sendToLocalClients(channel, "user", channel.userMessage);
                     }
-                    channel.clients.clear();
-                }
-                case "error" -> {
-                    channel.errorMsg = String.valueOf(data);
-                    channel.status = Status.error;
-                    channel.doneAt = System.currentTimeMillis();
-                    for (SseEmitter client : channel.clients) {
-                        sendEvent(client, "error", channel.errorMsg);
-                        try { client.complete(); } catch (Exception ignored) {}
+                    case "complete" -> {
+                        if (channel.status != Status.running) return;
+                        channel.finalAnswer = String.valueOf(data);
+                        channel.status = Status.done;
+                        channel.doneAt = System.currentTimeMillis();
+                        for (SseEmitter client : channel.clients) {
+                            sendEvent(client, "end", channel.finalAnswer);
+                            try { client.complete(); } catch (Exception ignored) {}
+                        }
+                        channel.clients.clear();
                     }
-                    channel.clients.clear();
-                }
-                default -> {
-                    if ("plan_approval".equals(name)) {
-                        channel.planApproval = data;
-                    } else if ("subgoal".equals(name) && data instanceof Map<?, ?> map) {
-                        Object text = map.get("text");
-                        channel.subgoalText = text == null ? "" : String.valueOf(text);
-                        channel.subgoalDone = toInt(map.get("done"));
-                        channel.subgoalTotal = toInt(map.get("total"));
-                    } else if ("todo".equals(name) && data instanceof Map<?, ?> map) {
-                        channel.todoItems = toTodoItems(map.get("items"));
-                    } else {
-                        applyEvent(channel, name, data == null ? "" : String.valueOf(data));
+                    case "error" -> {
+                        if (channel.status != Status.running) return;
+                        channel.errorMsg = String.valueOf(data);
+                        channel.status = Status.error;
+                        channel.doneAt = System.currentTimeMillis();
+                        for (SseEmitter client : channel.clients) {
+                            sendEvent(client, "error", channel.errorMsg);
+                            try { client.complete(); } catch (Exception ignored) {}
+                        }
+                        channel.clients.clear();
                     }
-                    if (!"append_ack".equals(name) || !channel.clients.isEmpty()) {
-                        sendToLocalClients(channel, name, data);
+                    default -> {
+                        if (channel.status != Status.running) return;
+                        applyPayload(channel, name, data);
+                        if (!"append_ack".equals(name) || !channel.clients.isEmpty()) {
+                            sendToLocalClients(channel, name, data);
+                        }
                     }
                 }
             }
         } catch (Exception e) {
             log.warn("SSE Redis 消息处理失败: {}", e.getMessage());
+        }
+    }
+
+    private static void applyPayload(SessionChannel channel, String name, Object data) {
+        switch (name) {
+            case "plan_approval" -> channel.planApproval = data;
+            case "permission_ask" -> channel.permissionAsk = data;
+            case "permission_ask_released" -> channel.permissionAsk = null;
+            case "user_question" -> channel.userQuestion = data;
+            case "task_outcome" -> channel.taskOutcome = data;
+            case "subgoal" -> {
+                if (data instanceof Map<?, ?> map) {
+                    Object text = map.get("text");
+                    channel.subgoalText = text == null ? "" : String.valueOf(text);
+                    channel.subgoalDone = toInt(map.get("done"));
+                    channel.subgoalTotal = toInt(map.get("total"));
+                }
+            }
+            case "todo" -> {
+                if (data instanceof Map<?, ?> map) channel.todoItems = toTodoItems(map.get("items"));
+            }
+            default -> applyEvent(channel, name, data == null ? "" : String.valueOf(data));
         }
     }
 

@@ -42,6 +42,11 @@ function isAudioUrl(url) {
     return AUDIO_EXTS.has(fileExt(clean));
 }
 
+function isVideoUrl(url) {
+    const clean = String(url).split('?')[0].split('#')[0];
+    return VIDEO_EXTS.has(fileExt(clean));
+}
+
 function parseMediaBang(s) {
     let out = '', i = 0;
     while (i < s.length) {
@@ -53,11 +58,26 @@ function parseMediaBang(s) {
         const alt = s.slice(p + 2, rb);
         const u = balancedUrl(s, rb + 1);
         if (!u) { out += s[p]; i = p + 1; continue; }
-        const url = u.url.replace(/&amp;/g, '&');
-        if (!/^https?:\/\//i.test(url) && !/^\/api\/generated-media\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/i.test(url) && !/^\/api\/conversation-media\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/i.test(url) && !/^\/api\/workspace-media\/[A-Za-z0-9._%~-]+$/i.test(url) && !/^data:image\//i.test(url))
+        let url = u.url.replace(/&amp;/g, '&');
+        const workspaceName = workspaceDownloadPath(url);
+        if (workspaceName) {
+            const ext = fileExt(workspaceName).toLowerCase();
+            const inlineImage = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif'].includes(ext);
+            const inlineVideo = VIDEO_EXTS.has(ext);
+            if (inlineImage || inlineVideo) {
+                url = '/api/workspace-media/' + workspaceName + workspaceSidQuery();
+            } else {
+                out += s.slice(p, u.end + 1);
+                i = u.end + 1;
+                continue;
+            }
+        }
+        if (!/^https?:\/\//i.test(url) && !/^\/api\/generated-media\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/i.test(url) && !/^\/api\/conversation-media\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/i.test(url) && !/^\/api\/workspace-media\/[A-Za-z0-9._%~-]+(?:\?sid=[A-Za-z0-9._~-]+)?$/i.test(url) && !/^data:image\//i.test(url))
             { out += s.slice(p, u.end + 1); i = u.end + 1; continue; }
         if (isAudioUrl(url)) {
             out += `<audio controls preload="metadata" ${mediaSrcAttr(url)}></audio>`;
+        } else if (isVideoUrl(url)) {
+            out += `<video controls playsinline preload="metadata" class="chat-video" ${mediaSrcAttr(url)}></video>`;
         } else {
             // alt 取自已经过 renderMD 全文转义文本，这里只需补引号（再走 escA 会把 &lt; 二次转义成字面量）
             out += `<img ${mediaSrcAttr(url)} alt="${escQ(alt)}" referrerpolicy="no-referrer" loading="lazy">`;

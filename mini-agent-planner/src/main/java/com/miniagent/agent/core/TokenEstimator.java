@@ -109,7 +109,9 @@ public class TokenEstimator {
                 tokens += estimate(am.text());
             }
             if (am.hasToolExecutionRequests()) {
-                tokens += am.toolExecutionRequests().size() * 30; // 工具调用开销
+                for (var request : am.toolExecutionRequests()) {
+                    tokens += 30 + estimate(request.name()) + estimate(request.arguments());
+                }
             }
         } else if (message instanceof dev.langchain4j.data.message.ToolExecutionResultMessage tr) {
             tokens += estimate(tr.text());

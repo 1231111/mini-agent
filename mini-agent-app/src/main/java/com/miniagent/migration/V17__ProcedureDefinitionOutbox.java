@@ -74,6 +74,13 @@ public class V17__ProcedureDefinitionOutbox extends BaseJavaMigration {
         }
     }
 
+    /**
+     *  判断表格是否存在
+     * @param connection
+     * @param name
+     * @return
+     * @throws Exception
+     */
     private boolean tableExists(Connection connection, String name) throws Exception {
         DatabaseMetaData metadata = connection.getMetaData();
         try (ResultSet tables = metadata.getTables(connection.getCatalog(), null, "%",

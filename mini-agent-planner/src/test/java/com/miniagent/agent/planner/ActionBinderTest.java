@@ -85,6 +85,40 @@ class ActionBinderTest {
         assertFalse(ActionBinder.canDirect(p));
     }
 
+    @Test
+    void binaryDocumentsAreNotWrittenByPlainTextDirectAction() {
+        for (String extension : List.of("docx", "xlsx", "pptx", "pdf")) {
+            TaskNode source = new TaskNode("source", "正文", "research", List.of(),
+                    List.of(), List.of(), TaskNodeStatus.SUCCESS, 10,
+                    DoneWhen.note(), "", "", 0, "Document body with enough text.");
+            TaskNode file = new TaskNode("file", "生成 report." + extension, "file_write", List.of("source"),
+                    List.of(), List.of(), TaskNodeStatus.READY, 9,
+                    DoneWhen.file("report." + extension), "", "", 0, "");
+
+            ActionProposal proposal = propose(new TaskGraph(List.of(source, file)), "file");
+            ActionSpec action = proposal.actions().get(0);
+            assertFalse(CapabilityRegistry.WRITE_FILE.equals(action.tool()), extension);
+            assertFalse(ActionBinder.canDirect(proposal), extension);
+            assertFalse(ActionBinder.canDirect(CapabilityRegistry.WRITE_FILE,
+                    Map.of("path", "report." + extension, "content", "Plain text")), extension);
+        }
+    }
+
+    @Test
+    void namedInputUsesItsPortBindingInsteadOfWholeProducerJson() {
+        String json = "{\"outputs\":{\"body\":\"本文\",\"metadata\":\"标题\"}}";
+        TaskNode source = new TaskNode("source", "提取正文", "web", List.of(),
+                List.of(), List.of("body", "metadata"), TaskNodeStatus.SUCCESS, 10,
+                DoneWhen.note(), "", "", 0, json)
+                .withOutput(json, Map.of("body", "本文", "metadata", "标题"));
+        TaskNode file = new TaskNode("file", "写入 notes.md", "file_write", List.of("source"),
+                List.of("body"), List.of(), TaskNodeStatus.READY, 9,
+                DoneWhen.file("notes.md"), "", "", 0, "");
+
+        ActionSpec action = propose(new TaskGraph(List.of(source, file)), "file").actions().get(0);
+        assertEquals("本文", action.arguments().get(ActionBinder.ARG_CONTENT));
+    }
+
     private static ActionProposal propose(TaskGraph g, String id) {
         TaskNode ready = g.byId(id).withStatus(TaskNodeStatus.READY);
         TaskGraph graph = g.replace(ready);

@@ -55,7 +55,8 @@ public class NodeExecutor {
         requireFence();
         RunScope scope = RunScope.capture();
         return toolPipeline.invoke(
-                        ToolRequest.bound(scope, toolName, argumentsJson).withApprovalWait())
+                        ToolRequest.bound(scope, toolName, argumentsJson).withApprovalWait()
+                                .withExecutionBudget(toolPipeline.timeoutSeconds(toolName, argumentsJson)))
                 .result();
     }
 

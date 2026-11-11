@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <linearGradient id="tile" x1="127" y1="92" x2="846" y2="936" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7D91FF"/>
+      <stop offset=".48" stop-color="#5369D7"/>
+      <stop offset="1" stop-color="#3548AA"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="242" y1="135" x2="776" y2="886" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#C3D0FF" stop-opacity=".78"/>
+      <stop offset=".5" stop-color="#7189F8" stop-opacity=".24"/>
+      <stop offset="1" stop-color="#263B9A" stop-opacity=".68"/>
+    </linearGradient>
+    <linearGradient id="side" x1="365" y1="372" x2="707" y2="735" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5266D1"/>
+      <stop offset="1" stop-color="#273B9E"/>
+    </linearGradient>
+    <linearGradient id="chip" x1="330" y1="290" x2="692" y2="682" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F7FBFF"/>
+      <stop offset=".42" stop-color="#DCE8FF"/>
+      <stop offset="1" stop-color="#A7C7FF"/>
+    </linearGradient>
+    <linearGradient id="chipFace" x1="354" y1="300" x2="660" y2="641" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FCFF"/>
+      <stop offset="1" stop-color="#CFDEFF"/>
+    </linearGradient>
+    <linearGradient id="circuit" x1="360" y1="360" x2="650" y2="635" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5E7BFA"/>
+      <stop offset="1" stop-color="#36D9F5"/>
+    </linearGradient>
+    <radialGradient id="shine" cx="0" cy="0" r="1" gradientTransform="matrix(496 471 -457 481 313 178)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF" stop-opacity=".34"/>
+      <stop offset="1" stop-color="#FFF" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="tileShadow" x="53" y="57" width="918" height="930" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="30"/>
+      <feOffset dy="22"/>
+      <feComponentTransfer><feFuncA type="linear" slope=".32"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="coreShadow" x="254" y="260" width="548" height="561" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="17"/>
+      <feOffset dy="20"/>
+      <feComponentTransfer><feFuncA type="linear" slope=".34"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glow" x="290" y="280" width="444" height="444" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse">
+      <feGaussianBlur stdDeviation="25"/>
+    </filter>
+  </defs>
+
+  <!-- Deep rounded base, beveled rim and soft top reflection. -->
+  <g filter="url(#tileShadow)">
+    <rect x="100" y="90" width="824" height="824" rx="220" fill="#253A9A"/>
+    <rect x="100" y="72" width="824" height="824" rx="220" fill="url(#tile)"/>
+    <rect x="114" y="86" width="796" height="796" rx="207" stroke="url(#edge)" stroke-width="16"/>
+    <rect x="124" y="96" width="776" height="776" rx="198" fill="url(#shine)"/>
+    <path d="M212 133c71-40 162-52 269-52 151 0 257 19 331 63" stroke="#FFF" stroke-opacity=".22" stroke-width="12" stroke-linecap="round"/>
+  </g>
+
+  <!-- Circuit traces sit behind the raised AI processor. -->
+  <g stroke="url(#circuit)" stroke-width="24" stroke-linecap="round" stroke-linejoin="round" opacity=".96">
+    <path d="M351 417H286V346"/>
+    <path d="M673 417h65v-71"/>
+    <path d="M351 604h-65v71"/>
+    <path d="M673 604h65v71"/>
+    <path d="M512 294v-42"/>
+    <path d="M512 708v42"/>
+  </g>
+  <g fill="#EAFBFF" stroke="#75E8FF" stroke-width="14">
+    <circle cx="286" cy="334" r="25"/>
+    <circle cx="738" cy="334" r="25"/>
+    <circle cx="286" cy="687" r="25"/>
+    <circle cx="738" cy="687" r="25"/>
+    <circle cx="512" cy="242" r="25"/>
+    <circle cx="512" cy="760" r="25"/>
+  </g>
+
+  <!-- A small isometric shadow gives the processor a tangible 3D edge. -->
+  <g filter="url(#coreShadow)">
+    <path d="m352 349 160-79 160 79v276l-160 88-160-88V349Z" fill="url(#side)"/>
+    <path d="m352 349 160-79 160 79-160 83-160-83Z" fill="#F1F6FF"/>
+    <path d="m352 349 160 83v281l-160-88V349Z" fill="url(#chip)"/>
+    <path d="m512 432 160-83v276l-160 88V432Z" fill="url(#chipFace)"/>
+    <path d="m374 357 138-68 138 68-138 71-138-71Z" fill="#FFF" fill-opacity=".52"/>
+    <path d="M373 372v240l121 66" stroke="#FFF" stroke-opacity=".66" stroke-width="8" stroke-linecap="round"/>
+    <path d="M651 372v240l-121 66" stroke="#7795E8" stroke-opacity=".38" stroke-width="8" stroke-linecap="round"/>
+  </g>
+
+  <!-- AI lettering and neural spark, with a luminous recessed face. -->
+  <ellipse cx="512" cy="493" rx="117" ry="97" fill="#5779F5" opacity=".16" filter="url(#glow)"/>
+  <path d="m427 542 55-111h25l55 111h-29l-12-26h-54l-12 26h-28Zm50-49h35l-17-38-18 38Z" fill="#435DD2"/>
+  <path d="M581 431h27v111h-27z" rx="8" fill="#435DD2"/>
+  <path d="M456 451c21-24 42-34 64-34 26 0 45 14 61 33" stroke="#43D7F2" stroke-width="11" stroke-linecap="round" opacity=".9"/>
+  <circle cx="455" cy="451" r="10" fill="#42D9F4"/>
+  <circle cx="581" cy="450" r="10" fill="#42D9F4"/>
+  <path d="M445 566h134" stroke="#7189F2" stroke-opacity=".42" stroke-width="8" stroke-linecap="round"/>
+</svg>

@@ -25,6 +25,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -457,6 +460,62 @@ class ToolPipelineTest {
     }
 
     @Test
+    void blockPolicyAppliedDuringApprovalPreventsTheOriginalCommandFromExecuting() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        Fixture fx = new Fixture("ask", execRegistry(calls));
+        String args = "{\"command\":\"echo one\"}";
+        AskGrant grant = fx.store.issueAskGrant("s", "exec_command", args, 30_000L);
+        ToolRequest request = ToolRequest.of("s", "exec_command", args, 0, "r1")
+                .withApprovalWait();
+        FutureTask<ToolInvocation> result = new FutureTask<>(() -> fx.pipeline.invoke(request));
+        Thread worker = Thread.ofVirtual().start(result);
+        try {
+            awaitApprovalWaitpoint(fx.store, grant);
+            fx.store.setExecPolicyOverride("s", ExecPolicy.BLOCK);
+            assertTrue(fx.store.grantAskTokenForResume("s", grant.token(), "exec_command").isPresent());
+
+            ToolInvocation invocation = result.get(2, TimeUnit.SECONDS);
+            assertEquals(ToolInvocation.Outcome.POLICY_DENIED, invocation.outcome());
+            assertEquals(ToolErrorCode.PERMISSION_DENIED, invocation.result().errorCode());
+            assertEquals(0, calls.get(), "旧审批不能越过等待期间收紧的禁止策略");
+            assertTrue(fx.trace.contentContains("policy_changed_before_execution"));
+            assertFalse(fx.store.hasAttachedAskResume("s", grant.token()));
+        } finally {
+            worker.interrupt();
+            worker.join(2_000L);
+        }
+    }
+
+    @Test
+    void invalidatedFenceDuringApprovalPreventsTheOriginalCommandFromExecuting() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        AtomicBoolean valid = new AtomicBoolean(true);
+        Fixture fx = new Fixture("ask", execRegistry(calls));
+        String args = "{\"command\":\"echo one\"}";
+        AskGrant grant = fx.store.issueAskGrant("s", "exec_command", args, 30_000L);
+        ExecutionTurnContext.open("s", 1L, List.of(), valid::get);
+        ToolRequest request = ToolRequest.of("s", "exec_command", args, 0, "r1")
+                .withApprovalWait();
+        ExecutionTurnContext.clear();
+        FutureTask<ToolInvocation> result = new FutureTask<>(() -> fx.pipeline.invoke(request));
+        Thread worker = Thread.ofVirtual().start(result);
+        try {
+            awaitApprovalWaitpoint(fx.store, grant);
+            valid.set(false);
+            assertTrue(fx.store.grantAskTokenForResume("s", grant.token(), "exec_command").isPresent());
+
+            ToolInvocation invocation = result.get(2, TimeUnit.SECONDS);
+            assertEquals(ToolInvocation.Outcome.FENCE_REJECTED, invocation.outcome());
+            assertEquals(ToolErrorCode.CONFLICT, invocation.result().errorCode());
+            assertEquals(0, calls.get(), "批准旧计划中的调用不能执行失效节点");
+            assertFalse(fx.store.hasAttachedAskResume("s", grant.token()));
+        } finally {
+            worker.interrupt();
+            worker.join(2_000L);
+        }
+    }
+
+    @Test
     void denyingApprovalWakesOriginalInvocationWithoutExecuting() throws Exception {
         AtomicInteger calls = new AtomicInteger();
         Fixture fx = new Fixture("ask", execRegistry(calls));
@@ -668,6 +727,15 @@ class ToolPipelineTest {
             return "{\"ok\":true}";
         });
         return registry;
+    }
+
+    private static void awaitApprovalWaitpoint(SessionPermissionStore store, AskGrant grant) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (!store.hasAttachedAskResume("s", grant.token())
+                && System.nanoTime() < deadline) {
+            Thread.onSpinWait();
+        }
+        assertTrue(store.hasAttachedAskResume("s", grant.token()), "工具应已进入原调用审批等待点");
     }
 
     private static ToolPipeline pipeline(ToolRegistry registry) {

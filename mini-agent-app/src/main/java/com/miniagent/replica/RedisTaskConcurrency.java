@@ -9,6 +9,7 @@ import org.springframework.stereotype.Component;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -86,7 +87,7 @@ public class RedisTaskConcurrency {
                 || !fencingToken.equals(heldSessionTokens.get(sessionId))) {
             return false;
         }
-        long ttlSeconds = properties.getRunLockTtlSeconds();
+        long ttlSeconds = configuredRunLockTtlSeconds();
         long now = System.currentTimeMillis();
         Long ok = redis.execute(OCCUPY_USER_QUOTA,
                 List.of(ReplicaLockKeys.userRunningKey(userId)),
@@ -122,7 +123,7 @@ public class RedisTaskConcurrency {
         Boolean ok = redis.opsForValue().setIfAbsent(
                 ReplicaLockKeys.sessionRunKey(sessionId),
                 fencingToken,
-                Duration.ofSeconds(properties.getRunLockTtlSeconds()));
+                Duration.ofSeconds(configuredRunLockTtlSeconds()));
         if (Boolean.TRUE.equals(ok)) {
             heldSessionTokens.put(sessionId, fencingToken);
             return true;
@@ -139,7 +140,7 @@ public class RedisTaskConcurrency {
         if (!fencingToken.equals(token)) {
             return false;
         }
-        long ttlSeconds = properties.getRunLockTtlSeconds();
+        long ttlSeconds = configuredRunLockTtlSeconds();
         HeldLease lease = heldSessionLeases.get(sessionId);
         if (lease != null && token.equals(lease.fencingToken())) {
             long expiresAt = System.currentTimeMillis()
@@ -175,6 +176,31 @@ public class RedisTaskConcurrency {
                 && !sessionId.isBlank()
                 && Boolean.TRUE.equals(redis.hasKey(
                         ReplicaLockKeys.sessionRunKey(sessionId)));
+    }
+
+    /**
+     * Reads the durable fencing token for the currently owned session run.
+     *
+     * <p>This deliberately reads Redis rather than the JVM ownership map: a
+     * cancel request may be handled by a different application replica.  An
+     * empty result means there is no current run and callers must not create a
+     * session-wide cancellation tombstone.</p>
+     */
+    public Optional<String> currentSessionToken(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return Optional.empty();
+        }
+        String token = redis.opsForValue().get(ReplicaLockKeys.sessionRunKey(sessionId));
+        return token == null || token.isBlank() ? Optional.empty() : Optional.of(token);
+    }
+
+    /** Configured lifetime of the current run-lock and quota lease. */
+    public long runLockTtlMillis() {
+        return Duration.ofSeconds(configuredRunLockTtlSeconds()).toMillis();
+    }
+
+    private long configuredRunLockTtlSeconds() {
+        return Math.max(1L, properties.getRunLockTtlSeconds());
     }
 
     /** 测试可见：本机是否登记了该 session 锁 */

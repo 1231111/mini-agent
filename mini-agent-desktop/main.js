@@ -5,11 +5,11 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 
-/** 只弹出全息浮层或仙鹤启动页，不拉后端、不占正式客户端的单实例锁。 */
+/** 只弹出全息浮层或启动页预览，不拉后端、不占正式客户端的单实例锁。 */
 const holoPreview = process.argv.includes('--holo-preview');
-const cranePreview = process.argv.includes('--crane-preview');
-if (holoPreview || cranePreview) {
-  const previewHome = holoPreview ? 'miniagent-holo-preview' : 'miniagent-crane-preview';
+const splashPreview = process.argv.includes('--splash-preview') || process.argv.includes('--crane-preview');
+if (holoPreview || splashPreview) {
+  const previewHome = holoPreview ? 'miniagent-holo-preview' : 'miniagent-splash-preview';
   app.setPath('userData', path.join(app.getPath('temp'), previewHome));
 }
 
@@ -455,15 +455,15 @@ async function waitForBackend(port, timeoutMs = 120000) {
 let bootStartedAt = Date.now();
 /** 当前阶段。心跳只带它出去，不改变它。 */
 let bootStage = 'spawn';
-/** 仙鹤投影阶段窗口还没撑开，这时的尺寸不能写进用户的窗口记忆。 */
+/** 启动画面阶段窗口还没撑开，这时的尺寸不能写进用户的窗口记忆。 */
 let bootPresenting = false;
 /** 炸开之后要恢复的聊天窗口尺寸。在缩成投影舞台之前记下来。 */
 let launchBounds = null;
 
-const BOOT_STAGE_W = 860;
-const BOOT_STAGE_H = 700;
-/** 启动画面淡出所需时间；超时后主进程仍会继续打开客户端。 */
-const BOOT_BURST_WAIT_MS = 2500;
+const BOOT_STAGE_W = 520;
+const BOOT_STAGE_H = 400;
+/** 启动画面收尾等待时间；超时后主进程仍会继续打开客户端。 */
+const BOOT_ANIMATION_WAIT_MS = 1200;
 const BOOT_EXPAND_MS = 420;
 
 /**
@@ -546,10 +546,10 @@ function rememberLaunchBounds(saved) {
   launchBounds = { x: x, y: y, width: width, height: height };
 }
 
-function waitForCraneBurst() {
+function waitForBootAnimation() {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, BOOT_BURST_WAIT_MS);
-    ipcMain.once('boot:burst-done', () => {
+    const timer = setTimeout(resolve, BOOT_ANIMATION_WAIT_MS);
+    ipcMain.once('boot:animation-done', () => {
       clearTimeout(timer);
       resolve();
     });
@@ -617,10 +617,10 @@ async function loadAppPage() {
   }
 }
 
-async function openAppAfterBurst() {
-  const burst = waitForCraneBurst();
+async function openAppAfterAnimation() {
+  const animation = waitForBootAnimation();
   pushBootStage('ready', '服务已就绪');
-  await burst;
+  await animation;
   if (!mainWindow || mainWindow.isDestroyed()) {
     return;
   }
@@ -629,6 +629,8 @@ async function openAppAfterBurst() {
     await animateBounds(launchBounds, BOOT_EXPAND_MS);
   }
   bootPresenting = false;
+  mainWindow.setMinimumSize(800, 600);
+  mainWindow.setResizable(true);
   await loadAppPage();
 }
 
@@ -645,8 +647,9 @@ function createWindow() {
     y: bounds.y,
     width: bounds.width,
     height: bounds.height,
-    minWidth: 800,
-    minHeight: 600,
+    minWidth: bootPresenting ? BOOT_STAGE_W : 800,
+    minHeight: bootPresenting ? BOOT_STAGE_H : 600,
+    resizable: !bootPresenting,
     title: 'MiniAgent',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -662,14 +665,31 @@ function createWindow() {
       : bootPresenting
         ? {
             frame: false,
-            transparent: true,
-            hasShadow: false,
-            thickFrame: false,
-            backgroundColor: '#00000000',
+            backgroundColor: '#0b1020',
             skipTaskbar: true
           }
         : { frame: false, backgroundColor: '#0e0f12' }),
     show: false
+  });
+
+  // Markdown links use target="_blank". Do not let Electron create a second
+  // app window for them (that window has no trusted page and may show the
+  // platform's whaleguard block page); send web links to the system browser.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      const parsed = new URL(String(url));
+      if ((parsed.protocol === 'https:' || parsed.protocol === 'http:')
+          && !parsed.username && !parsed.password) {
+        shell.openExternal(parsed.toString()).catch((error) => {
+          console.warn('Unable to open external link:', error.message || error);
+        });
+      } else {
+        console.warn('Blocked non-web popup URL:', String(url));
+      }
+    } catch (error) {
+      console.warn('Blocked invalid popup URL:', String(url));
+    }
+    return { action: 'deny' };
   });
 
   /* 渲染层的报错默认只出现在 F12 控制台里 —— 客户机上没人会按 F12。
@@ -1092,7 +1112,7 @@ async function startUp() {
     createHoloWindow();
     return;
   }
-  if (cranePreview) {
+  if (splashPreview) {
     createWindow();
     return;
   }
@@ -1158,9 +1178,9 @@ async function startUp() {
   }
 
   if (backendReady) {
-    // 先等仙鹤炸开，再把投影舞台撑成聊天窗口并载入后端页面。
+    // 给启动页一个短暂收尾动画，再把窗口扩展成聊天窗口并载入后端页面。
     try {
-      await openAppAfterBurst();
+      await openAppAfterAnimation();
     } catch (e) {
       failure = e.message;
       backendFailure = failure;
@@ -1174,6 +1194,10 @@ async function startUp() {
       mainWindow.setBounds(launchBounds);
     }
     bootPresenting = false;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setMinimumSize(800, 600);
+      mainWindow.setResizable(true);
+    }
     pushBootStage('failed', failure);
   }
 

@@ -316,6 +316,7 @@ agent:
 
   rate-limit:
     per-minute: 60
+    background-read-per-minute: 180
   concurrency:
     max-tasks-per-user: 2
 

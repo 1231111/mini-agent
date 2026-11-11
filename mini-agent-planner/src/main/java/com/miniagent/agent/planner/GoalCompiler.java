@@ -600,7 +600,8 @@ public class GoalCompiler {
                     n.status(), n.priority(), n.doneWhen(), n.toolHint(), n.toolArguments(),
                     n.compensation(), n.covers(), n.lastError(), n.retryCount(), n.output(),
                     n.outputBindings(), n.procedureId(), n.procedureVersion(), n.evolutionProposalId(),
-                    n.evolutionCandidateHash(), n.procedureVariant(), n.procedureSnapshotJson(), n.canaryTargetPercent()));
+                    n.evolutionCandidateHash(), n.procedureVariant(), n.procedureSnapshotJson(),
+                    n.canaryTargetPercent(), n.toolStatus()));
         }
         return new TaskGraph(kept);
     }

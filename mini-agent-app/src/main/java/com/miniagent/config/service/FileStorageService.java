@@ -242,10 +242,12 @@ public class FileStorageService {
             return false;
         }
         String lower = filename.toLowerCase();
-        String[] exts = {".txt", ".csv", ".json", ".md", ".markdown", ".xml", ".html", ".htm",
-                ".css", ".js", ".ts", ".py", ".java", ".sql", ".sh", ".bat",
-                ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".log",
-                ".c", ".cpp", ".h", ".hpp", ".go", ".rs", ".rb", ".php"};
+        String[] exts = {".txt", ".text", ".csv", ".tsv", ".json", ".jsonl", ".md", ".markdown", ".rst",
+                ".xml", ".xhtml", ".xsd", ".xsl", ".xslt", ".html", ".htm", ".svg",
+                ".css", ".scss", ".less", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".vue",
+                ".py", ".ipynb", ".java", ".kt", ".kts", ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".hpp",
+                ".cs", ".php", ".rb", ".swift", ".sql", ".sh", ".bash", ".zsh", ".bat", ".cmd", ".ps1",
+                ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".properties", ".env", ".log"};
         for (String e : exts) {
             if (lower.endsWith(e)) {
                 return true;

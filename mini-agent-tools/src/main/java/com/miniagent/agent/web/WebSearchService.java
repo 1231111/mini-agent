@@ -17,11 +17,20 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.apache.commons.lang3.StringUtils;
 
 /**
@@ -32,7 +41,8 @@ import org.apache.commons.lang3.StringUtils;
  *   web_extract → HttpClient 抓取页面 → 清洗提取纯文本/HTML
  *
  * 结果格式完全对标 hermes-agent：
- *   {"success": true, "data": {"web": [{"title", "url", "description", "position"}]}}
+ *   {"success": true, "data": {"web": [{"title", "url", "description", "position",
+ *       "publication_date", "publication_date_source", "date_verified"}]}}
  *
  * 环境变量：
  *   BING_API_KEY        — Bing Web Search API 密钥（首选）
@@ -51,7 +61,14 @@ public class WebSearchService {
             .build();
 
     private static final int DEFAULT_LIMIT = 5;
+    private static final int MAX_RESULTS = 10;
     private static final int MAX_CONTENT_LENGTH = 15000; // web_extract 单页最大字符数
+    private static final Pattern META_TAG = Pattern.compile("(?is)<meta\\b[^>]*>");
+    private static final Pattern HTML_ATTRIBUTE = Pattern.compile("(?is)([\\w:-]+)\\s*=\\s*(['\\\"])(.*?)\\2");
+    private static final Pattern JSON_LD = Pattern.compile("(?is)<script\\b[^>]*type\\s*=\\s*(['\\\"])application/ld\\+json\\1[^>]*>(.*?)</script>");
+    private static final Pattern DATE_TOKEN = Pattern.compile("(?<!\\d)(20\\d{2})[-/.年](\\d{1,2})[-/.月](\\d{1,2})日?(?!\\d)");
+    private static final Pattern ISO_DATE_IN_QUERY = Pattern.compile("(?<!\\d)(20\\d{2}-\\d{2}-\\d{2})(?!\\d)");
+    private static final Pattern PUBLISH_DATE_KEY = Pattern.compile("(?i)^(article:published_time|og:published_time|datepublished|date|pubdate|parsely-pub-date|sailthru\\.date|dc\\.date\\.issued|citation_publication_date|published_time)$");
 
     /** web_extract 的出网判定与传输：每跳校验 + 有界响应体。 */
     @Autowired
@@ -76,6 +93,9 @@ public class WebSearchService {
     @Value("${web.search.backend:}")
     private String configuredBackend;
 
+    @Value("${web.search.time-zone:Asia/Shanghai}")
+    private String configuredTimeZone;
+
     /**
      * 搜索网页 — 对标 hermes-agent web_search
      *
@@ -84,21 +104,40 @@ public class WebSearchService {
      * @return 标准化 JSON 结果
      */
     public String search(String query, Integer limit) {
+        return search(query, limit, null, null);
+    }
+
+    /** 搜索网页，可按来源发布日期限定范围；未知发布日期会显式标注，供后续 web_extract 核验。 */
+    public String search(String query, Integer limit, String dateFrom, String dateTo) {
         if (Objects.isNull(limit) || limit <= 0) {
             limit = DEFAULT_LIMIT;
         }
+        int requestedLimit = Math.min(limit, MAX_RESULTS);
+        DateWindow dateWindow;
+        try {
+            dateWindow = resolveDateWindow(query, dateFrom, dateTo,
+                    LocalDate.now(resolveSearchZone(configuredTimeZone)));
+        } catch (IllegalArgumentException e) {
+            return buildErrorResponse(e.getMessage());
+        }
         String backend = resolveBackend();
-        log.info("Web搜索: query='{}' limit={} backend={}", query, limit, backend);
+        String searchQuery = dateWindow == null ? query : withDateWindow(query, dateWindow);
+        int fetchLimit = dateWindow == null ? requestedLimit : Math.min(20, requestedLimit * 3);
+        log.info("Web搜索: query='{}' limit={} backend={} dateWindow={}", query, requestedLimit, backend, dateWindow);
 
         try {
             List<SearchResult> results = switch (backend) {
-                case "tavily" -> searchTavily(query, limit);
-                case "bing" -> searchBing(query, limit);
-                case "google" -> searchGoogle(query, limit);
-                default -> searchDuckDuckGo(query, limit);
+                case "tavily" -> searchTavily(searchQuery, fetchLimit);
+                case "bing" -> searchBing(searchQuery, fetchLimit, dateWindow);
+                case "google" -> searchGoogle(searchQuery, fetchLimit);
+                default -> searchDuckDuckGo(searchQuery, fetchLimit);
             };
-
-            return buildSuccessResponse(results);
+            if (dateWindow != null) {
+                results = filterDateWindow(results, dateWindow, requestedLimit);
+            } else {
+                results = results.stream().limit(requestedLimit).toList();
+            }
+            return buildSuccessResponse(results, dateWindow, resolveSearchZone(configuredTimeZone));
         } catch (Exception e) {
             log.error("Web搜索失败: backend={} error={}", backend, e.getMessage());
             return buildErrorResponse("搜索失败: " + e.getMessage() + "。请检查 " + backend + " API 密钥是否正确配置。");
@@ -145,6 +184,7 @@ public class WebSearchService {
 
             String html = response.bodyText();
             String title = extractTitle(html);
+            String publicationDate = extractPublishedDate(html, resolveSearchZone(configuredTimeZone));
             String text = htmlToText(html);
 
             if (text.length() > MAX_CONTENT_LENGTH) {
@@ -155,6 +195,7 @@ public class WebSearchService {
             result.put("success", true);
             result.put("url", url);
             result.put("title", title);
+            addPublicationDate(result, publicationDate, "source_page_metadata", publicationDate != null);
             result.put("content", text);
             result.put("content_length", text.length());
             return MAPPER.writeValueAsString(result);
@@ -198,6 +239,12 @@ public class WebSearchService {
                     content = first.path("content").asText("");
                 }
                 String title = first.path("title").asText("");
+                String providerDate = normalizePublicationDate(first.path("published_date").asText(""),
+                        resolveSearchZone(configuredTimeZone));
+                String pageDate = extractSourcePublicationDate(url);
+                String publicationDate = pageDate == null ? providerDate : pageDate;
+                String publicationDateSource = pageDate != null ? "source_page_metadata"
+                        : providerDate != null ? "tavily_extract_metadata" : "unknown";
 
                 if (content.length() > MAX_CONTENT_LENGTH) {
                     content = content.substring(0, MAX_CONTENT_LENGTH)
@@ -208,6 +255,7 @@ public class WebSearchService {
                 result.put("success", true);
                 result.put("url", url);
                 result.put("title", title);
+                addPublicationDate(result, publicationDate, publicationDateSource, pageDate != null);
                 result.put("content", content);
                 result.put("content_length", content.length());
                 return MAPPER.writeValueAsString(result);
@@ -257,7 +305,8 @@ public class WebSearchService {
                     item.path("title").asText(""),
                     item.path("url").asText(""),
                     item.path("content").asText(""),
-                    pos++
+                    pos++,
+                    normalizePublicationDate(item.path("published_date").asText(""), resolveSearchZone(configuredTimeZone))
             ));
         }
         return results;
@@ -267,12 +316,14 @@ public class WebSearchService {
      * Bing Web Search API
      * 文档: https://learn.microsoft.com/en-us/bing/search-apis/bing-web-search/quickstarts
      */
-    private List<SearchResult> searchBing(String query, int limit) throws Exception {
+    private List<SearchResult> searchBing(String query, int limit, DateWindow dateWindow) throws Exception {
         String apiKey = resolveKey(bingApiKey, "BING_API_KEY");
         String url = "https://api.bing.microsoft.com/v7.0/search?q="
                 + URLEncoder.encode(query, StandardCharsets.UTF_8)
                 + "&count=" + limit
-                + "&mkt=zh-CN";
+                + "&mkt=zh-CN"
+                + (dateWindow == null ? "" : "&freshness=" + URLEncoder.encode(
+                        dateWindow.start() + ".." + dateWindow.end(), StandardCharsets.UTF_8));
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
@@ -292,7 +343,8 @@ public class WebSearchService {
                     item.path("name").asText(""),
                     item.path("url").asText(""),
                     item.path("snippet").asText(""),
-                    pos++
+                    pos++,
+                    normalizePublicationDate(item.path("datePublished").asText(""), resolveSearchZone(configuredTimeZone))
             ));
         }
         return results;
@@ -310,7 +362,7 @@ public class WebSearchService {
                 + "?key=" + apiKey
                 + "&cx=" + cseId
                 + "&q=" + URLEncoder.encode(query, StandardCharsets.UTF_8)
-                + "&num=" + limit;
+                + "&num=" + Math.min(limit, 10);
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
@@ -329,7 +381,8 @@ public class WebSearchService {
                     item.path("title").asText(""),
                     item.path("link").asText(""),
                     item.path("snippet").asText(""),
-                    pos++
+                    pos++,
+                    googlePublishedDate(item.path("pagemap").path("metatags"), resolveSearchZone(configuredTimeZone))
             ));
         }
         return results;
@@ -366,7 +419,8 @@ public class WebSearchService {
                     root.path("Heading").asText(query),
                     abstractUrl,
                     abstractText,
-                    pos++
+                    pos++,
+                    null
             ));
         }
 
@@ -383,7 +437,8 @@ public class WebSearchService {
                         extractFirstSentence(text),
                         topicUrl,
                         text,
-                        pos++
+                        pos++,
+                        null
                 ));
             }
         }
@@ -396,7 +451,8 @@ public class WebSearchService {
                     "DuckDuckGo 免费 API 只支持即时答案，不支持完整网页搜索。"
                     + "建议配置 BING_API_KEY（免费3000次/月）获得完整搜索能力。"
                     + "前往 https://www.microsoft.com/en-us/bing/apis/bing-web-search-api 申请。",
-                    0
+                    0,
+                    null
             ));
         }
 
@@ -421,6 +477,185 @@ public class WebSearchService {
             return "google";
         }
         return "duckduckgo"; // 免费 fallback
+    }
+
+    static DateWindow resolveDateWindow(String query, String dateFrom, String dateTo, LocalDate today) {
+        LocalDate start = parseWindowDate(dateFrom, "dateFrom");
+        LocalDate end = parseWindowDate(dateTo, "dateTo");
+        if (start != null || end != null) {
+            if (start == null) start = end;
+            if (end == null) end = start;
+            if (start.isAfter(end)) throw new IllegalArgumentException("web_search 的 dateFrom 不能晚于 dateTo");
+            return new DateWindow(start, end);
+        }
+
+        String text = Objects.toString(query, "");
+        Matcher dates = ISO_DATE_IN_QUERY.matcher(text);
+        List<LocalDate> explicitDates = new ArrayList<>();
+        while (dates.find()) {
+            try { explicitDates.add(LocalDate.parse(dates.group(1))); }
+            catch (DateTimeParseException ignored) { /* 不是有效日期，忽略 */ }
+        }
+        if (!explicitDates.isEmpty()) {
+            return new DateWindow(explicitDates.get(0), explicitDates.get(explicitDates.size() - 1));
+        }
+        String lower = text.toLowerCase(java.util.Locale.ROOT);
+        if (lower.contains("昨天") || lower.contains("昨日") || lower.contains("yesterday")) {
+            LocalDate yesterday = today.minusDays(1);
+            return new DateWindow(yesterday, yesterday);
+        }
+        if (lower.contains("今天") || lower.contains("今日") || lower.contains("today")) {
+            return new DateWindow(today, today);
+        }
+        return null;
+    }
+
+    static String normalizePublicationDate(String value) {
+        return normalizePublicationDate(value, ZoneId.of("Asia/Shanghai"));
+    }
+
+    static String normalizePublicationDate(String value, ZoneId zone) {
+        if (StringUtils.isBlank(value)) return null;
+        String text = value.trim();
+        try { return OffsetDateTime.parse(text, DateTimeFormatter.ISO_DATE_TIME)
+                .atZoneSameInstant(zone).toLocalDate().toString(); }
+        catch (DateTimeParseException ignored) { }
+        try { return ZonedDateTime.parse(text, DateTimeFormatter.ISO_DATE_TIME)
+                .withZoneSameInstant(zone).toLocalDate().toString(); }
+        catch (DateTimeParseException ignored) { }
+        try { return ZonedDateTime.parse(text, DateTimeFormatter.RFC_1123_DATE_TIME)
+                .withZoneSameInstant(zone).toLocalDate().toString(); }
+        catch (DateTimeParseException ignored) { }
+        Matcher token = DATE_TOKEN.matcher(text);
+        if (token.find()) {
+            try {
+                return LocalDate.of(Integer.parseInt(token.group(1)), Integer.parseInt(token.group(2)),
+                        Integer.parseInt(token.group(3))).toString();
+            } catch (RuntimeException ignored) { return null; }
+        }
+        try { return LocalDate.parse(text).toString(); }
+        catch (DateTimeParseException ignored) { }
+        return null;
+    }
+
+    static String extractPublishedDate(String html) {
+        return extractPublishedDate(html, ZoneId.of("Asia/Shanghai"));
+    }
+
+    static String extractPublishedDate(String html, ZoneId zone) {
+        if (StringUtils.isBlank(html)) return null;
+        Matcher tags = META_TAG.matcher(html);
+        while (tags.find()) {
+            Map<String, String> attributes = new java.util.HashMap<>();
+            Matcher attrs = HTML_ATTRIBUTE.matcher(tags.group());
+            while (attrs.find()) attributes.put(attrs.group(1).toLowerCase(java.util.Locale.ROOT), attrs.group(3));
+            String key = attributes.getOrDefault("property", attributes.getOrDefault("name",
+                    attributes.getOrDefault("itemprop", ""))).trim();
+            if (PUBLISH_DATE_KEY.matcher(key).matches()) {
+                String date = normalizePublicationDate(attributes.get("content"), zone);
+                if (date != null) return date;
+            }
+        }
+
+        Matcher scripts = JSON_LD.matcher(html);
+        while (scripts.find()) {
+            try {
+                String date = findJsonPublishedDate(MAPPER.readTree(scripts.group(2)), zone);
+                if (date != null) return date;
+            } catch (Exception ignored) { /* malformed JSON-LD is not publication evidence */ }
+        }
+        return null;
+    }
+
+    private static String findJsonPublishedDate(JsonNode node, ZoneId zone) {
+        if (node == null || node.isMissingNode() || node.isNull()) return null;
+        if (node.isObject()) {
+            JsonNode published = node.get("datePublished");
+            if (published != null) {
+                String normalized = normalizePublicationDate(published.asText(""), zone);
+                if (normalized != null) return normalized;
+            }
+            var fields = node.fields();
+            while (fields.hasNext()) {
+                String date = findJsonPublishedDate(fields.next().getValue(), zone);
+                if (date != null) return date;
+            }
+        } else if (node.isArray()) {
+            for (JsonNode child : node) {
+                String date = findJsonPublishedDate(child, zone);
+                if (date != null) return date;
+            }
+        }
+        return null;
+    }
+
+    private static String googlePublishedDate(JsonNode metaTags, ZoneId zone) {
+        if (!metaTags.isArray()) return null;
+        for (JsonNode meta : metaTags) {
+            var fields = meta.fields();
+            while (fields.hasNext()) {
+                var field = fields.next();
+                if (PUBLISH_DATE_KEY.matcher(field.getKey()).matches()) {
+                    String date = normalizePublicationDate(field.getValue().asText(""), zone);
+                    if (date != null) return date;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static LocalDate parseWindowDate(String value, String field) {
+        if (StringUtils.isBlank(value)) return null;
+        try { return LocalDate.parse(value.trim()); }
+        catch (DateTimeParseException e) {
+            throw new IllegalArgumentException(field + " 必须使用 YYYY-MM-DD 格式");
+        }
+    }
+
+    static List<SearchResult> filterDateWindow(List<SearchResult> results, DateWindow window, int limit) {
+        return results.stream()
+                .filter(result -> !isOutsideWindow(result.publishedDate(), window))
+                .limit(limit)
+                .toList();
+    }
+
+    private static boolean isOutsideWindow(String publicationDate, DateWindow window) {
+        if (publicationDate == null) return false;
+        try {
+            LocalDate date = LocalDate.parse(publicationDate);
+            return date.isBefore(window.start()) || date.isAfter(window.end());
+        } catch (DateTimeParseException ignored) { return false; }
+    }
+
+    static String withDateWindow(String query, DateWindow window) {
+        LocalDate after = window.start().minusDays(1);
+        LocalDate before = window.end().plusDays(1);
+        return Objects.toString(query, "").strip()
+                + " after:" + after + " before:" + before
+                + " 发布日期 " + window.start() + " 至 " + window.end();
+    }
+
+    private static ZoneId resolveSearchZone(String configuredZone) {
+        try { return ZoneId.of(configuredZone); }
+        catch (Exception ignored) { return ZoneId.systemDefault(); }
+    }
+
+    private String extractSourcePublicationDate(String url) {
+        try {
+            String blocked = networkGuard.validateUrl(url);
+            if (blocked != null) return null;
+            GuardedHttpClient.Response response = guardedHttpClient.get(
+                    url,
+                    Map.of("User-Agent", "Mozilla/5.0 (compatible; MiniAgent/1.0)",
+                            "Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+                    Duration.ofSeconds(12),
+                    2 * 1024 * 1024);
+            if (response.statusCode() != 200) return null;
+            return extractPublishedDate(response.bodyText(), resolveSearchZone(configuredTimeZone));
+        } catch (Exception e) {
+            log.debug("无法从原文页面读取发布日期: {}", e.getMessage());
+            return null;
+        }
     }
 
     private String resolveKey(String value, String envName) {
@@ -448,9 +683,14 @@ public class WebSearchService {
 
     // ========== 工具方法 ==========
 
-    private static String buildSuccessResponse(List<SearchResult> results) throws Exception {
+    static String buildSuccessResponse(List<SearchResult> results, DateWindow dateWindow, ZoneId zone) throws Exception {
         ObjectNode root = MAPPER.createObjectNode();
         root.put("success", true);
+        if (dateWindow != null) {
+            root.put("date_window", dateWindow.start() + ".." + dateWindow.end());
+            root.put("time_zone", zone.getId());
+            root.put("date_policy", "超出窗口的已知发布日期已过滤；搜索服务日期仅用于检索筛选，所有候选必须用 web_extract 核验原文发布日期后才能引用。");
+        }
 
         ObjectNode data = MAPPER.createObjectNode();
         ArrayNode webArray = MAPPER.createArrayNode();
@@ -461,6 +701,9 @@ public class WebSearchService {
             item.put("url", r.url());
             item.put("description", r.description());
             item.put("position", r.position());
+            item.put("publication_date", r.publishedDate() == null ? "unknown" : r.publishedDate());
+            item.put("publication_date_source", r.publishedDate() == null ? "unknown" : "search_provider_metadata");
+            item.put("date_verified", false);
             webArray.add(item);
         }
 
@@ -480,6 +723,13 @@ public class WebSearchService {
         }
     }
 
+    private static void addPublicationDate(ObjectNode target, String publicationDate, String source, boolean verified) {
+        if (publicationDate == null) target.putNull("publication_date");
+        else target.put("publication_date", publicationDate);
+        target.put("publication_date_source", source);
+        target.put("date_verified", verified);
+    }
+
     /** 从 HTML 提取 <title> */
     private static String extractTitle(String html) {
         int start = html.indexOf("<title>");
@@ -490,6 +740,10 @@ public class WebSearchService {
                     .replaceAll("<[^>]+>", "");
         }
         return "";
+    }
+
+    record DateWindow(LocalDate start, LocalDate end) {
+        @Override public String toString() { return start + ".." + end; }
     }
 
     /** HTML → 纯文本（简易清洗） */
@@ -527,5 +781,5 @@ public class WebSearchService {
     }
 
     /** 搜索结果记录 */
-    private record SearchResult(String title, String url, String description, int position) {}
+    record SearchResult(String title, String url, String description, int position, String publishedDate) {}
 }

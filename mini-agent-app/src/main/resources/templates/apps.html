@@ -8,10 +8,10 @@
         (function () {
             try {
                 var t = localStorage.getItem('mini_agent_theme');
-                if (!t) t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+                if (!t) t = 'light';
                 document.documentElement.setAttribute('data-theme', t);
             } catch (e) {
-                document.documentElement.setAttribute('data-theme', 'dark');
+                document.documentElement.setAttribute('data-theme', 'light');
             }
         })();
     </script>
@@ -34,9 +34,10 @@
 
 <aside class="rail" id="rail">
     <div class="rail-brand">
-        <div class="rail-brand-icon">🤖</div>
-        <div class="rail-brand-name">智能体助手</div>
+        <div class="rail-brand-icon" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none" width="29" height="29"><path d="M6 21.5 11.2 10l5 12 4.3-9.4 5.5 8.9" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="25.5" cy="9" r="2" fill="currentColor"/></svg></div>
+        <div><div class="rail-brand-name">MiniAgent</div>
         <div class="rail-brand-sub">让 AI 帮你完成更多</div>
+        </div>
     </div>
     <nav class="rail-nav">
         <a class="rail-item" href="/" title="对话助手">
@@ -96,6 +97,10 @@
 
 <div class="page">
     <div class="page-head">
+        <a class="page-back" href="/" title="返回对话">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg><span>返回对话</span>
+        </a>
+        <span class="page-title-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/></svg></span>
         <h1 class="page-title">应用市场</h1>
         <span class="page-sub">这张表就是 Agent 当前真正能调用的工具面（内置 + MCP）。名字与描述直接取自工具注册表，不是前端写死的清单。</span>
         <div class="page-actions">

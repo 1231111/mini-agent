@@ -30,9 +30,6 @@ public class TodoPlanStopHook implements StopHook {
         if (context == null || context.plannerOwned()) {
             return StopDecision.proceed();
         }
-        if (context.mediaDelivered()) {
-            return StopDecision.proceed();
-        }
         if (context.hasTodoPlan() && context.runnableIncomplete()
                 && context.incompleteNudges() < MAX_NUDGES) {
             String body = MessageConstants.STOP_INCOMPLETE_TODO;

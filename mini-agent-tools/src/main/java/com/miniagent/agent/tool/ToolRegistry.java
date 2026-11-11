@@ -80,6 +80,26 @@ public class ToolRegistry {
     }
 
     /**
+     * Register a tool whose result is already classified by its implementation.
+     * Use this for tools returning arbitrary user/content text: legacy keyword
+     * classification must never reinterpret successful data as an execution error.
+     */
+    public void registerStructured(String name, String description,
+                                   Map<String, Object> parameters,
+                                   java.util.function.Function<String, ToolResult> handler) {
+        register(Tool.builder()
+                .name(name)
+                .description(description)
+                .parameters(parameters)
+                .sideEffect(ToolConcurrencyPolicy.sideEffectOf(name))
+                .idempotent(ToolConcurrencyPolicy.isIdempotent(name))
+                .streamPrefetchSafe(ToolConcurrencyPolicy.isStreamPrefetchSafe(name))
+                .executionProfile(ToolConcurrencyPolicy.profileOf(name))
+                .resultHandler(handler)
+                .build());
+    }
+
+    /**
      * 类型安全注册：使用参数实体类定义参数
      *
      * @param name        工具名称

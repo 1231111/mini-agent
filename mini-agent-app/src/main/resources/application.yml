@@ -362,6 +362,8 @@ agent:
     subagent-max-iterations: 25
   rate-limit:
     per-minute: 30
+    # UI 的任务状态/检查器刷新单独计数，避免历史会话轮询耗尽交互请求额度。
+    background-read-per-minute: 180
   concurrency:
     max-tasks-per-user: 2
   quota:
@@ -428,6 +430,7 @@ logging:
 web:
   search:
     backend:
+    time-zone: ${MINI_AGENT_TIME_ZONE:Asia/Shanghai}
     tavily-api-key: ${TAVILY_API_KEY:}
     bing-api-key: ${BING_API_KEY:}
     google-api-key: ${GOOGLE_API_KEY:}

@@ -17,6 +17,7 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -94,6 +95,37 @@ class ImagePersistTest {
 
     private Path ownerDir() {
         return dataDir.resolve("media").resolve("generated").resolve("7");
+    }
+
+    @Test
+    void svgConversationImageKeepsItsRealExtensionForHistoryPreview() throws Exception {
+        MediaStorage mediaStorage = new MediaStorage();
+        setField(mediaStorage, "paths", new AgentDataPaths(dataDir.toString()));
+        String svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\"></svg>";
+        String dataUrl = "data:image/svg+xml;base64," + java.util.Base64.getEncoder()
+                .encodeToString(svg.getBytes(StandardCharsets.UTF_8));
+
+        List<String> saved = mediaStorage.saveConversationImages("session-1", List.of(dataUrl));
+
+        assertEquals(1, saved.size());
+        assertTrue(saved.get(0).endsWith(".svg"));
+        String filename = saved.get(0).substring(saved.get(0).lastIndexOf('/') + 1);
+        assertEquals(svg, Files.readString(mediaStorage.conversationsDir()
+                .resolve("session-1").resolve(filename), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void commonRasterConversationImagesKeepTheirRealExtensions() throws Exception {
+        MediaStorage mediaStorage = new MediaStorage();
+        setField(mediaStorage, "paths", new AgentDataPaths(dataDir.toString()));
+        for (String type : List.of("image/bmp", "image/avif")) {
+            String dataUrl = "data:" + type + ";base64," + java.util.Base64.getEncoder()
+                    .encodeToString(new byte[]{1, 2, 3});
+            List<String> saved = mediaStorage.saveConversationImages("session-1", List.of(dataUrl));
+            String expectedExtension = type.endsWith("bmp") ? ".bmp" : ".avif";
+            assertEquals(1, saved.size());
+            assertTrue(saved.get(0).endsWith(expectedExtension));
+        }
     }
 
     @Test

@@ -5,6 +5,8 @@ import org.apache.commons.lang3.StringUtils;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Locale;
+import java.util.Set;
 
 /**
  * 调度时把 path / url / 前置产出绑到 ActionSpec。
@@ -17,6 +19,16 @@ final class ActionBinder {
     static final String ARG_URL = "url";
     private static final String CAP_FILE_READ = "file_read";
     private static final String CAP_IMAGE = "image";
+    private static final Set<String> TEXT_EXTENSIONS = Set.of(
+            ".md", ".markdown", ".txt", ".text", ".log", ".csv", ".tsv",
+            ".json", ".jsonl", ".xml", ".yaml", ".yml", ".toml", ".ini",
+            ".conf", ".config", ".properties", ".html", ".htm", ".css",
+            ".scss", ".sass", ".less", ".js", ".mjs", ".cjs", ".jsx",
+            ".ts", ".tsx", ".java", ".py", ".go", ".rs", ".c", ".cpp",
+            ".h", ".hpp", ".cs", ".rb", ".php", ".sh", ".bash", ".zsh",
+            ".bat", ".cmd", ".ps1", ".sql", ".vue", ".svelte", ".ipynb",
+            ".mmd", ".mermaid", ".tex", ".bib", ".rst", ".adoc", ".env",
+            ".gitignore", ".gitattributes", ".editorconfig");
 
     record Bound(String tool, Map<String, Object> arguments) {
         Bound {
@@ -37,7 +49,7 @@ final class ActionBinder {
         }
         putIfAbsent(args, ARG_PATH, pathOf(node));
         putIfAbsent(args, ARG_URL, urlOf(node));
-        if (writesPlainFile(node)) {
+        if (writesPlainFile(node, args)) {
             putIfAbsent(args, ARG_CONTENT, predecessorContent(node, graph));
         }
         return new Bound(toolOf(node, args), args);
@@ -59,7 +71,8 @@ final class ActionBinder {
 
     static boolean canDirect(String tool, Map<String, Object> arguments) {
         if (CapabilityRegistry.WRITE_FILE.equals(tool)) {
-            return hasText(arguments, ARG_PATH) && hasText(arguments, ARG_CONTENT);
+            return hasText(arguments, ARG_PATH) && hasText(arguments, ARG_CONTENT)
+                    && isPlainTextPath(String.valueOf(arguments.get(ARG_PATH)));
         }
         if (CapabilityRegistry.READ_FILE.equals(tool)) {
             return hasText(arguments, ARG_PATH);
@@ -68,7 +81,7 @@ final class ActionBinder {
     }
 
     private static String toolOf(TaskNode node, Map<String, Object> args) {
-        if (writesPlainFile(node)
+        if (writesPlainFile(node, args)
                 && hasText(args, ARG_PATH)
                 && hasText(args, ARG_CONTENT)) {
             return CapabilityRegistry.WRITE_FILE;
@@ -80,7 +93,7 @@ final class ActionBinder {
         return node.capability() == null ? "" : node.capability();
     }
 
-    private static boolean writesPlainFile(TaskNode node) {
+    private static boolean writesPlainFile(TaskNode node, Map<String, Object> arguments) {
         if (node == null) {
             return false;
         }
@@ -88,24 +101,34 @@ final class ActionBinder {
         if (CAP_IMAGE.equalsIgnoreCase(cap)) {
             return false;
         }
-        if (isMediaPath(pathOf(node))) {
+        String path = hasText(arguments, ARG_PATH)
+                ? String.valueOf(arguments.get(ARG_PATH)) : pathOf(node);
+        if (!isPlainTextPath(path)) {
             return false;
         }
         return CapabilityRegistry.persistsArtifacts(cap);
     }
 
-    /** 图片/矢量图不能把上一步工具 JSON 当正文写进去。 */
-    private static boolean isMediaPath(String path) {
+    /** 只对明确的文本格式直写；其它格式交给对应生成工具。 */
+    private static boolean isPlainTextPath(String path) {
         if (StringUtils.isBlank(path)) {
             return false;
         }
-        String name = path.replace('\\', '/').toLowerCase();
+        String name = path.replace('\\', '/').toLowerCase(Locale.ROOT);
         int cut = name.indexOf('?');
         if (cut > 0) {
             name = name.substring(0, cut);
         }
-        return name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")
-                || name.endsWith(".webp") || name.endsWith(".gif") || name.endsWith(".svg");
+        int slash = name.lastIndexOf('/');
+        String fileName = name.substring(slash + 1);
+        if (Set.of("dockerfile", "makefile", "license", "readme").contains(fileName)) {
+            return true;
+        }
+        int dot = name.lastIndexOf('.');
+        if (dot <= slash) {
+            return false;
+        }
+        return TEXT_EXTENSIONS.contains(name.substring(dot));
     }
 
     private static String pathOf(TaskNode node) {
@@ -143,7 +166,7 @@ final class ActionBinder {
             return;
         }
         String named = port.isEmpty() ? "" : prod.outputBindings().get(port);
-        String text = StringUtils.isNotBlank(prod.output()) ? prod.output() : named;
+        String text = StringUtils.isNotBlank(named) ? named : prod.output();
         if (StringUtils.isBlank(text)) {
             return;
         }

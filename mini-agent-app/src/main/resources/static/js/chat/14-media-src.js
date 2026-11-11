@@ -3,6 +3,12 @@
    ========================================================================= */
 const MEDIA_BLOB_CACHE = new Map();   // url -> { promise, objectUrl }
 const MEDIA_BLOB_CACHE_MAX = 40;
+const MEDIA_BLOB_CACHE_BYTES_MAX = 64 * 1024 * 1024;
+const INLINE_VIDEO_MAX_BYTES = 40 * 1024 * 1024;
+const WORKSPACE_CODE_EXTENSIONS = new Set(['HTML', 'HTM', 'JS', 'MJS', 'CJS', 'CSS', 'TS', 'TSX', 'JSX',
+    'JSON', 'PY', 'JAVA', 'GO', 'RS', 'C', 'H', 'CPP', 'HPP', 'SH', 'BAT', 'PS1', 'SQL', 'XML', 'YML', 'YAML']);
+const WORKSPACE_FILE_CHECKS = new Map();
+let mediaBlobCacheBytes = 0;
 
 /**
  * 同一个 URL 只取一次，重新渲染出来的新节点直接复用 objectURL。
@@ -16,10 +22,21 @@ function protectedMediaBlob(url) {
     entry.promise = fetch(url, { credentials: 'same-origin' })
         .then(resp => {
             if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const type = (resp.headers.get('Content-Type') || '').toLowerCase();
+            const length = Number(resp.headers.get('Content-Length'));
+            if (type.startsWith('video/') && Number.isFinite(length) && length > INLINE_VIDEO_MAX_BYTES) {
+                resp.body?.cancel();
+                throw new Error('视频超过 40 MB，暂不内联预览');
+            }
             return resp.blob();
         })
         .then(blob => {
+            if (blob.type.startsWith('video/') && blob.size > INLINE_VIDEO_MAX_BYTES)
+                throw new Error('视频超过 40 MB，暂不内联预览');
             entry.objectUrl = URL.createObjectURL(blob);
+            entry.byteLength = blob.size;
+            mediaBlobCacheBytes += entry.byteLength;
+            evictMediaBlobCache();
             return entry.objectUrl;
         })
         .catch(err => {
@@ -31,16 +48,21 @@ function protectedMediaBlob(url) {
 }
 
 function evictMediaBlobCache() {
-    while (MEDIA_BLOB_CACHE.size > MEDIA_BLOB_CACHE_MAX) {
+    while (MEDIA_BLOB_CACHE.size > MEDIA_BLOB_CACHE_MAX
+            || (MEDIA_BLOB_CACHE.size > 1 && mediaBlobCacheBytes > MEDIA_BLOB_CACHE_BYTES_MAX)) {
         const [oldUrl, old] = MEDIA_BLOB_CACHE.entries().next().value;
         MEDIA_BLOB_CACHE.delete(oldUrl);
-        if (old.objectUrl) URL.revokeObjectURL(old.objectUrl);
+        if (old.objectUrl) {
+            mediaBlobCacheBytes = Math.max(0, mediaBlobCacheBytes - (old.byteLength || 0));
+            URL.revokeObjectURL(old.objectUrl);
+        }
     }
 }
 
 /** 把 root 下所有 data-auth-src 元素挂上真实 src。 */
 function hydrateProtectedMedia(root) {
     if (!root || !root.querySelectorAll) return;
+    hydrateWorkspaceFileReferences(root);
     root.querySelectorAll('[data-auth-src]').forEach(el => {
         const url = el.getAttribute('data-auth-src');
         if (!url) return;
@@ -50,9 +72,86 @@ function hydrateProtectedMedia(root) {
             if (el.isConnected) el.src = objectUrl;
         }).catch(err => {
             el.setAttribute('data-media-error', '1');
+            if (el.tagName === 'VIDEO' && !el.nextElementSibling?.classList.contains('media-preview-error')) {
+                const fallback = document.createElement('div');
+                fallback.className = 'media-preview-error';
+                fallback.textContent = err.message.includes('40 MB')
+                    ? '视频超过 40 MB，暂不支持内联预览。'
+                    : '视频预览暂不可用。';
+                const sourceUrl = el.getAttribute('data-auth-src') || url;
+                if (sourceUrl.startsWith('/api/conversation-media/')) {
+                    const filename = sourceUrl.split('/').pop().split('?')[0];
+                    const session = sourceUrl.split('/')[3];
+                    appendAuthenticatedDownload(fallback, '/api/conversation-download/' + session + '/' + filename,
+                        decodeURIComponentSafe(filename));
+                } else if (sourceUrl.startsWith('/api/workspace-media/')) {
+                    const parts = sourceUrl.split('/');
+                    const filename = parts.pop().split('?')[0];
+                    const query = sourceUrl.includes('?') ? sourceUrl.slice(sourceUrl.indexOf('?')) : '';
+                    appendAuthenticatedDownload(fallback, '/api/workspace-download/' + filename + query,
+                        decodeURIComponentSafe(filename));
+                } else if (sourceUrl.startsWith('/api/generated-media/')) {
+                    const filename = sourceUrl.split('/').pop();
+                    appendAuthenticatedDownload(fallback, sourceUrl, decodeURIComponentSafe(filename));
+                }
+                el.parentNode?.appendChild(fallback);
+            }
             console.warn('受保护媒体加载失败:', url, err.message);
         });
     });
+}
+
+function appendAuthenticatedDownload(parent, url, name) {
+    const link = document.createElement('a');
+    link.href = '#';
+    link.className = 'conversation-download-link';
+    link.dataset.authDownload = url;
+    link.dataset.downloadName = name || 'video';
+    link.textContent = '下载视频';
+    parent.appendChild(link);
+}
+
+/** A filename is a reference until the owner-scoped endpoint confirms a real file. */
+function hydrateWorkspaceFileReferences(root) {
+    const candidates = root.matches && root.matches('[data-workspace-file-check]') ? [root] : [];
+    candidates.push(...root.querySelectorAll('[data-workspace-file-check]'));
+    candidates.forEach(link => {
+        const url = link.getAttribute('data-workspace-file-check');
+        if (!url) return;
+        link.removeAttribute('data-workspace-file-check');
+        let check = WORKSPACE_FILE_CHECKS.get(url);
+        if (!check || Date.now() - check.createdAt > 30000) {
+            check = {
+                createdAt: Date.now(),
+                promise: fetch(url, { method: 'HEAD', credentials: 'same-origin' })
+                    .then(response => response.status).catch(() => 0)
+            };
+            WORKSPACE_FILE_CHECKS.set(url, check);
+            if (WORKSPACE_FILE_CHECKS.size > 100) WORKSPACE_FILE_CHECKS.delete(WORKSPACE_FILE_CHECKS.keys().next().value);
+        }
+        check.promise.then(status => {
+            if (!link.isConnected) return;
+            const hint = link.querySelector('small');
+            const type = link.getAttribute('data-file-type') || '文件';
+            if (status >= 200 && status < 300) {
+                link.setAttribute('data-auth-download', url);
+                link.removeAttribute('aria-disabled');
+                link.title = '下载文件';
+                if (hint) hint.textContent = type + ' · 点击下载';
+            } else {
+                link.removeAttribute('href');
+                link.setAttribute('aria-disabled', 'true');
+                link.title = '回复中的文件引用；当前会话工作区未提供这个文件。';
+                if (hint) hint.textContent = status === 401 ? type + ' · 请登录后查看'
+                    : status === 0 || status >= 500 ? type + ' · 暂时无法确认文件'
+                        : type + ' · 文件引用，未提供下载';
+            }
+        });
+    });
+}
+
+function decodeURIComponentSafe(value) {
+    try { return decodeURIComponent(value); } catch (_) { return value; }
 }
 
 /* 流式渲染、历史回放、整段重画都会新建节点 —— 用观察器统一接管，免得到处记得调用。 */
@@ -94,7 +193,7 @@ function workspaceDownloadPath(href) {
     if (!match) return null;
     let name;
     try { name = decodeURIComponent(match[1]); } catch (_) { return null; }
-    if (!name || name.startsWith('.') || name.includes('..') || /[\/\\\x00-\x1f]/.test(name)) return null;
+    if (!name || name.startsWith('.') || name.includes('..') || /[\/\\<>:"|?*\x00-\x1f]/.test(name)) return null;
     return encodeURIComponent(name).replace(/%2E/gi, '.').replace(/%2D/gi, '-').replace(/%5F/gi, '_');
 }
 
@@ -106,6 +205,62 @@ function workspaceDownloadPath(href) {
  */
 function workspaceSidQuery() {
     return currentId ? '?sid=' + encodeURIComponent(currentId) : '';
+}
+
+function workspaceFileDownloadLink(workspacePath, downloadName, explicitUrl) {
+    if (!currentId) return '<code>' + esc(downloadName) + '</code>';
+    const ext = fileExt(downloadName).toUpperCase() || 'FILE';
+    const isMarkdown = ['MD', 'MDOWN', 'MARKDOWN'].includes(ext);
+    const isCode = WORKSPACE_CODE_EXTENSIONS.has(ext);
+    const officeKind = ['DOC', 'DOCX', 'ODT', 'RTF'].includes(ext) ? 'word'
+        : ['XLS', 'XLSX', 'ODS', 'CSV'].includes(ext) ? 'excel'
+            : ext === 'PDF' ? 'pdf'
+                : ['PPT', 'PPTX', 'ODP'].includes(ext) ? 'slides' : '';
+    const fileIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2.8h8l4 4V21H6z"/><path d="M14 2.8v4h4"/></svg>`;
+    const icon = isMarkdown
+        ? `${fileIcon}<b>MD</b>`
+        : isCode ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M14 5l-4 14"/></svg><b>${esc(ext.slice(0, 4))}</b>`
+            : `${fileIcon}<b>${esc(ext.slice(0, 4))}</b>`;
+    const typeLabel = isMarkdown ? 'Markdown 文档'
+        : ext === 'HTML' || ext === 'HTM' ? 'HTML 页面'
+            : ['JS', 'MJS', 'CJS'].includes(ext) ? 'JavaScript 源码'
+                : ext === 'CSS' ? 'CSS 样式表'
+                    : ext === 'JSON' ? 'JSON 数据文件'
+                        : officeKind === 'word' ? 'Word 文档'
+                            : officeKind === 'excel' ? 'Excel 表格'
+                                : officeKind === 'pdf' ? 'PDF 文档'
+                                    : officeKind === 'slides' ? '演示文稿'
+                                        : isCode ? `${ext} 源码文件` : `${ext} 文件`;
+    const hint = `${typeLabel} · 正在确认文件`;
+    const url = explicitUrl || '/api/workspace-download/' + workspacePath + workspaceSidQuery();
+    const typeClass = officeKind ? ` workspace-download-link--${officeKind}` : '';
+    const iconClass = officeKind ? ` workspace-file-ext--${officeKind}` : '';
+    return `<a href="#" data-workspace-file-check="${escA(url)}" data-file-type="${escA(typeLabel)}" aria-disabled="true" data-download-name="${escA(downloadName)}" class="workspace-download-link${isMarkdown ? ' workspace-download-link--markdown' : ''}${isCode ? ' workspace-download-link--code' : ''}${typeClass}" rel="nofollow"><span class="workspace-file-ext${isMarkdown ? ' workspace-file-ext--markdown' : ''}${isCode ? ' workspace-file-ext--code' : ''}${iconClass}">${icon}</span><span class="workspace-file-label">${esc(downloadName)}<small>${hint}</small></span></a>`;
+}
+
+/** 工作区交付物的行内文件名使用卡片展示；兼容 MD、源码、网页和常见文档格式。 */
+function inlineMarkdownFileLink(codeText) {
+    const token = String(codeText || '').trim().replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    if (!/\.(?:md|markdown|mdown|html?|css|m?js|cjs|tsx?|jsx|json|py|java|go|rs|c|h|cpp|hpp|sh|bat|ps1|sql|xml|ya?ml|txt|csv|pdf|docx?|xlsx?|pptx?)$/i.test(token)) return null;
+    const pathToken = token.startsWith('workspace/') ? token : 'workspace/' + token;
+    const workspacePath = workspaceDownloadPath(pathToken);
+    if (workspacePath) {
+        const downloadName = decodeURIComponentSafe(workspacePath);
+        return workspaceFileDownloadLink(workspacePath, downloadName);
+    }
+    // Nested and absolute references are resolved only inside this user's session
+    // workspace. The API rejects references outside that boundary.
+    const normalized = token.replace(/\\/g, '/');
+    const relative = normalized.replace(/^workspace\//i, '');
+    if (/^(?:https?:|file:|\/\/)/i.test(normalized)) return null;
+    const checkPath = relative.replace(/^[a-z]:\//i, '');
+    if (/[<>:"|?*\x00-\x1f]/.test(checkPath)
+            || checkPath.split('/').some(part => part === '..' || part.startsWith('.'))) return null;
+    const name = normalized.split('/').pop();
+    if (!name) return null;
+    const url = '/api/workspace-download?path=' + encodeURIComponent(relative)
+        + (currentId ? '&sid=' + encodeURIComponent(currentId) : '');
+    return workspaceFileDownloadLink(null, name, url);
 }
 
 /** 回复常把 write_file 返回的 workspace/文件名作为普通文本，而非 Markdown 链接。 */
@@ -128,7 +283,13 @@ function linkWorkspacePaths(s) {
         while ((item = heading.exec(line)) !== null) {
             const start = lineStart + item.index + item[1].length;
             const end = start + item[2].length;
-            if (!protectedRanges.some(range => start >= range[0] && start < range[1])) {
+            const before = text.slice(0, start);
+            const openTag = before.lastIndexOf('<');
+            const closeTag = before.lastIndexOf('>');
+            const inCode = before.lastIndexOf('<code>') > before.lastIndexOf('</code>')
+                || before.lastIndexOf('<pre>') > before.lastIndexOf('</pre>');
+            if (openTag <= closeTag && !inCode
+                    && !protectedRanges.some(range => start >= range[0] && start < range[1])) {
                 candidates.push({ start, end, token: item[2] });
             }
         }
@@ -137,11 +298,25 @@ function linkWorkspacePaths(s) {
     let out = '', cursor = 0;
     for (const candidate of candidates) {
         const href = workspaceDownloadPath(candidate.token);
-        if (!href) continue;
+        if (!href) {
+            if (inlineMarkdownFileLink(candidate.token)) {
+                out += text.slice(cursor, candidate.start) + '[查看文件](' + candidate.token + ')';
+                cursor = candidate.end;
+            }
+            continue;
+        }
         let displayName = candidate.token.slice('workspace/'.length);
         try { displayName = decodeURIComponent(displayName); } catch (_) { }
-        out += text.slice(cursor, candidate.start) + '[' + candidate.token.slice(0, 'workspace/'.length) + displayName
-            + '](workspace/' + href + ')';
+        const ext = fileExt(displayName);
+        const mediaUrl = '/api/workspace-media/' + href + workspaceSidQuery();
+        const isImage = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif'].includes(ext);
+        const isVideo = VIDEO_EXTS.has(ext);
+        if (isImage || isVideo) {
+            out += text.slice(cursor, candidate.start) + '![' + displayName + '](' + mediaUrl + ')';
+        } else {
+            out += text.slice(cursor, candidate.start) + '[查看文件：' + displayName
+                + '](workspace/' + href + ')';
+        }
         cursor = candidate.end;
     }
     return cursor ? out + text.slice(cursor) : text;
@@ -150,30 +325,157 @@ function linkWorkspacePaths(s) {
 function parseLinks(s) {
     let out = '', i = 0;
     while (i < s.length) {
-        const lb = s.indexOf('[', i);
-        if (lb === -1) { out += s.slice(i); break; }
-        if (lb > 0 && s[lb - 1] === '!') { out += s.slice(i, lb + 1); i = lb + 1; continue; }
-        out += s.slice(i, lb);
-        const rb = s.indexOf(']', lb + 1);
-        if (rb === -1 || s[rb + 1] !== '(') { out += s[lb]; i = lb + 1; continue; }
-        const txt = s.slice(lb + 1, rb);
-        const u = balancedUrl(s, rb + 1);
-        if (!u) { out += s[lb]; i = lb + 1; continue; }
-        const href = u.url.replace(/&amp;/g, '&');
-        const workspacePath = workspaceDownloadPath(href);
-        if (workspacePath) {
-            const downloadUrl = '/api/workspace-download/' + workspacePath + workspaceSidQuery();
-            let downloadName = workspacePath;
-            try { downloadName = decodeURIComponent(workspacePath); } catch (_) { }
-            out += `<a href="#" data-auth-download="${escA(downloadUrl)}" data-download-name="${escA(downloadName)}" class="workspace-download-link" rel="nofollow">${txt}</a>`;
-        } else if (!/^https?:\/\//i.test(href) && !/^\/\w/.test(href)) {
-            out += s.slice(lb, u.end + 1);
-        } else {
-            out += `<a href="${escA(href)}" target="_blank" rel="noopener">${txt}</a>`;
+        // Markdown 渲染前面已经生成安全标签。保留标签属性原样，绝不在 href/src 里再次识别 URL。
+        if (s[i] === '<') {
+            const tagEnd = s.indexOf('>', i + 1);
+            if (tagEnd !== -1) {
+                const tag = s.slice(i, tagEnd + 1);
+                const tagName = (tag.match(/^<\/?([a-z0-9-]+)/i) || [])[1]?.toLowerCase();
+                if (tagName === 'code' || tagName === 'pre' || tagName === 'a') {
+                    const closeAt = s.toLowerCase().indexOf('</' + tagName + '>', tagEnd + 1);
+                    const end = closeAt === -1 ? tagEnd + 1 : closeAt + tagName.length + 3;
+                    out += s.slice(i, end);
+                    i = end;
+                    continue;
+                }
+                out += tag;
+                i = tagEnd + 1;
+                continue;
+            }
         }
-        i = u.end + 1;
+
+        if (s[i] === '[' && !(i > 0 && s[i - 1] === '!')) {
+            const rb = s.indexOf(']', i + 1);
+            if (rb !== -1 && s[rb + 1] === '(') {
+                const label = s.slice(i + 1, rb);
+                const u = balancedUrl(s, rb + 1);
+                if (u) {
+                    const href = u.url.replace(/&amp;/g, '&');
+                    const workspacePath = workspaceDownloadPath(href);
+                    if (workspacePath) {
+                        let downloadName = workspacePath;
+                        try { downloadName = decodeURIComponent(workspacePath); } catch (_) { }
+                        out += workspaceFileDownloadLink(workspacePath, downloadName);
+                    } else if (!/^(?:https?:|\/\/|\/api\/)/i.test(href) && inlineMarkdownFileLink(href)) {
+                        out += inlineMarkdownFileLink(href);
+                    } else if (!/^https?:\/\//i.test(href) && !/^\/\w/.test(href)) {
+                        out += s.slice(i, u.end + 1);
+                    } else {
+                        out += `<a href="${escA(href)}" target="_blank" rel="noopener">${label}</a>`;
+                    }
+                    i = u.end + 1;
+                    continue;
+                }
+            }
+        }
+
+        if (/^https?:\/\//i.test(s.slice(i, i + 8))
+                && (i === 0 || !/[\w/.%-]/.test(s[i - 1]))) {
+            let end = i;
+            while (end < s.length && !/[\s<>"'`|]/.test(s[end])) end++;
+            let url = s.slice(i, end);
+            while (/[.,!?;:，。；！？、]$/.test(url)) url = url.slice(0, -1);
+            while (url.endsWith(')') && (url.match(/\)/g) || []).length > (url.match(/\(/g) || []).length)
+                url = url.slice(0, -1);
+            while (url.endsWith(']') && (url.match(/\]/g) || []).length > (url.match(/\[/g) || []).length)
+                url = url.slice(0, -1);
+            if (url.length > 8) {
+                out += `<a href="${escA(url.replace(/&amp;/g, '&'))}" target="_blank" rel="noopener" class="source-link">查看原文</a>`;
+                i += url.length;
+                continue;
+            }
+        }
+
+        out += s[i];
+        i++;
     }
     return out;
+}
+
+function groupAdjacentMedia(markup) {
+    const media = '(?:<img\\b[^>]*>|<video\\b[^>]*><\\/video>)';
+    const pair = new RegExp(media + '(?:(?:\\s|<br\\s*\\/?\\s*>)*' + media + ')+', 'gi');
+    return markup.replace(pair, group => '<div class="media-gallery">'
+        + group.replace(/<br\s*\/?\s*>/gi, '').replace(/\s+(?=<)/g, '')
+        + '</div>');
+}
+
+function travelCardText(value, fallback = '—') {
+    if (value === null || value === undefined || value === '') return fallback;
+    return esc(String(value).slice(0, 160));
+}
+
+function travelCardSource(value) {
+    if (!value || typeof value !== 'object' || typeof value.url !== 'string') return '';
+    try {
+        const url = new URL(value.url);
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return '';
+        const label = travelCardText(value.label, '查看来源');
+        return `<a class="travel-source-link" href="${escA(url.toString())}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    } catch (_) {
+        return '';
+    }
+}
+
+/** Render the opt-in JSON card protocol used by the bundled travel-search skill. */
+function renderTravelCardBlock(language, rawJson) {
+    const kind = String(language || '').toLowerCase();
+    if (kind !== 'miniagent-flight' && kind !== 'miniagent-train') return null;
+    if (rawJson.length > 100_000) return null;
+    let data;
+    try { data = JSON.parse(rawJson); } catch (_) { return null; }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+    const route = data.route && typeof data.route === 'object' ? data.route : {};
+    const from = travelCardText(route.from, '出发地待确认');
+    const to = travelCardText(route.to, '目的地待确认');
+    const date = travelCardText(route.date, '日期待确认');
+    const source = travelCardSource(data.source);
+    const flightMode = kind === 'miniagent-flight';
+    const items = data[flightMode ? 'flights' : 'trains'];
+    if (!Array.isArray(items)) return null;
+    const title = flightMode ? '航班查询' : '车次查询';
+    const routeLabel = flightMode ? '航线' : '行程';
+    let cards = '';
+    items.slice(0, 8).forEach(item => {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return;
+        const id = travelCardText(item.flightNo || item.trainNo || item.number, flightMode ? '航班' : '车次');
+        const depart = travelCardText(item.departureTime);
+        const arrive = travelCardText(item.arrivalTime);
+        const duration = travelCardText(item.duration, '时长待核实');
+        const departPlace = travelCardText(item.departureAirport || item.departureStation);
+        const arrivePlace = travelCardText(item.arrivalAirport || item.arrivalStation);
+        const carrier = travelCardText(item.airline || item.operator || (flightMode ? '' : id));
+        const cabin = travelCardText(item.cabin || item.seatClass, '席别待核实');
+        const price = travelCardText(item.price, flightMode ? '价格待核实' : '票价见席别');
+        const extra = flightMode
+            ? `<div class="travel-item-meta">${carrier} <span>·</span> ${id} <span>·</span> ${cabin}${item.aircraft ? ` <span>·</span> ${travelCardText(item.aircraft)}` : ''}${item.remaining ? ` <span>·</span> ${travelCardText(item.remaining)}` : ''}</div>`
+            : `<div class="travel-item-meta">${carrier} <span>·</span> ${id}</div>`;
+        let seats = '';
+        if (!flightMode && Array.isArray(item.seats)) {
+            seats = `<div class="travel-seat-list">${item.seats.slice(0, 5).map(seat => {
+                if (!seat || typeof seat !== 'object') return '';
+                const seatName = travelCardText(seat.name || seat.class, '席别');
+                const remaining = travelCardText(seat.remaining, '余票待核实');
+                const seatPrice = travelCardText(seat.price, '价格待核实');
+                return `<span class="travel-seat">${seatName}<small>${remaining}</small><b>${seatPrice}</b></span>`;
+            }).join('')}</div>`;
+        }
+        const itemSource = travelCardSource(item.source);
+        cards += `<article class="travel-option">
+            <div class="travel-option-top"><span class="travel-carrier">${carrier}</span><span class="travel-price">${price}</span></div>
+            <div class="travel-journey">
+                <div class="travel-point"><strong>${depart}</strong><span>${departPlace}</span></div>
+                <div class="travel-duration"><span>${duration}</span><i></i></div>
+                <div class="travel-point"><strong>${arrive}</strong><span>${arrivePlace}</span></div>
+            </div>
+            ${extra}${seats}${itemSource ? `<div class="travel-item-source">来源：${itemSource}</div>` : ''}
+        </article>`;
+    });
+    if (!cards) cards = '<div class="travel-empty">没有可展示的已核验班次，请查看来源或补充出发日期。</div>';
+    return `<section class="travel-result-card ${flightMode ? 'travel-result-card--flight' : 'travel-result-card--train'}" aria-label="${title}">
+        <header class="travel-card-heading"><span class="travel-card-icon" aria-hidden="true">${flightMode ? '✈' : '🚄'}</span><div><strong>${title}</strong><small>${routeLabel}：${from} → ${to}　·　${date}</small></div>${source}</header>
+        <div class="travel-options">${cards}</div>
+    </section>`;
 }
 
 /**
@@ -196,15 +498,26 @@ function renderMD(t) {
 
     // 1) 摘出 fenced code：内容不参与 markdown 结构替换，也不会被二次转义
     const codeBlocks = [];
-    t = t.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-        codeBlocks.push({ lang: lang || 'code', code: code });
+    t = t.replace(/```([\w-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
+        const travelCard = renderTravelCardBlock(lang, code);
+        if (travelCard) {
+            codeBlocks.push({ rendered: travelCard });
+        } else {
+            codeBlocks.push({ lang: lang || 'code', code: code });
+        }
         return '\u0000CB' + (codeBlocks.length - 1) + '\u0000';
     });
 
     // 2) 全文转义：此后所有 $1 插值都是安全文本
     t = esc(t);
 
-    t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+    // Inline code and file-card markup must not participate in later emphasis
+    // replacement: start_*.bat is literal, never a start_<em>.bat download URL.
+    const inlineBlocks = [];
+    t = t.replace(/`([^`]+)`/g, (match, codeText) => {
+        inlineBlocks.push(inlineMarkdownFileLink(codeText) || '<code>' + codeText + '</code>');
+        return '\u0000IC' + (inlineBlocks.length - 1) + '\u0000';
+    });
     t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     t = t.replace(/\*(.+?)\*/g, '<em>$1</em>');
     t = t.replace(/^### (.+)$/gm, '<h3>$1</h3>');
@@ -242,10 +555,11 @@ function renderMD(t) {
         return html;
     });
 
+    t = linkWorkspacePaths(t);
     t = parseMediaBang(t);
     t = parseBracketImg(t, '图片');
-    t = linkWorkspacePaths(t);
     t = parseLinks(t);
+    t = groupAdjacentMedia(t);
     t = t.replace(/^- (.+)$/gm, '<li>$1</li>');
     t = t.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
     t = t.replace(/(<li>[\s\S]*?<\/li>\n?)+/g, m => `<ul>${m}</ul>`);
@@ -256,9 +570,11 @@ function renderMD(t) {
     t = t.replace(/(<\/?(h[1-3]|ul|ol|li|blockquote|table|thead|tbody|tr|th|td|pre|hr)[^>]*>)<br>/gi, '$1');
 
     // 4) 还原代码块：内容转义；语言名只保留 [\w-] 再拼进 class，避免属性逃逸
+    t = t.replace(/\u0000IC(\d+)\u0000/g, (_, idx) => inlineBlocks[Number(idx)] || '');
     t = t.replace(/\u0000CB(\d+)\u0000/g, (_, idx) => {
         const b = codeBlocks[Number(idx)];
         if (!b) return '';
+        if (b.rendered) return b.rendered;
         const lang = String(b.lang).replace(/[^\w-]/g, '') || 'code';
         return `<pre><div class="code-hdr"><span>${esc(b.lang)}</span>`
             + `<button class="code-copy" onclick="copyCode(this)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>复制</button></div>`

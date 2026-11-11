@@ -98,6 +98,21 @@ class NodeOutputBinderTest {
         assertTrue(b.complete(n));
     }
 
+    @Test
+    void failedLastToolCannotBeHiddenByEarlierSuccessfulTool() {
+        TaskNode n = new TaskNode("n2", "写入 notes.md", "file_write",
+                List.of(), List.of(), List.of("notes.md"), TaskNodeStatus.PENDING,
+                9, DoneWhen.file("notes.md"), "", "", 0, "");
+        NodeOutputBinder.Bound b = NodeOutputBinder.bind(
+                n, "", List.of(
+                        ToolExecutionResultMessage.from("1", "read_file", "old good content"),
+                        ToolExecutionResultMessage.from("2", "write_file",
+                                "{\"success\":false,\"status\":\"failed\",\"error\":\"disk full\"}")),
+                "");
+        assertFalse(b.complete(n));
+        assertTrue(StepEvaluator.looksLikeToolError(b.evidence()));
+    }
+
     private static TaskNode acquire(String port) {
         return new TaskNode("n1", "获取资料原文", "web", List.of(),
                 List.of(), List.of(port), TaskNodeStatus.PENDING, 10,

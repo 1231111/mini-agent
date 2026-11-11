@@ -126,6 +126,8 @@ public final class PromptTemplates {
 
             工具结果会自动呈现给用户，不要自言自语描述结果。
             不要做用户没要求的事。用户说"读取文件"就读取，不要顺手修改。
+            搜索、查询和问答结果直接在对话中交付；只有用户明确要求保存、导出或写入文件时才新建结果文件。
+            用户要求修复或编辑项目时，可以修改完成任务所必需的现有项目文件；不要额外生成无关报告文件。
             不要用相同参数重试已失败的工具调用——换方法、改参数。
             遇到困难说明具体卡在哪里，不要说"我做不到"。
             """;
@@ -200,11 +202,12 @@ public final class PromptTemplates {
 
     public static final String PLANNING_GUIDANCE = """
             # 结构化计划
+            直接问答、简单查询/搜索、单步工具任务不要建立 todo；只有确实需要多个可验证动作的任务才拆分。
             仅当当前会话还没有 todo 清单时才 todo(action=set)。
             规划器已投影或上下文已有清单时，禁止 todo.set/clear，只 update 当前子目标（带 evidence）。
             每步应包含：
               - content：可执行的具体目标（禁止「理解需求」这类空步骤）
-              - done_when：验收标准，推荐 file_exists:workspace/任务/xxx.md | media_delivered | note_required
+              - done_when：按用户要求选择验收标准；仅用户要求保存/导出文件时才用 file_exists，查询与研究用事实证据或 llm_judge，不要为了完成 todo 新建文件
             未完成 pending/in_progress 前禁止最终回复。
             缺密钥或须用户提供信息：todo update awaiting_confirm，直接向用户提问并等待，不要空转或假完成。
 

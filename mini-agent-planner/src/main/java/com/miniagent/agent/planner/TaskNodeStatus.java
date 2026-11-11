@@ -13,5 +13,7 @@ public enum TaskNodeStatus {
     FAILED,
     RECOVERING,
     AWAITING_CONFIRM,
-    CANCELLED
+    CANCELLED,
+    /** 执行可能已产生副作用，核验前不得自动恢复或重放。 */
+    OUTCOME_UNKNOWN
 }

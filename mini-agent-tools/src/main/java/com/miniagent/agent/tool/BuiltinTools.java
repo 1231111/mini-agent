@@ -338,13 +338,14 @@ public class BuiltinTools {
 
     private void registerWebSearchTools() {
         registry.register("web_search",
-                "搜索网页，返回结构化的搜索结果（标题、URL、描述）。\n"
+                "搜索网页，返回结构化结果以及搜索服务提供的发布日期线索。查询涉及今天/今日/昨天或明确日期时，必须按上下文时区换算并传 dateFrom/dateTo（YYYY-MM-DD）；服务会加入日期限定并剔除已知超窗结果。搜索发布日期尚未经过原文核验；所有新闻候选都必须用 web_extract 核验原文发布日期后才能引用。\n"
                         + "搜索用简洁关键词，不用完整句子（用 \"Spring Boot 事务失效\" 而不是 \"我想知道 Spring Boot 里事务为什么会失效\"）。\n"
                         + "对结果准确性不确定时，用 web_extract 提取原文确认，不要直接拿搜索摘要下结论。",
                 WebSearchParams.class,
-                params -> webSearchService.search(params.getQuery(), params.getLimitOrDefault()));
+                params -> webSearchService.search(params.getQuery(), params.getLimitOrDefault(),
+                        params.getDateFrom(), params.getDateTo()));
 
-        registry.register("web_extract", "抓取网页内容，返回纯文本。支持任何公开网页。对于大页面会截断到合理长度。",
+        registry.register("web_extract", "抓取网页原文，返回正文及页面可识别的发布日期。用它核验新闻发布日期；date_verified=true 仅表示原文页面元数据中找到发布日期。对于大页面会截断到合理长度。",
                 WebExtractParams.class,
                 params -> webSearchService.extract(params.getUrl()));
     }
@@ -674,12 +675,17 @@ public class BuiltinTools {
     // ==================== 浏览器工具 ====================
 
     private void registerBrowserTools() {
-        registry.register("browser_navigate", "打开网页，返回页面标题和无障碍树快照",
+        registry.register("browser_navigate",
+                "打开公网 HTTP/HTTPS 网页并返回页面标题和无障碍树快照。不要用它预览本地文件、file://、localhost 或本机服务器；"
+                        + "工作区生成的 HTML 请用 read_file 或 exec_command 做静态检查，不要更换端口反复尝试。",
                 BrowserNavigateParams.class,
                 params -> {
                     String blocked = networkGuard.validateUrl(params.getUrl());
                     if (Objects.nonNull(blocked)) {
-                        return "{\"error\":\"" + blocked.replace("\"", "'") + "\"}";
+                        return errorJson(ToolErrorCode.PERMISSION_DENIED,
+                                "浏览器导航被安全策略拒绝：" + blocked
+                                        + "。此工具仅用于公网 HTTP/HTTPS 网页，不能预览 file://、localhost 或工作区本地文件；"
+                                        + "请停止更换端口重试，改用 read_file 或 exec_command 做静态验证。");
                     }
                     return browserService.navigate(params.getSessionIdOrDefault(), params.getUrl());
                 });
@@ -710,9 +716,9 @@ public class BuiltinTools {
                 BrowserScrollParams.class,
                 params -> browserService.scroll(params.getSessionIdOrDefault(), params.getDirection()));
 
-        registry.register("browser_screenshot", "截取当前页面截图并保存为 PNG 文件",
+        registry.register("browser_screenshot", "截取当前页面截图，在最近点击位置添加蓝色光圈指针，并保存到 workspace 供对话预览",
                 BrowserScreenshotParams.class,
-                params -> browserService.screenshot(params.getSessionIdOrDefault()));
+                params -> browserService.screenshot(params.getSessionIdOrDefault(), effectiveWorkspaceRoot()));
 
         if (browserEvaluateEnabled) {
             registry.register(BROWSER_EVALUATE, "在页面中执行 JavaScript 代码",
@@ -836,16 +842,16 @@ public class BuiltinTools {
 
     private void registerSkillTools() {
         // skill_list - 列出所有已安装的 skill
-        registry.register("skill_list",
+        registry.registerStructured("skill_list",
                 "List installed skills with name and description. Use this first to see what skills are available.",
                 Map.of(),
                 args -> {
                     String summary = skillStore.getSkillListSummary();
-                    return summary.isEmpty() ? "No skills installed." : summary;
+                    return ToolResult.success(summary.isEmpty() ? "No skills installed." : summary);
                 });
 
         // skill_view - 加载 skill 完整内容
-        registry.register("skill_view",
+        registry.registerStructured("skill_view",
                 "Load full content of a skill by name. Optionally load a sub-file (references, templates, scripts).",
                 Map.of(
                         "name", Map.of("type", "string", "description", "Skill name", "required", true),
@@ -853,21 +859,27 @@ public class BuiltinTools {
                 ),
                 args -> {
                     Map<String, Object> p = parseJson(args);
-                    String name = (String) p.get("name");
-                    String filePath = (String) p.getOrDefault("file_path", "");
-                    if (Objects.isNull(name)) {
-                        return errorJson(ToolErrorCode.INVALID_ARGUMENT, "name is required");
+                    String name = p.get("name") instanceof String value ? value.trim() : "";
+                    String filePath = p.get("file_path") instanceof String value ? value.trim() : "";
+                    if (name.isEmpty()) {
+                        return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT, "name is required", false);
                     }
                     if (!filePath.isEmpty()) {
-                        String content = skillStore.viewSkillFile(name, filePath);
-                        // 用 errorJson 而不是裸文本：裸文本 walks 到 fromLegacy 的最后一行 return success(rawText)，
-                        // 于是「找不到」被判成成功，失败闸门不会触发（2026-10-15 实测）。
-                        return Optional.ofNullable(content).orElse(errorJson(ToolErrorCode.NOT_FOUND,
-                                "File not found: " + name + "/" + filePath));
+                        SkillStore.SkillFileResult result = skillStore.readSkillFile(name, filePath);
+                        return switch (result.status()) {
+                            case FOUND -> ToolResult.success(result.content());
+                            case PATH_REJECTED -> ToolResult.failure(ToolErrorCode.PERMISSION_DENIED,
+                                    "Skill file path is outside the skill directory", false);
+                            case NOT_FOUND -> ToolResult.failure(ToolErrorCode.NOT_FOUND,
+                                    "File not found: " + name + "/" + filePath, false);
+                            case READ_FAILED -> ToolResult.failure(ToolErrorCode.INTERNAL_ERROR,
+                                    "Unable to read skill file: " + name + "/" + filePath, false);
+                        };
                     }
                     String content = skillStore.viewSkill(name);
-                    return Optional.ofNullable(content).orElse(errorJson(ToolErrorCode.NOT_FOUND,
-                                "Skill not found: " + name));
+                    return content == null
+                            ? ToolResult.failure(ToolErrorCode.NOT_FOUND, "Skill not found: " + name, false)
+                            : ToolResult.success(content);
                 });
 
         // skill_manage - 创建/编辑/删除 skill
@@ -1809,10 +1821,67 @@ public class BuiltinTools {
         // 2. 允许正常命令操作：管道 |、链接 && ||、分号 ; 都是正常语法
         //    只拦截重定向到项目外目录
         if (trimmed.contains(">") && !trimmed.contains("> workspace/")
-                && !trimmed.contains("> ./") && !trimmed.contains("> nul")) {
+                && !trimmed.contains("> ./")
+                && !hasOnlyNulOutputRedirects(trimmed)) {
             return true;
         }
         return false;
+    }
+
+    /**
+     * cmd.exe accepts the NUL device without a space after the redirection operator
+     * (for example {@code 2>nul}). Allow only commands whose every output redirection
+     * targets that exact device; keep file redirections subject to the workspace rule.
+     */
+    private static boolean hasOnlyNulOutputRedirects(String command) {
+        boolean sawRedirect = false;
+        char quote = 0;
+        for (int i = 0; i < command.length(); i++) {
+            char c = command.charAt(i);
+            if (quote != 0) {
+                if (c == quote) quote = 0;
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                quote = c;
+                continue;
+            }
+            if (c != '>') continue;
+
+            sawRedirect = true;
+            int targetStart = i + 1;
+            if (targetStart < command.length() && command.charAt(targetStart) == '>') targetStart++;
+            while (targetStart < command.length() && Character.isWhitespace(command.charAt(targetStart))) {
+                targetStart++;
+            }
+            if (targetStart >= command.length()) return false;
+
+            String target;
+            int targetEnd;
+            char first = command.charAt(targetStart);
+            if (first == '"' || first == '\'') {
+                int closingQuote = command.indexOf(first, targetStart + 1);
+                if (closingQuote < 0) return false;
+                target = command.substring(targetStart + 1, closingQuote);
+                targetEnd = closingQuote + 1;
+                if (targetEnd < command.length()
+                        && !Character.isWhitespace(command.charAt(targetEnd))
+                        && "&|;<>".indexOf(command.charAt(targetEnd)) < 0) {
+                    return false;
+                }
+            } else {
+                targetEnd = targetStart;
+                while (targetEnd < command.length()
+                        && !Character.isWhitespace(command.charAt(targetEnd))
+                        && "&|;<>".indexOf(command.charAt(targetEnd)) < 0) {
+                    targetEnd++;
+                }
+                target = command.substring(targetStart, targetEnd);
+            }
+            if (!"nul".equalsIgnoreCase(target)) return false;
+            i = targetEnd - 1;
+        }
+        return sawRedirect;
     }
 
     // ==================== JSON 解析 ====================

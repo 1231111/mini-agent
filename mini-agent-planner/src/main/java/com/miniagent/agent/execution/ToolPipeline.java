@@ -22,6 +22,7 @@ import com.miniagent.agent.tool.ToolDescriptor;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.agent.tool.ToolResult;
+import com.miniagent.agent.tool.ToolSideEffect;
 import com.miniagent.agent.tool.impl.ExecCommandParams;
 import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.agent.trace.TraceRecorder;
@@ -46,6 +47,11 @@ import java.util.HexFormat;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 工具执行唯一入口。ReAct 循环与规划器绑定动作走同一条管道：
@@ -120,13 +126,16 @@ public class ToolPipeline {
     /**
      * 一次审批的有效窗口（秒）。
      *
-     * <p>AgentLoop 必须用同一个数去算它外层 {@code Future.get} 的等待上限：
-     * 外层若按工具执行预算（通常 60～120s）先超时，工作线程会被 {@code cancel(true)}
-     * 打断，而用户的批准还在有效期内 —— 现象就是「弹窗还在、点了也没用」。
-     * 所以这个值不从别处复制，唯一来源留在管道里。</p>
+     * <p>审批窗口由管道单独管理，不占用 handler 的执行预算。
+     * 工具计时器在审批及暂停检查点通过并拿到资源锁后才启动。</p>
      */
     public long askGrantTtlSeconds() {
         return Math.max(1L, askGrantTtlSeconds);
+    }
+
+    /** Bound planner actions use the same argument-aware deadline as ReAct calls. */
+    public long timeoutSeconds(String name, String arguments) {
+        return toolExecutionGuards.timeoutSeconds(name, arguments);
     }
 
     public ToolInvocation invoke(ToolRequest request) {
@@ -262,9 +271,25 @@ public class ToolPipeline {
                 return ToolInvocation.permissionAsk(name, ToolResult.fromLegacy(pending));
             }
             try {
+                executionControl.markHumanWaitpoint(sid, true);
+                var waitStop = executionControl.checkpoint(sid);
+                if (waitStop != ExecutionControl.StopReason.NONE) {
+                    permissionStore.denyAskToken(sid, grant.token(), name);
+                    recordNode(sid, turn, AgentStepNode.PERM_DENY,
+                            "{\"tool\":\"" + name + "\",\"reason\":\"control_stop\"}",
+                            RunStatus.FAILURE.name());
+                    return ToolInvocation.controlStop(name, ToolResult.failure(
+                            controlErrorCode(waitStop), controlMessage(waitStop), false));
+                }
                 var approval = permissionStore.awaitAskApproval(sid, grant.token(),
-                        Math.max(1L, grant.expiresAtEpochMillis() - System.currentTimeMillis()));
+                        Math.max(1L, grant.expiresAtEpochMillis() - System.currentTimeMillis()),
+                        () -> executionControl.stopReason(sid) != ExecutionControl.StopReason.NONE);
                 if (approval.isEmpty()) {
+                    waitStop = executionControl.stopReason(sid);
+                    if (waitStop != ExecutionControl.StopReason.NONE) {
+                        return ToolInvocation.controlStop(name, ToolResult.failure(
+                                controlErrorCode(waitStop), controlMessage(waitStop), false));
+                    }
                     // 拒绝、超时、取消都会走到这里。必须留一条 PERM_DENY：
                     // 前端那句「用户未在有效期内批准」和真实原因（点了拒绝 / 超时）
                     // 在界面上长得一样，只有轨迹能区分。
@@ -295,9 +320,13 @@ public class ToolPipeline {
                         RunStatus.FAILURE.name());
                 return ToolInvocation.controlStop(name, ToolResult.failure(
                         ToolErrorCode.CANCELLED, "等待批准时任务已取消", false));
+            } finally {
+                executionControl.markHumanWaitpoint(sid, false);
             }
         }
-        ToolResult raw = executeJournaled(
+        ToolInvocation boundaryRejection = executionBoundary(run, name, turn);
+        if (boundaryRejection != null) return boundaryRejection;
+        ToolInvocation invocation = executeJournaled(
                 run,
                 sid,
                 name,
@@ -305,7 +334,14 @@ public class ToolPipeline {
                 turn,
                 request.runId(),
                 request.allowedTools(),
-                request.actionBinding());
+                request.actionBinding(),
+                request.budget());
+        if (invocation.outcome() != ToolInvocation.Outcome.EXECUTED) return invocation;
+        ToolResult raw = invocation.result();
+        // A text-only post hook has no authority to turn a failed or unresolved
+        // execution into success. Keep the exact structured and legacy terminal
+        // result that was persisted to the journal.
+        if (!raw.isSuccess()) return invocation;
         String processed = toolHookChain.after(
                 new ToolHookContext(sid, name, effective, turn, sub), raw.legacyText());
         ToolResult result = Objects.equals(processed, raw.legacyText())
@@ -320,6 +356,33 @@ public class ToolPipeline {
             }
         }
         return ToolInvocation.executed(name, result);
+    }
+
+    /** Recheck after every blocking boundary, including the resource lock wait. */
+    private ToolInvocation executionBoundary(RunScope run, String name, int turn) {
+        String sid = run.sessionId();
+        ExecutionControl.StopReason stop = executionControl.checkpoint(sid);
+        if (stop != ExecutionControl.StopReason.NONE) {
+            return ToolInvocation.controlStop(name, ToolResult.failure(
+                    controlErrorCode(stop), controlMessage(stop), false));
+        }
+        ExecutionTurnContext.Scope fence = run.execution();
+        if (fence != null && !fence.isValid()) {
+            return ToolInvocation.fenceRejected(name, ToolResult.failure(
+                    ToolErrorCode.CONFLICT, fence.rejectionReason(), false));
+        }
+        if (PermissionPolicy.isExecBlocked(name,
+                execPolicyService.effective(sid, run.permissionMode()))) {
+            recordNode(sid, turn, AgentStepNode.PERM_DENY,
+                    "{\"tool\":\"" + name + "\",\"execPolicy\":\"block\","
+                            + "\"reason\":\"policy_changed_before_execution\"}",
+                    RunStatus.FAILURE.name());
+            return ToolInvocation.policyDenied(name, ToolResult.failure(
+                    ToolErrorCode.PERMISSION_DENIED,
+                    "exec_command 已被策略禁止（exec-policy=block）；等待期间策略已更新，本次调用不再执行。",
+                    false));
+        }
+        return null;
     }
 
     /**
@@ -369,10 +432,10 @@ public class ToolPipeline {
         }
     }
 
-    private ToolResult executeJournaled(
+    private ToolInvocation executeJournaled(
             RunScope run, String sessionId, String name, String arguments,
             int turn, String runId, Set<String> allowedTools,
-            ExecutionTurnContext.ActionBinding actionBinding) {
+            ExecutionTurnContext.ActionBinding actionBinding, ToolInvocationBudget budget) {
         // 必须吃参数：exec_command 的幂等性取决于命令行（只读命令可安全重试，
         // 写类命令重跑可能重复副作用）。按名字取到的永远是注册期那份保守契约。
         ToolDescriptor descriptor = toolExecutionGuards.descriptor(name, arguments);
@@ -386,15 +449,17 @@ public class ToolPipeline {
                 ActionJournalEntry entry = previous.get();
                 if (entry.status() == ActionExecutionStatus.UNKNOWN
                         || entry.status() == ActionExecutionStatus.RUNNING) {
-                    return ToolResult.unknown("动作已有未确认执行记录，禁止自动重试", null);
+                    return ToolInvocation.executed(name,
+                            ToolResult.unknown("动作已有未确认执行记录，禁止自动重试", null));
                 }
                 if (entry.status() == ActionExecutionStatus.SUCCEEDED) {
-                    return ToolResult.success("{\"success\":true,\"deduplicated\":true}");
+                    return ToolInvocation.executed(name,
+                            ToolResult.success("{\"success\":true,\"deduplicated\":true}"));
                 }
                 if (!descriptor.idempotent() || !entry.status().terminal()) {
-                    return ToolResult.failure(ToolErrorCode.CONFLICT,
+                    return ToolInvocation.executed(name, ToolResult.failure(ToolErrorCode.CONFLICT,
                             "动作已有终态记录且不满足安全重试条件: " + entry.status(),
-                            false);
+                            false));
                 }
                 attempt = entry.attempt() + 1;
                 journal(key, name, argumentsHash, ActionExecutionStatus.READY, attempt,
@@ -409,36 +474,157 @@ public class ToolPipeline {
                     ToolErrorCode.NONE, "", "");
         } catch (Exception e) {
             log.error("Action Journal 预写失败，拒绝工具 {}: {}", name, e.getMessage());
-            return ToolResult.failure(
-                    ToolErrorCode.INTERNAL_ERROR, "无法持久化工具执行计划", false);
+            return ToolInvocation.executed(name, ToolResult.failure(
+                    ToolErrorCode.INTERNAL_ERROR, "无法持久化工具执行计划", false));
         }
 
         ToolResult result;
-        try (var ignored = ToolCallContext.bind(allowedTools)) {
-            result = toolExecutionGuards.executeGuarded(name, arguments, sessionId,
-                    () -> toolRegistry.executeResult(name, arguments));
+        ToolResult journalResult;
+        ToolInvocation invocation = null;
+        boolean interrupted = false;
+        try {
+            GuardedExecution execution = executeBounded(run, name, arguments, turn, allowedTools,
+                    budget == null ? new ToolInvocationBudget(descriptor.timeoutSeconds()) : budget,
+                    descriptor);
+            invocation = execution.invocation();
+            result = invocation.result();
+            journalResult = execution.journalResult();
+            interrupted = execution.interrupted();
         } catch (ToolLockTimeoutException e) {
             // 没轮到锁 = 工具根本没跑 = 零副作用。必须是可重试的失败，
             // 绝不能落进下面那个 EXECUTION_FAILED（更不能升级成 OUTCOME_UNKNOWN 中止整轮）。
             log.warn("  工具 {} 未拿到锁，退让: {}", name, e.getMessage());
             result = ToolResult.failure(ToolErrorCode.RESOURCE_BUSY, e.getMessage(), true);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            result = ToolResult.failure(ToolErrorCode.CANCELLED, "工具执行被取消", false);
+            journalResult = result;
         } catch (Exception e) {
             result = ToolResult.failure(ToolErrorCode.EXECUTION_FAILED,
                     "工具执行异常: " + Objects.requireNonNullElse(
                             e.getMessage(), e.getClass().getSimpleName()),
                     false);
+            journalResult = result;
         }
         try {
-            journal(key, name, argumentsHash, terminalStatus(result), attempt,
-                    result.errorCode(), result.message(), sha256(result.legacyText()));
+            journal(key, name, argumentsHash, terminalStatus(journalResult), attempt,
+                    journalResult.errorCode(), journalResult.message(), sha256(journalResult.legacyText()));
         } catch (Exception e) {
             log.error("工具 {} 已执行但无法写入终态 Journal: {}", name, e.getMessage());
-            return ToolResult.unknown("工具可能已执行，但终态无法持久化；禁止自动重试", null);
+            return ToolInvocation.executed(name,
+                    ToolResult.unknown("工具可能已执行，但终态无法持久化；禁止自动重试", null));
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
         }
-        return result;
+        return invocation != null && invocation.outcome() != ToolInvocation.Outcome.EXECUTED
+                ? invocation : ToolInvocation.executed(name, result);
+    }
+
+    private record GuardedExecution(ToolInvocation invocation, ToolResult journalResult,
+                                    boolean interrupted) { }
+
+    /**
+     * Keep locks on the actual handler thread until it really exits. Interrupting
+     * an uncooperative handler must still let the caller persist a terminal state;
+     * a late handler result is deliberately unable to write to the journal.
+     */
+    private GuardedExecution executeBounded(RunScope run, String name, String arguments,
+                                            int turn, Set<String> allowedTools,
+                                            ToolInvocationBudget budget,
+                                            ToolDescriptor descriptor) throws Exception {
+        Object gate = new Object();
+        AtomicBoolean abandoned = new AtomicBoolean();
+        AtomicBoolean handlerStarted = new AtomicBoolean();
+        FutureTask<ToolInvocation> future = new FutureTask<>(() -> {
+            try (var ignored = run.bind(); var tools = ToolCallContext.bind(allowedTools)) {
+                return toolExecutionGuards.executeGuarded(name, arguments, run.sessionId(), () -> {
+                    ToolInvocation rejection = executionBoundary(run, name, turn);
+                    if (rejection != null) return rejection;
+                    synchronized (gate) {
+                        if (abandoned.get()) return ToolInvocation.controlStop(name,
+                                ToolResult.failure(ToolErrorCode.CANCELLED, "工具调用已停止", false));
+                        handlerStarted.set(true);
+                        // Approval, pauses and resource-lock waits have their own bounds.
+                        budget.start();
+                    }
+                    try {
+                        return ToolInvocation.executed(name, toolRegistry.executeResult(name, arguments));
+                    } finally {
+                        budget.finish();
+                    }
+                });
+            }
+        });
+        Thread worker = Thread.ofVirtual().name("tool-handler-" + name).start(future);
+        try {
+            while (true) {
+                ExecutionControl.StopReason stop = executionControl.stopReason(run.sessionId());
+                if (stop != ExecutionControl.StopReason.NONE) {
+                    return abandonExecution(name, descriptor, gate, abandoned, handlerStarted, worker,
+                            ToolInvocation.controlStop(name, ToolResult.failure(
+                                    controlErrorCode(stop), controlMessage(stop), false)), false);
+                }
+                if (budget.expired()) {
+                    // Give cooperative handlers a short opportunity to release resources.
+                    // The outer AgentLoop grants a larger persistence grace period.
+                    try {
+                        future.get(100L, TimeUnit.MILLISECONDS);
+                        ToolResult timedOut = budget.timeoutResult(descriptor);
+                        return new GuardedExecution(ToolInvocation.executed(name, timedOut), timedOut, false);
+                    } catch (TimeoutException stillRunning) {
+                        return abandonExecution(name, descriptor, gate, abandoned, handlerStarted, worker,
+                                ToolInvocation.executed(name, budget.timeoutResult(descriptor)), false);
+                    }
+                }
+                try {
+                    ToolInvocation invocation = future.get(50L, TimeUnit.MILLISECONDS);
+                    if (budget.expired()) {
+                        ToolResult timedOut = budget.timeoutResult(descriptor);
+                        return new GuardedExecution(ToolInvocation.executed(name, timedOut), timedOut, false);
+                    }
+                    return new GuardedExecution(invocation, invocation.result(), false);
+                } catch (TimeoutException waiting) {
+                    // Observe stop/deadline without entering a pause checkpoint while a
+                    // handler is running. The handler reaches its next safe boundary itself.
+                }
+            }
+        } catch (InterruptedException e) {
+            return abandonExecution(name, descriptor, gate, abandoned, handlerStarted, worker,
+                    ToolInvocation.controlStop(name,
+                            ToolResult.failure(ToolErrorCode.CANCELLED, "工具执行被取消", false)), true);
+        } catch (ExecutionException e) {
+            if (budget.expired()) {
+                ToolResult timedOut = budget.timeoutResult(descriptor);
+                return new GuardedExecution(ToolInvocation.executed(name, timedOut), timedOut, false);
+            }
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception exception) throw exception;
+            throw new IllegalStateException("工具执行异常", cause);
+        } catch (RuntimeException e) {
+            return abandonExecution(name, descriptor, gate, abandoned, handlerStarted, worker,
+                    ToolInvocation.executed(name, ToolResult.failure(ToolErrorCode.DEPENDENCY_UNAVAILABLE,
+                            "无法确认执行控制状态: " + Objects.requireNonNullElse(e.getMessage(), "unknown"), false)), false);
+        }
+    }
+
+    private static GuardedExecution abandonExecution(String name, ToolDescriptor descriptor,
+                                                      Object gate, AtomicBoolean abandoned,
+                                                      AtomicBoolean handlerStarted, Thread worker,
+                                                      ToolInvocation invocation, boolean interrupted) {
+        boolean started;
+        synchronized (gate) {
+            abandoned.set(true);
+            started = handlerStarted.get();
+        }
+        worker.interrupt();
+        ToolResult terminal = invocation.result();
+        if (started && descriptor.sideEffect() != ToolSideEffect.READ_ONLY) {
+            terminal = ToolResult.unknown("工具已开始执行但尚未确认退出，禁止自动重试"
+                    + descriptor.recoveryHint(), null);
+            // Preserve the control outcome (so the loop stops), but expose the
+            // unresolved result too. A caller must never treat cancellation or
+            // deadline as a confirmed failure after a side effect started.
+            invocation = new ToolInvocation(invocation.outcome(), name, terminal,
+                    invocation.loopSignal());
+        }
+        return new GuardedExecution(invocation, terminal, interrupted);
     }
 
     private ActionJournalKey journalKey(

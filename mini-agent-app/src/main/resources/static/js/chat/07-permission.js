@@ -148,6 +148,90 @@ function showAskModal(tool, display, grantToken, expiresAt) {
     }
 }
 
+/** 新审批卡附着在当前助手消息中，审批仍然使用服务端一次性 token。 */
+function registerInlineAskCard(card, tool, display, grantToken, expiresAt) {
+    if (pendingAskCard && pendingAskCard !== card) {
+        updateInlineAskCard(pendingAskCard, '此授权请求已被新的请求替代。', 'closed');
+    }
+    clearTimeout(pendingAskExpiryTimer);
+    pendingAskExpiryTimer = null;
+    pendingAskCard = card || null;
+    pendingAskTool = tool || null;
+    pendingAskGrantToken = grantToken || null;
+
+    const labels = { exec_command: '终端命令执行', http_post: '发送 HTTP POST 请求' };
+    const label = labels[tool] || tool || '工具调用';
+    const title = card && card.querySelector('.permission-request-title');
+    const description = card && card.querySelector('.permission-request-detail');
+    const status = card && card.querySelector('.permission-request-status');
+    if (title) title.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.8 20 6v5.5c0 5.1-3.4 8.5-8 10.1-4.6-1.6-8-5-8-10.1V6l8-3.2Zm0 3.1L7 7.8v3.7c0 3.4 1.9 5.8 5 7.2 3.1-1.4 5-3.8 5-7.2V7.8l-5-1.9Zm-1 8.8-2.2-2.2 1.4-1.4 1.1 1.1 2.7-2.8 1.4 1.4-4.4 4.5Z"/></svg><span>需要你的授权</span>';
+    if (description) description.textContent = display
+        ? label + '：' + display
+        : 'Agent 请求「' + label + '」权限以继续当前步骤。';
+    if (status) status.textContent = '允许一次仅限本次调用；始终允许仅对本会话生效。';
+
+    const remaining = expiresAt ? Number(expiresAt) - Date.now() : 0;
+    if (!tool || !grantToken) {
+        pendingAskTool = null;
+        pendingAskGrantToken = null;
+        updateInlineAskCard(card,
+            '授权信息不完整，无法安全批准。请在下一轮重新触发该操作。', 'failed');
+        pendingAskCard = null;
+        return;
+    }
+    if (grantToken && remaining <= 0) {
+        pendingAskTool = null;
+        pendingAskGrantToken = null;
+        updateInlineAskCard(card, '这次授权已过期，Agent 会按未批准继续。需要执行时请在下一轮重新触发。', 'expired');
+        pendingAskCard = null;
+        return;
+    }
+    if (grantToken && remaining > 0) {
+        pendingAskExpiryTimer = setTimeout(() => {
+            if (pendingAskCard !== card) return;
+            pendingAskTool = null;
+            pendingAskGrantToken = null;
+            pendingAskExpiryTimer = null;
+            updateInlineAskCard(card, '授权已过期，Agent 会按未批准继续。需要执行时请在下一轮重新触发。', 'expired');
+            pendingAskCard = null;
+        }, remaining);
+    }
+}
+
+function updateInlineAskCard(card, message, state) {
+    if (!card) return;
+    card.classList.remove('approved', 'denied', 'expired', 'failed', 'closed');
+    if (state) card.classList.add(state);
+    const status = card.querySelector('.permission-request-status');
+    if (status) status.textContent = message || '';
+    const actions = card.querySelector('.permission-request-actions');
+    if (actions) actions.hidden = true;
+}
+
+function completeInlineAskCard(message, state) {
+    const card = pendingAskCard;
+    if (!card) return false;
+    updateInlineAskCard(card, message, state);
+    pendingAskCard = null;
+    return true;
+}
+
+/** 任务进入终态后，一次性授权就失效，清掉计时器、token 和仍可点击的授权卡。 */
+function settlePendingAskOnTerminal(message) {
+    clearTimeout(pendingAskExpiryTimer);
+    pendingAskExpiryTimer = null;
+    pendingAskTool = null;
+    pendingAskGrantToken = null;
+    if (pendingAskCard) {
+        updateInlineAskCard(pendingAskCard, message || '任务已结束，授权请求已失效。', 'closed');
+        pendingAskCard = null;
+    }
+    const modal = document.getElementById('askModal');
+    if (modal) modal.classList.remove('show');
+    if (typeof setAskModalText === 'function') setAskModalText('工具待确认');
+    if (typeof showAskActions === 'function') showAskActions();
+}
+
 function setAskModalText(text) {
     document.getElementById('askModalText').textContent = text;
 }
@@ -171,6 +255,11 @@ function showAskNotice() {
 function dismissAskNotice() {
     clearTimeout(pendingAskExpiryTimer);
     pendingAskExpiryTimer = null;
+    if (pendingAskCard) {
+        updateInlineAskCard(pendingAskCard, '授权请求已关闭。', 'closed');
+        pendingAskCard = null;
+        return;
+    }
     document.getElementById('askModal').classList.remove('show');
     setAskModalText('工具待确认');
     showAskActions();
@@ -178,10 +267,13 @@ function dismissAskNotice() {
 function denyAskTool() {
     const tool = pendingAskTool;
     const grantToken = pendingAskGrantToken;
+    const card = pendingAskCard;
     pendingAskTool = null;
     pendingAskGrantToken = null;
     clearTimeout(pendingAskExpiryTimer);
     pendingAskExpiryTimer = null;
+    pendingAskCard = null;
+    if (card) updateInlineAskCard(card, '已拒绝，Agent 会按未批准处理。', 'denied');
     document.getElementById('askModal').classList.remove('show');
     if (tool && grantToken && currentId) {
         fetch(permissionUrl(), {
@@ -194,6 +286,7 @@ function denyAskTool() {
 async function grantAskTool() {
     const tool = pendingAskTool;
     const grantToken = pendingAskGrantToken;
+    const card = pendingAskCard;
     if (!tool || !grantToken || !currentId) return;
     try {
         const resp = await fetch(permissionUrl(), {
@@ -212,6 +305,8 @@ async function grantAskTool() {
         pendingAskGrantToken = null;
         clearTimeout(pendingAskExpiryTimer);
         pendingAskExpiryTimer = null;
+        pendingAskCard = null;
+        if (card) updateInlineAskCard(card, '已批准，Agent 正在继续执行。', 'approved');
         document.getElementById('askModal').classList.remove('show');
         setAskModalText('工具待确认');
         showAskActions();
@@ -223,6 +318,13 @@ async function grantAskTool() {
         pendingAskTool = null;
         pendingAskGrantToken = null;
         clearTimeout(pendingAskExpiryTimer);
+        pendingAskExpiryTimer = null;
+        pendingAskCard = null;
+        if (card) {
+            updateInlineAskCard(card, '这次批准没有生效：' + e.message
+                + '。Agent 会按未批准继续；需要执行时请在下一轮重新触发。', 'failed');
+            return;
+        }
         setAskModalText('这次批准没有生效：' + e.message
             + '。Agent 会按未批准继续；需要执行时请在下一轮重新触发。');
         document.getElementById('askModal').classList.add('show');
@@ -254,53 +356,93 @@ async function alwaysAllowAskTool() {
         await grantAskTool();
     } catch (e) {
         console.warn('always allow failed', e);
+        if (pendingAskCard) {
+            const status = pendingAskCard.querySelector('.permission-request-status');
+            if (status) status.textContent = '没能记住这个工具：' + e.message
+                + '。仍可批准并继续这一次调用。';
+            return;
+        }
         setAskModalText('没能记住这个工具：' + e.message + '。可以改用「批准并继续」只放行这一次。');
         document.getElementById('askModal').classList.add('show');
         showAskActions();
     }
 }
 
-function showUserQuestionModal(payload) {
-    const q = payload && payload.question ? String(payload.question) : '';
-    const options = Array.isArray(payload && payload.options) ? payload.options : [];
-    document.getElementById('questionModalText').textContent =
-        q || '需要你补充一点信息才能继续。';
-    const box = document.getElementById('questionModalOptions');
-    box.innerHTML = '';
-    options.forEach((opt) => {
-        const label = String(opt || '').trim();
-        if (!label) return;
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'ask-allow';
-        btn.textContent = label;
-        btn.onclick = () => answerUserQuestion(label);
-        box.appendChild(btn);
+function registerUserQuestionCard(card) {
+    activeUserQuestionCard = card || null;
+}
+
+function beginUserQuestionAnswer(card) {
+    if (!card || !card.isConnected || card.classList.contains('answered')) return;
+    card.classList.add('submitting');
+    card.querySelectorAll('button').forEach(button => { button.disabled = true; });
+    const status = card.querySelector('.user-question-status');
+    if (status) status.textContent = '正在提交你的回复…';
+}
+
+function markUserQuestionAnswered(text, card) {
+    const target = card || activeUserQuestionCard;
+    if (!target || !target.isConnected) {
+        if (target === activeUserQuestionCard) activeUserQuestionCard = null;
+        return;
+    }
+    target.classList.add('answered');
+    target.classList.remove('submitting');
+    target.querySelectorAll('button').forEach(button => { button.disabled = true; });
+    const status = target.querySelector('.user-question-status');
+    if (status) status.textContent = '已回复：' + String(text || '');
+    if (target === activeUserQuestionCard) activeUserQuestionCard = null;
+}
+
+function resetUserQuestionCard(card, message) {
+    if (!card || !card.isConnected || card.classList.contains('answered')) return;
+    card.classList.remove('submitting');
+    const hasSelection = !!card.querySelector('.user-question-option.selected');
+    card.querySelectorAll('button').forEach(button => {
+        button.disabled = button.classList.contains('user-question-submit') && !hasSelection;
+        if (button.classList.contains('user-question-submit'))
+            button.setAttribute('aria-disabled', button.disabled ? 'true' : 'false');
     });
-    document.getElementById('questionModal').classList.add('show');
+    const status = card.querySelector('.user-question-status');
+    if (status) status.textContent = message || '回复未发送，请重试。';
+    registerUserQuestionCard(card);
 }
 
-function dismissQuestionModal() {
-    document.getElementById('questionModal').classList.remove('show');
-}
-
-async function answerUserQuestion(text) {
-    dismissQuestionModal();
+async function answerUserQuestion(text, card) {
     if (!text || !currentId) return;
+    const target = card || activeUserQuestionCard;
+    const sessionId = currentId;
+    if (target && target.dataset.sessionId && target.dataset.sessionId !== sessionId) return;
+    beginUserQuestionAnswer(target);
     const deadline = Date.now() + 90000;
     while (isStreaming && Date.now() < deadline) {
         await new Promise(r => setTimeout(r, 150));
     }
-    if (isStreaming) return;
+    if (isStreaming) {
+        if (target) resetUserQuestionCard(target, 'Agent 仍在收尾，请稍后再提交。');
+        return;
+    }
     await new Promise(r => setTimeout(r, 200));
-    if (isStreaming) return;
+    if (currentId !== sessionId || (target && !target.isConnected)) {
+        resetUserQuestionCard(target, '会话已切换，请回到原会话后再回复。');
+        return;
+    }
+    if (isStreaming) {
+        resetUserQuestionCard(target, 'Agent 仍在收尾，请稍后再提交。');
+        return;
+    }
     document.getElementById('welcomeScreen')?.remove();
+    if ($inp && $inp.value.trim() === text) {
+        $inp.value = '';
+        $inp.style.height = 'auto';
+        onInputChange();
+    }
     renderUserMsg(text, null, 0, []);
     addMsgToConv('user', text, null, null);
     const botBody = renderBotMsg(
         '<div class="typing-dots"><span></span><span></span><span></span></div>', true);
     setStreaming(true);
-    sendChatPost(text, currentId, [], [], botBody);
+    sendChatPost(text, sessionId, [], [], botBody, target);
 }
 
 const CONFIRM_LABELS = { dangerous: '需确认', auto: '自动确认' };

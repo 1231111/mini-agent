@@ -41,7 +41,8 @@ public record RunScope(
         ChatModel chatModel,
         StreamingChatModel streamingModel,
         int contextWindowTokens,
-        String projectId
+        String projectId,
+        String executionRunToken
 ) {
     @FunctionalInterface
     public interface Binding extends AutoCloseable {
@@ -79,14 +80,14 @@ public record RunScope(
                 AgentLoop.getCurrentChatModel(),
                 AgentLoop.getCurrentStreamingModel(),
                 EffectiveModelContext.currentContextWindow(),
-                OwnerContext.currentProjectId());
+                OwnerContext.currentProjectId(), TaskExecutionContext.currentRunToken());
     }
 
     public RunScope withSession(String sid) {
         return new RunScope(
                 sid, owner, turnPolicy, permissionMode, confirmPolicy, planApproved, permissionForced,
                 subagent, parentSessionId, role, taskName, writeTask, workspaceRoot,
-                execution, taskId, chatModel, streamingModel, contextWindowTokens, projectId);
+                execution, taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken);
     }
 
     /**
@@ -109,7 +110,7 @@ public record RunScope(
                 mode, confirmPolicy,
                 planApproved, true, true, parent,
                 roleId == null ? "" : roleId, taskName, "out", subWorkspace,
-                null, taskId, chatModel, streamingModel, contextWindowTokens, projectId);
+                null, taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken);
     }
 
     /**
@@ -169,7 +170,7 @@ public record RunScope(
         // 会话标识与工作区根必须同源安装：工具结果里的媒体地址要靠它指回正确的根
         WorkspaceContext.setSessionOverride(sessionId);
         ExecutionTurnContext.set(execution);
-        TaskExecutionContext.set(taskId);
+        TaskExecutionContext.set(taskId, executionRunToken);
         if (chatModel != null || streamingModel != null) {
             // 窗口一并恢复：并行工具/子代理线程上的辅助 LLM 调用与压缩阈值都要用它，
             // 只恢复模型会让"该不该压缩"在这条路径上退回全局常量。

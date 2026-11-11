@@ -1,6 +1,5 @@
 package com.miniagent.application;
 
-import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.core.SessionEventCenter;
 import com.miniagent.config.service.TaskRunService;
 import org.junit.jupiter.api.BeforeEach;
@@ -13,7 +12,6 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -21,31 +19,26 @@ class ChatStreamingServiceTest {
 
     private ChatStreamingService service;
     private SessionEventCenter eventCenter;
-    private ExecutionControl executionControl;
 
     @BeforeEach
     void setUp() {
         eventCenter = mock(SessionEventCenter.class);
-        executionControl = mock(ExecutionControl.class);
         service = new ChatStreamingService();
         ReflectionTestUtils.setField(service, "eventCenter", eventCenter);
         ReflectionTestUtils.setField(service, "taskRunService", mock(TaskRunService.class));
-        ReflectionTestUtils.setField(service, "executionControl", executionControl);
         ReflectionTestUtils.setField(service, "sseTimeoutMs", 45_000L);
         when(eventCenter.attachClient(anyString(), anyLong(), any(SseEmitter.class))).thenReturn(true);
     }
 
     @Test
-    void disconnectBeforeWorkerMarksRunningIsDeliveredAfterLeaseStarts() {
+    void disconnectBeforeWorkerMarksRunningDoesNotCancelTask() {
         SseEmitter emitter = service.createStream("s1", "hello", 7L);
 
-        // Simulate a browser closing the connection before the async worker gets
-        // scheduled. The cancellation must be deferred until markRunning(),
-        // because ExecutionControl.start() replaces any fallback lease.
-        runCompletionCallback(emitter);
+        // A route change or browser disconnect only detaches the client. The
+        // user has a separate explicit cancel action for stopping the worker.
+        emitter.complete();
         service.markRunning("s1");
 
-        verify(executionControl).cancel("s1");
         assertThat(emitter.getTimeout()).isEqualTo(45_000L);
     }
 
@@ -55,9 +48,8 @@ class ChatStreamingServiceTest {
         service.markRunning("s1");
         service.markCompleting("s1");
 
-        runCompletionCallback(emitter);
+        emitter.complete();
 
-        verify(executionControl, never()).cancel(anyString());
     }
 
     @Test
@@ -77,18 +69,12 @@ class ChatStreamingServiceTest {
     }
 
     @Test
-    void repeatedEmitterCallbacksIssueOnlyOneCancellation() {
+    void repeatedEmitterCompletionDoesNotCancelTask() {
         SseEmitter emitter = service.createStream("s1", "hello", 7L);
         service.markRunning("s1");
 
-        runCompletionCallback(emitter);
-        runCompletionCallback(emitter);
+        emitter.complete();
+        emitter.complete();
 
-        verify(executionControl).cancel("s1");
-    }
-
-    private static void runCompletionCallback(SseEmitter emitter) {
-        Object callback = ReflectionTestUtils.getField(emitter, "completionCallback");
-        ReflectionTestUtils.invokeMethod(callback, "run");
     }
 }

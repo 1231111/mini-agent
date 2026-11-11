@@ -18,8 +18,14 @@ public record ToolRequest(
         String probeDeny,
         Set<String> allowedTools,
         boolean waitForApproval,
-        ExecutionTurnContext.ActionBinding actionBinding
+        ExecutionTurnContext.ActionBinding actionBinding,
+        ToolInvocationBudget budget
 ) {
+    public ToolRequest(RunScope scope, String name, String arguments, int turn, String runId,
+                       String probeDeny, Set<String> allowedTools, boolean waitForApproval,
+                       ExecutionTurnContext.ActionBinding actionBinding) {
+        this(scope, name, arguments, turn, runId, probeDeny, allowedTools, waitForApproval, actionBinding, null);
+    }
     public ToolRequest(RunScope scope, String name, String arguments, int turn, String runId,
                        String probeDeny, Set<String> allowedTools, boolean waitForApproval) {
         this(scope, name, arguments, turn, runId, probeDeny, allowedTools, waitForApproval, null);
@@ -59,18 +65,23 @@ public record ToolRequest(
     }
 
     public ToolRequest withProbeDeny(String deny) {
-        return new ToolRequest(scope, name, arguments, turn, runId, deny, allowedTools, waitForApproval, actionBinding);
+        return new ToolRequest(scope, name, arguments, turn, runId, deny, allowedTools, waitForApproval, actionBinding, budget);
     }
 
     public ToolRequest withAllowedTools(Set<String> names) {
-        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, names, waitForApproval, actionBinding);
+        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, names, waitForApproval, actionBinding, budget);
     }
 
     public ToolRequest withApprovalWait() {
-        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, allowedTools, true, actionBinding);
+        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, allowedTools, true, actionBinding, budget);
     }
 
     public ToolRequest withActionBinding(ExecutionTurnContext.ActionBinding binding) {
-        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, allowedTools, waitForApproval, binding);
+        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, allowedTools, waitForApproval, binding, budget);
+    }
+
+    public ToolRequest withExecutionBudget(long timeoutSeconds) {
+        return new ToolRequest(scope, name, arguments, turn, runId, probeDeny, allowedTools, waitForApproval,
+                actionBinding, new ToolInvocationBudget(timeoutSeconds));
     }
 }

@@ -9,10 +9,10 @@
         (function () {
             try {
                 var t = localStorage.getItem('mini_agent_theme');
-                if (!t) t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+                if (!t) t = 'light';
                 document.documentElement.setAttribute('data-theme', t);
             } catch (e) {
-                document.documentElement.setAttribute('data-theme', 'dark');
+                document.documentElement.setAttribute('data-theme', 'light');
             }
         })();
     </script>
@@ -126,14 +126,52 @@
 
 <!-- ===================== SIDEBAR — 历史对话 ===================== -->
 <div class="sidebar" id="sidebar">
-    <div class="sb-history-head">
-        <span class="sb-history-title">历史对话</span>
-        <button type="button" class="sb-icon-btn" onclick="startNewChat()" title="新会话">
-            <svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                 stroke-linejoin="round" viewBox="0 0 24 24">
-                <path d="M12 5v14M5 12h14"/>
+    <div class="sb-brand">
+        <div class="sb-brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32" fill="none">
+                <path d="M6 21.5 11.2 10l5 12 4.3-9.4 5.5 8.9" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+                <circle cx="25.5" cy="9" r="2" fill="currentColor"/>
             </svg>
+        </div>
+        <div class="sb-brand-copy"><strong>MiniAgent</strong><span>智能体工作台</span></div>
+    </div>
+
+    <button type="button" class="sb-new" onclick="startNewChat()" title="新建任务">
+        <svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 5v14M5 12h14"/>
+        </svg>
+        <span>新建任务</span>
+    </button>
+
+    <nav class="sb-nav" aria-label="主导航">
+        <a class="sb-nav-item active" href="/" title="对话">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H8l-5 3 1.2-4.2A8.5 8.5 0 1 1 21 11.5z"/><path d="M8 11h8M8 15h5"/></svg>
+            <span>对话</span>
+        </a>
+        <a class="sb-nav-item" href="/trace" title="任务中心">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/><circle cx="19" cy="18" r="2"/></svg>
+            <span>任务中心</span>
+        </a>
+        <a class="sb-nav-item" href="/memory" title="记忆与偏好">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4a3 3 0 0 0-3 3v1a3 3 0 0 0 0 6v1a3 3 0 0 0 6 0v-1a3 3 0 0 0 0-6V7a3 3 0 0 0-3-3z"/><path d="M12 4v16"/></svg>
+            <span>记忆与偏好</span>
+        </a>
+        <a class="sb-nav-item" href="/apps" title="应用连接">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+            <span>应用连接</span>
+        </a>
+        <a class="sb-nav-item" href="/knowledge" title="知识库">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H19v18H6.5A2.5 2.5 0 0 1 4 18.5z"/><path d="M8 3v18M11 8h5M11 12h5"/></svg>
+            <span>知识库</span>
+        </a>
+        <button type="button" class="sb-nav-item" onclick="openSettings()" title="设置">
+            <svg fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9"/></svg>
+            <span>设置</span>
         </button>
+    </nav>
+
+    <div class="sb-history-head">
+        <span class="sb-history-title">最近对话</span>
         <button type="button" class="sb-icon-btn sb-toggle" id="sidebarToggle"
                 onclick="toggleSidebar()" title="收起侧栏">
             <svg class="icon-collapse" fill="none" stroke="currentColor" stroke-width="2"
@@ -203,26 +241,47 @@
     <div class="sb-history" id="sbHistory"></div>
 
     <div class="sb-footer">
-        <div class="sb-user" onclick="openSettings()" title="设置">
+        <div class="sb-user">
             <div class="sb-user-avatar">👤</div>
             <span class="sb-user-name" id="sbUserName">用户</span>
-            <button type="button" class="sb-settings-btn">设置</button>
         </div>
     </div>
 </div>
 
+<button type="button" class="sidebar-backdrop" id="sidebarBackdrop" hidden
+        onclick="toggleSidebar()" aria-label="关闭导航"></button>
+
 <!-- ===================== MAIN ===================== -->
 <div class="main">
 
-    <!-- 窄屏时右侧栏被隐藏，用这个按钮把它拉出来（宽屏下 display:none） -->
-    <button type="button" class="inspector-toggle" id="inspectorToggle"
-            onclick="toggleInspector()" title="任务执行详情">
-        <svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
-             stroke-linejoin="round" viewBox="0 0 24 24">
-            <rect x="3" y="4" width="18" height="16" rx="2"/>
-            <path d="M15 4v16"/>
-        </svg>
-    </button>
+    <header class="conversation-header">
+        <div class="conversation-heading">
+            <button type="button" class="conversation-menu" onclick="toggleSidebar()" title="打开导航" aria-label="打开导航">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+            </button>
+            <span class="conversation-eyebrow">当前会话</span>
+            <h1 class="conversation-title" id="conversationTitle">新对话</h1>
+            <span class="conversation-status" id="conversationStatus"><i></i><span>准备就绪</span></span>
+        </div>
+        <div class="conversation-actions">
+            <button type="button" class="task-pause-btn" id="taskPauseBtn" hidden
+                    onclick="toggleTaskPause()" title="暂停当前任务">
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <path d="M8 5h3v14H8zM15 5h3v14h-3z"/>
+                </svg>
+                <span id="taskPauseLabel">暂停任务</span>
+            </button>
+            <button type="button" class="inspector-toggle" id="inspectorToggle" hidden
+                    onclick="toggleInspector()" title="任务执行详情" aria-label="展开任务执行详情">
+                <svg fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                     stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="3" y="4" width="18" height="16" rx="2"/>
+                    <path d="M15 4v16"/>
+                </svg>
+                <span>执行详情</span>
+            </button>
+        </div>
+    </header>
 
     <!-- 顶部任务条：随滚动切换到当前视口所属的用户任务 -->
     <div class="task-pin" id="taskPin" onclick="taskPinJump()" title="点击定位到该任务">
@@ -290,7 +349,7 @@
                           onkeydown="handleKey(event)" oninput="onInputChange()"></textarea>
                 <div class="input-toolbar">
                     <div class="input-left">
-                        <input type="file" id="fileInput" accept="image/*,audio/*,video/*,.mp3,.wav,.flac,.m4a,.ogg,.mp4,.mov,.avi,.wmv,.pdf,.docx,.pptx,.xlsx,.txt,.csv,.json,.md,.markdown,.xml,.html,.js,.py,.java" multiple style="display:none"
+                        <input type="file" id="fileInput" accept="image/*,audio/*,video/*,.mp3,.wav,.flac,.m4a,.ogg,.mp4,.mov,.avi,.wmv,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.txt,.text,.log,.csv,.tsv,.json,.jsonl,.md,.markdown,.rst,.html,.htm,.xhtml,.xml,.xsd,.xsl,.xslt,.svg,.css,.scss,.less,.js,.mjs,.cjs,.jsx,.ts,.tsx,.vue,.py,.ipynb,.java,.kt,.kts,.go,.rs,.c,.h,.cc,.cpp,.hpp,.cs,.php,.rb,.swift,.sql,.sh,.bash,.zsh,.bat,.cmd,.ps1,.yaml,.yml,.toml,.ini,.conf,.properties,.env,.zip,.7z,.tar,.gz" multiple style="display:none"
                                onchange="onFileSelected(event)">
                         <button class="in-tool-btn" id="imgBtn" title="上传图片或文档（pdf/docx/pptx/xlsx/md…）"
                                 onclick="document.getElementById('fileInput').click()">
@@ -447,11 +506,11 @@
 
 <!-- ===================== INSPECTOR — 右侧检查器 =====================
      数据全部来自真实接口（14a-inspector.js）：
-       · 任务执行详情  /api/conversations/{sid}/executions + /api/executions/{id}/steps
+       · 执行步骤      /api/conversations/{sid}/todos（优先）+ 真实轨迹回退
        · 执行工具      同一份 steps 聚合去重
        · 记忆与知识    /api/shell/memory-insights
        · 系统状态      /api/shell/status
-     没有任何一块是写死的占位数字；拿不到数据就显式说"暂无"。 -->
+     时间戳只在轨迹有真实记录时显示；拿不到数据就显示明确的空状态。 -->
 <aside class="inspector" id="inspector">
     <div class="inspector-head">
         <span class="inspector-title">任务执行详情</span>
@@ -463,8 +522,8 @@
                 aria-label="收起执行详情" onclick="toggleInspector(false)">×</button>
     </div>
 
-    <div class="insp-section">
-        <div class="insp-head">执行步骤<a href="/trace" target="_self">查看全部</a></div>
+    <div class="insp-section insp-section--timeline">
+        <div class="insp-head"><span class="insp-head-icon icon-timeline" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="12" r="2"/><circle cx="6" cy="19" r="2"/><path d="M11 5h9M11 12h9M11 19h9"/></svg></span>任务执行状态<a href="/trace" target="_self">查看全部 <span aria-hidden="true">›</span></a></div>
         <div class="insp-steps" id="inspSteps">
             <div class="insp-empty">当前会话还没有执行记录。发一条消息后这里会实时显示每一步。</div>
         </div>
@@ -473,26 +532,51 @@
         </div>
     </div>
 
-    <div class="insp-section">
-        <div class="insp-head">执行工具<a href="/apps" target="_self">查看全部</a></div>
-        <div class="insp-tools" id="inspTools">
-            <div class="insp-empty">本次任务尚未调用工具。</div>
+    <div class="insp-section insp-section--details">
+        <div class="insp-head"><span class="insp-head-icon icon-details" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3h8l5 5v13H7a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3z"/><path d="M14 3v6h6M9 13h7M9 17h7"/></svg></span>任务详情<a href="/trace" target="_self">查看执行过程 <span aria-hidden="true">›</span></a></div>
+        <div class="insp-task-details" id="inspTaskDetails">
+            <div class="insp-empty">发起任务后显示实际执行信息。</div>
         </div>
     </div>
 
-    <div class="insp-section">
-        <div class="insp-head">记忆与知识<a href="/memory" target="_self">查看全部</a></div>
+    <div class="insp-section insp-section--memory">
+        <div class="insp-head"><span class="insp-head-icon icon-memory" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4a3 3 0 0 0-3 3v1a3 3 0 0 0 0 6v1a3 3 0 0 0 6 0v-1a3 3 0 0 0 0-6V7a3 3 0 0 0-3-3z"/><path d="M12 4v16"/></svg></span>记忆信息<a href="/memory" target="_self">查看全部 <span aria-hidden="true">›</span></a></div>
         <div class="insp-kv" id="inspMemory">
             <div class="insp-empty">加载中…</div>
         </div>
     </div>
 
-    <div class="insp-section">
-        <div class="insp-head">系统状态</div>
+    <div class="insp-section insp-section--tools">
+        <div class="insp-head"><span class="insp-head-icon icon-tools" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m14.7 6.3 3-3a5 5 0 0 1-6.6 6.6l-7.7 7.7a2.1 2.1 0 0 0 3 3l7.7-7.7a5 5 0 0 1 6.6-6.6l-3 3-3-3z"/></svg></span>本次工具<a href="/apps" target="_self">查看全部 <span aria-hidden="true">›</span></a></div>
+        <div class="insp-tools" id="inspTools">
+            <div class="insp-empty">本次任务尚未调用工具。</div>
+        </div>
+    </div>
+
+    <div class="insp-section insp-section--quick-actions">
+        <div class="insp-head"><span class="insp-head-icon icon-quick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3z"/><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15z"/></svg></span>快捷操作</div>
+        <div class="insp-quick-grid">
+            <button type="button" class="insp-quick-action" onclick="document.getElementById('fileInput').click()" title="添加图片或文件">
+                <span class="insp-quick-icon quick-file" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg></span><span>添加文件</span>
+            </button>
+            <button type="button" class="insp-quick-action" onclick="openWorkspacePicker()" title="选择工作目录">
+                <span class="insp-quick-icon quick-folder" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></span><span>工作目录</span>
+            </button>
+            <a class="insp-quick-action" href="/knowledge" title="查看知识库">
+                <span class="insp-quick-icon quick-knowledge" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v18H6.5A2.5 2.5 0 0 1 4 18.5z"/><path d="M8 3v18M12 8h5M12 12h5"/></svg></span><span>知识库</span>
+            </a>
+        </div>
+    </div>
+
+    <details class="insp-runtime-card">
+        <summary>
+            <span>运行环境</span>
+            <span class="insp-system-state"><i class="insp-system-dot" id="inspSystemStateDot"></i><span id="inspSystemStateText">运行正常</span></span>
+        </summary>
         <div class="insp-kv" id="inspStatus">
             <div class="insp-empty">加载中…</div>
         </div>
-    </div>
+    </details>
 </aside>
 
 <!-- Lightbox -->
@@ -532,19 +616,6 @@
              留一个点了没反应的「批准并继续」比不给按钮更糟。 -->
         <div class="ask-actions" id="askNoticeActions" style="display: none">
             <button type="button" class="ask-allow" onclick="dismissAskNotice()">知道了</button>
-        </div>
-    </div>
-</div>
-
-<div class="ask-modal-backdrop" id="questionModal">
-    <div class="ask-modal">
-        <h3>需要你补充信息</h3>
-        <p id="questionModalText">请选择或回复</p>
-        <div class="question-options" id="questionModalOptions"></div>
-        <div class="ask-actions">
-            <button type="button" class="ask-deny" onclick="dismissQuestionModal()">
-                稍后在输入框回答
-            </button>
         </div>
     </div>
 </div>

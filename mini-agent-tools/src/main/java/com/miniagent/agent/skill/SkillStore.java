@@ -8,6 +8,7 @@ import org.slf4j.LoggerFactory;
 import org.yaml.snakeyaml.Yaml;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
@@ -29,7 +30,20 @@ import java.util.stream.Stream;
  */
 public class SkillStore {
 
+    public enum SkillFileStatus { FOUND, NOT_FOUND, PATH_REJECTED, READ_FAILED }
+    public record SkillFileResult(SkillFileStatus status, String content) {}
+
     private static final Logger log = LoggerFactory.getLogger(SkillStore.class);
+
+    /** Skills shipped by MiniAgent. Each is copied only on first install and never overwrites user edits. */
+    private static final Map<String, String> BUNDLED_SKILLS = Map.of(
+            "web-research", "builtin-skills/web-research/SKILL.md",
+            "ai-news-briefing", "builtin-skills/ai-news-briefing/SKILL.md",
+            "document-authoring", "builtin-skills/document-authoring/SKILL.md",
+            "codebase-analysis", "builtin-skills/codebase-analysis/SKILL.md",
+            "browser-workflow", "builtin-skills/browser-workflow/SKILL.md",
+            "travel-search", "builtin-skills/travel-search/SKILL.md"
+    );
 
     private final Path skillsDir;
 
@@ -40,7 +54,43 @@ public class SkillStore {
     public SkillStore(Path skillsDir) {
         this.skillsDir = skillsDir;
         ensureDir(skillsDir);
+        installBundledSkills();
         log.info("SkillStore initialized: skillsDir={}", skillsDir);
+    }
+
+    /**
+     * Seed the starter skills into a fresh data directory. A marker is retained after a skill is
+     * first considered so deleting a built-in skill stays deleted; existing skills are never replaced.
+     */
+    private void installBundledSkills() {
+        Path stateDir = skillsDir.resolve(".builtin-state");
+        for (Map.Entry<String, String> entry : BUNDLED_SKILLS.entrySet()) {
+            String name = entry.getKey();
+            Path marker = stateDir.resolve(name + ".seeded");
+            if (Files.exists(marker)) continue;
+
+            try {
+                Path skillDir = PathGuard.resolveInside(skillsDir, "bundled skill install", name);
+                Path skillFile = skillDir.resolve("SKILL.md");
+                if (!Files.exists(skillFile)) {
+                    try (InputStream source = SkillStore.class.getClassLoader()
+                            .getResourceAsStream(entry.getValue())) {
+                        if (source == null) {
+                            log.warn("Bundled skill resource missing: {}", entry.getValue());
+                            continue;
+                        }
+                        Files.createDirectories(skillDir);
+                        Files.copy(source, skillFile);
+                    }
+                }
+                Files.createDirectories(stateDir);
+                Files.writeString(marker, "seeded\n", StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            } catch (IOException | SecurityException | IllegalArgumentException e) {
+                // Optional defaults must not prevent the agent from starting or hide custom skills.
+                log.warn("Unable to install bundled skill {}: {}", name, e.getMessage());
+            }
+        }
     }
 
     public Path getSkillsDir() {
@@ -87,9 +137,19 @@ public class SkillStore {
     }
 
     public String viewSkillFile(String name, String relativePath) {
+        SkillFileResult result = readSkillFile(name, relativePath);
+        return switch (result.status()) {
+            case FOUND -> result.content();
+            case PATH_REJECTED -> "Error: path traversal";
+            case NOT_FOUND, READ_FAILED -> null;
+        };
+    }
+
+    /** Typed variant for callers that must distinguish file text from legacy error sentinels. */
+    public SkillFileResult readSkillFile(String name, String relativePath) {
         Path skillDir = findSkillDir(name);
         if (Objects.isNull(skillDir)) {
-            return null;
+            return new SkillFileResult(SkillFileStatus.NOT_FOUND, null);
         }
         // 这里要支持多级（references/x.md），所以逐段过闸而不是整串判断：
         // 旧实现只做词法 startsWith，挡得住 `..` 但挡不住"技能包里放一个指向外部的 junction"。
@@ -98,16 +158,17 @@ public class SkillStore {
             target = PathGuard.resolveRelative(skillDir, "skill file read", relativePath);
         } catch (SecurityException | IllegalArgumentException e) {
             log.warn("拒绝读取技能包内文件 {}/{}: {}", name, relativePath, e.getMessage());
-            return "Error: path traversal";
+            return new SkillFileResult(SkillFileStatus.PATH_REJECTED, null);
         }
         if (!Files.exists(target)) {
-            return null;
+            return new SkillFileResult(SkillFileStatus.NOT_FOUND, null);
         }
         try {
-            return Files.readString(target, StandardCharsets.UTF_8);
+            return new SkillFileResult(SkillFileStatus.FOUND,
+                    Files.readString(target, StandardCharsets.UTF_8));
         } catch (IOException e) {
             log.error("Read skill file failed: {}/{}", name, relativePath, e);
-            return null;
+            return new SkillFileResult(SkillFileStatus.READ_FAILED, null);
         }
     }
 

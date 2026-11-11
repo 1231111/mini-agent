@@ -1691,12 +1691,26 @@ public class TaskTodoStore {
                 row.put("id", it.id());
                 row.put("content", it.content());
                 row.put("status", it.status().name());
+                row.put("note", it.note());
+                row.put("evidence", it.evidence());
                 payload.add(row);
             }
             eventCenter.publishTodo(sessionId, payload);
         } catch (Exception e) {
             log.debug("todo UI 推送跳过: {}", e.getMessage());
         }
+    }
+
+    /**
+     * 在新一轮聊天 SSE 建立后重放当前作用域的任务清单。
+     *
+     * <p>清单可能来自上一轮或持久化存储；若本轮没有调用 todo 工具，新的 SSE 通道
+     * 不会收到任何 {@code todo} 事件，导致右侧检查器有任务、聊天气泡却没有进度卡片。</p>
+     */
+    public synchronized void publishCurrentState(String sessionId) {
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        publishTodoUi(sessionOf(key), todos.getOrDefault(key, List.of()));
     }
 
     private static String nullToEmpty(String s) {

@@ -23,8 +23,19 @@ async function checkAndPollTask(sid) {
         if (!resp.ok) return;
         const status = await apiJson(resp) || {};
         if (status.running) {
+            taskIsActive = true;
+            taskRunningSessionId = sid;
+            taskPauseRequested = status.pauseRequested === true;
+            taskPausedAtCheckpoint = status.pausedAtCheckpoint === true;
+            if (typeof syncTaskControlButton === 'function') syncTaskControlButton();
             // 任务正在运行 → 重连事件流，先回放已产出内容，再继续实时跟到结束
             await reconnectStream(sid);
+        } else if (taskRunningSessionId === sid) {
+            taskIsActive = false;
+            taskRunningSessionId = null;
+            taskPauseRequested = false;
+            taskPausedAtCheckpoint = false;
+            if (typeof syncTaskControlButton === 'function') syncTaskControlButton();
         }
     } catch (e) {
         console.warn('checkAndPollTask failed:', e);
@@ -46,6 +57,7 @@ async function reconnectStream(sid) {
         }
         const epoch = ++streamEpoch;
         setStreaming(true);
+        if (typeof refreshTaskPauseState === 'function') refreshTaskPauseState(sid);
         const botBody = renderBotMsg('<div class="typing-dots"><span></span><span></span><span></span></div>', true);
         await consumeStream(resp.body.getReader(), botBody, sid);
         if (isStreaming && epoch === streamEpoch) unlockComposer();
@@ -68,7 +80,10 @@ function renderUserEchoIfNeeded(botBody, text) {
     const row = document.createElement('div');
     row.className = 'msg-row user-row';
     row.innerHTML = '<div class="msg-inner"><div class="user-bubble">'
-        + esc(text).replace(/\n/g, '<br>') + '</div></div>';
+        + esc(text).replace(/\n/g, '<br>')
+        + '</div><div class="user-avatar" aria-label="用户"><svg viewBox="0 0 24 24" aria-hidden="true">'
+        + '<path d="M12 12a4.2 4.2 0 1 0 0-8.4A4.2 4.2 0 0 0 12 12Zm0 2.1c-4.3 0-7.8 2.2-7.8 4.9v1h15.6v-1c0-2.7-3.5-4.9-7.8-4.9Z"/>'
+        + '</svg></div></div>';
     insertAt($msg, row, botRow);
 }
 
@@ -80,7 +95,7 @@ function showTaskRunningHint(sid) {
     hint.id = 'task-running-hint';
     hint.className = 'msg-row bot-row';
     hint.innerHTML = `<div class="msg-inner">
-        <div class="bot-avatar">🤖</div>
+        <div class="bot-avatar" aria-label="MiniAgent"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="ai-mark" d="M12 2.5 14.25 9.75 21.5 12l-7.25 2.25L12 21.5l-2.25-7.25L2.5 12l7.25-2.25L12 2.5Z"/><path d="M19.5 3.5v4M17.5 5.5h4M5 17v4M3 19h4"/></svg></div>
         <div class="bot-content">
             <div class="bot-body">
                 <div class="typing-dots"><span></span><span></span><span></span></div>
@@ -103,6 +118,13 @@ function startPolling(sid) {
             const resp = await fetch('/api/conversations/' + encodeURIComponent(sid) + '/task');
             const status = await apiJson(resp) || {};
             if (!status.running) {
+                if (taskRunningSessionId === sid) {
+                    taskIsActive = false;
+                    taskRunningSessionId = null;
+                    taskPauseRequested = false;
+                    taskPausedAtCheckpoint = false;
+                    if (typeof syncTaskControlButton === 'function') syncTaskControlButton();
+                }
                 stopPolling(sid);
                 unlockComposer();
                 if (sid === currentId) await switchConv(sid, true);
@@ -110,7 +132,7 @@ function startPolling(sid) {
         } catch (e) {
             console.warn('poll error:', e);
         }
-    }, 2000);  // 每2秒轮询一次
+    }, 10000);  // SSE 不可用时低频检查，限制页面与网络负载
 }
 
 function stopPolling(sid) {

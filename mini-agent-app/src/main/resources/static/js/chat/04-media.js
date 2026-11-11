@@ -50,6 +50,7 @@ function addFile(file) {
     // 2. 添加到文件列表
     const idx = selectedFiles.length;
     selectedFiles.push(file);
+    previewSrcs[idx] = null;
     
     // 3. 根据文件类型处理
     if (file.type.startsWith('image/')) {
@@ -71,7 +72,9 @@ function addFile(file) {
 function previewImageFile(file) {
     const reader = new FileReader();
     reader.onload = ev => {
-        previewSrcs.push(ev.target.result);
+        const currentIndex = selectedFiles.indexOf(file);
+        if (currentIndex < 0) return;
+        previewSrcs[currentIndex] = ev.target.result;
         renderImgPreview();
     };
     reader.readAsDataURL(file);
@@ -81,7 +84,6 @@ function previewImageFile(file) {
  * 预览非图片文件（音视频）
  */
 function previewNonImageFile() {
-    previewSrcs.push(null);
     renderImgPreview();
     uploadingCount++;
     updateSendButton();
@@ -141,8 +143,12 @@ async function ensureSessionId() {
         throw new Error('create conversation returned no sessionId');
     }
     currentId = sid;
+    if (typeof syncConversationHeader === 'function') syncConversationHeader();
     localStorage.setItem(LS_CUR, sid);
     renderSidebar();
+    // 首次发送会直接创建会话，不经过 switchConv()；同步切换右侧检查器，
+    // 让步骤快照和 traces SSE 从这条新会话开始跟踪。
+    if (typeof scheduleInspectorRefresh === 'function') scheduleInspectorRefresh();
     // 新会话没有会话级覆盖，但要把"全局默认"和"最终生效"拉回来渲染按钮。
     await refreshExecPolicyView();
     return sid;

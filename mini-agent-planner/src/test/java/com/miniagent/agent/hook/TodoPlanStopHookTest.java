@@ -28,6 +28,16 @@ class TodoPlanStopHookTest {
     }
 
     @Test
+    void deliveredMediaDoesNotBypassUnfinishedTaskNodes() {
+        StopContext context = new StopContext(
+                "s", "image generated", 1, 8, Set.of("image_generate"), false, true, false,
+                PermissionMode.DEFAULT, true, false, true, true, 0,
+                "1. completed: generate cover\n2. pending: write report");
+
+        assertEquals(StopDecision.Action.BLOCK_RETRY, hook.evaluate(context).action());
+    }
+
+    @Test
     void directIncompleteGivesUpAfterNudges() {
         StopDecision d = hook.evaluate(ctx(false, true, true, TodoPlanStopHook.MAX_NUDGES));
         assertTrue(d.isProceed());

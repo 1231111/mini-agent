@@ -11,6 +11,7 @@ import org.springframework.beans.factory.annotation.Value;
 import com.miniagent.agent.delegate.SubagentContext;
 import com.miniagent.agent.execution.ToolExecutionGuards;
 import com.miniagent.agent.execution.ToolInvocation;
+import com.miniagent.agent.execution.ToolInvocationBudget;
 import com.miniagent.agent.execution.ToolPipeline;
 import com.miniagent.agent.execution.ToolRequest;
 import com.miniagent.agent.hook.StopContext;
@@ -141,10 +142,29 @@ public class AgentLoop {
     private static final int FAIL_REPEAT_ABORT = 3;
 
     public record LoopOutcome(String text, String endReason, List<ChatMessage> messages,
-                              List<String> toolsInvoked, ToolErrorCode lastErrorCode) {
+                              List<String> toolsInvoked, ToolErrorCode lastErrorCode,
+                              ToolResult lastToolResult) {
+        public LoopOutcome(String text, String endReason, List<ChatMessage> messages,
+                           List<String> toolsInvoked, ToolErrorCode lastErrorCode) {
+            this(text, endReason, messages, toolsInvoked, lastErrorCode, null);
+        }
+
         public LoopOutcome {
             toolsInvoked = toolsInvoked == null ? List.of() : List.copyOf(toolsInvoked);
             lastErrorCode = lastErrorCode == null ? ToolErrorCode.NONE : lastErrorCode;
+        }
+
+        public boolean successful() {
+            return RunStatus.SUCCESS.name().equals(endReason) && StringUtils.isNotBlank(text)
+                    && (lastToolResult == null || lastToolResult.isSuccess());
+        }
+
+        public boolean awaitingHuman() {
+            return PERM_ASK.equals(endReason) || USER_QUESTION.equals(endReason);
+        }
+
+        public boolean cancelled() {
+            return CANCELLED.equals(endReason) || RunStatus.CANCELED.name().equals(endReason);
         }
     }
     /** 虚拟线程池：工具并行执行专用，IO 密集型任务零开销 */
@@ -513,10 +533,9 @@ public class AgentLoop {
         int currentTurn = 0;  // 当前迭代轮次，供工具执行路径使用
         final Set<String> toolsInvoked = new LinkedHashSet<>();
         ToolErrorCode lastErrorCode = ToolErrorCode.NONE;
+        ToolResult lastToolResult;
         boolean writeFileSucceeded = false;
         boolean mediaDelivered = false;
-        boolean mediaReminderSent = false;
-        int mediaIgnoreCount = 0;
         String lastMediaResult = null;
         boolean imageGenerateUnavailable = false;
         boolean fileReminderSent = false; // 是否已注入过一次性文件落盘提醒
@@ -549,20 +568,29 @@ public class AgentLoop {
         volatile Set<String> allowedToolsForTurn = Set.of();
 
         void noteStructuredResult(String toolName, ToolResult result) {
-            if (result == null || result.status() != com.miniagent.agent.tool.ToolStatus.UNKNOWN) {
+            if (result == null) {
                 return;
             }
-            // 页面操作超时后可以 snapshot 核验，不必把整条任务打死
-            if (ToolConcurrencyPolicy.isOutcomeVerifiable(toolName)) {
-                return;
+            boolean unknown = result.status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN;
+            // UNKNOWN means verification has not happened. A tool's ability to be
+            // observed later cannot turn its current unknown outcome into a retry.
+            if (unknown) {
+                unknownOutcome = true;
+                unknownOutcomeMessage = Objects.requireNonNullElse(result.message(), "");
             }
-            unknownOutcome = true;
-            unknownOutcomeMessage = Objects.requireNonNullElse(result.message(), "");
+            // Todo bookkeeping must not hide a failed real action. Once UNKNOWN
+            // is observed, collecting other in-flight results cannot clear it.
+            if ((!unknownOutcome || unknown)
+                    && (!com.miniagent.agent.tool.CapabilityRegistry.FALLBACK_TOOL.equals(toolName)
+                    || lastToolResult == null || !result.isSuccess())) {
+                lastToolResult = result;
+                lastErrorCode = result.errorCode();
+            }
         }
 
-        void noteToolFinished(String name, String args, String result) {
+        void noteToolFinished(String name, String args, ToolResult result) {
             String key = name + "|" + (args == null ? "" : args);
-            if (TraceRecorder.isFailedResult(result))
+            if (!result.isSuccess() && result.status() != ToolStatus.AWAITING_USER)
                 failDupCounter.merge(key, 1, Integer::sum);
             else
                 failDupCounter.remove(key);
@@ -605,12 +633,19 @@ public class AgentLoop {
     }
 
     private static LoopOutcome finish(String text, LoopState state, List<ChatMessage> messages) {
+        String reason = state.loopEndReason;
+        if (RunStatus.SUCCESS.name().equals(reason) && state.lastToolResult != null
+                && !state.lastToolResult.isSuccess()) {
+            reason = RunStatus.FAILURE.name();
+        }
+        state.loopEndReason = reason;
         return new LoopOutcome(
                 text == null ? "" : text,
-                state.loopEndReason,
+                reason,
                 messages,
                 List.copyOf(state.toolsInvoked),
-                state.lastErrorCode);
+                state.lastErrorCode,
+                state.lastToolResult);
     }
 
     // ==================== executeLoop ====================
@@ -697,7 +732,9 @@ public class AgentLoop {
                 messages.add(new SystemMessage(
                         "【任务目标锚定】本轮 taskGoal：" + taskGoal
                                 + "\n所有工具调用与计划步骤必须服务该目标；禁止跑去处理无关需求。"
-                                + "若需修订目标，等用户明确追加指令后再改 todo。"));
+                                + "若需修订目标，等用户明确追加指令后再改 todo。"
+                                + "涉及今天/今日/昨天等相对日期时，必须遵循上方系统提示中的日期锚点，"
+                                + "将日期展开后再搜索；不能用训练日期或模型记忆中的日期替代。"));
                 state.goalAnchorInjected = true;
             }
             if (turn == 0 && LoopTurnContext.current().hardGate()) {
@@ -930,7 +967,7 @@ public class AgentLoop {
                 if (state.lengthTruncationCount >= 4) {
                     log.warn("连续 {} 次长度截断仍未完成，终止避免空转", state.lengthTruncationCount);
                     if (state.writeFileSucceeded) {
-                        state.loopEndReason = RunStatus.SUCCESS.name();
+                        state.loopEndReason = RunStatus.FAILURE.name();
                         return finish("内容较长、多次写入后仍超出单轮输出上限。已写入的部分见 workspace/，建议把需求拆成更小的文件分别生成。",
                                 state, messages);
                     }
@@ -1017,28 +1054,9 @@ public class AgentLoop {
                             + "把上次没写完的剩余内容分多次追加到同一文件，每次片段不要太长，直到整份文件写完。"));
                 }
 
-                // 媒体已交付后，如果 LLM 还在调非输出工具，强制提醒或终止
-                if (state.mediaDelivered) {
-                    boolean hasNonOutputTool = toolCalls.stream()
-                            .anyMatch(tc -> {
-                                String name = toolNameOf(tc);
-                                return !"image_generate".equals(name)
-                                        && !SongGenerateParams.TOOL_NAME.equals(name);
-                            });
-                    if (hasNonOutputTool) {
-                        state.mediaReminderSent = true;
-                        state.mediaIgnoreCount++;
-                        log.info("媒体已交付但 LLM 还在调其他工具，第 {} 次忽略提醒", state.mediaIgnoreCount);
-                        if (state.mediaIgnoreCount >= 1) {
-                            log.warn("LLM 连续忽略 {} 次提醒，强制结束循环", state.mediaIgnoreCount);
-                            state.loopEndReason = "MEDIA_ABORT";
-                            return finish(Optional.ofNullable(state.lastMediaResult)
-                                    .orElse("图片已生成。"), state, messages);
-                        }
-                        messages.add(new SystemMessage(
-                                "图片已经生成完毕，不要再调用任何工具，直接输出 markdown 图片链接给用户。"));
-                    }
-                }
+                // A media artifact can be one part of the user's goal. Later
+                // research, document writing and validation use the same normal
+                // loop budgets and failure guards as every other task.
 
                 // 预算与压缩已移到每轮请求前（见上方「每次请求前压缩」）：
                 // 放在这里只有一个后果 —— 首包带着未压缩的长历史发出去，压缩永远慢一拍。
@@ -1070,7 +1088,8 @@ public class AgentLoop {
                 if (Objects.nonNull(traceRecorder)) {
                     traceRecorder.recordAnswer(sessionId, turn, result);
                 }
-                state.loopEndReason = RunStatus.SUCCESS.name();
+                state.loopEndReason = !LoopTurnContext.current().hardGate() && hasBlockingTodos(sessionId)
+                        ? "INCOMPLETE_TODO" : RunStatus.SUCCESS.name();
                 return finish(result, state, messages);
             }
             // tryReturnFinalText 注入了提醒，继续循环
@@ -1349,13 +1368,13 @@ public class AgentLoop {
         if (invocation == null) {
             return "";
         }
+        // Control-stop results may also carry an unknown side-effect outcome.
+        state.noteStructuredResult(invocation.toolName(), invocation.result());
         switch (invocation.outcome()) {
             case GATE_DENIED -> state.noteGateDenied(invocation.toolName());
             case PERMISSION_ASK -> state.permissionAskTool = invocation.toolName();
             case USER_QUESTION -> state.userQuestionText = invocation.loopSignal();
-            case EXECUTED -> state.noteStructuredResult(
-                    invocation.toolName(), invocation.result());
-            case POLICY_DENIED, PERMISSION_DENIED, CONTROL_STOP, FENCE_REJECTED -> {
+            case EXECUTED, POLICY_DENIED, PERMISSION_DENIED, CONTROL_STOP, FENCE_REJECTED -> {
             }
         }
         return invocation.text();
@@ -1724,6 +1743,7 @@ public class AgentLoop {
         } else {
             for (var tc : toolCalls) {
                 executeToolCallSingle(tc, messages, state, bindings.get(toolIdOf(tc)));
+                if (state.unknownOutcome) break;
             }
         }
     }
@@ -1756,13 +1776,11 @@ public class AgentLoop {
                                            LoopState state,
                                            Map<String, ExecutionTurnContext.ActionBinding> bindings) {
         Map<String, String> cachedResults = new HashMap<>();
-        Map<String, ToolInvocation> invocations = new ConcurrentHashMap<>();
         // 用 ExecutorService.submit 拿到真正的 Future：cancel(true) 会**中断**工作线程，
         // 而 CompletableFuture 的 cancel 只改状态、不打断已在运行的任务 ——
         // 于是"报超时但工具还在跑、还在写盘"，模型重试就产生重复副作用。
-        List<Future<?>> futures = new ArrayList<>();
-        List<Long> deadlines = new ArrayList<>();
-        long batchDeadline = 0L;
+        List<Future<ToolInvocation>> futures = new ArrayList<>();
+        List<ToolRequest> requests = new ArrayList<>();
 
         RunScope scope = RunScope.capture();
         final int turn = state.currentTurn;
@@ -1781,7 +1799,7 @@ public class AgentLoop {
                         toolIdOf(tc) + "|" + name,
                         state.toolResultCache.get(cacheKey));
                 futures.add(CompletableFuture.completedFuture(null));
-                deadlines.add(0L);
+                requests.add(null);
                 continue;
             }
 
@@ -1790,84 +1808,65 @@ public class AgentLoop {
             long timeout = resolveToolTimeout(name, args);
             ToolRequest request = toolRequest(
                     name, args, turn, denyProbes, state, scope)
-                    .withActionBinding(bindings.get(toolIdOf(tc)));
-            // 审批等待是执行预算之外的一段时间，必须加进去；只取 max 会让
-            // 用户在 TTL 后段批准时，工具刚醒就被判超时。
-            long deadline = System.nanoTime()
-                    + TimeUnit.SECONDS.toNanos(toolWaitSeconds(request, timeout));
-            batchDeadline = Math.max(batchDeadline, deadline);
+                    .withActionBinding(bindings.get(toolIdOf(tc)))
+                    .withExecutionBudget(timeout);
             futures.add(VIRTUAL_EXECUTOR.submit(() -> {
                 try (var ignored = scope.bind()) {
-                    ToolInvocation invocation = toolPipeline.invoke(request);
-                    if (invocation != null) {
-                        invocations.put(toolIdOf(tc) + "|" + name, invocation);
-                    }
+                    return toolPipeline.invoke(request);
                 }
             }));
-            deadlines.add(deadline);
+            requests.add(request);
         }
 
-        // 按每个调用自己的截止时间等待；超时即 cancel(true) 真正中断，并记录是哪几个被取消。
-        Set<String> timedOut = new LinkedHashSet<>();
-        for (int i = 0; i < futures.size(); i++) {
-            Future<?> f = futures.get(i);
-            long deadline = deadlines.get(i);
-            if (deadline == 0L) {
-                continue; // 缓存命中，无任务
-            }
-            long remainNanos = deadline - System.nanoTime();
-            try {
-                f.get(Math.max(1L, remainNanos), TimeUnit.NANOSECONDS);
-            } catch (java.util.concurrent.TimeoutException te) {
-                f.cancel(true); // 中断工作线程；子进程由工具内的 finally 强杀
-                timedOut.add(toolNameOf(toolCalls.get(i)));
-                log.warn("  [并行] {} 超时，已请求中断（进程树由工具侧强杀）",
-                        toolNameOf(toolCalls.get(i)));
-            } catch (Exception e) {
-                log.warn("并行工具异常: {}，继续收集其余结果", e.getMessage());
-            }
-        }
-        if (!timedOut.isEmpty()) {
-            log.warn("并行批次共 {} 个调用超时: {}", timedOut.size(), timedOut);
-        }
-
-        // 给被中断的任务一点收尾时间（工具侧会在 finally 里强杀子进程），但不再无限等：
-        // 已经超时的调用不该阻塞整轮。
-        for (Future<?> f : futures) {
-            if (f.isDone()) {
-                continue;
-            }
-            try {
-                f.get(5, TimeUnit.SECONDS);
-            } catch (Exception ignored) {
-                // 仍未结束：结果按超时处理（收集阶段会给合成结果）
-            }
-        }
-
-        // 按顺序收集结果
-        for (var tc : toolCalls) {
+        // Each handler's independent watchdog starts inside the resource lock.
+        // Ordered result collection therefore cannot extend a later call's budget.
+        for (int index = 0; index < toolCalls.size(); index++) {
+            var tc = toolCalls.get(index);
             String name = toolNameOf(tc);
             String args = argumentsOf(tc);
             String result = cachedResults.get(toolIdOf(tc) + "|" + name);
+            // Only structured successes enter this cache; their payload can
+            // contain ordinary business fields named error/status.
+            ToolResult structuredResult = result == null ? null : ToolResult.success(result);
             if (result == null) {
-                ToolInvocation invocation = invocations.get(toolIdOf(tc) + "|" + name);
-                result = invocation == null
-                        ? timeoutToolResult(
-                                name, args, resolveToolTimeout(name, args)).legacyText()
-                        : applyInvocation(invocation, state);
+                Future<ToolInvocation> future = futures.get(index);
+                ToolRequest request = requests.get(index);
+                try {
+                    ToolInvocation invocation = awaitToolInvocation(future, request);
+                    structuredResult = invocation.result();
+                    result = applyInvocation(invocation, state);
+                } catch (java.util.concurrent.TimeoutException timeout) {
+                    // The watchdog already interrupted the handler. A second
+                    // interrupt here could hit terminal journal persistence.
+                    result = timeoutToolResult(name, args, request.budget().timeoutSeconds()).legacyText();
+                } catch (InterruptedException interrupted) {
+                    futures.forEach(pending -> pending.cancel(true));
+                    Thread.currentThread().interrupt();
+                    structuredResult = toolExecutionGuards.descriptor(name, args).sideEffect() == ToolSideEffect.READ_ONLY
+                            ? ToolResult.failure(ToolErrorCode.CANCELLED, "工具执行被取消", false)
+                            : unconfirmedToolStop(request, "等待工具结果时被中断，实际结果未确认");
+                    result = structuredResult.legacyText();
+                } catch (Exception error) {
+                    future.cancel(true);
+                    structuredResult = toolExecutionGuards.descriptor(name, args).sideEffect() == ToolSideEffect.READ_ONLY
+                            ? ToolResult.failure(ToolErrorCode.EXECUTION_FAILED,
+                                    "工具执行异常: " + Objects.requireNonNullElse(error.getMessage(), "unknown"), false)
+                            : unconfirmedToolStop(request, "工具调用异常，实际结果未确认");
+                    result = structuredResult.legacyText();
+                }
             }
-            state.noteStructuredResult(name, ToolResult.fromLegacy(result));
+            if (structuredResult == null) structuredResult = ToolResult.fromLegacy(result);
             String cacheKey = name + ":" + argumentsOf(tc);
-            if (isCacheableTool(name) && ToolResult.fromLegacy(result).isSuccess() && !result.isEmpty()) {
+            if (isCacheableTool(name) && structuredResult.isSuccess() && !result.isEmpty()) {
                 state.toolResultCache.put(cacheKey, result);
             }
-            trackResult(name, result, state);
+            trackResult(name, result, state, structuredResult);
 
             // 反思机制（并行）：失败时把反思提示并入工具结果，不伪装成用户消息。
             // 这里不再为 ask_user_question 单开特判 —— 它和「等用户批准」现在都返回
             // {"status":"awaiting_user"}，isFailedResult 会短路，两者天然不产生反思提示。
             // 原先只给 ask_user_question 开特判、漏了授权路径，正是那个漏口把「等人」读成了「失败」。
-            String parallelReflection = buildReflectionHint(name, argumentsOf(tc), result);
+            String parallelReflection = buildReflectionHint(name, argumentsOf(tc), result, structuredResult);
             String resultForContext = clampForContext(result, name);
             resultForContext = applyBrowserNudge(name, result, resultForContext, messages);
             if (Objects.nonNull(parallelReflection)) {
@@ -1883,7 +1882,7 @@ public class AgentLoop {
 
             log.info("  [并行] {}: {}", name, truncate(redactSensitive(result), 200));
             recordToolOutcome(state, name, argumentsOf(tc), result,
-                    bindings.get(toolIdOf(tc)));
+                    bindings.get(toolIdOf(tc)), structuredResult);
             messages.add(ToolExecutionResultMessage.from(
                     toolIdOf(tc), name, resultForContext));
         }
@@ -1899,6 +1898,7 @@ public class AgentLoop {
         if (state.lengthTruncatedToolCalls && !"write_file".equals(name) && !"read_file".equals(name)) {
             String truncErr = "{\"error\":\"本次工具调用的参数因模型输出长度上限被截断，无法执行。请用更短的参数重试。\"}";
             log.warn("  [截断保护] 跳过执行 {}，参数可能不完整", name);
+            trackResult(name, truncErr, state, ToolResult.fromLegacy(truncErr));
             recordToolOutcome(state, name, args, truncErr, null);
             messages.add(ToolExecutionResultMessage.from(toolIdOf(tc), name, truncErr));
             return;
@@ -1909,14 +1909,13 @@ public class AgentLoop {
         log.info("  {}({})", name, truncate(redactSensitive(args), 150));
 
         String result;
+        ToolResult structuredResult = null;
         if (isCacheableTool(name) && state.toolResultCache.containsKey(cacheKey)) {
             result = state.toolResultCache.get(cacheKey);
+            structuredResult = ToolResult.success(result);
             log.info("  [缓存命中] {}", name);
         } else {
-            // 外层超时兜底：即使某工具内部超时逻辑失灵（如常驻进程把读流挂死），
-            // 也能在此处被强制中断，绝不让单个工具拖死整个 Agent 循环。
-            // 与并行路径共用 resolveToolTimeout 的预算（执行契约 + agent.tools.timeout-overrides 覆盖）；
-            // 给读流/清理留 10s 余量。
+            // 与并行路径共用执行契约预算；审批、暂停和锁等待不消耗 handler 预算。
             long timeout = resolveToolTimeout(name, args);
             final String fName = name, fArgs = args;
             final int turn = state.currentTurn;
@@ -1925,7 +1924,8 @@ public class AgentLoop {
                     consecutiveProbeTurns(messages));
             ToolRequest request = toolRequest(
                     fName, fArgs, turn, denyProbes, state, scope)
-                    .withActionBinding(binding);
+                    .withActionBinding(binding)
+                    .withExecutionBudget(timeout);
             // submit 而非 supplyAsync：只有 ExecutorService 的 Future 才支持
             // "cancel(true) 真正中断工作线程"。CompletableFuture 的 cancel 只改状态，
             // 于是超时后工具还在跑（还在写盘），模型重试就产生重复副作用。
@@ -1935,32 +1935,44 @@ public class AgentLoop {
                             return toolPipeline.invoke(request);
                         }
                     });
-            long waitTimeout = toolWaitSeconds(request, timeout);
             try {
-                result = applyInvocation(future.get(waitTimeout, TimeUnit.SECONDS), state);
+                ToolInvocation invocation = awaitToolInvocation(future, request);
+                structuredResult = invocation.result();
+                result = applyInvocation(invocation, state);
             } catch (java.util.concurrent.TimeoutException te) {
-                future.cancel(true);
-                log.warn("  工具 {} 执行超时（{}s，含审批等待），已中断工作线程（子进程由工具侧强杀进程树）",
-                        name, waitTimeout);
+                log.warn("  工具 {} handler 执行超时（{}s），已中断工作线程",
+                        name, timeout);
                 ToolResult timeoutResult = timeoutToolResult(name, args, timeout);
                 state.noteStructuredResult(name, timeoutResult);
                 result = timeoutResult.legacyText();
+            } catch (InterruptedException interrupted) {
+                future.cancel(true);
+                Thread.currentThread().interrupt();
+                structuredResult = toolExecutionGuards.descriptor(name, args).sideEffect() == ToolSideEffect.READ_ONLY
+                        ? ToolResult.failure(ToolErrorCode.CANCELLED, "工具执行被取消", false)
+                        : unconfirmedToolStop(request, "等待工具结果时被中断，实际结果未确认");
+                result = structuredResult.legacyText();
             } catch (Exception e) {
                 future.cancel(true);
                 log.warn("  工具 {} 执行异常: {}", name, e.getMessage());
-                result = "{\"error\":\"工具执行异常: " + e.getMessage() + "\"}";
+                structuredResult = toolExecutionGuards.descriptor(name, args).sideEffect() == ToolSideEffect.READ_ONLY
+                        ? ToolResult.failure(ToolErrorCode.EXECUTION_FAILED,
+                                "工具执行异常: " + Objects.requireNonNullElse(e.getMessage(), "unknown"), false)
+                        : unconfirmedToolStop(request, "工具调用异常，实际结果未确认");
+                result = structuredResult.legacyText();
             }
-            if (isCacheableTool(name) && ToolResult.fromLegacy(result).isSuccess()) {
+            if (structuredResult == null) structuredResult = ToolResult.fromLegacy(result);
+            if (isCacheableTool(name) && structuredResult.isSuccess()) {
                 state.toolResultCache.put(cacheKey, result);
             }
         }
 
-        trackResult(name, result, state);
+        trackResult(name, result, state, structuredResult == null ? ToolResult.fromLegacy(result) : structuredResult);
 
         // 反思机制：工具失败时把反思提示并入工具结果，不伪装成用户消息。
         // 不特判 ask_user_question 与授权等待：「未执行」的结果带 status=awaiting_user，
         // isFailedResult 短路，不需要按工具名逐个开白名单（那种写法漏一个就是一个 bug）。
-        String reflectionHint = buildReflectionHint(name, args, result);
+        String reflectionHint = buildReflectionHint(name, args, result, structuredResult);
         String resultForContext = clampForContext(result, name);
         resultForContext = applyBrowserNudge(name, result, resultForContext, messages);
         if (Objects.nonNull(reflectionHint)) {
@@ -1977,38 +1989,78 @@ public class AgentLoop {
         }
 
         log.info("  {}: {}", name, truncate(redactSensitive(result), 300));
-        recordToolOutcome(state, name, args, result, binding);
+        recordToolOutcome(state, name, args, result, binding, structuredResult);
         messages.add(ToolExecutionResultMessage.from(
                 toolIdOf(tc), name, resultForContext));
     }
 
-    /**
-     * 外层等待比审批窗口多留的余量（秒）：留给唤醒、参数核对和真正的工具执行。
-     */
-    private static final long APPROVAL_WAIT_MARGIN_SECONDS = 15L;
-    /** ToolPipeline 不可用（单测 / mock）时的兜底审批窗口，与 application.yml 默认值一致。 */
-    private static final long DEFAULT_APPROVAL_WAIT_SECONDS = 300L;
-
-    private long approvalWaitSeconds() {
-        ToolPipeline pipeline = toolPipeline;
-        long ttl = pipeline == null
-                ? DEFAULT_APPROVAL_WAIT_SECONDS : pipeline.askGrantTtlSeconds();
-        return Math.max(1L, ttl) + APPROVAL_WAIT_MARGIN_SECONDS;
+    private ToolInvocation awaitToolInvocation(Future<ToolInvocation> future, ToolRequest request)
+            throws InterruptedException, java.util.concurrent.ExecutionException,
+            java.util.concurrent.TimeoutException {
+        long timeoutObservedAt = 0L;
+        while (true) {
+            // The pipeline owns the journal and the authoritative tool result.
+            // Prefer its completed result even if its handler timer has expired.
+            if (future.isDone()) return future.get();
+            ExecutionControl.StopReason stop;
+            try {
+                stop = executionControl == null ? ExecutionControl.StopReason.NONE
+                        : executionControl.stopReason(request.sessionId());
+            } catch (RuntimeException signalFailure) {
+                try {
+                    // The pipeline can distinguish an action still waiting for
+                    // a lock from one that may already have produced side effects.
+                    return future.get(500L, TimeUnit.MILLISECONDS);
+                } catch (java.util.concurrent.TimeoutException stillWaiting) {
+                    future.cancel(true);
+                    return ToolInvocation.executed(request.name(),
+                            unconfirmedToolStop(request, "执行控制状态读取失败，无法确认工具结果"));
+                }
+            }
+            if (stop != ExecutionControl.StopReason.NONE) {
+                try {
+                    // An executing handler's pipeline observes the same control
+                    // state and persists its terminal record before returning.
+                    return future.get(500L, TimeUnit.MILLISECONDS);
+                } catch (java.util.concurrent.TimeoutException stillWaiting) {
+                    // Approval waits need an interrupt to discard their pending
+                    // single-use grant. Also bound unexpected pipeline stalls.
+                    future.cancel(true);
+                    ToolResult result = toolExecutionGuards.descriptor(request.name(), request.arguments())
+                            .sideEffect() == ToolSideEffect.READ_ONLY
+                            ? ToolResult.failure(stop == ExecutionControl.StopReason.CANCELLED
+                                    ? ToolErrorCode.CANCELLED : ToolErrorCode.TIMEOUT, controlMessage(stop), false)
+                            : unconfirmedToolStop(request, controlMessage(stop) + "，工具结果未确认");
+                    return ToolInvocation.controlStop(request.name(), result);
+                }
+            }
+            if (request.budget() != null && request.budget().expired()) {
+                if (timeoutObservedAt == 0L) timeoutObservedAt = System.nanoTime();
+                if (System.nanoTime() - timeoutObservedAt >= TimeUnit.MILLISECONDS.toNanos(500L)) {
+                    // The pipeline normally settles within 150 ms. Leave it a
+                    // bounded persistence grace period before using the fallback.
+                    future.cancel(true);
+                    return ToolInvocation.executed(request.name(),
+                            toolExecutionGuards.descriptor(request.name(), request.arguments()).sideEffect()
+                                    == ToolSideEffect.READ_ONLY
+                                    ? timeoutToolResult(request.name(), request.arguments(), request.budget().timeoutSeconds())
+                                    : unconfirmedToolStop(request, "工具执行超时，终态尚未确认"));
+                }
+            }
+            try {
+                return future.get(100L, TimeUnit.MILLISECONDS);
+            } catch (java.util.concurrent.TimeoutException waiting) {
+                // Approval TTL, pause and lock waits do not spend handler budget,
+                // but cancellation and the overall run deadline still apply.
+            }
+        }
     }
 
-    /**
-     * 一次工具调用在外层要等多久。
-     *
-     * <p>{@code waitForApproval} 的调用分两段：先等用户点批准（审批 TTL），
-     * 批准之后才开始工具自己的执行预算。这两段是<b>相加</b>关系。
-     * 取 {@code max(ttl, timeout)} 是错的：审批占掉大半 TTL 后，工具只剩不到
-     * 原本预算的时间，{@code mvnw package} 这类长命令会在批准后立刻被判超时。</p>
-     */
-    private long toolWaitSeconds(ToolRequest request, long toolTimeoutSeconds) {
-        if (request == null || !request.waitForApproval()) {
-            return toolTimeoutSeconds;
-        }
-        return approvalWaitSeconds() + Math.max(1L, toolTimeoutSeconds);
+    private ToolResult unconfirmedToolStop(ToolRequest request, String message) {
+        ToolDescriptor descriptor = toolExecutionGuards.descriptor(request.name(), request.arguments());
+        return descriptor.sideEffect() == ToolSideEffect.READ_ONLY
+                ? ToolResult.failure(ToolErrorCode.DEPENDENCY_UNAVAILABLE, message, false)
+                : ToolResult.unknown(message + "；请核验实际状态后再决定是否重试", null);
     }
 
     /**
@@ -2041,18 +2093,7 @@ public class AgentLoop {
      */
     private ToolResult timeoutToolResult(String name, String argumentsJson, long timeoutSeconds) {
         ToolDescriptor descriptor = toolExecutionGuards.descriptor(name, argumentsJson);
-        String message = "工具执行超时" + (timeoutSeconds > 0 ? "（" + timeoutSeconds + "s）" : "");
-        return switch (descriptor.timeoutRecovery()) {
-            // 等待用户：这不是失败，是用户一直没答。转「等待用户」而不是报错。
-            case AWAIT_USER -> ToolResult.failure(ToolErrorCode.CANCELLED,
-                    "等待用户回答已结束，请根据用户下一条消息继续", false);
-            // 副作用去向不明且无法核验 —— 只能中止整轮（state.unknownOutcome → OUTCOME_UNKNOWN）。
-            case ABORT -> ToolResult.unknown(message + descriptor.recoveryHint(), null);
-            // RETRY / RESUME / VERIFY 都是可自愈的失败：不中止整轮，
-            // 把核验步骤 / 续查方式写在 recoveryHint 里告诉模型下一步怎么做。
-            default -> ToolResult.failure(ToolErrorCode.TIMEOUT,
-                    message + descriptor.recoveryHint(), true);
-        };
+        return ToolInvocationBudget.timeoutResult(descriptor, timeoutSeconds);
     }
 
     /** 格式化消息列表为可读的 trace 文本（截断长内容） */
@@ -2090,13 +2131,17 @@ public class AgentLoop {
 
     private void recordToolOutcome(LoopState state, String name, String args, String result,
                                    ExecutionTurnContext.ActionBinding binding) {
-        state.noteToolFinished(name, args, result);
-        boolean failed = TraceRecorder.isFailedResult(result);
-        String st = failed ? RunStatus.FAILURE.name() : RunStatus.SUCCESS.name();
+        recordToolOutcome(state, name, args, result, binding, ToolResult.fromLegacy(result));
+    }
+
+    private void recordToolOutcome(LoopState state, String name, String args, String result,
+                                   ExecutionTurnContext.ActionBinding binding, ToolResult structuredResult) {
+        ToolResult actual = structuredResult == null ? ToolResult.fromLegacy(result) : structuredResult;
+        state.noteToolFinished(name, args, actual);
         if (Objects.nonNull(traceRecorder))
             traceRecorder.recordToolResult(
-                    currentSessionId.get(), state.currentTurn, name, result, 0, st);
-        notifyToolExecution(state, name, result, binding);
+                    currentSessionId.get(), state.currentTurn, name, actual, 0);
+        notifyToolExecution(state, name, result, binding, actual);
     }
 
     /**
@@ -2111,18 +2156,17 @@ public class AgentLoop {
      * <p>{@code AWAITING_USER} 不上报：那种情况下工具压根没执行，报成一次执行是假事实。</p>
      */
     private void notifyToolExecution(LoopState state, String name, String result,
-                                     ExecutionTurnContext.ActionBinding binding) {
+                                     ExecutionTurnContext.ActionBinding binding, ToolResult actual) {
         ToolExecutionSink sink = this.toolExecutionSink;
         if (Objects.isNull(sink) || Objects.isNull(currentSessionId.get())) {
             return;
         }
-        ToolResult parsed = ToolResult.fromLegacy(result);
-        if (parsed.status() == ToolStatus.AWAITING_USER) {
+        if (actual.status() == ToolStatus.AWAITING_USER) {
             return;
         }
         try {
             sink.onToolExecuted(currentSessionId.get(), state.currentTurn, name,
-                    parsed.status(), truncate(redactSensitive(result), 400), binding);
+                    actual.status(), truncate(redactSensitive(result), 400), binding);
         } catch (Exception e) {
             log.debug("工具执行事件上报失败: {} {}", name, e.getMessage());
         }
@@ -2130,16 +2174,15 @@ public class AgentLoop {
 
     /** 工具失败时注入反思上下文，引导模型换策略 */
     private String buildReflectionHint(String toolName, String args, String result) {
+        return buildReflectionHint(toolName, args, result, ToolResult.fromLegacy(result));
+    }
+
+    private String buildReflectionHint(String toolName, String args, String result, ToolResult structuredResult) {
         if (StringUtils.isBlank(result)) {
             return null;
         }
-        if ("read_file".equals(toolName) || "search_code".equals(toolName)
-                || "read_package".equals(toolName)) {
-            if (!result.contains("\"error\"")) {
-                return null;
-            }
-        }
-        if (!TraceRecorder.isFailedResult(result)) {
+        ToolResult actual = structuredResult == null ? ToolResult.fromLegacy(result) : structuredResult;
+        if (actual.isSuccess() || actual.status() == ToolStatus.AWAITING_USER) {
             return null;
         }
 
@@ -2193,9 +2236,9 @@ public class AgentLoop {
     }
 
     /** 更新循环状态 */
-    private void trackResult(String toolName, String result, LoopState state) {
+    private void trackResult(String toolName, String result, LoopState state, ToolResult structuredResult) {
         state.toolsInvoked.add(toolName);
-        state.lastErrorCode = ToolResult.fromLegacy(result).errorCode();
+        state.noteStructuredResult(toolName, structuredResult);
         if ("read_file".equals(toolName) || "list_files".equals(toolName)
                 || "exec_command".equals(toolName)) state.explorationCount++;
         if (isRetrievalTool(toolName)) {
@@ -2204,7 +2247,7 @@ public class AgentLoop {
         if ("read_package".equals(toolName)) {
             state.explorationCount += 3;
         }
-        if (WRITE_TOOLS.contains(toolName) && Objects.nonNull(result)
+        if (structuredResult.isSuccess() && WRITE_TOOLS.contains(toolName) && Objects.nonNull(result)
                 && (result.contains("\"success\":true") || result.startsWith("写入成功"))) {
             state.writeFileSucceeded = true;
             // 写入成功后失效文件相关的缓存，避免后续读到过期内容
@@ -2221,7 +2264,7 @@ public class AgentLoop {
         }
         // 使用结构化 ToolResult 判断 image_generate 是否可用
         if ("image_generate".equals(toolName)) {
-            ToolResult toolResult = ToolResult.fromLegacy(result);
+            ToolResult toolResult = structuredResult;
             if (toolResult.status() == ToolStatus.FAILED && !toolResult.retriable()) {
                 state.imageGenerateUnavailable = true;
                 log.warn("image_generate 标记为不可用: {}", toolResult.message());
@@ -2230,7 +2273,8 @@ public class AgentLoop {
                 state.imageGenerateUnavailable = true;
             }
         }
-        if (MEDIA_TOOLS.contains(toolName) && Objects.nonNull(result) && looksLikeMediaSuccess(result)) {
+        if (structuredResult.isSuccess() && MEDIA_TOOLS.contains(toolName)
+                && Objects.nonNull(result) && looksLikeMediaSuccess(result)) {
             state.mediaDelivered = true;
             state.lastMediaResult = result;
         }

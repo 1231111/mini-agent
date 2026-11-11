@@ -5,6 +5,10 @@ import com.miniagent.agent.todo.LlmJudgeTodoValidator;
 import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.agent.todo.TodoSemanticValidator;
 import com.miniagent.agent.tool.CapabilityRegistry;
+import com.miniagent.agent.tool.CommandSemantics;
+import com.miniagent.agent.tool.ToolResult;
+import com.miniagent.agent.tool.ToolStatus;
+import com.fasterxml.jackson.databind.JsonNode;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -20,7 +24,7 @@ import java.util.regex.Pattern;
 public class StepEvaluator {
 
     private static final Pattern EXIT_CODE =
-            Pattern.compile("exit_code\\s*=\\s*(-?\\d+)");
+            Pattern.compile("^\\s*exit_code\\s*=\\s*(-?\\d+)(?:\\s|$)", Pattern.CASE_INSENSITIVE);
 
     public record EvalResult(boolean ok, String reason) {
         public static EvalResult pass() { return new EvalResult(true, ""); }
@@ -56,6 +60,23 @@ public class StepEvaluator {
     }
 
     public EvalResult evaluate(TaskNode node, String toolResult, String evidence) {
+        return evaluate(node, toolResult, evidence, false);
+    }
+
+    /** A concrete ToolResult outranks heuristics over its human-readable payload. */
+    public EvalResult evaluate(TaskNode node, ToolResult structuredResult, String evidence) {
+        if (structuredResult == null) {
+            return evaluate(node, "", evidence, false);
+        }
+        if (!structuredResult.isSuccess()) {
+            return reject("tool error: " + abbreviate(
+                    StringUtils.defaultIfBlank(structuredResult.message(), structuredResult.legacyText()), 400));
+        }
+        return evaluate(node, structuredResult.legacyText(), evidence, true);
+    }
+
+    private EvalResult evaluate(TaskNode node, String toolResult, String evidence,
+                                boolean structuredSuccess) {
         if (node == null) {
             return reject("missing node");
         }
@@ -69,7 +90,7 @@ public class StepEvaluator {
         if (looksLikeAcquire(node) && isHollowEvidence(ev)) {
             return reject("获取类节点不能用空洞 evidence 放行");
         }
-        if (!dw.worldCheck() && (looksLikeToolError(ev) || looksLikeLoopAbort(ev))) {
+        if (!structuredSuccess && (looksLikeToolError(toolResult) || looksLikeToolError(ev))) {
             // 400 而不是 200：这条 reason 会被 RecoveryEngine 装进 FailureDiagnosis.reason，
             // 再原样拼进 tryLlmReplan 的重规划提示词 —— 它是模型唯一能看到的失败细节。
             // 200 字刚好卡掉服务端返回里靠后的关键字段（SongGenerationService 的
@@ -81,12 +102,12 @@ public class StepEvaluator {
             return judge(node, dw.criteria(), ev);
         }
         if (dw.isCommand()) {
-            return checkCommand(ev);
+            return checkCommand(ev, structuredSuccess);
         }
         if (dw.isValidation()) {
             if (StringUtils.isNotBlank(dw.criteria()))
                 return judge(node, dw.criteria(), ev);
-            return checkValidation(ev);
+            return checkValidation(ev, structuredSuccess);
         }
 
         if (dw.isNote() && looksLikeFileDelivery(node)) {
@@ -140,11 +161,6 @@ public class StepEvaluator {
 
     /** 循环结束后验收：不看 todo 勾选，只认证据与 doneWhen。 */
     public EvalResult evaluateAfterLoop(TaskNode node, String evidence) {
-        DoneWhen dw = node == null || node.doneWhen() == null
-                ? DoneWhen.note() : node.doneWhen();
-        if (!dw.worldCheck() && looksLikeLoopAbort(evidence)) {
-            return reject("loop abort: " + abbreviate(evidence, 120));
-        }
         return evaluate(node, evidence, evidence);
     }
 
@@ -156,10 +172,13 @@ public class StepEvaluator {
             if (n.status() != TaskNodeStatus.SUCCESS) {
                 return GraphEval.fail(n.id(), "eval: unfinished node " + n.id());
             }
+            if (n.toolStatus() != null && n.toolStatus() != ToolStatus.SUCCESS) {
+                return GraphEval.fail(n.id(), "eval: unsuccessful tool status " + n.toolStatus());
+            }
             if (!NodeOutputBinder.ofNode(n).complete(n)) {
                 return GraphEval.fail(n.id(), "eval: outputs 未绑定");
             }
-            EvalResult ev = evaluate(n, n.output(), n.output());
+            EvalResult ev = evaluate(n, n.output(), n.output(), n.toolStatus() == ToolStatus.SUCCESS);
             if (!ev.ok()) {
                 return GraphEval.fail(n.id(), ev.reason());
             }
@@ -242,39 +261,42 @@ public class StepEvaluator {
     }
 
     static EvalResult checkCommand(String evidence) {
+        return checkCommand(evidence, false);
+    }
+
+    private static EvalResult checkCommand(String evidence, boolean structuredSuccess) {
         if (StringUtils.isBlank(evidence))
             return EvalResult.fail("command_success 缺少 evidence");
-        if (looksLikeToolError(evidence) || looksLikeLoopAbort(evidence))
+        if (!structuredSuccess && looksLikeToolError(evidence))
             return EvalResult.fail("command_success 命令失败");
-        Matcher m = EXIT_CODE.matcher(evidence);
-        if (!m.find())
+        Integer code = exitCode(evidence);
+        if (code == null)
             return EvalResult.fail("command_success 缺少 exit_code");
-        int code = Integer.parseInt(m.group(1));
-        if (code != 0)
+        if (code != 0 && !CommandSemantics.isToleratedExitText(evidence))
             return EvalResult.fail("command_success 退出码 " + code);
         return EvalResult.pass();
     }
 
     static EvalResult checkValidation(String evidence) {
+        return checkValidation(evidence, false);
+    }
+
+    private static EvalResult checkValidation(String evidence, boolean structuredSuccess) {
         if (StringUtils.isBlank(evidence)) {
             return EvalResult.fail("validation_passed 缺少 evidence");
         }
-        if (looksLikeToolError(evidence) || looksLikeLoopAbort(evidence)) {
+        if (!structuredSuccess && looksLikeToolError(evidence)) {
             return EvalResult.fail("validation_passed 命令失败");
         }
-        Matcher m = EXIT_CODE.matcher(evidence);
-        if (m.find()) {
-            int code = Integer.parseInt(m.group(1));
-            if (code != 0) {
+        Integer code = exitCode(evidence);
+        if (code != null) {
+            if (code != 0 && !CommandSemantics.isToleratedExitText(evidence)) {
                 return EvalResult.fail("validation_passed 退出码 " + code);
             }
             return EvalResult.pass();
         }
-        String t = evidence.toLowerCase();
-        if (t.contains("\"success\":false")) {
-            return EvalResult.fail("validation_passed 未通过");
-        }
-        if (t.contains("\"success\":true")) {
+        JsonNode root = jsonObject(evidence);
+        if (root != null && root.path("success").isBoolean() && root.path("success").asBoolean()) {
             return EvalResult.pass();
         }
         return EvalResult.fail("validation_passed 证据无法证明校验通过");
@@ -289,10 +311,57 @@ public class StepEvaluator {
         if (s == null || s.isBlank()) {
             return false;
         }
-        String t = s.toLowerCase();
-        return t.contains("\"error\"") || t.startsWith("错误") || t.startsWith("未知工具")
-                || t.contains("tool execution error") || t.contains("timeout")
-                || t.contains("planner 硬闸门");
+        String text = s.trim();
+        JsonNode root = jsonObject(text);
+        if (root != null) {
+            String status = root.path("status").asText("");
+            if ("failed".equalsIgnoreCase(status) || "failure".equalsIgnoreCase(status)
+                    || "error".equalsIgnoreCase(status)) {
+                return true;
+            }
+            JsonNode code = root.get("exit_code");
+            if (code != null && code.canConvertToInt() && code.asInt() != 0) {
+                return true;
+            }
+        }
+        Integer code = exitCode(text);
+        if (code != null && code != 0 && !CommandSemantics.isToleratedExitText(text)) {
+            return true;
+        }
+        // Shared legacy protocol reads only top-level execution fields or known
+        // error-response prefixes. Nested data and command stdout are ordinary content.
+        return !ToolResult.fromLegacy(text).isSuccess()
+                || text.startsWith("未知工具")
+                || text.regionMatches(true, 0, "tool execution error:", 0, "tool execution error:".length());
+    }
+
+    private static Integer exitCode(String evidence) {
+        if (StringUtils.isBlank(evidence)) {
+            return null;
+        }
+        JsonNode root = jsonObject(evidence);
+        if (root != null) {
+            JsonNode code = root.get("exit_code");
+            return code != null && code.canConvertToInt() ? code.asInt() : null;
+        }
+        Matcher matcher = EXIT_CODE.matcher(evidence);
+        if (!matcher.find()) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(matcher.group(1));
+        } catch (NumberFormatException invalid) {
+            return Integer.MIN_VALUE;
+        }
+    }
+
+    private static JsonNode jsonObject(String text) {
+        try {
+            JsonNode root = PlannerStateJson.MAPPER.readTree(text);
+            return root != null && root.isObject() ? root : null;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     static boolean isHollowEvidence(String s) {
@@ -303,14 +372,6 @@ public class StepEvaluator {
         return t.equals(AgentLoop.STEP_SEGMENT_DONE)
                 || t.equals("本步已完成")
                 || t.startsWith("已按规划图推进任务");
-    }
-
-    static boolean looksLikeLoopAbort(String s) {
-        if (s == null || s.isBlank()) {
-            return false;
-        }
-        return s.contains("达到最大迭代") || s.contains("任务轮次已达上限")
-                || s.contains("MAX_ITERATIONS") || s.contains("任务还没做完");
     }
 
     private static String abbreviate(String s, int max) {

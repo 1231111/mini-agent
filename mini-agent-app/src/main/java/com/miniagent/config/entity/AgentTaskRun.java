@@ -11,7 +11,7 @@ import java.util.Objects;
 })
 public class AgentTaskRun {
 
-    public enum Status { RUNNING, COMPLETED, FAILED, CANCELLED, INTERRUPTED }
+    public enum Status { RUNNING, COMPLETED, FAILED, CANCELLED, INTERRUPTED, WAITING }
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)

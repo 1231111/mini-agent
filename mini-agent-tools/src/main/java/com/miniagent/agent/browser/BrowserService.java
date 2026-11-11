@@ -14,6 +14,18 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import javax.imageio.ImageIO;
+import java.awt.BasicStroke;
+import java.awt.Color;
+import java.awt.Graphics2D;
+import java.awt.Polygon;
+import java.awt.RadialGradientPaint;
+import java.awt.RenderingHints;
+import java.awt.geom.Ellipse2D;
+import java.awt.geom.Point2D;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
@@ -653,7 +665,10 @@ public class BrowserService {
     private Playwright playwright;
     private Browser browser;
     private final Map<String, Page> pages = new ConcurrentHashMap<>();
+    private final Map<String, PointerPosition> lastPointerPositions = new ConcurrentHashMap<>();
     private final ReentrantLock pageLock = new ReentrantLock();
+
+    private record PointerPosition(double x, double y, int viewportWidth, int viewportHeight) {}
 
     @Autowired
     private NetworkGuard networkGuard;
@@ -1212,7 +1227,7 @@ public class BrowserService {
             Page page = getPage(sessionId);
             boolean numeric = ref.chars().allMatch(Character::isDigit);
             if ("ref".equals(mode) || ("auto".equals(mode) && numeric)) {
-                return clickBySnapshotRef(page, ref);
+                return clickBySnapshotRef(sessionId, page, ref);
             }
             Locator loc = switch (mode) {
                 case "text" -> page.getByText(ref, new Page.GetByTextOptions().setExact(true));
@@ -1225,7 +1240,7 @@ public class BrowserService {
             if (Objects.isNull(loc)) {
                 return String.format(MessageConstants.BROWSER_CLICK_FAILED_UNKNOWN_BY, mode);
             }
-            return clickAndSnap(page, loc, mode, ref);
+            return clickAndSnap(sessionId, page, loc, mode, ref);
         } catch (Exception e) {
             log.error("点击失败: ref={} by={}", ref, mode, e);
             return String.format(MessageConstants.BROWSER_CLICK_FAILED, ref, mode, e.getMessage());
@@ -1234,7 +1249,7 @@ public class BrowserService {
         }
     }
 
-    private String clickBySnapshotRef(Page page, String ref) {
+    private String clickBySnapshotRef(String sessionId, Page page, String ref) {
         final int refNum;
         try {
             refNum = Integer.parseInt(ref);
@@ -1258,7 +1273,7 @@ public class BrowserService {
                 ? page.getByRole(AriaRole.LINK, new Page.GetByRoleOptions().setName(name))
                 : page.getByText(name);
         try {
-            return clickAndSnap(page, loc, "ref", name);
+            return clickAndSnap(sessionId, page, loc, "ref", name);
         } catch (Exception e) {
             return String.format(MessageConstants.BROWSER_CLICK_FAILED_BY_NAME, ref, name, e.getMessage());
         }
@@ -1275,9 +1290,18 @@ public class BrowserService {
         return page.getByRole(role, new Page.GetByRoleOptions().setName(roleName));
     }
 
-    private String clickAndSnap(Page page, Locator locator, String strategy, String label) {
+    private String clickAndSnap(String sessionId, Page page, Locator locator, String strategy, String label) {
         try {
             locator.scrollIntoViewIfNeeded();
+        } catch (Exception ignored) {}
+        double clickX = Double.NaN;
+        double clickY = Double.NaN;
+        try {
+            var clickBox = locator.boundingBox();
+            if (clickBox != null) {
+                clickX = clickBox.x + clickBox.width / 2d;
+                clickY = clickBox.y + clickBox.height / 2d;
+            }
         } catch (Exception ignored) {}
         try {
             locator.click(new Locator.ClickOptions().setTimeout(CLICK_TIMEOUT_MS));
@@ -1288,6 +1312,18 @@ public class BrowserService {
             } catch (Exception jsEx) {
                 throw clickEx;
             }
+        }
+        if (Double.isFinite(clickX) && Double.isFinite(clickY)) {
+            try {
+                var viewport = page.viewportSize();
+                if (viewport != null && viewport.width > 0 && viewport.height > 0) {
+                    lastPointerPositions.put(sessionId, new PointerPosition(
+                            clickX,
+                            clickY,
+                            viewport.width,
+                            viewport.height));
+                }
+            } catch (Exception ignored) {}
         }
         page.waitForTimeout(400);
         return String.format(MessageConstants.BROWSER_CLICK_SUCCESS, strategy, label) + "\n\n"
@@ -1452,15 +1488,25 @@ public class BrowserService {
     /**
      * 截图
      */
-    public String screenshot(String sessionId) {
+    public String screenshot(String sessionId, Path workspaceRoot) {
         pageLock.lock();
         try {
             Page page = getPage(sessionId);
-            String path = "screenshot_" + sessionId + ".png";
-            page.screenshot(new Page.ScreenshotOptions()
-                    .setPath(Paths.get(path))
-                    .setFullPage(false));
-            return String.format(MessageConstants.BROWSER_SCREENSHOT_SAVED, path);
+            Path target = screenshotOutputPath(workspaceRoot, sessionId);
+            String filename = target.getFileName().toString();
+            Path root = workspaceRoot.toAbsolutePath().normalize();
+            byte[] screenshot = page.screenshot(new Page.ScreenshotOptions().setFullPage(false));
+            PointerPosition pointer = lastPointerPositions.get(sessionId);
+            if (pointer != null) {
+                try {
+                    screenshot = applyPointerSpotlight(screenshot, pointer);
+                } catch (Exception overlayError) {
+                    log.debug("截图指针高亮渲染失败，保留原截图: {}", overlayError.getMessage());
+                }
+            }
+            Files.createDirectories(root);
+            Files.write(target, screenshot);
+            return String.format(MessageConstants.BROWSER_SCREENSHOT_SAVED, "workspace/" + filename);
         } catch (Exception e) {
             return String.format(MessageConstants.BROWSER_SCREENSHOT_FAILED, e.getMessage());
         } finally {
@@ -1468,11 +1514,78 @@ public class BrowserService {
         }
     }
 
+    static Path screenshotOutputPath(Path workspaceRoot, String sessionId) throws IOException {
+        if (workspaceRoot == null) throw new IOException("workspace 路径为空");
+        String safeSessionId = String.valueOf(sessionId == null ? "default" : sessionId)
+                .replaceAll("[^a-zA-Z0-9._-]", "_");
+        Path root = workspaceRoot.toAbsolutePath().normalize();
+        Path target = root.resolve("screenshot_" + safeSessionId + ".png").normalize();
+        if (!target.startsWith(root)) throw new IOException("截图路径超出 workspace");
+        return target;
+    }
+
+    static byte[] applyPointerSpotlight(byte[] screenshotBytes, double x, double y,
+                                        int viewportWidth, int viewportHeight) throws IOException {
+        return applyPointerSpotlight(screenshotBytes,
+                new PointerPosition(x, y, viewportWidth, viewportHeight));
+    }
+
+    private static byte[] applyPointerSpotlight(byte[] screenshotBytes, PointerPosition pointer) throws IOException {
+        BufferedImage image = ImageIO.read(new ByteArrayInputStream(screenshotBytes));
+        if (image == null || pointer.viewportWidth() <= 0 || pointer.viewportHeight() <= 0) return screenshotBytes;
+
+        double scaleX = image.getWidth() / (double) pointer.viewportWidth();
+        double scaleY = image.getHeight() / (double) pointer.viewportHeight();
+        float scale = (float) Math.max(0.5, Math.min(scaleX, scaleY));
+        float centerX = (float) (pointer.x() * scaleX);
+        float centerY = (float) (pointer.y() * scaleY);
+        float radius = 76f * scale;
+
+        Graphics2D g = image.createGraphics();
+        try {
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+            g.setPaint(new RadialGradientPaint(
+                    new Point2D.Float(centerX, centerY), radius,
+                    new float[]{0f, .42f, 1f},
+                    new Color[]{new Color(48, 126, 246, 72), new Color(48, 126, 246, 34), new Color(48, 126, 246, 0)}));
+            g.fill(new Ellipse2D.Float(centerX - radius, centerY - radius, radius * 2, radius * 2));
+
+            g.setStroke(new BasicStroke(1.8f * scale));
+            g.setColor(new Color(55, 132, 255, 105));
+            float ring = 36f * scale;
+            g.draw(new Ellipse2D.Float(centerX - ring, centerY - ring, ring * 2, ring * 2));
+            g.setColor(new Color(55, 132, 255, 48));
+            ring = 52f * scale;
+            g.draw(new Ellipse2D.Float(centerX - ring, centerY - ring, ring * 2, ring * 2));
+
+            int[] xs = {0, 0, 5, 9, 13, 9, 16};
+            int[] ys = {0, 18, 13, 22, 20, 11, 11};
+            for (int i = 0; i < xs.length; i++) {
+                xs[i] = Math.round(centerX + xs[i] * scale);
+                ys[i] = Math.round(centerY + ys[i] * scale);
+            }
+            Polygon cursor = new Polygon(xs, ys, xs.length);
+            g.setColor(new Color(255, 255, 255, 235));
+            g.setStroke(new BasicStroke(3f * scale, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            g.draw(cursor);
+            g.setColor(new Color(20, 25, 37, 245));
+            g.fill(cursor);
+        } finally {
+            g.dispose();
+        }
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        ImageIO.write(image, "png", out);
+        return out.toByteArray();
+    }
+
     /**
      * 关闭当前 session 的浏览器页面
      */
     public String close(String sessionId) {
         Page page = pages.remove(sessionId);
+        lastPointerPositions.remove(sessionId);
         if (Objects.nonNull(page)) {
             page.close();
             return String.format(MessageConstants.BROWSER_PAGE_CLOSED, sessionId);

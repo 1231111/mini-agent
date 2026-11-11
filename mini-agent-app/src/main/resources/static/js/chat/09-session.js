@@ -7,6 +7,8 @@ function startNewChat(doFocus = true) {
     pendingTodoConfirm = null;
     setStreaming(false);
     currentId = null;
+    if (typeof syncTaskControlButton === 'function') syncTaskControlButton();
+    if (typeof syncConversationHeader === 'function') syncConversationHeader();
     localStorage.removeItem(LS_CUR);
     resetExecPolicyView();
     paintWorkspaceView(null);
@@ -25,6 +27,8 @@ async function switchConv(id, force) {
     pendingTodoConfirm = null;
     setStreaming(false);
     currentId = id;
+    if (typeof syncTaskControlButton === 'function') syncTaskControlButton();
+    if (typeof syncConversationHeader === 'function') syncConversationHeader();
     localStorage.setItem(LS_CUR, id);
     removeTaskRunningHint();
 
@@ -33,6 +37,7 @@ async function switchConv(id, force) {
     window._msgHasMore = true;
     window._msgLoading = false;
 
+    releaseAttachmentObjectUrls($msg);
     $msg.innerHTML = '';
     await loadMoreMessages(id, false);
     checkAndPollTask(id);
@@ -113,7 +118,8 @@ async function loadMoreMessages(sessionId, prepend) {
             messages.forEach(m => {
                 if (m.role === 'user') {
                     const imgs = m.images || [];
-                    renderUserMsg(m.content || '', imgs[0] || null, imgs.length, []);
+                    renderUserMsg(m.content || '', null, 0, [], false,
+                        imgs.map(src => ({ src, name: attachmentNameFromSource(src) })));
                 } else {
                     const bd = renderBotMsg(renderMD(m.content || ''), false);
                     bindLightbox(bd.closest('.bot-row'));
@@ -132,14 +138,16 @@ function buildUserRow(text, images = []) {
     row.className = 'msg-row user-row';
     row.dataset.task = text || '';   // 同上，历史 prepend 路径
     const imgs = Array.isArray(images) ? images.filter(Boolean) : [];
-    const imgHtml = imgs[0]
-        ? `<img src="${escA(imgs[0])}" alt="上传图片">`
-            + (imgs.length > 1
-                ? `<div style="font-size:11px;color:var(--text2);margin-top:4px">附 ${imgs.length} 张图片</div>`
-                : '')
-        : '';
     const textHtml = text ? esc(text).replace(/\n/g, '<br>') : '';
-    row.innerHTML = `<div class="msg-inner"><div class="user-bubble">${imgHtml}${textHtml}</div></div>`;
+    row.innerHTML = `<div class="msg-inner"><div class="user-bubble">${textHtml}</div><div class="user-avatar" aria-label="用户"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4.2 4.2 0 1 0 0-8.4A4.2 4.2 0 0 0 12 12Zm0 2.1c-4.3 0-7.8 2.2-7.8 4.9v1h15.6v-1c0-2.7-3.5-4.9-7.8-4.9Z"/></svg></div></div>`;
+    if (imgs.length) {
+        const grid = document.createElement('div');
+        grid.className = 'attachment-preview-grid';
+        imgs.forEach(src => grid.appendChild(createAttachmentPreview(src)));
+        row.querySelector('.user-bubble').insertBefore(grid, row.querySelector('.user-bubble').firstChild);
+    }
+    bindLightbox(row);
+    hydrateProtectedMedia(row);
     return row;
 }
 
@@ -147,12 +155,13 @@ function buildBotRow(text) {
     const row = document.createElement('div');
     row.className = 'msg-row bot-row';
     const bid = 'bb_' + Date.now() + '_' + Math.random().toString(36).slice(2,5);
-    row.innerHTML = '<div class="msg-inner"><div class="bot-avatar">🤖</div><div class="bot-content"><div class="bot-body" id="' + bid + '">' + renderMD(text) + '</div><div class="bot-actions"><button class="ba-btn" onclick="copyBotMsg(this)" title="复制"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>复制</button></div></div></div>';
+    row.innerHTML = '<div class="msg-inner"><div class="bot-avatar" aria-label="MiniAgent"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="ai-mark" d="M12 2.5 14.25 9.75 21.5 12l-7.25 2.25L12 21.5l-2.25-7.25L2.5 12l7.25-2.25L12 2.5Z"/><path d="M19.5 3.5v4M17.5 5.5h4M5 17v4M3 19h4"/></svg></div><div class="bot-content"><div class="bot-body" id="' + bid + '"><div class="answer-stream md-body has-content">' + renderMD(text) + '</div></div><div class="bot-actions"><button class="ba-btn" onclick="copyBotMsg(this)" title="复制"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>复制</button></div></div></div>';
     return row;
 }
 
 function renderConvMessages(id) {
     const conv = getConv(id);
+    releaseAttachmentObjectUrls($msg);
     $msg.innerHTML = '';
     if (!conv || !conv.messages?.length) {
         $msg.innerHTML = WELCOME;

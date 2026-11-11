@@ -15,8 +15,10 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.time.Duration;
 
 @Service
 public class TaskRunService implements SessionLock {
@@ -30,6 +32,8 @@ public class TaskRunService implements SessionLock {
     @Value("${agent.concurrency.max-tasks-per-user:2}")
     private int maxPerUserConfig;
     private int maxPerUser = 2;
+    @Value("${agent.replica.run-lock-ttl-seconds:7200}")
+    private long runLockTtlSeconds = 7200L;
     /** 仅 local 模式：本机用户正在运行的任务数 */
     private final ConcurrentHashMap<Long, AtomicInteger> localRunningCount = new ConcurrentHashMap<>();
     /** 仅 local 模式：会话 → fencing token。 */
@@ -95,27 +99,26 @@ public class TaskRunService implements SessionLock {
         String fencingToken = UUID.randomUUID().toString().replace("-", "");
 
         if (taskConcurrency != null) {
-            if (!taskConcurrency.tryLockSession(sessionId, fencingToken)) {
-                return StartResult.rejected("该会话已有任务在运行");
-            }
-            if (!taskConcurrency.tryOccupyUserQuota(
-                    userId, sessionId, fencingToken, maxPerUser)) {
-                taskConcurrency.unlockSession(sessionId, fencingToken);
-                return StartResult.rejected(
-                        "并发任务过多（每用户最多 " + maxPerUser + " 个），请等待当前任务完成");
-            }
+            RunHandle admission = new RunHandle(null, userId, sessionId, fencingToken);
             try {
+                if (!taskConcurrency.tryLockSession(sessionId, fencingToken)) {
+                    return StartResult.rejected("该会话已有任务在运行");
+                }
+                if (!taskConcurrency.tryOccupyUserQuota(
+                        userId, sessionId, fencingToken, maxPerUser)) {
+                    releaseRedisResources(admission);
+                    return StartResult.rejected(
+                            "并发任务过多（每用户最多 " + maxPerUser + " 个），请等待当前任务完成");
+                }
                 interruptPreviousRun(sessionId);
                 AgentTaskRun run = saveRunning(userId, sessionId);
                 return StartResult.accepted(new RunHandle(
                         run.getId(), userId, sessionId, fencingToken));
             } catch (Exception e) {
-                try {
-                    taskConcurrency.unlockSession(sessionId, fencingToken);
-                } finally {
-                    taskConcurrency.releaseUserQuota(
-                            userId, sessionId, fencingToken);
-                }
+                // A Redis command can time out after its write succeeded. Clean
+                // both token-owned resources even when acquisition was unconfirmed.
+                releaseRedisResources(admission);
+                log.warn("Task admission failed: user={} session={}", userId, sessionId, e);
                 return StartResult.rejected("无法启动任务: " + e.getMessage());
             }
         }
@@ -203,6 +206,12 @@ public class TaskRunService implements SessionLock {
         finish(run, AgentTaskRun.Status.CANCELLED, reason);
     }
 
+    /** This worker has yielded to a human; a later turn may resume the goal. */
+    @Transactional
+    public void markWaiting(RunHandle run, String reason) {
+        finish(run, AgentTaskRun.Status.WAITING, reason);
+    }
+
     private void finish(RunHandle run, AgentTaskRun.Status status, String error) {
         if (run == null) {
             return;
@@ -228,17 +237,7 @@ public class TaskRunService implements SessionLock {
 
     private void releaseResources(RunHandle run) {
         if (taskConcurrency != null) {
-            try {
-                if (run.sessionId() != null) {
-                    taskConcurrency.unlockSession(
-                            run.sessionId(), run.fencingToken());
-                }
-            } finally {
-                if (run.userId() != null) {
-                    taskConcurrency.releaseUserQuota(
-                            run.userId(), run.sessionId(), run.fencingToken());
-                }
-            }
+            releaseRedisResources(run);
             return;
         }
         boolean owned = run.sessionId() == null
@@ -251,10 +250,54 @@ public class TaskRunService implements SessionLock {
         }
     }
 
+    /** Redis expiry is the final fallback; cleanup must not roll back the DB terminal state. */
+    private void releaseRedisResources(RunHandle run) {
+        if (run.sessionId() != null) {
+            try {
+                taskConcurrency.unlockSession(run.sessionId(), run.fencingToken());
+            } catch (RuntimeException e) {
+                log.warn("Failed to release task session lock; lease will expire: runId={} session={}",
+                        run.runId(), run.sessionId(), e);
+            }
+        }
+        if (run.userId() != null) {
+            try {
+                taskConcurrency.releaseUserQuota(run.userId(), run.sessionId(), run.fencingToken());
+            } catch (RuntimeException e) {
+                log.warn("Failed to release task user quota; lease will expire: runId={} session={} user={}",
+                        run.runId(), run.sessionId(), run.userId(), e);
+            }
+        }
+    }
+
     public boolean isRunning(String sessionId) {
         if (taskConcurrency != null) {
             return taskConcurrency.isSessionLocked(sessionId);
         }
         return repository.existsBySessionIdAndStatus(sessionId, AgentTaskRun.Status.RUNNING);
+    }
+
+    /**
+     * Returns the fencing token of the run currently owning a session.
+     *
+     * <p>Cancellation and other execution signals must be scoped to this
+     * token.  In Redis mode the durable lock is authoritative across replicas;
+     * in local mode the compare-and-remove map is authoritative.</p>
+     */
+    public Optional<String> activeRunToken(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return Optional.empty();
+        }
+        if (taskConcurrency != null) {
+            return taskConcurrency.currentSessionToken(sessionId);
+        }
+        return Optional.ofNullable(localSessionLocks.get(sessionId))
+                .filter(token -> !token.isBlank());
+    }
+
+    /** Lifetime used by the run-lock renewer in Redis and local configurations. */
+    public long runLockTtlMillis() {
+        if (taskConcurrency != null) return taskConcurrency.runLockTtlMillis();
+        return Duration.ofSeconds(Math.max(1L, runLockTtlSeconds)).toMillis();
     }
 }

@@ -20,11 +20,13 @@ import com.miniagent.agent.planner.PlanningLoop;
 import com.miniagent.memory.MemoryService;
 import com.miniagent.memory.MemoryStore;
 import com.miniagent.agent.todo.TaskTodoContext;
+import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.agent.memory.ChatMemoryConfig;
 import com.miniagent.agent.tool.BuiltinTools;
 import com.miniagent.agent.tool.WorkspaceContext;
 import com.miniagent.config.service.DatabaseConversationStore;
 import com.miniagent.web.dto.FileAttachment;
+import com.miniagent.web.dto.FileRef;
 import com.miniagent.web.dto.MediaRef;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
@@ -43,6 +45,7 @@ import com.miniagent.config.repository.ChatTaskRepository;
 import com.miniagent.config.repository.UserRepository;
 import com.miniagent.config.entity.ChatTask;
 import com.miniagent.config.service.TaskRunService;
+import com.miniagent.config.service.TaskRunLeaseRenewer;
 import com.miniagent.agent.delegate.ClientMultiAgent;
 import com.miniagent.agent.delegate.RoleContext;
 import com.miniagent.agent.permission.PermissionContext;
@@ -112,6 +115,8 @@ public class AgentChatApplicationService {
     @Autowired
     private SessionEventCenter eventCenter;
     @Autowired
+    private TaskTodoStore taskTodoStore;
+    @Autowired
     private BuiltinTools builtinTools;
     /**
      * 代码诊断待检查队列。与 {@code builtinTools.clearToolCache()} 同生命周期清空：
@@ -121,6 +126,8 @@ public class AgentChatApplicationService {
     private com.miniagent.agent.coding.DiagnosticCollector diagnosticCollector;
     @Autowired
     private TaskRunService taskRunService;
+    @Autowired(required = false)
+    private TaskRunLeaseRenewer taskRunLeaseRenewer;
     @Autowired
     private ModelClientFactory modelClientFactory;
     /** 后台异步任务（记忆巩固）在新线程上跑，不继承 ThreadLocal，需要显式绑定用户模型。 */
@@ -164,7 +171,9 @@ public class AgentChatApplicationService {
         String sid = (StringUtils.isBlank(sessionId))
                 ? UUID.randomUUID().toString().substring(0, 8)
                 : sessionId.trim();
-        return executeAgentWithProgress(userId, sid, userMessage.trim(), null, List.of(), List.of());
+        return executeAgentWithProgress(
+                userId, sid, userMessage.trim(), userMessage.trim(), null,
+                List.of(), List.of(), List.of(), null, null).answer();
     }
 
     /**
@@ -212,38 +221,62 @@ public class AgentChatApplicationService {
         });
     }
 
-    private String executeAgentWithProgress(
-            Long userId,
-            String sessionId,
-            String userMessage,
-            SseEmitter progressEmitter,
-            List<String> imageDataUrls,
-            List<MediaRef> mediaRefs) {
+    private record PreparedRun(Long tenantId, String projectId, TaskRunService.RunHandle handle) {}
+
+    private PreparedRun prepareRun(Long userId, String sessionId) {
         Long tenantId = userRepository.findById(userId)
                 .filter(com.miniagent.config.entity.User::isEnabled)
                 .map(com.miniagent.config.entity.User::getTenantId)
                 .orElseThrow(() -> new BusinessException(ErrorCode.AUTH_SESSION_INVALID));
+        String projectId = conversationProjectService.resolveAuthorized(
+                userId, String.valueOf(tenantId), sessionId);
         TaskRunService.StartResult start = taskRunService.tryStart(userId, sessionId);
         if (!start.accepted()) {
             throw new IllegalStateException(start.error());
         }
-        TaskRunService.RunHandle run = start.handle();
-        String authorizedProjectId = conversationProjectService.resolveAuthorized(
-                userId, String.valueOf(tenantId), sessionId);
+        return new PreparedRun(tenantId, projectId, start.handle());
+    }
+
+    private AgentResult executeAgentWithProgress(
+            Long userId,
+            String sessionId,
+            String userMessage,
+            String displayMessage,
+            SseEmitter progressEmitter,
+            List<String> imageDataUrls,
+            List<MediaRef> mediaRefs,
+            List<FileRef> fileRefs,
+            PreparedRun acceptedRun,
+            String streamToken) {
+        PreparedRun prepared = acceptedRun == null ? prepareRun(userId, sessionId) : acceptedRun;
+        Long tenantId = prepared.tenantId();
+        String authorizedProjectId = prepared.projectId();
+        TaskRunService.RunHandle run = prepared.handle();
         OwnerContext owner = new OwnerContext(userId, String.valueOf(tenantId));
         boolean executionStarted = false;
+        boolean workerOpenAttempted = false;
+        AutoCloseable leaseRenewal = null;
 
         long[] taskId = {0L};
-        try (var ignoredOwner = OwnerContext.bind(owner)) {
+        try (var ignoredOwner = OwnerContext.bind(owner);
+             var ignoredRun = TaskExecutionContext.bindRun(run.fencingToken())) {
+            leaseRenewal = taskRunLeaseRenewer == null
+                    ? null : taskRunLeaseRenewer.start(run);
             OwnerContext.setCurrentProjectId(authorizedProjectId);
-            executionControl.start(sessionId, tenantId);
+            if (!taskRunService.renewSessionLock(sessionId, run.fencingToken())) {
+                throw new IllegalStateException("Task run lease is no longer owned");
+            }
+            executionControl.start(sessionId, tenantId, run.fencingToken());
             executionStarted = true;
-            // Install the execution lease before publishing the running state.
-            // A client can disconnect between taskRunService.tryStart and this
-            // point; ChatStreamingService then delivers the deferred cancellation
-            // to the real lease instead of losing it when start() replaces a
-            // fallback lease.
+            if (executionControl.isCancelled(sessionId, run.fencingToken())) {
+                stopLeaseRenewal(leaseRenewal);
+                leaseRenewal = null;
+                taskRunService.markCancelled(run, "Cancelled before worker start");
+                return new AgentResult("任务已取消。", RunStatus.CANCELED, "CANCELLED", 0L);
+            }
+            // Route changes only detach SSE clients; explicit controls own cancellation.
             streamingService.markRunning(sessionId);
+            workerOpenAttempted = true;
             clientMultiAgent.open(sessionId);
             memoryStore.loadFromDisk();
             try {
@@ -257,13 +290,21 @@ public class AgentChatApplicationService {
                     sessionId,
                     run,
                     userMessage,
+                    displayMessage,
                     progressEmitter,
                     imageDataUrls,
                     mediaRefs,
-                    taskId);
+                    fileRefs,
+                    taskId,
+                    streamToken);
             taskId[0] = agentResult.taskId();
+            // Stop renewal before selecting a terminal state. close() waits for
+            // any in-flight renewal tick, which may have discovered a lost run
+            // lease and canceled this fencing token while doExecuteAgent returned.
+            stopLeaseRenewal(leaseRenewal);
+            leaseRenewal = null;
             String answer = agentResult.answer();
-            if (executionControl.isCancelled(sessionId)) {
+            if (executionControl.isCancelled(sessionId, run.fencingToken()) || agentResult.status() == RunStatus.CANCELED) {
                 taskRunService.markCancelled(run, "Cancelled by user");
                 recordEvent(
                         sessionId,
@@ -272,23 +313,21 @@ public class AgentChatApplicationService {
                         "executor",
                         Map.of("reason", "cancelled"),
                         com.miniagent.memory.model.AgentEvent.EventStatus.FAILED);
-                return answer;
+                return new AgentResult(answer, RunStatus.CANCELED, "CANCELLED", taskId[0]);
             }
-            PlanningLoop.RunOutcome unfinished = agentResult.unfinishedOutcome();
-            if (unfinished != null) {
-                // 「没做完」不能记为完成。
-                // 此前规划器的死锁/恢复耗尽/轮次用尽都只返回一句"已按规划图推进任务"，
-                // 这里照样 markCompleted —— 任务状态、完成率口径、以及用户对"做完了"的判断
-                // 同时失真。现在按结局分流：UNFINISHED/FAILED 记为失败并留下原因码。
-                String reason = unfinished.reason();
+            if (agentResult.status() == RunStatus.WAITING) {
+                taskRunService.markWaiting(run, agentResult.reason());
+                return agentResult;
+            }
+            if (agentResult.status() != RunStatus.SUCCESS) {
+                String reason = agentResult.reason();
                 taskRunService.markFailed(run, "任务未达成目标: " + reason);
                 recordEvent(sessionId, Long.toString(taskId[0]),
                         com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
                         "executor", Map.of("reason", reason),
                         com.miniagent.memory.model.AgentEvent.EventStatus.FAILED);
-                log.warn("任务未达成目标，标记为失败: session={}, outcome={}, reason={}",
-                        sessionId, unfinished.outcome(), reason);
-                return answer;
+                log.warn("任务未达成目标，标记为失败: session={}, reason={}", sessionId, reason);
+                return agentResult;
             }
             taskRunService.markCompleted(run);
 
@@ -297,24 +336,40 @@ public class AgentChatApplicationService {
                 "executor", Map.of("answer", truncate(answer, 500)),
                 com.miniagent.memory.model.AgentEvent.EventStatus.SUCCESS);
 
-            return answer;
+            return agentResult;
         } catch (Exception e) {
-            if (executionStarted && executionControl.isCancelled(sessionId)) {
+            stopLeaseRenewal(leaseRenewal);
+            leaseRenewal = null;
+            if (executionStarted && executionControl.isCancelled(sessionId, run.fencingToken())) {
                 taskRunService.markCancelled(run, "Cancelled by user");
             } else {
-                taskRunService.markFailed(run, e.getMessage());
+                taskRunService.markFailed(run, exceptionDetail(e));
             }
 
             // 记录任务失败事件
             recordEvent(sessionId, Long.toString(taskId[0]), com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
-                "executor", Map.of("error", e.getMessage()),
+                "executor", Map.of("error", exceptionDetail(e)),
                 com.miniagent.memory.model.AgentEvent.EventStatus.FAILED);
 
             throw e;
         } finally {
-            if (executionStarted) {
-                clientMultiAgent.close(sessionId);
-                executionControl.finish(sessionId);
+            stopLeaseRenewal(leaseRenewal);
+            try {
+                if (workerOpenAttempted) {
+                    clientMultiAgent.close(sessionId);
+                }
+            } catch (RuntimeException e) {
+                log.warn("关闭会话 worker 失败: session={}", sessionId, e);
+            }
+            try {
+                executionControl.finish(sessionId, run.fencingToken());
+            } catch (RuntimeException e) {
+                log.warn("释放执行控制状态失败: session={}", sessionId, e);
+            } finally {
+                TaskTodoContext.clear();
+                // Always clear thread-local overrides before any further I/O.
+                WorkspaceContext.clearRootOverride();
+                WorkspaceContext.clearSessionOverride();
             }
             // For SSE runs the outer async wrapper publishes the terminal event
             // before releasing the ChatStreamingService reservation. Releasing it
@@ -323,11 +378,6 @@ public class AgentChatApplicationService {
             if (progressEmitter == null) {
                 streamingService.markIdle(sessionId);
             }
-            TaskTodoContext.clear();
-            // 工作区覆盖是线程级的，必须在本轮结束清掉：这个线程会被后续请求复用，
-            // 留着会让下一个会话莫名其妙地在别人的项目目录里写文件。
-            WorkspaceContext.clearRootOverride();
-            WorkspaceContext.clearSessionOverride();
 
             // 巩固走后台，避免挡住 SSE end（PERM_ASK 批准后续跑会等流结束）
             if (memoryManager != null) {
@@ -348,11 +398,40 @@ public class AgentChatApplicationService {
         }
     }
 
+    private static void stopLeaseRenewal(AutoCloseable renewal) {
+        if (renewal == null) return;
+        try {
+            renewal.close();
+        } catch (Exception e) {
+            log.warn("停止任务运行锁续租失败", e);
+        }
+    }
+
     public void cancel(Long userId, String sessionId) {
         if (StringUtils.isBlank(sessionId)) {
             throw new IllegalArgumentException("sessionId required");
         }
-        executionControl.cancel(sessionId);
+        taskRunService.activeRunToken(sessionId).ifPresent(token -> executionControl.cancel(sessionId, token));
+    }
+
+    public void pause(String sessionId) {
+        if (StringUtils.isBlank(sessionId)) throw new IllegalArgumentException("sessionId required");
+        taskRunService.activeRunToken(sessionId).ifPresent(token -> executionControl.pause(sessionId, token));
+    }
+
+    public void resume(String sessionId) {
+        if (StringUtils.isBlank(sessionId)) throw new IllegalArgumentException("sessionId required");
+        taskRunService.activeRunToken(sessionId).ifPresent(token -> executionControl.resume(sessionId, token));
+    }
+
+    public boolean isPauseRequested(String sessionId) {
+        return taskRunService.activeRunToken(sessionId)
+                .map(token -> executionControl.isPauseRequested(sessionId, token)).orElse(false);
+    }
+
+    public boolean isPausedAtCheckpoint(String sessionId) {
+        return taskRunService.activeRunToken(sessionId)
+                .map(token -> executionControl.isPausedAtCheckpoint(sessionId, token)).orElse(false);
     }
 
     private void recordEvent(String sessionId, String taskId,
@@ -390,14 +469,19 @@ public class AgentChatApplicationService {
     /**
      * 一次 agent 执行的结果。
      *
-     * <p>{@code unfinishedOutcome} 非空表示"这一轮没达成目标"（规划器死锁/恢复耗尽/轮次用尽/
-     * 任务图无法验收）—— 调用方必须据此把 run 记为失败，而不是完成。</p>
+     * <p>默认循环与规划器共用显式终态，持久任务、轨迹及 SSE 不从答复文本推断成功。</p>
      */
-    record AgentResult(String answer, PlanningLoop.RunOutcome unfinishedOutcome,
-                       boolean planApprovalRequired, long taskId) {
-        AgentResult(String answer, PlanningLoop.RunOutcome unfinishedOutcome) {
-            this(answer, unfinishedOutcome, false, 0L);
-        }
+    record AgentResult(String answer, RunStatus status, String reason, long taskId) {}
+
+    static RunStatus loopStatus(AgentLoop.LoopOutcome outcome) {
+        if (outcome == null) return RunStatus.FAILURE;
+        if (outcome.cancelled()) return RunStatus.CANCELED;
+        if (outcome.awaitingHuman()) return RunStatus.WAITING;
+        return outcome.successful() ? RunStatus.SUCCESS : RunStatus.FAILURE;
+    }
+
+    private static String exceptionDetail(Exception error) {
+        return Objects.requireNonNullElse(error.getMessage(), error.getClass().getSimpleName());
     }
 
     /**
@@ -422,19 +506,25 @@ public class AgentChatApplicationService {
             String sessionId,
             TaskRunService.RunHandle run,
             String userMessage,
+            String displayMessage,
             SseEmitter progressEmitter,
             List<String> imageDataUrls,
             List<MediaRef> mediaRefs,
-            long[] taskId) {
+            List<FileRef> fileRefs,
+            long[] taskId,
+            String streamToken) {
         List<String> images = Optional.ofNullable(imageDataUrls).orElseGet(List::of).stream()
                 .filter(StringUtils::isNotBlank).toList();
         List<MediaRef> media = Optional.ofNullable(mediaRefs).orElseGet(List::of).stream()
                 .filter(r -> Objects.nonNull(r) && StringUtils.isNotBlank(r.getFilePath()))
                 .toList();
+        List<FileRef> uploadedFiles = Optional.ofNullable(fileRefs).orElseGet(List::of).stream()
+                .filter(r -> Objects.nonNull(r) && StringUtils.isNotBlank(r.getFilePath()))
+                .toList();
         boolean hasImage = !images.isEmpty();
         boolean hasAv = !media.isEmpty();
         boolean hasMedia = hasImage || hasAv;
-        String runStatus = RunStatus.SUCCESS.name();
+        RunStatus runStatus = RunStatus.SUCCESS;
 
         contextCompressor.setCurrentSession(sessionId);
         builtinTools.clearToolCache();
@@ -479,19 +569,26 @@ public class AgentChatApplicationService {
 
         List<String> savedImagePaths = hasImage ? multimodalBuilder.saveImagesToDisk(sessionId, images) : new ArrayList<>();
         List<String> savedMediaPaths = hasAv ? multimodalBuilder.copyMediaToConversation(userId, sessionId, media) : List.of();
-        List<String> allSavedPaths = new ArrayList<>(savedImagePaths);
-        allSavedPaths.addAll(savedMediaPaths);
+        List<String> savedFilePaths = multimodalBuilder.referenceFilesForConversation(userId, uploadedFiles);
+        List<String> memoryMediaPaths = new ArrayList<>(savedImagePaths);
+        memoryMediaPaths.addAll(savedMediaPaths);
+        List<String> allSavedPaths = new ArrayList<>(memoryMediaPaths);
+        allSavedPaths.addAll(savedFilePaths);
 
         UserMessage multimodalMsg = hasMedia
                 ? multimodalBuilder.buildMultimodalUserMessage(userId, userMessage, images, savedImagePaths, media, savedMediaPaths)
                 : null;
-        String displayQuestion = MultimodalMessageBuilder.buildDisplayQuestion(userMessage, images.size(), media.size());
+        String displayQuestion = MultimodalMessageBuilder.buildDisplayQuestion(
+                Objects.requireNonNullElse(displayMessage, ""), images.size(), media.size());
 
         String firstLine = StringUtils.isNotBlank(userMessage)
                 ? userMessage.split("[\r\n]", 2)[0]
                 : (hasMedia ? MessageConstants.CHAT_IMAGE_ANALYSIS : MessageConstants.CHAT_DEFAULT_SESSION);
         BuiltinTools.setCurrentTaskName(firstLine);
         TaskTodoContext.set(sessionId);
+        // 新一轮聊天流需要主动回放当前任务清单：清单可能从上一轮沿用，
+        // 本轮模型不一定再次调用 todo 工具，但聊天气泡仍应显示任务进度卡片。
+        taskTodoStore.publishCurrentState(sessionId);
         String systemPrompt = loaded.systemPrompt();
 
         final boolean streaming = Objects.nonNull(progressEmitter);
@@ -501,20 +598,21 @@ public class AgentChatApplicationService {
         com.miniagent.agent.core.AgentStreamSink streamSink = !streaming ? null
                 : new com.miniagent.agent.core.AgentStreamSink() {
             @Override public void onThinking(String delta) {
-                eventCenter.publish(sessionId, "thinking", delta);
+                eventCenter.publish(sessionId, "thinking", delta, streamToken);
             }
             @Override public void onAnswerToken(String delta) {
-                eventCenter.publish(sessionId, "token", delta);
+                eventCenter.publish(sessionId, "token", delta, streamToken);
             }
             @Override public void onAnswerReset() {
-                eventCenter.publish(sessionId, "seal", "");
+                eventCenter.publish(sessionId, "seal", "", streamToken);
             }
             @Override public void onSubGoal(String text, int done, int total) {
-                eventCenter.publishSubGoal(sessionId, text, done, total);
+                eventCenter.publish(sessionId, "subgoal",
+                        Map.of("text", Objects.requireNonNullElse(text, ""), "done", done, "total", total), streamToken);
             }
             @Override public void onContext(int used, int limit) {
                 eventCenter.publish(sessionId, "context",
-                        "{\"used\":" + used + ",\"limit\":" + limit + "}");
+                        "{\"used\":" + used + ",\"limit\":" + limit + "}", streamToken);
             }
         };
 
@@ -524,8 +622,7 @@ public class AgentChatApplicationService {
         com.miniagent.common.model.EffectiveModelContext.set(
                 effectiveChat, models.streaming(), models.settings().contextWindowTokens());
         String answer;
-        // 规划器的结局：只有"没做完"会被带出去让调用方记为失败；完成与人等状态保持原语义。
-        PlanningLoop.RunOutcome unfinishedOutcome = null;
+        String endReason = "SUCCESS";
         boolean planApprovalRequired = false;
         try {
             String executionId = Objects.nonNull(traceRecorder)
@@ -536,31 +633,49 @@ public class AgentChatApplicationService {
                         history, taskPlan, sessionId, run.fencingToken(), executionId,
                         streamSink);
                 answer = outcome.answer();
+                endReason = outcome.reason();
                 planApprovalRequired = "PLAN_APPROVAL_REQUIRED".equals(outcome.reason());
                 if (planApprovalRequired && progressEmitter != null) {
                     eventCenter.publish(sessionId, "plan_approval",
-                            Map.of("required", true, "reason", outcome.reason()));
+                            Map.of("required", true, "reason", outcome.reason()), streamToken);
                 }
                 if (meansUnfinished(outcome)) {
-                    unfinishedOutcome = outcome;
-                    runStatus = RunStatus.FAILURE.name();
+                    runStatus = RunStatus.FAILURE;
+                } else if (outcome.outcome() == PlanningLoop.Outcome.BLOCKED_ON_HUMAN) {
+                    runStatus = RunStatus.WAITING;
                 }
-            } else if (hasMedia) {
-                answer = agentLoop.runWithMultimodal(effectiveChat, systemPrompt, multimodalMsg, history,
-                        maxIterations(), taskPlan, streamSink);
             } else {
-                answer = agentLoop.run(effectiveChat, systemPrompt, userMessage, history,
-                        maxIterations(), taskPlan, streamSink);
+                AgentLoop.LoopOutcome outcome = hasMedia
+                        ? agentLoop.runWithMultimodalOutcome(effectiveChat, systemPrompt, multimodalMsg,
+                                history, maxIterations(), taskPlan, streamSink)
+                        : agentLoop.runOutcome(effectiveChat, systemPrompt, userMessage, history,
+                                maxIterations(), taskPlan, streamSink);
+                answer = outcome == null ? "" : outcome.text();
+                endReason = outcome == null ? "MISSING_LOOP_OUTCOME"
+                        : StringUtils.defaultIfBlank(outcome.endReason(), "UNKNOWN_LOOP_OUTCOME");
+                runStatus = loopStatus(outcome);
             }
             if (executionControl.isCancelled(sessionId)) {
-                runStatus = RunStatus.CANCELED.name();
-            } else if (planningLoop.isAwaitingConfirm(sessionId)) {
-                runStatus = RunStatus.WAITING.name();
+                runStatus = RunStatus.CANCELED;
+                endReason = "CANCELLED";
             }
         } finally {
             PermissionContext.clear();
             AgentLoop.clearCurrentModels();
             AgentLoop.clearCurrentSession();
+        }
+
+        // A blank `end` event is rendered as a successful completion by the chat UI.
+        // Preserve a visible, persisted assistant response instead of silently ending
+        // the turn with an empty bubble. A waiting/approval turn is handled separately.
+        if (StringUtils.isBlank(answer)
+                && runStatus != RunStatus.WAITING
+                && runStatus != RunStatus.CANCELED
+                && !planApprovalRequired) {
+            answer = ensureFinalAnswer(answer);
+            runStatus = RunStatus.FAILURE;
+            endReason = "EMPTY_FINAL_ANSWER";
+            log.warn("Agent 返回空最终答复，已写入兜底提示并标记未完成: session={}", sessionId);
         }
 
         if (hasMedia) {
@@ -582,11 +697,11 @@ public class AgentChatApplicationService {
         persistTurn(userId, sessionId,
                 StringUtils.isNotBlank(userMessage) ? userMessage : displayQuestion,
                 answer,
-                allSavedPaths.isEmpty() ? null : allSavedPaths);
-        return new AgentResult(answer, unfinishedOutcome, planApprovalRequired, loaded.taskId());
+                memoryMediaPaths.isEmpty() ? null : memoryMediaPaths);
+        return new AgentResult(answer, runStatus, endReason, loaded.taskId());
         }
         } catch (Exception e) {
-            runStatus = RunStatus.FAILURE.name();
+            runStatus = RunStatus.FAILURE;
             if (Objects.nonNull(traceRecorder)) {
                 traceRecorder.recordError(sessionId, 0, e.getMessage());
             }
@@ -595,11 +710,16 @@ public class AgentChatApplicationService {
             // 权限上下文在这里提前绑定过，任何在进入内层 try 之前抛出的异常都要清掉，
             // 否则线程复用时会带着上一个会话的模式去找下一个会话要授权。
             PermissionContext.clear();
-            TaskExecutionContext.clear();
             if (Objects.nonNull(traceRecorder) && traceRecorder.isActive()) {
-                traceRecorder.endExecution(runStatus);
+                traceRecorder.endExecution(runStatus.name());
             }
         }
+    }
+
+    static String ensureFinalAnswer(String answer) {
+        return StringUtils.isNotBlank(answer)
+                ? answer
+                : "任务已结束，但智能体没有生成最终回复。请查看右侧任务详情中的执行记录和已生成文件。";
     }
 
     // =========================================================================
@@ -610,8 +730,10 @@ public class AgentChatApplicationService {
      * 统一多模态 SSE 入口：文字 + 图片 + 已上传音视频。
      */
     public SseEmitter chatStreamMultimodal(Long userId, String sessionId, String userMessage,
+                                           String displayMessage,
                                            List<String> imageDataUrls, List<FileAttachment> files,
-                                           List<MediaRef> mediaRefs, String role) {
+                                           List<MediaRef> mediaRefs, List<FileRef> fileRefs,
+                                           String role) {
         List<FileAttachment> fileAttachments =
             Optional.ofNullable(files).orElseGet(List::of).stream()
                 .filter(f -> Objects.nonNull(f) && StringUtils.isNotBlank(f.getBase64()))
@@ -635,7 +757,11 @@ public class AgentChatApplicationService {
         List<MediaRef> media = Optional.ofNullable(mediaRefs).orElseGet(List::of).stream()
                 .filter(r -> Objects.nonNull(r) && StringUtils.isNotBlank(r.getFilePath()))
                 .toList();
-        if (StringUtils.isBlank(userMessage) && images.isEmpty() && media.isEmpty()) {
+        List<FileRef> uploadedFiles = Optional.ofNullable(fileRefs).orElseGet(List::of).stream()
+                .filter(r -> Objects.nonNull(r) && StringUtils.isNotBlank(r.getFilePath()))
+                .toList();
+        if (StringUtils.isBlank(userMessage) && images.isEmpty() && media.isEmpty()
+                && uploadedFiles.isEmpty()) {
             return streamingService.createErrorEmitter("error", MessageConstants.CHAT_MULTIMODAL_EMPTY);
         }
 
@@ -644,30 +770,79 @@ public class AgentChatApplicationService {
                 : sessionId.trim();
         final String finalSid = sid;
         final String finalUserMessage = userMessage;
+        final String finalDisplayMessage = Objects.requireNonNullElse(displayMessage, "");
         final String finalRole = role;
         final List<String> finalImages = images;
         final List<MediaRef> finalMedia = media;
+        final List<FileRef> finalFileRefs = uploadedFiles;
 
-        SseEmitter emitter = streamingService.createStream(finalSid,
-                Optional.ofNullable(finalUserMessage).orElse(""), userId);
+        // The distributed task lock must be acquired before opening/broadcasting
+        // a channel. A losing replica must not replace the accepted run's stream.
+        final PreparedRun prepared;
+        try {
+            prepared = prepareRun(userId, finalSid);
+        } catch (Exception e) {
+            return streamingService.createErrorEmitter("error", exceptionDetail(e));
+        }
+        final ChatStreamingService.StreamStart stream;
+        try {
+            stream = streamingService.tryCreateStreamForAcceptedRun(finalSid,
+                    Optional.ofNullable(finalUserMessage).orElse(""), userId);
+        } catch (Exception e) {
+            taskRunService.markFailed(prepared.handle(), exceptionDetail(e));
+            executionControl.finish(finalSid, prepared.handle().fencingToken());
+            return streamingService.createErrorEmitter("error", exceptionDetail(e));
+        }
+        if (!stream.accepted()) {
+            taskRunService.markFailed(prepared.handle(), "SSE channel already reserved");
+            executionControl.finish(finalSid, prepared.handle().fencingToken());
+            return stream.emitter();
+        }
+        SseEmitter emitter = stream.emitter();
 
+        try {
         CompletableFuture.runAsync(() -> {
             try {
                 if (StringUtils.isNotBlank(finalRole)) {
                     RoleContext.setRole(finalRole);
                 }
-                String answer = executeAgentWithProgress(
-                        userId, finalSid, finalUserMessage, emitter, finalImages, finalMedia);
+                AgentResult result = executeAgentWithProgress(
+                        userId, finalSid, finalUserMessage, finalDisplayMessage,
+                        emitter, finalImages, finalMedia,
+                        finalFileRefs, prepared, stream.runToken());
                 streamingService.markCompleting(finalSid);
-                streamingService.getEventCenter().complete(finalSid, Optional.ofNullable(answer).orElse(""));
+                streamingService.getEventCenter().publish(finalSid, "task_outcome",
+                        Map.of("status", result.status().name(), "reason", result.reason()), stream.runToken());
+                if (result.status() == RunStatus.FAILURE) {
+                    streamingService.getEventCenter().error(finalSid, result.answer(), stream.runToken());
+                } else {
+                    streamingService.getEventCenter().complete(finalSid, result.answer(), stream.runToken());
+                }
             } catch (Exception e) {
                 streamingService.markCompleting(finalSid);
-                streamingService.getEventCenter().error(finalSid, MessageConstants.CHAT_PROCESSING_ERROR + e.getMessage());
+                streamingService.getEventCenter().error(finalSid,
+                        MessageConstants.CHAT_PROCESSING_ERROR + exceptionDetail(e), stream.runToken());
             } finally {
-                streamingService.markIdle(finalSid);
-                RoleContext.clear();
+                try {
+                    streamingService.markIdle(finalSid);
+                } finally {
+                    RoleContext.clear();
+                }
             }
         });
+        } catch (RuntimeException e) {
+            try {
+                taskRunService.markFailed(prepared.handle(), exceptionDetail(e));
+                streamingService.markCompleting(finalSid);
+                streamingService.getEventCenter().error(finalSid, exceptionDetail(e), stream.runToken());
+            } finally {
+                try {
+                    executionControl.finish(finalSid, prepared.handle().fencingToken());
+                } finally {
+                    streamingService.markIdle(finalSid);
+                }
+            }
+        }
 
         return emitter;
     }
