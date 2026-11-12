@@ -3,7 +3,9 @@ package com.miniagent.agent.mcp;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import com.miniagent.agent.tool.Tool;
+import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.ToolRegistry;
+import com.miniagent.agent.tool.ToolResult;
 import com.miniagent.common.MessageConstants;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
@@ -146,7 +148,7 @@ public class McpToolBridge {
                     .name(regName)
                     .description(desc)
                     .parameters(params)
-                    .handler(args -> invoke(serverId, toolName, args))
+                    .resultHandler(args -> invoke(serverId, toolName, args))
                     .build());
             names.add(regName);
             registeredNames.add(regName);
@@ -169,16 +171,24 @@ public class McpToolBridge {
         }
     }
 
-    private String invoke(String serverId, String toolName, String argsJson) {
+    private ToolResult invoke(String serverId, String toolName, String argsJson) {
         McpStdioClient client = clients.get(serverId);
         if (Objects.isNull(client)) {
-            return "{\"error\":\"" + String.format(MessageConstants.MCP_SERVER_NOT_CONNECTED, serverId) + "\"}";
+            return ToolResult.failure(ToolErrorCode.DEPENDENCY_UNAVAILABLE,
+                    String.format(MessageConstants.MCP_SERVER_NOT_CONNECTED, serverId), true);
         }
         try {
-            return client.callTool(toolName, argsJson);
+            String raw = client.callTool(toolName, argsJson);
+            return raw == null || raw.isBlank()
+                    ? ToolResult.unknown("MCP 返回空结果，无法确认操作是否已生效；请先核验实际状态，禁止直接重试", null)
+                    : ToolResult.fromLegacy(raw);
         } catch (Exception e) {
             log.warn("MCP 调用失败 {}.{}: {}", serverId, toolName, e.getMessage());
-            return "{\"error\":\"" + String.format(MessageConstants.MCP_CALL_FAILED, e.getMessage().replace("\"", "'")) + "\"}";
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            // MCP tools are conservatively registered as external writes. A
+            // transport exception cannot establish whether tools/call committed.
+            return ToolResult.unknown(String.format(MessageConstants.MCP_CALL_FAILED, e.getMessage())
+                    + "；操作可能已在 MCP 服务端生效，请先核验实际状态，禁止直接重试", null);
         }
     }
 

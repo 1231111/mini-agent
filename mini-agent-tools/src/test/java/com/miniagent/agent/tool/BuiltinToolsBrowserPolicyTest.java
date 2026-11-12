@@ -1,6 +1,9 @@
 package com.miniagent.agent.tool;
 
 import com.miniagent.agent.browser.BrowserService;
+import com.miniagent.agent.browser.BrowserSessionIdentity;
+import com.miniagent.common.context.OwnerContext;
+import org.junit.jupiter.api.AfterEach;
 import com.miniagent.agent.security.NetworkGuard;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -11,8 +14,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.verify;
 
 class BuiltinToolsBrowserPolicyTest {
+
+    @AfterEach
+    void cleanup() {
+        WorkspaceContext.clearSessionOverride();
+        OwnerContext.clearCurrentUser();
+        OwnerContext.clearCurrentTenant();
+    }
 
     @Test
     void browserEvaluateRegistrationFollowsConfiguration() {
@@ -38,6 +49,32 @@ class BuiltinToolsBrowserPolicyTest {
         assertFalse(result.retriable());
         assertTrue(result.message().contains("停止更换端口重试"));
         assertTrue(result.message().contains("exec_command"));
+        verifyNoInteractions(browser);
+    }
+
+    @Test
+    void browserSessionComesFromTrustedOwnerAndChatRatherThanDefaultModelArgument() {
+        OwnerContext.setCurrentUser(7L);
+        OwnerContext.setCurrentTenant("tenant");
+        WorkspaceContext.setSessionOverride("chat-a");
+        BrowserService browser = mock(BrowserService.class);
+        String expected = BrowserSessionIdentity.resolve(null);
+        when(browser.snapshot(expected, false)).thenReturn("observed");
+        ToolRegistry registry = registerBrowserTools(false, mock(NetworkGuard.class), browser);
+        assertEquals(ToolStatus.SUCCESS, registry.executeResult("browser_snapshot", "{}").status());
+        verify(browser).snapshot(expected, false);
+    }
+
+    @Test
+    void anotherSessionOrMissingRunCannotDispatchBrowserAction() {
+        BrowserService browser = mock(BrowserService.class);
+        ToolRegistry registry = registerBrowserTools(false, mock(NetworkGuard.class), browser);
+        assertEquals(ToolErrorCode.PERMISSION_DENIED, registry.executeResult("browser_close", "{}").errorCode());
+        OwnerContext.setCurrentUser(7L);
+        OwnerContext.setCurrentTenant("tenant");
+        WorkspaceContext.setSessionOverride("chat-a");
+        assertEquals(ToolErrorCode.PERMISSION_DENIED,
+                registry.executeResult("browser_click", "{\"ref\":\"b1.1\",\"sessionId\":\"chat-b\"}").errorCode());
         verifyNoInteractions(browser);
     }
 

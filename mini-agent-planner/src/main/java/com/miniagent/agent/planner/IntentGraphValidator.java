@@ -29,14 +29,17 @@ public final class IntentGraphValidator {
             if (path.isEmpty() && name.isEmpty()) {
                 continue;
             }
-            List<TaskNode> producers = producersOf(graph, path, name);
+            boolean conversational = "answer".equalsIgnoreCase(deliverable.type())
+                    || "action".equalsIgnoreCase(deliverable.type());
+            List<TaskNode> producers = producersOf(graph, path, name, conversational);
             if (producers.isEmpty()) {
                 String expected = path.isEmpty() ? deliverable.name() : deliverable.path();
                 errors.add(new PlanValidationReport.ValidationError(
                         PlanValidationReport.ValidationError.Type.GOAL_GRAPH_MISMATCH,
                         null,
                         "必需交付物没有生产者节点: " + expected,
-                        "增加负责生成该交付物的节点，并把路径写进 doneWhen.path 或 outputs。"));
+                        "文件/媒体的精确路径写进 doneWhen.path 或 outputs；"
+                                + "对话回答/操作结果的交付物名称原样写进 outputs，不必另建写文件节点。"));
             } else if (producers.size() > 1) {
                 warnings.add(new PlanValidationReport.ValidationWarning(
                         PlanValidationReport.ValidationWarning.Type.BEST_PRACTICE,
@@ -98,17 +101,17 @@ public final class IntentGraphValidator {
         return new PlanValidationReport(errors, warnings);
     }
 
-    private static List<TaskNode> producersOf(TaskGraph graph, String path, String name) {
+    private static List<TaskNode> producersOf(TaskGraph graph, String path, String name, boolean conversational) {
         List<TaskNode> producers = new ArrayList<>();
         for (TaskNode node : graph.nodes()) {
-            if (produces(node, path, name)) {
+            if (produces(node, path, name, conversational)) {
                 producers.add(node);
             }
         }
         return producers;
     }
 
-    private static boolean produces(TaskNode node, String path, String name) {
+    private static boolean produces(TaskNode node, String path, String name, boolean conversational) {
         DoneWhen done = node.doneWhen();
         if (done != null && (done.isFile() || done.isMedia())) {
             String expected = normalizePath(done.path());
@@ -125,6 +128,12 @@ public final class IntentGraphValidator {
                 return true;
             }
             if (path.isEmpty() && !name.isEmpty() && normalized.contains(name)) {
+                return true;
+            }
+            // An answer may carry a URL in path while its output port names the
+            // response. It is still a produced answer, not a file at that URL.
+            // File/media deliveries retain strict path matching above.
+            if (conversational && !name.isEmpty() && normalized.equals(normalizePath(name))) {
                 return true;
             }
         }

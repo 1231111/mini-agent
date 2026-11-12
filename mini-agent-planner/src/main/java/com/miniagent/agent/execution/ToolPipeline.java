@@ -23,6 +23,7 @@ import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.agent.tool.ToolResult;
 import com.miniagent.agent.tool.ToolSideEffect;
+import com.miniagent.agent.tool.ToolStatus;
 import com.miniagent.agent.tool.impl.ExecCommandParams;
 import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.agent.trace.TraceRecorder;
@@ -565,9 +566,8 @@ public class ToolPipeline {
                     // Give cooperative handlers a short opportunity to release resources.
                     // The outer AgentLoop grants a larger persistence grace period.
                     try {
-                        future.get(100L, TimeUnit.MILLISECONDS);
-                        ToolResult timedOut = budget.timeoutResult(descriptor);
-                        return new GuardedExecution(ToolInvocation.executed(name, timedOut), timedOut, false);
+                        return expiredExecution(name, descriptor, budget,
+                                future.get(100L, TimeUnit.MILLISECONDS));
                     } catch (TimeoutException stillRunning) {
                         return abandonExecution(name, descriptor, gate, abandoned, handlerStarted, worker,
                                 ToolInvocation.executed(name, budget.timeoutResult(descriptor)), false);
@@ -576,8 +576,7 @@ public class ToolPipeline {
                 try {
                     ToolInvocation invocation = future.get(50L, TimeUnit.MILLISECONDS);
                     if (budget.expired()) {
-                        ToolResult timedOut = budget.timeoutResult(descriptor);
-                        return new GuardedExecution(ToolInvocation.executed(name, timedOut), timedOut, false);
+                        return expiredExecution(name, descriptor, budget, invocation);
                     }
                     return new GuardedExecution(invocation, invocation.result(), false);
                 } catch (TimeoutException waiting) {
@@ -602,6 +601,16 @@ public class ToolPipeline {
                     ToolInvocation.executed(name, ToolResult.failure(ToolErrorCode.DEPENDENCY_UNAVAILABLE,
                             "无法确认执行控制状态: " + Objects.requireNonNullElse(e.getMessage(), "unknown"), false)), false);
         }
+    }
+
+    private static GuardedExecution expiredExecution(String name, ToolDescriptor descriptor,
+                                                     ToolInvocationBudget budget, ToolInvocation completed) {
+        // The handler may already have supplied precise evidence of an unknown
+        // outcome while responding to the deadline's interrupt. Never replace
+        // that evidence with a weaker retryable timeout or a late success.
+        ToolResult terminal = completed.result().status() == ToolStatus.UNKNOWN
+                ? completed.result() : budget.timeoutResult(descriptor);
+        return new GuardedExecution(ToolInvocation.executed(name, terminal), terminal, false);
     }
 
     private static GuardedExecution abandonExecution(String name, ToolDescriptor descriptor,
@@ -707,9 +716,7 @@ public class ToolPipeline {
                 || StringUtils.isBlank(tool)) {
             return;
         }
-        String display = ToolConcurrencyPolicy.EXEC_TOOL.equals(tool)
-                ? ExecCommandParams.displayText(argumentsJson)
-                : "";
+        String display = permissionDisplay(tool, argumentsJson);
         StringBuilder json = new StringBuilder("{\"tool\":\"").append(jsonEscape(tool)).append('"');
         if (!display.isBlank()) {
             json.append(",\"display\":\"").append(jsonEscape(display)).append('"');
@@ -723,6 +730,48 @@ public class ToolPipeline {
         }
         json.append('}');
         eventCenter.publish(sessionId, MessageConstants.SSE_PERMISSION_ASK, json.toString());
+    }
+
+    /** Desktop approvals identify one observation/action without copying typed secrets into the card. */
+    static String permissionDisplay(String tool, String argumentsJson) {
+        if (ToolConcurrencyPolicy.EXEC_TOOL.equals(tool)) {
+            return ExecCommandParams.displayText(argumentsJson);
+        }
+        if (!"desktop_act".equals(tool)) {
+            return "";
+        }
+        try {
+            JsonNode args = ARGS_JSON.readTree(argumentsJson);
+            if (args == null || !args.isObject()) return "桌面操作（参数无效）";
+            String action = args.path("action").asText("");
+            StringBuilder display = new StringBuilder("桌面操作 ");
+            switch (action) {
+                case "click", "double_click", "right_click" -> display.append(action)
+                        .append(" · 位置 (").append(args.path("x").asText("?"))
+                        .append(", ").append(args.path("y").asText("?")).append(')');
+                case "type" -> {
+                    String text = args.path("text").asText("");
+                    display.append("输入文本 · ").append(text.codePointCount(0, text.length()))
+                            .append(" 个字符");
+                }
+                case "key" -> display.append("按键 · ")
+                        .append(StringUtils.abbreviate(args.path("key").asText("?"), 48));
+                case "scroll" -> display.append("滚动 · ")
+                        .append(args.path("amount").asText("?"))
+                        .append(args.has("x") ? " · 位置 (" + args.path("x").asText("?")
+                                + ", " + args.path("y").asText("?") + ")" : " · 窗口中心");
+                case "focus" -> display.append("切换窗口 · ")
+                        .append(StringUtils.abbreviate(args.path("targetWindowId").asText("?"), 48));
+                default -> display.append("未知动作");
+            }
+            String observation = args.path("observationId").asText("");
+            if (!observation.isBlank()) {
+                display.append(" · 观察 ").append(StringUtils.abbreviate(observation, 96));
+            }
+            return display.toString();
+        } catch (Exception ignored) {
+            return "桌面操作（参数无效）";
+        }
     }
 
     /** 最小 JSON 字符串转义：事件体是手拼的，字段值里有引号就会破坏整条事件。 */

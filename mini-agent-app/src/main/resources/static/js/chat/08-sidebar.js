@@ -228,10 +228,7 @@ async function delConvAndRefresh(id) {
 const WELCOME = `
 <div class="welcome" id="welcomeScreen">
     <div class="welcome-logo" aria-hidden="true">
-        <svg viewBox="0 0 32 32" fill="none">
-            <path d="M5.5 21.5 10.7 10l5 12 4.3-9.4 5.5 8.9" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
-            <circle cx="25.5" cy="9" r="2" fill="currentColor"/>
-        </svg>
+        <svg viewBox="0 0 48 48" fill="none"><use href="#ma-ai-core"/></svg>
     </div>
     <h1>有什么可以帮你的？</h1>
     <div class="suggestion-grid">

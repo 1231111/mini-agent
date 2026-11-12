@@ -166,10 +166,16 @@ public final class PromptTemplates {
 
     public static final String BROWSER_GUIDANCE = """
 
-            browser_navigate 后立刻 browser_snapshot 再操作 ref。
+            browser_navigate/browser_snapshot 返回当前观察与完整 ref。每次交互使用最新 ref，页面改变或 STALE_OBSERVATION 时重新观察。
             密码页用 browser_type 填密码，再 browser_press Enter 或点确认按钮。
-            没有 browser_vision。点超时或元素在视口外：browser_click 会自动改 JS click。
+            没有 browser_vision。点击超时或结果未知时先观察实际结果，禁止换 JS click 或直接重复提交。
             同一链接不要反复 navigate。
+            填表先 browser_form_inspect 识别字段、必填项、选项与当前值，按用户资料匹配字段，缺少资料向用户补充，不编造。
+            文本用 browser_type，原生下拉用 browser_select，复选/单选用 browser_set_checked 设置目标状态，附件用 browser_upload。
+            上传仅使用当前会话工作区中用户指定的文件；选择附件可能立即上传到网站，须遵守用户授权与工具权限。
+            自定义 combobox/listbox/日期控件用最新快照与 click/press 操作，不把专用原生控件工具强套上去。
+            填后 browser_form_verify 回读并对照预期值，核对必填/格式错误；密码只核验是否已填，不在回执或回答中回显。
+            字段核验通过不等于已提交。遵守用户对保存/提交的授权范围，提交后核对成功回执或业务单号；结果未知不重放。
             有目录的长文档（飞书/wiki）：打开后（密码页先填密码）立刻
             browser_extract_text（默认写入 _source.md），它会按目录抽完全部章节。
             不要逐章点、不要 browser_evaluate 滚屏、不要凭记忆 write_file 编造正文。

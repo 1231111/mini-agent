@@ -10,7 +10,11 @@ class AgentLoopRetrievalCapTest {
     @Test
     void retrievalToolsAreRecognized() {
         assertTrue(AgentLoop.isRetrievalTool("web_search"));
-        assertTrue(AgentLoop.isRetrievalTool("browser_navigate"));
+        assertTrue(AgentLoop.isRetrievalTool("web_extract"));
+        assertFalse(AgentLoop.isRetrievalTool("browser_navigate"));
+        assertFalse(AgentLoop.isRetrievalTool("browser_click"));
+        assertFalse(AgentLoop.isRetrievalTool("browser_screenshot"));
+        assertFalse(AgentLoop.isRetrievalTool("desktop_act"));
         assertFalse(AgentLoop.isRetrievalTool("exec_command"));
         assertFalse(AgentLoop.isRetrievalTool("read_file"));
     }

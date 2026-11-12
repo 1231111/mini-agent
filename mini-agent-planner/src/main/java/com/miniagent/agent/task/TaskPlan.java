@@ -13,7 +13,7 @@ import java.util.Set;
  * 本轮的输入参数：用户在说什么、允许哪些工具、是否有预置步骤。
  *
  * <p>不再包含「本轮属于哪一类」的分类结果，也不包含从用户文本里用词表推断出的信号。
- * 是否拆解、是否建 todo、调哪个工具，全部由模型在 {@code AgentLoop} 内自行决定。</p>
+ * 是否使用 DAG 由执行入口的语义路由器决定；具体工具由模型在执行阶段选择。</p>
  *
  * <p>历史说明：这里曾有三个字段（{@code intent} / {@code decision} /
  * {@code directExecutable}），后来又有一组 {@code TaskSignals}
@@ -24,8 +24,14 @@ public record TaskPlan(
         String taskGoal,
         List<String> allowedTools,
         List<TaskStep> steps,
-        String reason
+        String reason,
+        Boolean artifactDeliveryRequested
 ) {
+
+    /** Legacy callers have no semantic delivery decision; validators retain their compatibility policy. */
+    public TaskPlan(String taskGoal, List<String> allowedTools, List<TaskStep> steps, String reason) {
+        this(taskGoal, allowedTools, steps, reason, null);
+    }
 
     public TaskPlan {
         taskGoal = taskGoal == null ? "" : taskGoal;
@@ -39,7 +45,11 @@ public record TaskPlan(
     }
 
     public TaskPlan withTaskGoal(String value) {
-        return new TaskPlan(value, allowedTools, steps, reason);
+        return new TaskPlan(value, allowedTools, steps, reason, artifactDeliveryRequested);
+    }
+
+    public TaskPlan withArtifactDeliveryRequested(boolean requested) {
+        return new TaskPlan(taskGoal, allowedTools, steps, reason, requested);
     }
 
     /** {@code null} 表示不限制（全量工具）。 */

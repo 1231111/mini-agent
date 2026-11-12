@@ -1,7 +1,11 @@
 /* =========================================================================
    BACKEND SYNC — 切会话时从后端拉取最新消息
    ========================================================================= */
-let pollingTimers = {};  // sessionId -> intervalId
+let pollingTimers = {};  // sessionId -> { timer, loadEpoch }
+
+function isCurrentTaskNavigation(sid, loadEpoch) {
+    return sid === currentId && loadEpoch === window._msgLoadEpoch;
+}
 
 async function syncFromBackend(sid) {
     // Trigger a re-render of the conversation from backend data
@@ -18,10 +22,13 @@ async function syncFromBackend(sid) {
 }
 
 async function checkAndPollTask(sid) {
+    const loadEpoch = window._msgLoadEpoch;
+    if (!isCurrentTaskNavigation(sid, loadEpoch)) return;
     try {
         const resp = await fetch('/api/conversations/' + encodeURIComponent(sid) + '/task');
-        if (!resp.ok) return;
+        if (!resp.ok || !isCurrentTaskNavigation(sid, loadEpoch)) return;
         const status = await apiJson(resp) || {};
+        if (!isCurrentTaskNavigation(sid, loadEpoch)) return;
         if (status.running) {
             taskIsActive = true;
             taskRunningSessionId = sid;
@@ -29,7 +36,7 @@ async function checkAndPollTask(sid) {
             taskPausedAtCheckpoint = status.pausedAtCheckpoint === true;
             if (typeof syncTaskControlButton === 'function') syncTaskControlButton();
             // 任务正在运行 → 重连事件流，先回放已产出内容，再继续实时跟到结束
-            await reconnectStream(sid);
+            await reconnectStream(sid, loadEpoch);
         } else if (taskRunningSessionId === sid) {
             taskIsActive = false;
             taskRunningSessionId = null;
@@ -38,6 +45,7 @@ async function checkAndPollTask(sid) {
             if (typeof syncTaskControlButton === 'function') syncTaskControlButton();
         }
     } catch (e) {
+        if (!isCurrentTaskNavigation(sid, loadEpoch)) return;
         console.warn('checkAndPollTask failed:', e);
     }
 }
@@ -46,26 +54,33 @@ async function checkAndPollTask(sid) {
  * 重连正在运行的会话事件流：GET .../messages/stream，复用 consumeStream 渲染。
  * 收到 gone（缓冲已驱逐）则回退轮询 + 数据库加载。
  */
-async function reconnectStream(sid) {
+async function reconnectStream(sid, loadEpoch = window._msgLoadEpoch) {
+    if (!isCurrentTaskNavigation(sid, loadEpoch)) return;
+    let epoch = null;
     try {
         const resp = await fetch('/api/conversations/' + encodeURIComponent(sid) + '/messages/stream');
+        if (!isCurrentTaskNavigation(sid, loadEpoch)) {
+            if (resp.body) await resp.body.cancel().catch(() => {});
+            return;
+        }
         if (!resp.ok || !resp.body) {
             unlockComposer();
             showTaskRunningHint(sid);
-            startPolling(sid);
+            startPolling(sid, loadEpoch);
             return;
         }
-        const epoch = ++streamEpoch;
+        epoch = ++streamEpoch;
         setStreaming(true);
         if (typeof refreshTaskPauseState === 'function') refreshTaskPauseState(sid);
         const botBody = renderBotMsg('<div class="typing-dots"><span></span><span></span><span></span></div>', true);
         await consumeStream(resp.body.getReader(), botBody, sid);
-        if (isStreaming && epoch === streamEpoch) unlockComposer();
+        if (isCurrentTaskNavigation(sid, loadEpoch) && isStreaming && epoch === streamEpoch) unlockComposer();
     } catch (e) {
+        if (!isCurrentTaskNavigation(sid, loadEpoch) || (epoch !== null && epoch !== streamEpoch)) return;
         console.warn('reconnectStream failed:', e);
         unlockComposer();
         showTaskRunningHint(sid);
-        startPolling(sid);
+        startPolling(sid, loadEpoch);
     }
 }
 
@@ -95,8 +110,9 @@ function showTaskRunningHint(sid) {
     hint.id = 'task-running-hint';
     hint.className = 'msg-row bot-row';
     hint.innerHTML = `<div class="msg-inner">
-        <div class="bot-avatar" aria-label="MiniAgent"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="ai-mark" d="M12 2.5 14.25 9.75 21.5 12l-7.25 2.25L12 21.5l-2.25-7.25L2.5 12l7.25-2.25L12 2.5Z"/><path d="M19.5 3.5v4M17.5 5.5h4M5 17v4M3 19h4"/></svg></div>
+        <div class="bot-avatar" aria-label="MiniAgent"><svg viewBox="0 0 48 48" aria-hidden="true"><use href="#ma-ai-core"/></svg></div>
         <div class="bot-content">
+            <div class="bot-identity"><span>MiniAgent</span><span class="bot-identity-label">AI 助手</span></div>
             <div class="bot-body">
                 <div class="typing-dots"><span></span><span></span><span></span></div>
                 <span class="progress-hint">任务仍在运行中，请稍候...</span>
@@ -111,12 +127,20 @@ function removeTaskRunningHint() {
     document.getElementById('task-running-hint')?.remove();
 }
 
-function startPolling(sid) {
-    if (pollingTimers[sid]) return; // 已在轮询
-    pollingTimers[sid] = setInterval(async () => {
+function startPolling(sid, loadEpoch = window._msgLoadEpoch) {
+    if (!isCurrentTaskNavigation(sid, loadEpoch)) return;
+    if (pollingTimers[sid] && pollingTimers[sid].loadEpoch === loadEpoch) return;
+    stopPolling(sid);
+    const poll = { timer: null, loadEpoch };
+    pollingTimers[sid] = poll;
+    poll.timer = setInterval(async () => {
+        const isCurrent = () => pollingTimers[sid] === poll && isCurrentTaskNavigation(sid, loadEpoch);
+        if (!isCurrent()) { stopPolling(sid, poll); return; }
         try {
             const resp = await fetch('/api/conversations/' + encodeURIComponent(sid) + '/task');
+            if (!isCurrent() || !resp.ok) return;
             const status = await apiJson(resp) || {};
+            if (!isCurrent()) return;
             if (!status.running) {
                 if (taskRunningSessionId === sid) {
                     taskIsActive = false;
@@ -125,19 +149,20 @@ function startPolling(sid) {
                     taskPausedAtCheckpoint = false;
                     if (typeof syncTaskControlButton === 'function') syncTaskControlButton();
                 }
-                stopPolling(sid);
+                stopPolling(sid, poll);
                 unlockComposer();
-                if (sid === currentId) await switchConv(sid, true);
+                await switchConv(sid, true);
             }
         } catch (e) {
+            if (!isCurrent()) return;
             console.warn('poll error:', e);
         }
     }, 10000);  // SSE 不可用时低频检查，限制页面与网络负载
 }
 
-function stopPolling(sid) {
-    if (pollingTimers[sid]) {
-        clearInterval(pollingTimers[sid]);
+function stopPolling(sid, expectedPoll) {
+    if (pollingTimers[sid] && (!expectedPoll || pollingTimers[sid] === expectedPoll)) {
+        clearInterval(pollingTimers[sid].timer);
         delete pollingTimers[sid];
     }
 }

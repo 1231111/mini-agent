@@ -52,6 +52,11 @@ roles:
       - browser_click
       - browser_type
       - browser_press
+      - browser_form_inspect
+      - browser_form_verify
+      - browser_select
+      - browser_set_checked
+      - browser_upload
       - browser_scroll
       - browser_screenshot
       - browser_evaluate
@@ -215,6 +220,8 @@ roles:
       - browser_evaluate
       - browser_click
       - browser_scroll
+      - browser_form_inspect
+      - browser_form_verify
       - write_file
       - web_search
 
@@ -266,6 +273,11 @@ roles:
       - browser_snapshot
       - browser_click
       - browser_type
+      - browser_form_inspect
+      - browser_form_verify
+      - browser_select
+      - browser_set_checked
+      - browser_upload
       - browser_screenshot
       - browser_evaluate
       - read_file

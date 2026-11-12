@@ -207,7 +207,7 @@ function workspaceSidQuery() {
     return currentId ? '?sid=' + encodeURIComponent(currentId) : '';
 }
 
-function workspaceFileDownloadLink(workspacePath, downloadName, explicitUrl) {
+function workspaceFileDownloadLink(workspacePath, downloadName, explicitUrl, displayLabel) {
     if (!currentId) return '<code>' + esc(downloadName) + '</code>';
     const ext = fileExt(downloadName).toUpperCase() || 'FILE';
     const isMarkdown = ['MD', 'MDOWN', 'MARKDOWN'].includes(ext);
@@ -235,18 +235,21 @@ function workspaceFileDownloadLink(workspacePath, downloadName, explicitUrl) {
     const url = explicitUrl || '/api/workspace-download/' + workspacePath + workspaceSidQuery();
     const typeClass = officeKind ? ` workspace-download-link--${officeKind}` : '';
     const iconClass = officeKind ? ` workspace-file-ext--${officeKind}` : '';
-    return `<a href="#" data-workspace-file-check="${escA(url)}" data-file-type="${escA(typeLabel)}" aria-disabled="true" data-download-name="${escA(downloadName)}" class="workspace-download-link${isMarkdown ? ' workspace-download-link--markdown' : ''}${isCode ? ' workspace-download-link--code' : ''}${typeClass}" rel="nofollow"><span class="workspace-file-ext${isMarkdown ? ' workspace-file-ext--markdown' : ''}${isCode ? ' workspace-file-ext--code' : ''}${iconClass}">${icon}</span><span class="workspace-file-label">${esc(downloadName)}<small>${hint}</small></span></a>`;
+    // displayLabel comes from parseLinks after renderMD's full HTML escaping;
+    // filenames are raw path data and must always pass esc() separately.
+    const title = displayLabel && !/^查看文件(?:[:：]|$)/.test(displayLabel) ? displayLabel : esc(downloadName);
+    return `<a href="#" data-workspace-file-check="${escA(url)}" data-file-type="${escA(typeLabel)}" aria-disabled="true" data-download-name="${escA(downloadName)}" class="workspace-download-link workspace-file-chip${isMarkdown ? ' workspace-download-link--markdown' : ''}${isCode ? ' workspace-download-link--code' : ''}${typeClass}" rel="nofollow"><span class="workspace-file-ext${isMarkdown ? ' workspace-file-ext--markdown' : ''}${isCode ? ' workspace-file-ext--code' : ''}${iconClass}">${icon}</span><span class="workspace-file-label"><span class="workspace-file-name">${title}</span><small>${hint}</small></span></a>`;
 }
 
 /** 工作区交付物的行内文件名使用卡片展示；兼容 MD、源码、网页和常见文档格式。 */
-function inlineMarkdownFileLink(codeText) {
+function inlineMarkdownFileLink(codeText, displayLabel) {
     const token = String(codeText || '').trim().replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
     if (!/\.(?:md|markdown|mdown|html?|css|m?js|cjs|tsx?|jsx|json|py|java|go|rs|c|h|cpp|hpp|sh|bat|ps1|sql|xml|ya?ml|txt|csv|pdf|docx?|xlsx?|pptx?)$/i.test(token)) return null;
     const pathToken = token.startsWith('workspace/') ? token : 'workspace/' + token;
     const workspacePath = workspaceDownloadPath(pathToken);
     if (workspacePath) {
         const downloadName = decodeURIComponentSafe(workspacePath);
-        return workspaceFileDownloadLink(workspacePath, downloadName);
+        return workspaceFileDownloadLink(workspacePath, downloadName, null, displayLabel);
     }
     // Nested and absolute references are resolved only inside this user's session
     // workspace. The API rejects references outside that boundary.
@@ -260,7 +263,7 @@ function inlineMarkdownFileLink(codeText) {
     if (!name) return null;
     const url = '/api/workspace-download?path=' + encodeURIComponent(relative)
         + (currentId ? '&sid=' + encodeURIComponent(currentId) : '');
-    return workspaceFileDownloadLink(null, name, url);
+    return workspaceFileDownloadLink(null, name, url, displayLabel);
 }
 
 /** 回复常把 write_file 返回的 workspace/文件名作为普通文本，而非 Markdown 链接。 */
@@ -355,9 +358,9 @@ function parseLinks(s) {
                     if (workspacePath) {
                         let downloadName = workspacePath;
                         try { downloadName = decodeURIComponent(workspacePath); } catch (_) { }
-                        out += workspaceFileDownloadLink(workspacePath, downloadName);
+                        out += workspaceFileDownloadLink(workspacePath, downloadName, null, label);
                     } else if (!/^(?:https?:|\/\/|\/api\/)/i.test(href) && inlineMarkdownFileLink(href)) {
-                        out += inlineMarkdownFileLink(href);
+                        out += inlineMarkdownFileLink(href, label);
                     } else if (!/^https?:\/\//i.test(href) && !/^\/\w/.test(href)) {
                         out += s.slice(i, u.end + 1);
                     } else {
@@ -514,8 +517,8 @@ function renderMD(t) {
     // Inline code and file-card markup must not participate in later emphasis
     // replacement: start_*.bat is literal, never a start_<em>.bat download URL.
     const inlineBlocks = [];
-    t = t.replace(/`([^`]+)`/g, (match, codeText) => {
-        inlineBlocks.push(inlineMarkdownFileLink(codeText) || '<code>' + codeText + '</code>');
+    t = t.replace(/`([^`]+)`/g, (match, codeText, offset, source) => {
+        inlineBlocks.push(renderMarkdownCodeToken(codeText, source, offset, match.length));
         return '\u0000IC' + (inlineBlocks.length - 1) + '\u0000';
     });
     t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
@@ -582,7 +585,7 @@ function renderMD(t) {
     });
 
     if (!t.startsWith('<')) t = '<p>' + t + '</p>';
-    return t;
+    return layoutMarkdownFiles(t);
 }
 
 function copyCode(btn) {

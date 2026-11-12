@@ -78,11 +78,9 @@ public class TaskRunService implements SessionLock {
                     && taskConcurrency.isSessionLocked(run.getSessionId())) {
                 continue;
             }
-            run.setStatus(AgentTaskRun.Status.INTERRUPTED);
-            run.setFinishedAt(now);
-            run.setErrorMessage("Process restarted; previous run interrupted");
-            repository.save(run);
-            recovered++;
+            recovered += repository.finishIfRunning(run.getId(), AgentTaskRun.Status.RUNNING,
+                    AgentTaskRun.Status.INTERRUPTED, now,
+                    "Process restarted; previous run interrupted");
         }
         if (recovered > 0) {
             log.warn("Recovered {} orphaned RUNNING task(s) as INTERRUPTED", recovered);
@@ -110,7 +108,7 @@ public class TaskRunService implements SessionLock {
                     return StartResult.rejected(
                             "并发任务过多（每用户最多 " + maxPerUser + " 个），请等待当前任务完成");
                 }
-                interruptPreviousRun(sessionId);
+                interruptPreviousRun(sessionId, "Distributed run lease expired");
                 AgentTaskRun run = saveRunning(userId, sessionId);
                 return StartResult.accepted(new RunHandle(
                         run.getId(), userId, sessionId, fencingToken));
@@ -143,6 +141,13 @@ public class TaskRunService implements SessionLock {
             }
         }
         try {
+            // The local token is the live-worker authority. A terminal DB write
+            // may have failed after its owner released the token; repair that
+            // stale row only after this admission owns both lock and quota.
+            if (sessionId != null) {
+                interruptPreviousRun(sessionId,
+                        "Local run ownership lost; previous worker ended without a terminal state");
+            }
             AgentTaskRun run = saveRunning(userId, sessionId);
             return StartResult.accepted(new RunHandle(
                     run.getId(), userId, sessionId, fencingToken));
@@ -180,14 +185,14 @@ public class TaskRunService implements SessionLock {
         return repository.save(run);
     }
 
-    private void interruptPreviousRun(String sessionId) {
+    private void interruptPreviousRun(String sessionId, String reason) {
         repository.findFirstBySessionIdAndStatusOrderByStartedAtDesc(
                         sessionId, AgentTaskRun.Status.RUNNING)
                 .ifPresent(run -> {
-                    run.setStatus(AgentTaskRun.Status.INTERRUPTED);
-                    run.setFinishedAt(LocalDateTime.now());
-                    run.setErrorMessage("Distributed run lease expired");
-                    repository.save(run);
+                    // Its owner may have committed completion after our query.
+                    // Compare the persisted status rather than saving a stale entity.
+                    repository.finishIfRunning(run.getId(), AgentTaskRun.Status.RUNNING,
+                            AgentTaskRun.Status.INTERRUPTED, LocalDateTime.now(), reason);
                 });
     }
 
@@ -274,7 +279,7 @@ public class TaskRunService implements SessionLock {
         if (taskConcurrency != null) {
             return taskConcurrency.isSessionLocked(sessionId);
         }
-        return repository.existsBySessionIdAndStatus(sessionId, AgentTaskRun.Status.RUNNING);
+        return sessionId != null && localSessionLocks.containsKey(sessionId);
     }
 
     /**

@@ -20,7 +20,7 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Exercises actual AgentLoop -> permission -> locks -> registered handler execution. */
 class AgentLoopToolTimeoutTest {
     private static final String SESSION = "handler-timeout";
-    private static final String COMMAND = "{\"command\":\"echo safe\"}";
+    private static final String COMMAND = "{\"command\":\"git status\"}";
 
     @Test
     void ordinaryReadRespectsOneSecondActionCapAndJournalsTimeout() throws Exception {

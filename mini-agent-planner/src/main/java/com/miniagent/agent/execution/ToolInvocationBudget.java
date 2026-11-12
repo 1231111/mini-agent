@@ -3,6 +3,7 @@ package com.miniagent.agent.execution;
 import com.miniagent.agent.tool.ToolDescriptor;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.ToolResult;
+import com.miniagent.agent.tool.ToolSideEffect;
 
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -46,6 +47,12 @@ public final class ToolInvocationBudget {
 
     public static ToolResult timeoutResult(ToolDescriptor descriptor, long timeoutSeconds) {
         String message = "工具执行超时（" + timeoutSeconds + "s）";
+        // A handler deadline says nothing about whether a submitted write took
+        // effect. VERIFY/RESUME are recovery instructions, not proof that retry
+        // is safe; their timeout must still stop automatic action dispatch.
+        if (descriptor.sideEffect() != ToolSideEffect.READ_ONLY) {
+            return ToolResult.unknown(message + descriptor.recoveryHint(), null);
+        }
         return switch (descriptor.timeoutRecovery()) {
             case AWAIT_USER -> ToolResult.failure(ToolErrorCode.CANCELLED,
                     "等待用户回答已结束，请根据用户下一条消息继续", false);

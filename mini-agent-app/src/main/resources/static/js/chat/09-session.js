@@ -2,6 +2,7 @@
    NEW CHAT / SWITCH CONVERSATION
    ========================================================================= */
 function startNewChat(doFocus = true) {
+    window._msgLoadEpoch = (window._msgLoadEpoch || 0) + 1;
     if (currentId) stopPolling(currentId);
     removeTaskRunningHint();
     pendingTodoConfirm = null;
@@ -36,10 +37,12 @@ async function switchConv(id, force) {
     window._msgPage = 0;
     window._msgHasMore = true;
     window._msgLoading = false;
+    const loadEpoch = window._msgLoadEpoch = (window._msgLoadEpoch || 0) + 1;
 
     releaseAttachmentObjectUrls($msg);
     $msg.innerHTML = '';
     await loadMoreMessages(id, false);
+    if (currentId !== id || window._msgLoadEpoch !== loadEpoch) return;
     checkAndPollTask(id);
     renderSidebar();
     // 同上：步骤、工具、记忆三块都跟着会话走，切会话必须换数据源
@@ -74,13 +77,18 @@ async function switchConv(id, force) {
 async function loadMoreMessages(sessionId, prepend) {
     if (window._msgLoading || !window._msgHasMore) return;
     window._msgLoading = true;
+    const loadEpoch = window._msgLoadEpoch;
 
     try {
         const page = window._msgPage || 0;
         const resp = await fetch('/api/conversations/' + encodeURIComponent(sessionId)
             + '/messages?page=' + page + '&size=20');
-        if (!resp.ok) { window._msgLoading = false; return; }
+        if (!resp.ok) {
+            if (currentId === sessionId && window._msgLoadEpoch === loadEpoch) window._msgLoading = false;
+            return;
+        }
         const data = await apiJson(resp) || {};
+        if (currentId !== sessionId || window._msgLoadEpoch !== loadEpoch) return;
 
         window._msgHasMore = data.hasMore;
         window._msgPage = page + 1;
@@ -91,8 +99,9 @@ async function loadMoreMessages(sessionId, prepend) {
         rawTasks.forEach(t => {
             const imgs = Array.isArray(t.images) ? t.images.filter(Boolean) : [];
             if (t.question || imgs.length)
-                messages.push({ role: 'user', content: t.question || '', images: imgs });
-            if (t.answer) messages.push({ role: 'assistant', content: t.answer });
+                messages.push({ role: 'user', content: t.question || '', images: imgs, task: t });
+            if (t.answer || (t.progress && t.progress.items && t.progress.items.length))
+                messages.push({ role: 'assistant', content: t.answer || '', task: t });
         });
 
         if (prepend) {
@@ -104,9 +113,11 @@ async function loadMoreMessages(sessionId, prepend) {
             const frag = document.createDocumentFragment();
             messages.forEach(m => {
                 if (m.role === 'user') {
-                    frag.appendChild(buildUserRow(m.content || '', m.images || []));
+                    const row = buildUserRow(m.content || '', m.images || []);
+                    if (m.task.id != null) row.dataset.chatTaskId = String(m.task.id);
+                    frag.appendChild(row);
                 } else {
-                    frag.appendChild(buildBotRow(m.content || ''));
+                    frag.appendChild(buildBotRow(m.content || '', m.task));
                 }
             });
             insertAt($msg, frag, $msg.firstChild);
@@ -118,10 +129,12 @@ async function loadMoreMessages(sessionId, prepend) {
             messages.forEach(m => {
                 if (m.role === 'user') {
                     const imgs = m.images || [];
-                    renderUserMsg(m.content || '', null, 0, [], false,
+                    const row = renderUserMsg(m.content || '', null, 0, [], false,
                         imgs.map(src => ({ src, name: attachmentNameFromSource(src) })));
+                    if (row && m.task.id != null) row.dataset.chatTaskId = String(m.task.id);
                 } else {
                     const bd = renderBotMsg(renderMD(m.content || ''), false);
+                    restoreTaskProgress(bd, m.task);
                     bindLightbox(bd.closest('.bot-row'));
                 }
             });
@@ -130,7 +143,7 @@ async function loadMoreMessages(sessionId, prepend) {
     } catch (e) {
         console.warn('Failed to load messages:', e);
     }
-    window._msgLoading = false;
+    if (currentId === sessionId && window._msgLoadEpoch === loadEpoch) window._msgLoading = false;
 }
 
 function buildUserRow(text, images = []) {
@@ -151,11 +164,14 @@ function buildUserRow(text, images = []) {
     return row;
 }
 
-function buildBotRow(text) {
+function buildBotRow(text, task) {
     const row = document.createElement('div');
     row.className = 'msg-row bot-row';
-    const bid = 'bb_' + Date.now() + '_' + Math.random().toString(36).slice(2,5);
-    row.innerHTML = '<div class="msg-inner"><div class="bot-avatar" aria-label="MiniAgent"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="ai-mark" d="M12 2.5 14.25 9.75 21.5 12l-7.25 2.25L12 21.5l-2.25-7.25L2.5 12l7.25-2.25L12 2.5Z"/><path d="M19.5 3.5v4M17.5 5.5h4M5 17v4M3 19h4"/></svg></div><div class="bot-content"><div class="bot-body" id="' + bid + '"><div class="answer-stream md-body has-content">' + renderMD(text) + '</div></div><div class="bot-actions"><button class="ba-btn" onclick="copyBotMsg(this)" title="复制"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>复制</button></div></div></div>';
+    const bid = nextBotBodyId();
+    row.innerHTML = '<div class="msg-inner"><div class="bot-avatar" aria-label="MiniAgent"><svg viewBox="0 0 48 48" aria-hidden="true"><use href="#ma-ai-core"/></svg></div><div class="bot-content"><div class="bot-identity"><span>MiniAgent</span><span class="bot-identity-label">AI 助手</span></div><div class="bot-body" id="' + bid + '"><div class="answer-stream md-body has-content">' + renderMD(text) + '</div></div><div class="bot-actions"><button class="ba-btn" onclick="copyBotMsg(this)" title="复制"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>复制</button></div></div></div>';
+    restoreTaskProgress(row.querySelector('.bot-body'), task);
+    bindLightbox(row);
+    hydrateProtectedMedia(row);
     return row;
 }
 
@@ -169,7 +185,10 @@ function renderConvMessages(id) {
         conv.messages.forEach(m => {
             if (m.role === 'user') renderUserMsg(m.text || '', m.imgSrc || null);
             else {
-                const bd = renderBotMsg(m.html || renderMD(m.text || ''), false);
+                const bd = renderBotMsg(m.html || renderMD(m.text || ''), !!m.html);
+                bd.classList.remove('streaming');
+                const card = bd.querySelector('.todo-panel');
+                if (card) insertAt(bd, card, bd.querySelector('.answer-stream'));
                 bindLightbox(bd.closest('.bot-row'));
             }
         });

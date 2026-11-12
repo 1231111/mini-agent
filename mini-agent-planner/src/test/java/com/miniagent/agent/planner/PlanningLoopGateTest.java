@@ -10,16 +10,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * 规划器入口的行为契约。
  *
- * <p>默认 Agent 路径不做「简单任务/复杂任务」判断；
- * 只有会话显式处于 PermissionMode.PLAN 时才进入规划器。
- * shouldHandle 本身依赖会话状态和 Spring 协作方，因此这里保留纯函数级的
- * 模式契约测试，实际 shouldHandle 的会话集成测试由 PlanningLoop 的入口测试覆盖。</p>
+ * <p>权限模式枚举及降级审批的独立契约。自动语义路由见 PlanningLoopRoutingTest。</p>
  */
 class PlanningLoopGateTest {
 
     @Test
-    void defaultAgentDoesNotNeedTaskComplexityClassifier() {
-        // 搜索、写文件、URL 和复杂多步请求都由 AgentLoop 直接交给 LLM。
+    void defaultModeRetainsItsPermissionMeaning() {
         assertEquals(PermissionMode.DEFAULT, PermissionMode.from("default"));
         assertEquals(PermissionMode.DEFAULT, PermissionMode.from("normal"));
     }

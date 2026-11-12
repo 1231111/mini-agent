@@ -117,10 +117,90 @@ async function consume(harness, chunks, reconnectAttempt = 0) {
     return harness.bot.querySelector('.answer-stream');
 }
 
+for (const answerFirst of [true, false]) {
+    const h = createHarness();
+    const nodes = event('todo', JSON.stringify({ items: [{ id: 1, content: '核验来源', status: 'completed' }] }));
+    const token = event('token', '今日动态已核验');
+    await consume(h, answerFirst ? [token, () => h.flushPaint(), nodes, event('end', '今日动态已核验')]
+        : [nodes, token, event('end', '今日动态已核验')]);
+    assert.ok(h.bot.children.indexOf(h.bot.querySelector('.todo-panel'))
+        < h.bot.children.indexOf(h.bot.querySelector('.answer-stream')));
+    assert.equal(h.bot.querySelectorAll('.todo-panel').length, 1);
+    console.log('PASS: task card precedes its answer when ' + (answerFirst ? 'tokens arrive first' : 'nodes arrive first'));
+}
+
+{
+    const h = createHarness();
+    const makeHistoricalBody = () => {
+        const row = new Element(); row.className = 'bot-row';
+        const body = new Element(); body.className = 'bot-body';
+        const answer = new Element(); answer.className = 'answer-stream'; answer.textContent = '相同问题的回复';
+        body.appendChild(answer); row.appendChild(body); return body;
+    };
+    const first = makeHistoricalBody(), second = makeHistoricalBody();
+    // JSON round-trip models the server response after a process restart.
+    const turns = JSON.parse(JSON.stringify([
+        { id: 41, progress: { executionId: 'exec-first', status: 'SUCCESS', items: [
+            { id: 1, content: '首轮查询来源', status: 'completed' }
+        ] } },
+        { id: 42, progress: { executionId: 'exec-second', status: 'FAILURE', items: [
+            { id: 1, content: '第二轮生成页面', status: 'completed' },
+            { id: 2, content: '第二轮验证页面', status: 'blocked' }
+        ] } }
+    ]));
+    h.context.restoreTaskProgress(first, turns[0]); h.context.restoreTaskProgress(second, turns[1]);
+    h.context.restoreTaskProgress(first, turns[0]); // idempotent rerender must not duplicate cards
+    assert.equal(first.closest('.bot-row').dataset.chatTaskId, '41');
+    assert.equal(second.closest('.bot-row').dataset.chatTaskId, '42');
+    assert.equal(first.dataset.executionId, 'exec-first');
+    assert.equal(second.dataset.executionId, 'exec-second');
+    assert.equal(first.querySelectorAll('.todo-panel').length, 1);
+    assert.equal(first.querySelector('.todo-progress-meta').textContent, '1/1 已完成');
+    assert.equal(second.querySelector('.todo-progress-meta').textContent, '1/2 已完成');
+    assert.equal(second.querySelector('.todo-progress-title').textContent, '任务执行失败');
+    assert.ok(first.children.indexOf(first.querySelector('.todo-panel')) < first.children.indexOf(first.querySelector('.answer-stream')));
+    assert.ok(second.children.indexOf(second.querySelector('.todo-panel')) < second.children.indexOf(second.querySelector('.answer-stream')));
+    assert.doesNotMatch(first.textContent, /第二轮/); assert.doesNotMatch(second.textContent, /首轮/);
+    console.log('PASS: reload preserves two separate execution snapshots, order, statuses and node counts');
+}
+
+{
+    const h = createHarness();
+    h.context.restoreTaskProgress(h.bot, { id: 43, progress: { status: 'WAITING', items: [
+        { id: 1, content: '曾经等待确认的历史节点', status: 'awaiting_confirm' }
+    ] } });
+    assert.equal(h.bot.querySelector('.todo-confirm-btn'), null);
+    assert.match(h.bot.querySelector('.todo-progress-title').textContent, /等待你的操作/);
+    console.log('PASS: historical approval nodes are read only and cannot approve a different current task');
+}
+
 const ask = () => event('permission_ask', JSON.stringify({
     tool: 'exec_command', display: 'node verify-ui.js', grantToken: 'test-token',
     expiresAt: Date.now() + 60_000
 }));
+for (const backToA of [false, true]) {
+    const h = createHarness();
+    await consume(h, [
+        () => vm.runInContext("currentId = 'other-session'; window._msgLoadEpoch = 1; isStreaming = true; taskIsActive = true; taskRunningSessionId = currentId;", h.context),
+        ...(backToA ? [() => vm.runInContext("currentId = 'regression-session'; window._msgLoadEpoch = 2; taskRunningSessionId = currentId;", h.context)] : []),
+        event('task_outcome', JSON.stringify({ status: 'SUCCESS' })), event('end', '旧会话答复')
+    ]);
+    assert.equal(vm.runInContext('isStreaming', h.context), true);
+    assert.equal(vm.runInContext('taskIsActive', h.context), true);
+    assert.equal(h.bot.querySelector('.answer-stream'), null);
+    console.log('PASS: late SSE terminal event cannot finish ' + (backToA ? 'a newer navigation to the same session' : 'another conversation'));
+}
+{
+    const h = createHarness();
+    let rejectPost;
+    h.context.fetch = () => new Promise((resolve, reject) => { rejectPost = reject; });
+    const pending = h.context.sendChatPost('原会话任务', 'regression-session', [], [], h.bot, null);
+    vm.runInContext("currentId = 'other-session'; window._msgLoadEpoch = 1; isStreaming = true; taskIsActive = true; taskRunningSessionId = currentId;", h.context);
+    rejectPost(new Error('original POST failed after navigation')); await pending;
+    assert.equal(vm.runInContext('isStreaming', h.context), true);
+    assert.equal(h.bot.textContent, '');
+    console.log('PASS: late POST rejection cannot unlock the newly selected conversation');
+}
 const finalAnswer = '已生成虚拟仿真交互页面。\n\n[查看 HTML 文件](awsim_virtual_sim_ui.html)';
 
 {

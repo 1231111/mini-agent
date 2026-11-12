@@ -42,7 +42,8 @@ public class SkillStore {
             "document-authoring", "builtin-skills/document-authoring/SKILL.md",
             "codebase-analysis", "builtin-skills/codebase-analysis/SKILL.md",
             "browser-workflow", "builtin-skills/browser-workflow/SKILL.md",
-            "travel-search", "builtin-skills/travel-search/SKILL.md"
+            "travel-search", "builtin-skills/travel-search/SKILL.md",
+            "desktop-workflow", "builtin-skills/desktop-workflow/SKILL.md"
     );
 
     private final Path skillsDir;

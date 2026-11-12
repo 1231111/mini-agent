@@ -5,7 +5,9 @@ import com.microsoft.playwright.Locator.AriaSnapshotOptions;
 import com.microsoft.playwright.options.AriaRole;
 import com.microsoft.playwright.options.Proxy;
 import com.microsoft.playwright.options.RequestOptions;
+import com.microsoft.playwright.options.SelectOption;
 import com.microsoft.playwright.options.WaitUntilState;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.security.NetworkGuard;
 import com.miniagent.common.MessageConstants;
 import jakarta.annotation.PreDestroy;
@@ -32,6 +34,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -39,6 +42,13 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.Objects;
 import java.util.regex.Matcher;
@@ -51,7 +61,7 @@ import org.apache.commons.lang3.StringUtils;
  * 核心思路（对标 hermes-agent 的 agent-browser）：
  * - 不返回 HTML，而是返回 accessibility tree（aria snapshot）
  * - 每个 task 有独立的浏览器 session
- * - LLM 通过 ref ID（如 @1, @2）定位元素
+ * - LLM 通过绑定观察版本与 DOM 节点的 ref（如 b12.3）定位元素
  */
 @Slf4j
 @Service
@@ -666,7 +676,103 @@ public class BrowserService {
     private Browser browser;
     private final Map<String, Page> pages = new ConcurrentHashMap<>();
     private final Map<String, PointerPosition> lastPointerPositions = new ConcurrentHashMap<>();
+    private final Map<String, Observation> observations = new LinkedHashMap<>();
     private final ReentrantLock pageLock = new ReentrantLock();
+    private final ObjectMapper resultJson = new ObjectMapper();
+    private volatile Thread actorThread;
+    private long observationSequence;
+    // Playwright Java objects must always be used from the thread that created them.
+    private final ThreadPoolExecutor actor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(64), work -> {
+                Thread thread = new Thread(() -> {
+                    actorThread = Thread.currentThread();
+                    work.run();
+                }, "miniagent-browser");
+                thread.setDaemon(true);
+                // Tool workers may originate in ForkJoinPool.commonPool(), whose
+                // context loader cannot see Spring Boot's nested dependencies.
+                // Playwright uses the context loader to locate driver/platform.
+                thread.setContextClassLoader(BrowserService.class.getClassLoader());
+                return thread;
+            }, new ThreadPoolExecutor.AbortPolicy());
+
+    private record ObservedElement(String description, ElementHandle handle) {}
+    private static final class PageDiagnostics {
+        final List<String> consoleErrors = new ArrayList<>();
+        final List<String> pageErrors = new ArrayList<>();
+        final Set<String> requestOrigins = new LinkedHashSet<>();
+    }
+    private final Map<String, PageDiagnostics> pageDiagnostics = new ConcurrentHashMap<>();
+    private record Observation(String id, String url, String rawSnapshot, Map<String, ObservedElement> elements,
+                               String formFingerprint) {
+        Observation(String id, String url, String rawSnapshot, Map<String, ObservedElement> elements) {
+            this(id, url, rawSnapshot, elements, null);
+        }
+    }
+
+    private String onActor(Callable<String> operation) {
+        if (Thread.currentThread() == actorThread) {
+            try { return operation.call(); }
+            catch (RuntimeException error) { throw error; }
+            catch (Exception error) { throw new IllegalStateException(error); }
+        }
+        if (Thread.currentThread().isInterrupted()) {
+            return browserError("CANCELLED", "浏览器操作在派发前已取消");
+        }
+        AtomicInteger state = new AtomicInteger(); // queued / running / cancelled / finished
+        Future<String> pending = actor.submit(() -> {
+            if (!state.compareAndSet(0, 1)) return browserError("CANCELLED", "浏览器操作在执行前已取消");
+            try { return operation.call(); }
+            finally { state.set(3); }
+        });
+        try {
+            return pending.get();
+        } catch (InterruptedException interrupted) {
+            boolean beforeStart = state.compareAndSet(0, 2);
+            Thread.currentThread().interrupt();
+            // Never interrupt the shared Playwright event loop: an already-dispatched click
+            // may have committed. The tool pipeline must retain that uncertainty.
+            return beforeStart ? browserError("CANCELLED", "浏览器操作在执行前已取消")
+                    : "{\"success\":false,\"status\":\"unknown\",\"errorCode\":\"OUTCOME_UNKNOWN\","
+                    + "\"error\":\"浏览器操作已派发，尚未确认结果；请重新观察，禁止直接重试\"}";
+        } catch (ExecutionException error) {
+            Throwable cause = error.getCause();
+            if (cause instanceof RuntimeException runtime) throw runtime;
+            throw new IllegalStateException(cause);
+        }
+    }
+
+    private String browserError(String code, String message) {
+        return resultJson.createObjectNode().put("success", false).put("errorCode", code)
+                .put("error", message).toString();
+    }
+
+    public String navigate(String sessionId, String url) { return onActor(() -> navigateOnActor(sessionId, url)); }
+    public String snapshot(String sessionId, boolean full) { return onActor(() -> snapshotOnActor(sessionId, full)); }
+    public String formInspect(String sessionId) { return onActor(() -> formInspectOnActor(sessionId)); }
+    public String formVerify(String sessionId, String ref, String expectedValue, Boolean expectedChecked,
+                             List<String> expectedValues, List<String> expectedFiles) {
+        return onActor(() -> formVerifyOnActor(sessionId, ref, expectedValue, expectedChecked, expectedValues, expectedFiles));
+    }
+    public String click(String sessionId, String ref) { return click(sessionId, ref, "auto"); }
+    public String click(String sessionId, String ref, String by) { return onActor(() -> clickOnActor(sessionId, ref, by)); }
+    public String type(String sessionId, String ref, String text) { return onActor(() -> typeOnActor(sessionId, ref, text)); }
+    public String select(String sessionId, String ref, List<String> values, String by) {
+        return onActor(() -> selectOnActor(sessionId, ref, values, by));
+    }
+    public String setChecked(String sessionId, String ref, boolean checked) {
+        return onActor(() -> setCheckedOnActor(sessionId, ref, checked));
+    }
+    public String upload(String sessionId, String ref, List<Path> trustedPaths) {
+        return onActor(() -> uploadOnActor(sessionId, ref, trustedPaths));
+    }
+    public String press(String sessionId, String key) { return onActor(() -> pressOnActor(sessionId, key)); }
+    public String scroll(String sessionId, String direction) { return onActor(() -> scrollOnActor(sessionId, direction)); }
+    public String screenshot(String sessionId, Path workspaceRoot) { return onActor(() -> screenshotOnActor(sessionId, workspaceRoot)); }
+    public String close(String sessionId) { return onActor(() -> closeOnActor(sessionId)); }
+    public String extractArticleText(String sessionId) { return extractArticleText(sessionId, null); }
+    public String extractArticleText(String sessionId, Path imageDir) { return onActor(() -> extractArticleTextOnActor(sessionId, imageDir)); }
+    public String evaluate(String sessionId, String expression) { return onActor(() -> evaluateOnActor(sessionId, expression)); }
 
     private record PointerPosition(double x, double y, int viewportWidth, int viewportHeight) {}
 
@@ -1136,13 +1242,27 @@ public class BrowserService {
      * 获取或创建一个 page
      */
     private Page getPage(String sessionId) {
-        // 空字符串/null → 用 "default" session
         if (StringUtils.isBlank(sessionId)) {
-            sessionId = "default";
+            throw new IllegalArgumentException("浏览器操作需要明确的可信会话");
         }
         return pages.computeIfAbsent(sessionId, id -> {
             ensureBrowser();
             Page page = browser.newPage();
+            pageDiagnostics.put(id, new PageDiagnostics());
+            page.onConsoleMessage(message -> {
+                if ("error".equals(message.type())) addPageError(id, false, message.text());
+            });
+            page.onPageError(message -> addPageError(id, true, message));
+            page.onRequest(request -> {
+                try {
+                    URI uri = URI.create(request.url());
+                    PageDiagnostics diagnostics = pageDiagnostics.get(id);
+                    if (diagnostics != null && uri.getHost() != null && diagnostics.requestOrigins.size() < 20) {
+                        diagnostics.requestOrigins.add(uri.getScheme() + "://" + uri.getHost()
+                                + (uri.getPort() == -1 ? "" : ":" + uri.getPort()));
+                    }
+                } catch (IllegalArgumentException ignored) { }
+            });
             log.info("创建新浏览器页面: {}", id);
             return page;
         });
@@ -1153,12 +1273,12 @@ public class BrowserService {
     /**
      * 打开网页
      */
-    public String navigate(String sessionId, String url) {
+    private String navigateOnActor(String sessionId, String url) {
         pageLock.lock();
         try {
             String blocked = networkGuard.validateUrl(url);
             if (Objects.nonNull(blocked)) {
-                return blocked;
+                return browserError("PERMISSION_DENIED", blocked);
             }
             Page page = getPage(sessionId);
             if (sameDocPath(page.url(), url)) {
@@ -1166,8 +1286,10 @@ public class BrowserService {
                 String snapshot = page.locator("body").ariaSnapshot();
                 log.info("已在该页，跳过重新导航: {}", url);
                 return "已在该页，未重新加载（避免 SPA 回到首页）。标题: "
-                        + title + "\n\n" + formatSnapshot(snapshot);
+                        + title + "\n\n" + observe(sessionId, page, snapshot);
             }
+            invalidateObservation(sessionId);
+            pageDiagnostics.put(sessionId, new PageDiagnostics());
             page.navigate(url, new Page.NavigateOptions()
                     .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
                     .setTimeout(15000));
@@ -1176,11 +1298,11 @@ public class BrowserService {
             String snapshot = page.locator("body").ariaSnapshot();
             log.info("导航到: {} 标题: {}", url, title);
 
-            return "页面标题: " + title + "\n\n" + formatSnapshot(snapshot);
+            return "页面标题: " + title + "\n\n" + observe(sessionId, page, snapshot);
 
         } catch (Exception e) {
             log.error("导航失败: {}", url, e);
-            return String.format(MessageConstants.BROWSER_NAV_FAILED, e.getMessage());
+            return browserError("EXECUTION_FAILED", String.format(MessageConstants.BROWSER_NAV_FAILED, e.getMessage()));
         } finally {
             pageLock.unlock();
         }
@@ -1189,7 +1311,7 @@ public class BrowserService {
     /**
      * 获取页面无障碍树快照
      */
-    public String snapshot(String sessionId, boolean full) {
+    private String snapshotOnActor(String sessionId, boolean full) {
         pageLock.lock();
         try {
             Page page = getPage(sessionId);
@@ -1200,11 +1322,11 @@ public class BrowserService {
             } else {
                 snapshot = page.locator("body").ariaSnapshot();
             }
-            return formatSnapshot(snapshot);
+            return observe(sessionId, page, snapshot);
 
         } catch (Exception e) {
             log.error("获取快照失败", e);
-            return String.format(MessageConstants.BROWSER_SNAPSHOT_FAILED, e.getMessage());
+            return browserError("EXECUTION_FAILED", String.format(MessageConstants.BROWSER_SNAPSHOT_FAILED, e.getMessage()));
         } finally {
             pageLock.unlock();
         }
@@ -1213,69 +1335,52 @@ public class BrowserService {
     /**
      * 点击。by：auto|ref|text|role|css|aria。数字 ref 只走快照，失败立即返回（不把编号当 aria-label）。
      */
-    public String click(String sessionId, String ref) {
-        return click(sessionId, ref, "auto");
-    }
-
-    public String click(String sessionId, String ref, String by) {
+    private String clickOnActor(String sessionId, String ref, String by) {
         if (StringUtils.isBlank(ref)) {
-            return MessageConstants.BROWSER_CLICK_FAILED_EMPTY_REF;
+            return browserError("INVALID_ARGUMENT", MessageConstants.BROWSER_CLICK_FAILED_EMPTY_REF);
         }
         String mode = StringUtils.isBlank(by) ? "auto" : by.trim().toLowerCase(Locale.ROOT);
         pageLock.lock();
         try {
             Page page = getPage(sessionId);
-            boolean numeric = ref.chars().allMatch(Character::isDigit);
-            if ("ref".equals(mode) || ("auto".equals(mode) && numeric)) {
+            boolean reference = ref.startsWith("b") && ref.contains(".") || ref.chars().allMatch(Character::isDigit);
+            if ("ref".equals(mode) || ("auto".equals(mode) && reference)) {
                 return clickBySnapshotRef(sessionId, page, ref);
             }
             Locator loc = switch (mode) {
                 case "text" -> page.getByText(ref, new Page.GetByTextOptions().setExact(true));
                 case "role" -> roleLocator(page, ref);
-                case "css" -> page.locator(ref).first();
-                case "aria" -> page.locator("[aria-label*='" + ref + "'], [placeholder*='" + ref + "']").first();
+                case "css" -> page.locator(ref);
+                case "aria" -> page.getByLabel(ref, new Page.GetByLabelOptions().setExact(true));
                 case "auto" -> page.getByText(ref, new Page.GetByTextOptions().setExact(true));
                 default -> null;
             };
             if (Objects.isNull(loc)) {
-                return String.format(MessageConstants.BROWSER_CLICK_FAILED_UNKNOWN_BY, mode);
+                return browserError("INVALID_ARGUMENT", String.format(MessageConstants.BROWSER_CLICK_FAILED_UNKNOWN_BY, mode));
             }
+            if (loc.count() != 1) return browserError("CONFLICT", "点击目标匹配不唯一或不存在，请重新观察");
             return clickAndSnap(sessionId, page, loc, mode, ref);
         } catch (Exception e) {
             log.error("点击失败: ref={} by={}", ref, mode, e);
-            return String.format(MessageConstants.BROWSER_CLICK_FAILED, ref, mode, e.getMessage());
+            invalidateObservation(sessionId);
+            return unknownAction("点击结果尚未确认：" + e.getMessage());
         } finally {
             pageLock.unlock();
         }
     }
 
     private String clickBySnapshotRef(String sessionId, Page page, String ref) {
-        final int refNum;
+        ObservedElement element = resolveObservedElement(sessionId, page, ref);
+        if (element == null) return staleObservation();
         try {
-            refNum = Integer.parseInt(ref);
-        } catch (NumberFormatException e) {
-            return String.format(MessageConstants.BROWSER_CLICK_FAILED_NOT_DIGIT, ref);
-        }
-        String elementInfo = findElementByRef(page, refNum);
-        if (Objects.isNull(elementInfo)) {
-            return String.format(MessageConstants.BROWSER_CLICK_FAILED_NO_REF, ref);
-        }
-        log.info("click ref={} 对应元素: {}", ref, elementInfo);
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"([^\"]+)\"").matcher(elementInfo);
-        String name = m.find() ? m.group(1) : null;
-        if (StringUtils.isBlank(name)) {
-            return String.format(MessageConstants.BROWSER_CLICK_FAILED_NO_NAME, ref, elementInfo);
-        }
-        // 按快照角色选唯一策略；失败直接报错，不静默串联
-        Locator loc = elementInfo.contains("button")
-                ? page.getByRole(AriaRole.BUTTON, new Page.GetByRoleOptions().setName(name))
-                : elementInfo.contains("link")
-                ? page.getByRole(AriaRole.LINK, new Page.GetByRoleOptions().setName(name))
-                : page.getByText(name);
-        try {
-            return clickAndSnap(sessionId, page, loc, "ref", name);
+            var box = element.handle().boundingBox();
+            element.handle().click(new ElementHandle.ClickOptions().setTimeout(CLICK_TIMEOUT_MS));
+            rememberPointer(sessionId, page, box);
+            page.waitForTimeout(100);
+            return "点击成功 (ref): " + ref + "\n\n" + observe(sessionId, page, page.locator("body").ariaSnapshot());
         } catch (Exception e) {
-            return String.format(MessageConstants.BROWSER_CLICK_FAILED_BY_NAME, ref, name, e.getMessage());
+            invalidateObservation(sessionId);
+            return unknownAction("点击结果尚未确认：" + e.getMessage());
         }
     }
 
@@ -1287,7 +1392,7 @@ public class BrowserService {
             role = parseAriaRole(ref.substring(0, eq).trim());
             roleName = ref.substring(eq + 1).trim();
         }
-        return page.getByRole(role, new Page.GetByRoleOptions().setName(roleName));
+        return page.getByRole(role, new Page.GetByRoleOptions().setName(roleName).setExact(true));
     }
 
     private String clickAndSnap(String sessionId, Page page, Locator locator, String strategy, String label) {
@@ -1303,16 +1408,8 @@ public class BrowserService {
                 clickY = clickBox.y + clickBox.height / 2d;
             }
         } catch (Exception ignored) {}
-        try {
-            locator.click(new Locator.ClickOptions().setTimeout(CLICK_TIMEOUT_MS));
-        } catch (Exception clickEx) {
-            try {
-                locator.evaluate("el => el.click()");
-                log.info("click 超时，已改 JS click: {}", label);
-            } catch (Exception jsEx) {
-                throw clickEx;
-            }
-        }
+        // A timeout does not prove that a click did not happen. Never follow it with a JS click.
+        locator.click(new Locator.ClickOptions().setTimeout(CLICK_TIMEOUT_MS));
         if (Double.isFinite(clickX) && Double.isFinite(clickY)) {
             try {
                 var viewport = page.viewportSize();
@@ -1327,23 +1424,292 @@ public class BrowserService {
         }
         page.waitForTimeout(400);
         return String.format(MessageConstants.BROWSER_CLICK_SUCCESS, strategy, label) + "\n\n"
-                + formatSnapshot(page.locator("body").ariaSnapshot());
+                + observe(sessionId, page, page.locator("body").ariaSnapshot());
     }
 
     static boolean sameDocPath(String currentUrl, String targetUrl) {
-        return normPath(currentUrl).equals(normPath(targetUrl));
+        if (currentUrl == null || targetUrl == null || currentUrl.isBlank() || targetUrl.isBlank()) return false;
+        try {
+            // Origin, query and fragment matter: different hosts with the same path are different pages.
+            return URI.create(currentUrl.trim()).normalize().equals(URI.create(targetUrl.trim()).normalize());
+        } catch (Exception ignored) { return false; }
     }
 
-    private static String normPath(String url) {
-        if (url == null || url.isBlank()) {
-            return "";
+    private void rememberPointer(String sessionId, Page page, com.microsoft.playwright.options.BoundingBox box) {
+        if (box == null) return;
+        var viewport = page.viewportSize();
+        if (viewport != null && viewport.width > 0 && viewport.height > 0) {
+            lastPointerPositions.put(sessionId, new PointerPosition(box.x + box.width / 2,
+                    box.y + box.height / 2, viewport.width, viewport.height));
         }
+    }
+
+    private String unknownAction(String message) {
+        return resultJson.createObjectNode().put("success", false).put("status", "unknown")
+                .put("errorCode", "OUTCOME_UNKNOWN")
+                .put("error", message + "；请重新观察实际状态，禁止直接重复操作").toString();
+    }
+
+    private String staleObservation() {
+        return browserError("CONFLICT", "STALE_OBSERVATION: ref 已过期或页面发生变化，请先 browser_snapshot 再使用新的 ref");
+    }
+
+    private ObservedElement resolveObservedElement(String sessionId, Page page, String ref) {
+        Observation observation = observations.get(sessionId);
+        if (observation == null || !observation.elements().containsKey(ref)) return null;
+        if (!observation.url().equals(page.url())
+                || !interactionFingerprint(observation.rawSnapshot())
+                    .equals(interactionFingerprint(page.locator("body").ariaSnapshot()))) {
+            invalidateObservation(sessionId);
+            return null;
+        }
+        if (observation.formFingerprint() != null
+                && !observation.formFingerprint().equals(formFingerprint(page))) {
+            invalidateObservation(sessionId);
+            return null;
+        }
+        ObservedElement element = observation.elements().get(ref);
+        if (!Boolean.TRUE.equals(element.handle().evaluate("el => el.isConnected"))) {
+            invalidateObservation(sessionId);
+            return null;
+        }
+        return element;
+    }
+
+    /** Live clocks/telemetry do not change a DOM ref; changed controls and link targets do. */
+    private static List<String> interactionFingerprint(String snapshot) {
+        return snapshot.lines().map(String::stripTrailing)
+                .filter(line -> isSnapshotRefLine(line.trim())
+                        || line.trim().startsWith("- /url:")
+                        || line.trim().startsWith("- option"))
+                .toList();
+    }
+
+    private void invalidateObservation(String sessionId) {
+        Observation old = observations.remove(sessionId);
+        if (old != null) old.elements().values().forEach(element -> {
+            try { element.handle().dispose(); } catch (Exception ignored) {}
+        });
+    }
+
+    private void addPageError(String sessionId, boolean uncaught, String message) {
+        PageDiagnostics diagnostics = pageDiagnostics.get(sessionId);
+        if (diagnostics == null || message == null) return;
+        List<String> errors = uncaught ? diagnostics.pageErrors : diagnostics.consoleErrors;
+        if (errors.size() < 20) errors.add(message.substring(0, Math.min(message.length(), 500)));
+    }
+
+    private String diagnosticsText(String sessionId) {
+        PageDiagnostics diagnostics = pageDiagnostics.get(sessionId);
+        if (diagnostics == null) return "";
+        return "\nbrowserDiagnostics=" + resultJson.valueToTree(Map.of(
+                "scope", "Observed since last navigation; up to 20 entries per category; request origins only",
+                "consoleErrors", diagnostics.consoleErrors,
+                "pageErrors", diagnostics.pageErrors,
+                "requestOrigins", diagnostics.requestOrigins)) + "\n";
+    }
+
+    /** Bind references to the exact DOM nodes observed, never to a future snapshot's line numbers. */
+    private String observe(String sessionId, Page page, String rawSnapshot) {
+        invalidateObservation(sessionId);
+        String id = "b" + (++observationSequence);
+        Map<String, ObservedElement> elements = new LinkedHashMap<>();
+        StringBuilder text = new StringBuilder("observationId=" + id + " url=" + page.url() + "\n");
+        int number = 0;
+        for (String line : rawSnapshot.split("\n")) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) continue;
+            ElementHandle handle = isSnapshotRefLine(trimmed) ? observedHandle(page, trimmed) : null;
+            if (handle == null) {
+                text.append(line).append('\n');
+            } else {
+                String ref = id + "." + (++number);
+                elements.put(ref, new ObservedElement(trimmed, handle));
+                text.append('[').append(ref).append("] ").append(trimmed).append('\n');
+            }
+        }
+        observations.put(sessionId, new Observation(id, page.url(), rawSnapshot, Map.copyOf(elements)));
+        return redactPasswordValues(page, text + diagnosticsText(sessionId));
+    }
+
+    private String redactPasswordValues(Page page, String text) {
+        Locator passwords = page.locator("input[type=password]");
+        if (passwords == null) return text; // mock-only pages may not implement this locator
+        Object raw = passwords.evaluateAll("els => els.map(el => el.value).filter(Boolean)");
+        if (raw instanceof List<?> values) {
+            for (Object value : values) {
+                String secret = String.valueOf(value);
+                if (!secret.isEmpty()) {
+                    text = redactSnapshotText(text, secret);
+                    // ariaSnapshot can quote or escape a password rather than emitting it literally.
+                    String encoded = resultJson.valueToTree(secret).toString();
+                    if (encoded.length() > 2) text = redactSnapshotText(text, encoded.substring(1, encoded.length() - 1));
+                }
+            }
+        }
+        return text;
+    }
+
+    private String redactSnapshotText(String snapshot, String secret) {
+        String[] lines = snapshot.split("\n", -1);
+        for (int i = 1; i < lines.length; i++) {
+            // A short password may equal a digit in b12.3. Preserve the tool's
+            // observation/ref syntax while redacting the untrusted page text.
+            int prefix = lines[i].matches("^\\[b[0-9]+\\.[0-9]+].*") ? lines[i].indexOf(']') + 1 : 0;
+            lines[i] = lines[i].substring(0, prefix) + lines[i].substring(prefix).replace(secret, "[密码已隐藏]");
+        }
+        return String.join("\n", lines);
+    }
+
+    private ElementHandle observedHandle(Page page, String description) {
+        Matcher role = Pattern.compile("^-\\s+([a-z]+)(?:\\s+\"((?:\\\\.|[^\"\\\\])*)\")?").matcher(description);
+        if (!role.find()) return null;
         try {
-            String p = java.net.URI.create(url.trim()).getPath();
-            return p == null ? url : p;
-        } catch (Exception e) {
-            return url;
+            AriaRole ariaRole = AriaRole.valueOf(role.group(1).toUpperCase(Locale.ROOT));
+            Page.GetByRoleOptions options = new Page.GetByRoleOptions().setExact(true);
+            if (role.group(2) != null) options.setName(resultJson.readValue("\"" + role.group(2) + "\"", String.class));
+            Locator locator = page.getByRole(ariaRole, options);
+            return locator.count() == 1 ? locator.elementHandle() : null;
+        } catch (Exception ignored) { return null; }
+    }
+
+    private record FormField(ElementHandle handle, Map<String, Object> state) {}
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> readFormField(ElementHandle handle) {
+        return new LinkedHashMap<>((Map<String, Object>) handle.evaluate(BrowserFormSupport.READ_FIELD));
+    }
+
+    private List<FormField> scanFormFields(Page page) {
+        List<FormField> fields = new ArrayList<>();
+        Locator candidates = page.locator(BrowserFormSupport.SELECTOR);
+        try {
+            int count = Math.min(candidates.count(), BrowserFormSupport.MAX_FIELDS);
+            for (int i = 0; i < count; i++) {
+                ElementHandle handle = candidates.nth(i).elementHandle();
+                if (handle == null) continue;
+                try {
+                    Map<String, Object> state = readFormField(handle);
+                    if (Boolean.TRUE.equals(state.get("visible")) || "file".equals(state.get("type"))) {
+                        fields.add(new FormField(handle, state));
+                        handle = null; // ownership transferred to the result
+                    }
+                } finally { if (handle != null) handle.dispose(); }
+            }
+            return fields;
+        } catch (RuntimeException error) {
+            fields.forEach(field -> { try { field.handle().dispose(); } catch (Exception ignored) {} });
+            throw error;
         }
+    }
+
+    private String formFingerprint(Page page) {
+        List<FormField> fields = scanFormFields(page);
+        try { return resultJson.valueToTree(fields.stream().map(FormField::state).toList()).toString(); }
+        finally { fields.forEach(field -> { try { field.handle().dispose(); } catch (Exception ignored) {} }); }
+    }
+
+    private String formInspectOnActor(String sessionId) {
+        List<FormField> fields = List.of();
+        boolean retained = false;
+        try {
+            Page page = getPage(sessionId);
+            String raw = page.locator("body").ariaSnapshot();
+            String snapshot = observe(sessionId, page, raw);
+            fields = scanFormFields(page);
+            Observation base = observations.get(sessionId);
+            Map<String, ObservedElement> elements = new LinkedHashMap<>(base.elements());
+            var result = resultJson.createObjectNode().put("success", true).put("observationId", base.id())
+                    .put("url", page.url()).put("snapshot", snapshot)
+                    .put("truncated", page.locator(BrowserFormSupport.SELECTOR).count() > BrowserFormSupport.MAX_FIELDS)
+                    .put("scope", "Current document and open shadow roots; iframe contents need separate support")
+                    .put("message", "按字段类型填写；页面/值/约束变化后重新识别。valid只反映当前浏览器约束，不证明提交成功。");
+            var output = result.putArray("fields");
+            int index = elements.size();
+            for (FormField field : fields) {
+                String ref = base.id() + "." + (++index);
+                elements.put(ref, new ObservedElement("form field " + field.state().get("label"), field.handle()));
+                var node = resultJson.valueToTree(field.state());
+                ((com.fasterxml.jackson.databind.node.ObjectNode) node).put("ref", ref);
+                output.add(node);
+            }
+            String fingerprint = resultJson.valueToTree(fields.stream().map(FormField::state).toList()).toString();
+            observations.put(sessionId, new Observation(base.id(), base.url(), raw, Map.copyOf(elements), fingerprint));
+            retained = true;
+            return result.toString();
+        } catch (Exception error) {
+            invalidateObservation(sessionId);
+            return browserError("EXECUTION_FAILED", "识别表单失败：" + error.getMessage());
+        } finally {
+            if (!retained) fields.forEach(field -> { try { field.handle().dispose(); } catch (Exception ignored) {} });
+        }
+    }
+
+    private String formVerifyOnActor(String sessionId, String ref, String expectedValue, Boolean expectedChecked,
+                                     List<String> expectedValues, List<String> expectedFiles) {
+        int expectations = (expectedValue == null ? 0 : 1) + (expectedChecked == null ? 0 : 1)
+                + (expectedValues == null ? 0 : 1) + (expectedFiles == null ? 0 : 1);
+        if (StringUtils.isBlank(ref) || expectations > 1)
+            return browserError("INVALID_ARGUMENT", "需要最新字段ref，四种expected参数最多传一种");
+        try {
+            Page page = getPage(sessionId);
+            ObservedElement element = resolveObservedElement(sessionId, page, ref);
+            if (element == null) return staleObservation();
+            if (!Boolean.TRUE.equals(element.handle().evaluate("(el, selector) => el.matches(selector)", BrowserFormSupport.SELECTOR)))
+                return browserError("INVALID_ARGUMENT", "目标不是可核验的表单字段，请先browser_form_inspect");
+            Map<String, Object> state = readFormField(element.handle());
+            if (Boolean.TRUE.equals(state.get("valueRedacted")) && expectations > 0)
+                return browserError("PERMISSION_DENIED", "密码仅返回是否已填写，不能回显或对照密码内容");
+            boolean matched = true;
+            if (expectedValue != null) {
+                if (Boolean.TRUE.equals(state.get("valueTruncated")))
+                    return browserError("INVALID_ARGUMENT", "字段内容超出回读上限，不能确认完全匹配");
+                matched = expectedValue.equals(state.get("value"));
+            } else if (expectedChecked != null) {
+                Object checked = state.get("checked");
+                if (!(checked instanceof Boolean) && !"true".equals(checked) && !"false".equals(checked))
+                    return browserError("INVALID_ARGUMENT", "该字段没有可核验的勾选状态");
+                matched = expectedChecked.equals(checked instanceof Boolean ? checked : Boolean.valueOf(checked.toString()));
+            } else if (expectedValues != null) {
+                matched = sameFormValues(expectedValues, state.get("selectedValues"));
+            } else if (expectedFiles != null) {
+                if (!"file".equals(state.get("type")))
+                    return browserError("INVALID_ARGUMENT", "该字段不是文件上传控件");
+                var files = resultJson.valueToTree(state.get("files"));
+                List<String> names = new ArrayList<>(); files.forEach(file -> names.add(file.path("name").asText()));
+                matched = sameFormValues(expectedFiles, names);
+            }
+            var validity = resultJson.valueToTree(state.get("validity"));
+            boolean valid = !validity.isObject() || validity.path("valid").asBoolean(false);
+            String ariaInvalid = Objects.toString(state.get("ariaInvalid"), "false");
+            valid &= ariaInvalid.isBlank() || "false".equals(ariaInvalid);
+            // Custom controls have no browser ValidityState. Do not bless a
+            // required empty value/unchecked control merely because it is ARIA.
+            if (validity.isNull() && Boolean.TRUE.equals(state.get("required"))) {
+                Object checked = state.get("checked");
+                valid &= checked == null ? StringUtils.isNotBlank(Objects.toString(state.get("value"), ""))
+                        : Boolean.TRUE.equals(checked) || "true".equals(checked);
+            }
+            boolean success = matched && valid;
+            var result = resultJson.createObjectNode().put("success", success).put("matched", matched).put("valid", valid)
+                    .put("ref", ref).put("message", success ? "字段实际值及当前约束核验通过；尚未证明提交成功"
+                            : "字段值不匹配或页面校验未通过，请根据实际状态修正");
+            result.set("field", resultJson.valueToTree(state));
+            result.put("validationCoverage", validity.isObject() ? "browser_constraints_and_aria_invalid"
+                    : "aria_required_and_invalid_only; application rules still require page confirmation");
+            if (!success) result.put("errorCode", "CONFLICT");
+            return result.toString();
+        } catch (Exception error) {
+            return browserError("EXECUTION_FAILED", "回读表单字段失败：" + error.getMessage());
+        }
+    }
+
+    private boolean sameFormValues(List<String> expected, Object rawActual) {
+        if (expected.stream().anyMatch(Objects::isNull) || !(rawActual instanceof List<?> actual)) return false;
+        List<String> a = new ArrayList<>(expected);
+        List<String> b = actual.stream().map(String::valueOf).sorted().toList();
+        Collections.sort(a);
+        return a.equals(b);
     }
 
     private static AriaRole parseAriaRole(String raw) {
@@ -1354,124 +1720,216 @@ public class BrowserService {
         }
     }
 
+    @SuppressWarnings("unchecked")
+    private String selectOnActor(String sessionId, String ref, List<String> values, String by) {
+        String mode = by == null || by.isBlank() ? "value" : by.trim().toLowerCase(Locale.ROOT);
+        if (!validFormActionRef(ref) || values == null || values.size() > 50
+                || values.stream().anyMatch(Objects::isNull) || !Set.of("value", "label").contains(mode))
+            return browserError("INVALID_ARGUMENT", "请选择最新表单 ref，最多提供50个明确选项，by仅支持value或label；空列表仅用于清空多选框");
+        boolean dispatched = false;
+        pageLock.lock();
+        try {
+            Page page = getPage(sessionId);
+            ObservedElement element = resolveObservedElement(sessionId, page, ref);
+            if (element == null) return staleObservation();
+            Map<String, Object> info = (Map<String, Object>) element.handle().evaluate("""
+                    el => ({tag:el.tagName.toLowerCase(), multiple:!!el.multiple,
+                      disabled:el.matches(':disabled') || el.getAttribute('aria-disabled')==='true',
+                      options:el.options ? Array.from(el.options, o=>({value:o.value,label:o.label,
+                        disabled:o.disabled || (o.parentElement.tagName==='OPTGROUP' && o.parentElement.disabled)})) : []})
+                    """);
+            if (!"select".equals(info.get("tag")))
+                return browserError("INVALID_ARGUMENT", "目标不是原生下拉框；自定义组合框请依据新快照点击选项或使用按键");
+            if (Boolean.TRUE.equals(info.get("disabled")))
+                return browserError("CONFLICT", "下拉框处于禁用状态，未执行选择");
+            if (!Boolean.TRUE.equals(info.get("multiple")) && values.size() != 1)
+                return browserError("INVALID_ARGUMENT", "单选下拉框只能指定一个选项");
+            List<Map<String, Object>> options = (List<Map<String, Object>>) info.get("options");
+            LinkedHashSet<String> expected = new LinkedHashSet<>();
+            for (String value : values) {
+                List<Map<String, Object>> matches = options.stream().filter(option -> value.equals(option.get(mode))).toList();
+                if (matches.size() != 1)
+                    return browserError("CONFLICT", "选项不存在或匹配不唯一，未执行选择；请重新识别表单并提供唯一 value");
+                if (Boolean.TRUE.equals(matches.get(0).get("disabled")))
+                    return browserError("CONFLICT", "选项已禁用，未执行选择");
+                String selectedValue = (String) matches.get(0).get("value");
+                if (options.stream().filter(option -> selectedValue.equals(option.get("value"))).count() != 1)
+                    return browserError("CONFLICT", "选项 value 重复，无法唯一选择，请使用页面控件人工确认");
+                expected.add(selectedValue);
+            }
+            List<String> before = selectedValues(element.handle());
+            if (!new LinkedHashSet<>(before).equals(expected)) {
+                SelectOption[] selection = expected.stream().map(value -> new SelectOption().setValue(value)).toArray(SelectOption[]::new);
+                dispatched = true;
+                element.handle().selectOption(selection, new ElementHandle.SelectOptionOptions().setTimeout(CLICK_TIMEOUT_MS));
+            }
+            List<String> actual = selectedValues(element.handle());
+            if (!new LinkedHashSet<>(actual).equals(expected)) {
+                invalidateObservation(sessionId);
+                return unknownAction("选择后回读值与目标不一致");
+            }
+            return formActionResult(sessionId, page, "下拉选项已回读核验", "selectedValues", actual);
+        } catch (Exception error) {
+            invalidateObservation(sessionId);
+            return dispatched ? unknownAction("下拉选择结果尚未确认：" + error.getMessage())
+                    : browserError("EXECUTION_FAILED", "无法检查下拉框：" + error.getMessage());
+        } finally { pageLock.unlock(); }
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> selectedValues(ElementHandle handle) {
+        return (List<String>) handle.evaluate("el => Array.from(el.selectedOptions, o=>o.value)");
+    }
+
+    @SuppressWarnings("unchecked")
+    private String setCheckedOnActor(String sessionId, String ref, boolean checked) {
+        if (!validFormActionRef(ref)) return browserError("INVALID_ARGUMENT", "勾选状态需要最新表单完整 ref");
+        boolean dispatched = false;
+        pageLock.lock();
+        try {
+            Page page = getPage(sessionId);
+            ObservedElement element = resolveObservedElement(sessionId, page, ref);
+            if (element == null) return staleObservation();
+            Map<String, Object> info = (Map<String, Object>) element.handle().evaluate("""
+                    el => ({tag:el.tagName.toLowerCase(),type:el.type,checked:!!el.checked,
+                      disabled:el.matches(':disabled') || el.getAttribute('aria-disabled')==='true'})
+                    """);
+            String type = String.valueOf(info.get("type"));
+            if (!"input".equals(info.get("tag")) || !Set.of("checkbox", "radio").contains(type))
+                return browserError("INVALID_ARGUMENT", "目标不是原生复选框或单选框；自定义控件请依据新快照操作并核验状态");
+            if (Boolean.TRUE.equals(info.get("disabled")))
+                return browserError("CONFLICT", "目标处于禁用状态，未更改勾选状态");
+            boolean before = Boolean.TRUE.equals(info.get("checked"));
+            if ("radio".equals(type) && before && !checked)
+                return browserError("INVALID_ARGUMENT", "单选框不能直接取消；请选择同一组选项中的其他单选框");
+            if (before != checked) {
+                dispatched = true;
+                element.handle().setChecked(checked, new ElementHandle.SetCheckedOptions().setTimeout(CLICK_TIMEOUT_MS));
+            }
+            boolean actual = element.handle().isChecked();
+            if (actual != checked) {
+                invalidateObservation(sessionId);
+                return unknownAction("勾选动作后的实际状态与目标不一致");
+            }
+            return formActionResult(sessionId, page, "勾选状态已回读核验", "checked", actual);
+        } catch (Exception error) {
+            invalidateObservation(sessionId);
+            return dispatched ? unknownAction("勾选状态尚未确认：" + error.getMessage())
+                    : browserError("EXECUTION_FAILED", "无法检查勾选状态：" + error.getMessage());
+        } finally { pageLock.unlock(); }
+    }
+
+    @SuppressWarnings("unchecked")
+    private String uploadOnActor(String sessionId, String ref, List<Path> trustedPaths) {
+        if (!validFormActionRef(ref) || trustedPaths == null || trustedPaths.isEmpty() || trustedPaths.size() > 20)
+            return browserError("INVALID_ARGUMENT", "上传需要最新表单完整 ref 及 1-20 个已授权工作区文件");
+        if (trustedPaths.stream().anyMatch(path -> path == null || !path.isAbsolute()
+                || !Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) || !Files.isReadable(path)))
+            return browserError("INVALID_ARGUMENT", "上传目标必须是已授权工作区内可读取的普通文件，不能使用目录或符号链接");
+        boolean dispatched = false;
+        pageLock.lock();
+        try {
+            Page page = getPage(sessionId);
+            ObservedElement element = resolveObservedElement(sessionId, page, ref);
+            if (element == null) return staleObservation();
+            Map<String, Object> info = (Map<String, Object>) element.handle().evaluate("""
+                    el => ({tag:el.tagName.toLowerCase(),type:el.type,multiple:!!el.multiple,
+                      directory:!!el.webkitdirectory,disabled:el.matches(':disabled') || el.getAttribute('aria-disabled')==='true'})
+                    """);
+            if (!"input".equals(info.get("tag")) || !"file".equals(info.get("type")))
+                return browserError("INVALID_ARGUMENT", "目标不是文件上传输入框，请先识别表单获取 type=file 的 ref");
+            if (Boolean.TRUE.equals(info.get("directory")))
+                return browserError("INVALID_ARGUMENT", "暂不支持目录上传，请选择普通文件上传控件");
+            if (Boolean.TRUE.equals(info.get("disabled")))
+                return browserError("CONFLICT", "上传控件已禁用，未选择文件");
+            if (!Boolean.TRUE.equals(info.get("multiple")) && trustedPaths.size() != 1)
+                return browserError("INVALID_ARGUMENT", "该上传控件仅接受单个文件");
+            List<Map<String, Object>> expected = new ArrayList<>();
+            for (Path path : trustedPaths) expected.add(Map.of("name", path.getFileName().toString(), "size", Files.size(path)));
+            dispatched = true;
+            element.handle().setInputFiles(trustedPaths.toArray(Path[]::new),
+                    new ElementHandle.SetInputFilesOptions().setTimeout(CLICK_TIMEOUT_MS));
+            List<Map<String, Object>> actual = (List<Map<String, Object>>) element.handle().evaluate(
+                    "el => Array.from(el.files, f=>({name:f.name,size:f.size}))");
+            if (!sameUploadedFiles(expected, actual)) {
+                invalidateObservation(sessionId);
+                return unknownAction("上传控件回读的文件名或大小与目标不一致");
+            }
+            return formActionResult(sessionId, page, "文件已选择并回读核验；是否已上传到服务器仍需检查页面回执", "files", actual);
+        } catch (Exception error) {
+            invalidateObservation(sessionId);
+            return dispatched ? unknownAction("文件选择或上传结果尚未确认：" + error.getMessage())
+                    : browserError("EXECUTION_FAILED", "无法检查上传控件：" + error.getMessage());
+        } finally { pageLock.unlock(); }
+    }
+
+    private static boolean sameUploadedFiles(List<Map<String, Object>> expected, List<Map<String, Object>> actual) {
+        if (expected.size() != actual.size()) return false;
+        for (int i = 0; i < expected.size(); i++) {
+            if (!expected.get(i).get("name").equals(actual.get(i).get("name"))
+                    || !(actual.get(i).get("size") instanceof Number actualSize)
+                    || ((Number) expected.get(i).get("size")).longValue() != actualSize.longValue()) return false;
+        }
+        return true;
+    }
+
+    private static boolean validFormActionRef(String ref) {
+        return ref != null && ref.matches("b[0-9]+\\.[0-9]+");
+    }
+
+    private String formActionResult(String sessionId, Page page, String message, String key, Object value) {
+        String snapshot = observe(sessionId, page, page.locator("body").ariaSnapshot());
+        var result = resultJson.createObjectNode().put("success", true).put("message", message).put("snapshot", snapshot);
+        result.set(key, resultJson.valueToTree(value));
+        return result.toString();
+    }
+
     /**
      * 在搜索框/输入框中输入文字
      * ref: 快照中的编号（如 "11"）或 placeholder 文本（如 "搜索"）
      * text: 要输入的文字
      */
-    public String type(String sessionId, String ref, String text) {
+    private String typeOnActor(String sessionId, String ref, String text) {
         try {
             Page page = getPage(sessionId);
-            int shortTimeout = 3000; // 每个策略最多等3秒，失败立即跳下一个
-
-            // 策略1: ref 是数字 → 在快照中找到该编号对应的元素，用 aria label/name 匹配
-            try {
-                int refNum = Integer.parseInt(ref);
-                String elementInfo = findElementByRef(page, refNum);
-                if (Objects.nonNull(elementInfo)) {
-                    log.info("ref={} 对应元素: {}", ref, elementInfo);
-                    // 尝试用 placeholder / label 找输入框
-                    Locator input = findInputByInfo(page, elementInfo);
-                    if (Objects.nonNull(input)) {
-                        input.fill(text, new Locator.FillOptions().setTimeout(shortTimeout));
-                        return String.format(MessageConstants.BROWSER_INPUT_SUCCESS, ref, text) + "\n\n"
-                                + formatSnapshot(page.locator("body").ariaSnapshot());
-                    }
-                }
-            } catch (Exception ignored) {}
-
-            // 策略2: ref 是文本 → 用 placeholder 匹配
-            try {
-                page.getByPlaceholder(ref).fill(text, new Locator.FillOptions().setTimeout(shortTimeout));
-                return String.format(MessageConstants.BROWSER_INPUT_SUCCESS_PLACEHOLDER, ref, text) + "\n\n"
-                        + formatSnapshot(page.locator("body").ariaSnapshot());
-            } catch (Exception ignored) {}
-
-            // 策略3: ref 是文本 → 用 aria label 匹配
-            try {
-                page.getByLabel(ref).fill(text, new Locator.FillOptions().setTimeout(shortTimeout));
-                return String.format(MessageConstants.BROWSER_INPUT_SUCCESS_LABEL, ref, text) + "\n\n"
-                        + formatSnapshot(page.locator("body").ariaSnapshot());
-            } catch (Exception ignored) {}
-
-            return String.format(MessageConstants.BROWSER_INPUT_FAILED_NOT_FOUND, ref);
-
+            if (ref == null || ref.isBlank()) return browserError("EXECUTION_FAILED", "输入需要明确的快照 ref 或输入框名称");
+            if (ref.startsWith("b") && ref.contains(".") || ref.chars().allMatch(Character::isDigit)) {
+                ObservedElement element = resolveObservedElement(sessionId, page, ref);
+                if (element == null) return staleObservation();
+                element.handle().fill(text, new ElementHandle.FillOptions().setTimeout(CLICK_TIMEOUT_MS));
+            } else {
+                Locator input = page.getByPlaceholder(ref, new Page.GetByPlaceholderOptions().setExact(true));
+                if (input.count() != 1) input = page.getByLabel(ref, new Page.GetByLabelOptions().setExact(true));
+                if (input.count() != 1) return browserError("CONFLICT", "输入框匹配不唯一或不存在，请重新获取快照");
+                input.fill(text, new Locator.FillOptions().setTimeout(CLICK_TIMEOUT_MS));
+            }
+            return "输入成功: ref=" + ref + "\n\n" + observe(sessionId, page, page.locator("body").ariaSnapshot());
         } catch (Exception e) {
-            log.error("输入失败: ref={}", ref, e);
-            return String.format(MessageConstants.BROWSER_INPUT_FAILED, e.getMessage());
+            invalidateObservation(sessionId);
+            return unknownAction("输入结果尚未确认：" + e.getMessage());
         }
-    }
-
-    /**
-     * 从无障碍树快照中找到 ref 编号对应的元素描述
-     */
-    private String findElementByRef(Page page, int refNum) {
-        String raw = page.locator("body").ariaSnapshot();
-        int currentRef = 0;
-        for (String line : raw.split("\n")) {
-            String trimmed = line.trim();
-            if (trimmed.isEmpty()) {
-                continue;
-            }
-            if (isSnapshotRefLine(trimmed)) {
-                currentRef++;
-                if (currentRef == refNum) {
-                    return trimmed;
-                }
-            }
-        }
-        return null;
-    }
-
-    /**
-     * 根据元素描述尝试找到输入框
-     */
-    private Locator findInputByInfo(Page page, String elementInfo) {
-        // 提取引号中的文本（如 "搜索"）
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"([^\"]+)\"").matcher(elementInfo);
-        String label = m.find() ? m.group(1) : null;
-
-        if (elementInfo.contains("searchbox") || elementInfo.contains("textbox")
-                || (Objects.nonNull(label) && (label.contains("搜索") || label.contains("search")))) {
-            // 搜索框 / 输入框
-            Locator byPlaceholder = page.locator("input[placeholder]").first();
-            if (byPlaceholder.count() > 0) {
-                return byPlaceholder;
-            }
-        }
-
-        if (Objects.nonNull(label)) {
-            try {
-                return page.getByPlaceholder(label);
-            } catch (Exception ignored) {}
-            try {
-                return page.getByLabel(label);
-            } catch (Exception ignored) {}
-        }
-
-        // fallback: 第一个可见的 input
-        Locator firstInput = page.locator("input:visible, textarea:visible").first();
-        return firstInput.count() > 0 ? firstInput : null;
     }
 
     /**
      * 按键盘按键
      */
-    public String press(String sessionId, String key) {
+    private String pressOnActor(String sessionId, String key) {
         try {
             Page page = getPage(sessionId);
             page.keyboard().press(key);
-            return String.format(MessageConstants.BROWSER_PRESS_SUCCESS, key);
+            return String.format(MessageConstants.BROWSER_PRESS_SUCCESS, key) + "\n\n"
+                    + observe(sessionId, page, page.locator("body").ariaSnapshot());
         } catch (Exception e) {
             log.error("按键失败: key={}", key, e);
-            return String.format(MessageConstants.BROWSER_PRESS_FAILED, e.getMessage());
+            invalidateObservation(sessionId);
+            return unknownAction("按键结果尚未确认：" + e.getMessage());
         }
     }
 
     /**
      * 滚动页面
      */
-    public String scroll(String sessionId, String direction) {
+    private String scrollOnActor(String sessionId, String direction) {
         try {
             Page page = getPage(sessionId);
             if ("up".equalsIgnoreCase(direction)) {
@@ -1479,20 +1937,24 @@ public class BrowserService {
             } else {
                 page.mouse().wheel(0, 500);
             }
-            return String.format(MessageConstants.BROWSER_SCROLL_SUCCESS, direction);
+            return String.format(MessageConstants.BROWSER_SCROLL_SUCCESS, direction) + "\n\n"
+                    + observe(sessionId, page, page.locator("body").ariaSnapshot());
         } catch (Exception e) {
-            return String.format(MessageConstants.BROWSER_SCROLL_FAILED, e.getMessage());
+            invalidateObservation(sessionId);
+            return unknownAction("滚动结果尚未确认：" + e.getMessage());
         }
     }
 
     /**
      * 截图
      */
-    public String screenshot(String sessionId, Path workspaceRoot) {
+    private String screenshotOnActor(String sessionId, Path workspaceRoot) {
         pageLock.lock();
         try {
             Page page = getPage(sessionId);
             Path target = screenshotOutputPath(workspaceRoot, sessionId);
+            String baseName = target.getFileName().toString().replaceFirst("\\.png$", "");
+            target = target.resolveSibling(baseName + "_" + java.util.UUID.randomUUID() + ".png");
             String filename = target.getFileName().toString();
             Path root = workspaceRoot.toAbsolutePath().normalize();
             byte[] screenshot = page.screenshot(new Page.ScreenshotOptions().setFullPage(false));
@@ -1506,9 +1968,13 @@ public class BrowserService {
             }
             Files.createDirectories(root);
             Files.write(target, screenshot);
-            return String.format(MessageConstants.BROWSER_SCREENSHOT_SAVED, "workspace/" + filename);
+            var result = resultJson.createObjectNode().put("success", true)
+                    .put("message", String.format(MessageConstants.BROWSER_SCREENSHOT_SAVED, "workspace/" + filename))
+                    .put("path", target.toString()).put("url", page.url());
+            result.putArray("tool_images").addObject().put("path", target.toString()).put("mimeType", "image/png");
+            return result.toString();
         } catch (Exception e) {
-            return String.format(MessageConstants.BROWSER_SCREENSHOT_FAILED, e.getMessage());
+            return browserError("EXECUTION_FAILED", String.format(MessageConstants.BROWSER_SCREENSHOT_FAILED, e.getMessage()));
         } finally {
             pageLock.unlock();
         }
@@ -1583,8 +2049,10 @@ public class BrowserService {
     /**
      * 关闭当前 session 的浏览器页面
      */
-    public String close(String sessionId) {
+    private String closeOnActor(String sessionId) {
+        invalidateObservation(sessionId);
         Page page = pages.remove(sessionId);
+        pageDiagnostics.remove(sessionId);
         lastPointerPositions.remove(sessionId);
         if (Objects.nonNull(page)) {
             page.close();
@@ -1597,16 +2065,13 @@ public class BrowserService {
      * 滚完主内容区（含虚拟列表）并返回去重后的正文。
      * 侧栏有目录时按项点击，一次抽完全部章节。
      */
-    public String extractArticleText(String sessionId) {
-        return extractArticleText(sessionId, null);
-    }
-
-    public String extractArticleText(String sessionId, Path imageDir) {
+    private String extractArticleTextOnActor(String sessionId, Path imageDir) {
         pageLock.lock();
         try {
+            invalidateObservation(sessionId);
             Page page = getPage(sessionId);
             if (isPasswordGate(page)) {
-                return "抽取失败: 当前是登录或密码页，先 browser_type 填密码再抽取";
+                return browserError("PERMISSION_DENIED", "抽取失败: 当前是登录或密码页，先 browser_type 填密码再抽取");
             }
             String home = page.url();
             waitForWikiTree(page);
@@ -1667,8 +2132,8 @@ public class BrowserService {
             log.info("抽取知识库 chapters={} chars={}", ok, all.length());
             return all.toString();
         } catch (Exception e) {
-            return String.format(MessageConstants.BROWSER_EXTRACT_FAILED,
-                    e.getMessage());
+            return browserError("EXECUTION_FAILED", String.format(MessageConstants.BROWSER_EXTRACT_FAILED,
+                    e.getMessage()));
         } finally {
             pageLock.unlock();
         }
@@ -1682,8 +2147,8 @@ public class BrowserService {
         Object result = page.evaluate(script);
         String body = result == null ? "" : result.toString().trim();
         if (body.length() < EXTRACT_MIN_CHARS) {
-            return String.format(MessageConstants.BROWSER_EXTRACT_EMPTY,
-                    page.url());
+            return browserError("EMPTY_RESULT", String.format(MessageConstants.BROWSER_EXTRACT_EMPTY,
+                    page.url()));
         }
         body = localizeImages(page, body, imageDir);
         String title = StringUtils.defaultString(page.title());
@@ -2040,15 +2505,16 @@ public class BrowserService {
     /**
      * 在页面执行 JavaScript
      */
-    public String evaluate(String sessionId, String expression) {
+    private String evaluateOnActor(String sessionId, String expression) {
         pageLock.lock();
         try {
+            invalidateObservation(sessionId);
             Page page = getPage(sessionId);
             Object result = page.evaluate(expression);
             return String.format(MessageConstants.BROWSER_EVAL_RESULT,
                     Objects.nonNull(result) ? result.toString() : "null");
         } catch (Exception e) {
-            return String.format(MessageConstants.BROWSER_EVAL_FAILED, e.getMessage());
+            return unknownAction(String.format(MessageConstants.BROWSER_EVAL_FAILED, e.getMessage()));
         } finally {
             pageLock.unlock();
         }
@@ -2061,32 +2527,6 @@ public class BrowserService {
      * 原始:  - link "搜索"
      * 处理后: [1] - link "搜索"
      */
-    private String formatSnapshot(String snapshot) {
-        if (StringUtils.isBlank(snapshot)) {
-            return MessageConstants.BROWSER_EMPTY_PAGE;
-        }
-
-        StringBuilder sb = new StringBuilder();
-        String[] lines = snapshot.split("\n");
-        int refNum = 1;
-
-        for (String line : lines) {
-            String trimmed = line.trim();
-            if (trimmed.isEmpty()) {
-                continue;
-            }
-
-            // 只给可点击角色编号；普通 `- text:` 不当 ref，否则编号和点击对不上
-            if (isSnapshotRefLine(trimmed)) {
-                sb.append(String.format("[%d] %s%n", refNum++, trimmed));
-            } else {
-                sb.append(line).append("\n");
-            }
-        }
-
-        return sb.toString();
-    }
-
     /** 快照里可点的角色行才编号。`- text:` 静态文案不算。 */
     public static boolean isSnapshotRefLine(String trimmed) {
         if (trimmed == null) {
@@ -2106,9 +2546,16 @@ public class BrowserService {
 
     @PreDestroy
     public void shutdown() {
+        try { onActor(() -> { shutdownOnActor(); return "closed"; }); }
+        finally { actor.shutdown(); }
+    }
+
+    private void shutdownOnActor() {
         log.info("关闭所有浏览器会话...");
+        for (String session : new ArrayList<>(observations.keySet())) invalidateObservation(session);
         pages.values().forEach(Page::close);
         pages.clear();
+        pageDiagnostics.clear();
         if (Objects.nonNull(browser)) {
             browser.close();
         }

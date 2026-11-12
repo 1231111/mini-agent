@@ -113,6 +113,34 @@ class NodeOutputBinderTest {
         assertTrue(StepEvaluator.looksLikeToolError(b.evidence()));
     }
 
+    @Test
+    void validationRetainsTheObservedBeforeAndAfterStatesInsteadOfOnlyTheLastTodoReceipt() {
+        TaskNode node = new TaskNode("verify", "验证场景切换", "browser", List.of(), List.of(),
+                List.of("验证结论"), TaskNodeStatus.PENDING, 50, DoneWhen.validation("场景确实切换"), "", "", 0, "");
+        var receipts = List.<dev.langchain4j.data.message.ChatMessage>of(
+                ToolExecutionResultMessage.from("1", "browser_navigate", "当前场景：生产场景"),
+                ToolExecutionResultMessage.from("2", "browser_click", "点击成功：切换场景；当前场景：测试场景"),
+                ToolExecutionResultMessage.from("3", "browser_click", "点击成功：恢复默认；当前场景：生产场景"),
+                ToolExecutionResultMessage.from("4", "todo", "{\"success\":true,\"stats\":{\"completed\":2}}"));
+        var bound = NodeOutputBinder.bind(node, "", receipts, AgentLoop.STEP_SEGMENT_DONE,
+                com.miniagent.agent.tool.ToolResult.fromLegacy("{\"success\":true}"));
+        assertTrue(bound.complete(node));
+        assertTrue(bound.evidence().contains("测试场景"));
+        assertTrue(bound.evidence().contains("恢复默认"));
+        assertFalse(bound.evidence().contains("stats"));
+    }
+
+    @Test
+    void accumulatedVerificationEvidenceCannotHideAFailedTerminalTool() {
+        TaskNode node = new TaskNode("verify", "验证", "browser", List.of(), List.of(),
+                List.of("验证结论"), TaskNodeStatus.PENDING, 50, DoneWhen.validation("检查成功"), "", "", 0, "");
+        var bound = NodeOutputBinder.bind(node, "", List.of(
+                ToolExecutionResultMessage.from("1", "browser_click", "previous success")), "",
+                com.miniagent.agent.tool.ToolResult.fromLegacy("{\"success\":false,\"error\":\"not verified\"}"));
+        assertFalse(bound.complete(node));
+        assertTrue(bound.evidence().contains("not verified"));
+    }
+
     private static TaskNode acquire(String port) {
         return new TaskNode("n1", "获取资料原文", "web", List.of(),
                 List.of(), List.of(port), TaskNodeStatus.PENDING, 10,

@@ -15,13 +15,13 @@ public class BrowserTypeParams extends ToolParams {
     @ToolParamSchema(description = "要输入的文字", required = true)
     private String text;
 
-    @ToolParamSchema(description = "输入框的ref编号或选择器")
+    @ToolParamSchema(description = "输入框的最新快照完整 ref（如 b12.3）或唯一 placeholder/label")
     private String ref;
 
     @ToolParamSchema(description = "定位策略")
     private String by;
 
-    @ToolParamSchema(description = "浏览器会话ID")
+    @ToolParamSchema(description = "兼容字段，通常省略；仅允许当前聊天ID，不能指定其他会话")
     private String sessionId;
 
     /**

@@ -109,22 +109,56 @@ public class PlanningLoop {
         return shouldHandle(plan, sessionId, null);
     }
 
-    /**
-     * 本轮是否进入规划器。
-     *
-     * <p>默认 Agent 路径对齐 WorkBuddy：不先用词表判断「简单任务/复杂任务」，
-     * 每条消息直接交给 AgentLoop，由 LLM 自己决定回答、调用工具、反问或委派。
-     * 只有用户显式把会话切到 {@link PermissionMode#PLAN}，才进入
-     * GoalCompiler → PlanValidator → GraphScheduler 这条计划执行链。</p>
-     *
-     * <p>默认 Agent 模式不因为历史上有未完成图、用户说「继续」或消息命中某个
-     * 任务信号而重新进入规划器；这些消息仍交给 AgentLoop，让 LLM 结合会话历史自行处理。
-     * 规划器只由显式 {@link PermissionMode#PLAN} 模式打开。</p>
-     */
+    /** Cheap forced/resume gate. New requests require {@link #selectRoute} for semantic routing. */
     public boolean shouldHandle(TaskPlan plan, String sessionId, String requestText) {
-        return properties.isEnabled()
-                && plan != null
-                && PermissionContext.mode() == PermissionMode.PLAN;
+        if (!properties.isEnabled() || plan == null) return false;
+        if (PermissionContext.mode() == PermissionMode.PLAN) return true;
+        return canResume(sessionId, requestText);
+    }
+
+    private boolean canResume(String sessionId, String requestText) {
+        if (StringUtils.isBlank(sessionId)) return false;
+        return stateStore.get(sessionId).map(snapshot -> {
+            TaskGraph graph = snapshot.graph();
+            boolean incomplete = graph != null && !graph.isEmpty() && !graph.allTerminalSuccess();
+            boolean pending = PlannerStateStore.PLAN_APPROVAL_PENDING.equals(
+                    snapshot.execution().get(PlannerStateStore.EXECUTION_PLAN_APPROVAL));
+            return incomplete && (PlannerResumePolicy.shouldResume(requestText,
+                    graph.hasAwaitingConfirm(), true, pending)
+                    || shouldRecompileClarify(snapshot.goal(), graph, requestText)
+                    || (pending && StringUtils.isNotBlank(requestText)
+                    && !PlannerResumePolicy.isClearlyNewTopic(requestText.trim())));
+        }).orElse(false);
+    }
+
+    /** Resolve once per turn. The decision is passed explicitly to execution, never stored in a ThreadLocal. */
+    public PlanningRoute selectRoute(ChatModel chat, TaskPlan plan, String sessionId,
+                                     String requestText, UserMessage multimodal, List<ChatMessage> history) {
+        PlanningRoute route;
+        if (!properties.isEnabled() || plan == null) {
+            route = PlanningRoute.direct("configuration", "PLANNER_DISABLED_OR_NO_TASK");
+        } else if (shouldHandle(plan, sessionId, requestText)) {
+            route = PlanningRoute.dag("state", PermissionContext.mode() == PermissionMode.PLAN
+                    ? "EXPLICIT_PLAN_MODE" : "RESUME_CURRENT_GRAPH");
+            if (PermissionContext.mode() == PermissionMode.PLAN && !canResume(sessionId, requestText)) {
+                PlanningRoute semantic = new SemanticPlanningRouter().decide(goalCompiler.resolvePlannerChat(chat),
+                        requestText == null ? plan.taskGoal() : requestText, multimodal, history);
+                route = new PlanningRoute(true, "explicit", "EXPLICIT_PLAN_MODE; " + semantic.reason(),
+                        semantic.artifactDeliveryRequested());
+            }
+        } else if (!properties.isAutoPlanning()) {
+            route = PlanningRoute.direct("configuration", "AUTO_PLANNING_DISABLED");
+        } else {
+            route = new SemanticPlanningRouter().decide(goalCompiler.resolvePlannerChat(chat),
+                    requestText == null ? plan.taskGoal() : requestText, multimodal, history);
+        }
+        trace(sessionId, AgentStepNode.PLANNING_ROUTE,
+                "{\"route\":\"" + (route.useDag() ? "dag" : "direct")
+                        + "\",\"source\":\"" + jsonEscape(route.source())
+                        + "\",\"reason\":\"" + jsonEscape(route.reason()) + "\"}");
+        log.info("任务策略 session={} route={} source={} reason={}", sessionId,
+                route.useDag() ? "dag" : "direct", route.source(), route.reason());
+        return route;
     }
 
     /**
@@ -139,7 +173,8 @@ public class PlanningLoop {
 
     static boolean shouldRecompileClarify(Goal goal, TaskGraph graph, String userMessage) {
         if (StringUtils.isBlank(userMessage)
-                || HumanYield.looksLikeBareContinue(userMessage)) {
+                || HumanYield.looksLikeBareContinue(userMessage)
+                || PlannerResumePolicy.isClearlyNewTopic(userMessage.trim())) {
             return false;
         }
         if (goal != null && goal.isClarify()) {
@@ -216,8 +251,26 @@ public class PlanningLoop {
                     degraded ? "GRAPH_COMPLETED_DEGRADED" : "GRAPH_COMPLETED", degraded);
         }
 
-        static RunOutcome direct(String answer) {
-            return new RunOutcome(answer, Outcome.COMPLETED, "DIRECT_LOOP");
+        static RunOutcome direct(AgentLoop.LoopOutcome result) {
+            if (result == null) {
+                return failed("智能体未返回执行结果。", "MISSING_LOOP_OUTCOME");
+            }
+            String reason = StringUtils.defaultIfBlank(result.endReason(), "UNKNOWN_LOOP_OUTCOME");
+            if (AgentLoop.OUTCOME_UNKNOWN.equals(reason)
+                    || (result.lastToolResult() != null
+                    && result.lastToolResult().status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN)) {
+                return failed(result.text(), AgentLoop.OUTCOME_UNKNOWN);
+            }
+            if (result.awaitingHuman()) {
+                return blockedOnHuman(result.text(), reason);
+            }
+            if (result.successful()) {
+                return new RunOutcome(result.text(), Outcome.COMPLETED, reason);
+            }
+            if (RunStatus.SUCCESS.name().equals(reason)) {
+                reason = StringUtils.isBlank(result.text()) ? "EMPTY_FINAL_ANSWER" : "TOOL_EXECUTION_FAILED";
+            }
+            return failed(result.text(), reason);
         }
 
         static RunOutcome unfinished(String answer, String reason) {
@@ -263,16 +316,29 @@ public class PlanningLoop {
                       String fencingToken,
                       String executionId,
                       AgentStreamSink streamSink) {
-        if (!shouldHandle(taskPlan, sessionId, userMessage)) {
+        return runWithOutcome(chat, systemPrompt, userMessage, multimodalUser, history, taskPlan,
+                sessionId, fencingToken, executionId, streamSink,
+                selectRoute(chat, taskPlan, sessionId, userMessage, multimodalUser, history));
+    }
+
+    /** Executes a previously resolved per-turn strategy without a second model routing call. */
+    public RunOutcome runWithOutcome(ChatModel chat, String systemPrompt, String userMessage,
+                      UserMessage multimodalUser, List<ChatMessage> history, TaskPlan taskPlan,
+                      String sessionId, String fencingToken, String executionId,
+                      AgentStreamSink streamSink, PlanningRoute route) {
+        if (!properties.isEnabled() || taskPlan == null || route == null || !route.useDag()) {
             // 直跑路径：结局由 AgentLoop 自己判定，规划器不替它宣称完成
             if (multimodalUser != null) {
-                return RunOutcome.direct(nodeExecutor.runDirectMultimodal(chat, systemPrompt,
+                return RunOutcome.direct(nodeExecutor.runDirectMultimodalOutcome(chat, systemPrompt,
                         multimodalUser, history, 90, taskPlan, streamSink));
             }
-            return RunOutcome.direct(nodeExecutor.runDirect(chat, systemPrompt, userMessage, history,
+            return RunOutcome.direct(nodeExecutor.runDirectOutcome(chat, systemPrompt, userMessage, history,
                     90, taskPlan, streamSink));
         }
 
+        if (route.artifactDeliveryRequested() != null) {
+            taskPlan = taskPlan.withArtifactDeliveryRequested(route.artifactDeliveryRequested());
+        }
         GoalCompiler.CompileResult compiled;
         StateSnapshot snap;
         var existing = stateStore.get(sessionId);
@@ -299,18 +365,22 @@ public class PlanningLoop {
                 && !isPlanApprovalReply(userMessage)
                 && !PlannerResumePolicy.isClearlyNewTopic(
                         userMessage == null ? "" : userMessage.trim());
+        if ((resume || clarifyRecompile || planRevision) && taskPlan.artifactDeliveryRequested() == null) {
+            Object stored = existing.get().execution().get("artifactDeliveryRequested");
+            if (stored instanceof Boolean requested) taskPlan = taskPlan.withArtifactDeliveryRequested(requested);
+        }
         if (clarifyRecompile) {
             String merged = mergeClarifyObjective(
                     existing.get().goal().objective(), userMessage);
             TaskPlan nextPlan = taskPlan.withTaskGoal(merged);
             compiled = compileAndValidate(chat, merged, nextPlan);
-            if (!planValidator.accept(compiled.graph(), nextPlan, compiled.goal())) {
+            if (!planValidator.accept(compiled.graph(), nextPlan, compiled.goal(), compiled.intent())) {
                 // 同上：澄清后图仍编不出来，降级直跑（合并后的目标进直跑消息，历史仍在），
                 // 不报「任务图未通过验收」。
                 log.warn("PlanningLoop 澄清后任务图仍无法验收，降级直跑 session={} code={}",
                         sessionId, ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
                 return directFallback(chat, systemPrompt, merged, multimodalUser,
-                        history, nextPlan, streamSink);
+                        history, nextPlan, sessionId, executionId, streamSink);
             }
             String execId = StringUtils.isNotBlank(executionId)
                     ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
@@ -324,6 +394,13 @@ public class PlanningLoop {
                     existing.get().goal().objective(), userMessage);
             TaskPlan nextPlan = taskPlan.withTaskGoal(merged);
             compiled = compileAndValidate(chat, merged, nextPlan);
+            if (!planValidator.accept(compiled.graph(), nextPlan, compiled.goal(), compiled.intent())) {
+                // A revision is not approval to execute either the old or an invalid
+                // replacement plan. Retain the pending snapshot for another revision.
+                return RunOutcome.blockedOnHuman(
+                        "调整后的任务计划未通过校验，尚未开始执行。请重新调整计划后重试。",
+                        "PLAN_REVISION_INVALID");
+            }
             String execId = StringUtils.isNotBlank(executionId)
                     ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
             // 重编译后是全新快照，审批状态自动回到未批准，会再次停下等确认。
@@ -352,7 +429,7 @@ public class PlanningLoop {
 
         } else {
             compiled = compileAndValidate(chat, userMessage, taskPlan);
-            if (!planValidator.accept(compiled.graph(), taskPlan, compiled.goal())) {
+            if (!planValidator.accept(compiled.graph(), taskPlan, compiled.goal(), compiled.intent())) {
                 // 规划模型没产出可用图 ≠ 任务失败。对齐 WorkBuddy：没有「图没编出来就拒活」的硬门，
                 // 编译/验收失败一律降级直跑 —— 交给 AgentLoop 让模型自主选工具完成请求，
                 // 而不是回一句「任务图未通过验收，无法调度」。这是切换到 AgentLoop 的直跑路径，
@@ -360,12 +437,18 @@ public class PlanningLoop {
                 log.warn("PlanningLoop 任务图验收失败，降级直跑 session={} code={}",
                         sessionId, ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
                 return directFallback(chat, systemPrompt, userMessage, multimodalUser,
-                        history, taskPlan, streamSink);
+                        history, taskPlan, sessionId, executionId, streamSink);
             }
             String execId = StringUtils.isNotBlank(executionId)
                     ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
             snap = stateStore.init(sessionId, execId, compiled.goal(), compiled.graph(),
                     compiled.intent(), compiled.source(), compiled.degraded());
+        }
+        if (taskPlan.artifactDeliveryRequested() != null
+                && !taskPlan.artifactDeliveryRequested().equals(snap.execution().get("artifactDeliveryRequested"))) {
+            Map<String, Object> metadata = new LinkedHashMap<>(snap.execution());
+            metadata.put("artifactDeliveryRequested", taskPlan.artifactDeliveryRequested());
+            snap = stateStore.commit(sessionId, snap.version(), snap.withExecution(metadata));
         }
         todoProjector.project(sessionId, snap.graph());
         // A tool whose outcome was unknown may have applied a side effect even though
@@ -527,9 +610,11 @@ public class PlanningLoop {
                 continue;
             }
 
-            // 只提案 READY 节点
-            ActionProposal proposal = graphScheduler.propose(snap, ready,
-                    properties.getProposalBatchSize());
+            // StepExec carries one node's terminal result and evidence. Dispatch
+            // exactly one graph node until results can be correlated per action;
+            // a larger legacy batch setting must not certify unexecuted nodes.
+            // Tool calls inside this node retain their normal concurrency policy.
+            ActionProposal proposal = graphScheduler.propose(snap, ready, 1);
             if (proposal.actions().isEmpty()) {
                 unfinishedReason = "EMPTY_PROPOSAL";
                 break;
@@ -674,7 +759,7 @@ public class PlanningLoop {
                     g = g.replace(node.withStatus(TaskNodeStatus.SUCCESS).withError("")
                             .withToolStatus(step.structuredResult() == null
                                     ? null : step.structuredResult().status())
-                            .withOutput(clip(bound.evidence(), PRIOR_OUTPUT_CHARS),
+                            .withOutput(clip(bound.evidence(), 12000),
                                     clipBindings(bound.bindings())));
                     metrics.nodeSuccess();
                     recordToolOutcome(node, true);
@@ -1032,11 +1117,16 @@ public class PlanningLoop {
         if (graph == null || node == null || input == null) {
             return null;
         }
-        for (String d : node.dependsOn()) {
+        Set<String> visited = new HashSet<>();
+        List<String> pending = new ArrayList<>(node.dependsOn());
+        for (int i = 0; i < pending.size(); i++) {
+            String d = pending.get(i);
+            if (d.equals(node.id()) || !visited.add(d)) continue;
             TaskNode dep = graph.byId(d);
             if (dep != null && dep.outputs().contains(input)) {
                 return dep;
             }
+            if (dep != null) pending.addAll(dep.dependsOn());
         }
         return null;
     }
@@ -1457,7 +1547,7 @@ public class PlanningLoop {
             return Optional.empty();
         }
         if (!mergeValidationReports(
-                planValidator.validate(merged, taskPlan, compiled.goal()),
+                planValidator.validate(merged, taskPlan, compiled.goal(), compiled.intent()),
                 intentGraphValidator.validate(compiled.intent(), merged)).valid()) {
             log.warn("运行时 LLM replan 图验收失败（结构或意图）session={}", sessionId);
             return Optional.empty();
@@ -1607,14 +1697,30 @@ public class PlanningLoop {
     /** 编译/验收失败后的直跑降级：多模态走多模态直跑，否则走文本直跑。结局由 AgentLoop 自己判定。 */
     private RunOutcome directFallback(ChatModel chat, String systemPrompt, String userMessage,
                                       UserMessage multimodalUser, List<ChatMessage> history,
-                                      TaskPlan taskPlan,
+                                      TaskPlan taskPlan, String sessionId, String executionId,
                                       AgentStreamSink streamSink) {
-        if (multimodalUser != null) {
-            return RunOutcome.direct(nodeExecutor.runDirectMultimodal(chat, systemPrompt,
-                    multimodalUser, history, 90, taskPlan, streamSink));
+        AgentLoop.LoopOutcome loopResult = multimodalUser != null
+                ? nodeExecutor.runDirectMultimodalOutcome(chat, systemPrompt,
+                    multimodalUser, history, 90, taskPlan, streamSink)
+                : nodeExecutor.runDirectOutcome(chat, systemPrompt, userMessage, history,
+                    90, taskPlan, streamSink);
+        RunOutcome result = RunOutcome.direct(loopResult);
+        if (AgentLoop.OUTCOME_UNKNOWN.equals(result.reason()) && StringUtils.isNotBlank(sessionId)) {
+            // A failed compilation has no executable graph to retain the unknown
+            // action. Persist the same quarantine used by ordinary DAG nodes so
+            // a later "continue" cannot silently recompile and replay it.
+            TaskNode unknown = new TaskNode("direct_fallback", "直跑步骤执行结果待核验", "general",
+                    List.of(), List.of(), List.of(), TaskNodeStatus.OUTCOME_UNKNOWN, 0,
+                    DoneWhen.note(), "", result.answer(), 0, "")
+                    .withToolStatus(com.miniagent.agent.tool.ToolStatus.UNKNOWN);
+            String objective = taskPlan == null ? userMessage : taskPlan.taskGoal();
+            Goal goal = new Goal("direct_fallback", objective, "", Map.of(), List.of(), List.of());
+            String execId = StringUtils.defaultIfBlank(executionId, "exec_" + UUID.randomUUID());
+            stateStore.init(sessionId, execId, goal, new TaskGraph(List.of(unknown)),
+                    TaskIntent.fromGoal(goal), GoalCompiler.CompilationSource.VALIDATION_ERROR, true);
+            todoProjector.project(sessionId, new TaskGraph(List.of(unknown)));
         }
-        return RunOutcome.direct(nodeExecutor.runDirect(chat, systemPrompt, userMessage, history,
-                90, taskPlan, streamSink));
+        return result;
     }
 
     private GoalCompiler.CompileResult compileAndValidate(ChatModel chat,
@@ -1625,7 +1731,7 @@ public class PlanningLoop {
 
         // 结构化验证
         PlanValidationReport report = mergeValidationReports(
-                planValidator.validate(compiled.graph(), taskPlan, compiled.goal()),
+                planValidator.validate(compiled.graph(), taskPlan, compiled.goal(), compiled.intent()),
                 intentGraphValidator.validate(compiled.intent(), compiled.graph()));
         if (report.valid()) {
             return compiled;
@@ -1651,7 +1757,7 @@ public class PlanningLoop {
 
             // 验证重新编译的结果
             report = mergeValidationReports(
-                    planValidator.validate(replanned.graph(), taskPlan, replanned.goal()),
+                    planValidator.validate(replanned.graph(), taskPlan, replanned.goal(), replanned.intent()),
                     intentGraphValidator.validate(replanned.intent(), replanned.graph()));
             if (report.valid()) {
                 log.info("Replan 成功，尝试次数={}", attempt);

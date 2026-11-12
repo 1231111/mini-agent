@@ -12,13 +12,13 @@ import lombok.EqualsAndHashCode;
 @EqualsAndHashCode(callSuper = true)
 public class BrowserClickParams extends ToolParams {
 
-    @ToolParamSchema(description = "快照编号（推荐）或文本/选择器，含义由 by 决定", required = true)
+    @ToolParamSchema(description = "最新快照完整 ref（如 b12.3）或明确文本/选择器，含义由 by 决定", required = true)
     private String ref;
 
     @ToolParamSchema(description = "定位策略：ref=仅编号；text=精确文本；role=button=名称；css=CSS选择器；aria=aria-label")
     private String by;
 
-    @ToolParamSchema(description = "浏览器会话ID")
+    @ToolParamSchema(description = "兼容字段，通常省略；仅允许当前聊天ID，不能指定其他会话")
     private String sessionId;
 
     /**

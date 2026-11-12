@@ -2,6 +2,9 @@ package com.miniagent.agent.tool;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.browser.BrowserService;
+import com.miniagent.agent.browser.BrowserSessionIdentity;
+import com.miniagent.agent.browser.BrowserUploadFiles;
+import com.miniagent.common.context.OwnerContext;
 import com.miniagent.agent.skill.SkillStore;
 import com.miniagent.agent.song.LyriaMusicService;
 import com.miniagent.agent.song.MiniMaxMusicService;
@@ -687,44 +690,76 @@ public class BuiltinTools {
                                         + "。此工具仅用于公网 HTTP/HTTPS 网页，不能预览 file://、localhost 或工作区本地文件；"
                                         + "请停止更换端口重试，改用 read_file 或 exec_command 做静态验证。");
                     }
-                    return browserService.navigate(params.getSessionIdOrDefault(), params.getUrl());
+                    return withBrowserSession(params.getSessionId(), session -> browserService.navigate(session, params.getUrl()));
                 });
 
-        registry.register("browser_snapshot", "获取当前页面的无障碍树快照，显示可交互元素的编号ref",
+        registry.register("browser_snapshot", "获取当前页面的无障碍树快照与观察标识。使用返回的完整 ref（如 b12.3）；页面改变后旧 ref 失效。",
                 BrowserSnapshotParams.class,
-                params -> browserService.snapshot(params.getSessionIdOrDefault(), params.isFullOrDefault()));
+                params -> withBrowserSession(params.getSessionId(), session -> browserService.snapshot(session, params.isFullOrDefault())));
+
+        registry.register("browser_form_inspect", "识别当前网页表单：返回字段ref、类型、标签、必填、约束、选项、当前值和校验错误；包含隐藏上传控件，密码值不回显。每次填写后重新识别获取最新ref。",
+                BrowserFormInspectParams.class,
+                params -> withBrowserSession(params.getSessionId(), browserService::formInspect));
+        registry.register("browser_form_verify", "回读一个最新字段ref，检查实际值及页面约束。可传一种expected参数核对文本、勾选、选中value或文件名；核验通过不代表已提交。",
+                BrowserFormVerifyParams.class,
+                params -> withBrowserSession(params.getSessionId(), session -> browserService.formVerify(session,
+                        params.getRef(), params.getExpectedValue(), params.getExpectedChecked(), params.getExpectedValues(), params.getExpectedFiles())));
+        registry.register("browser_select", "选择原生select下拉框的指定选项，支持多选；只用最新ref。values传value或by=label传精确显示名称。返回实际选值及新快照；自定义下拉使用快照click/press。",
+                BrowserSelectParams.class,
+                params -> withBrowserSession(params.getSessionId(), session -> browserService.select(session,
+                        params.getRef(), params.getValues(), params.getByOrDefault())));
+        registry.register("browser_set_checked", "将原生复选框或单选框设为明确的checked状态，不进行盲目翻转；使用最新ref。单选框不能直接取消，应选择同组其他项。",
+                BrowserSetCheckedParams.class,
+                params -> params.getChecked() == null ? errorJson(ToolErrorCode.INVALID_ARGUMENT, "checked必须明确为true或false")
+                        : withBrowserSession(params.getSessionId(), session -> browserService.setChecked(session, params.getRef(), params.getChecked())));
+        registry.register("browser_upload", "给表单文件字段上传附件，会向网站传输文件。使用browser_form_inspect返回的file字段ref；paths仅限当前会话工作区或本人已上传附件，最多10个/总50MiB。操作前须在用户授权范围内。",
+                BrowserUploadParams.class,
+                params -> withBrowserSession(params.getSessionId(), session -> {
+                    try {
+                        String dataDir = System.getProperty("miniagent.data.dir");
+                        Long user = OwnerContext.currentUserId();
+                        Path uploads = StringUtils.isBlank(dataDir) || user == null ? null : Path.of(dataDir, "media", "uploads", user.toString());
+                        return browserService.upload(session, params.getRef(), BrowserUploadFiles.resolve(effectiveWorkspaceRoot(), uploads, params.getPaths()));
+                    } catch (SecurityException denied) {
+                        return errorJson(ToolErrorCode.PERMISSION_DENIED, denied.getMessage());
+                    } catch (IllegalArgumentException invalid) {
+                        return errorJson(ToolErrorCode.INVALID_ARGUMENT, invalid.getMessage());
+                    } catch (java.io.IOException missing) {
+                        return errorJson(ToolErrorCode.NOT_FOUND, "上传文件不存在或无法读取");
+                    }
+                }));
 
         registry.register("browser_click",
-                "点击页面元素。默认用快照编号 ref（如 \"10\"）。解析失败时不要盲重试同参，改 by 切换策略："
-                        + "ref=仅编号；text=精确文本；role=button=名称 或 link=名称；css=CSS选择器；aria=aria-label/placeholder。",
+                "点击页面元素。默认使用最新快照完整 ref（如 b12.3），不能只传数字。STALE_OBSERVATION 时重新获取快照。"
+                        + "也可明确选择 text=精确文本、role=button=名称、css=唯一选择器、aria=唯一标签。禁止结果未知后直接重试。",
                 BrowserClickParams.class,
-                params -> browserService.click(params.getSessionIdOrDefault(), 
+                params -> withBrowserSession(params.getSessionId(), session -> browserService.click(session,
                                             params.getRef(), 
-                                            params.getByOrDefault()));
+                                            params.getByOrDefault())));
 
         registry.register("browser_type", "在输入框中输入文字",
                 BrowserTypeParams.class,
-                params -> browserService.type(params.getSessionIdOrDefault(), 
+                params -> withBrowserSession(params.getSessionId(), session -> browserService.type(session,
                                            params.getRef(), 
-                                           params.getText()));
+                                           params.getText())));
 
         registry.register("browser_press", "按下键盘按键（Enter, Tab, Escape, ArrowDown 等）",
                 BrowserPressParams.class,
-                params -> browserService.press(params.getSessionIdOrDefault(), params.getKey()));
+                params -> withBrowserSession(params.getSessionId(), session -> browserService.press(session, params.getKey())));
 
         registry.register("browser_scroll", "滚动页面",
                 BrowserScrollParams.class,
-                params -> browserService.scroll(params.getSessionIdOrDefault(), params.getDirection()));
+                params -> withBrowserSession(params.getSessionId(), session -> browserService.scroll(session, params.getDirection())));
 
         registry.register("browser_screenshot", "截取当前页面截图，在最近点击位置添加蓝色光圈指针，并保存到 workspace 供对话预览",
                 BrowserScreenshotParams.class,
-                params -> browserService.screenshot(params.getSessionIdOrDefault(), effectiveWorkspaceRoot()));
+                params -> withBrowserSession(params.getSessionId(), session -> browserService.screenshot(session, effectiveWorkspaceRoot())));
 
         if (browserEvaluateEnabled) {
             registry.register(BROWSER_EVALUATE, "在页面中执行 JavaScript 代码",
                     BrowserEvaluateParams.class,
-                    params -> browserService.evaluate(
-                            params.getSessionIdOrDefault(), params.getScript()));
+                    params -> withBrowserSession(params.getSessionId(), session -> browserService.evaluate(
+                            session, params.getScript())));
         }
 
         registry.register("browser_extract_text",
@@ -732,7 +767,7 @@ public class BuiltinTools {
                         + "一次调用覆盖全部章节。代码块写成 Markdown 围栏，图片保存到"
                         + "同目录 images/。禁止 browser_evaluate 手动滚屏。",
                 BrowserExtractTextParams.class,
-                params -> {
+                params -> withBrowserSession(params.getSessionId(), session -> {
                     String path = params.getPath();
                     if (StringUtils.isBlank(path)) {
                         path = "_source.md";
@@ -742,7 +777,7 @@ public class BuiltinTools {
                     Path mdParent = mdFile.getParent();
                     Path imgDir = (mdParent == null ? mdFile : mdParent)
                             .resolve(EXTRACT_IMAGES_DIR);
-                    String text = browserService.extractArticleText(params.getSessionIdOrDefault(), imgDir);
+                    String text = browserService.extractArticleText(session, imgDir);
                     if (text.startsWith("抽取失败")) {
                         return text;
                     }
@@ -757,11 +792,19 @@ public class BuiltinTools {
                         writeFile("notes.md", chunk, false, true);
                     }
                     return written;
-                });
+                }));
 
         registry.register("browser_close", "关闭浏览器会话",
                 BrowserCloseParams.class,
-                params -> browserService.close(params.getSessionIdOrDefault()));
+                params -> withBrowserSession(params.getSessionId(), browserService::close));
+    }
+
+    private String withBrowserSession(String requestedSession, java.util.function.Function<String, String> operation) {
+        try {
+            return operation.apply(BrowserSessionIdentity.resolve(requestedSession));
+        } catch (SecurityException denied) {
+            return errorJson(ToolErrorCode.PERMISSION_DENIED, denied.getMessage());
+        }
     }
 
     // ==================== 云端图像生成（多后端自动降级） ====================

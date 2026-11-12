@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
+const { restoreWindowBounds, animateWindowBounds } = require('./src/window-bounds.cjs');
 
 /** 只弹出全息浮层或启动页预览，不拉后端、不占正式客户端的单实例锁。 */
 const holoPreview = process.argv.includes('--holo-preview');
@@ -68,12 +69,13 @@ function ensureDesktopJwtSecret() {
 function loadConfig() {
   try {
     if (fs.existsSync(configPath)) {
-      return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      const stored = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      if (stored && typeof stored === 'object' && !Array.isArray(stored)) return stored;
     }
   } catch (e) {}
   return {
     windowBounds: { width: 1200, height: 800 },
-    theme: 'dark'
+    theme: 'light'
   };
 }
 
@@ -535,15 +537,7 @@ function stageBounds() {
 
 function rememberLaunchBounds(saved) {
   const area = screen.getPrimaryDisplay().workArea;
-  const width = Math.max(800, Math.min(saved.width || 1200, area.width));
-  const height = Math.max(600, Math.min(saved.height || 800, area.height));
-  const x = Number.isFinite(saved.x)
-    ? saved.x
-    : Math.round(area.x + (area.width - width) / 2);
-  const y = Number.isFinite(saved.y)
-    ? saved.y
-    : Math.round(area.y + (area.height - height) / 2);
-  launchBounds = { x: x, y: y, width: width, height: height };
+  launchBounds = restoreWindowBounds(saved, area);
 }
 
 function waitForBootAnimation() {
@@ -553,32 +547,6 @@ function waitForBootAnimation() {
       clearTimeout(timer);
       resolve();
     });
-  });
-}
-
-function animateBounds(to, ms) {
-  const from = mainWindow.getBounds();
-  const start = Date.now();
-  return new Promise((resolve) => {
-    const timer = setInterval(() => {
-      if (!mainWindow || mainWindow.isDestroyed()) {
-        clearInterval(timer);
-        resolve();
-        return;
-      }
-      const t = Math.min(1, (Date.now() - start) / ms);
-      const e = 1 - Math.pow(1 - t, 3);
-      mainWindow.setBounds({
-        x: Math.round(from.x + (to.x - from.x) * e),
-        y: Math.round(from.y + (to.y - from.y) * e),
-        width: Math.round(from.width + (to.width - from.width) * e),
-        height: Math.round(from.height + (to.height - from.height) * e)
-      });
-      if (t >= 1) {
-        clearInterval(timer);
-        resolve();
-      }
-    }, 16);
   });
 }
 
@@ -626,8 +594,9 @@ async function openAppAfterAnimation() {
   }
   revealAppChrome();
   if (launchBounds) {
-    await animateBounds(launchBounds, BOOT_EXPAND_MS);
+    await animateWindowBounds(mainWindow, launchBounds, BOOT_EXPAND_MS);
   }
+  if (!mainWindow || mainWindow.isDestroyed()) return;
   bootPresenting = false;
   mainWindow.setMinimumSize(800, 600);
   mainWindow.setResizable(true);

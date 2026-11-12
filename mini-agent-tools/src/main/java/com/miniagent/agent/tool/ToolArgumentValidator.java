@@ -45,6 +45,13 @@ public final class ToolArgumentValidator {
             if (!matches(type, value)) {
                 return ValidationResult.failure("参数 " + entry.getKey() + " 类型错误，期望 " + type);
             }
+            if (value.isArray() && def.get("items") instanceof Map<?, ?> items) {
+                String itemType = Objects.toString(items.get("type"), "string");
+                for (JsonNode item : value) {
+                    if (item == null || item.isNull() || !matches(itemType, item))
+                        return ValidationResult.failure("参数 " + entry.getKey() + " 的数组元素类型错误，期望 " + itemType);
+                }
+            }
             if (def.get("enum") instanceof Collection<?> allowed
                     && allowed.stream().noneMatch(v -> Objects.equals(String.valueOf(v), value.asText()))) {
                 return ValidationResult.failure("参数 " + entry.getKey() + " 不在允许值中: " + allowed);

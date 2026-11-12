@@ -68,12 +68,18 @@ final class NodeOutputBinder {
             // final action. The evaluator must see the failure before world checks.
             return new Bound(tools, Map.of());
         }
+        DoneWhen dw = node.doneWhen() == null ? DoneWhen.note() : node.doneWhen();
+        if (dw.isJudge() || dw.isValidation()) {
+            // A verification spans observations and actions. The final receipt
+            // alone (often just todo.update or a reset click) loses that proof.
+            String history = verificationToolEvidence(messages);
+            if (StringUtils.isNotBlank(history)) tools = history;
+        }
         String evidence = firstNonBlank(todo, tools);
         Map<String, String> bindings = new LinkedHashMap<>();
         mergeJsonPorts(bindings, node, todo);
         mergeJsonPorts(bindings, node, tools);
         mergeFilePath(bindings, node);
-        DoneWhen dw = node.doneWhen() == null ? DoneWhen.note() : node.doneWhen();
         if (dw.isFile() && StringUtils.isBlank(evidence)
                 && StringUtils.isNotBlank(dw.path())) {
             evidence = dw.path();
@@ -90,6 +96,28 @@ final class NodeOutputBinder {
             evidence = firstBinding(bindings, node);
         }
         return new Bound(evidence, bindings);
+    }
+
+    private static String verificationToolEvidence(List<ChatMessage> messages) {
+        if (messages == null) return "";
+        var receipts = messages.stream().filter(ToolExecutionResultMessage.class::isInstance)
+                .map(ToolExecutionResultMessage.class::cast)
+                .filter(result -> !CapabilityRegistry.FALLBACK_TOOL.equals(result.toolName()))
+                .filter(result -> StringUtils.isNotBlank(usable(result.text())))
+                .toList();
+        if (receipts.isEmpty()) return "";
+        StringBuilder evidence = new StringBuilder("本节点工具执行记录（按时间顺序）：\n");
+        for (int i = 0; i < receipts.size(); i++) {
+            // Preserve the initial observation and the latest actions, keeping
+            // the complete evidence below the judge's 12,000 character limit.
+            if (i > 0 && i < receipts.size() - 7) continue;
+            var result = receipts.get(i);
+            String text = result.text();
+            if (text.length() > 1300) text = text.substring(0, 900) + "\n[本条中段已截断]\n"
+                    + text.substring(text.length() - 400);
+            evidence.append('\n').append('[').append(result.toolName()).append("]\n").append(text).append('\n');
+        }
+        return evidence.toString();
     }
 
     private static String usable(String s) {

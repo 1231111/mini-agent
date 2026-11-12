@@ -86,6 +86,7 @@ class PlanningLoopAnswerTest {
         TaskGraph graph = GoalCompiler.clarifyGraph();
         assertTrue(PlanningLoop.shouldRecompileClarify(goal, graph, "写一个 hello.txt"));
         assertFalse(PlanningLoop.shouldRecompileClarify(goal, graph, "继续"));
+        assertFalse(PlanningLoop.shouldRecompileClarify(goal, graph, "换个问题，为什么天空是蓝色？"));
         assertEquals("做点什么\n写一个 hello.txt",
                 PlanningLoop.mergeClarifyObjective("做点什么", "写一个 hello.txt"));
     }

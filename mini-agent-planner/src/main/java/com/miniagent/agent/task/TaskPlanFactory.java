@@ -9,8 +9,8 @@ import java.util.List;
  * 把用户消息变成 {@link TaskPlan}。
  *
  * <p>它只做两件事：去掉首尾空白、识别系统控制语。不做分类、不提取信号、
- * 不判断任务复杂度 —— 这些判断在 2026-10-22 随词表层一起删除。
- * 需要拆解时由模型在 {@code AgentLoop} 内自行决定。</p>
+ * 不判断任务复杂度。执行入口的语义路由器结合上下文决定是否使用 DAG，
+ * 不再通过任务关键词把用户请求硬编码到某条执行路径。</p>
  */
 @Component
 public class TaskPlanFactory {

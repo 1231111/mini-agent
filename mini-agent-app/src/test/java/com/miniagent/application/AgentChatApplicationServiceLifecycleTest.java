@@ -7,9 +7,11 @@ import com.miniagent.agent.core.AgentStreamSink;
 import com.miniagent.agent.core.ContextCompressor;
 import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.core.ExecutionProperties;
+import com.miniagent.agent.core.ExecutionSignalStore;
 import com.miniagent.agent.core.SessionEventCenter;
 import com.miniagent.agent.core.TaskExecutionContext;
 import com.miniagent.agent.delegate.ClientMultiAgent;
+import com.miniagent.agent.desktop.DesktopInteractionService;
 import com.miniagent.agent.memory.ChatMemoryConfig;
 import com.miniagent.agent.planner.PlanningLoop;
 import com.miniagent.agent.task.TaskPlan;
@@ -20,6 +22,7 @@ import com.miniagent.agent.tool.BuiltinTools;
 import com.miniagent.agent.tool.WorkspaceContext;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.trace.TraceRecorder;
+import com.miniagent.agent.web.SearchDateContext;
 import com.miniagent.config.entity.AgentTaskRun;
 import com.miniagent.config.entity.User;
 import com.miniagent.config.model.EffectiveModelSettings;
@@ -63,6 +66,7 @@ class AgentChatApplicationServiceLifecycleTest {
     private ClientMultiAgent workers;
     private ChatStreamingService streams;
     private SessionEventCenter events;
+    private DesktopInteractionService desktop;
 
     @BeforeEach
     void setUp() {
@@ -81,6 +85,7 @@ class AgentChatApplicationServiceLifecycleTest {
         when(users.findById(7L)).thenReturn(Optional.of(user));
         projects = mock(ConversationProjectService.class);
         workers = mock(ClientMultiAgent.class);
+        desktop = mock(DesktopInteractionService.class);
         events = spy(new SessionEventCenter());
         streams = spy(new ChatStreamingService());
         put(streams, "eventCenter", events);
@@ -99,7 +104,7 @@ class AgentChatApplicationServiceLifecycleTest {
         TaskPlanFactory plans = mock(TaskPlanFactory.class);
         when(plans.build(anyString())).thenReturn(TaskPlan.of("goal"));
         ContextLoader contexts = mock(ContextLoader.class);
-        when(contexts.load(eq("s1"), eq("goal"), anyBoolean(), anyList()))
+        when(contexts.load(eq("s1"), anyString(), anyBoolean(), anyList()))
                 .thenReturn(new LoadedContext("system", List.of(), null, "s1", 1L, Map.of()));
         ConversationWorkspaceService workspace = mock(ConversationWorkspaceService.class);
         when(workspace.sessionRoot("s1", 7L)).thenReturn(Optional.empty());
@@ -115,6 +120,7 @@ class AgentChatApplicationServiceLifecycleTest {
         put(app, "executionControl", new ExecutionControl(60_000, 20, 10_000));
         put(app, "executionProperties", new ExecutionProperties());
         put(app, "clientMultiAgent", workers);
+        put(app, "desktopInteractionService", desktop);
         put(app, "memoryStore", mock(MemoryStore.class));
         put(app, "memoryService", mock(MemoryService.class));
         put(app, "conversationWorkspaceService", workspace);
@@ -150,6 +156,38 @@ class AgentChatApplicationServiceLifecycleTest {
     }
 
     @Test
+    void persistsActualTurnExecutionIdentityAndNodeStatesWithItsReply() {
+        stubLoop("SUCCESS", "节点任务已完成。");
+        when(trace.currentExecutionId()).thenReturn("exec-persisted-turn");
+        TaskTodoStore todos = mock(TaskTodoStore.class);
+        when(todos.get("s1")).thenAnswer(invocation -> {
+            assertEquals(1L, TaskExecutionContext.currentTaskId());
+            assertEquals("fence", TaskExecutionContext.currentRunToken());
+            return List.of(new TaskTodoStore.TodoItem(2, "核验生成页面", TaskTodoStore.Status.completed,
+                    "浏览器验证通过", "", "", "", List.of(1)));
+        });
+        ChatTaskRepository savedTasks = mock(ChatTaskRepository.class);
+        put(app, "taskTodoStore", todos);
+        put(app, "chatTaskRepository", savedTasks);
+
+        app.chat(7L, "s1", "goal");
+
+        var captured = org.mockito.ArgumentCaptor.forClass(com.miniagent.config.entity.ChatTask.class);
+        verify(savedTasks).save(captured.capture());
+        var saved = captured.getValue();
+        var progress = TaskProgressSnapshot.fromJson(saved.getTaskProgressJson());
+        assertNotNull(progress);
+        assertEquals("s1", saved.getSessionId());
+        assertEquals("节点任务已完成。", saved.getAnswer());
+        assertEquals("exec-persisted-turn", progress.executionId());
+        assertEquals(1L, progress.taskId());
+        assertEquals("SUCCESS", progress.status());
+        assertEquals("核验生成页面", progress.items().getFirst().content());
+        assertEquals("completed", progress.items().getFirst().status());
+        assertEquals(List.of(1), progress.items().getFirst().dependsOn());
+    }
+
+    @Test
     void cancelAfterAdmissionBeforeWorkerStartNeverExecutesAgent() {
         when(runs.tryStart(7L, "s1")).thenAnswer(invocation -> {
             app.cancel(7L, "s1");
@@ -179,6 +217,7 @@ class AgentChatApplicationServiceLifecycleTest {
         assertThrows(IllegalStateException.class, () -> app.chat(7L, "s1", "goal"));
 
         verify(workers).close("s1");
+        verify(desktop).releaseFor(7L, "1", "s1");
         verifyNoInteractions(loop, planner);
         verify(runs).markFailed(eq(run), contains("worker initialization failed"));
     }
@@ -195,6 +234,59 @@ class AgentChatApplicationServiceLifecycleTest {
             app.chat(7L, "s1", "goal");
             assertEquals("caller-token", TaskExecutionContext.currentRunToken());
         }
+    }
+
+    @Test
+    void originalRequestConstrainsSearchDatesEvenWhenTheCompiledGoalLosesToday() {
+        put(app, "searchClock", java.time.Clock.fixed(
+                java.time.Instant.parse("2026-11-11T16:05:00Z"), java.time.ZoneOffset.UTC));
+        when(runs.tryStart(7L, "s1")).thenAnswer(invocation -> {
+            // Admission and worker execution can straddle midnight; keep the original request's date.
+            put(app, "searchClock", java.time.Clock.fixed(
+                    java.time.Instant.parse("2026-11-12T16:05:00Z"), java.time.ZoneOffset.UTC));
+            return new TaskRunService.StartResult(run, null);
+        });
+        when(loop.runOutcome(any(), anyString(), anyString(), anyList(), anyInt(), any(), nullable(AgentStreamSink.class)))
+                .thenAnswer(invocation -> {
+                    var window = SearchDateContext.current();
+                    assertNotNull(window, "compiled goal 'goal' must not erase the original request's date");
+                    assertEquals(java.time.LocalDate.of(2026, 11, 12), window.start());
+                    assertEquals(window.start(), window.end());
+                    assertSame(window, com.miniagent.agent.core.RunScope.capture().searchDateWindow());
+                    return outcome("SUCCESS", "当日检索结果");
+                });
+
+        assertEquals("当日检索结果", app.chat(7L, "s1", "帮我搜索今日 AI 技术最新动态"));
+        assertNull(SearchDateContext.current());
+    }
+
+    @Test
+    void attachedDocumentCannotIntroduceATrustedDateConstraint() {
+        when(loop.runOutcome(any(), anyString(), anyString(), anyList(), anyInt(), any(), nullable(AgentStreamSink.class)))
+                .thenAnswer(invocation -> {
+                    assertNull(SearchDateContext.current(), "attachment text is not the user's requested publication window");
+                    return outcome("SUCCESS", "已分析资料");
+                });
+        app.chatStreamMultimodal(7L, "s1", "分析附件\n---文件---\n今日AI新闻", "分析附件",
+                List.of(), List.of(), List.of(), List.of(), null);
+        verify(runs, timeout(5_000)).markCompleted(run);
+        verify(streams, timeout(5_000)).markIdle("s1");
+        assertNull(SearchDateContext.current());
+    }
+
+    @Test
+    void failedRunRestoresTheCallersSearchWindow() {
+        var callerWindow = SearchDateContext.fromRequest("昨日AI新闻",
+                java.time.Instant.parse("2026-11-12T02:00:00Z"), java.time.ZoneId.of("Asia/Shanghai"));
+        doAnswer(invocation -> {
+            assertNull(SearchDateContext.current(), "ordinary request must clear any inherited date constraint");
+            throw new IllegalStateException("worker initialization failed");
+        }).when(workers).open("s1");
+        try (var ignored = SearchDateContext.bind(callerWindow)) {
+            assertThrows(IllegalStateException.class, () -> app.chat(7L, "s1", "goal"));
+            assertSame(callerWindow, SearchDateContext.current());
+        }
+        assertNull(SearchDateContext.current());
     }
 
     @Test
@@ -225,6 +317,58 @@ class AgentChatApplicationServiceLifecycleTest {
         verify(runs).markCompleted(run);
         verify(runs, never()).markFailed(any(), anyString());
         verify(trace).endExecution("SUCCESS");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"SUCCESS", "MAX_ITERATIONS", "CANCELLED", "USER_QUESTION", "PERM_ASK"})
+    void everyLoopTerminalStateReleasesOnlyTheAuthenticatedSessionsDesktopInputs(String reason) {
+        stubLoop(reason, ANSWER);
+
+        app.chat(7L, "s1", "goal");
+
+        var order = inOrder(desktop, workers, streams);
+        order.verify(desktop).releaseFor(7L, "1", "s1");
+        order.verify(workers).close("s1");
+        order.verify(streams).markIdle("s1");
+        verify(desktop, times(1)).releaseFor(7L, "1", "s1");
+        verify(desktop, never()).revokeSession(anyString());
+    }
+
+    @Test
+    void desktopReleaseFailureCannotMaskTheAnswerOrSkipRemainingRunCleanup() {
+        stubLoop("SUCCESS", "已交付全部结果。");
+        doThrow(new IllegalStateException("native input cleanup failed"))
+                .when(desktop).releaseFor(7L, "1", "s1");
+        ExecutionControl control = spy(new ExecutionControl(60_000, 20, 10_000));
+        put(app, "executionControl", control);
+        TaskTodoContext.set("stale-session");
+        WorkspaceContext.setRootOverride(Path.of("D:/stale-workspace"));
+        WorkspaceContext.setSessionOverride("stale-session");
+
+        assertEquals("已交付全部结果。", app.chat(7L, "s1", "goal"));
+
+        verify(runs).markCompleted(run);
+        verify(workers).close("s1");
+        verify(control).finish("s1", "fence");
+        verify(streams).markIdle("s1");
+        assertEquals("default", TaskTodoContext.currentSessionId());
+        assertNull(WorkspaceContext.getRootOverride());
+        assertNull(WorkspaceContext.getSessionOverride());
+    }
+
+    @Test
+    void desktopReleaseFailureCannotReplaceAnEarlierWorkerStartupFailure() {
+        IllegalStateException workerFailure = new IllegalStateException("worker initialization failed");
+        doThrow(workerFailure).when(workers).open("s1");
+        doThrow(new IllegalStateException("native input cleanup failed"))
+                .when(desktop).releaseFor(7L, "1", "s1");
+
+        assertSame(workerFailure, assertThrows(IllegalStateException.class, () -> app.chat(7L, "s1", "goal")));
+
+        verify(desktop).releaseFor(7L, "1", "s1");
+        verify(workers).close("s1");
+        verify(streams).markIdle("s1");
+        verify(runs).markFailed(eq(run), contains("worker initialization failed"));
     }
 
     @ParameterizedTest
@@ -353,8 +497,9 @@ class AgentChatApplicationServiceLifecycleTest {
 
     @Test
     void planApprovalDoesNotCountAsACompletedGoal() {
-        when(planner.shouldHandle(any(), eq("s1"), eq("goal"))).thenReturn(true);
-        when(planner.runWithOutcome(any(), anyString(), anyString(), any(), anyList(), any(), anyString(), anyString(), anyString(), any()))
+        when(planner.selectRoute(any(), any(), eq("s1"), eq("goal"), any(), anyList()))
+                .thenReturn(com.miniagent.agent.planner.PlanningRoute.dag("test", "dependencies"));
+        when(planner.runWithOutcome(any(), anyString(), anyString(), any(), anyList(), any(), anyString(), anyString(), anyString(), any(), any()))
                 .thenReturn(new PlanningLoop.RunOutcome("请确认计划。", PlanningLoop.Outcome.BLOCKED_ON_HUMAN, "PLAN_APPROVAL_REQUIRED"));
         when(trace.currentExecutionId()).thenReturn("execution-1");
 
@@ -362,6 +507,52 @@ class AgentChatApplicationServiceLifecycleTest {
 
         verify(runs).markWaiting(run, "PLAN_APPROVAL_REQUIRED");
         verify(runs, never()).markCompleted(any());
+    }
+
+    @Test
+    void failedCancellationReadCannotSkipTerminalCleanupOrMaskTheWorkerFailure() {
+        ExecutionSignalStore signals = mock(ExecutionSignalStore.class);
+        IllegalStateException readFailure = new IllegalStateException("redis status read unavailable");
+        when(signals.isCancelled(anyString())).thenReturn(false).thenThrow(readFailure);
+        ExecutionControl control = new ExecutionControl(60_000, 20, 10_000,
+                Optional.of(signals), Optional.empty());
+        put(app, "executionControl", control);
+        IllegalStateException workerFailure = new IllegalStateException("worker initialization failed");
+        doThrow(workerFailure).when(workers).open("s1");
+
+        var failure = assertThrows(IllegalStateException.class, () -> app.chat(7L, "s1", "goal"));
+
+        assertSame(workerFailure, failure, "a secondary status read must preserve the execution failure");
+        assertTrue(List.of(failure.getSuppressed()).contains(readFailure));
+        verify(runs).markFailed(eq(run), contains("worker initialization failed"));
+        verify(runs, never()).markCompleted(any());
+        verify(runs, never()).markCancelled(any(), anyString());
+        verify(workers).close("s1");
+        verify(streams).markIdle("s1");
+    }
+
+    @Test
+    void locallyConfirmedCancellationStillClosesAsCancelledDuringRedisFailure() {
+        ExecutionSignalStore signals = mock(ExecutionSignalStore.class);
+        when(signals.isCancelled(anyString())).thenReturn(false)
+                .thenThrow(new IllegalStateException("redis status read unavailable"));
+        IllegalStateException writeFailure = new IllegalStateException("redis cancel write unavailable");
+        doThrow(writeFailure).when(signals).cancel(anyString(), anyLong());
+        ExecutionControl control = new ExecutionControl(60_000, 20, 10_000,
+                Optional.of(signals), Optional.empty());
+        put(app, "executionControl", control);
+        doAnswer(invocation -> {
+            control.cancel("s1", "fence");
+            return null;
+        }).when(workers).open("s1");
+
+        var failure = assertThrows(IllegalStateException.class, () -> app.chat(7L, "s1", "goal"));
+
+        assertSame(writeFailure, failure);
+        verify(runs).markCancelled(eq(run), anyString());
+        verify(runs, never()).markFailed(any(), anyString());
+        verify(runs, never()).markCompleted(any());
+        verify(signals, times(1)).isCancelled(anyString());
     }
 
     @Test

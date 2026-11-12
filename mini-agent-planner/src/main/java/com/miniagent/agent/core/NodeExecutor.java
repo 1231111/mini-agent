@@ -63,16 +63,27 @@ public class NodeExecutor {
     public String runDirect(ChatModel chat, String system, String user,
                             List<ChatMessage> history, int maxIterations,
                             TaskPlan plan, AgentStreamSink sink) {
-        return agentLoop.run(
-                chat, system, user, history, maxIterations, plan, sink);
+        return runDirectOutcome(chat, system, user, history, maxIterations, plan, sink).text();
+    }
+
+    public AgentLoop.LoopOutcome runDirectOutcome(ChatModel chat, String system, String user,
+                                                 List<ChatMessage> history, int maxIterations,
+                                                 TaskPlan plan, AgentStreamSink sink) {
+        return agentLoop.runOutcome(chat, system, user, history, maxIterations, plan, sink);
     }
 
     public String runDirectMultimodal(
             ChatModel chat, String system, UserMessage user,
             List<ChatMessage> history, int maxIterations,
             TaskPlan plan, AgentStreamSink sink) {
-        return agentLoop.runWithMultimodal(
-                chat, system, user, history, maxIterations, plan, sink);
+        return runDirectMultimodalOutcome(chat, system, user, history, maxIterations, plan, sink).text();
+    }
+
+    public AgentLoop.LoopOutcome runDirectMultimodalOutcome(
+            ChatModel chat, String system, UserMessage user,
+            List<ChatMessage> history, int maxIterations,
+            TaskPlan plan, AgentStreamSink sink) {
+        return agentLoop.runWithMultimodalOutcome(chat, system, user, history, maxIterations, plan, sink);
     }
 
     private static void requireFence() {

@@ -61,6 +61,10 @@ public class PlanValidator {
         return validate(g, plan, goal).valid();
     }
 
+    public boolean accept(TaskGraph g, TaskPlan plan, Goal goal, TaskIntent intent) {
+        return validate(g, plan, goal, intent).valid();
+    }
+
     public PlanValidationReport validate(TaskGraph g, TaskPlan plan) {
         return validate(g, plan, null);
     }
@@ -69,6 +73,11 @@ public class PlanValidator {
      * 结构化验证。goal 非空时核对 successCriteria 里的文件是否在图上。
      */
     public PlanValidationReport validate(TaskGraph g, TaskPlan plan, Goal goal) {
+        return validate(g, plan, goal, null);
+    }
+
+    /** Intent inputs come from outside the graph; node outputs must still have an ancestor producer. */
+    public PlanValidationReport validate(TaskGraph g, TaskPlan plan, Goal goal, TaskIntent intent) {
         List<PlanValidationReport.ValidationError> errors = new ArrayList<>();
         List<PlanValidationReport.ValidationWarning> warnings = new ArrayList<>();
 
@@ -200,12 +209,12 @@ public class PlanValidator {
             }
 
             // 检查输入产出
-            if (!inputsProducedByDeps(g, n)) {
+            if (!inputsProducedByDeps(g, n, externalInputs(intent, g))) {
                 errors.add(new PlanValidationReport.ValidationError(
                     PlanValidationReport.ValidationError.Type.UNPRODUCED_INPUTS,
                     n.id(),
                     "节点输入未被前置节点产出: " + n.id(),
-                    "确保依赖节点的outputs包含当前节点的inputs"
+                    "确保输入由依赖链上的前序节点产出；用户消息/附件须在 intent.inputs 声明为外部输入"
                 ));
             }
         }
@@ -264,6 +273,7 @@ public class PlanValidator {
         if (plan == null) {
             return true;
         }
+        if (plan.artifactDeliveryRequested() != null) return plan.artifactDeliveryRequested();
         return claimsFileDelivery(plan.taskGoal());
     }
 
@@ -291,8 +301,7 @@ public class PlanValidator {
     }
 
     /**
-     * ponytail: 图里同时有获取和落盘时，至少一条获取→落盘边。
-     * 要求每个落盘都挂获取会误伤「并行写本地文件」。
+     * 获取与落盘须有执行依赖。既允许获取→写入，也允许生成页面→浏览器验收。
      */
     static void addAcquirePersistEdgeError(
             TaskGraph g, List<PlanValidationReport.ValidationError> errors) {
@@ -316,7 +325,8 @@ public class PlanValidator {
             return;
         }
         for (TaskNode n : g.nodes()) {
-            if (persistRole(n) && hasAcquireAncestor(g, n)) {
+            if ((persistRole(n) && hasAcquireAncestor(g, n))
+                    || (CapabilityRegistry.acquires(n.capability()) && hasAncestor(g, n, PlanValidator::persistRole))) {
                 return;
             }
         }
@@ -324,8 +334,8 @@ public class PlanValidator {
         errors.add(new PlanValidationReport.ValidationError(
                 PlanValidationReport.ValidationError.Type.UNDER_DECOMPOSED,
                 id,
-                "图中同时有获取和落盘，但没有 dependsOn 边",
-                "落盘节点必须依赖获取节点，例如 web → file_write"
+                "图中获取与落盘节点之间缺少执行依赖",
+                "按实际数据流连接依赖，例如 web → file_write，或 code → browser 验收"
         ));
     }
 
@@ -387,6 +397,10 @@ public class PlanValidator {
     }
 
     static boolean hasAcquireAncestor(TaskGraph g, TaskNode node) {
+        return hasAncestor(g, node, n -> CapabilityRegistry.acquires(n.capability()));
+    }
+
+    private static boolean hasAncestor(TaskGraph g, TaskNode node, java.util.function.Predicate<TaskNode> predicate) {
         if (g == null || node == null) {
             return false;
         }
@@ -402,7 +416,7 @@ public class PlanValidator {
             if (dep == null) {
                 continue;
             }
-            if (CapabilityRegistry.acquires(dep.capability())) {
+            if (predicate.test(dep)) {
                 return true;
             }
             queue.addAll(dep.dependsOn());
@@ -422,18 +436,35 @@ public class PlanValidator {
     }
 
     static boolean inputsProducedByDeps(TaskGraph g, TaskNode n) {
+        return inputsProducedByDeps(g, n, Set.of());
+    }
+
+    private static Set<String> externalInputs(TaskIntent intent, TaskGraph graph) {
+        if (intent == null) return Set.of();
+        Set<String> external = new HashSet<>();
+        for (TaskIntent.Input input : intent.inputs()) {
+            if (StringUtils.isNotBlank(input.name()) && StringUtils.isNotBlank(input.source()))
+                external.add(input.name());
+        }
+        // A graph output cannot be relabelled as an external input to bypass its dependency edge.
+        for (TaskNode node : graph.nodes()) external.removeAll(node.outputs());
+        return external;
+    }
+
+    private static boolean inputsProducedByDeps(TaskGraph g, TaskNode n, Set<String> external) {
+        Set<String> available = new HashSet<>(external);
+        Set<String> visited = new HashSet<>();
+        java.util.ArrayDeque<String> pending = new java.util.ArrayDeque<>(n.dependsOn());
+        while (!pending.isEmpty()) {
+            String id = pending.removeFirst();
+            if (!visited.add(id) || id.equals(n.id())) continue;
+            TaskNode ancestor = g.byId(id);
+            if (ancestor == null) continue;
+            available.addAll(ancestor.outputs());
+            pending.addAll(ancestor.dependsOn());
+        }
         for (String in : n.inputs()) {
-            boolean found = false;
-            for (String d : n.dependsOn()) {
-                TaskNode dep = g.byId(d);
-                if (dep != null && dep.outputs().contains(in)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                return false;
-            }
+            if (!available.contains(in)) return false;
         }
         return true;
     }

@@ -1,0 +1,65 @@
+/* File references stay within prose; dedicated deliveries use a compact attachment grid. */
+.bot-body a.workspace-download-link.workspace-file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    max-width: min(100%, 260px);
+    margin: 0 2px;
+    padding: 2px 7px 2px 5px;
+    border: 1px solid var(--card-border, #dce4f2);
+    border-radius: 6px;
+    background: var(--accent-soft, #f5f8fd);
+    color: var(--accent, #3f6095);
+    font-size: .9em;
+    line-height: 1.45;
+    vertical-align: -5px;
+    text-decoration: none;
+}
+.bot-body .workspace-file-chip .workspace-file-ext {
+    flex: 0 0 17px;
+    width: 17px;
+    height: 19px;
+    border-radius: 3px;
+    background: transparent;
+}
+.bot-body .workspace-file-chip .workspace-file-ext svg { width: 15px; height: 17px; }
+.bot-body .workspace-file-chip .workspace-file-ext b,
+.bot-body .workspace-file-chip .workspace-file-label small { display: none; }
+.bot-body .workspace-file-chip .workspace-file-label { display: block; min-width: 0; }
+.bot-body .workspace-file-name { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.bot-body .workspace-attachment-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(225px, 100%), 1fr));
+    gap: 10px;
+    width: 100%;
+    max-width: 720px;
+    margin: 12px 0;
+}
+.bot-body a.workspace-download-link.workspace-attachment-card {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    margin: 0;
+    padding: 12px;
+    border: 1px solid var(--card-border, #e1e7f0);
+    border-radius: 10px;
+    background: var(--surface, #fbfcff);
+    color: var(--text, #2b3547);
+    text-decoration: none;
+}
+.bot-body .workspace-attachment-card .workspace-file-ext { flex: 0 0 34px; width: 34px; height: 38px; }
+.bot-body .workspace-attachment-card .workspace-file-label { gap: 4px; }
+.bot-body .workspace-attachment-card .workspace-file-name { font-size: 12px; font-weight: 600; }
+.bot-body .workspace-attachment-card .workspace-file-label small { font-size: 10px; color: var(--text3, #8290a4); }
+.bot-body a.workspace-file-chip:hover,
+.bot-body a.workspace-attachment-card:hover { border-color: var(--accent, #a8bfdf); background: var(--accent-soft, #f1f6fe); }
+.bot-body a.workspace-download-link:focus-visible { outline: 2px solid #759bce; outline-offset: 2px; }
+@media (max-width: 620px) {
+    .bot-body .workspace-attachment-grid { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+    .bot-body a.workspace-download-link.workspace-file-chip { max-width: min(100%, 220px); }
+}

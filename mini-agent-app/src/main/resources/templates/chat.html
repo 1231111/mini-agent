@@ -9,7 +9,7 @@
         (function () {
             try {
                 var t = localStorage.getItem('mini_agent_theme');
-                if (!t) t = 'light';
+                if (t !== 'dark' && t !== 'light') t = 'light';
                 document.documentElement.setAttribute('data-theme', t);
             } catch (e) {
                 document.documentElement.setAttribute('data-theme', 'light');
@@ -38,8 +38,27 @@
     </script>
     <link rel="stylesheet" href="/css/chat.css">
     <link rel="stylesheet" href="/css/shell.css">
+    <link rel="stylesheet" href="/css/ai-workspace.css">
+    <link rel="stylesheet" href="/css/chat-artifacts.css">
 </head>
 <body>
+
+<!-- Shared vector identity: a layered AI core, drawn locally without external assets. -->
+<svg class="ai-symbols" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="ma-core-face" x1="8" y1="5" x2="38" y2="43" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#a5f3fc"/><stop offset=".5" stop-color="#5ca9ff"/><stop offset="1" stop-color="#8971ff"/>
+        </linearGradient>
+        <radialGradient id="ma-core-glow"><stop stop-color="#fff"/><stop offset="1" stop-color="#67e8f9"/></radialGradient>
+    </defs>
+    <symbol id="ma-ai-core" viewBox="0 0 48 48">
+        <path d="m24 3 18 10.5v21L24 45 6 34.5v-21Z" fill="url(#ma-core-face)" fill-opacity=".12" stroke="url(#ma-core-face)" stroke-width="1.4"/>
+        <path d="m6 13.5 18 11 18-11M24 24.5V45M15 8.3l18 10.5v10.4l-9 5.3-9-5.3V18.8l9-5.3" fill="none" stroke="url(#ma-core-face)" stroke-width="1.2"/>
+        <path d="m24 16 7 4v8l-7 4-7-4v-8Z" fill="url(#ma-core-face)"/>
+        <circle cx="24" cy="24" r="3.2" fill="url(#ma-core-glow)"/>
+        <g fill="#b4f2ff"><circle cx="6" cy="13.5" r="1.8"/><circle cx="42" cy="13.5" r="1.8"/><circle cx="24" cy="45" r="1.8"/></g>
+    </symbol>
+</svg>
 
 <!-- ===================== RAIL — 主导航 =====================
      只放真实存在的入口：对话助手（/）、任务中心（/trace）、记忆管理（/memory）、
@@ -128,12 +147,9 @@
 <div class="sidebar" id="sidebar">
     <div class="sb-brand">
         <div class="sb-brand-mark" aria-hidden="true">
-            <svg viewBox="0 0 32 32" fill="none">
-                <path d="M6 21.5 11.2 10l5 12 4.3-9.4 5.5 8.9" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-                <circle cx="25.5" cy="9" r="2" fill="currentColor"/>
-            </svg>
+            <svg viewBox="0 0 48 48" fill="none"><use href="#ma-ai-core"/></svg>
         </div>
-        <div class="sb-brand-copy"><strong>MiniAgent</strong><span>智能体工作台</span></div>
+        <div class="sb-brand-copy"><strong>MiniAgent<span class="sb-ai-badge">AI</span></strong><span>智能体工作台</span></div>
     </div>
 
     <button type="button" class="sb-new" onclick="startNewChat()" title="新建任务">
@@ -259,7 +275,7 @@
             <button type="button" class="conversation-menu" onclick="toggleSidebar()" title="打开导航" aria-label="打开导航">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
             </button>
-            <span class="conversation-eyebrow">当前会话</span>
+            <span class="conversation-eyebrow" aria-label="AI 工作台"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9Z" stroke="currentColor" stroke-width="1.5"/><path d="m4 7.5 8 5 8-5M12 12.5V21" stroke="currentColor" stroke-width="1.5"/></svg></span>
             <h1 class="conversation-title" id="conversationTitle">新对话</h1>
             <span class="conversation-status" id="conversationStatus"><i></i><span>准备就绪</span></span>
         </div>
@@ -512,8 +528,9 @@
        · 系统状态      /api/shell/status
      时间戳只在轨迹有真实记录时显示；拿不到数据就显示明确的空状态。 -->
 <aside class="inspector" id="inspector">
+    <div class="insp-section insp-section--timeline" aria-label="任务执行状态">
     <div class="inspector-head">
-        <span class="inspector-title">任务执行详情</span>
+        <span class="inspector-title">任务执行状态</span>
         <span class="inspector-state">
             <span class="inspector-dot" id="inspStateDot"></span>
             <span id="inspStateText">空闲</span>
@@ -522,21 +539,21 @@
                 aria-label="收起执行详情" onclick="toggleInspector(false)">×</button>
     </div>
 
-    <div class="insp-section insp-section--timeline">
-        <div class="insp-head"><span class="insp-head-icon icon-timeline" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="12" r="2"/><circle cx="6" cy="19" r="2"/><path d="M11 5h9M11 12h9M11 19h9"/></svg></span>任务执行状态<a href="/trace" target="_self">查看全部 <span aria-hidden="true">›</span></a></div>
         <div class="insp-steps" id="inspSteps">
             <div class="insp-empty">当前会话还没有执行记录。发一条消息后这里会实时显示每一步。</div>
         </div>
         <div class="insp-progress" id="inspProgress" hidden>
             <div class="insp-progress-fill" id="inspProgressFill"></div>
         </div>
+        <a class="insp-timeline-link" href="/trace">查看全部步骤 <span aria-hidden="true">›</span></a>
     </div>
 
     <div class="insp-section insp-section--details">
-        <div class="insp-head"><span class="insp-head-icon icon-details" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3h8l5 5v13H7a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3z"/><path d="M14 3v6h6M9 13h7M9 17h7"/></svg></span>任务详情<a href="/trace" target="_self">查看执行过程 <span aria-hidden="true">›</span></a></div>
+        <div class="insp-head"><span class="insp-head-icon icon-details" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3h8l5 5v13H7a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3z"/><path d="M14 3v6h6M9 13h7M9 17h7"/></svg></span>任务详情</div>
         <div class="insp-task-details" id="inspTaskDetails">
             <div class="insp-empty">发起任务后显示实际执行信息。</div>
         </div>
+        <a class="insp-detail-link" href="/trace">查看执行过程 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M14 3h7v7M21 3l-11 11M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5"/></svg></a>
     </div>
 
     <div class="insp-section insp-section--memory">
@@ -666,7 +683,7 @@
             <div class="settings-row">
                 <div>
                     <div class="settings-row-label">背景主题</div>
-                    <div class="settings-row-meta" id="themeLabel">深色</div>
+                    <div class="settings-row-meta" id="themeLabel">浅色</div>
                 </div>
                 <button type="button" class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="切换主题">
                     <svg class="icon-sun" fill="none" stroke="currentColor" stroke-width="2"

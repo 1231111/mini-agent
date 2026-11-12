@@ -10,6 +10,7 @@ import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.todo.TaskTodoContext;
 import com.miniagent.agent.tool.BuiltinTools;
 import com.miniagent.agent.tool.WorkspaceContext;
+import com.miniagent.agent.web.SearchDateContext;
 import com.miniagent.common.model.EffectiveModelContext;
 import com.miniagent.memory.MemoryStore;
 import dev.langchain4j.model.chat.ChatModel;
@@ -20,7 +21,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 一次运行的身份快照。并行工具 / 子代理拷贝这一份，再 {@link #bind()} 到工作线程。
- * 工具内部仍可读 ThreadLocal；新增身份字段加在这里，禁止再开 ThreadLocal。
+ * 工具内部仍可读 ThreadLocal；新增运行上下文必须在这里捕获、传播与恢复。
  */
 public record RunScope(
         String sessionId,
@@ -42,7 +43,8 @@ public record RunScope(
         StreamingChatModel streamingModel,
         int contextWindowTokens,
         String projectId,
-        String executionRunToken
+        String executionRunToken,
+        SearchDateContext.Window searchDateWindow
 ) {
     @FunctionalInterface
     public interface Binding extends AutoCloseable {
@@ -80,14 +82,14 @@ public record RunScope(
                 AgentLoop.getCurrentChatModel(),
                 AgentLoop.getCurrentStreamingModel(),
                 EffectiveModelContext.currentContextWindow(),
-                OwnerContext.currentProjectId(), TaskExecutionContext.currentRunToken());
+                OwnerContext.currentProjectId(), TaskExecutionContext.currentRunToken(), SearchDateContext.current());
     }
 
     public RunScope withSession(String sid) {
         return new RunScope(
                 sid, owner, turnPolicy, permissionMode, confirmPolicy, planApproved, permissionForced,
                 subagent, parentSessionId, role, taskName, writeTask, workspaceRoot,
-                execution, taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken);
+                execution, taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken, searchDateWindow);
     }
 
     /**
@@ -110,7 +112,7 @@ public record RunScope(
                 mode, confirmPolicy,
                 planApproved, true, true, parent,
                 roleId == null ? "" : roleId, taskName, "out", subWorkspace,
-                null, taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken);
+                null, taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken, searchDateWindow);
     }
 
     /**
@@ -171,6 +173,7 @@ public record RunScope(
         WorkspaceContext.setSessionOverride(sessionId);
         ExecutionTurnContext.set(execution);
         TaskExecutionContext.set(taskId, executionRunToken);
+        SearchDateContext.set(searchDateWindow);
         if (chatModel != null || streamingModel != null) {
             // 窗口一并恢复：并行工具/子代理线程上的辅助 LLM 调用与压缩阈值都要用它，
             // 只恢复模型会让"该不该压缩"在这条路径上退回全局常量。

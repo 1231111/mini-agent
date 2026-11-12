@@ -7,8 +7,11 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.LocalDateTime;
+import java.util.List;
 
 public interface AgentSessionPlannerRepository extends JpaRepository<AgentSessionPlanner, String> {
+
+    List<AgentSessionPlanner> findBySessionIdOrSessionIdStartingWith(String sessionId, String scopePrefix);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""

@@ -8,9 +8,14 @@ import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.time.Duration;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -188,17 +193,23 @@ class TaskRunServiceTest {
         TaskRunService service = service(repository, concurrency);
         AgentTaskRun live = run("live");
         AgentTaskRun orphan = run("orphan");
+        live.setId(11L);
+        orphan.setId(12L);
         when(repository.findByStatus(AgentTaskRun.Status.RUNNING))
                 .thenReturn(List.of(live, orphan));
         when(concurrency.isSessionLocked("live")).thenReturn(true);
         when(concurrency.isSessionLocked("orphan")).thenReturn(false);
+        when(repository.finishIfRunning(eq(12L), eq(AgentTaskRun.Status.RUNNING),
+                eq(AgentTaskRun.Status.INTERRUPTED), any(), any())).thenReturn(1);
 
         service.recoverOrphanedRuns();
 
         assertEquals(AgentTaskRun.Status.RUNNING, live.getStatus());
-        assertEquals(AgentTaskRun.Status.INTERRUPTED, orphan.getStatus());
+        verify(repository, never()).finishIfRunning(eq(11L), any(), any(), any(), any());
+        verify(repository).finishIfRunning(eq(12L), eq(AgentTaskRun.Status.RUNNING),
+                eq(AgentTaskRun.Status.INTERRUPTED), any(), eq("Process restarted; previous run interrupted"));
         verify(repository, never()).save(live);
-        verify(repository).save(orphan);
+        verify(repository, never()).save(orphan);
     }
 
     @Test
@@ -211,6 +222,174 @@ class TaskRunServiceTest {
         assertFalse(service.isRunning("stale"));
         verify(repository, never())
                 .existsBySessionIdAndStatus("stale", AgentTaskRun.Status.RUNNING);
+    }
+
+    @Test
+    void localOrphanRecoveryCannotOverwriteAConcurrentlyCompletedRun() {
+        assertOrphanRecoveryPreservesConcurrentCompletion(false);
+    }
+
+    @Test
+    void redisOrphanRecoveryCannotOverwriteAConcurrentlyCompletedRun() {
+        assertOrphanRecoveryPreservesConcurrentCompletion(true);
+    }
+
+    private void assertOrphanRecoveryPreservesConcurrentCompletion(boolean redisMode) {
+        AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
+        RedisTaskConcurrency concurrency = redisMode ? mock(RedisTaskConcurrency.class) : null;
+        TaskRunService service = service(repository, concurrency);
+        if (concurrency != null) {
+            when(concurrency.tryLockSession(eq("s1"), any())).thenReturn(true);
+            when(concurrency.tryOccupyUserQuota(eq(7L), eq("s1"), any(), eq(2))).thenReturn(true);
+        }
+        AgentTaskRun snapshot = run("s1");
+        snapshot.setId(11L);
+        AtomicReference<AgentTaskRun.Status> durableStatus = new AtomicReference<>(AgentTaskRun.Status.RUNNING);
+        when(repository.findFirstBySessionIdAndStatusOrderByStartedAtDesc("s1", AgentTaskRun.Status.RUNNING))
+                .thenAnswer(ignored -> {
+                    // The old owner's terminal transaction commits after the
+                    // new admission queried its previous RUNNING snapshot.
+                    durableStatus.set(AgentTaskRun.Status.COMPLETED);
+                    return Optional.of(snapshot);
+                });
+        when(repository.save(any(AgentTaskRun.class))).thenAnswer(invocation -> {
+            AgentTaskRun entity = invocation.getArgument(0);
+            if (Long.valueOf(11L).equals(entity.getId())) durableStatus.set(entity.getStatus());
+            else entity.setId(12L);
+            return entity;
+        });
+        when(repository.finishIfRunning(any(), any(), any(), any(), any())).thenAnswer(invocation -> {
+            if (!Long.valueOf(11L).equals(invocation.getArgument(0, Long.class))) return 1;
+            return durableStatus.compareAndSet(invocation.getArgument(1), invocation.getArgument(2)) ? 1 : 0;
+        });
+
+        TaskRunService.StartResult started = service.tryStart(7L, "s1");
+
+        assertTrue(started.accepted());
+        assertEquals(AgentTaskRun.Status.COMPLETED, durableStatus.get(),
+                "orphan recovery must not overwrite the previous owner's committed completion");
+        verify(repository, never()).save(snapshot);
+        service.markCancelled(started.handle(), "test cleanup");
+    }
+
+    @Test
+    void startupOrphanRecoveryCannotOverwriteAConcurrentlyCompletedRun() {
+        AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
+        RedisTaskConcurrency concurrency = mock(RedisTaskConcurrency.class);
+        TaskRunService service = service(repository, concurrency);
+        AgentTaskRun snapshot = run("s1");
+        snapshot.setId(11L);
+        AtomicReference<AgentTaskRun.Status> durableStatus = new AtomicReference<>(AgentTaskRun.Status.COMPLETED);
+        when(repository.findByStatus(AgentTaskRun.Status.RUNNING)).thenReturn(List.of(snapshot));
+        when(repository.save(snapshot)).thenAnswer(invocation -> {
+            durableStatus.set(snapshot.getStatus());
+            return snapshot;
+        });
+        when(repository.finishIfRunning(any(), any(), any(), any(), any())).thenAnswer(invocation ->
+                durableStatus.compareAndSet(invocation.getArgument(1), invocation.getArgument(2)) ? 1 : 0);
+
+        service.recoverOrphanedRuns();
+
+        assertEquals(AgentTaskRun.Status.COMPLETED, durableStatus.get());
+        verify(repository, never()).save(snapshot);
+    }
+
+    @Test
+    void localRunCanRecoverAfterATerminalDatabaseFailureWithoutReleasingItsReplacement() {
+        AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
+        Map<Long, AgentTaskRun> persisted = new LinkedHashMap<>();
+        AtomicLong ids = new AtomicLong();
+        when(repository.save(any(AgentTaskRun.class))).thenAnswer(invocation -> {
+            AgentTaskRun entity = invocation.getArgument(0);
+            if (entity.getId() == null) entity.setId(ids.incrementAndGet());
+            persisted.put(entity.getId(), entity);
+            return entity;
+        });
+        when(repository.existsBySessionIdAndStatus(eq("s1"), eq(AgentTaskRun.Status.RUNNING)))
+                .thenAnswer(ignored -> persisted.values().stream().anyMatch(entity ->
+                        "s1".equals(entity.getSessionId()) && entity.getStatus() == AgentTaskRun.Status.RUNNING));
+        when(repository.findFirstBySessionIdAndStatusOrderByStartedAtDesc(
+                eq("s1"), eq(AgentTaskRun.Status.RUNNING))).thenAnswer(ignored ->
+                persisted.values().stream().filter(entity -> entity.getStatus() == AgentTaskRun.Status.RUNNING)
+                        .reduce((earlier, later) -> later));
+        AtomicBoolean firstTerminalWrite = new AtomicBoolean(true);
+        when(repository.finishIfRunning(any(), any(), any(), any(), any())).thenAnswer(invocation -> {
+            if (firstTerminalWrite.getAndSet(false)) throw new IllegalStateException("temporary database outage");
+            AgentTaskRun entity = persisted.get(invocation.getArgument(0, Long.class));
+            if (entity.getStatus() != AgentTaskRun.Status.RUNNING) return 0;
+            entity.setStatus(invocation.getArgument(2));
+            entity.setFinishedAt(invocation.getArgument(3));
+            entity.setErrorMessage(invocation.getArgument(4));
+            return 1;
+        });
+        TaskRunService service = service(repository, null);
+        ReflectionTestUtils.setField(service, "maxPerUser", 1);
+        TaskRunService.StartResult first = service.tryStart(7L, "s1");
+        assertTrue(first.accepted());
+
+        assertThrows(IllegalStateException.class, () -> service.markCompleted(first.handle()));
+
+        assertEquals(Optional.empty(), service.activeRunToken("s1"));
+        assertFalse(service.isRunning("s1"), "a stale database row has no live local worker");
+        TaskRunService.StartResult next = service.tryStart(7L, "s1");
+        assertTrue(next.accepted(), "a recovered database must allow the session to start again");
+        assertEquals(AgentTaskRun.Status.INTERRUPTED, persisted.get(first.handle().runId()).getStatus());
+        assertTrue(persisted.get(first.handle().runId()).getErrorMessage().contains("Local run ownership lost"));
+        service.markCompleted(first.handle());
+        assertEquals(AgentTaskRun.Status.RUNNING, persisted.get(next.handle().runId()).getStatus());
+        assertEquals(Optional.of(next.handle().fencingToken()), service.activeRunToken("s1"));
+        assertFalse(service.tryStart(7L, "s2").accepted(), "an old finish cannot release the replacement's quota");
+        service.markCompleted(next.handle());
+    }
+
+    @Test
+    void localOwnerBlocksAdmissionEvenWhenTheDatabaseHasNoRunningRow() {
+        AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
+        TaskRunService service = service(repository, null);
+        @SuppressWarnings("unchecked")
+        ConcurrentHashMap<String, String> locks =
+                (ConcurrentHashMap<String, String>) ReflectionTestUtils.getField(service, "localSessionLocks");
+        locks.put("s1", "live-owner");
+
+        assertTrue(service.isRunning("s1"));
+        assertFalse(service.tryStart(7L, "s1").accepted());
+
+        assertEquals(Optional.of("live-owner"), service.activeRunToken("s1"));
+        verifyNoInteractions(repository);
+    }
+
+    @Test
+    void failedLocalOrphanRecoveryRollsBackAdmissionBeforeAnyNewRunIsCreated() {
+        AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
+        TaskRunService service = service(repository, null);
+        ReflectionTestUtils.setField(service, "maxPerUser", 1);
+        AgentTaskRun orphan = run("s1");
+        orphan.setId(11L);
+        when(repository.existsBySessionIdAndStatus("s1", AgentTaskRun.Status.RUNNING)).thenReturn(true);
+        when(repository.findFirstBySessionIdAndStatusOrderByStartedAtDesc("s1", AgentTaskRun.Status.RUNNING))
+                .thenReturn(Optional.of(orphan));
+        when(repository.finishIfRunning(eq(11L), eq(AgentTaskRun.Status.RUNNING),
+                eq(AgentTaskRun.Status.INTERRUPTED), any(), any()))
+                .thenThrow(new IllegalStateException("database still unavailable")).thenReturn(1);
+
+        TaskRunService.StartResult rejected = service.tryStart(7L, "s1");
+
+        assertFalse(rejected.accepted());
+        assertTrue(rejected.error().contains("database still unavailable"));
+        assertEquals(Optional.empty(), service.activeRunToken("s1"));
+        @SuppressWarnings("unchecked")
+        ConcurrentHashMap<Long, AtomicInteger> counts =
+                (ConcurrentHashMap<Long, AtomicInteger>) ReflectionTestUtils.getField(service, "localRunningCount");
+        assertEquals(0, counts.get(7L).get());
+        verify(repository, never()).save(any(AgentTaskRun.class));
+        when(repository.save(any(AgentTaskRun.class))).thenAnswer(invocation -> {
+            AgentTaskRun entity = invocation.getArgument(0);
+            if (entity.getId() == null) entity.setId(12L);
+            return entity;
+        });
+        TaskRunService.StartResult recovered = service.tryStart(7L, "s1");
+        assertTrue(recovered.accepted());
+        service.markCancelled(recovered.handle(), "test cleanup");
     }
 
     @Test

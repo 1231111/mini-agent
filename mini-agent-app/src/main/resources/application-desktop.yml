@@ -162,6 +162,8 @@ logging:
     name: ${MINI_AGENT_HOME:${user.home}/.miniagent}/logs/miniagent.log
 
 agent:
+  desktop:
+    enabled: true
   auth:
     # 不提供仓库默认值。Electron 壳会在每次安装首次启动时生成并持久化
     # 一把独立的 JWT_SECRET；直接运行 jar 时若没有显式环境变量则拒绝启动。
@@ -226,6 +228,7 @@ agent:
 
   planner:
     enabled: true
+    auto-planning: true
     storage: db
 
   # 防止出厂包里的 base-url 被改到任意地址，把 API key 送到非预期端点。

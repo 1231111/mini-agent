@@ -155,9 +155,7 @@ class PlanValidatorTest {
     /**
      * 非诊断目标不套诊断语义：不因为「没有诊断节点」被拒。
      *
-     * <p>节点用 `research` 而不是 `deliver`：`deliver` 属于 {@code persistsArtifacts} 能力包，
-     * 挂 {@code note_required} 会被 4.2 的落盘验收规则判为 INVALID_DONE_WHEN，
-     * 那样这条用例就测不到自己声明的东西了。</p>
+     * <p>信息摘要可在对话中交付，不需要附加文件验收。</p>
      */
     @Test
     void nonDiagnosticGoalIsNotSubjectToDiagnosticSemantics() {

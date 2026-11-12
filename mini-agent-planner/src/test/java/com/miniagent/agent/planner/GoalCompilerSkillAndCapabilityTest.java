@@ -81,7 +81,13 @@ class GoalCompilerSkillAndCapabilityTest {
     @Test
     void 空技能目录返回空摘要(@TempDir Path dir) {
         GoalCompiler c = compiler();
-        c.attachSkillStore(new SkillStore(dir));
+        SkillStore store = new SkillStore(dir);
+        // Fresh stores install starter skills; remove them through the public API to test an empty store.
+        for (var skill : java.util.List.copyOf(store.listSkills())) {
+            assertEquals(Boolean.TRUE, store.deleteSkill(skill.get("name")).get("success"));
+        }
+        assertTrue(store.listSkills().isEmpty());
+        c.attachSkillStore(store);
         assertEquals("", c.skillDigest(), "没有 skill 时不应注入空壳段落");
     }
 }

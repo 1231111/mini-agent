@@ -90,6 +90,42 @@ class IntentGraphValidatorTest {
         assertTrue(validator.validate(intent, new TaskGraph(List.of(node("读取 销售明细", "file_read")))).valid());
     }
 
+    @Test
+    void answerUrlCanBeDeliveredThroughItsNamedOutputPort() {
+        TaskIntent intent = new TaskIntent("交付页面",
+                List.of(new TaskIntent.Deliverable("页面链接与验证结论", "answer",
+                        "https://example.com/dashboard.html", true)),
+                List.of(), List.of(), List.of(), List.of(), false, "");
+        TaskNode verifier = new TaskNode("verify", "浏览器验收", "browser", List.of(), List.of(),
+                List.of("页面链接与验证结论"), TaskNodeStatus.PENDING, 1,
+                DoneWhen.validation("检查页面及交互后给出链接与结论"), "", "", 0, "");
+
+        assertTrue(validator.validate(intent, new TaskGraph(List.of(verifier))).valid());
+    }
+
+    @Test
+    void matchingNameCannotHideWrongFilePath() {
+        TaskIntent intent = new TaskIntent("交付报告",
+                List.of(new TaskIntent.Deliverable("验收报告", "file", "required/report.pdf", true)),
+                List.of(), List.of(), List.of(), List.of(), false, "");
+        TaskNode wrong = new TaskNode("write", "写入报告", "file_write", List.of(), List.of(),
+                List.of("验收报告", "wrong/report.pdf"), TaskNodeStatus.PENDING, 1,
+                DoneWhen.file("wrong/report.pdf"), "", "", 0, "");
+
+        assertFalse(validator.validate(intent, new TaskGraph(List.of(wrong))).valid());
+    }
+
+    @Test
+    void answerMentionedOnlyInCriteriaStillNeedsAnOutputPort() {
+        TaskIntent intent = new TaskIntent("交付链接",
+                List.of(new TaskIntent.Deliverable("页面链接", "answer", "https://example.com/", true)),
+                List.of(), List.of(), List.of(), List.of(), false, "");
+        TaskNode talk = new TaskNode("n1", "分析", "research", List.of(), List.of(), List.of(),
+                TaskNodeStatus.PENDING, 1, DoneWhen.judge("讨论页面链接 https://example.com/"), "", "", 0, "");
+
+        assertFalse(validator.validate(intent, new TaskGraph(List.of(talk))).valid());
+    }
+
     private static TaskNode node(String name, String capability) {
         return new TaskNode("n1", name, capability, List.of(), List.of(), List.of(),
                 TaskNodeStatus.PENDING, 1, DoneWhen.note(), "", "", 0, "");

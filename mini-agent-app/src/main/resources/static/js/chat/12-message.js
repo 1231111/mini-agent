@@ -1,6 +1,12 @@
 /* =========================================================================
    MESSAGE DOM BUILDERS
    ========================================================================= */
+let botMessageSequence = 0;
+
+function nextBotBodyId() {
+    return 'bb_' + Date.now().toString(36) + '_' + (++botMessageSequence).toString(36);
+}
+
 function attachmentExtension(name) {
     return fileExt(String(name || '').split('?')[0].split('#')[0]).toLowerCase();
 }
@@ -177,13 +183,14 @@ function renderSystemNote(text) {
 function renderBotMsg(initHtml, streaming = true) {
     const row = document.createElement('div');
     row.className = 'msg-row bot-row';
-    const bid = 'bb_' + Date.now();
+    const bid = nextBotBodyId();
     const initialContent = streaming ? initHtml
         : `<div class="answer-stream md-body has-content">${initHtml}</div>`;
     row.innerHTML = `
         <div class="msg-inner">
-            <div class="bot-avatar" aria-label="MiniAgent"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="ai-mark" d="M12 2.5 14.25 9.75 21.5 12l-7.25 2.25L12 21.5l-2.25-7.25L2.5 12l7.25-2.25L12 2.5Z"/><path d="M19.5 3.5v4M17.5 5.5h4M5 17v4M3 19h4"/></svg></div>
+            <div class="bot-avatar" aria-label="MiniAgent"><svg viewBox="0 0 48 48" aria-hidden="true"><use href="#ma-ai-core"/></svg></div>
             <div class="bot-content">
+                <div class="bot-identity"><span>MiniAgent</span><span class="bot-identity-label">AI 助手</span></div>
                 <div class="bot-body ${streaming ? 'streaming' : ''}" id="${bid}">${initialContent}</div>
                 <div class="bot-actions">
                     <button class="ba-btn" onclick="copyBotMsg(this)" title="复制">

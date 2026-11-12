@@ -11,6 +11,9 @@ public class PlannerProperties {
 
     private boolean enabled = true;
 
+    /** 默认/自动/只读模式也由模型按执行依赖选择 DAG；不改变任何工具授权。 */
+    private boolean autoPlanning = true;
+
     // ─── 专用规划模型（GoalCompiler DAG 编译用） ───
     /** 专用规划模型名称。为空时 fallback 到主对话模型。 */
     private String plannerModelName;
@@ -22,6 +25,7 @@ public class PlannerProperties {
     private int plannerTimeoutSeconds = 60;
 
     private int maxRecoveries = 3;
+    /** 兼容历史配置；PlanningLoop 当前逐节点派发与验收，实际批量固定为 1。 */
     private int proposalBatchSize = 1;
     private int proposalMaxIterations = 8;
     /** 本步工具含 browser_* 时的每段轮次上限 */

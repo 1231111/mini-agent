@@ -21,7 +21,8 @@ class SkillStoreBundledSkillsTest {
     void freshStoreInstallsBundledSkills() {
         SkillStore store = new SkillStore(tempDir.resolve("skills"));
 
-        assertEquals(6, store.listSkills().size());
+        assertEquals(7, store.listSkills().size());
+        assertTrue(store.viewSkill("desktop-workflow").contains("desktop_observe"));
         assertTrue(store.viewSkill("web-research").contains("Use `web_search`"));
         assertTrue(store.viewSkill("ai-news-briefing").contains("coverage window"));
         assertTrue(store.viewSkill("document-authoring").contains("write_document"));

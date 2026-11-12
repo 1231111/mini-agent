@@ -2,6 +2,7 @@ package com.miniagent.agent.planner;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.miniagent.agent.context.RelativeDateGuidance;
 import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.common.llm.DedicatedChatModel;
 import com.miniagent.agent.skill.SkillStore;
@@ -16,6 +17,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -132,6 +134,9 @@ public class GoalCompiler {
             涉及网页的任务按用户真实动作拆：要整篇正文（飞书/wiki 等长文）就用
             browser 一次抽全再落盘；要点击、填表、读取局部字段，就拆成打开页面 →
             看结构 → 交互，不要一律套「抽正文写文档」。
+            原生桌面软件使用desktop能力；网页优先browser。节点内部观察→操作→验证，
+            不要将每次点击、按键、截图分别拆成DAG节点。桌面节点用实际界面结果验收，
+            输入成功、截图成功不能独自证明业务完成；模型不能跳过逐动作权限检查。
             doneWhen.type 仅：note_required / file_exists / media_delivered / llm_judge /
             command_success / validation_passed。
             file_exists 填 path，可加 criteria 做内容验收。
@@ -143,6 +148,8 @@ public class GoalCompiler {
             也没有给出输出路径时：禁止生成 file_write 节点，禁止把「整理成某文件」
             写进 objective / deliverables / successCriteria。这类请求的交付物是
             对话内的回答（deliverable type=answer），不是落盘文件。
+            用户要求实际实现可运行网页、软件、图像等产物，也属于产物交付，
+            不要求用户额外说“保存文件”。依照本轮语义交付判定生成实际产物。
             例：用户说「搜索今日 AI 技术最新动态」→ 一个 web 节点 + note_required，
             不要在目标里追加「并整理成 Markdown 简报文件」。
 
@@ -163,7 +170,14 @@ public class GoalCompiler {
             不要创建接收请求、理解需求、开始/结束等无执行价值的节点。
             生成与交付仅在验收标准不同时拆开。
             dependsOn 只表示执行前置；无依赖的节点可并行。
-            后续节点的 inputs 必须引用前置节点的 outputs。
+            后续节点的 inputs 引用依赖链上前序节点的 outputs。
+            用户消息、附件、用户指定URL属于外部输入，不需要虚构“接收请求”节点生产它们；
+            在 intent.inputs 声明名称和来源，消费节点的 inputs 使用完全相同的名称。
+            deliver 可交付对话内链接或结论，此时用 note_required/llm_judge；
+            只有实际写出文件时用 file_exists。最终答复能直接给链接时无需另加交付节点。
+            intent.deliverables 与节点输出必须可精确对应：文件/媒体的 path 原样写进
+            doneWhen.path 或 outputs；answer/action 的 name 原样写进负责节点的 outputs。
+            回答附带的链接可放在验收 criteria，不要把 URL 当作待写出的文件路径。
             不要制造无意义的 input/output。
             每节点必须有 doneWhen，按本步如何证明完成来选。
             凡是产出文件的节点（代码、文档、报告、图表、数据），doneWhen 必须用
@@ -200,6 +214,17 @@ public class GoalCompiler {
     /** 词表在装配期注入：PACKS 加了能力而提示词没跟上，正是这次生歌用不上的直接原因。 */
     static String compilerSystem() {
         return COMPILER_SYSTEM_TEMPLATE.replace("{CAPS}", capabilityVocabulary());
+    }
+
+    @Value("${web.search.time-zone:Asia/Shanghai}")
+    private String configuredTimeZone = "Asia/Shanghai";
+
+    /** Planning and correction use the same live date anchor as direct execution. */
+    private String compilerSystemForCurrentTime() {
+        return compilerSystem() + "\n\n"
+                + RelativeDateGuidance.render(RelativeDateGuidance.resolveNow(configuredTimeZone))
+                + "\n将用户指定的时间范围保留在 constraints 和 intent.acceptanceCriteria 中，"
+                + "所有检索节点及验收必须遵守；禁止在拆分或修正计划时扩大范围。";
     }
 
     private final PlannerProperties properties;
@@ -429,12 +454,16 @@ public class GoalCompiler {
 
         String user = "用户消息:\n" + userMessage
                 + "\n任务目标:" + (plan == null ? "" : plan.taskGoal())
+                + (plan == null || plan.artifactDeliveryRequested() == null ? ""
+                    : "\n本轮语义交付判定: " + (plan.artifactDeliveryRequested()
+                        ? "用户要求实际产物，允许为该产物生成文件，禁止额外报告。"
+                        : "仅对话内回答，禁止额外落盘文件。"))
                 + skillDigest(procedureSnapshot)
                 + "\n\n**修正要求**:\n" + correctionPrompt
                 + "\n\n请根据上述修正要求重新生成任务图。";
 
         var response = chat.chat(ChatRequest.builder()
-                .messages(List.of(new SystemMessage(compilerSystem()), UserMessage.from(user)))
+                .messages(List.of(new SystemMessage(compilerSystemForCurrentTime()), UserMessage.from(user)))
                 .build());
         String text = response.aiMessage() == null ? "" : response.aiMessage().text();
         try {
@@ -471,8 +500,7 @@ public class GoalCompiler {
     /** 叫规划模型编一张图，并返回失败原因。 */
     private LlmCompileAttempt tryLlmCompile(ChatModel chat, String userMessage, TaskPlan plan) {
         ChatModel planner = resolvePlannerChat(chat);
-        // 无可用规划模型时直接失败。进入规划器意味着用户显式选择了 Plan mode，
-        // 任务拆解只能由 LLM 完成，没有模板兜底。
+        // 无可用规划模型时直接失败。任务拆解只能由 LLM 完成，没有模板兜底。
         if (planner == null) {
             log.warn("GoalCompiler 跳过 LLM 拆解：无可用规划模型（传入 chat={}，专用模型={}）",
                     chat == null ? "null" : chat.getClass().getSimpleName(),
@@ -639,11 +667,15 @@ public class GoalCompiler {
         String user = "用户消息:\n" + userMessage
                 + "\n任务目标:" + (plan == null ? "" : plan.taskGoal())
                 + "\n若同时要获取资料并保存文件，至少拆成获取 + 写入两个节点。"
+                + (plan == null || plan.artifactDeliveryRequested() == null ? ""
+                    : "\n本轮语义交付判定: " + (plan.artifactDeliveryRequested()
+                        ? "用户要求实际产物，允许为该产物生成文件，禁止额外报告。"
+                        : "仅对话内回答，禁止额外落盘文件。"))
                 + "\n若同时要读取表格并统计，至少拆成读取 + 计算两个节点。"
                 + "\n不要把打开/读取/解析同一文件拆成多个节点。"
                 + skillDigest(procedureSnapshot);
         var response = chat.chat(ChatRequest.builder()
-                .messages(List.of(new SystemMessage(compilerSystem()), UserMessage.from(user)))
+                .messages(List.of(new SystemMessage(compilerSystemForCurrentTime()), UserMessage.from(user)))
                 .build());
         String text = response.aiMessage() == null ? "" : response.aiMessage().text();
         try {

@@ -23,7 +23,9 @@ public final class PermissionPolicy {
             "read_file", "list_files", "read_package",
             "search_code", "ast_search", "codebase_search",
             "web_search", "web_extract", "http_get",
-            "browser_navigate", "browser_snapshot", "browser_screenshot", "browser_close"
+            "browser_navigate", "browser_snapshot", "browser_screenshot", "browser_close",
+            "browser_form_inspect", "browser_form_verify",
+            "desktop_observe", "desktop_release"
     );
 
     /** Ask 模式下需用户确认的危险工具 */
@@ -31,9 +33,10 @@ public final class PermissionPolicy {
             EXEC_TOOL, "http_post",
             "write_file", "edit_file",
             "browser_click", "browser_type", "browser_press", "browser_scroll",
+            "browser_select", "browser_set_checked", "browser_upload",
             "browser_evaluate", "browser_extract_text",
             SongGenerateParams.TOOL_NAME,
-            "delegate_task"
+            "delegate_task", "desktop_act"
     );
 
     public static boolean isPlanSafe(String toolName) {
@@ -137,6 +140,12 @@ public final class PermissionPolicy {
             // 编辑类工具的二次询问，不是"任意 shell 免批"；免批只能来自
             // 「自动编辑 + 自动确认」的组合（isFullAuto）或显式 allow 档。
             return exec == ExecPolicy.ASK;
+        }
+        if ("desktop_act".equals(toolName)) {
+            // Foreground input can submit/send/delete in any app. Automatic
+            // editing alone is not an approval for an arbitrary desktop action.
+            // Explicit full-auto and explicit session grants retain their existing semantics.
+            return true;
         }
         if (mode == PermissionMode.ACCEPT_EDITS) {
             return false;

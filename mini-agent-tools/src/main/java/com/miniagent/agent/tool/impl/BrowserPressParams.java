@@ -15,7 +15,7 @@ public class BrowserPressParams extends ToolParams {
     @ToolParamSchema(description = "键盘按键（Enter, Tab, Escape, ArrowDown 等）", required = true)
     private String key;
 
-    @ToolParamSchema(description = "浏览器会话ID")
+    @ToolParamSchema(description = "兼容字段，通常省略；仅允许当前聊天ID，不能指定其他会话")
     private String sessionId;
 
     /**

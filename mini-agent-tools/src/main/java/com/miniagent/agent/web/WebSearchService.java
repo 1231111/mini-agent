@@ -68,6 +68,8 @@ public class WebSearchService {
     private static final Pattern JSON_LD = Pattern.compile("(?is)<script\\b[^>]*type\\s*=\\s*(['\\\"])application/ld\\+json\\1[^>]*>(.*?)</script>");
     private static final Pattern DATE_TOKEN = Pattern.compile("(?<!\\d)(20\\d{2})[-/.年](\\d{1,2})[-/.月](\\d{1,2})日?(?!\\d)");
     private static final Pattern ISO_DATE_IN_QUERY = Pattern.compile("(?<!\\d)(20\\d{2}-\\d{2}-\\d{2})(?!\\d)");
+    private static final Pattern SEARCH_DATE_OPERATOR = Pattern.compile(
+            "(?i)(?<![\\w:])(?:after|before):\\s*\\d{4}-\\d{1,2}-\\d{1,2}(?![\\d-])");
     private static final Pattern PUBLISH_DATE_KEY = Pattern.compile("(?i)^(article:published_time|og:published_time|datepublished|date|pubdate|parsely-pub-date|sailthru\\.date|dc\\.date\\.issued|citation_publication_date|published_time)$");
 
     /** web_extract 的出网判定与传输：每跳校验 + 有界响应体。 */
@@ -113,10 +115,15 @@ public class WebSearchService {
             limit = DEFAULT_LIMIT;
         }
         int requestedLimit = Math.min(limit, MAX_RESULTS);
+        SearchDateContext.Window requestedWindow = SearchDateContext.current();
+        ZoneId searchZone = currentSearchZone();
+        LocalDate today = requestedWindow == null ? LocalDate.now(searchZone)
+                : requestedWindow.asOf().atZone(searchZone).toLocalDate();
         DateWindow dateWindow;
         try {
-            dateWindow = resolveDateWindow(query, dateFrom, dateTo,
-                    LocalDate.now(resolveSearchZone(configuredTimeZone)));
+            dateWindow = resolveDateWindow(query, dateFrom, dateTo, today, requestedWindow);
+        } catch (DateWindowConflictException e) {
+            return buildErrorResponse("DATE_WINDOW_CONFLICT", e.getMessage());
         } catch (IllegalArgumentException e) {
             return buildErrorResponse(e.getMessage());
         }
@@ -137,7 +144,7 @@ public class WebSearchService {
             } else {
                 results = results.stream().limit(requestedLimit).toList();
             }
-            return buildSuccessResponse(results, dateWindow, resolveSearchZone(configuredTimeZone));
+            return buildSuccessResponse(results, dateWindow, searchZone);
         } catch (Exception e) {
             log.error("Web搜索失败: backend={} error={}", backend, e.getMessage());
             return buildErrorResponse("搜索失败: " + e.getMessage() + "。请检查 " + backend + " API 密钥是否正确配置。");
@@ -184,7 +191,7 @@ public class WebSearchService {
 
             String html = response.bodyText();
             String title = extractTitle(html);
-            String publicationDate = extractPublishedDate(html, resolveSearchZone(configuredTimeZone));
+            String publicationDate = extractPublishedDate(html, currentSearchZone());
             String text = htmlToText(html);
 
             if (text.length() > MAX_CONTENT_LENGTH) {
@@ -196,6 +203,7 @@ public class WebSearchService {
             result.put("url", url);
             result.put("title", title);
             addPublicationDate(result, publicationDate, "source_page_metadata", publicationDate != null);
+            addRequestedDatePolicy(result, publicationDate, publicationDate != null, SearchDateContext.current());
             result.put("content", text);
             result.put("content_length", text.length());
             return MAPPER.writeValueAsString(result);
@@ -240,7 +248,7 @@ public class WebSearchService {
                 }
                 String title = first.path("title").asText("");
                 String providerDate = normalizePublicationDate(first.path("published_date").asText(""),
-                        resolveSearchZone(configuredTimeZone));
+                        currentSearchZone());
                 String pageDate = extractSourcePublicationDate(url);
                 String publicationDate = pageDate == null ? providerDate : pageDate;
                 String publicationDateSource = pageDate != null ? "source_page_metadata"
@@ -256,6 +264,7 @@ public class WebSearchService {
                 result.put("url", url);
                 result.put("title", title);
                 addPublicationDate(result, publicationDate, publicationDateSource, pageDate != null);
+                addRequestedDatePolicy(result, publicationDate, pageDate != null, SearchDateContext.current());
                 result.put("content", content);
                 result.put("content_length", content.length());
                 return MAPPER.writeValueAsString(result);
@@ -306,7 +315,7 @@ public class WebSearchService {
                     item.path("url").asText(""),
                     item.path("content").asText(""),
                     pos++,
-                    normalizePublicationDate(item.path("published_date").asText(""), resolveSearchZone(configuredTimeZone))
+                    normalizePublicationDate(item.path("published_date").asText(""), currentSearchZone())
             ));
         }
         return results;
@@ -344,7 +353,7 @@ public class WebSearchService {
                     item.path("url").asText(""),
                     item.path("snippet").asText(""),
                     pos++,
-                    normalizePublicationDate(item.path("datePublished").asText(""), resolveSearchZone(configuredTimeZone))
+                    normalizePublicationDate(item.path("datePublished").asText(""), currentSearchZone())
             ));
         }
         return results;
@@ -382,7 +391,7 @@ public class WebSearchService {
                     item.path("link").asText(""),
                     item.path("snippet").asText(""),
                     pos++,
-                    googlePublishedDate(item.path("pagemap").path("metatags"), resolveSearchZone(configuredTimeZone))
+                    googlePublishedDate(item.path("pagemap").path("metatags"), currentSearchZone())
             ));
         }
         return results;
@@ -477,6 +486,25 @@ public class WebSearchService {
             return "google";
         }
         return "duckduckgo"; // 免费 fallback
+    }
+
+    /** The trusted user-request window survives query rewrites and cannot be broadened by model arguments. */
+    static DateWindow resolveDateWindow(String query, String dateFrom, String dateTo, LocalDate today,
+                                        SearchDateContext.Window requestedWindow) {
+        DateWindow modelWindow = resolveDateWindow(query, dateFrom, dateTo, today);
+        if (requestedWindow == null) return modelWindow;
+        if (modelWindow == null) return new DateWindow(requestedWindow.start(), requestedWindow.end());
+
+        LocalDate start = modelWindow.start().isBefore(requestedWindow.start())
+                ? requestedWindow.start() : modelWindow.start();
+        LocalDate end = modelWindow.end().isAfter(requestedWindow.end())
+                ? requestedWindow.end() : modelWindow.end();
+        if (start.isAfter(end)) {
+            throw new DateWindowConflictException("搜索日期 " + modelWindow + " 与用户要求的 "
+                    + requestedWindow.start() + ".." + requestedWindow.end()
+                    + " 无交集。请按用户指定日期重新搜索，不得扩大为过去 24/48 小时或用旧消息凑数。");
+        }
+        return new DateWindow(start, end);
     }
 
     static DateWindow resolveDateWindow(String query, String dateFrom, String dateTo, LocalDate today) {
@@ -630,14 +658,18 @@ public class WebSearchService {
     static String withDateWindow(String query, DateWindow window) {
         LocalDate after = window.start().minusDays(1);
         LocalDate before = window.end().plusDays(1);
-        return Objects.toString(query, "").strip()
+        return SEARCH_DATE_OPERATOR.matcher(Objects.toString(query, "")).replaceAll(" ").strip()
                 + " after:" + after + " before:" + before
                 + " 发布日期 " + window.start() + " 至 " + window.end();
     }
 
     private static ZoneId resolveSearchZone(String configuredZone) {
-        try { return ZoneId.of(configuredZone); }
-        catch (Exception ignored) { return ZoneId.systemDefault(); }
+        return SearchDateContext.resolveZone(configuredZone);
+    }
+
+    private ZoneId currentSearchZone() {
+        SearchDateContext.Window requestedWindow = SearchDateContext.current();
+        return requestedWindow == null ? resolveSearchZone(configuredTimeZone) : requestedWindow.zone();
     }
 
     private String extractSourcePublicationDate(String url) {
@@ -651,7 +683,7 @@ public class WebSearchService {
                     Duration.ofSeconds(12),
                     2 * 1024 * 1024);
             if (response.statusCode() != 200) return null;
-            return extractPublishedDate(response.bodyText(), resolveSearchZone(configuredTimeZone));
+            return extractPublishedDate(response.bodyText(), currentSearchZone());
         } catch (Exception e) {
             log.debug("无法从原文页面读取发布日期: {}", e.getMessage());
             return null;
@@ -689,7 +721,7 @@ public class WebSearchService {
         if (dateWindow != null) {
             root.put("date_window", dateWindow.start() + ".." + dateWindow.end());
             root.put("time_zone", zone.getId());
-            root.put("date_policy", "超出窗口的已知发布日期已过滤；搜索服务日期仅用于检索筛选，所有候选必须用 web_extract 核验原文发布日期后才能引用。");
+            root.put("date_policy", "日期窗口是必须遵守的范围，不得自行扩大为过去 24/48 小时，不得用旧消息凑数。超出窗口的已知发布日期已过滤；搜索服务日期仅用于检索筛选，所有候选必须用 web_extract 核验原文发布日期在请求窗口内后才能引用。若原文返回 citation_eligible=false，则不得作为窗口内消息引用。合格消息不足时应明确说明，不得补入旧闻。");
         }
 
         ObjectNode data = MAPPER.createObjectNode();
@@ -704,6 +736,10 @@ public class WebSearchService {
             item.put("publication_date", r.publishedDate() == null ? "unknown" : r.publishedDate());
             item.put("publication_date_source", r.publishedDate() == null ? "unknown" : "search_provider_metadata");
             item.put("date_verified", false);
+            if (dateWindow != null) {
+                item.put("within_requested_window", isWithinWindow(r.publishedDate(), dateWindow));
+                item.put("citation_eligible", false);
+            }
             webArray.add(item);
         }
 
@@ -713,10 +749,15 @@ public class WebSearchService {
     }
 
     private static String buildErrorResponse(String message) {
+        return buildErrorResponse(null, message);
+    }
+
+    private static String buildErrorResponse(String code, String message) {
         try {
             ObjectNode root = MAPPER.createObjectNode();
             root.put("success", false);
             root.put("error", message);
+            if (code != null) root.put("error_code", code);
             return MAPPER.writeValueAsString(root);
         } catch (Exception e) {
             return "{\"success\":false,\"error\":\"" + message.replace("\"", "\\\"") + "\"}";
@@ -728,6 +769,30 @@ public class WebSearchService {
         else target.put("publication_date", publicationDate);
         target.put("publication_date_source", source);
         target.put("date_verified", verified);
+    }
+
+    private static void addRequestedDatePolicy(ObjectNode target, String publicationDate, boolean verified,
+                                                SearchDateContext.Window requestedWindow) {
+        if (requestedWindow == null) return;
+        DateWindow window = new DateWindow(requestedWindow.start(), requestedWindow.end());
+        boolean withinWindow = isWithinWindow(publicationDate, window);
+        target.put("requested_date_window", window.toString());
+        target.put("time_zone", requestedWindow.zone().getId());
+        target.put("within_requested_window", withinWindow);
+        target.put("citation_eligible", verified && withinWindow);
+        target.put("date_policy", "仅 citation_eligible=true 的原文可作为请求日期内的消息引用；发布日期未知或超出日期窗口的内容不可用于凑数。");
+    }
+
+    private static boolean isWithinWindow(String publicationDate, DateWindow window) {
+        if (publicationDate == null) return false;
+        try {
+            LocalDate date = LocalDate.parse(publicationDate);
+            return !date.isBefore(window.start()) && !date.isAfter(window.end());
+        } catch (DateTimeParseException ignored) { return false; }
+    }
+
+    private static final class DateWindowConflictException extends IllegalArgumentException {
+        private DateWindowConflictException(String message) { super(message); }
     }
 
     /** 从 HTML 提取 <title> */

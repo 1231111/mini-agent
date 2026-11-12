@@ -16,7 +16,7 @@
      3. 订阅 /api/conversations/{sid}/traces 的 SSE 推送，收到 trace 事件后防抖刷新。
 
    展开状态存在 localStorage['mini_agent_inspector']：宽屏（≥1180px）默认展开，
-   窄屏默认收起；≤1180px 仍作为可收缩的停靠列，极窄窗口（≤560px）才改为浮层。
+   窄屏默认收起；≤1180px 展开时使用抽屉，避免挤压对话和文件卡片。
    ========================================================================= */
 
 const INSP_LS_KEY = 'mini_agent_inspector';
@@ -304,9 +304,19 @@ function buildInspectorTaskDetails(execution, todos, steps, taskRunning) {
         todo && ['completed', 'cancelled'].includes(String(todo.status || '')));
     const allTodosCancelled = todos.length > 0 && todos.every(todo =>
         todo && todo.status === 'cancelled');
-    const toolNames = [...new Set((steps || []).filter(step => step && step.stepType === 'TOOL_CALL')
-        .map(step => step.toolName).filter(Boolean))];
-    const categories = [...new Set(toolNames.map(toolKind))];
+    const consumedToolResults = new Set();
+    const toolPresentations = [];
+    (steps || []).forEach((step, index) => {
+        if (!step || step.stepType !== 'TOOL_CALL' || !step.toolName) return;
+        const resultIndex = steps.findIndex((candidate, candidateIndex) => candidateIndex > index
+            && !consumedToolResults.has(candidateIndex) && candidate && candidate.toolName === step.toolName
+            && ['TOOL_RESULT', 'TOOL_ERROR'].includes(candidate.stepType));
+        if (resultIndex >= 0) consumedToolResults.add(resultIndex);
+        toolPresentations.push(toolPresentation(step.toolName, step.toolArgs,
+            resultIndex >= 0 ? steps[resultIndex].content : null));
+    });
+    const toolNames = [...new Set(toolPresentations.map(tool => tool.title))];
+    const categories = [...new Set(toolPresentations.map(tool => tool.kind))];
     const categoryLabels = { file: '文件处理', web: '联网搜索', code: '代码与命令',
         image: '图像处理', memory: '记忆操作', other: '通用工具' };
     const type = categories.length
@@ -329,7 +339,7 @@ function buildInspectorTaskDetails(execution, todos, steps, taskRunning) {
             rows.push(['执行耗时', formatDuration(end - start)]);
         }
     }
-    if (toolNames.length) rows.push(['涉及工具', shortText(toolNames.map(toolDisplayName).join('、'), 54)]);
+    if (toolNames.length) rows.push(['涉及工具', shortText(toolNames.join('、'), 54)]);
     return '<div class="insp-detail-state state-' + stateKind + '">' +
         '<span class="insp-detail-state-dot"></span><span>' + esc(state) + '</span></div>' +
         '<div class="insp-detail-grid">' + rows.map(row =>
@@ -426,8 +436,9 @@ function buildInspectorStepRows(steps, execution) {
                 : step.status;
             const state = INSP_WAIT_STATUS.has(String(status || '').toUpperCase())
                 ? 'awaiting' : result && status === 'RUNNING' ? 'running' : stepState(status);
-            const title = toolDisplayName(step.toolName);
-            const groupKey = title.toLocaleLowerCase('zh-CN');
+            const presentation = toolPresentation(step.toolName, step.toolArgs, result && result.content);
+            const title = presentation.title;
+            const groupKey = presentation.kind + ':' + title.toLocaleLowerCase('zh-CN');
             let group = toolGroups.get(groupKey);
             if (!group) {
                 group = { title, attempts: [] };
@@ -514,9 +525,12 @@ function buildInspectorToolRows(steps) {
             || INSP_FAIL_STATUS.has(resultStatus));
         const state = failed ? 'failed' : INSP_WAIT_STATUS.has(resultStatus) ? 'awaiting'
             : !result || INSP_RUN_STATUS.has(resultStatus) ? 'running' : 'done';
+        const presentation = toolPresentation(step.toolName, step.toolArgs, result && result.content);
         calls.push({
             name: step.toolName,
-            title: toolDisplayName(step.toolName),
+            title: presentation.title,
+            kind: presentation.kind,
+            htmlFile: presentation.htmlFile,
             state,
             detail: (result && result.stepType === 'TOOL_ERROR' ? toolFailureSummary(result) : '')
                 || toolArgsSummary(step.toolArgs, step.toolName)
@@ -529,7 +543,7 @@ function buildInspectorToolRows(steps) {
     });
     const latestByName = new Map();
     calls.forEach(call => {
-        const key = call.title.toLocaleLowerCase('zh-CN');
+        const key = call.kind + ':' + call.title.toLocaleLowerCase('zh-CN');
         const previous = latestByName.get(key);
         latestByName.set(key, {
             ...call,
@@ -552,11 +566,11 @@ function buildInspectorToolRows(steps) {
                 ? (state === 'awaiting' ? '待确认 · ' : '') + '调用 ' + t.count + ' 次'
                 : stateLabel;
         const detail = shortText(t.detail || toolDescription(t.name), 62);
-        const key = t.title.toLocaleLowerCase('zh-CN');
+        const key = t.kind + ':' + t.title.toLocaleLowerCase('zh-CN');
         return `<details class="insp-tool-card ${state}" data-tool-key="${escQ(esc(key))}"
                     ontoggle="onInspectorToolLogToggle(this)">
             <summary class="insp-tool" title="点击查看${escQ(esc(t.title))}的执行日志" aria-label="查看${escQ(esc(t.title))}的执行日志">
-                <span class="insp-tool-icon kind-${toolKind(t.name)}">${toolIcon(t.name)}</span>
+                <span class="insp-tool-icon kind-${t.kind}">${toolIcon(t.name, t.kind)}</span>
                 <span class="insp-tool-main">
                     <span class="insp-tool-name" title="${escQ(esc(t.name))}">${esc(t.title)}</span>
                     <span class="insp-tool-detail">${esc(detail)}</span>
@@ -586,12 +600,31 @@ function buildInspectorToolLogEntry(call, index, total) {
     const meta = [call.time ? formatClock(call.time) : '',
         call.durationMs > 0 ? formatDuration(call.durationMs) : ''].filter(Boolean).join(' · ');
     const args = call.args ? formatInspectorToolLog(call.args) : '';
+    const argsValue = parseJson(call.args);
+    const outputValue = parseJson(call.output);
+    const htmlWrite = call.name === 'write_file'
+        && toolPresentation(call.name, call.args, call.output).htmlFile
+        && argsValue && typeof argsValue.content === 'string'
+        && (argsValue.content.length > 320 || /[\r\n]/.test(argsValue.content));
+    let argsMarkup = args ? `<div class="insp-tool-log-block"><div class="insp-tool-log-label">调用参数</div><pre>${esc(args)}</pre></div>` : '';
+    if (htmlWrite) {
+        const redactedArgs = redactInspectorLogValue(argsValue);
+        const source = String(redactedArgs.content);
+        const compactArgs = { ...redactedArgs, content: `[HTML 源码，${argsValue.content.length} 字符]` };
+        argsMarkup = `<div class="insp-tool-log-block"><div class="insp-tool-log-label">调用参数摘要</div><pre>${esc(JSON.stringify(compactArgs, null, 2))}</pre></div>
+            <details class="insp-tool-log-block insp-tool-source"><summary class="insp-tool-log-label">查看 HTML 源码 · ${argsValue.content.length} 字符</summary><pre>${esc(source)}</pre></details>
+            <details class="insp-tool-log-block insp-tool-source"><summary class="insp-tool-log-label">查看完整调用参数</summary><pre>${esc(args)}</pre></details>`;
+    }
     const output = call.output ? formatInspectorToolLog(call.output)
         : state === 'running' || state === 'awaiting' ? '等待工具返回…' : '没有记录到返回内容。';
     const outputLabel = state === 'failed' ? '错误日志' : '工具返回';
     return `<article class="insp-tool-log-entry ${state}">
         <div class="insp-tool-log-head"><strong>${esc(heading)}</strong>${meta ? `<span>${esc(meta)}</span>` : ''}</div>
-        ${args ? `<div class="insp-tool-log-block"><div class="insp-tool-log-label">调用参数</div><pre>${esc(args)}</pre></div>` : ''}
+        <div class="insp-tool-log-label">底层工具：${esc(call.name || '未知工具')}</div>
+        ${call.state === 'done' && call.name === 'write_file' && call.htmlFile
+                && outputValue && outputValue.success === true
+            ? '<div class="insp-tool-log-label">HTML 页面文件已保存；页面运行效果需另行验证。</div>' : ''}
+        ${argsMarkup}
         <div class="insp-tool-log-block"><div class="insp-tool-log-label">${outputLabel}</div><pre>${esc(output)}</pre></div>
     </article>`;
 }
@@ -653,12 +686,28 @@ function toolDisplayName(name) {
         list_files: '浏览文件', exec_command: '执行命令', image_generate: '生成图片',
         generate_image: '生成图片', browser_navigate: '浏览网页', browser_snapshot: '读取页面',
         browser_click: '操作网页', browser_type: '填写网页', browser_extract_text: '提取网页内容',
+        browser_form_inspect: '识别表单', browser_form_verify: '核验字段', browser_select: '选择选项',
+        browser_set_checked: '设置勾选', browser_upload: '上传附件',
         delegate_task: '子任务委派', todo: '更新任务清单', memory: '记忆操作',
         skill_list: '查看技能列表', skill_view: '读取技能', skill_manage: '管理技能'
     };
     if (known[name]) return known[name];
     const clean = String(name || '执行工具').replace(/^mcp__[^_]+__/, '').replace(/[_-]+/g, ' ').trim();
     return clean || '执行工具';
+}
+
+/** A tool's label describes its actual file target, not the overall task's completion. */
+function toolPresentation(name, rawArgs, rawOutput) {
+    const fallback = { title: toolDisplayName(name), kind: toolKind(name), htmlFile: false };
+    const actions = { write_file: '保存', edit_file: '编辑', read_file: '读取', file_read: '读取' };
+    if (!actions[name]) return fallback;
+    const args = parseJson(rawArgs);
+    const output = parseJson(rawOutput);
+    const candidates = [args && args.path, args && args.file_path, args && args.filename,
+        args && args.fileName, args && args.file, output && output.path];
+    const path = candidates.find(value => typeof value === 'string' && value.trim());
+    if (!path || !/\.html?$/i.test(path.trim())) return fallback;
+    return { title: actions[name] + ' HTML 页面', kind: 'code', htmlFile: true };
 }
 
 function toolKind(name) {
@@ -671,7 +720,7 @@ function toolKind(name) {
     return 'other';
 }
 
-function toolIcon(name) {
+function toolIcon(name, kind) {
     const paths = {
         file: '<path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M4 10h16"/>',
         web: '<circle cx="11" cy="11" r="7"/><path d="m16 16 4.5 4.5M8 11h6M11 8v6"/>',
@@ -681,7 +730,7 @@ function toolIcon(name) {
         other: '<path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="8"/>'
     };
     return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-        + paths[toolKind(name)] + '</svg>';
+        + paths[kind || toolKind(name)] + '</svg>';
 }
 
 function toolArgsSummary(raw, toolName) {

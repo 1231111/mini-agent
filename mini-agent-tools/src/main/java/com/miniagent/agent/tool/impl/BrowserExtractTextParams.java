@@ -18,7 +18,7 @@ public class BrowserExtractTextParams extends ToolParams {
     @ToolParamSchema(description = "overwrite 或 append，默认 overwrite")
     private String mode;
 
-    @ToolParamSchema(description = "浏览器会话ID")
+    @ToolParamSchema(description = "兼容字段，通常省略；仅允许当前聊天ID，不能指定其他会话")
     private String sessionId;
 
     /**

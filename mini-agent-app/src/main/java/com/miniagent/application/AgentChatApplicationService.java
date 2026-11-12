@@ -41,6 +41,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import com.miniagent.agent.web.FileContentExtractor;
+import com.miniagent.agent.web.SearchDateContext;
+import com.miniagent.agent.desktop.DesktopInteractionService;
 import com.miniagent.config.repository.ChatTaskRepository;
 import com.miniagent.config.repository.UserRepository;
 import com.miniagent.config.entity.ChatTask;
@@ -55,6 +57,8 @@ import java.util.Objects;
 import java.util.Optional;
 
 import java.io.IOException;
+import java.time.Clock;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import com.miniagent.common.ChatMessageTexts;
@@ -73,6 +77,10 @@ import org.apache.commons.lang3.StringUtils;
 @Service
 @Slf4j
 public class AgentChatApplicationService {
+
+    @Value("${web.search.time-zone:Asia/Shanghai}")
+    private String searchTimeZone = "Asia/Shanghai";
+    private Clock searchClock = Clock.systemUTC();
 
     @Value("${agent.multimodal.audio-max-bytes:36700160}")
     private long audioMaxBytes;
@@ -139,6 +147,8 @@ public class AgentChatApplicationService {
     private ChatStreamingService streamingService;
     @Autowired(required = false)
     private SessionHistoryVectorStore sessionHistoryVectorStore;
+    @Autowired(required = false)
+    private DesktopInteractionService desktopInteractionService;
     @Autowired(required = false)
     private com.miniagent.memory.MemoryManager memoryManager;
     @Autowired
@@ -221,9 +231,10 @@ public class AgentChatApplicationService {
         });
     }
 
-    private record PreparedRun(Long tenantId, String projectId, TaskRunService.RunHandle handle) {}
+    private record PreparedRun(Long tenantId, String projectId, TaskRunService.RunHandle handle, Instant requestedAt) {}
 
     private PreparedRun prepareRun(Long userId, String sessionId) {
+        Instant requestedAt = searchClock.instant();
         Long tenantId = userRepository.findById(userId)
                 .filter(com.miniagent.config.entity.User::isEnabled)
                 .map(com.miniagent.config.entity.User::getTenantId)
@@ -234,7 +245,7 @@ public class AgentChatApplicationService {
         if (!start.accepted()) {
             throw new IllegalStateException(start.error());
         }
-        return new PreparedRun(tenantId, projectId, start.handle());
+        return new PreparedRun(tenantId, projectId, start.handle(), requestedAt);
     }
 
     private AgentResult executeAgentWithProgress(
@@ -259,7 +270,9 @@ public class AgentChatApplicationService {
 
         long[] taskId = {0L};
         try (var ignoredOwner = OwnerContext.bind(owner);
-             var ignoredRun = TaskExecutionContext.bindRun(run.fencingToken())) {
+             var ignoredRun = TaskExecutionContext.bindRun(run.fencingToken());
+             var ignoredDate = SearchDateContext.bind(SearchDateContext.fromRequest(
+                     displayMessage, prepared.requestedAt(), SearchDateContext.resolveZone(searchTimeZone)))) {
             leaseRenewal = taskRunLeaseRenewer == null
                     ? null : taskRunLeaseRenewer.start(run);
             OwnerContext.setCurrentProjectId(authorizedProjectId);
@@ -340,7 +353,20 @@ public class AgentChatApplicationService {
         } catch (Exception e) {
             stopLeaseRenewal(leaseRenewal);
             leaseRenewal = null;
-            if (executionStarted && executionControl.isCancelled(sessionId, run.fencingToken())) {
+            boolean cancelled = false;
+            if (executionStarted) {
+                try {
+                    // isCancelled observes the local flag before querying Redis.
+                    // A confirmed local cancel still wins during a Redis outage;
+                    // an unavailable remote status must not skip terminal cleanup.
+                    cancelled = executionControl.isCancelled(sessionId, run.fencingToken());
+                } catch (RuntimeException controlFailure) {
+                    if (controlFailure != e) e.addSuppressed(controlFailure);
+                    log.warn("任务失败后无法查询取消状态，按执行失败收口: session={}, runId={}",
+                            sessionId, run.runId(), controlFailure);
+                }
+            }
+            if (cancelled) {
                 taskRunService.markCancelled(run, "Cancelled by user");
             } else {
                 taskRunService.markFailed(run, exceptionDetail(e));
@@ -354,6 +380,10 @@ public class AgentChatApplicationService {
             throw e;
         } finally {
             stopLeaseRenewal(leaseRenewal);
+            if (desktopInteractionService != null) {
+                try { desktopInteractionService.releaseFor(userId, owner.tenantId(), sessionId); }
+                catch (RuntimeException e) { log.warn("释放桌面输入失败: session={}", sessionId, e); }
+            }
             try {
                 if (workerOpenAttempted) {
                     clientMultiAgent.close(sessionId);
@@ -408,15 +438,35 @@ public class AgentChatApplicationService {
     }
 
     public void cancel(Long userId, String sessionId) {
-        if (StringUtils.isBlank(sessionId)) {
-            throw new IllegalArgumentException("sessionId required");
-        }
-        taskRunService.activeRunToken(sessionId).ifPresent(token -> executionControl.cancel(sessionId, token));
+        requestExecutionStop(sessionId, false);
     }
 
     public void pause(String sessionId) {
-        if (StringUtils.isBlank(sessionId)) throw new IllegalArgumentException("sessionId required");
-        taskRunService.activeRunToken(sessionId).ifPresent(token -> executionControl.pause(sessionId, token));
+        requestExecutionStop(sessionId, true);
+    }
+
+    private void requestExecutionStop(String sessionId, boolean pause) {
+        if (StringUtils.isBlank(sessionId)) {
+            throw new IllegalArgumentException("sessionId required");
+        }
+        RuntimeException controlFailure = null;
+        try {
+            taskRunService.activeRunToken(sessionId).ifPresent(token -> {
+                if (pause) executionControl.pause(sessionId, token);
+                else executionControl.cancel(sessionId, token);
+            });
+        } catch (RuntimeException failure) {
+            controlFailure = failure;
+            throw failure;
+        } finally {
+            if (desktopInteractionService != null) {
+                try { desktopInteractionService.revokeSession(sessionId); }
+                catch (RuntimeException cleanupFailure) {
+                    if (controlFailure == null) throw cleanupFailure;
+                    if (controlFailure != cleanupFailure) controlFailure.addSuppressed(cleanupFailure);
+                }
+            }
+        }
     }
 
     public void resume(String sessionId) {
@@ -545,8 +595,7 @@ public class AgentChatApplicationService {
 
         ChatMemory memory = chatMemoryProvider.get(sessionId);
         List<ChatMessage> memMsgs = memory.messages();
-        // 本轮不再从用户文本里提取信号。是否拆解、是否建 todo、调哪个工具，
-        // 全部由模型在 AgentLoop 内自行决定；hasMedia 只作为多模态输入传给上下文。
+        // 不从用户文本匹配任务词表；加载上下文后由模型按依赖关系选择 direct / DAG。
         TaskPlan taskPlan = taskPlanFactory.build(userMessage);
         // 权限必须在拼上下文之前绑定：system prompt 的确认口径、todo 块的执行原则
         // 都要读当前会话的「模式 + 确认策略」。晚绑一步，全自动会话拿到的仍是默认值，
@@ -627,11 +676,13 @@ public class AgentChatApplicationService {
         try {
             String executionId = Objects.nonNull(traceRecorder)
                     ? traceRecorder.currentExecutionId() : null;
-            if (planningLoop.shouldHandle(taskPlan, sessionId, userMessage)) {
+            var planningRoute = planningLoop.selectRoute(effectiveChat, taskPlan, sessionId,
+                    userMessage, multimodalMsg, history);
+            if (planningRoute != null && planningRoute.useDag()) {
                 PlanningLoop.RunOutcome outcome = planningLoop.runWithOutcome(
                         effectiveChat, systemPrompt, userMessage, multimodalMsg,
                         history, taskPlan, sessionId, run.fencingToken(), executionId,
-                        streamSink);
+                        streamSink, planningRoute);
                 answer = outcome.answer();
                 endReason = outcome.reason();
                 planApprovalRequired = "PLAN_APPROVAL_REQUIRED".equals(outcome.reason());
@@ -690,6 +741,10 @@ public class AgentChatApplicationService {
         task.setSessionId(sessionId);
         task.setQuestion(displayQuestion);
         task.setAnswer(answer);
+        task.setTaskProgressJson(TaskProgressSnapshot.capture(
+                traceRecorder == null ? null : traceRecorder.currentExecutionId(), loaded.taskId(),
+                runStatus.name(), endReason, taskTodoStore == null ? List.of() : taskTodoStore.get(sessionId))
+                .toJson());
         if (!allSavedPaths.isEmpty()) {
             task.setImages(String.join(",", allSavedPaths));
         }

@@ -45,7 +45,7 @@ public final class ToolConcurrencyPolicy {
     private static final Set<String> READ_ONLY = Set.of(
             "skill_list", "skill_view", "read_file", "list_files", "read_package",
             "search_code", "ast_search", "codebase_search", "web_search", "web_extract",
-            "http_get", "browser_snapshot", "ask_user_question");
+            "http_get", "browser_snapshot", "browser_form_inspect", "browser_form_verify", "ask_user_question");
 
     /** 写进本地状态但能靠一次只读观察核验终态的工具，超时后共用这句提示。 */
     private static final String VERIFY_LOCAL_HINT =
@@ -134,6 +134,28 @@ public final class ToolConcurrencyPolicy {
     private static final ToolExecutionProfile BROWSER = new ToolExecutionProfile(
             30, 0, 10, ToolConcurrencyScope.SESSION, "", "",
             ToolTimeoutRecovery.VERIFY, VERIFY_BROWSER_HINT, 0);
+
+    /** Form changes can trigger remote autosave/upload; a lost reply must never replay the input. */
+    private static final ToolExecutionProfile BROWSER_FORM_ACTION = new ToolExecutionProfile(
+            30, 0, 10, ToolConcurrencyScope.SESSION, "", "",
+            ToolTimeoutRecovery.ABORT,
+            "，表单动作结果未知；先 browser_form_inspect 或 browser_form_verify 核验当前字段，禁止自动重复填写、上传或提交", 0);
+
+    /** The foreground input device is shared by every chat on this host. */
+    private static final ToolExecutionProfile DESKTOP_OBSERVE = new ToolExecutionProfile(
+            15, 0, 3, ToolConcurrencyScope.SHARED_RESOURCE, "", "desktop:local-input",
+            ToolTimeoutRecovery.RETRY, "，可重新 desktop_observe 获取当前屏幕", 0);
+
+    /** A timed-out click/key may already have committed an external action. Never replay it. */
+    private static final ToolExecutionProfile DESKTOP_ACT = new ToolExecutionProfile(
+            10, 0, 3, ToolConcurrencyScope.SHARED_RESOURCE, "", "desktop:local-input",
+            ToolTimeoutRecovery.ABORT,
+            "，桌面动作结果未知；先 desktop_observe 核验并释放输入控制，禁止直接重复点击或输入", 0);
+
+    /** Only releases this caller's held inputs/lease; it cannot send arbitrary input. */
+    private static final ToolExecutionProfile DESKTOP_RELEASE = new ToolExecutionProfile(
+            5, 0, 3, ToolConcurrencyScope.SHARED_RESOURCE, "", "desktop:local-input",
+            ToolTimeoutRecovery.VERIFY, "，请核验本任务输入控制是否已释放", 0);
 
 
     /**
@@ -249,8 +271,15 @@ public final class ToolConcurrencyPolicy {
             // ── 浏览器（同一个页面必须串行） ──
             case "browser_close" -> BROWSER.withBudget(10);
             case "browser_snapshot", "browser_evaluate" -> BROWSER.withBudget(15);
+            case "browser_form_inspect", "browser_form_verify" -> BROWSER.withBudget(15);
+            case "browser_select", "browser_set_checked", "browser_upload" -> BROWSER_FORM_ACTION;
             case "browser_screenshot" -> BROWSER.withBudget(20);
             case "browser_extract_text" -> BROWSER.withBudget(300);
+
+            // ── 本机桌面（跨会话共享同一个前台输入设备） ──
+            case "desktop_observe" -> DESKTOP_OBSERVE;
+            case "desktop_act" -> DESKTOP_ACT;
+            case "desktop_release" -> DESKTOP_RELEASE;
 
             // ── 远程生成 ──
             case "image_generate" -> REMOTE_GENERATION;
@@ -416,7 +445,9 @@ public final class ToolConcurrencyPolicy {
         return ToolSideEffect.EXTERNAL_WRITE;
     }
 
-    public static boolean isReadOnly(String name) { return name != null && READ_ONLY.contains(name); }
+    public static boolean isReadOnly(String name) {
+        return name != null && (READ_ONLY.contains(name) || "desktop_observe".equals(name));
+    }
 
     /**
      * 超时后能靠一次只读观察确定真实终态的工具。
@@ -431,8 +462,12 @@ public final class ToolConcurrencyPolicy {
     }
 
     public static boolean isIdempotent(String name) {
-        return isReadOnly(name) || "render_diagram".equals(name);
+        return isReadOnly(name) || "render_diagram".equals(name) || "desktop_release".equals(name);
     }
 
-    public static boolean isStreamPrefetchSafe(String name) { return isReadOnly(name); }
+    public static boolean isStreamPrefetchSafe(String name) {
+        // Desktop observations can include other apps' visible content and acquire
+        // an interaction lease. Only observe after the model has committed to it.
+        return isReadOnly(name) && !"desktop_observe".equals(name);
+    }
 }

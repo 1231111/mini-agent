@@ -119,7 +119,7 @@ flowchart LR
 | 内核 | 类 | 何时进 | 进之前必须有 |
 |------|-----|--------|----------------|
 | ReAct | `AgentLoop` | `shouldHandle` 为 false，含简单问答 | `systemPrompt` + `history` + `TaskPlan.toPromptBlock` |
-| 任务图 | `PlanningLoop` | `shouldHandle` 为 true | 同一份 `systemPrompt` + `history`；节点内再交给 `AgentLoop` |
+| 任务图 | `PlanningLoop` | `selectRoute` 返回 DAG（语义选择、显式 PLAN 或续跑） | 同一份 `systemPrompt` + `history`；节点内再交给 `AgentLoop` |
 
 `delegate_task` 不是第三套顶层路由。它是工具，内部再 new 一轮 `AgentLoop`（上限 25），同样传入系统提示。
 
@@ -445,7 +445,7 @@ flowchart TD
 这两件事都发生，互不代替。
 
 - **装多少**：只看一个运行时事实 —— 这个会话里有没有被挂起的 todo 清单（`ContextLoadPolicy.forSuspendedTodo(boolean)`）。有 → `CONTINUE`（恢复清单），没有 → `ACTION`（挂起上一任务的活动清单）。不再根据用户原文命中哪些词来决定。
-- **进哪个内核**：`PlanningLoop.shouldHandle`（`agent.planner.enabled=false` 或 `plan == null` 时直接 false），再看 `DecompositionPolicy.hasGraphSignal`（原文或 taskGoal 里能抽出路径或 URL），否则仅当该 scope 有未完成图且 `PlannerResumePolicy.shouldResume` 为真。
+- **进哪个内核**：`PlanningLoop.selectRoute` 先处理显式 PLAN 与当前图的续跑；新请求交由 `SemanticPlanningRouter` 根据独立产出、执行依赖、验收需求选择 direct/DAG。默认与全自动模式均可进入 DAG，权限检查仍由 `ToolPipeline` 执行。`agent.planner.enabled=false` 关闭规划器；`auto-planning=false` 仅关闭新请求的自动语义路由，保留显式 PLAN 和已有图续跑。
 
 一步就能做完的请求：上下文用 `ACTION`（记忆、技能、todo 全开），内核仍是 `AgentLoop`。
 
@@ -460,7 +460,7 @@ flowchart TD
     Q -->|是| PLAN["PlanningLoop"]
 ```
 
-进不进规划器只由 `shouldHandle` 决定，那里没有「这轮要不要结构化计划」这一档：要么原文/taskGoal 里能抽出路径或 URL（`DecompositionPolicy.hasGraphSignal`），要么该 scope 有未完成图且 `PlannerResumePolicy.shouldResume` 为真。
+新请求的拆分不靠路径、URL、任务词表或长度阈值。路由模型同时判断是否要求实际产物，并引用当前请求的连续原文作为依据；可运行网页也属于实际产物。格式或原文证据无效时最多修正一次，仍失败则记录原因并降级直跑。路由结果显式传给本轮执行器，不存放在跨轮次的线程变量中。模型分类增加一次请求延迟。
 
 ### 4.3 工具调用
 
@@ -709,9 +709,11 @@ Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 **做：** 编译、校验、调度、节点执行、验收、恢复。图是唯一事实源。  
 **不做：** 用 Todo 勾选回写节点成功；把 90 轮套在每个图节点上；`shouldHandle==false` 时 `init` 一张空图。
 
-`shouldHandle` 见 3.5.3。不接手时外层已经把系统上下文交给 `AgentLoop`。`PlanningLoop.run` 里若再次发现不该接手，会 `NodeExecutor.runDirect`（无围栏）。现网这条回退写了字面量 90，与 `ExecutionProperties` 重复。复现时注入配置，不要再抄第四个上限。
+应用入口只调用一次 `selectRoute`，把结果传给 `runWithOutcome`；`shouldHandle` 仅保留显式 PLAN 和续跑的便宜门禁。DAG 编译失败时可降级直跑，直跑结局由 `AgentLoop.LoopOutcome` 决定；失败、等待授权、空回答不会被规划器改写成完成。待审批计划的修改若校验失败，则保留原计划并等待重新修改，不执行空图或绕过审批直跑。回退路径的字面量 90 仍与 `ExecutionProperties` 重复，尚未合并。
 
-主循环：`max-outer-rounds` 默认 24。每圈续会话锁，失败则 `AGENT_PLANNER_LOCK_LOST`。`normalizeForScheduling` 后 CAS。全部 SUCCESS 则 `evaluateGraph`。否则 `GraphScheduler` 选 READY（有 RUNNING 则本圈不选），`proposal-batch-size=1`。`NodeExecutor.execute` / `executeBound` / `continueNode` 必须有 `ExecutionTurnContext`。`hard-proposal=true` 时锁工具面、禁止改其它 todo。
+`intent.inputs` 声明用户消息、附件等外部输入；节点输入也可消费依赖链祖先的 outputs，但不能消费无依赖或未来节点的输出。生成页面→浏览器验收与获取资料→写文件均为合法依赖方向。answer/action 的交付名称匹配输出端口，文件/媒体仍按精确路径校验。语义验收保留本节点多个工具回执，避免最后一次 todo 更新覆盖操作前后的证据。
+
+主循环：`max-outer-rounds` 默认 24。每圈续会话锁，失败则 `AGENT_PLANNER_LOCK_LOST`。`normalizeForScheduling` 后 CAS。全部 SUCCESS 则 `evaluateGraph`。否则 `GraphScheduler` 选 READY（有 RUNNING 则本圈不选）。当前执行器仅返回一份节点结果和证据，`PlanningLoop` 每次固定派发一个节点；`proposal-batch-size` 保留配置兼容，设置大于 1 也不会批量验收多个节点。节点内部工具仍按工具并发策略执行。`NodeExecutor.execute` / `executeBound` / `continueNode` 必须有 `ExecutionTurnContext`。`hard-proposal=true` 时锁工具面、禁止改其它 todo。
 
 节点内 ReAct：`proposal-max-iterations=8`（含 `browser_*` 时 16）× `proposal-max-chunks=6`。
 
@@ -1134,14 +1136,14 @@ V7 已删意图规则表，不要再建。
 
 1. `ContextLoadPolicy` 只有 CONTINUE / ACTION，判据是 `taskTodoStore.hasSuspended(sessionId)`。
 2. ACTION 必须挂起上一份未完成 Todo；CONTINUE 先恢复再渲染。
-3. `shouldHandle` 在 `load` 之后。false 分支把 `loaded` 传进 `AgentLoop`，true 分支把同一份传进 `PlanningLoop`。
+3. `selectRoute` 在 `load` 之后。direct 分支把 `loaded` 传进 `AgentLoop`，dag 分支把同一份传进 `PlanningLoop`。
 
 验收：「你好」不带出上一张已完成计划（ACTION 会挂起或归档它）。「继续」能恢复挂起清单，此时策略是 CONTINUE。
 
 ### 阶段 D — 规划
 
 1. `PlannerStateStore` 存 JSON 图。
-2. `shouldHandle` 条件与 3.5.3 一致。
+2. `selectRoute` 按 4.2 的语义与续跑规则选路，选择策略不改变会话权限。
 3. 节点内 `AgentLoop` 上限 8×6，入参仍含系统上下文。
 4. `TodoStateProjector` 单向投影。完成只认 `StepEvaluator`。
 

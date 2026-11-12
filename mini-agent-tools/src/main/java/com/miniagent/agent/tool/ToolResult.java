@@ -52,15 +52,15 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
         String raw = rawTextOverride != null && !rawTextOverride.isBlank()
                 ? rawTextOverride
                 : "{\"success\":false,\"status\":\"" + status.name().toLowerCase(Locale.ROOT)
-                + "\",\"errorCode\":\"" + actual + "\",\"error\":\""
-                + msg.replace("\\", "\\\\").replace("\"", "'") + "\",\"retriable\":" + retriable + "}";
+                + "\",\"errorCode\":\"" + actual + "\",\"error\":"
+                + TextNode.valueOf(msg) + ",\"retriable\":" + retriable + "}";
         return new ToolResult(status, actual, msg, data(raw), retriable, "", raw);
     }
 
     public static ToolResult unknown(String message, String rawText) {
         String msg = Objects.requireNonNullElse(message, "工具结果未知");
-        String raw = rawText == null ? "{\"success\":false,\"status\":\"unknown\",\"errorCode\":\"OUTCOME_UNKNOWN\",\"error\":\""
-                + msg.replace("\"", "'") + "\"}" : rawText;
+        String raw = rawText == null ? "{\"success\":false,\"status\":\"unknown\",\"errorCode\":\"OUTCOME_UNKNOWN\",\"error\":"
+                + TextNode.valueOf(msg) + "}" : rawText;
         return new ToolResult(ToolStatus.UNKNOWN, ToolErrorCode.OUTCOME_UNKNOWN, msg, data(raw), false, "", raw);
     }
 

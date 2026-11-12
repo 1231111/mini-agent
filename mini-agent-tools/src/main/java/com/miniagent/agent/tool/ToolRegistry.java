@@ -6,6 +6,8 @@ import org.springframework.stereotype.Component;
 
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
+import dev.langchain4j.model.chat.request.json.JsonArraySchema;
+import dev.langchain4j.model.chat.request.json.JsonStringSchema;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -303,6 +305,8 @@ public class ToolRegistry {
                     boolean isRequired = Boolean.TRUE.equals(def.get("required"));
 
                     switch (type) {
+                        case "array" -> schema.addProperty(paramName, JsonArraySchema.builder()
+                                .description(desc).items(new JsonStringSchema()).build());
                         case "integer" -> {
                             if (StringUtils.isBlank(desc)) {
                                 schema.addIntegerProperty(paramName);

@@ -11,7 +11,6 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.core.annotation.Order;
 import org.springframework.beans.factory.annotation.Value;
 
-import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -130,10 +129,7 @@ public class ContextContributorConfiguration {
     @Order(90)
     SystemContextContributor closingContributor() {
         return ctx -> {
-            ZoneId zone;
-            try { zone = ZoneId.of(configuredTimeZone); }
-            catch (Exception ignored) { zone = ZoneId.systemDefault(); }
-            ZonedDateTime now = ZonedDateTime.now(zone);
+            ZonedDateTime now = RelativeDateGuidance.resolveNow(configuredTimeZone);
             return ContextFragment.of(ContextSlot.CLOSING,
                     PromptTemplates.UNTRUSTED_DATA_RULES + "\n\n"
                             + (ctx.fullAuto() ? PromptTemplates.FULL_AUTO_CONFIRMATION
@@ -170,6 +166,14 @@ public class ContextContributorConfiguration {
         parts.add(PromptTemplates.BEHAVIOR);
         if (toolNames.contains("browser_navigate")) {
             parts.add(PromptTemplates.BROWSER_GUIDANCE);
+        }
+        if (toolNames.contains("desktop_observe")) {
+            parts.add("桌面任务使用 desktop_observe → desktop_act → 核对新截图的反馈循环。网页优先使用 browser 工具。"
+                    + "坐标为当前窗口截图物理像素；每次动作使用最新 observationId，旧观察失效必须重新观察。"
+                    + "需要切换应用时只用观察中 windows 列表的 targetWindowId 执行 focus。"
+                    + "输入已接收不等于任务完成，必须验证界面结果；结果未知时先观察，禁止重复提交。"
+                    + "暂停或交还用户前释放桌面租约。不要用Shell绕过动作审批，不自动接受系统权限。"
+                    + "DAG只拆业务交付步骤，不把每次点击、输入或截图拆成长期任务节点。");
         }
         // 只在真有 image_generate 时讲降级：没有它就没有「不可用后改走 render_diagram」这回事，
         // 无条件注入等于往每轮提示词里塞一段用不上的规则。

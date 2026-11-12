@@ -108,3 +108,78 @@ function mediaSrcAttr(url) {
     return `data-auth-src="${escA(url)}"`;
 }
 
+/** Bare filenames in prose are code references; only explicit paths or attachment-only lines become files. */
+function renderMarkdownCodeToken(codeText, source, offset, tokenLength) {
+    const openLabel = source.lastIndexOf('[', offset);
+    const closeLabel = source.lastIndexOf(']', offset);
+    const labelEnd = source.indexOf('](', offset + tokenLength);
+    if (openLabel > closeLabel && labelEnd >= 0 && !source.slice(offset, labelEnd).includes('\n'))
+        return '<code>' + codeText + '</code>'; // code inside a link label must never become a nested anchor
+    const lineStart = source.lastIndexOf('\n', offset - 1) + 1;
+    const lineEnd = source.indexOf('\n', offset + tokenLength);
+    const before = source.slice(lineStart, offset).trim();
+    const after = source.slice(offset + tokenLength, lineEnd < 0 ? source.length : lineEnd).trim();
+    const standalone = /^(?:[-*]|\d+\.)?$/.test(before) && /^[，,。.;；]?$/.test(after);
+    const explicitPath = /^(?:workspace[\/\\]|[A-Za-z]:[\/\\]|\/)/i.test(codeText);
+    const file = standalone || explicitPath ? inlineMarkdownFileLink(codeText) : null;
+    return file || '<code>' + codeText + '</code>';
+}
+
+/** Keep prose links inline; promote only attachment-only lines into a compact responsive grid. */
+function layoutMarkdownFiles(markup) {
+    if (!markup.includes('workspace-download-link') || typeof document === 'undefined') return markup;
+    const template = document.createElement('template');
+    template.innerHTML = markup;
+    const root = template.content;
+    const links = [...root.querySelectorAll('a.workspace-download-link')];
+    links.forEach(link => link.classList.add('workspace-file-chip'));
+    const onlyFiles = node => {
+        const copy = node.cloneNode(true);
+        copy.querySelectorAll('a.workspace-download-link').forEach(link => link.remove());
+        if (copy.querySelector('img,video,audio,pre,code,table,a,button,input')) return false;
+        return /^(?:(?:附件|交付文件|生成文件|文件)\s*[:：]?\s*)?[\s，,。.;；·]*$/.test(copy.textContent || '');
+    };
+    const promote = (node, files) => {
+        const grid = document.createElement('div');
+        grid.className = 'workspace-attachment-grid';
+        grid.setAttribute('aria-label', '任务文件');
+        files.forEach(link => {
+            link.classList.remove('workspace-file-chip');
+            link.classList.add('workspace-attachment-card');
+            grid.appendChild(link);
+        });
+        node.replaceWith(grid);
+    };
+    if (links.length && onlyFiles(root)) {
+        const grid = document.createElement('div');
+        grid.className = 'workspace-attachment-grid';
+        grid.setAttribute('aria-label', '任务文件');
+        links.forEach(link => {
+            link.classList.remove('workspace-file-chip');
+            link.classList.add('workspace-attachment-card');
+            grid.appendChild(link);
+        });
+        root.replaceChildren(grid);
+        return template.innerHTML;
+    }
+    // Lists containing only files are one attachment group, without empty bullets or dangling punctuation.
+    [...root.querySelectorAll('ul,ol')].forEach(list => {
+        const files = [...list.querySelectorAll('a.workspace-download-link')];
+        if (files.length && onlyFiles(list)) promote(list, files);
+    });
+    [...root.querySelectorAll('p')].forEach(paragraph => {
+        const files = [...paragraph.querySelectorAll('a.workspace-file-chip')];
+        if (files.length && onlyFiles(paragraph)) promote(paragraph, files);
+    });
+    // Consecutive standalone file paragraphs should form one grid.
+    [...root.querySelectorAll('.workspace-attachment-grid')].forEach(grid => {
+        while (grid.nextSibling && (grid.nextSibling.nodeType === 3 && !grid.nextSibling.textContent.trim()
+                || grid.nextSibling.nodeType === 1 && grid.nextSibling.matches('br,.workspace-attachment-grid'))) {
+            const next = grid.nextSibling;
+            if (next.nodeType === 1 && next.matches('.workspace-attachment-grid')) grid.append(...next.children);
+            next.remove();
+        }
+    });
+    return template.innerHTML;
+}
+

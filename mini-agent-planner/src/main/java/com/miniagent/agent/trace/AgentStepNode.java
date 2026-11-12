@@ -31,6 +31,7 @@ public enum AgentStepNode {
     TASK_PLAN("执行计划", "执行计划定案", "TaskPlan（目标/工具白名单/预置步骤）", true, true),
 
     // —— 生产级 Planner（Goal / DAG / Proposal / Recovery）——
+    PLANNING_ROUTE("规划控制", "选择执行策略", "按语义依赖选择 direct / DAG，不改变工具权限", true, false),
     GOAL_COMPILED("规划控制", "目标编译完成", "NL → Goal + TaskGraph", true, true),
     GRAPH_UPDATED("规划控制", "任务图更新", "DAG 节点状态或结构变更", true, true),
     PROPOSAL("规划控制", "动作提案", "ActionProposal（basedOnVersion + actions）", true, true),

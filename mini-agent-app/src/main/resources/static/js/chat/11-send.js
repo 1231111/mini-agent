@@ -98,6 +98,9 @@ async function chatHttpErrorMessage(resp) {
 /** POST /api/conversations/{id}/messages/stream，读 SSE 流式响应 */
 async function sendChatPost(text, sessionId, files, refs, botBody, questionCard) {
     const epoch = ++streamEpoch;
+    const loadEpoch = window._msgLoadEpoch;
+    const isCurrentSend = () => sessionId === currentId
+        && loadEpoch === window._msgLoadEpoch && epoch === streamEpoch;
     beginUserQuestionAnswer(questionCard);
     try {
         let images = [];
@@ -132,11 +135,17 @@ async function sendChatPost(text, sessionId, files, refs, botBody, questionCard)
             body: JSON.stringify(body)
         });
 
+        if (!isCurrentSend()) {
+            if (resp.body) await resp.body.cancel().catch(() => {});
+            return;
+        }
         if (!resp.ok || !resp.body) {
-            botBody.textContent = await chatHttpErrorMessage(resp);
+            const message = await chatHttpErrorMessage(resp);
+            if (!isCurrentSend()) return;
+            botBody.textContent = message;
             botBody.classList.remove('streaming');
             resetUserQuestionCard(questionCard, '回复未发送，请检查原因后重试。');
-            if (epoch === streamEpoch) {
+            if (isCurrentSend()) {
                 setStreaming(false); onInputChange(); scrollToBottom();
             }
             return;
@@ -146,12 +155,13 @@ async function sendChatPost(text, sessionId, files, refs, botBody, questionCard)
 
         // 读 SSE 流
         await consumeStream(resp.body.getReader(), botBody, sessionId);
-        if (isStreaming && epoch === streamEpoch) unlockComposer();
+        if (isStreaming && isCurrentSend()) unlockComposer();
     } catch (err) {
+        if (!isCurrentSend()) return;
         botBody.innerHTML = renderMD('❌ ' + err.message);
         botBody.classList.remove('streaming');
         resetUserQuestionCard(questionCard, '回复未发送，请检查网络后重试。');
-        if (epoch === streamEpoch) {
+        if (isCurrentSend()) {
             setStreaming(false); onInputChange(); scrollToBottom();
         }
     }
@@ -160,6 +170,10 @@ async function sendChatPost(text, sessionId, files, refs, botBody, questionCard)
 /** 复用的 SSE 渲染：首次发送与刷新重连共用同一套增量渲染逻辑 */
 const MAX_STREAM_RECONNECTS = 3;  // 单次发送内流意外中断后最多自动重连次数
 async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
+  const loadEpoch = window._msgLoadEpoch;
+  const activeEpoch = streamEpoch;
+  const isCurrentStream = () => sessionId === currentId
+      && loadEpoch === window._msgLoadEpoch && activeEpoch === streamEpoch;
   try {
         const decoder = new TextDecoder('utf-8');
         let buffer = '', answer = '', done = false;
@@ -188,9 +202,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         // Only real decomposed task nodes produce a progress card. Model turns and
         // free-form subgoal messages do not imply a measurable task percentage.
         let todoItems = null;
-        let todoEl = null, todoListEl = null;
-        let todoProgressTitleEl = null;
-        let todoProgressMetaEl = null, todoProgressFillEl = null;
+        let todoEl = null;
         function clearOnce() { if (!cleared) { botBody.innerHTML = ''; cleared = true; } }
         function firstInteractionCard() {
             return botBody.querySelector('.user-question-card, .permission-request-card');
@@ -217,6 +229,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
          * 前缀被改写时发生（重连后从头来过），且只发生一次。
          */
         function paintAnswerNow() {
+            if (!isCurrentStream()) return;
             removeTyping();
             ensureAnswer();
             answerEl.classList.toggle('has-content', !!answer.trim());
@@ -303,6 +316,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             if (panelEl) panelEl.classList.add('collapsed');
         }
         function finish(html, cancelled, incomplete) {
+            if (!isCurrentStream()) return;
             if (done) return; done = true;
             turnWaiting = taskOutcomeStatus === 'WAITING';
             turnCancelled = taskOutcomeStatus === 'CANCELED' || (!taskOutcomeStatus && !!cancelled);
@@ -450,137 +464,28 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             answerEl.appendChild(answerTailEl);
             renderedFrozen = '';
             renderedTail = '';
-            // 回复正文排在任务进度卡前；思考恒在链尾，正文与进度都在它之上。
-            insertAt(botBody, answerEl, todoEl || firstInteractionCard() || panelEl);
+            // 任务节点在前，最终回复在后；与 SSE 事件到达顺序无关。
+            insertAt(botBody, answerEl, firstInteractionCard() || panelEl);
         }
         /** The DAG/todo snapshot is the only source of node progress. */
         function paintTodo() {
             if (!todoItems) return;
+            clearOnce();
             botBody.querySelectorAll('.task-status-card').forEach(card => card.remove());
             const botRow = botBody.closest('.bot-row');
             const previousRow = botRow && botRow.previousElementSibling;
             if (previousRow && previousRow.classList.contains('plan-row')) previousRow.remove();
-
-            if (!todoItems.length) {
-                if (todoEl) todoEl.remove();
-                todoEl = todoListEl = null;
-                todoProgressTitleEl = todoProgressMetaEl = todoProgressFillEl = null;
-                return;
-            }
-
-            if (!todoEl) {
-                clearOnce();
-                botBody.querySelectorAll('.todo-panel').forEach(card => card.remove());
-                todoEl = document.createElement('section');
-                todoEl.className = 'todo-panel';
-                todoEl.setAttribute('aria-label', '任务节点进度');
-
-                const progressCard = document.createElement('div');
-                progressCard.className = 'todo-progress-card';
-                const top = document.createElement('div');
-                top.className = 'todo-progress-top';
-                todoProgressTitleEl = document.createElement('div');
-                todoProgressTitleEl.className = 'todo-progress-title';
-                todoProgressMetaEl = document.createElement('span');
-                todoProgressMetaEl.className = 'todo-progress-meta';
-                top.append(todoProgressTitleEl, todoProgressMetaEl);
-                const track = document.createElement('div');
-                track.className = 'todo-progress-track';
-                track.setAttribute('role', 'progressbar');
-                track.setAttribute('aria-label', '已完成的任务节点');
-                track.setAttribute('aria-valuemin', '0');
-                track.setAttribute('aria-valuemax', '100');
-                todoProgressFillEl = document.createElement('div');
-                todoProgressFillEl.className = 'todo-progress-fill';
-                track.appendChild(todoProgressFillEl);
-                progressCard.append(top, track);
-                todoListEl = document.createElement('ol');
-                todoListEl.className = 'todo-list';
-                todoEl.append(progressCard, todoListEl);
-                insertAt(botBody, todoEl, firstInteractionCard() || panelEl);
-            }
-
-            // Cancelled nodes remain visible, but are never counted as completed.
-            const scheduled = todoItems.filter(item => item.status !== 'cancelled');
-            const completed = scheduled.filter(item => item.status === 'completed').length;
-            const total = scheduled.length;
-            const percent = total ? Math.round(completed * 100 / total) : 0;
-            const live = isStreaming && !done;
-            const current = todoItems.find(item => item.status === 'awaiting_confirm')
-                || todoItems.find(item => item.status === 'in_progress')
-                || todoItems.find(item => item.status === 'blocked')
-                || todoItems.find(item => item.status === 'pending');
-            let heading, state;
-            if (turnWaiting) {
-                heading = current ? '等待你的操作：' + current.content : '任务等待你的操作'; state = 'waiting';
-            } else if (turnIncomplete) {
-                heading = '任务未完成，连接已中断'; state = 'blocked';
-            } else if (turnFailed) {
-                heading = '任务执行失败'; state = 'blocked';
-            } else if (turnCancelled && taskOutcomeStatus === 'CANCELED') {
-                heading = '任务已取消'; state = 'idle';
-            } else if (!total) {
-                heading = '任务步骤已取消'; state = 'idle';
-            } else if (completed === total) {
-                heading = '所有任务节点已完成'; state = 'done';
-            } else if (current && current.status === 'awaiting_confirm') {
-                heading = '等待确认：' + current.content; state = 'waiting';
-            } else if (current && current.status === 'blocked') {
-                heading = '步骤受阻：' + current.content; state = 'blocked';
-            } else if (live && current) {
-                heading = (current.status === 'in_progress' ? '正在执行：' : '准备执行：') + current.content;
-                state = 'running';
-            } else {
-                heading = turnCancelled ? '任务已停止' : '任务步骤待继续';
-                state = 'idle';
-            }
-            todoEl.dataset.state = state;
-            todoProgressTitleEl.textContent = heading;
-            todoProgressMetaEl.textContent = completed + '/' + total + ' 已完成';
-            todoProgressFillEl.style.width = percent + '%';
-            todoProgressFillEl.parentElement.setAttribute('aria-valuenow', String(percent));
-            todoListEl.innerHTML = '';
-            const labels = {
-                completed: '已完成', in_progress: live ? '进行中' : '待继续',
-                pending: '待执行', awaiting_confirm: '待确认',
-                blocked: '受阻', cancelled: '已取消'
-            };
-            for (const item of todoItems) {
-                const status = item.status || 'pending';
-                const li = document.createElement('li');
-                li.className = 'todo-item ' + status + (!live && status === 'in_progress' ? ' idle' : '');
-                li.dataset.nodeId = String(item.id);
-                const mark = document.createElement('span');
-                mark.className = 'todo-mark';
-                mark.setAttribute('aria-hidden', 'true');
-                const text = document.createElement('span');
-                text.className = 'todo-text';
-                text.textContent = item.content || '';
-                const label = document.createElement('span');
-                label.className = 'todo-node-state';
-                label.textContent = labels[status] || '待执行';
-                li.append(mark, text, label);
-                if (status === 'awaiting_confirm') {
-                    const button = document.createElement('button');
-                    button.type = 'button';
-                    button.className = 'todo-confirm-btn';
-                    button.textContent = '确认并继续';
-                    button.disabled = live;
-                    button.onclick = function (event) {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        confirmTodoAndContinue(item.id);
-                    };
-                    li.appendChild(button);
-                }
-                todoListEl.appendChild(li);
-            }
+            todoEl = renderTaskProgress(botBody, todoItems, {
+                live: isStreaming && !done, waiting: turnWaiting, incomplete: turnIncomplete,
+                failed: turnFailed, cancelled: turnCancelled, status: taskOutcomeStatus, allowConfirm: true
+            });
         }
         function removeTyping() {
             const t = botBody.querySelector('.typing-dots');
             if (t) t.remove();
         }
         function paint() {
+            if (!isCurrentStream()) return;
             // 思考只有一条出口：.think-panel，钉在本轮气泡最上方。
             // 与任务节点进度无关，节点卡片只展示结构化的执行步骤。
             if (thinkText) {
@@ -763,6 +668,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         }
 
         function onEvent(name, data) {
+            if (!isCurrentStream()) return;
             if (name === 'thinking') {
                 thinkText += data;
                 if (thinkText.length > MAX_THINK_CHARS)
@@ -891,6 +797,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
          * 定义在闭包内，可访问 answer/done/finish 等流状态。
          */
         async function tryResumeOrFinish(err) {
+            if (!isCurrentStream()) return;
             if (reconnectAttempt >= MAX_STREAM_RECONNECTS) {
                 if (answer) finish(renderMD(answer), false, true);
                 else finish(renderMD('❌ 连接多次中断，请重试' + (err ? '：' + err.message : '')), false, true);
@@ -902,6 +809,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 const r = await fetch('/api/conversations/' + encodeURIComponent(sessionId) + '/task');
                 if (r.ok) stillRunning = (await apiJson(r) || {}).running === true;
             } catch (e) { /* 探测失败按未运行处理 */ }
+            if (!isCurrentStream()) return;
 
             if (!stillRunning) {
                 if (answer) finish(renderMD(answer), false, true);
@@ -915,12 +823,18 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
 
             // 退避后挂到 attach 端点，复用同一 botBody 续流
             await new Promise(res => setTimeout(res, 800 * (reconnectAttempt + 1)));
+            if (!isCurrentStream()) return;
             try {
                 const resp = await fetch('/api/conversations/' + encodeURIComponent(sessionId) + '/messages/stream');
+                if (!isCurrentStream()) {
+                    if (resp.body) await resp.body.cancel().catch(() => {});
+                    return;
+                }
                 if (!resp.ok || !resp.body) throw new Error('attach HTTP ' + resp.status);
                 done = true; // 交棒给重连流，避免本帧再次走收尾分支
                 await consumeStream(resp.body.getReader(), botBody, sessionId, reconnectAttempt + 1);
             } catch (e) {
+                if (!isCurrentStream()) return;
                 console.warn('resume stream failed:', e);
                 if (answer) finish(renderMD(answer), false, true);
                 else {
@@ -935,6 +849,10 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         try {
             while (true) {
                 const { value, done: streamDone } = await reader.read();
+                if (!isCurrentStream()) {
+                    if (typeof reader.cancel === 'function') await reader.cancel().catch(() => {});
+                    return;
+                }
                 if (streamDone) break;
                 buffer += decoder.decode(value, { stream: true });
                 const events = buffer.split('\n\n');
@@ -957,6 +875,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             if (!done) await tryResumeOrFinish(readErr);
         }
     } catch (err) {
+        if (!isCurrentStream()) return;
         botBody.innerHTML = renderMD('❌ ' + err.message);
         botBody.classList.remove('streaming');
         setStreaming(false); onInputChange(); scrollToBottom();

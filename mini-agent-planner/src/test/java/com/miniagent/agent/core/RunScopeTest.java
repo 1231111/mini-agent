@@ -12,6 +12,7 @@ import com.miniagent.agent.permission.SessionPermissionStore;
 import com.miniagent.agent.todo.TaskTodoContext;
 import com.miniagent.agent.tool.BuiltinTools;
 import com.miniagent.agent.tool.WorkspaceContext;
+import com.miniagent.agent.web.SearchDateContext;
 import com.miniagent.memory.MemoryStore;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -42,6 +43,7 @@ class RunScopeTest {
         BuiltinTools.clearCurrentTaskName();
         WorkspaceContext.clearTaskOverride();
         WorkspaceContext.clearRootOverride();
+        SearchDateContext.set(null);
         OwnerContext.clearCurrentUser();
         OwnerContext.clearCurrentTenant();
     }
@@ -70,6 +72,35 @@ class RunScopeTest {
             assertEquals(42L, TaskExecutionContext.currentTaskId());
         }
         assertEquals(0L, TaskExecutionContext.currentTaskId());
+    }
+
+    @Test
+    void trustedSearchDatesPropagateToWorkersAndSubagentsWithoutLeaking() throws Exception {
+        var window = SearchDateContext.fromRequest("今日AI新闻",
+                java.time.Instant.parse("2026-11-12T02:20:34Z"), java.time.ZoneId.of("Asia/Shanghai"));
+        RunScope parent;
+        try (var ignored = SearchDateContext.bind(window)) {
+            parent = RunScope.capture().withSession("parent");
+        }
+        assertNull(SearchDateContext.current());
+        var child = parent.asSubagent("child", "researcher", PermissionMode.DEFAULT, null);
+        try (var pool = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            assertSame(window, pool.submit(() -> {
+                try (var ignored = child.bind()) {
+                    assertEquals("child", AgentLoop.getCurrentSession());
+                    return SearchDateContext.current();
+                }
+            }).get());
+            assertNull(pool.submit(SearchDateContext::current).get(), "reused worker must not retain another run's dates");
+        }
+        var yesterday = SearchDateContext.fromRequest("昨日AI新闻", window.asOf(), window.zone());
+        try (var ignored = SearchDateContext.bind(yesterday)) {
+            try (var worker = parent.bind()) {
+                assertSame(window, SearchDateContext.current());
+            }
+            assertSame(yesterday, SearchDateContext.current());
+        }
+        assertNull(SearchDateContext.current());
     }
 
     @Test

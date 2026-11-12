@@ -109,6 +109,8 @@ public class AgentLoop {
     private ExecutionControl executionControl;
     @Autowired
     private ContextCompressor contextCompressor;
+    @Autowired(required = false)
+    private ToolVisionModelResolver toolVisionModelResolver;
     @Autowired
     private StreamingChatModel streamingChatModel;
     @Autowired
@@ -195,7 +197,7 @@ public class AgentLoop {
     public static ChatModel getCurrentChatModel() { return EffectiveModelContext.currentChat(); }
     public static StreamingChatModel getCurrentStreamingModel() { return EffectiveModelContext.currentStreaming(); }
     private static final int MAX_EXPLORATION_CALLS = 40;  // read_file + list_files + exec_command 总上限（放开：复杂任务定位文件常需多次读取）
-    /** 非规划任务的网页/HTTP/浏览器调用上限。到顶后收掉这类工具，避免检索螺旋把每一轮推理都再跑一遍。 */
+    /** 网页/HTTP 检索上限。浏览器交互由动作预算控制，不能八次点击就被当作搜索螺旋关掉。 */
     static final int RETRIEVAL_CALL_CAP = 8;
     /** 安全网关拒答只再试一轮。同一份长摘要重发会再次被拒。 */
     private static final int REFUSE_RECOVERY_CAP = 1;
@@ -287,6 +289,8 @@ public class AgentLoop {
             Map.entry("list_files",         2000),
             Map.entry("image_generate",     1000),
             Map.entry("browser_screenshot", 1000),
+            Map.entry("desktop_observe",    4000),
+            Map.entry("desktop_act",        4000),
             Map.entry("read_package",       15000)
     );
     /** 未在 TOOL_RESULT_LIMITS 中的工具使用此默认值 */
@@ -534,6 +538,11 @@ public class AgentLoop {
         final Set<String> toolsInvoked = new LinkedHashSet<>();
         ToolErrorCode lastErrorCode = ToolErrorCode.NONE;
         ToolResult lastToolResult;
+        final List<ToolObservationProjector.Observation> pendingObservations = new ArrayList<>();
+        UserMessage latestObservation;
+        ToolVisionModelResolver.Models visionModels;
+        boolean desktopImageGrounded;
+        boolean observationProjectionFailed;
         boolean writeFileSucceeded = false;
         boolean mediaDelivered = false;
         String lastMediaResult = null;
@@ -568,6 +577,11 @@ public class AgentLoop {
         volatile Set<String> allowedToolsForTurn = Set.of();
 
         void noteStructuredResult(String toolName, ToolResult result) {
+            if ("desktop_observe".equals(toolName) || "desktop_act".equals(toolName) || "desktop_release".equals(toolName)) {
+                // A new input/capture attempt invalidates the previous frame. Only
+                // successful image projection at the batch boundary can reopen input.
+                desktopImageGrounded = false;
+            }
             if (result == null) {
                 return;
             }
@@ -639,6 +653,9 @@ public class AgentLoop {
             reason = RunStatus.FAILURE.name();
         }
         state.loopEndReason = reason;
+        // Tool screenshots are short-lived evidence, not persisted conversation attachments.
+        messages = new ArrayList<>(messages);
+        ToolObservationProjector.stripImages(messages);
         return new LoopOutcome(
                 text == null ? "" : text,
                 reason,
@@ -646,6 +663,32 @@ public class AgentLoop {
                 List.copyOf(state.toolsInvoked),
                 state.lastErrorCode,
                 state.lastToolResult);
+    }
+
+    /** Recovery may drop old assistant chatter, but never user intent or half a tool batch. */
+    static List<ChatMessage> recoveryHistory(List<ChatMessage> messages) {
+        int headEnd = 0;
+        while (headEnd < messages.size() && messages.get(headEnd) instanceof SystemMessage) headEnd++;
+        int tailStart = Math.max(headEnd, messages.size() - 10);
+        Map<String, Integer> calls = new HashMap<>();
+        for (int i = 0; i < messages.size(); i++) {
+            if (messages.get(i) instanceof AiMessage ai && ai.hasToolExecutionRequests()) {
+                for (var call : ai.toolExecutionRequests()) calls.put(call.id(), i);
+            }
+        }
+        for (int i = messages.size() - 1; i >= tailStart; i--) {
+            if (messages.get(i) instanceof ToolExecutionResultMessage result) {
+                Integer callIndex = calls.get(result.id());
+                if (callIndex != null) tailStart = Math.min(tailStart, callIndex);
+            }
+        }
+        List<ChatMessage> retained = new ArrayList<>();
+        for (int i = 0; i < messages.size(); i++) {
+            ChatMessage message = messages.get(i);
+            boolean userInstruction = message instanceof UserMessage && !ToolObservationProjector.isObservation(message);
+            if (i < headEnd || i >= tailStart || userInstruction) retained.add(message);
+        }
+        return retained;
     }
 
     // ==================== executeLoop ====================
@@ -660,6 +703,13 @@ public class AgentLoop {
         int iterations = executionProperties.capIterations(maxIterations);
 
         LoopState state = new LoopState();
+        if (messages.stream().anyMatch(ToolObservationProjector::isObservation)) {
+            messages = new ArrayList<>(messages);
+            ToolObservationProjector.stripImages(messages);
+            messages.add(new SystemMessage("【工具观察需刷新】历史工具截图已从上下文移除。"
+                    + "继续桌面操作前必须重新 desktop_observe，等本轮视觉模型实际看到新图后再 desktop_act。"
+                    + "不能按历史截图猜坐标；继续遵循原始用户目标与当前 DAG 步骤。DOM 浏览器操作仍按有效 ref 执行。"));
+        }
         boolean explicitlyNeedsFile = EXPLICIT_FILE_REQ.matcher(
                 Optional.ofNullable(userTextForFilePattern).orElse("")).find();
         String taskGoal = summarizeTaskGoal(
@@ -755,6 +805,23 @@ public class AgentLoop {
             }
 
             var specsForTurn = specsAndBindTurnTools(base, state, messages);
+            boolean needsToolVision = state.latestObservation != null
+                    && ToolObservationProjector.hasImages(List.of(state.latestObservation));
+            if (needsToolVision && state.visionModels == null) {
+                try {
+                    if (toolVisionModelResolver == null) {
+                        throw new IllegalStateException("Tool vision model resolver unavailable");
+                    }
+                    state.visionModels = Objects.requireNonNull(toolVisionModelResolver.resolve());
+                } catch (RuntimeException unavailable) {
+                    log.warn("工具截图无法解析视觉模型: {}", unavailable.getClass().getSimpleName());
+                    state.loopEndReason = RunStatus.FAILURE.name();
+                    state.noteStructuredResult("tool_vision", ToolResult.failure(
+                            ToolErrorCode.DEPENDENCY_UNAVAILABLE,
+                            "已获得工具截图，但视觉模型不可用。请配置可接收图片的视觉模型后重试。", false));
+                    return finish(state.lastToolResult.message(), state, messages);
+                }
+            }
             log.info("Agent循环第 {}/{} 轮: {}, messages={}, availableTools={}, alreadyInvoked={}",
                     turn + 1, iterations, truncate(subGoalLog, 80), messages.size(),
                     specsForTurn.size(), state.toolsInvoked);
@@ -766,6 +833,11 @@ public class AgentLoop {
             // 预算 = 模型窗口（或配置上限）− 工具 schema 开销：schema 每轮都发，
             // 不计入的话真实 prompt 会比估算大一截，压缩永远偏晚。
             int window = effectiveContextTokens();
+            if (needsToolVision) {
+                int configuredWindow = maxContextTokens > 0 ? maxContextTokens : 512000;
+                int visionWindow = state.visionModels.contextWindowTokens();
+                window = visionWindow > 0 ? Math.min(configuredWindow, visionWindow) : configuredWindow;
+            }
             int schemaTokens = toolSchemaTokenEstimate(specsForTurn.size());
             int budget = Math.max(1000, window - schemaTokens);
             // 压缩是**同步阻塞**的：执行到这里本轮就不再往下走，压完才发请求。
@@ -773,7 +845,13 @@ public class AgentLoop {
             int observed = observedMessageTokens(sessionId, schemaTokens);
             ContextCompressor.CompressResult cr =
                     contextCompressor.maybeCompress(messages, budget, sessionId, observed);
-            messages = cr.messages();
+            messages = new ArrayList<>(cr.messages());
+            // Compression may fold old user messages. Reattach only the latest actual
+            // screenshot, after the complete tool batch, so subsequent actions stay grounded.
+            if (needsToolVision && !messages.contains(state.latestObservation)) {
+                ToolObservationProjector.stripImages(messages);
+                messages.add(state.latestObservation);
+            }
             // 每轮把判据的分子分母都打出来。没有这行时"压缩为什么没触发"只能靠猜：
             // 真实 usage 含工具 schema、本地估算偏低、预算被 schema 扣掉，三个数各不相同，
             // 任何一个缺失都会让人误判成"阈值配错了"。
@@ -812,8 +890,17 @@ public class AgentLoop {
             }
             log.info("开始调用 LLM（流式={}，工具数={}）…", Objects.nonNull(streamSink), specsForTurn.size());
             long llmStartMs = System.currentTimeMillis();
-            ChatResponse response = callLlm(chatModel, messages, specsForTurn,
-                    !specsForTurn.isEmpty(), streamSink);
+            ChatResponse response;
+            if (needsToolVision) {
+                var vision = state.visionModels;
+                try (var ignored = EffectiveModelContext.bind(vision.chat(), vision.streaming(), vision.contextWindowTokens())) {
+                    response = callLlm(vision.chat(), vision.streaming(), messages, specsForTurn,
+                            !specsForTurn.isEmpty(), streamSink);
+                }
+            } else {
+                response = callLlm(chatModel, Optional.ofNullable(getCurrentStreamingModel()).orElse(streamingChatModel),
+                        messages, specsForTurn, !specsForTurn.isEmpty(), streamSink);
+            }
             log.info("LLM 调用结束，耗时 {}ms，response={}",
                     System.currentTimeMillis() - llmStartMs, Objects.isNull(response) ? "null" : "ok");
             long llmEndMs = System.currentTimeMillis();
@@ -886,27 +973,16 @@ public class AgentLoop {
                     messages.add(new SystemMessage(MessageConstants.AGENT_LLM_NETWORK_RECONNECT));
                     continue;
                 } else if (state.llmFailureCount == 2 && messages.size() > 20) {
-                    log.warn("LLM 连续失败 2 次且上下文过长（{} 条），裁剪至最近 10 条后做最终尝试", messages.size());
+                    log.warn("LLM 连续失败 2 次且上下文过长（{} 条），保留用户指令和最近完整工具轮后做最终尝试", messages.size());
                     if (Objects.nonNull(traceRecorder)) {
                         traceRecorder.recordLlmRetry(sessionId, turn, "trim_context", state.llmFailureCount);
                     }
                     if (Objects.nonNull(streamSink)) {
                         streamSink.onThinking("\n（第二次重试失败，正在精简上下文后做最后尝试...）\n");
                     }
-                    List<ChatMessage> trimmed = new ArrayList<>();
-                    int sysEnd = 0;
-                    for (int i = 0; i < Math.min(5, messages.size()); i++) {
-                        if (messages.get(i) instanceof SystemMessage) {
-                            sysEnd = i + 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    trimmed.addAll(messages.subList(0, sysEnd));
-                    int keep = Math.min(10, messages.size() - sysEnd);
-                    trimmed.addAll(messages.subList(messages.size() - keep, messages.size()));
-                    messages = trimmed;
+                    messages = recoveryHistory(messages);
                     state.currentSubGoalMsg = null;
+                    state.goalAnchorInjected = false;
                     continue;
                 } else {
                     log.error("LLM 调用连续失败 {} 次（已尝试恢复与降级），任务终止", state.llmFailureCount);
@@ -1012,6 +1088,10 @@ public class AgentLoop {
                     return finish("工具调用可能已产生副作用，但终态无法确认。"
                             + state.unknownOutcomeMessage + " 请先核验实际状态，再决定是否重试或补偿。",
                             state, messages);
+                }
+                if (state.observationProjectionFailed) {
+                    state.loopEndReason = RunStatus.FAILURE.name();
+                    return finish(state.lastToolResult.message(), state, messages);
                 }
                 if (state.permissionAskTool != null) {
                     log.info("等待用户批准工具 {}", state.permissionAskTool);
@@ -1201,6 +1281,9 @@ public class AgentLoop {
         if (state.imageGenerateUnavailable) {
             names.remove("image_generate");
         }
+        // This allowlist is also enforced by ToolPipeline; a text model cannot
+        // bypass the visual-grounding requirement by inventing a desktop_act call.
+        if (!state.desktopImageGrounded) names.remove("desktop_act");
         if (!LoopTurnContext.current().hardGate()
                 && state.explorationCount >= MAX_EXPLORATION_CALLS) {
             names.remove("read_file");
@@ -1213,10 +1296,10 @@ public class AgentLoop {
             names.removeIf(AgentLoop::isRetrievalTool);
             if (names.size() != before && !state.retrievalClosedNote) {
                 messages.add(new SystemMessage(
-                        "【检索已够】网页搜索、页面提取、浏览器和 HTTP 本轮不再提供。"
+                        "【检索已够】网页搜索、页面提取和 HTTP 本轮不再提供。"
                                 + "根据已经拿到的材料直接回答，不要再检索。"));
                 state.retrievalClosedNote = true;
-                log.info("检索调用已达 {} 次，关闭网页/HTTP/浏览器工具", state.retrievalCalls);
+                log.info("检索调用已达 {} 次，关闭网页/HTTP检索工具", state.retrievalCalls);
             }
         }
         PermissionMode mode = PermissionContext.mode();
@@ -1298,6 +1381,9 @@ public class AgentLoop {
         for (int i = messages.size() - 1; i >= 0; i--) {
             ChatMessage m = messages.get(i);
             if (m instanceof SystemMessage) {
+                continue;
+            }
+            if (ToolObservationProjector.isObservation(m)) {
                 continue;
             }
             if (m instanceof UserMessage) {
@@ -1402,7 +1488,7 @@ public class AgentLoop {
     // ==================== LLM 调用 ====================
 
     /** 调用 LLM 并记录 token 用量。streamSink 非空时走流式桥接，实时推送思考/答案增量。 */
-    private ChatResponse callLlm(ChatModel chatModel, List<ChatMessage> messages,
+    private ChatResponse callLlm(ChatModel chatModel, StreamingChatModel selectedStreamingModel, List<ChatMessage> messages,
                                   List<?> specsForTurn, boolean hasTools, AgentStreamSink streamSink) {
         ChatRequest.Builder reqBuilder = ChatRequest.builder().messages(messages);
         if (hasTools && !specsForTurn.isEmpty()) {
@@ -1418,9 +1504,20 @@ public class AgentLoop {
             boolean resetBeforeCall = attempted && streamSink != null;
             attempted = true;
             try {
-                ChatResponse response = Objects.isNull(streamSink)
+                ChatResponse response = Objects.isNull(streamSink) || selectedStreamingModel == null
                         ? chatModel.chat(request)
-                        : callLlmStreaming(request, streamSink, resetBeforeCall);
+                        : callLlmStreaming(selectedStreamingModel, request, streamSink, resetBeforeCall);
+                // Some configured vision endpoints expose only a synchronous client.
+                // Never send images to a different, global text streaming client.
+                if (streamSink != null && selectedStreamingModel == null && response != null
+                        && response.aiMessage() != null && StringUtils.isNotBlank(response.aiMessage().text())) {
+                    try {
+                        if (resetBeforeCall) streamSink.onAnswerReset();
+                        streamSink.onAnswerToken(response.aiMessage().text());
+                    } catch (Exception ignored) {
+                        // Client display failures must not replay a completed model response.
+                    }
+                }
                 if (Objects.nonNull(response)) {
                     String sid = currentSessionId.get();
                     int inputTokens = 0;
@@ -1573,7 +1670,7 @@ public class AgentLoop {
      *                        不重置的话，"第一次尝试的半截答案 + 重试后的完整答案"会在界面上
      *                        拼成一段重复文本（前端的 token 事件是累加的）。
      */
-    private ChatResponse callLlmStreaming(ChatRequest request, AgentStreamSink streamSink,
+    private ChatResponse callLlmStreaming(StreamingChatModel model, ChatRequest request, AgentStreamSink streamSink,
                                           boolean resetBeforeCall) throws Exception {
         if (resetBeforeCall) {
             try {
@@ -1591,7 +1688,6 @@ public class AgentLoop {
         long firstTokenTimeoutSec = estimateFirstTokenTimeoutSec(request);
         log.info("流式 LLM 等待首包超时={}s（大上下文会自动加长）", firstTokenTimeoutSec);
 
-        StreamingChatModel model = Optional.ofNullable(getCurrentStreamingModel()).orElse(streamingChatModel);
         model.chat(request, new StreamingChatResponseHandler() {
             @Override
             public void onPartialThinking(PartialThinking partialThinking) {
@@ -1680,7 +1776,7 @@ public class AgentLoop {
         return sid != null && executionControl != null && executionControl.isCancelled(sid);
     }
 
-    /** 网页搜索、抓取、浏览器。命令执行不算：写代码的任务会合法地多次跑命令。 */
+    /** 搜索/HTTP 抓取；浏览器点击、输入、观察是交互动作，使用正常工具预算。 */
     static boolean isRetrievalTool(String name) {
         if (name == null || name.isEmpty()) {
             return false;
@@ -1688,8 +1784,7 @@ public class AgentLoop {
         return "web_search".equals(name)
                 || "web_extract".equals(name)
                 || "http_get".equals(name)
-                || "http_post".equals(name)
-                || name.startsWith("browser_");
+                || "http_post".equals(name);
     }
 
     /** 直跑检索到顶就收口，避免 90 轮上限形同没有。规划图由自己的调度控步数。 */
@@ -1728,6 +1823,7 @@ public class AgentLoop {
      * 不该进用户界面。完整记录仍在 {@code traceRecorder}（{@code /trace} 可查）与日志里。</p>
      */
     private void executeToolCalls(List<?> toolCalls, List<ChatMessage> messages, LoopState state) {
+        state.pendingObservations.clear();
         Map<String, ExecutionTurnContext.ActionBinding> bindings = resolveToolBindings(toolCalls);
         if (!toolCalls.isEmpty()) {
             log.info("工具调用: {}", toolCalls.stream()
@@ -1745,6 +1841,22 @@ public class AgentLoop {
                 executeToolCallSingle(tc, messages, state, bindings.get(toolIdOf(tc)));
                 if (state.unknownOutcome) break;
             }
+        }
+        ToolObservationProjector.Projection projection = ToolObservationProjector.projectBatch(state.pendingObservations);
+        state.pendingObservations.clear();
+        UserMessage observation = projection.message();
+        if (observation != null) {
+            ToolObservationProjector.stripImages(messages);
+            state.latestObservation = observation;
+            messages.add(observation);
+        }
+        if (projection.observedTools().contains("desktop_observe") || projection.observedTools().contains("desktop_act")) {
+            state.desktopImageGrounded = true;
+        }
+        if (projection.allImagesRejected()) {
+            state.observationProjectionFailed = true;
+            state.noteStructuredResult("tool_vision", ToolResult.failure(ToolErrorCode.DEPENDENCY_UNAVAILABLE,
+                    "工具已返回，但截图未通过工作目录或图片校验，视觉模型没有看到界面。已停止后续操作；请重新观察后再继续，禁止直接重放之前的动作。", false));
         }
     }
 
@@ -1883,6 +1995,7 @@ public class AgentLoop {
             log.info("  [并行] {}: {}", name, truncate(redactSensitive(result), 200));
             recordToolOutcome(state, name, argumentsOf(tc), result,
                     bindings.get(toolIdOf(tc)), structuredResult);
+            state.pendingObservations.add(new ToolObservationProjector.Observation(name, toolIdOf(tc), structuredResult));
             messages.add(ToolExecutionResultMessage.from(
                     toolIdOf(tc), name, resultForContext));
         }
@@ -1990,6 +2103,7 @@ public class AgentLoop {
 
         log.info("  {}: {}", name, truncate(redactSensitive(result), 300));
         recordToolOutcome(state, name, args, result, binding, structuredResult);
+        state.pendingObservations.add(new ToolObservationProjector.Observation(name, toolIdOf(tc), structuredResult));
         messages.add(ToolExecutionResultMessage.from(
                 toolIdOf(tc), name, resultForContext));
     }
@@ -2619,6 +2733,14 @@ public class AgentLoop {
             case "browser_screenshot"-> "📸 截图中...";
             case "browser_click"     -> "🖱️ 点击：" + extractJsonField(arguments, "ref");
             case "browser_type"      -> "⌨️ 输入：" + truncate(extractJsonField(arguments, "text"), 30);
+            case "browser_form_inspect" -> "📋 识别网页表单";
+            case "browser_form_verify" -> "✅ 核验表单字段";
+            case "browser_select" -> "🔽 选择表单选项";
+            case "browser_set_checked" -> "☑️ 设置勾选状态";
+            case "browser_upload" -> "📎 上传表单附件";
+            case "desktop_observe"   -> "🖥️ 正在查看电脑界面…";
+            case "desktop_act"       -> "🖱️ 正在操作电脑：" + extractJsonField(arguments, "action");
+            case "desktop_release"   -> "🖥️ 已释放电脑控制";
             case "memory"            -> "🧠 更新记忆...";
             case "http_get"          -> "📡 请求：" + extractJsonField(arguments, "url");
             case "http_post"         -> "📡 POST：" + extractJsonField(arguments, "url");

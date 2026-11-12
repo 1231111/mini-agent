@@ -117,6 +117,8 @@ public class MiniAgentChatPageController {
     private  ChatMessageRepository chatMessageRepository;
     @Autowired
     private  ChatTaskRepository chatTaskRepository;
+    @Autowired(required = false)
+    private com.miniagent.application.ConversationTaskProgressService taskProgressService;
     @Autowired
     private  AgentTraceStepRepository agentTraceStepRepository;
     @Autowired
@@ -1156,6 +1158,8 @@ public class MiniAgentChatPageController {
         Collections.reverse(list);
         Map<Long, List<String>> legacyUploadsByTask = legacyUploadsByTask(list,
                 fileStorageService.getUserSessionFiles(userId, sessionId));
+        var progressByTask = taskProgressService == null ? Map.<Long, com.miniagent.application.TaskProgressSnapshot>of()
+                : taskProgressService.forMessages(userId, sessionId, list);
         List<ConversationMessagesDTO.Task> mapped = new ArrayList<>();
         for (var t : list) {
             List<String> attachments = new ArrayList<>(toConversationImageUrls(sessionId, t.getImages()));
@@ -1165,7 +1169,9 @@ public class MiniAgentChatPageController {
                     t.getQuestion(),
                     Optional.ofNullable(t.getAnswer()).orElse(""),
                     Objects.nonNull(t.getCreatedAt()) ? t.getCreatedAt().toString() : "",
-                    attachments));
+                    attachments,
+                    progressByTask.getOrDefault(t.getId(),
+                            com.miniagent.application.TaskProgressSnapshot.fromJson(t.getTaskProgressJson()))));
         }
         return ApiResponse.ok(new ConversationMessagesDTO(mapped, tasks.hasNext()));
     }

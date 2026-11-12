@@ -66,6 +66,9 @@ public abstract class ToolParams {
 
             Map<String, Object> fieldDef = new LinkedHashMap<>();
             fieldDef.put("type", getJsonType(field.getType()));
+            if (java.util.Collection.class.isAssignableFrom(field.getType())) {
+                fieldDef.put("items", Map.of("type", "string"));
+            }
             fieldDef.put("description", annotation.description());
 
             if (annotation.required()) {
@@ -98,6 +101,8 @@ public abstract class ToolParams {
             return "number";
         } else if (type == Boolean.class || type == boolean.class) {
             return "boolean";
+        } else if (java.util.Collection.class.isAssignableFrom(type)) {
+            return "array";
         } else {
             return "string";
         }

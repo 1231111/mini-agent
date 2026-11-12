@@ -98,13 +98,38 @@ public class Tool {
             if (Objects.nonNull(resultHandler)) {
                 ToolResult result = resultHandler.apply(argumentsJson);
                 return Objects.nonNull(result) ? result
-                        : ToolResult.failure(ToolErrorCode.EMPTY_RESULT, "工具返回空结果", false);
+                        : missingAcknowledgement(argumentsJson);
             }
-            return ToolResult.fromLegacy(handler.apply(argumentsJson));
+            String raw = handler.apply(argumentsJson);
+            return raw == null || raw.isBlank()
+                    ? missingAcknowledgement(argumentsJson) : ToolResult.fromLegacy(raw);
         } catch (Exception e) {
-            return ToolResult.failure(ToolErrorCode.EXECUTION_FAILED,
-                    "工具执行错误 [" + name + "]: " + e.getMessage(), false);
+            String message = "工具执行错误 [" + name + "]: " + e.getMessage();
+            // Once a writing handler has started, an exception is not proof that
+            // its side effects failed. A lost response after a remote commit must
+            // enter the same UNKNOWN boundary as cancellation and timeout.
+            return executionIsReadOnly(argumentsJson)
+                    ? ToolResult.failure(ToolErrorCode.EXECUTION_FAILED, message, false)
+                    : unconfirmedOutcome(message);
         }
+    }
+
+    private ToolResult missingAcknowledgement(String argumentsJson) {
+        return executionIsReadOnly(argumentsJson)
+                ? ToolResult.failure(ToolErrorCode.EMPTY_RESULT, "工具返回空结果", false)
+                : unconfirmedOutcome("工具返回空结果，无法确认操作是否已生效");
+    }
+
+    private boolean executionIsReadOnly(String argumentsJson) {
+        // exec_command is registered conservatively: the actual command decides
+        // whether an exception can leave unconfirmed writes behind.
+        ToolSideEffect actual = ToolConcurrencyPolicy.EXEC_TOOL.equals(name)
+                ? ToolConcurrencyPolicy.sideEffectOf(name, argumentsJson) : sideEffect;
+        return actual == ToolSideEffect.READ_ONLY;
+    }
+
+    private ToolResult unconfirmedOutcome(String message) {
+        return ToolResult.unknown(message + "；操作可能已生效，请先核验实际状态，禁止直接重试", null);
     }
 
     public ToolDescriptor descriptor() {

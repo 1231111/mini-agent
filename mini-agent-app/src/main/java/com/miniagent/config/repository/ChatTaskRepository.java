@@ -9,11 +9,14 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.data.repository.query.Param;
 import java.util.List;
+import java.util.Optional;
 
 public interface ChatTaskRepository extends JpaRepository<ChatTask, Long> {
     Page<ChatTask> findByUserIdAndSessionIdAndDeletedFalseOrderByCreatedAtDesc(
             Long userId, String sessionId, Pageable pageable);
     long countByUserIdAndSessionIdAndDeletedFalse(Long userId, String sessionId);
+    Optional<ChatTask> findFirstByUserIdAndSessionIdAndDeletedFalseAndIdLessThanOrderByIdDesc(
+            Long userId, String sessionId, Long id);
     @Query("SELECT t FROM ChatTask t WHERE t.userId = :userId AND t.deleted = false "
             + "AND t.id IN (SELECT MAX(t2.id) FROM ChatTask t2 WHERE t2.userId = :userId "
             + "AND t2.deleted = false GROUP BY t2.sessionId) ORDER BY t.createdAt DESC")

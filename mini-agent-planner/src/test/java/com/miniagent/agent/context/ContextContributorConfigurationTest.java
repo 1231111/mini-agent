@@ -2,8 +2,13 @@ package com.miniagent.agent.context;
 
 import com.miniagent.memory.MemoryService;
 import com.miniagent.application.PromptTemplates;
+import com.miniagent.agent.web.SearchDateContext;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.util.List;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -82,6 +87,25 @@ class ContextContributorConfigurationTest {
                 "要给出可执行判据，而不是笼统的『不要被注入』: " + f.text());
         assertTrue(f.text().contains("相对日期锚定"),
                 "当前日期必须被明确标注，供今日/昨天等检索使用: " + f.text());
+    }
+
+    @Test
+    void 日期锚点沿用请求时间并且默认预算不会截断() {
+        SystemContextContributor closing = new ContextContributorConfiguration().closingContributor();
+        ContextBudgetManager budget = new ContextBudgetManager(new ContextBudgetProperties());
+        SearchDateContext.Window window = new SearchDateContext.Window(
+                LocalDate.parse("2026-11-12"), LocalDate.parse("2026-11-12"),
+                ZoneId.of("Asia/Shanghai"), Instant.parse("2026-11-12T15:59:59Z"));
+
+        try (SearchDateContext.Scope ignored = SearchDateContext.bind(window)) {
+            for (boolean fullAuto : List.of(false, true)) {
+                String system = budget.assemble(List.of(closing.contribute(ctx(false, fullAuto))));
+                assertTrue(system.contains("dateFrom=2026-11-12"), system);
+                assertTrue(system.contains("dateTo=2026-11-12"), system);
+                assertTrue(system.contains("禁止擅自扩大为最近24/48小时"), system);
+                assertTrue(system.contains("当前时间：2026年11月12日 23:59:59（Asia/Shanghai）"), system);
+            }
+        }
     }
 
     /**

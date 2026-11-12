@@ -40,7 +40,7 @@ public class CapabilityRegistry implements SmartInitializingSingleton {
      * 结构化图节点禁止填 general，见 PlanValidator。
      */
     public static final List<String> PLANNER_CAPABILITIES = List.of(
-            "file_read", "file_write", "web", "code", "image", "browser", "shell",
+            "file_read", "file_write", "web", "code", "image", "browser", "desktop", "shell",
             "research", "deliver", "plan", GENERAL);
 
     private static final List<String> FILE_READ =
@@ -66,8 +66,13 @@ public class CapabilityRegistry implements SmartInitializingSingleton {
     private static final List<String> BROWSER = List.of(
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_press", "browser_scroll",
+            "browser_form_inspect", "browser_form_verify", "browser_select",
+            "browser_set_checked", "browser_upload",
             "browser_evaluate", "browser_screenshot", "browser_extract_text",
             "browser_close");
+
+    private static final List<String> DESKTOP = List.of(
+            "desktop_observe", "desktop_act", "desktop_release");
 
     /** 媒体生成能力包（图 / 视频 / 音频统一走这里，Planner 节点按能力取工具）。 */
     private static final List<String> IMAGE = List.of(
@@ -90,6 +95,7 @@ public class CapabilityRegistry implements SmartInitializingSingleton {
             Map.entry("web", merge(WEB, BROWSER)),
             Map.entry("research", merge(WEB, BROWSER, FILE_READ)),
             Map.entry("browser", BROWSER),
+            Map.entry("desktop", DESKTOP),
             Map.entry("image", merge(IMAGE, List.of(WRITE_FILE, "edit_file"))),
             Map.entry("code", merge(CODE_SEARCH, FILE_READ, FILE_WRITE, SHELL)),
             Map.entry("shell", merge(SHELL, FILE_READ, FILE_WRITE)),
@@ -141,7 +147,8 @@ public class CapabilityRegistry implements SmartInitializingSingleton {
      */
     public static boolean persistsArtifacts(String capability) {
         String key = normalize(capability);
-        return "file_write".equals(key) || "deliver".equals(key)
+        // deliver can return an answer/link. Its frozen doneWhen decides whether it writes a file.
+        return "file_write".equals(key)
                 || "image".equals(key) || "file".equals(key);
     }
 
@@ -151,7 +158,7 @@ public class CapabilityRegistry implements SmartInitializingSingleton {
     public static boolean acquires(String capability) {
         String key = normalize(capability);
         return "web".equals(key) || "research".equals(key)
-                || "browser".equals(key) || "file_read".equals(key);
+                || "browser".equals(key) || "desktop".equals(key) || "file_read".equals(key);
     }
 
     private record Snapshot(Set<String> registered, Map<String, List<String>> index) {}

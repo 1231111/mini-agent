@@ -28,6 +28,9 @@ public class ChatTask extends BaseEntity {
     /** 用户上传的图片路径（逗号分隔），相对于 conversation-images/ 目录 */
     @Column(name = "images", columnDefinition = "TEXT")
     private String images;
+    /** Immutable progress for this reply; the session's current DAG may change later. */
+    @Column(name = "task_progress_json", columnDefinition = "LONGTEXT")
+    private String taskProgressJson;
     @Column(nullable = false)
     private boolean deleted = false;
     public Long getId() { return id; }
@@ -42,6 +45,8 @@ public class ChatTask extends BaseEntity {
     public void setAnswer(String answer) { this.answer = answer; }
     public String getImages() { return images; }
     public void setImages(String images) { this.images = images; }
+    public String getTaskProgressJson() { return taskProgressJson; }
+    public void setTaskProgressJson(String taskProgressJson) { this.taskProgressJson = taskProgressJson; }
     public boolean isDeleted() { return deleted; }
     public void setDeleted(boolean deleted) { this.deleted = deleted; }
 }

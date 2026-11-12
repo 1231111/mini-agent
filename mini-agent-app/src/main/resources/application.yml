@@ -383,10 +383,14 @@ agent:
   # 生产级 Planner：GoalCompiler + PlanningLoop + Recovery（Todo/Trace 为投影）
   planner:
     enabled: true
+    # 按执行依赖与验收需求由模型选择 DAG，与工具权限模式独立。
+    auto-planning: true
     # db=多副本真相源（agent_session_planner）；file=本地 JSON；memory=仅进程内（勿用于扩容）
     storage: db
     persist-dir: ${agent.data-dir}/workspace/.planner
     max-recoveries: 3
+    # 兼容配置。执行器目前只有单节点结果/证据，PlanningLoop 实际固定为 1。
+    # 节点内部工具仍按工具并发策略执行。
     proposal-batch-size: 1
     proposal-max-iterations: 8
     proposal-browser-max-iterations: 16

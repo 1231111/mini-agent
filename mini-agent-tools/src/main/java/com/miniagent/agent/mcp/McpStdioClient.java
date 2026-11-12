@@ -139,9 +139,10 @@ public class McpStdioClient implements AutoCloseable {
             throws Exception {
         try {
             return future.get(timeoutSeconds, TimeUnit.SECONDS);
-        } catch (TimeoutException e) {
-            // A timed-out request must leave the pending map immediately. A
-            // dead or malicious server must not retain one future per call.
+        } catch (TimeoutException | InterruptedException e) {
+            // A caller that stopped waiting no longer owns a pending slot.
+            // Otherwise repeated cancellation against a silent server can fill
+            // the connection's entire request capacity before any timeout fires.
             pending.values().remove(future);
             future.cancel(true);
             throw e;
@@ -149,8 +150,11 @@ public class McpStdioClient implements AutoCloseable {
     }
 
     private String formatCallResult(JsonNode result) throws Exception {
-        if (Objects.isNull(result)) {
-            return "{\"error\":\"MCP 空结果\"}";
+        if (Objects.isNull(result) || result.isNull()) {
+            // A JSON-RPC null result is not a tools/call acknowledgement. Let
+            // the bridge retain the uncertain outcome rather than succeed on
+            // the literal text "null" or treat a missing reply as a safe failure.
+            throw new IllegalStateException("MCP tools/call 返回空结果，无法确认操作状态");
         }
         boolean isError = result.path("isError").asBoolean(false);
         JsonNode content = result.get("content");
