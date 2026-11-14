@@ -440,6 +440,8 @@ flowchart TD
 
 **停机条件（AgentLoop）**：纯文本终答；`MAX_ITERATIONS`；`DUP_TOOLS`（同失败工具 ≥3）；`OUTCOME_UNKNOWN`；`CANCELLED`；`DEADLINE_EXCEEDED`；`PERM_ASK`；`USER_QUESTION`；资源或配额耗尽。
 
+执行循环、语义路由、计划编译/修正、LLM 验收与上下文摘要调用通过 `ModelCallControl` 继承同一 `RunScope` 和任务控制。调用前、等待中和接收结果时检查取消与任务总 deadline；暂停在安全检查点等待，恢复时保留已发请求的结果，不因暂停重发。取消/超时不进入模型重试、规划降级或验收失败恢复，流式尝试关闭后不再接收其迟到增量。SDK 忽略中断时不能保证远端请求已停止，但本地等待及时结束且结果被隔离；同时限制仍未退出的模型调用数量，避免无界积累。
+
 ### 4.2 进不进规划器，与上下文装多少，是两件事
 
 这两件事都发生，互不代替。
@@ -460,7 +462,7 @@ flowchart TD
     Q -->|是| PLAN["PlanningLoop"]
 ```
 
-新请求的拆分不靠路径、URL、任务词表或长度阈值。路由模型同时判断是否要求实际产物，并引用当前请求的连续原文作为依据；可运行网页也属于实际产物。格式或原文证据无效时最多修正一次，仍失败则记录原因并降级直跑。路由结果显式传给本轮执行器，不存放在跨轮次的线程变量中。模型分类增加一次请求延迟。
+新请求的拆分不靠路径、URL、任务词表或长度阈值。路由模型同时判断是否要求实际产物，并引用当前请求的连续原文作为依据；可运行网页也属于实际产物。格式或原文证据无效时最多修正一次，仍失败则返回 unresolved 和明确失败原因，不启动工具操作；模型缺失或异常也不能推断为 direct。显式 PLAN 和已有 DAG 续跑仍使用已确定的策略。路由结果显式传给本轮执行器，不存放在跨轮次的线程变量中。模型分类增加一次请求延迟。
 
 ### 4.3 工具调用
 
@@ -709,7 +711,7 @@ Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 **做：** 编译、校验、调度、节点执行、验收、恢复。图是唯一事实源。  
 **不做：** 用 Todo 勾选回写节点成功；把 90 轮套在每个图节点上；`shouldHandle==false` 时 `init` 一张空图。
 
-应用入口只调用一次 `selectRoute`，把结果传给 `runWithOutcome`；`shouldHandle` 仅保留显式 PLAN 和续跑的便宜门禁。DAG 编译失败时可降级直跑，直跑结局由 `AgentLoop.LoopOutcome` 决定；失败、等待授权、空回答不会被规划器改写成完成。待审批计划的修改若校验失败，则保留原计划并等待重新修改，不执行空图或绕过审批直跑。回退路径的字面量 90 仍与 `ExecutionProperties` 重复，尚未合并。
+应用入口只调用一次 `selectRoute`，把结果传给 `runWithOutcome`；`shouldHandle` 仅保留显式 PLAN 和续跑的便宜门禁。已选 DAG 的任务必须通过编译和校验后才可执行；修正仍失败时返回 `PLAN_VALIDATION_FAILED`，保留旧快照供重试，不绕过任务图直跑。正常 direct 的结局由 `AgentLoop.LoopOutcome` 决定；失败、等待授权、空回答不会被规划器改写成完成。路由或编译期间的取消、超时也进入统一聊天记录、任务状态和 SSE 收口。待审批计划的修改若校验失败，则保留原计划并等待重新修改，不执行空图或绕过审批直跑。规划器兼容 direct 入口的迭代上限 90 仍与 `ExecutionProperties` 重复，尚未合并。
 
 `intent.inputs` 声明用户消息、附件等外部输入；节点输入也可消费依赖链祖先的 outputs，但不能消费无依赖或未来节点的输出。生成页面→浏览器验收与获取资料→写文件均为合法依赖方向。answer/action 的交付名称匹配输出端口，文件/媒体仍按精确路径校验。语义验收保留本节点多个工具回执，避免最后一次 todo 更新覆盖操作前后的证据。
 
@@ -717,11 +719,13 @@ Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 
 节点内 ReAct：`proposal-max-iterations=8`（含 `browser_*` 时 16）× `proposal-max-chunks=6`。
 
-验收：`StepEvaluator` 按 `DoneWhen` 查文件/媒体/命令/llm_judge。`evaluateGraph` 要求每节点 SUCCESS 且目标 successCriteria 过。`agent.planner.strict-eval=true` 写在 yml 里，`StepEvaluator` 源码未按它分支。复现时不要假装有两套宽严逻辑。
+验收：`StepEvaluator` 始终按冻结的 `DoneWhen` 查文件/媒体/命令/llm_judge。`evaluateGraph` 要求每节点 SUCCESS 且目标 successCriteria 过。`agent.planner.strict-eval` 已弃用；旧配置仍可绑定，但有效值固定为 true，配置 false 时输出迁移警告，不能关闭证据检查，也不强制所有节点调用 llm_judge。计划编译校验失败和未生成有效执行策略的轨迹节点写入 FAILURE，成功节点才显示成功。
 
 `TodoStateProjector.project` 覆盖写出 Todo。`confirmByTodoId` 只把 `AWAITING_CONFIRM` 改回 `PENDING`。
 
 状态键：`PlannerStateStore` 用 `TaskScopeRegistry.scopeKey`，不是裸 sessionId。
+
+Redis 副本模式的 Planner 状态与事件也直接读写 MySQL：`RedisMysqlPlannerStateStore` 不再采用或回填 `planner:session:*` 热缓存，变更后只尽力清理旧缓存键。旧缓存缺少 execution generation 与独立 event revision，单比较 planner version 无法正确处理同版本事件更新、计划重置、删除重建或晚到回填。当前以增加数据库读取换取不让过期缓存进入调度和派发判断；数据库不可用时不退回 Redis 旧图。重新引入热缓存前，需先建立持久化 generation/event revision 及原子比较协议。此修复不构成跨副本旧工具工作者的硬隔离。
 
 | 键 | 默认 |
 |----|------|
@@ -788,6 +792,8 @@ Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 `templates/chat.html`，样式内联。`spring.thymeleaf.cache=false` 时改 HTML 刷新即可。前端不是独立 SPA。
 
 SSE 事件名必须对齐：`session` `user` `thinking` `token` `seal` `subgoal` `todo` `permission_ask` `user_question` `append_ack` `end` `error` `gone` `context`。`context` 载荷是 `{"used","limit"}`：`used` 为当次模型 input token，`limit` 为 `agent.context.max-tokens`（默认 512000），不是厂商上下文上限。轨迹流是 `trace`（`GET /api/conversations/{sessionId}/traces`）。`reset` 的处理函数在，主路径不 publish。
+
+`SessionEventCenter` 在通道锁内同步更新缓冲、运行标识和终态；SSE 发送使用每连接的有界串行队列，Redis 通知使用会话级串行队列，外部发送不占用通道状态锁。发送工作线程有全局上限，慢连接超时或队列溢出时摘除，重连按缓冲快照恢复，再接收后续事件。客户端断开不取消任务。Redis 通知仍是尽力投递；消息追加的确认、最终封口脚本保持同步并受 Redis 客户端命令超时约束，不把通知队列当作持久化消息系统。
 
 `progress` 已下线（2026-10-22）：工具名、参数、结果原文不再进对话区，只写日志与 `agent_trace_steps`。`AgentLoop` 的 `progressCallback` 参数链一并删除（`AgentLoop`、`NodeExecutor`、`PlanningLoop`、`ClientMultiAgent`、`AgentChatApplicationService`），`SessionEventCenter` 也不再缓存 `progress`。对话区保留的是 `thinking`（深度思考）、`seal`（把已流出的正文封存为「过程说明」）、`token`（最终答案）、`todo`（计划条）。
 
@@ -1106,7 +1112,7 @@ V7 已删意图规则表，不要再建。
 10. **独立前端 / 移动端 / 训练平台**：无。
 11. **`reset` SSE**：处理函数有，主路径未 publish。
 12. **`PlanningLoop` 回退路径字面量 90**：与配置重复，不要再引入第四个上限。
-13. **`strict-eval`**：yml 为 true，验收代码未按它分支。
+13. **`strict-eval` 兼容配置**：已弃用，步骤固定按 `DoneWhen` 验收；旧配置 false 会警告并保持验收，迁移时删除该键。
 
 ---
 
@@ -1180,5 +1186,12 @@ V7 已删意图规则表，不要再建。
 | 错误码 | `mini-agent-common/.../ErrorCode.java` |
 
 ---
+
+### 执行结果与并发审计约束（2026-11-14）
+
+- Planner 状态 CAS 同时比较任务作用域、状态版本和执行 ID。图提交与对应 `NODE_SUCCESS/NODE_FAILED` 事件使用 `commit(..., appended)` 一起落库；事件增量在数据库行锁内合并，不能用读取时的完整历史覆盖新追加的事件。文件实现和内存实现保持相同的增量语义。
+- 节点成功率指标、工具统计和 Procedure 反馈在状态提交成功后更新。取消、超时后的未知副作用不作为已核验的 Procedure 失败；整图终验的成功或失败都需在慢验收返回后重查身份、版本和租约。终验成功通过 CAS 保存后才返回任务完成。
+- 任务终态使用独立事务，提交或回滚完成后才释放该任务的会话锁与用户配额。Redis 的迟到锁响应不能覆盖更新一次准入取得的本地归属；清理与续租均比较 fencing token。
+- 模型工具调用的操作回执和未确认副作用隔离分别管理：新调用编号允许重新读取页面状态，也允许再次执行已确认结束的交互；同一执行、计划与节点内相同工具和规范化参数的 `RUNNING/UNKNOWN` 副作用不能通过更换调用编号重放。该约束依赖工具的副作用分类，不能代替外部服务的幂等键或已派发动作的回滚能力。
 
 *Mini Agent · 本文只描述仓库已实现行为。配置默认值以 `application.yml` 为准；yml 没写的键以对应 Java 字段为准。不再有 `application-prod.yml`：生产与测试的差异靠网络隔离，不靠配置文件分叉。*

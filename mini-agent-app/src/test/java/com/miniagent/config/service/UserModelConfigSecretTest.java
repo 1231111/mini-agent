@@ -142,7 +142,7 @@ class UserModelConfigSecretTest {
     }
 
     @Test
-    void legacyPlaintextRowIsStillReadable() {
+    void legacyPlaintextWithoutEndpointBindingRequiresReentryAndIsEncryptedOnResave() {
         AtomicReference<UserModelConfig> holder = new AtomicReference<>();
         UserModelConfigService svc = service(repository(holder), crypto(KEY));
         UserModelConfig row = new UserModelConfig();
@@ -150,8 +150,14 @@ class UserModelConfigSecretTest {
         row.setCustomApiKey("sk-legacy-plain-text");
         holder.set(row);
 
-        assertEquals("sk-legacy-plain-text", svc.getEffective(1L).apiKey(),
-                "历史明文行必须仍可读（迁移器负责把它换成密文）");
+        assertThrows(IllegalStateException.class, () -> svc.getEffective(1L),
+                "历史行没有凭据目的地，不能猜测并发送到当前预设");
+        assertEquals(false, current(svc.getView(1L)).get("configurationValid"));
+        assertEquals(false, svc.save(1L, "default", null, null, "").get("success"));
+        assertEquals(true, svc.save(1L, "default", null, null, "sk-legacy-plain-text").get("success"));
+        assertEquals("https://api.example.com/v1", row.getCustomApiKeyBaseUrl());
+        assertTrue(crypto(KEY).isEncrypted(row.getCustomApiKey()));
+        assertEquals("sk-legacy-plain-text", svc.getEffective(1L).apiKey());
     }
 
     @Test
@@ -163,7 +169,38 @@ class UserModelConfigSecretTest {
         svc.save(1L, "default", null, null, "__CLEAR__");
 
         assertEquals(null, holder.get().getCustomApiKey(), "清空必须真的清空密文");
+        assertEquals(null, holder.get().getCustomApiKeyBaseUrl(), "清空凭据也清空目的地绑定");
         assertEquals("sk-global-platform-key", svc.getEffective(1L).apiKey(),
                 "清空后应回退到全局密钥");
+    }
+
+    @Test
+    void acceptsTheEncryptedColumnBoundaryAndRejectsLongerKeysWithoutMutatingTheRow() {
+        AtomicReference<UserModelConfig> holder = new AtomicReference<>();
+        SecretCryptoService crypto = crypto(KEY);
+        UserModelConfigService svc = service(repository(holder), crypto);
+        assertEquals(true, svc.save(1L, "default", null, "original", "x".repeat(734)).get("success"));
+        assertEquals(1023, holder.get().getCustomApiKey().length());
+        String originalCiphertext = holder.get().getCustomApiKey();
+        Map<String, Object> rejected = svc.save(1L, "default", "https://new.example/v1", "changed", "x".repeat(735), 32000);
+        assertEquals(false, rejected.get("success"));
+        assertEquals("API_KEY_TOO_LONG", rejected.get("errorCode"));
+        assertEquals("original", holder.get().getCustomModelName());
+        assertEquals(originalCiphertext, holder.get().getCustomApiKey());
+        assertEquals("https://api.example.com/v1", holder.get().getCustomApiKeyBaseUrl());
+        assertEquals(null, holder.get().getCustomContextWindowTokens());
+    }
+
+    @Test
+    void encryptedLengthValidationUsesActualUtf8BytesAndAlsoWorksWithoutEncryption() {
+        AtomicReference<UserModelConfig> holder = new AtomicReference<>();
+        UserModelConfigService encrypted = service(repository(holder), crypto(KEY));
+        assertEquals("API_KEY_TOO_LONG", encrypted.save(1L, "default", null, null, "密".repeat(245)).get("errorCode"));
+        assertEquals(null, holder.get());
+        UserModelConfigService local = service(repository(holder), crypto(""));
+        assertEquals(true, local.save(1L, "default", null, null, "x".repeat(1024)).get("success"));
+        Map<String, Object> rejected = local.save(1L, "default", null, "changed", "x".repeat(1025));
+        assertEquals("API_KEY_TOO_LONG", rejected.get("errorCode"));
+        assertEquals(null, holder.get().getCustomModelName());
     }
 }

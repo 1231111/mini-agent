@@ -2,6 +2,7 @@ package com.miniagent.agent.planner;
 
 import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.todo.LlmJudgeTodoValidator;
+import com.miniagent.agent.todo.AcceptanceEvidenceFiles;
 import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.agent.todo.TodoSemanticValidator;
 import com.miniagent.agent.tool.CapabilityRegistry;
@@ -18,7 +19,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * 步骤验收。strictEval=true 时禁止宽松放行，并走语义 / llm_judge。
+ * 步骤始终按冻结的 doneWhen 验收；只有 llm_judge/带 criteria 的 validation 才调用评判模型。
+ * 旧 strict-eval 配置不再控制验收，不能通过配置关闭证据检查。
  */
 @Component
 public class StepEvaluator {
@@ -47,14 +49,13 @@ public class StepEvaluator {
         }
     }
 
-    private final PlannerProperties properties;
     private final PlannerMetrics metrics;
     private final LlmJudgeTodoValidator llmJudge;
 
-    public StepEvaluator(PlannerProperties properties,
+    /** PlannerProperties remains in the constructor for compatibility with existing callers. */
+    public StepEvaluator(PlannerProperties ignoredProperties,
                          PlannerMetrics metrics,
                          @Autowired(required = false) LlmJudgeTodoValidator llmJudge) {
-        this.properties = properties;
         this.metrics = metrics;
         this.llmJudge = llmJudge;
     }
@@ -98,38 +99,44 @@ public class StepEvaluator {
             return reject("tool error: " + abbreviate(ev, 400));
         }
 
+        EvalResult structural;
+        String artifactHash = "";
         if (dw.isJudge()) {
-            return judge(node, dw.criteria(), ev);
-        }
-        if (dw.isCommand()) {
-            return checkCommand(ev, structuredSuccess);
-        }
-        if (dw.isValidation()) {
-            if (StringUtils.isNotBlank(dw.criteria()))
-                return judge(node, dw.criteria(), ev);
-            return checkValidation(ev, structuredSuccess);
-        }
-
-        if (dw.isNote() && looksLikeFileDelivery(node)) {
-            return evaluateFile(node, ev, dw.path());
-        }
-        if (dw.isNote()) {
+            structural = StringUtils.isBlank(ev) ? reject("缺少语义验收 evidence") : EvalResult.pass();
+        } else if (dw.isCommand()) {
+            structural = checkCommand(ev, structuredSuccess);
+        } else if (dw.isValidation()) {
+            structural = dw.semanticChecks().isEmpty() ? checkValidation(ev, structuredSuccess)
+                    : (StringUtils.isBlank(ev) ? reject("缺少验证 evidence") : EvalResult.pass());
+        } else if (dw.isNote() && looksLikeFileDelivery(node)) {
+            structural = evaluateFile(node, ev, dw.path());
+        } else if (dw.isNote()) {
             if (StringUtils.isBlank(ev) || isHollowEvidence(ev)) {
                 return reject("缺少 evidence");
             }
-            return EvalResult.pass();
-        }
-
-        if (dw.isFile() || dw.isMedia()) {
+            structural = EvalResult.pass();
+        } else if (dw.isFile() || dw.isMedia()) {
             TodoSemanticValidator.Result r = TodoSemanticValidator.validate(
                     node.name(), spec, ev);
             if (!r.ok()) {
                 return reject(r.error());
             }
-            return EvalResult.pass();
+            artifactHash = r.contentHash();
+            structural = EvalResult.pass();
+        } else {
+            return reject("未知 doneWhen.type: " + dw.type());
         }
-
-        return reject("未知 doneWhen.type: " + dw.type());
+        if (!structural.ok() || dw.semanticChecks().isEmpty()) return structural;
+        String semanticEvidence = ev;
+        if (dw.isFile()) {
+            semanticEvidence = fileContentForSemanticCheck(dw.path(), artifactHash);
+            if (semanticEvidence == null) return reject("文件结构验收通过，但内容尚未验证：无法读取完整文本；请提供独立验证节点");
+        }
+        for (String criterion : dw.semanticChecks()) {
+            EvalResult checked = judge(node, criterion, semanticEvidence);
+            if (!checked.ok()) return checked;
+        }
+        return EvalResult.pass();
     }
 
     private EvalResult evaluateFile(TaskNode node, String evidence, String pathHint) {
@@ -190,12 +197,10 @@ public class StepEvaluator {
             if (Goal.isPlaceholderCriterion(c)) {
                 continue;
             }
+            if (hasMatchingJudge(graph, c)) continue;
             String path = DataflowNormalizer.pathFromName(c);
-            if (path.isBlank()) {
-                if (!hasMatchingJudge(graph, c)) {
-                    return GraphEval.fail("", "eval: successCriteria 无法验收 " + c);
-                }
-                continue;
+            if (path.isBlank() || !path.equals(c.trim())) {
+                return GraphEval.fail("", "eval: successCriteria 无法验收 " + c);
             }
             if (!hasFileDeliverable(graph, path)) {
                 return GraphEval.fail("", "eval: successCriteria 缺少产物 " + path);
@@ -232,11 +237,7 @@ public class StepEvaluator {
         String want = criteria.trim();
         for (TaskNode n : graph.nodes()) {
             DoneWhen dw = n.doneWhen();
-            if (dw == null || StringUtils.isBlank(dw.criteria())) {
-                continue;
-            }
-            if ((dw.isJudge() || dw.isValidation())
-                    && want.equals(dw.criteria().trim())) {
+            if (dw != null && dw.valid() && dw.verifies(want)) {
                 return true;
             }
         }
@@ -252,12 +253,21 @@ public class StepEvaluator {
         if (llmJudge == null) {
             return reject("llm_judge 未启用");
         }
+        if (StringUtils.isBlank(criteria) || StringUtils.isBlank(evidence)) return reject("语义验收缺少条件或 evidence");
+        if (evidence.length() > 12000) return reject("语义验收 evidence 超出完整校验范围，尚未验证；请拆分验证材料");
         String spec = DoneWhen.JUDGE + ":" + criteria;
         TaskTodoStore.TodoItem item = new TaskTodoStore.TodoItem(
                 0, node.name(), TaskTodoStore.Status.in_progress, "",
                 spec, evidence, "", List.of());
         String err = llmJudge.validate(item, evidence);
         return err == null ? EvalResult.pass() : reject(err);
+    }
+
+    /** Read the declared artifact itself; a write receipt or filename is not its semantic content. */
+    private static String fileContentForSemanticCheck(String declaredPath, String expectedSha256) {
+        String content = AcceptanceEvidenceFiles.readText(declaredPath, expectedSha256);
+        // Mark this as already loaded text: a JSON artifact's own "path" field must not trigger another read.
+        return content == null ? null : "实际文件内容：\n" + content;
     }
 
     static EvalResult checkCommand(String evidence) {

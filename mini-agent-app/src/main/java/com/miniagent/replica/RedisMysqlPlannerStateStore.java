@@ -1,7 +1,6 @@
 package com.miniagent.replica;
 
 import com.miniagent.agent.planner.DomainEvent;
-import com.miniagent.agent.planner.PlannerStateJson;
 import com.miniagent.agent.planner.PlannerStatePersistence;
 import com.miniagent.agent.planner.StateSnapshot;
 import com.miniagent.config.service.DbPlannerStatePersistence;
@@ -13,15 +12,17 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
-import java.time.Duration;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 
 /**
- * Planner 跨副本：MySQL 负责 CAS 真相源；Redis 热缓存读路径。
- * CAS 绝不只写 Redis，避免多实例脑裂。
+ * Redis 副本模式下，Planner 的状态和事件仍只读写 MySQL 真相源。
+ *
+ * <p>旧热缓存没有 execution generation / event revision。只比较 planner version
+ * 不能正确处理同版本事件更新、强制重置及删除后重建，晚到的缓存回填也会令派发闸门读到旧图。
+ * 因此在具备持久化缓存修订号之前，宁可增加数据库读取，也不让 Redis 参与执行决策。
+ * 写入后尽力清理旧版本遗留的缓存键；清理失败不改变数据库结果。
+ * 该策略不替代任务租约、工具进程隔离或业务侧幂等。</p>
  */
 @Slf4j
 @Component
@@ -36,91 +37,89 @@ public class RedisMysqlPlannerStateStore implements PlannerStatePersistence {
     private StringRedisTemplate redis;
     @Autowired
     private DbPlannerStatePersistence mysql;
-    @Autowired
-    private ReplicaProperties properties;
-
     private static String redisKey(String sessionId) {
         return KEY_PREFIX + sessionId;
     }
 
     @Override
     public Optional<Bundle> load(String sessionId) {
-        try {
-            Map<Object, Object> map = redis.opsForHash().entries(redisKey(sessionId));
-            if (map != null && !map.isEmpty()) {
-                Object state = map.get("state");
-                Object events = map.get("events");
-                if (state != null && !String.valueOf(state).isBlank()) {
-                    StateSnapshot snap = PlannerStateJson.snapshotFromJson(String.valueOf(state));
-                    List<DomainEvent> ev = PlannerStateJson.eventsFromJson(
-                            events == null ? "[]" : String.valueOf(events));
-                    return Optional.of(new Bundle(snap, ev));
-                }
-            }
-        } catch (Exception e) {
-            log.warn("Redis planner 读失败，回源 MySQL: {}", e.getMessage());
-        }
-        Optional<Bundle> fromDb = mysql.load(sessionId);
-        fromDb.ifPresent(b -> writeToRedis(sessionId, b.snapshot(), b.events()));
-        return fromDb;
+        // Keep snapshot and events from the same database read. A Redis hit is
+        // never a fallback, including while MySQL is unavailable.
+        return mysql.load(sessionId);
     }
 
     @Override
     public void replace(String sessionId, StateSnapshot snapshot, List<DomainEvent> events) {
-        mysql.replace(sessionId, snapshot, events);
-        writeToRedis(sessionId, snapshot, events);
+        try {
+            mysql.replace(sessionId, snapshot, events);
+        } finally {
+            evict(sessionId);
+        }
     }
 
     @Override
     public boolean compareAndSet(String sessionId, long expectedVersion,
                                  StateSnapshot next, List<DomainEvent> events) {
-        boolean ok = mysql.compareAndSet(sessionId, expectedVersion, next, events);
-        if (ok) {
-            writeToRedis(sessionId, next, events);
-        } else {
-            // 冲突：丢掉可能过期的热缓存，迫使下次回源
+        try {
+            return mysql.compareAndSet(sessionId, expectedVersion, next, events);
+        } finally {
+            // Also invalidate after conflicts or uncertain database failures.
             evict(sessionId);
         }
-        return ok;
+    }
+
+    @Override
+    public boolean compareAndSet(String sessionId, long expectedVersion, String expectedExecutionId,
+                                 StateSnapshot next, List<DomainEvent> events) {
+        try { return mysql.compareAndSet(sessionId, expectedVersion, expectedExecutionId, next, events); }
+        finally { evict(sessionId); }
+    }
+
+    @Override
+    public boolean compareAndSetAppending(String sessionId, long expectedVersion, String expectedExecutionId,
+                                          StateSnapshot next, List<DomainEvent> appended) {
+        try { return mysql.compareAndSetAppending(sessionId, expectedVersion, expectedExecutionId, next, appended); }
+        finally { evict(sessionId); }
     }
 
     @Override
     public boolean updateEvents(String sessionId, long expectedVersion, List<DomainEvent> events) {
-        boolean ok = mysql.updateEvents(sessionId, expectedVersion, events);
-        if (ok) {
-            Optional<Bundle> loaded = mysql.load(sessionId);
-            loaded.ifPresent(b -> writeToRedis(sessionId, b.snapshot(), events));
-        } else {
+        try {
+            return mysql.updateEvents(sessionId, expectedVersion, events);
+        } finally {
             evict(sessionId);
         }
-        return ok;
+    }
+
+    @Override
+    public boolean updateEvents(String sessionId, long expectedVersion, String expectedExecutionId,
+                                List<DomainEvent> events) {
+        try { return mysql.updateEvents(sessionId, expectedVersion, expectedExecutionId, events); }
+        finally { evict(sessionId); }
+    }
+
+    @Override
+    public boolean appendEvents(String sessionId, long expectedVersion, String expectedExecutionId,
+                                List<DomainEvent> appended) {
+        try { return mysql.appendEvents(sessionId, expectedVersion, expectedExecutionId, appended); }
+        finally { evict(sessionId); }
     }
 
     @Override
     public void delete(String sessionId) {
-        evict(sessionId);
-        mysql.delete(sessionId);
-    }
-
-    private void evict(String sessionId) {
         try {
-            redis.delete(redisKey(sessionId));
-        } catch (Exception e) {
-            log.warn("Redis planner 删失败: {}", e.getMessage());
+            mysql.delete(sessionId);
+        } finally {
+            evict(sessionId);
         }
     }
 
-    private void writeToRedis(String sessionId, StateSnapshot snapshot, List<DomainEvent> events) {
+    private void evict(String sessionId) {
+        if (sessionId == null) return;
         try {
-            Map<String, String> map = new HashMap<>();
-            map.put("state", PlannerStateJson.snapshotToJson(snapshot));
-            map.put("events", PlannerStateJson.eventsToJson(events));
-            map.put("version", String.valueOf(snapshot.version()));
-            String key = redisKey(sessionId);
-            redis.opsForHash().putAll(key, map);
-            redis.expire(key, Duration.ofSeconds(properties.getPlannerTtlSeconds()));
+            redis.delete(redisKey(sessionId));
         } catch (Exception e) {
-            log.warn("Redis planner 写失败（MySQL 已落盘）: {}", e.getMessage());
+            log.warn("Redis planner 旧缓存清理失败（不参与状态读取）: {}", e.getClass().getSimpleName());
         }
     }
 }

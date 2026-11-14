@@ -20,6 +20,10 @@ public class AgentSessionPlanner extends BaseEntity {
     @Column(name = "planner_version", nullable = false)
     private long plannerVersion;
 
+    /** Independent execution fence: planner_version may restart after replace/reset. */
+    @Column(name = "execution_id", length = 128)
+    private String executionId;
+
     @Lob
     @Column(name = "state_json", columnDefinition = "LONGTEXT", nullable = false)
     private String stateJson = "{}";
@@ -43,6 +47,8 @@ public class AgentSessionPlanner extends BaseEntity {
     public void setSessionId(String sessionId) { this.sessionId = sessionId; }
     public long getPlannerVersion() { return plannerVersion; }
     public void setPlannerVersion(long plannerVersion) { this.plannerVersion = plannerVersion; }
+    public String getExecutionId() { return executionId; }
+    public void setExecutionId(String executionId) { this.executionId = executionId; }
     public String getStateJson() { return stateJson; }
     public void setStateJson(String stateJson) { this.stateJson = stateJson; }
     public String getEventsJson() { return eventsJson; }

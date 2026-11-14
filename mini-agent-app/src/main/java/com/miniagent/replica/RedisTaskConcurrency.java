@@ -11,6 +11,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 跨实例：用户并发任务名额 + 会话运行锁（持有者 token，可续期）。
@@ -25,6 +27,9 @@ public class RedisTaskConcurrency {
     private ReplicaProperties properties;
     /** 本 JVM 持有的 session → lockToken */
     private final ConcurrentHashMap<String, String> heldSessionTokens = new ConcurrentHashMap<>();
+    /** Updated only while holding the corresponding heldSessionTokens compute lock. */
+    private final ConcurrentHashMap<String, Long> heldSessionAcquisitions = new ConcurrentHashMap<>();
+    private final AtomicLong sessionAcquisitionSequence = new AtomicLong();
     /** 本 JVM 持有的 session → 用户配额租约。 */
     private final ConcurrentHashMap<String, HeldLease> heldSessionLeases =
             new ConcurrentHashMap<>();
@@ -34,12 +39,16 @@ public class RedisTaskConcurrency {
 
     private static final DefaultRedisScript<Long> OCCUPY_USER_QUOTA = new DefaultRedisScript<>(
             """
+            if redis.call('GET', KEYS[2]) ~= ARGV[4] then
+              return 0
+            end
             redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
             if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then
               return 0
             end
             redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
             redis.call('EXPIRE', KEYS[1], ARGV[5])
+            redis.call('EXPIRE', KEYS[2], ARGV[5])
             return 1
             """, Long.class);
 
@@ -90,15 +99,24 @@ public class RedisTaskConcurrency {
         long ttlSeconds = configuredRunLockTtlSeconds();
         long now = System.currentTimeMillis();
         Long ok = redis.execute(OCCUPY_USER_QUOTA,
-                List.of(ReplicaLockKeys.userRunningKey(userId)),
+                List.of(ReplicaLockKeys.userRunningKey(userId), ReplicaLockKeys.sessionRunKey(sessionId)),
                 String.valueOf(now),
                 String.valueOf(now + Duration.ofSeconds(ttlSeconds).toMillis()),
                 String.valueOf(maxPerUser),
                 fencingToken,
                 String.valueOf(ttlSeconds));
         if (ok != null && ok == 1L) {
-            heldSessionLeases.put(sessionId, new HeldLease(fencingToken, userId));
-            return true;
+            AtomicBoolean installed = new AtomicBoolean();
+            // A successful Redis reply may arrive after this JVM admitted a new
+            // token. Never let that old reply replace the new quota renewer.
+            heldSessionTokens.computeIfPresent(sessionId, (ignored, currentToken) -> {
+                if (fencingToken.equals(currentToken)) {
+                    heldSessionLeases.put(sessionId, new HeldLease(fencingToken, userId));
+                    installed.set(true);
+                }
+                return currentToken;
+            });
+            return installed.get();
         }
         return false;
     }
@@ -120,13 +138,30 @@ public class RedisTaskConcurrency {
                 || fencingToken == null || fencingToken.isBlank()) {
             return false;
         }
+        long acquisition = sessionAcquisitionSequence.incrementAndGet();
         Boolean ok = redis.opsForValue().setIfAbsent(
                 ReplicaLockKeys.sessionRunKey(sessionId),
                 fencingToken,
                 Duration.ofSeconds(configuredRunLockTtlSeconds()));
         if (Boolean.TRUE.equals(ok)) {
-            heldSessionTokens.put(sessionId, fencingToken);
-            return true;
+            AtomicBoolean installed = new AtomicBoolean();
+            heldSessionTokens.compute(sessionId, (ignored, currentToken) -> {
+                Long currentAcquisition = heldSessionAcquisitions.get(sessionId);
+                if (currentAcquisition == null || currentAcquisition < acquisition) {
+                    heldSessionAcquisitions.put(sessionId, acquisition);
+                    installed.set(true);
+                    return fencingToken;
+                }
+                return currentToken;
+            });
+            if (!installed.get()) {
+                // SET NX may succeed but its response can arrive after its TTL
+                // and a replacement's response. Never overwrite or unlock that
+                // newer owner. Also clean our own token if it is still durable.
+                redis.execute(UNLOCK_IF_OWNER,
+                        List.of(ReplicaLockKeys.sessionRunKey(sessionId)), fencingToken);
+            }
+            return installed.get();
         }
         return false;
     }
@@ -166,7 +201,11 @@ public class RedisTaskConcurrency {
         if (sessionId == null || fencingToken == null || fencingToken.isBlank()) {
             return;
         }
-        heldSessionTokens.remove(sessionId, fencingToken);
+        heldSessionTokens.computeIfPresent(sessionId, (ignored, currentToken) -> {
+            if (!fencingToken.equals(currentToken)) return currentToken;
+            heldSessionAcquisitions.remove(sessionId);
+            return null;
+        });
         redis.execute(UNLOCK_IF_OWNER,
                 List.of(ReplicaLockKeys.sessionRunKey(sessionId)), fencingToken);
     }

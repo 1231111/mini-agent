@@ -34,6 +34,15 @@ public class ChatStreamingService {
     private final Set<String> terminalizingRuns = ConcurrentHashMap.newKeySet();
     private final Object lifecycleLock = new Object();
 
+    /** Local lifecycle only: admission must not recurse into TaskRunService or Redis. */
+    public boolean hasLocalLifecycleReservation(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) return false;
+        synchronized (lifecycleLock) {
+            return pendingRuns.contains(sessionId) || runningTasks.containsKey(sessionId)
+                    || terminalizingRuns.contains(sessionId);
+        }
+    }
+
     public void markRunning(String sessionId) {
         synchronized (lifecycleLock) {
             pendingRuns.remove(sessionId);

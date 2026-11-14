@@ -84,6 +84,7 @@ import {
   defaultTokenizerSrc,
   resolveModelSources
 } from './lib/model-manifest.mjs';
+import { driverPackagePrefix, readBrowserRequirements, validateBrowserMaterials } from './lib/browser-materials.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
@@ -676,27 +677,42 @@ async function playwrightJars() {
 
 async function stepBrowsers(skip, jdk, withHeaded) {
   step(4, '下载 Chromium（随包分发）');
-  if (skip) {
-    if (!fs.existsSync(BROWSERS_DIR)) fail(`--skip-browsers 但 ${BROWSERS_DIR} 不存在`);
-    log(`      已跳过（--skip-browsers），现有体积 ${mb(dirSize(BROWSERS_DIR))}`);
-    return;
-  }
-
   const { jars, tmp } = await playwrightJars();
   log(`      classpath: ${jars.map((j) => path.basename(j)).join(', ')}`);
 
   try {
+    const bundle = jars.find(jar => path.basename(jar).startsWith('driver-bundle-'));
+    const prefix = driverPackagePrefix(process.platform, process.arch);
+    const packageDir = path.join(tmp, 'driver-package');
+    const entries = listZipEntriesInFile(bundle).filter(entry => entry.name.startsWith(prefix));
+    if (!entries.length) fail(`driver-bundle 中没有当前平台 ${prefix}`);
+    // Only JavaScript package files for this host are needed. Never unpack all five Node binaries.
+    for (const entry of entries) {
+      const out = path.resolve(packageDir, entry.name.slice(prefix.length));
+      const relative = path.relative(packageDir, out);
+      if (relative.startsWith('..') || path.isAbsolute(relative)) fail('driver-bundle 条目路径无效');
+      fs.mkdirSync(path.dirname(out), { recursive: true });
+      await extractZipEntryToFile(bundle, entry, out);
+    }
+    const requirements = readBrowserRequirements(packageDir, BROWSERS_DIR, withHeaded);
+    try {
+      validateBrowserMaterials(requirements, BROWSERS_DIR);
+      log(`      ${skip ? '已跳过（--skip-browsers）' : '已复用'}：当前 fat jar 所需 ${requirements.map(b => `${b.name}-${b.revision}`).join(', ')} 校验通过`);
+      return requirements;
+    } catch (invalid) {
+      if (skip) fail(invalid.message);
+      log(`      当前版本物料需补齐：${invalid.message.split('\n')[0]}`);
+    }
     // 下到随包目录而不是默认缓存目录。CLI 与运行时后端都靠同一个环境变量定位，
     // 两边必须指向同一个路径 —— 不一致的后果是"明明装了却报 Executable doesn't exist"。
     const env = {
       ...process.env,
       PLAYWRIGHT_BROWSERS_PATH: BROWSERS_DIR,
-      PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT: '600000'
+      PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT: '600000',
+      PLAYWRIGHT_SKIP_BROWSER_GC: '1'
     };
 
-    // 先清空：Playwright 的版本化目录（chromium-<rev> / chromium_headless_shell-<rev>）
-    // 升级后会换名字，旧目录不会自动删，留在包里只是白占体积。
-    rmrf(BROWSERS_DIR);
+    // Retain older revisions: another local installation may still require them.
     fs.mkdirSync(BROWSERS_DIR, { recursive: true });
 
     // --only-shell = 装 chromium 时跳过完整包，只下 headless shell。
@@ -709,8 +725,11 @@ async function stepBrowsers(skip, jdk, withHeaded) {
     const sep = IS_WIN ? ';' : ':';
     run(jdk.java, ['-cp', jars.join(sep), 'com.microsoft.playwright.CLI', ...installArgs], { env });
 
+    validateBrowserMaterials(requirements, BROWSERS_DIR);
+
     log(`      Chromium: ${mb(dirSize(BROWSERS_DIR))}${withHeaded ? '（含完整包，有头调试可用）' : '（仅 headless shell）'}`);
     log(`      目录：${BROWSERS_DIR}`);
+    return requirements;
   } finally {
     // driver-bundle 解出来是 189MB，只是下载 Chromium 的临时工具，不该留在工作区
     rmrf(tmp);
@@ -899,7 +918,7 @@ function verifyArtifactArch(files) {
   }
 }
 
-function stepPackage(skip, targets) {
+function stepPackage(skip, targets, browserRequirements) {
   step(6, '打包安装包');
   if (skip) {
     log('      已跳过（--skip-package）');
@@ -921,7 +940,7 @@ function stepPackage(skip, targets) {
   // 随包 JRE、Chromium、模型都必须在位 —— package.json 的 extraResources 直接引用它们，
   // 缺失时 electron-builder 只在日志里给一行 warning，打出来的包里点开才发现起不来。
   if (!fs.existsSync(JRE_DIR)) fail(`随包 JRE 不存在：${JRE_DIR}（先跑一次不带 --skip-jre 的构建）`);
-  if (!fs.existsSync(BROWSERS_DIR)) fail(`随包 Chromium 不存在：${BROWSERS_DIR}（先跑一次不带 --skip-browsers 的构建）`);
+  validateBrowserMaterials(browserRequirements, BROWSERS_DIR);
   if (!fs.existsSync(MODELS_DIR)) fail(`随包模型不存在：${MODELS_DIR}（先跑一次不带 --skip-models 的构建）`);
   // --skip-models 只保证目录在，不保证内容齐 —— 这里补一次"成对"检查。
   // 缺 tokenizer 与缺模型的症状完全一样：应用照常启动，语义检索静默降级。
@@ -1010,9 +1029,9 @@ async function main() {
   stepJar(opts.skipJar);
   stepJre(opts.skipJre);
   await stepFfmpeg(opts.skipFfmpeg);
-  await stepBrowsers(opts.skipBrowsers, jdk, opts.withHeaded);
+  const browserRequirements = await stepBrowsers(opts.skipBrowsers, jdk, opts.withHeaded);
   stepModels(opts.skipModels, opts.modelVariant, opts.modelSrc);
-  stepPackage(opts.skipPackage, targets);
+  stepPackage(opts.skipPackage, targets, browserRequirements);
 
   log('\n完成。产物在 mini-agent-desktop/dist/\n');
 }

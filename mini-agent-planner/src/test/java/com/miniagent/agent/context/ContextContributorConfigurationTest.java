@@ -108,6 +108,30 @@ class ContextContributorConfigurationTest {
         }
     }
 
+    @Test
+    void 媒体输出协议对纯文本请求生效且默认预算完整保留() {
+        SystemContextContributor closing = new ContextContributorConfiguration().closingContributor();
+        ContextBudgetManager budget = new ContextBudgetManager(new ContextBudgetProperties());
+        SearchDateContext.Window window = new SearchDateContext.Window(
+                LocalDate.parse("2026-11-12"), LocalDate.parse("2026-11-12"),
+                ZoneId.of("Asia/Shanghai"), Instant.parse("2026-11-12T15:59:59Z"));
+
+        try (SearchDateContext.Scope ignored = SearchDateContext.bind(window)) {
+            for (boolean hasMedia : List.of(false, true)) {
+                for (boolean fullAuto : List.of(false, true)) {
+                    // 此请求没有媒体关键词，也没有开放工具；输出契约不能依赖附件或技能命中。
+                    String system = budget.assemble(List.of(closing.contribute(ctx(hasMedia, fullAuto))));
+                    assertTrue(system.contains("```miniagent-media"), system);
+                    assertTrue(system.contains(PromptTemplates.OUTPUT.strip()),
+                            "输出协议不能被槽位预算截断: " + system);
+                    assertTrue(system.contains("dateFrom=2026-11-12"), system);
+                    assertTrue(system.endsWith("当前时间：2026年11月12日 23:59:59（Asia/Shanghai）"),
+                            "媒体协议不能挤掉日期锚点: " + system);
+                }
+            }
+        }
+    }
+
     /**
      * 全自动会话里不能再出现"问用户确认"的口径。
      *

@@ -9,6 +9,53 @@ permissions:
   contents: read
 
 jobs:
+  browser-contracts:
+    name: Real Chromium execution and client recovery (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Build isolated test runtime
+        shell: pwsh
+        run: ./mvnw.cmd -B -ntp -pl mini-agent-app -am package '-DskipTests'
+      - name: Install Chromium matching the packaged Java driver
+        run: node scripts/build-desktop.mjs --skip-jar --skip-jre --skip-ffmpeg --skip-models --skip-package
+      - name: Verify browser fixtures and production client recovery
+        run: node scripts/run-browser-contracts.mjs "--evidence-dir=${{ runner.temp }}/miniagent-browser-contracts"
+      - name: Save fixture diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-contract-results
+          path: |
+            **/target/surefire-reports/
+            ${{ runner.temp }}/miniagent-browser-contracts/
+          retention-days: 7
+
+  client-quality:
+    name: Offline client and acceptance contracts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run client regressions and business acceptance contract fixtures
+        run: node scripts/agent-eval/run-offline-checks.mjs
+
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 30

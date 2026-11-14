@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
+import java.util.Objects;
 
 /**
  * 单机文件回退（非多副本）。水平扩容请用 storage=db + replica.mode=redis。
@@ -35,7 +36,7 @@ public class FilePlannerStatePersistence implements PlannerStatePersistence {
     }
 
     @Override
-    public Optional<Bundle> load(String sessionId) {
+    public synchronized Optional<Bundle> load(String sessionId) {
         Path f = file(sessionId);
         if (!Files.isRegularFile(f)) {
             return Optional.empty();
@@ -62,14 +63,30 @@ public class FilePlannerStatePersistence implements PlannerStatePersistence {
     @Override
     public synchronized boolean compareAndSet(String sessionId, long expectedVersion,
                                               StateSnapshot next, List<DomainEvent> events) {
+        return compareAndSet(sessionId, expectedVersion, next.executionId(), next, events);
+    }
+
+    @Override
+    public synchronized boolean compareAndSet(String sessionId, long expectedVersion, String expectedExecutionId,
+                                              StateSnapshot next, List<DomainEvent> events) {
+        return compareAndSetAppending(sessionId, expectedVersion, expectedExecutionId, next, events);
+    }
+
+    @Override
+    public synchronized boolean compareAndSetAppending(String sessionId, long expectedVersion, String expectedExecutionId,
+                                                       StateSnapshot next, List<DomainEvent> appended) {
+        if (next.version() != expectedVersion + 1 || !Objects.equals(sessionId, next.sessionId())
+                || !Objects.equals(expectedExecutionId, next.executionId()))
+            throw new IllegalArgumentException("planner stream identity or next version changed");
         Optional<Bundle> cur = load(sessionId);
         if (cur.isEmpty()) {
             return false;
         }
-        if (cur.get().snapshot().version() != expectedVersion) {
+        if (cur.get().snapshot().version() != expectedVersion
+                || !Objects.equals(expectedExecutionId, cur.get().snapshot().executionId())) {
             return false;
         }
-        write(sessionId, next, events);
+        write(sessionId, next, PlannerEventHistory.append(cur.get().events(), appended));
         return true;
     }
 
@@ -77,18 +94,32 @@ public class FilePlannerStatePersistence implements PlannerStatePersistence {
     public synchronized boolean updateEvents(String sessionId, long expectedVersion,
                                              List<DomainEvent> events) {
         Optional<Bundle> cur = load(sessionId);
+        return cur.isPresent() && updateEvents(sessionId, expectedVersion, cur.get().snapshot().executionId(), events);
+    }
+
+    @Override
+    public synchronized boolean updateEvents(String sessionId, long expectedVersion, String expectedExecutionId,
+                                             List<DomainEvent> events) {
+        return appendEvents(sessionId, expectedVersion, expectedExecutionId, events);
+    }
+
+    @Override
+    public synchronized boolean appendEvents(String sessionId, long expectedVersion, String expectedExecutionId,
+                                             List<DomainEvent> appended) {
+        Optional<Bundle> cur = load(sessionId);
         if (cur.isEmpty()) {
             return false;
         }
-        if (cur.get().snapshot().version() != expectedVersion) {
+        if (cur.get().snapshot().version() != expectedVersion
+                || !Objects.equals(expectedExecutionId, cur.get().snapshot().executionId())) {
             return false;
         }
-        write(sessionId, cur.get().snapshot(), events);
+        write(sessionId, cur.get().snapshot(), PlannerEventHistory.append(cur.get().events(), appended));
         return true;
     }
 
     @Override
-    public void delete(String sessionId) {
+    public synchronized void delete(String sessionId) {
         try {
             Files.deleteIfExists(file(sessionId));
         } catch (Exception e) {

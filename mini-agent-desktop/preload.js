@@ -15,7 +15,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 账号门户地址（注册 / 会员 / 充值）。空串 = 本机没配门户，界面应退回壳内注册。
   getPortalUrl: () => ipcRenderer.invoke('get-portal-url'),
 
-  // 用系统浏览器打开账号门户。主进程会校验只允许 http/https。
+  // 用系统浏览器打开网页。主进程统一校验 HTTP/HTTPS、禁止 URL 账号密码。
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
 
   // 原生目录选择（会话工作目录）。取消返回 null；路径校验在服务端。

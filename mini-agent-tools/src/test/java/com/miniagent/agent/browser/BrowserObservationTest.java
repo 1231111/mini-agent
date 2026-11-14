@@ -30,9 +30,10 @@ class BrowserObservationTest {
         String first = service.snapshot("chat", false);
         String ref = reference(first);
         assertTrue(service.click("chat", ref, "ref").contains("点击成功"));
-        verify(fixture.handle()).click(any(ElementHandle.ClickOptions.class));
+        verify(fixture.handle()).click(argThat(options -> Boolean.TRUE.equals(options.trial)));
+        verify(fixture.handle()).click(argThat(options -> !Boolean.TRUE.equals(options.trial)));
         assertTrue(service.click("chat", ref, "ref").contains("STALE_OBSERVATION"));
-        verify(fixture.handle(), times(1)).click(any(ElementHandle.ClickOptions.class));
+        verify(fixture.handle(), times(1)).click(argThat(options -> !Boolean.TRUE.equals(options.trial)));
     }
 
     @Test
@@ -50,7 +51,7 @@ class BrowserObservationTest {
         String ref = reference(service.snapshot("chat", false));
         fixture.snapshot().set("- text: Clock 10:01 CPU 32%\n- button \"Save\"");
         assertTrue(service.click("chat", ref, "ref").contains("点击成功"));
-        verify(fixture.handle()).click(any(ElementHandle.ClickOptions.class));
+        verify(fixture.handle()).click(argThat(options -> !Boolean.TRUE.equals(options.trial)));
     }
 
     @Test
@@ -179,6 +180,7 @@ class BrowserObservationTest {
         when(page.url()).thenReturn("https://example.test/page");
         when(page.locator("body")).thenReturn(body);
         when(body.ariaSnapshot()).thenAnswer(invocation -> snapshot.get());
+        when(body.ariaSnapshot(any())).thenAnswer(invocation -> snapshot.get());
         when(page.getByRole(eq(AriaRole.BUTTON), any(Page.GetByRoleOptions.class))).thenReturn(button);
         when(button.count()).thenReturn(1);
         when(button.elementHandle()).thenReturn(handle);

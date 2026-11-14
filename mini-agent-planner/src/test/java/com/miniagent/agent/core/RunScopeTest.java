@@ -24,6 +24,7 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -43,6 +44,7 @@ class RunScopeTest {
         BuiltinTools.clearCurrentTaskName();
         WorkspaceContext.clearTaskOverride();
         WorkspaceContext.clearRootOverride();
+        WorkspaceContext.setOperationRootSession(null);
         SearchDateContext.set(null);
         OwnerContext.clearCurrentUser();
         OwnerContext.clearCurrentTenant();
@@ -72,6 +74,29 @@ class RunScopeTest {
             assertEquals(42L, TaskExecutionContext.currentTaskId());
         }
         assertEquals(0L, TaskExecutionContext.currentTaskId());
+    }
+
+    @Test
+    void rootOwnershipSurvivesNestedDelegationAndWorkerCaptureWithoutLeaking() throws Exception {
+        AgentLoop.setCurrentSession("root-session");
+        RunScope parent = RunScope.capture();
+        assertNull(WorkspaceContext.getOperationRootSession());
+        RunScope child = parent.asSubagent("child-session", "researcher", PermissionMode.DEFAULT, null);
+        RunScope captured;
+        try (var ignored = child.bind()) {
+            assertEquals("root-session", WorkspaceContext.getOperationRootSession());
+            captured = RunScope.capture().asSubagent("grandchild-session", "researcher", PermissionMode.DEFAULT, null);
+        }
+        assertNull(WorkspaceContext.getOperationRootSession(), "restore the original null override exactly");
+        try (var pool = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            assertEquals("root-session", pool.submit(() -> {
+                try (var ignored = captured.bind()) {
+                    assertEquals("grandchild-session", WorkspaceContext.getSessionOverride());
+                    return WorkspaceContext.getOperationRootSession();
+                }
+            }).get());
+            assertNull(pool.submit(WorkspaceContext::getOperationRootSession).get());
+        }
     }
 
     @Test
@@ -133,7 +158,7 @@ class RunScopeTest {
     }
 
     @Test
-    void asSubagentIsolatesGateAndFenceKeepsTaskName() {
+    void asSubagentIsolatesBindingsButInheritsParentRevocationAndTaskName() {
         AgentLoop.setCurrentSession("parent");
         BuiltinTools.restoreTaskName("main_task");
         LoopTurnContext.set(new ClosedGate());
@@ -151,7 +176,8 @@ class RunScopeTest {
         assertEquals("main_task", child.taskName());
         assertEquals("out", child.writeTask());
         assertSame(LoopTurnPolicy.NONE, child.turnPolicy());
-        assertNull(child.execution());
+        assertNotNull(child.execution());
+        assertEquals("child", child.execution().sessionId());
         assertTrue(child.permissionForced());
         assertEquals(PermissionMode.ASK, child.permissionMode());
 
@@ -164,7 +190,7 @@ class RunScopeTest {
             assertEquals("coder", RoleContext.getRole());
             assertEquals("main_task", BuiltinTools.currentTaskName());
             assertEquals("out", WorkspaceContext.getTaskOverride());
-            assertNull(ExecutionTurnContext.current());
+            assertSame(child.execution(), ExecutionTurnContext.current());
             assertFalse(LoopTurnContext.current().hardGate());
         }
         assertEquals("parent", AgentLoop.getCurrentSession());

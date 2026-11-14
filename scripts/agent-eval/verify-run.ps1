@@ -1,32 +1,22 @@
 param(
-    [Parameter(Mandatory = $true)][string]$RunId
+    [Parameter(Mandatory = $true)][string]$RunId,
+    [string]$ReportRoot = "",
+    [switch]$RequireLive,
+    [string]$Commit = "",
+    [string]$ManifestSha256 = "",
+    [string]$AdapterSha256 = "",
+    [string]$TargetSha256 = "",
+    [string]$TrustedPublicKey = ""
 )
-
-$ReportDir = Join-Path $PSScriptRoot "reports"
-$jsonPath = Join-Path $ReportDir "$RunId-results.json"
-if (-not (Test-Path $jsonPath)) {
-    Write-Error "Missing $jsonPath"
-    exit 1
-}
-
-$results = Get-Content $jsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
-$failed = @($results | Where-Object { -not $_.pass })
-Write-Host "VERIFY run=$RunId total=$($results.Count) failed=$($failed.Count)"
-
-if ($failed.Count -eq 0) {
-    Write-Host "ALL_PASS"
-    exit 0
-}
-
-Write-Host "Re-running failed cases..."
-$ids = ($failed | ForEach-Object { $_.id }) -join ","
-& (Join-Path $PSScriptRoot "run-prod-eval.ps1") -RunId "$RunId-retry" -Category all
-
-# Filter retry to only failed ids by re-reading cases.json - simpler: manual list
-$cases = Get-Content (Join-Path $PSScriptRoot "cases.json") -Raw -Encoding UTF8 | ConvertFrom-Json
-$retryCases = @($cases | Where-Object { $failed.id -contains $_.id })
-if ($retryCases.Count -eq 0) { exit 1 }
-
-# Inline retry with same runner logic would duplicate; emit list for operator
-Write-Host "Retry IDs: $($failed.id -join ', ')"
-exit 1
+$ErrorActionPreference = 'Stop'
+if ($RunId -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$') { throw 'Invalid RunId' }
+if (-not $ReportRoot) { $ReportRoot = Join-Path $PSScriptRoot '../../.verify/_agent-eval' }
+$verifyArguments = @((Join-Path $PSScriptRoot 'verify-report.mjs'), (Join-Path $ReportRoot "$RunId/report.json"))
+if ($RequireLive) { $verifyArguments += '--require-live' }
+if ($Commit) { $verifyArguments += @('--commit', $Commit) }
+if ($ManifestSha256) { $verifyArguments += @('--manifest-sha256', $ManifestSha256) }
+if ($AdapterSha256) { $verifyArguments += @('--adapter-sha256', $AdapterSha256) }
+if ($TargetSha256) { $verifyArguments += @('--target-sha256', $TargetSha256) }
+if ($TrustedPublicKey) { $verifyArguments += @('--trusted-public-key', $TrustedPublicKey) }
+& node @verifyArguments
+exit $LASTEXITCODE

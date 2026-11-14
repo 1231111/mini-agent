@@ -2,9 +2,11 @@ package com.miniagent.agent.planner;
 
 import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.core.AgentStreamSink;
+import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.core.ExecutionTurnContext;
 import com.miniagent.agent.core.LoopTurnContext;
 import com.miniagent.agent.core.NodeExecutor;
+import com.miniagent.agent.execution.ToolInvocation;
 import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.ToolResult;
@@ -45,10 +47,13 @@ import java.util.stream.Collectors;
  */
 @Component
 public class PlanningLoop {
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.miniagent.agent.core.ModelCallControl modelCallControl;
 
     private static final Logger log = LoggerFactory.getLogger(PlanningLoop.class);
     private static final int PRIOR_OUTPUT_CHARS = 6000;
     private static final int AWAITING_HINT_CHARS = 500;
+    static final String EXECUTION_HUMAN_WAIT = "humanWait";
 
     private final PlannerProperties properties;
     private final GoalCompiler goalCompiler;
@@ -141,7 +146,7 @@ public class PlanningLoop {
             route = PlanningRoute.dag("state", PermissionContext.mode() == PermissionMode.PLAN
                     ? "EXPLICIT_PLAN_MODE" : "RESUME_CURRENT_GRAPH");
             if (PermissionContext.mode() == PermissionMode.PLAN && !canResume(sessionId, requestText)) {
-                PlanningRoute semantic = new SemanticPlanningRouter().decide(goalCompiler.resolvePlannerChat(chat),
+                PlanningRoute semantic = new SemanticPlanningRouter(modelCallControl).decide(goalCompiler.resolvePlannerChat(chat),
                         requestText == null ? plan.taskGoal() : requestText, multimodal, history);
                 route = new PlanningRoute(true, "explicit", "EXPLICIT_PLAN_MODE; " + semantic.reason(),
                         semantic.artifactDeliveryRequested());
@@ -149,15 +154,16 @@ public class PlanningLoop {
         } else if (!properties.isAutoPlanning()) {
             route = PlanningRoute.direct("configuration", "AUTO_PLANNING_DISABLED");
         } else {
-            route = new SemanticPlanningRouter().decide(goalCompiler.resolvePlannerChat(chat),
+            route = new SemanticPlanningRouter(modelCallControl).decide(goalCompiler.resolvePlannerChat(chat),
                     requestText == null ? plan.taskGoal() : requestText, multimodal, history);
         }
         trace(sessionId, AgentStepNode.PLANNING_ROUTE,
-                "{\"route\":\"" + (route.useDag() ? "dag" : "direct")
+                "{\"route\":\"" + route.routeName()
                         + "\",\"source\":\"" + jsonEscape(route.source())
-                        + "\",\"reason\":\"" + jsonEscape(route.reason()) + "\"}");
+                        + "\",\"reason\":\"" + jsonEscape(route.reason()) + "\"}",
+                route.resolved() ? RunStatus.SUCCESS : RunStatus.FAILURE);
         log.info("任务策略 session={} route={} source={} reason={}", sessionId,
-                route.useDag() ? "dag" : "direct", route.source(), route.reason());
+                route.routeName(), route.source(), route.reason());
         return route;
     }
 
@@ -326,7 +332,11 @@ public class PlanningLoop {
                       UserMessage multimodalUser, List<ChatMessage> history, TaskPlan taskPlan,
                       String sessionId, String fencingToken, String executionId,
                       AgentStreamSink streamSink, PlanningRoute route) {
-        if (!properties.isEnabled() || taskPlan == null || route == null || !route.useDag()) {
+        if (route == null || !route.resolved()) {
+            String reason = route == null ? "ROUTER_MISSING_DECISION" : route.reason();
+            return RunOutcome.failed(RoutingModelFailure.userMessage(reason), reason);
+        }
+        if (!route.useDag()) {
             // 直跑路径：结局由 AgentLoop 自己判定，规划器不替它宣称完成
             if (multimodalUser != null) {
                 return RunOutcome.direct(nodeExecutor.runDirectMultimodalOutcome(chat, systemPrompt,
@@ -334,6 +344,9 @@ public class PlanningLoop {
             }
             return RunOutcome.direct(nodeExecutor.runDirectOutcome(chat, systemPrompt, userMessage, history,
                     90, taskPlan, streamSink));
+        }
+        if (!properties.isEnabled() || taskPlan == null) {
+            return RunOutcome.failed("任务规划当前不可用，尚未开始操作。请重试。", "PLANNER_UNAVAILABLE");
         }
 
         if (route.artifactDeliveryRequested() != null) {
@@ -375,12 +388,7 @@ public class PlanningLoop {
             TaskPlan nextPlan = taskPlan.withTaskGoal(merged);
             compiled = compileAndValidate(chat, merged, nextPlan);
             if (!planValidator.accept(compiled.graph(), nextPlan, compiled.goal(), compiled.intent())) {
-                // 同上：澄清后图仍编不出来，降级直跑（合并后的目标进直跑消息，历史仍在），
-                // 不报「任务图未通过验收」。
-                log.warn("PlanningLoop 澄清后任务图仍无法验收，降级直跑 session={} code={}",
-                        sessionId, ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
-                return directFallback(chat, systemPrompt, merged, multimodalUser,
-                        history, nextPlan, sessionId, executionId, streamSink);
+                return invalidPlanOutcome(sessionId, compiled);
             }
             String execId = StringUtils.isNotBlank(executionId)
                     ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
@@ -409,7 +417,7 @@ public class PlanningLoop {
             log.info("PlanningLoop 按审批意见重编译 session={} nodes={}",
                     sessionId, compiled.graph().nodes().size());
         } else if (resume) {
-            snap = existing.get();
+            snap = consumeHumanWait(sessionId, existing.get());
             compiled = new GoalCompiler.CompileResult(snap.goal(), snap.graph(), snap.degraded(),
                     snap.compilationSource(), "", snap.intent());
             log.info("PlanningLoop 续跑已有图 session={} version={} nodes={}",
@@ -430,20 +438,15 @@ public class PlanningLoop {
         } else {
             compiled = compileAndValidate(chat, userMessage, taskPlan);
             if (!planValidator.accept(compiled.graph(), taskPlan, compiled.goal(), compiled.intent())) {
-                // 规划模型没产出可用图 ≠ 任务失败。对齐 WorkBuddy：没有「图没编出来就拒活」的硬门，
-                // 编译/验收失败一律降级直跑 —— 交给 AgentLoop 让模型自主选工具完成请求，
-                // 而不是回一句「任务图未通过验收，无法调度」。这是切换到 AgentLoop 的直跑路径，
-                // 直跑是另一条正确路径：模型看得到历史与全部工具面，自己决定怎么干。
-                log.warn("PlanningLoop 任务图验收失败，降级直跑 session={} code={}",
-                        sessionId, ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
-                return directFallback(chat, systemPrompt, userMessage, multimodalUser,
-                        history, taskPlan, sessionId, executionId, streamSink);
+                return invalidPlanOutcome(sessionId, compiled);
             }
             String execId = StringUtils.isNotBlank(executionId)
                     ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
             snap = stateStore.init(sessionId, execId, compiled.goal(), compiled.graph(),
                     compiled.intent(), compiled.source(), compiled.degraded());
         }
+        final String admittedExecutionId = snap.executionId();
+        final String admittedScopeId = snap.sessionId();
         if (taskPlan.artifactDeliveryRequested() != null
                 && !taskPlan.artifactDeliveryRequested().equals(snap.execution().get("artifactDeliveryRequested"))) {
             Map<String, Object> metadata = new LinkedHashMap<>(snap.execution());
@@ -510,6 +513,10 @@ public class PlanningLoop {
                 return RunOutcome.failed(answer, "SESSION_LOCK_LOST");
             }
             snap = stateStore.get(sessionId).orElse(snap);
+            if (!java.util.Objects.equals(admittedExecutionId, snap.executionId())
+                    || !java.util.Objects.equals(admittedScopeId, snap.sessionId())) {
+                return RunOutcome.failed("任务执行已被新的任务接替，旧执行已停止。", "STALE_EXECUTION");
+            }
             unknownNode = unknownOutcomeNode(snap.graph());
             if (unknownNode != null) {
                 return stopUnknownOutcome(sessionId, snap, unknownNode);
@@ -532,6 +539,15 @@ public class PlanningLoop {
             if (snap.graph().allTerminalSuccess()) {
                 StepEvaluator.GraphEval acc = stepEvaluator.evaluateGraph(
                         snap.goal(), snap.graph());
+                StateSnapshot evaluated = stateStore.get(sessionId).orElse(null);
+                if (evaluated == null || !java.util.Objects.equals(snap.sessionId(), evaluated.sessionId())
+                        || !java.util.Objects.equals(snap.executionId(), evaluated.executionId())) {
+                    return RunOutcome.failed("任务执行已被新的任务接替，旧执行已停止。", "STALE_EXECUTION");
+                }
+                if (evaluated.version() != snap.version()) continue;
+                if (!sessionLock.renewSessionLock(sessionId, fencingToken)) {
+                    return RunOutcome.failed("任务执行租约已失效，已停止确认完成。", "SESSION_LOCK_LOST");
+                }
                 if (!acc.ok()) {
                     log.warn("图终验失败 session={} node={} reason={}",
                             sessionId, acc.nodeId(), acc.reason());
@@ -543,14 +559,13 @@ public class PlanningLoop {
                     TaskGraph g = snap.graph().replace(
                             bad.withStatus(TaskNodeStatus.FAILED)
                                     .withError(acc.reason()));
-                    settleNode(sessionId, "acceptance-" + bad.id() + "-" + snap.planVersion(),
-                            bad, NodeTerminalCommitPort.Result.FAILURE,
-                            failureDetail(null, acc.reason(), userMessage));
                     FailureDiagnosis dx = recoveryEngine.diagnose(
                             bad, diagnoseTool(bad, ""), acc.reason());
                     try {
-                        snap = stateStore.commit(
-                                sessionId, snap.version(), snap.withGraph(g));
+                        snap = commitNodeOutcomes(sessionId, fencingToken, snap, snap.withGraph(g), List.of(
+                                new NodeOutcome("acceptance-" + bad.id() + "-" + snap.planVersion(),
+                                        bad, NodeTerminalCommitPort.Result.FAILURE,
+                                        failureDetail(null, acc.reason(), userMessage))));
                     } catch (PlannerStateStore.VersionConflictException e) {
                         metrics.casConflict();
                         continue;
@@ -558,6 +573,17 @@ public class PlanningLoop {
                     snap = applyRecoveryOrCancel(sessionId, snap, bad, dx, bad.id(),
                             chat, userMessage, taskPlan);
                     todoProjector.project(sessionId, snap.graph());
+                    continue;
+                }
+                // Acceptance can run a slow model or read external state. Fence
+                // its result with an actual CAS before returning task success.
+                try {
+                    Map<String, Object> accepted = new LinkedHashMap<>(snap.execution());
+                    accepted.put("graphAcceptedPlanVersion", snap.planVersion());
+                    accepted.put("graphAcceptedStateVersion", snap.version());
+                    snap = stateStore.commit(sessionId, snap.version(), snap.withExecution(accepted));
+                } catch (PlannerStateStore.VersionConflictException conflict) {
+                    metrics.casConflict();
                     continue;
                 }
                 log.info("PlanningLoop 图完成 session={} version={} metrics={}",
@@ -666,6 +692,9 @@ public class PlanningLoop {
                         sessionId, proposal.proposalId(), proposal.basedOnPlanVersion(), snap.planVersion());
                 continue;
             }
+            if (isExecutionStop(step.endReason())) {
+                return stopExecution(sessionId, snap, proposal, step, userMessage);
+            }
             if (AgentLoop.OUTCOME_UNKNOWN.equals(step.endReason())
                     || (step.structuredResult() != null
                     && step.structuredResult().status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN)) {
@@ -677,9 +706,6 @@ public class PlanningLoop {
                         stopped = stopped.replace(node.withStatus(TaskNodeStatus.OUTCOME_UNKNOWN)
                                 .withToolStatus(com.miniagent.agent.tool.ToolStatus.UNKNOWN)
                                 .withError(reason));
-                        settleNode(sessionId, action.actionId(), node,
-                                NodeTerminalCommitPort.Result.FAILURE,
-                                failureDetail(ToolErrorCode.OUTCOME_UNKNOWN, reason, userMessage));
                     }
                 }
                 try {
@@ -696,13 +722,15 @@ public class PlanningLoop {
             }
             boolean anyFail = false;
             TaskGraph g = snap.graph();
+            List<NodeOutcome> pendingOutcomes = new ArrayList<>();
             for (ActionSpec action : proposal.actions()) {
                 TaskNode node = g.byId(action.taskId());
                 if (node == null) {
                     continue;
                 }
                 if (humanWait) {
-                    g = g.replace(node.withStatus(TaskNodeStatus.READY).withToolStatus(null).withError(""));
+                    g = g.replace(node.withStatus(TaskNodeStatus.AWAITING_CONFIRM).withToolStatus(null)
+                            .withError(clip(step.text(), AWAITING_HINT_CHARS)));
                     continue;
                 }
                 boolean awaiting = todoProjector.isTodoAwaiting(
@@ -715,22 +743,15 @@ public class PlanningLoop {
                 }
                 if (drifted) {
                     anyFail = true;
-                    metrics.nodeFailed();
-                    recordToolOutcome(node, false);
                     String reason = "drift:偏离子目标 " + node.name();
                     g = g.replace(node.withStatus(TaskNodeStatus.FAILED).withToolStatus(null).withError(reason));
-                    stateStore.appendEvent(sessionId, new DomainEvent(
-                            "ev_" + UUID.randomUUID().toString().substring(0, 8),
-                            DomainEventType.NODE_FAILED, action.actionId(), action.taskId(),
-                            Map.of("reason", reason), null));
-                    settleNode(sessionId, action.actionId(), node,
-                            NodeTerminalCommitPort.Result.FAILURE,
-                            failureDetail(step.lastErrorCode(), reason, userMessage));
                     FailureDiagnosis dx = recoveryEngine.diagnose(
                             node, diagnoseTool(node, step.lastTool()), reason,
                             step.lastErrorCode());
                     try {
-                        snap = stateStore.commit(sessionId, snap.version(), snap.withGraph(g));
+                        snap = commitNodeOutcomes(sessionId, fencingToken, snap, snap.withGraph(g), List.of(
+                                new NodeOutcome(action.actionId(), node, NodeTerminalCommitPort.Result.FAILURE,
+                                        failureDetail(step.lastErrorCode(), reason, userMessage))));
                     } catch (PlannerStateStore.VersionConflictException e) {
                         metrics.casConflict();
                         break;
@@ -761,37 +782,24 @@ public class PlanningLoop {
                                     ? null : step.structuredResult().status())
                             .withOutput(clip(bound.evidence(), 12000),
                                     clipBindings(bound.bindings())));
-                    metrics.nodeSuccess();
-                    recordToolOutcome(node, true);
-                    stateStore.appendEvent(sessionId, new DomainEvent(
-                            "ev_" + UUID.randomUUID().toString().substring(0, 8),
-                            DomainEventType.NODE_SUCCESS, action.actionId(), action.taskId(),
-                            Map.of(), null));
-                    settleNode(sessionId, action.actionId(), node,
+                    pendingOutcomes.add(new NodeOutcome(action.actionId(), node,
                             NodeTerminalCommitPort.Result.SUCCESS,
-                            new NodeTerminalCommitPort.Detail(null, null, userMessage));
+                            new NodeTerminalCommitPort.Detail(null, null, userMessage)));
                 } else if (next == TaskNodeStatus.READY) {
                     g = g.replace(node.withStatus(TaskNodeStatus.READY).withToolStatus(null).withError(""));
                 } else {
                     anyFail = true;
-                    metrics.nodeFailed();
-                    recordToolOutcome(node, false);
                     g = g.replace(node.withStatus(TaskNodeStatus.FAILED)
                             .withToolStatus(step.structuredResult() == null
                                     ? null : step.structuredResult().status()).withError(ev.reason()));
-                    stateStore.appendEvent(sessionId, new DomainEvent(
-                            "ev_" + UUID.randomUUID().toString().substring(0, 8),
-                            DomainEventType.NODE_FAILED, action.actionId(), action.taskId(),
-                            Map.of("reason", ev.reason()), null));
-                    settleNode(sessionId, action.actionId(), node,
-                            NodeTerminalCommitPort.Result.FAILURE,
-                            failureDetail(step.lastErrorCode(), ev.reason(), userMessage));
                     FailureDiagnosis dx = recoveryEngine.diagnose(
                             node, diagnoseTool(node, step.lastTool()), ev.reason(),
                             step.lastErrorCode());
                     StateSnapshot failedSnap = snap.withGraph(g);
                     try {
-                        snap = stateStore.commit(sessionId, snap.version(), failedSnap);
+                        snap = commitNodeOutcomes(sessionId, fencingToken, snap, failedSnap, List.of(
+                                new NodeOutcome(action.actionId(), node, NodeTerminalCommitPort.Result.FAILURE,
+                                        failureDetail(step.lastErrorCode(), ev.reason(), userMessage))));
                     } catch (PlannerStateStore.VersionConflictException e) {
                         metrics.casConflict();
                         log.warn("状态冲突，触发 replan: {}", e.getMessage());
@@ -804,7 +812,14 @@ public class PlanningLoop {
             }
             if (!anyFail) {
                 try {
-                    snap = stateStore.commit(sessionId, snap.version(), snap.withGraph(g));
+                    StateSnapshot next = snap.withGraph(g);
+                    if (humanWait) {
+                        Map<String, Object> metadata = new LinkedHashMap<>(snap.execution());
+                        metadata.put(EXECUTION_HUMAN_WAIT, Map.of("reason", step.endReason(), "taskIds",
+                                proposal.actions().stream().map(ActionSpec::taskId).toList()));
+                        next = next.withExecution(metadata);
+                    }
+                    snap = commitNodeOutcomes(sessionId, fencingToken, snap, next, pendingOutcomes);
                     trace(sessionId, AgentStepNode.STATE_COMMIT,
                             "{\"version\":" + snap.version() + "}");
                 } catch (PlannerStateStore.VersionConflictException e) {
@@ -818,9 +833,9 @@ public class PlanningLoop {
                 log.info("PlanningLoop 等待用户 session={} reason={}",
                         sessionId, step.endReason());
                 if (StringUtils.isNotBlank(lastAnswer)) {
-                    return RunOutcome.blockedOnHuman(lastAnswer, "HUMAN_WAIT");
+                    return RunOutcome.blockedOnHuman(lastAnswer, step.endReason());
                 }
-                return RunOutcome.blockedOnHuman("需要你确认后才能继续。", "HUMAN_WAIT");
+                return RunOutcome.blockedOnHuman("需要你确认后才能继续。", step.endReason());
             }
             TaskGraph latest = stateStore.get(sessionId).map(StateSnapshot::graph).orElse(g);
             if (latest.hasAwaitingConfirm() || g.hasAwaitingConfirm()) {
@@ -961,10 +976,61 @@ public class PlanningLoop {
 
     private record StepExec(String text, String endReason, boolean drifted,
                             String lastTool, ToolErrorCode lastErrorCode,
-                            List<ChatMessage> messages, ToolResult structuredResult) {
+                            List<ChatMessage> messages, ToolResult structuredResult, boolean toolAttempted) {
         StepExec {
             messages = messages == null ? List.of() : List.copyOf(messages);
         }
+    }
+
+    /** Only executor waits are consumed by a reply; explicit Todo confirmations stay gated. */
+    private StateSnapshot consumeHumanWait(String sessionId, StateSnapshot snapshot) {
+        Object pending = snapshot.execution().get(EXECUTION_HUMAN_WAIT);
+        if (!(pending instanceof Map<?, ?> wait)
+                || !(wait.get("taskIds") instanceof List<?> taskIds)) return snapshot;
+        TaskGraph graph = snapshot.graph();
+        for (Object taskId : taskIds) {
+            TaskNode node = taskId instanceof String id ? graph.byId(id) : null;
+            if (node != null && node.status() == TaskNodeStatus.AWAITING_CONFIRM)
+                graph = graph.replace(node.withStatus(TaskNodeStatus.PENDING).withToolStatus(null).withError(""));
+        }
+        Map<String, Object> metadata = new LinkedHashMap<>(snapshot.execution());
+        metadata.remove(EXECUTION_HUMAN_WAIT);
+        return stateStore.commit(sessionId, snapshot.version(), snapshot.withGraph(graph).withExecution(metadata));
+    }
+
+    private static boolean isExecutionStop(String reason) {
+        return AgentLoop.CANCELLED.equals(reason) || RunStatus.CANCELED.name().equals(reason)
+                || AgentLoop.DEADLINE_EXCEEDED.equals(reason) || isResourceQuotaAbort(reason);
+    }
+
+    /** A control stop outranks old successful tool evidence and must never enter acceptance or recovery. */
+    private RunOutcome stopExecution(String sessionId, StateSnapshot snapshot, ActionProposal proposal,
+                                     StepExec step, String userMessage) {
+        TaskGraph graph = snapshot.graph();
+        boolean unknown = step.toolAttempted();
+        for (ActionSpec action : proposal.actions()) {
+            TaskNode node = graph.byId(action.taskId());
+            if (node == null) continue;
+            TaskNode stopped = node.withStatus(unknown ? TaskNodeStatus.OUTCOME_UNKNOWN : TaskNodeStatus.PENDING)
+                    .withToolStatus(unknown ? com.miniagent.agent.tool.ToolStatus.UNKNOWN : null)
+                    .withError(step.endReason() + ": " + clip(step.text(), AWAITING_HINT_CHARS));
+            if (unknown) {
+                NodeOutputBinder.Bound evidence = NodeOutputBinder.bind(
+                        node, "", step.messages(), "", step.structuredResult());
+                stopped = stopped.withOutput(clip(evidence.evidence(), 12000), clipBindings(evidence.bindings()));
+            }
+            graph = graph.replace(stopped);
+            // A control stop or unknown external effect is not a verified
+            // procedure failure. Preserve evidence without training a verdict.
+        }
+        Map<String, Object> metadata = new LinkedHashMap<>(snapshot.execution());
+        metadata.put("stopReason", step.endReason());
+        metadata.put("stoppedTaskIds", proposal.actions().stream().map(ActionSpec::taskId).toList());
+        StateSnapshot stopped = stateStore.commit(sessionId, snapshot.version(), snapshot.withGraph(graph).withExecution(metadata));
+        todoProjector.project(sessionId, stopped.graph());
+        String answer = StringUtils.defaultIfBlank(step.text(), "任务已停止，尚未完成。");
+        if (unknown) answer += "\n当前节点已保留执行证据，请先核验实际状态；系统不会自动重放该节点。";
+        return RunOutcome.failed(answer, step.endReason());
     }
 
     /** 轮次用尽就续跑。file_exists 可能只是写了个开头，不能当「做完了」。 */
@@ -1028,6 +1094,7 @@ public class PlanningLoop {
 
     static boolean isResourceQuotaAbort(String endReason) {
         return AgentLoop.RESOURCE_QUOTA_EXCEEDED.equals(endReason)
+                || "RESOURCE_QUOTA_EXCEEDED".equals(endReason)
                 || "TENANT_QUOTA_EXCEEDED".equals(endReason)
                 || "TOOL_BUDGET_EXCEEDED".equals(endReason);
     }
@@ -1179,7 +1246,7 @@ public class PlanningLoop {
                 .map(a -> new ExecutionTurnContext.ActionBinding(
                         a.actionId(), a.taskId(), a.tool(), a.idempotencyKey()))
                 .toList();
-        ExecutionTurnContext.open(sessionId, proposal.basedOnPlanVersion(), bindings,
+        ExecutionTurnContext.open(sessionId, proposal.executionId(), proposal.basedOnPlanVersion(), bindings,
                 () -> dispatchFenceValid(sessionId, proposal));
         metrics.proposal();
         try {
@@ -1210,6 +1277,7 @@ public class PlanningLoop {
                 AgentLoop.LoopOutcome out = nodeExecutor.execute(chat, focus, userMessage, multimodalUser,
                         history, maxIter, taskPlan, streamSink);
                 ToolResult lastToolResult = out.lastToolResult();
+                boolean toolAttempted = !out.toolsInvoked().isEmpty() || lastToolResult != null;
                 int chunks = 1;
                 int maxChunks = Math.max(1, properties.getProposalMaxChunks());
                 while (shouldResumeChunk(out.endReason(), chunks, maxChunks)) {
@@ -1219,18 +1287,20 @@ public class PlanningLoop {
                     out = nodeExecutor.continueNode(chat, live, userMessage,
                             maxIter, taskPlan, streamSink);
                     if (out.lastToolResult() != null) lastToolResult = out.lastToolResult();
+                    toolAttempted |= !out.toolsInvoked().isEmpty() || out.lastToolResult() != null;
                     chunks++;
                 }
                 return new StepExec(out.text(), out.endReason(), policy.consumeDrift(),
                         lastInvokedTool(out), lastToolResult == null ? out.lastErrorCode()
-                        : lastToolResult.errorCode(), out.messages(), lastToolResult);
+                        : lastToolResult.errorCode(), out.messages(), lastToolResult, toolAttempted);
             } catch (RuntimeException ex) {
+                com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(ex);
                 // A ReAct turn may already have dispatched tools before the caller
                 // failed. Without a complete result, replay cannot be assumed safe.
                 log.warn("节点执行异常，停止自动重试 task={}", focusTask, ex);
                 String message = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
                 return new StepExec("节点执行结果未知：" + message, AgentLoop.OUTCOME_UNKNOWN,
-                        policy.consumeDrift(), "", ToolErrorCode.OUTCOME_UNKNOWN, List.of(), null);
+                        policy.consumeDrift(), "", ToolErrorCode.OUTCOME_UNKNOWN, List.of(), null, true);
             }
         } finally {
             ExecutionTurnContext.clear();
@@ -1247,9 +1317,12 @@ public class PlanningLoop {
             return null;
         }
         ToolResult result;
+        ToolInvocation invocation = null;
         try {
-            result = nodeExecutor.executeBound(action.tool(), json);
+            invocation = nodeExecutor.executeBoundInvocation(action.tool(), json);
+            result = invocation == null ? null : invocation.result();
         } catch (RuntimeException ex) {
+            com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(ex);
             log.warn("绑定工具执行异常，停止自动重试 tool={} task={}", action.tool(), action.taskId(), ex);
             String msg = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
             result = ToolResult.unknown("工具执行结果未知：" + msg, null);
@@ -1259,14 +1332,38 @@ public class PlanningLoop {
         }
         String text = result.legacyText();
         boolean ok = result.isSuccess();
-        ToolExecutionResultMessage msg = ToolExecutionResultMessage.from(
-                action.actionId(), action.tool(), text);
         ToolErrorCode code = result.errorCode();
         String end = ok ? AgentLoop.STEP_SEGMENT_DONE
                 : result.status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN
                 ? AgentLoop.OUTCOME_UNKNOWN : RunStatus.FAILURE.name();
+        if (invocation != null) {
+            switch (invocation.outcome()) {
+                case CONTROL_STOP -> {
+                    ExecutionControl.StopReason stop = invocation.controlStopReason();
+                    // An unspecified legacy control stop is also unsafe to replay automatically.
+                    end = stop == ExecutionControl.StopReason.NONE ? AgentLoop.OUTCOME_UNKNOWN : stop.name();
+                    ok = false;
+                }
+                case PERMISSION_ASK -> {
+                    end = AgentLoop.PERM_ASK;
+                    ok = false;
+                }
+                case USER_QUESTION -> {
+                    end = AgentLoop.USER_QUESTION;
+                    text = StringUtils.defaultIfBlank(invocation.loopSignal(), text);
+                    ok = false;
+                }
+                default -> { }
+            }
+        }
+        ToolExecutionResultMessage msg = ToolExecutionResultMessage.from(
+                action.actionId(), action.tool(), result.legacyText());
+        // A stopped external write is UNKNOWN in the pipeline once dispatched. Pre-dispatch
+        // stops and approval waits can be resumed without claiming unconfirmed side effects.
+        boolean attempted = invocation == null || invocation.outcome() == ToolInvocation.Outcome.EXECUTED
+                || result.status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN;
         return new StepExec(ok ? AgentLoop.STEP_SEGMENT_DONE : text, end, false,
-                action.tool(), code, List.of(msg), result);
+                action.tool(), code, List.of(msg), result, attempted);
     }
 
     private boolean dispatchFenceValid(String sessionId, ActionProposal proposal) {
@@ -1275,6 +1372,7 @@ public class PlanningLoop {
 
     static boolean ownsRunningProposal(StateSnapshot snapshot, ActionProposal proposal) {
         if (snapshot == null || proposal == null || proposal.actions().isEmpty()
+                || !java.util.Objects.equals(snapshot.executionId(), proposal.executionId())
                 || snapshot.planVersion() != proposal.basedOnPlanVersion()) return false;
         return proposal.actions().stream().allMatch(action -> {
             TaskNode node = snapshot.graph().byId(action.taskId());
@@ -1376,7 +1474,9 @@ public class PlanningLoop {
             return stateStore.commit(sessionId, snap.version(), snap.withExecution(exec));
         } catch (PlannerStateStore.VersionConflictException e) {
             metrics.casConflict();
-            return stateStore.get(sessionId).orElse(snap);
+            // The approval applied to this exact plan. A concurrent revision
+            // or replacement must be presented again before it can execute.
+            throw e;
         }
     }
 
@@ -1476,7 +1576,7 @@ public class PlanningLoop {
         boolean atLimit = snap.recoveryCount() >= properties.getMaxRecoveries()
                 || recoveryEngine.classCount(snap, dx.failureClass())
                 >= recoveryEngine.classLimit(dx.failureClass());
-        if (recoveryEngine.recover(sessionId, dx).isPresent()) {
+        if (recoveryEngine.recover(sessionId, snap, dx).isPresent()) {
             metrics.recovery();
             return stateStore.get(sessionId).orElse(snap);
         }
@@ -1534,6 +1634,7 @@ public class PlanningLoop {
             compiled = goalCompiler.compileWithCorrection(
                     chat, userMessage, taskPlan, correction);
         } catch (Exception e) {
+            com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(e);
             log.warn("运行时 LLM replan 失败: {}", e.getMessage());
             return Optional.empty();
         }
@@ -1561,7 +1662,7 @@ public class PlanningLoop {
                 .withExecution(exec).withRecoveryInc();
         try {
             StateSnapshot committed = stateStore.commit(sessionId, snap.version(), patched);
-            stateStore.appendEvent(sessionId, new DomainEvent(
+            stateStore.appendEvent(sessionId, committed, new DomainEvent(
                     "ev_" + UUID.randomUUID().toString().substring(0, 8),
                     DomainEventType.RECOVERY_APPLIED, null, dx.taskId(),
                     Map.of("class", dx.failureClass().name(), "kind", dx.kind().name(),
@@ -1628,7 +1729,10 @@ public class PlanningLoop {
 
     private StateSnapshot markRunning(String sessionId, StateSnapshot snap, ActionProposal proposal) {
         StateSnapshot current = stateStore.get(sessionId).orElse(snap);
-        if (current.version() != snap.version() || current.planVersion() != proposal.basedOnPlanVersion()
+        if (!java.util.Objects.equals(current.sessionId(), snap.sessionId())
+                || !java.util.Objects.equals(current.executionId(), snap.executionId())
+                || !java.util.Objects.equals(current.executionId(), proposal.executionId())
+                || current.version() != snap.version() || current.planVersion() != proposal.basedOnPlanVersion()
                 || proposal.basedOnVersion() != current.version()) return current;
         TaskGraph g = current.graph();
         for (ActionSpec a : proposal.actions()) {
@@ -1694,33 +1798,15 @@ public class PlanningLoop {
         return nodes.isEmpty() ? null : nodes.get(nodes.size() - 1);
     }
 
-    /** 编译/验收失败后的直跑降级：多模态走多模态直跑，否则走文本直跑。结局由 AgentLoop 自己判定。 */
-    private RunOutcome directFallback(ChatModel chat, String systemPrompt, String userMessage,
-                                      UserMessage multimodalUser, List<ChatMessage> history,
-                                      TaskPlan taskPlan, String sessionId, String executionId,
-                                      AgentStreamSink streamSink) {
-        AgentLoop.LoopOutcome loopResult = multimodalUser != null
-                ? nodeExecutor.runDirectMultimodalOutcome(chat, systemPrompt,
-                    multimodalUser, history, 90, taskPlan, streamSink)
-                : nodeExecutor.runDirectOutcome(chat, systemPrompt, userMessage, history,
-                    90, taskPlan, streamSink);
-        RunOutcome result = RunOutcome.direct(loopResult);
-        if (AgentLoop.OUTCOME_UNKNOWN.equals(result.reason()) && StringUtils.isNotBlank(sessionId)) {
-            // A failed compilation has no executable graph to retain the unknown
-            // action. Persist the same quarantine used by ordinary DAG nodes so
-            // a later "continue" cannot silently recompile and replay it.
-            TaskNode unknown = new TaskNode("direct_fallback", "直跑步骤执行结果待核验", "general",
-                    List.of(), List.of(), List.of(), TaskNodeStatus.OUTCOME_UNKNOWN, 0,
-                    DoneWhen.note(), "", result.answer(), 0, "")
-                    .withToolStatus(com.miniagent.agent.tool.ToolStatus.UNKNOWN);
-            String objective = taskPlan == null ? userMessage : taskPlan.taskGoal();
-            Goal goal = new Goal("direct_fallback", objective, "", Map.of(), List.of(), List.of());
-            String execId = StringUtils.defaultIfBlank(executionId, "exec_" + UUID.randomUUID());
-            stateStore.init(sessionId, execId, goal, new TaskGraph(List.of(unknown)),
-                    TaskIntent.fromGoal(goal), GoalCompiler.CompilationSource.VALIDATION_ERROR, true);
-            todoProjector.project(sessionId, new TaskGraph(List.of(unknown)));
-        }
-        return result;
+    /** A selected DAG cannot execute until compilation and validation succeed. */
+    private RunOutcome invalidPlanOutcome(String sessionId, GoalCompiler.CompileResult compiled) {
+        trace(sessionId, AgentStepNode.GOAL_COMPILED,
+                "{\"nodes\":0,\"accepted\":false,\"source\":\"" + compiled.source().name()
+                        + "\",\"reason\":\"PLAN_VALIDATION_FAILED\"}", RunStatus.FAILURE);
+        log.warn("PlanningLoop 任务图未通过校验，停止本轮执行 session={} source={} code={}",
+                sessionId, compiled.source(), ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
+        return RunOutcome.failed("任务计划生成失败，尚未开始操作。请重试；原有任务进度已保留。",
+                "PLAN_VALIDATION_FAILED");
     }
 
     private GoalCompiler.CompileResult compileAndValidate(ChatModel chat,
@@ -1841,6 +1927,34 @@ public class PlanningLoop {
      * 一个已经通过验收的节点会被判成任务失败 —— 记忆的故障反向决定了任务的成败，
      * 这是不能接受的耦合。失败只降级为 warn，图状态照常提交。</p>
      */
+    private record NodeOutcome(String actionId, TaskNode node, NodeTerminalCommitPort.Result result,
+                               NodeTerminalCommitPort.Detail detail) {}
+
+    /** The node and its audit verdict become durable together, before metrics or memory learn it. */
+    private StateSnapshot commitNodeOutcomes(String sessionId, String fencingToken, StateSnapshot expected, StateSnapshot next,
+                                             List<NodeOutcome> outcomes) {
+        if (!sessionLock.renewSessionLock(sessionId, fencingToken)) {
+            throw new IllegalStateException("SESSION_LOCK_LOST");
+        }
+        List<DomainEvent> events = outcomes.stream().map(outcome -> {
+            boolean success = outcome.result() == NodeTerminalCommitPort.Result.SUCCESS;
+            String reason = outcome.detail() == null ? "" :
+                    java.util.Objects.requireNonNullElse(outcome.detail().failureReason(), "");
+            return new DomainEvent("ev_" + UUID.randomUUID().toString().substring(0, 8),
+                    success ? DomainEventType.NODE_SUCCESS : DomainEventType.NODE_FAILED,
+                    outcome.actionId(), outcome.node().id(), success ? Map.of() : Map.of("reason", reason), null);
+        }).toList();
+        StateSnapshot committed = stateStore.commit(sessionId, expected.version(), next, events);
+        for (NodeOutcome outcome : outcomes) {
+            boolean success = outcome.result() == NodeTerminalCommitPort.Result.SUCCESS;
+            if (success) metrics.nodeSuccess(); else metrics.nodeFailed();
+            TaskNode persisted = committed.graph().byId(outcome.node().id());
+            recordToolOutcome(persisted, success);
+            settleNode(sessionId, outcome.actionId(), persisted, outcome.result(), outcome.detail());
+        }
+        return committed;
+    }
+
     private void settleNode(String sessionId, String actionId, TaskNode node,
                             NodeTerminalCommitPort.Result result,
                             NodeTerminalCommitPort.Detail detail) {
@@ -1875,10 +1989,14 @@ public class PlanningLoop {
     }
 
     private void trace(String sessionId, AgentStepNode node, String content) {
+        trace(sessionId, node, content, RunStatus.SUCCESS);
+    }
+
+    private void trace(String sessionId, AgentStepNode node, String content, RunStatus status) {
         if (traceRecorder == null) {
             return;
         }
-        traceRecorder.recordNode(sessionId, 0, node.name(), content, RunStatus.SUCCESS.name(), 0);
+        traceRecorder.recordNode(sessionId, 0, node.name(), content, status.name(), 0);
     }
 
     /**

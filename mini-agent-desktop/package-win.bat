@@ -28,9 +28,8 @@ if exist "mini-agent-desktop\jre\bin\java.exe" (
 if exist "mini-agent-desktop\ffmpeg\ffmpeg.dll" (
     set "BUILD_ARGS=!BUILD_ARGS! --skip-ffmpeg"
 )
-if exist "mini-agent-desktop\browsers\chromium_headless_shell-*" (
-    set "BUILD_ARGS=!BUILD_ARGS! --skip-browsers"
-)
+rem Browser revisions must match the new fat jar. The build script validates/reuses
+rem current material automatically; a directory from an older driver is insufficient.
 if exist "mini-agent-desktop\models\yuan-embedding-2.0-zh.int8.onnx" (
     if exist "mini-agent-desktop\models\tokenizer.json" (
         set "BUILD_ARGS=!BUILD_ARGS! --skip-models"

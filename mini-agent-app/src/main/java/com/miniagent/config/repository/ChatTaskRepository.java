@@ -14,6 +14,8 @@ import java.util.Optional;
 public interface ChatTaskRepository extends JpaRepository<ChatTask, Long> {
     Page<ChatTask> findByUserIdAndSessionIdAndDeletedFalseOrderByCreatedAtDesc(
             Long userId, String sessionId, Pageable pageable);
+    Page<ChatTask> findByUserIdAndSessionIdAndDeletedFalseOrderByIdDesc(
+            Long userId, String sessionId, Pageable pageable);
     long countByUserIdAndSessionIdAndDeletedFalse(Long userId, String sessionId);
     Optional<ChatTask> findFirstByUserIdAndSessionIdAndDeletedFalseAndIdLessThanOrderByIdDesc(
             Long userId, String sessionId, Long id);
@@ -31,4 +33,14 @@ public interface ChatTaskRepository extends JpaRepository<ChatTask, Long> {
                                        @Param("sessionId") String sessionId);
 
     boolean existsByUserIdAndSessionIdAndDeletedFalse(Long userId, String sessionId);
+
+    /** Update the exact reply projection without merging stale question/answer/media fields. */
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("update ChatTask t set t.taskProgressJson = :next, t.updatedAt = CURRENT_TIMESTAMP "
+            + "where t.id = :id and t.userId = :userId and t.sessionId = :sessionId "
+            + "and t.deleted = false and t.taskProgressJson = :expected")
+    int compareAndSetTaskProgress(@Param("id") Long id, @Param("userId") Long userId,
+                                  @Param("sessionId") String sessionId, @Param("expected") String expected,
+                                  @Param("next") String next);
 }

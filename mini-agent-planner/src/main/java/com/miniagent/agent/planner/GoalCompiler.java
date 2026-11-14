@@ -1,5 +1,7 @@
 package com.miniagent.agent.planner;
 
+import com.miniagent.agent.core.ModelCallControl;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.context.RelativeDateGuidance;
@@ -94,25 +96,25 @@ public class GoalCompiler {
 
             【第三步：输出 JSON】
             {
-              "taskType": "图表生成/文档生成/代码生成/...",
-              "objective": "...",
-              "constraints": ["..."],
-            "successCriteria": ["notes.md"],
+              "taskType": "文档生成",
+              "objective": "生成包含结论和来源的 notes.md 报告",
+              "constraints": ["报告使用中文"],
+            "successCriteria": ["notes.md", "报告包含结论和来源"],
             "intent": {
-              "objective": "用户最终目标",
-              "deliverables": [{"name":"交付物", "type":"file|media|answer|action", "path":"", "required":true}],
-              "inputs": [{"name":"输入材料", "source":"用户消息/附件/网页/文件", "required":true}],
-              "constraints": ["必须遵守的限制"],
-              "exclusions": ["明确禁止或不需要的操作"],
-              "acceptanceCriteria": ["可验证的完成条件"],
+              "objective": "生成包含结论和来源的 notes.md 报告",
+              "deliverables": [{"name":"报告", "type":"file", "path":"notes.md", "required":true}],
+              "inputs": [],
+              "constraints": ["报告使用中文"],
+              "exclusions": [],
+              "acceptanceCriteria": ["报告包含结论和来源"],
               "needsClarification": false,
               "clarificationQuestion": ""
             },
-            "entities": {"k": "v"},
+            "entities": {},
             "nodes": [
-                {"id": "n1", "name": "...", "capability": "...",
-                 "dependsOn": [], "inputs": [], "outputs": [], "priority": 50,
-                 "doneWhen": {"type": "note_required", "path": "", "criteria": ""}}
+                {"id": "n1", "name": "生成 notes.md 报告", "capability": "file_write",
+                 "dependsOn": [], "inputs": [], "outputs": ["notes.md"], "priority": 50,
+                 "doneWhen": {"type": "file_exists", "path": "notes.md", "criteria": "报告包含结论和来源", "checks": ["报告使用中文"]}}
               ]
             }
 
@@ -142,6 +144,17 @@ public class GoalCompiler {
             file_exists 填 path，可加 criteria 做内容验收。
             llm_judge、validation_passed 可填 criteria。
             command_success 要求 evidence 含 exit_code=0。
+            doneWhen.checks 是需要逐项验证的语义条件数组；criteria/checks 都会实际调用验收，
+            不会因文件存在、工具返回 success 或文字中提及该条件而自动通过。
+            intent.constraints 中的每个限制、acceptanceCriteria 中的每个非文件存在条件，
+            必须原文对应某个节点的 doneWhen.criteria 或 checks。多个条件用 checks 逐项列出，
+            不要只放进节点 name/toolArguments。无法取得证据的条件先澄清，不得省略或宣称已验证。
+            文件存在只证明结构性产出；内容、计算正确性、交互与视觉质量必须分别有对应验证。
+            file_exists 附带的criteria/checks会读取真实UTF-8文本，不能用写入回执代替内容；
+            Office/PDF/图片等二进制或长文件，应单独读取/渲染/运行校验工具，再由验证节点验收结果。
+            参照截图实现网页时，将生成产物和浏览器验证拆为有依赖的节点：实际打开产物，
+            用 browser_snapshot/字段回读等工具检查页面与关键交互，再对这些真实记录验收。
+            只读HTML源码不能证明页面渲染正常；没有实际视觉证据时不能宣称与截图一致。
 
             【不要放大用户请求】
             交付物必须能在用户原文里找到依据。用户没有明确要求保存、导出、写入文件，
@@ -230,6 +243,9 @@ public class GoalCompiler {
     private final PlannerProperties properties;
     private volatile ChatModel dedicatedPlanner;
 
+    @Autowired(required = false)
+    private ModelCallControl modelCallControl;
+
     /**
      * skill 摘要来源，喂给规划模型看。
      *
@@ -269,6 +285,7 @@ public class GoalCompiler {
         try {
             summary = skillStore.getSkillListSummary();
         } catch (Exception e) {
+            ModelCallControl.rethrowIfStopped(e);
             log.warn("读取 skill 摘要失败，按无技能继续拆解: {}", e.getMessage());
             return procedureDigest("", procedures);
         }
@@ -321,6 +338,7 @@ public class GoalCompiler {
         try {
             summary = skillStore.getSkillListSummary();
         } catch (Exception e) {
+            ModelCallControl.rethrowIfStopped(e);
             log.warn("读取 skill 摘要失败，按无技能继续拆解: {}", e.getMessage());
             return procedureDigest("");
         }
@@ -431,6 +449,7 @@ public class GoalCompiler {
                 }
                 log.warn("GoalCompiler 带修正的 LLM 编译得到空图");
             } catch (Exception e) {
+                ModelCallControl.rethrowIfStopped(e);
                 log.warn("GoalCompiler 带修正的 LLM 编译失败: {}", e.getMessage());
             }
         }
@@ -462,9 +481,11 @@ public class GoalCompiler {
                 + "\n\n**修正要求**:\n" + correctionPrompt
                 + "\n\n请根据上述修正要求重新生成任务图。";
 
-        var response = chat.chat(ChatRequest.builder()
+        var request = ChatRequest.builder()
                 .messages(List.of(new SystemMessage(compilerSystemForCurrentTime()), UserMessage.from(user)))
-                .build());
+                .build();
+        var response = modelCallControl == null ? chat.chat(request)
+                : modelCallControl.call(() -> chat.chat(request));
         String text = response.aiMessage() == null ? "" : response.aiMessage().text();
         try {
             ParsedCompilation parsed = parseCompilation(text, goalFromPlan(userMessage, plan), procedureSnapshot);
@@ -477,6 +498,7 @@ public class GoalCompiler {
             }
             return parsed;
         } catch (Exception e) {
+            ModelCallControl.rethrowIfStopped(e);
             throw new IllegalStateException("parse graph failed: " + e.getMessage()
                     + " | 原文前 300 字: " + abbreviate(text, 300), e);
         }
@@ -528,6 +550,7 @@ public class GoalCompiler {
                 log.warn("GoalCompiler LLM 拆解得到空图 retry={} 耗时={}ms（原文见上一条 warn）",
                         i, ms);
             } catch (Exception e) {
+                ModelCallControl.rethrowIfStopped(e);
                 modelError = true;
                 lastError = abbreviate(e.getMessage(), 180);
                 log.warn("GoalCompiler LLM 拆解失败 retry={} 耗时={}ms: {}",
@@ -674,9 +697,11 @@ public class GoalCompiler {
                 + "\n若同时要读取表格并统计，至少拆成读取 + 计算两个节点。"
                 + "\n不要把打开/读取/解析同一文件拆成多个节点。"
                 + skillDigest(procedureSnapshot);
-        var response = chat.chat(ChatRequest.builder()
+        var request = ChatRequest.builder()
                 .messages(List.of(new SystemMessage(compilerSystemForCurrentTime()), UserMessage.from(user)))
-                .build());
+                .build();
+        var response = modelCallControl == null ? chat.chat(request)
+                : modelCallControl.call(() -> chat.chat(request));
         String text = response.aiMessage() == null ? "" : response.aiMessage().text();
         try {
             ParsedCompilation parsed = parseCompilation(text, goalFromPlan(userMessage, plan), procedureSnapshot);
@@ -689,6 +714,7 @@ public class GoalCompiler {
             }
             return parsed;
         } catch (Exception e) {
+            ModelCallControl.rethrowIfStopped(e);
             throw new IllegalStateException("parse graph failed: " + e.getMessage()
                     + " | 原文前 300 字: " + abbreviate(text, 300), e);
         }
@@ -848,7 +874,7 @@ public class GoalCompiler {
     }
 
     /**
-     * 终验只认文件名，或图上已有的 llm_judge/validation criteria。
+     * Keep concrete criteria even when the graph omitted their checker: validation must report that omission.
      */
     static List<String> checkableCriteria(List<String> raw, String objective,
                                           TaskGraph graph) {
@@ -864,13 +890,11 @@ public class GoalCompiler {
                     continue;
                 }
                 String path = DataflowNormalizer.pathFromName(c);
-                if (!path.isBlank()) {
+                if (!path.isBlank() && path.equals(c.trim())) {
                     out.add(path);
                     continue;
                 }
-                if (StepEvaluator.hasMatchingJudge(graph, c)) {
-                    out.add(c.trim());
-                }
+                out.add(c.trim());
             }
         }
         return List.copyOf(out);

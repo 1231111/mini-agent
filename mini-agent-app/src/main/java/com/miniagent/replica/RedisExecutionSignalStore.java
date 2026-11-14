@@ -88,6 +88,12 @@ public class RedisExecutionSignalStore implements ExecutionSignalStore {
     }
 
     @Override
+    public boolean isPausedAtCheckpoint(String sessionId) {
+        Object value = redis.opsForHash().get(key(sessionId), "pausedAtCheckpoint");
+        return "1".equals(String.valueOf(value));
+    }
+
+    @Override
     public void markHumanWaitpoint(String sessionId, boolean waiting, long ttlMillis) {
         updateFlag(sessionId, "humanWaitpoint", waiting, ttlMillis);
     }

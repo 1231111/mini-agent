@@ -1,5 +1,6 @@
 package com.miniagent.agent.execution;
 
+import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.tool.ToolResult;
 
 /**
@@ -70,6 +71,24 @@ public record ToolInvocation(
 
     public static ToolInvocation controlStop(String name, ToolResult result) {
         return new ToolInvocation(Outcome.CONTROL_STOP, name, result, "");
+    }
+
+    /** Carry the control reason separately from tool error codes, which ordinary tools also use. */
+    public static ToolInvocation controlStop(String name, ToolResult result, ExecutionControl.StopReason reason) {
+        if (reason == null || reason == ExecutionControl.StopReason.NONE) {
+            throw new IllegalArgumentException("A control stop requires a stop reason");
+        }
+        return new ToolInvocation(Outcome.CONTROL_STOP, name, result, reason.name());
+    }
+
+    /** Legacy invocations without a typed control signal stay unspecified; never infer from tool errors. */
+    public ExecutionControl.StopReason controlStopReason() {
+        if (outcome != Outcome.CONTROL_STOP) return ExecutionControl.StopReason.NONE;
+        try {
+            return ExecutionControl.StopReason.valueOf(loopSignal);
+        } catch (IllegalArgumentException e) {
+            return ExecutionControl.StopReason.NONE;
+        }
     }
 
     public static ToolInvocation fenceRejected(String name, ToolResult result) {

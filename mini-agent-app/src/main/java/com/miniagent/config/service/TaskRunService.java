@@ -10,12 +10,15 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
 import java.util.Optional;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.time.Duration;
@@ -27,8 +30,12 @@ public class TaskRunService implements SessionLock {
 
     @Autowired
     private AgentTaskRunRepository repository;
+    @Autowired
+    private PlatformTransactionManager transactionManager;
     @Autowired(required = false)
     private RedisTaskConcurrency taskConcurrency;
+    @Autowired(required = false)
+    private TaskAdmissionGuard admissionGuard;
     @Value("${agent.concurrency.max-tasks-per-user:2}")
     private int maxPerUserConfig;
     private int maxPerUser = 2;
@@ -108,6 +115,18 @@ public class TaskRunService implements SessionLock {
                     return StartResult.rejected(
                             "并发任务过多（每用户最多 " + maxPerUser + " 个），请等待当前任务完成");
                 }
+                String activityRejection = activityRejection(userId, sessionId);
+                if (activityRejection != null) {
+                    releaseRedisResources(admission);
+                    return StartResult.rejected(activityRejection);
+                }
+                // Admission/status RPCs may return after their lease expired and
+                // a replacement was admitted. Validate after those reads before
+                // recovering any persisted RUNNING row.
+                if (!taskConcurrency.renewSessionLock(sessionId, fencingToken)) {
+                    releaseRedisResources(admission);
+                    return StartResult.rejected("任务启动租约已失效，请重试");
+                }
                 interruptPreviousRun(sessionId, "Distributed run lease expired");
                 AgentTaskRun run = saveRunning(userId, sessionId);
                 return StartResult.accepted(new RunHandle(
@@ -141,6 +160,11 @@ public class TaskRunService implements SessionLock {
             }
         }
         try {
+            String activityRejection = activityRejection(userId, sessionId);
+            if (activityRejection != null) {
+                releaseResources(new RunHandle(null, userId, sessionId, fencingToken));
+                return StartResult.rejected(activityRejection);
+            }
             // The local token is the live-worker authority. A terminal DB write
             // may have failed after its owner released the token; repair that
             // stale row only after this admission owns both lock and quota.
@@ -158,6 +182,17 @@ public class TaskRunService implements SessionLock {
             }
             return StartResult.rejected("无法启动任务: " + e.getMessage());
         }
+    }
+
+    private String activityRejection(Long userId, String sessionId) {
+        if (admissionGuard == null) return null;
+        TaskAdmissionGuard.Decision decision;
+        try { decision = admissionGuard.check(userId, sessionId); }
+        catch (RuntimeException unavailable) { decision = TaskAdmissionGuard.Decision.UNAVAILABLE; }
+        if (decision == TaskAdmissionGuard.Decision.ALLOW) return null;
+        return decision == TaskAdmissionGuard.Decision.BUSY
+                ? "上一轮工具操作尚未结束，请稍后重试"
+                : "暂时无法确认上一轮执行状态，请稍后重试";
     }
 
     /**
@@ -196,23 +231,19 @@ public class TaskRunService implements SessionLock {
                 });
     }
 
-    @Transactional
     public void markCompleted(RunHandle run) {
         finish(run, AgentTaskRun.Status.COMPLETED, null);
     }
 
-    @Transactional
     public void markFailed(RunHandle run, String error) {
         finish(run, AgentTaskRun.Status.FAILED, error);
     }
 
-    @Transactional
     public void markCancelled(RunHandle run, String reason) {
         finish(run, AgentTaskRun.Status.CANCELLED, reason);
     }
 
     /** This worker has yielded to a human; a later turn may resume the goal. */
-    @Transactional
     public void markWaiting(RunHandle run, String reason) {
         finish(run, AgentTaskRun.Status.WAITING, reason);
     }
@@ -222,21 +253,25 @@ public class TaskRunService implements SessionLock {
             return;
         }
         try {
-            String detail = error == null || error.length() <= 900
-                    ? error : error.substring(0, 900);
-            int updated = repository.finishIfRunning(
-                    run.runId(),
-                    AgentTaskRun.Status.RUNNING,
-                    status,
-                    LocalDateTime.now(),
-                    detail);
-            if (updated == 0) {
-                log.warn(
-                        "Ignored stale terminal transition runId={} session={} status={}",
-                        run.runId(), run.sessionId(), status);
-            }
+            TransactionTemplate terminalTransaction = new TransactionTemplate(
+                    Objects.requireNonNull(transactionManager, "Task terminal transaction manager is required"));
+            terminalTransaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+            terminalTransaction.executeWithoutResult(ignored -> persistTerminal(run, status, error));
         } finally {
+            // The template includes begin, commit and rollback in this try:
+            // failures at any of those stages must release the ended worker.
             releaseResources(run);
+        }
+    }
+
+    private void persistTerminal(RunHandle run, AgentTaskRun.Status status, String error) {
+        String detail = error == null || error.length() <= 900
+                ? error : error.substring(0, 900);
+        int updated = repository.finishIfRunning(
+                run.runId(), AgentTaskRun.Status.RUNNING, status, LocalDateTime.now(), detail);
+        if (updated == 0) {
+            log.warn("Ignored stale terminal transition runId={} session={} status={}",
+                    run.runId(), run.sessionId(), status);
         }
     }
 

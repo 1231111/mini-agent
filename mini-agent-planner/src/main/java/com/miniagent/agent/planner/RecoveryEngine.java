@@ -173,8 +173,20 @@ public class RecoveryEngine {
      * 应用恢复并 CAS 升版本。总上限或分类熔断时返回 empty。
      */
     public Optional<StateSnapshot> recover(String sessionId, FailureDiagnosis dx) {
+        return recover(sessionId, stateStore.get(sessionId).orElse(null), dx);
+    }
+
+    /** A diagnosis belongs to the exact execution and plan that produced it, never a later task. */
+    public Optional<StateSnapshot> recover(String sessionId, StateSnapshot expected, FailureDiagnosis dx) {
+        if (StringUtils.isBlank(sessionId) || expected == null || dx == null
+                || StringUtils.isBlank(expected.sessionId()) || StringUtils.isBlank(expected.executionId())) {
+            return Optional.empty();
+        }
         StateSnapshot cur = stateStore.get(sessionId).orElse(null);
-        if (cur == null) {
+        if (cur == null || !java.util.Objects.equals(expected.sessionId(), cur.sessionId())
+                || !java.util.Objects.equals(expected.executionId(), cur.executionId())
+                || expected.planVersion() != cur.planVersion() || expected.version() != cur.version()) {
+            log.info("Recovery 拒绝过期失败诊断 session={} task={}", sessionId, dx.taskId());
             return Optional.empty();
         }
         if (cur.recoveryCount() >= properties.getMaxRecoveries()) {
@@ -244,7 +256,7 @@ public class RecoveryEngine {
                 .withExecution(exec).withRecoveryInc();
         try {
             StateSnapshot committed = stateStore.commit(sessionId, cur.version(), patched);
-            stateStore.appendEvent(sessionId, new DomainEvent(
+            stateStore.appendEvent(sessionId, committed, new DomainEvent(
                     "ev_" + UUID.randomUUID().toString().substring(0, 8),
                     DomainEventType.RECOVERY_APPLIED, null, dx.taskId(),
                     Map.of("class", dx.failureClass().name(), "kind", dx.kind().name(),
@@ -258,7 +270,7 @@ public class RecoveryEngine {
             }
             return Optional.of(committed);
         } catch (PlannerStateStore.VersionConflictException e) {
-            stateStore.appendEvent(sessionId, new DomainEvent(
+            stateStore.appendEvent(sessionId, cur, new DomainEvent(
                     "ev_" + UUID.randomUUID().toString().substring(0, 8),
                     DomainEventType.VERSION_CONFLICT, null, dx.taskId(),
                     Map.of("expected", e.expected(), "actual", e.actual()), null));

@@ -2,6 +2,7 @@ package com.miniagent.agent.planner;
 
 import com.miniagent.agent.core.NodeExecutor;
 import com.miniagent.agent.core.AgentLoop;
+import com.miniagent.agent.execution.ToolInvocation;
 import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.task.TaskPlan;
@@ -112,7 +113,7 @@ class PlanningLoopToolResultTest {
         assertEquals(TaskNodeStatus.OUTCOME_UNKNOWN,
                 store.get("s").orElseThrow().graph().byId("web").status());
         verify(executor, times(1)).execute(any(), anyString(), anyString(), any(), anyList(), anyInt(), any(), any());
-        verify(executor, never()).executeBound(anyString(), anyString());
+        verify(executor, never()).executeBoundInvocation(anyString(), anyString());
     }
 
     @Test
@@ -176,7 +177,7 @@ class PlanningLoopToolResultTest {
 
         PlanningLoop.RunOutcome resumed = invoke(run.loop());
         assertEquals("OUTCOME_UNKNOWN", resumed.reason());
-        verify(run.executor(), times(1)).executeBound(anyString(), anyString());
+        verify(run.executor(), times(1)).executeBoundInvocation(anyString(), anyString());
         assertEquals(0, run.store().get("s").orElseThrow().recoveryCount());
     }
 
@@ -208,14 +209,15 @@ class PlanningLoopToolResultTest {
                 new TaskGraph(List.of(node)));
         NodeExecutor executor = mock(NodeExecutor.class);
         if (exception == null) {
-            when(executor.executeBound(anyString(), anyString())).thenReturn(result);
+            when(executor.executeBoundInvocation(anyString(), anyString()))
+                    .thenAnswer(call -> ToolInvocation.executed(call.getArgument(0), result));
         } else {
-            when(executor.executeBound(anyString(), anyString())).thenThrow(exception);
+            when(executor.executeBoundInvocation(anyString(), anyString())).thenThrow(exception);
         }
         PlanningLoop loop = loop(store, executor, List.of("read_file", "write_file"));
         PermissionContext.force("s", PermissionMode.PLAN, true);
         PlanningLoop.RunOutcome outcome = invoke(loop);
-        verify(executor).executeBound(anyString(), anyString());
+        verify(executor).executeBoundInvocation(anyString(), anyString());
         return new Run(outcome, store, loop, executor);
     }
 

@@ -13,6 +13,7 @@ import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.core.TaskExecutionContext;
 import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.core.ExecutionProperties;
+import com.miniagent.agent.core.ModelCallControl;
 import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.task.TaskPlanFactory;
 import com.miniagent.agent.trace.AgentStepNode;
@@ -97,6 +98,8 @@ public class AgentChatApplicationService {
     private ClientMultiAgent clientMultiAgent;
     @Autowired
     private PlanningLoop planningLoop;
+    @Autowired(required = false)
+    private com.miniagent.agent.planner.PlannerStateStore plannerStates;
     @Autowired
     private com.miniagent.agent.trace.TraceRecorder traceRecorder;
 
@@ -267,6 +270,10 @@ public class AgentChatApplicationService {
         boolean executionStarted = false;
         boolean workerOpenAttempted = false;
         AutoCloseable leaseRenewal = null;
+        AgentResult result = null;
+        RunStatus terminalStatus = RunStatus.FAILURE;
+        String terminalDetail = "Task worker interrupted before completion";
+        RuntimeException failure = null;
 
         long[] taskId = {0L};
         try (var ignoredOwner = OwnerContext.bind(owner);
@@ -282,77 +289,69 @@ public class AgentChatApplicationService {
             executionControl.start(sessionId, tenantId, run.fencingToken());
             executionStarted = true;
             if (executionControl.isCancelled(sessionId, run.fencingToken())) {
-                stopLeaseRenewal(leaseRenewal);
-                leaseRenewal = null;
-                taskRunService.markCancelled(run, "Cancelled before worker start");
-                return new AgentResult("任务已取消。", RunStatus.CANCELED, "CANCELLED", 0L);
-            }
-            // Route changes only detach SSE clients; explicit controls own cancellation.
-            streamingService.markRunning(sessionId);
-            workerOpenAttempted = true;
-            clientMultiAgent.open(sessionId);
-            memoryStore.loadFromDisk();
-            try {
-                memoryService.promoteUserBlob();
-            } catch (Exception e) {
-                log.debug("用户画像晋升跳过: {}", e.getMessage());
-            }
-            applySessionWorkspace(userId, sessionId);
-            AgentResult agentResult = doExecuteAgent(
-                    userId,
-                    sessionId,
-                    run,
-                    userMessage,
-                    displayMessage,
-                    progressEmitter,
-                    imageDataUrls,
-                    mediaRefs,
-                    fileRefs,
-                    taskId,
-                    streamToken);
-            taskId[0] = agentResult.taskId();
-            // Stop renewal before selecting a terminal state. close() waits for
-            // any in-flight renewal tick, which may have discovered a lost run
-            // lease and canceled this fencing token while doExecuteAgent returned.
-            stopLeaseRenewal(leaseRenewal);
-            leaseRenewal = null;
-            String answer = agentResult.answer();
-            if (executionControl.isCancelled(sessionId, run.fencingToken()) || agentResult.status() == RunStatus.CANCELED) {
-                taskRunService.markCancelled(run, "Cancelled by user");
-                recordEvent(
+                terminalStatus = RunStatus.CANCELED;
+                terminalDetail = "Cancelled before worker start";
+                result = new AgentResult("任务已取消。", RunStatus.CANCELED, "CANCELLED", 0L);
+            } else {
+                // Route changes only detach SSE clients; explicit controls own cancellation.
+                streamingService.markRunning(sessionId);
+                workerOpenAttempted = true;
+                clientMultiAgent.open(sessionId);
+                memoryStore.loadFromDisk();
+                try {
+                    memoryService.promoteUserBlob();
+                } catch (Exception e) {
+                    log.debug("用户画像晋升跳过: {}", e.getMessage());
+                }
+                applySessionWorkspace(userId, sessionId);
+                AgentResult agentResult = doExecuteAgent(
+                        userId,
                         sessionId,
-                        Long.toString(taskId[0]),
-                        com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
-                        "executor",
-                        Map.of("reason", "cancelled"),
-                        com.miniagent.memory.model.AgentEvent.EventStatus.FAILED);
-                return new AgentResult(answer, RunStatus.CANCELED, "CANCELLED", taskId[0]);
+                        run,
+                        userMessage,
+                        displayMessage,
+                        progressEmitter,
+                        imageDataUrls,
+                        mediaRefs,
+                        fileRefs,
+                        taskId,
+                        streamToken);
+                taskId[0] = agentResult.taskId();
+                result = agentResult;
+                String answer = agentResult.answer();
+                if (executionControl.isCancelled(sessionId, run.fencingToken()) || agentResult.status() == RunStatus.CANCELED) {
+                    terminalStatus = RunStatus.CANCELED;
+                    terminalDetail = "Cancelled by user";
+                    recordEvent(
+                            sessionId,
+                            Long.toString(taskId[0]),
+                            com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
+                            "executor",
+                            Map.of("reason", "cancelled"),
+                            com.miniagent.memory.model.AgentEvent.EventStatus.FAILED);
+                    result = new AgentResult(answer, RunStatus.CANCELED, "CANCELLED", taskId[0], agentResult.executionId());
+                } else if (agentResult.status() == RunStatus.WAITING) {
+                    terminalStatus = RunStatus.WAITING;
+                    terminalDetail = agentResult.reason();
+                } else if (agentResult.status() != RunStatus.SUCCESS) {
+                    String reason = agentResult.reason();
+                    terminalStatus = RunStatus.FAILURE;
+                    terminalDetail = "任务未达成目标: " + reason;
+                    recordEvent(sessionId, Long.toString(taskId[0]),
+                            com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
+                            "executor", Map.of("reason", reason),
+                            com.miniagent.memory.model.AgentEvent.EventStatus.FAILED);
+                    log.warn("任务未达成目标，标记为失败: session={}, reason={}", sessionId, reason);
+                } else {
+                    terminalStatus = RunStatus.SUCCESS;
+                    terminalDetail = null;
+                    recordEvent(sessionId, Long.toString(taskId[0]), com.miniagent.memory.model.AgentEvent.EventType.TASK_COMPLETE,
+                        "executor", Map.of("answer", truncate(answer, 500)),
+                        com.miniagent.memory.model.AgentEvent.EventStatus.SUCCESS);
+                }
             }
-            if (agentResult.status() == RunStatus.WAITING) {
-                taskRunService.markWaiting(run, agentResult.reason());
-                return agentResult;
-            }
-            if (agentResult.status() != RunStatus.SUCCESS) {
-                String reason = agentResult.reason();
-                taskRunService.markFailed(run, "任务未达成目标: " + reason);
-                recordEvent(sessionId, Long.toString(taskId[0]),
-                        com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
-                        "executor", Map.of("reason", reason),
-                        com.miniagent.memory.model.AgentEvent.EventStatus.FAILED);
-                log.warn("任务未达成目标，标记为失败: session={}, reason={}", sessionId, reason);
-                return agentResult;
-            }
-            taskRunService.markCompleted(run);
-
-            // 记录任务成功事件
-            recordEvent(sessionId, Long.toString(taskId[0]), com.miniagent.memory.model.AgentEvent.EventType.TASK_COMPLETE,
-                "executor", Map.of("answer", truncate(answer, 500)),
-                com.miniagent.memory.model.AgentEvent.EventStatus.SUCCESS);
-
-            return agentResult;
-        } catch (Exception e) {
-            stopLeaseRenewal(leaseRenewal);
-            leaseRenewal = null;
+        } catch (RuntimeException e) {
+            failure = e;
             boolean cancelled = false;
             if (executionStarted) {
                 try {
@@ -367,19 +366,21 @@ public class AgentChatApplicationService {
                 }
             }
             if (cancelled) {
-                taskRunService.markCancelled(run, "Cancelled by user");
+                terminalStatus = RunStatus.CANCELED;
+                terminalDetail = "Cancelled by user";
             } else {
-                taskRunService.markFailed(run, exceptionDetail(e));
+                terminalStatus = RunStatus.FAILURE;
+                terminalDetail = exceptionDetail(e);
             }
 
             // 记录任务失败事件
             recordEvent(sessionId, Long.toString(taskId[0]), com.miniagent.memory.model.AgentEvent.EventType.TASK_FAIL,
                 "executor", Map.of("error", exceptionDetail(e)),
                 com.miniagent.memory.model.AgentEvent.EventStatus.FAILED);
-
-            throw e;
         } finally {
-            stopLeaseRenewal(leaseRenewal);
+            // Keep the admission lease while native/session cleanup can still
+            // affect this session. A replacement must not start between the
+            // result and the old worker's releaseFor/close/markIdle calls.
             if (desktopInteractionService != null) {
                 try { desktopInteractionService.releaseFor(userId, owner.tenantId(), sessionId); }
                 catch (RuntimeException e) { log.warn("释放桌面输入失败: session={}", sessionId, e); }
@@ -391,6 +392,34 @@ public class AgentChatApplicationService {
             } catch (RuntimeException e) {
                 log.warn("关闭会话 worker 失败: session={}", sessionId, e);
             }
+            // For SSE runs the outer wrapper retains its channel reservation
+            // until it publishes the terminal event. Synchronous runs have no
+            // outer wrapper, so finish their session flag before unlocking.
+            if (progressEmitter == null) {
+                try { streamingService.markIdle(sessionId); }
+                catch (RuntimeException e) { log.warn("清理同步任务状态失败: session={}", sessionId, e); }
+            }
+            // close waits for an in-flight tick. Cancellation discovered during
+            // cleanup or that tick must still override the selected loop result.
+            stopLeaseRenewal(leaseRenewal);
+            if (executionStarted && terminalStatus != RunStatus.CANCELED) {
+                try {
+                    if (executionControl.isCancelled(sessionId, run.fencingToken())) {
+                        terminalStatus = RunStatus.CANCELED;
+                        terminalDetail = "Cancelled before worker cleanup completed";
+                        if (result != null) result = new AgentResult(result.answer(), RunStatus.CANCELED,
+                                "CANCELLED", result.taskId(), result.executionId());
+                    }
+                } catch (RuntimeException controlFailure) {
+                    if (failure != null) {
+                        if (failure != controlFailure) failure.addSuppressed(controlFailure);
+                    } else {
+                        failure = controlFailure;
+                        terminalStatus = RunStatus.FAILURE;
+                        terminalDetail = exceptionDetail(controlFailure);
+                    }
+                }
+            }
             try {
                 executionControl.finish(sessionId, run.fencingToken());
             } catch (RuntimeException e) {
@@ -401,19 +430,25 @@ public class AgentChatApplicationService {
                 WorkspaceContext.clearRootOverride();
                 WorkspaceContext.clearSessionOverride();
             }
-            // For SSE runs the outer async wrapper publishes the terminal event
-            // before releasing the ChatStreamingService reservation. Releasing it
-            // here would let a rapid second request replace the channel between
-            // this finally block and eventCenter.complete/error.
-            if (progressEmitter == null) {
-                streamingService.markIdle(sessionId);
+            // The persisted terminal transition also releases lock/quota. It is
+            // deliberately last, after every session-scoped cleanup above.
+            try (var ignoredRun = TaskExecutionContext.bindRun(run.fencingToken())) {
+                switch (terminalStatus) {
+                    case SUCCESS -> taskRunService.markCompleted(run);
+                    case WAITING -> taskRunService.markWaiting(run, terminalDetail);
+                    case CANCELED -> taskRunService.markCancelled(run, terminalDetail);
+                    default -> taskRunService.markFailed(run, terminalDetail);
+                }
+            } catch (RuntimeException terminalFailure) {
+                if (failure == null) failure = terminalFailure;
+                else if (failure != terminalFailure) failure.addSuppressed(terminalFailure);
             }
 
             // 巩固走后台，避免挡住 SSE end（PERM_ASK 批准后续跑会等流结束）
             if (memoryManager != null) {
                 final String consolidateSid = sessionId;
                 final Long consolidateUserId = userId;
-                CompletableFuture.runAsync(() -> {
+                try { CompletableFuture.runAsync(() -> {
                     // 异步线程不继承 ThreadLocal：显式绑定归属与该用户配置的模型，
                     // 否则巩固的 LLM 提炼会回退到全局 Bean（全局 key 失效即稳定 401）。
                     try (var ignoredOwner = OwnerContext.bind(owner);
@@ -423,9 +458,13 @@ public class AgentChatApplicationService {
                     } catch (Exception e) {
                         log.debug("记忆巩固失败: {}", e.getMessage());
                     }
-                });
+                }); } catch (RuntimeException schedulingFailure) {
+                    log.debug("记忆巩固调度失败: {}", schedulingFailure.getMessage());
+                }
             }
         }
+        if (failure != null) throw failure;
+        return result;
     }
 
     private static void stopLeaseRenewal(AutoCloseable renewal) {
@@ -521,13 +560,34 @@ public class AgentChatApplicationService {
      *
      * <p>默认循环与规划器共用显式终态，持久任务、轨迹及 SSE 不从答复文本推断成功。</p>
      */
-    record AgentResult(String answer, RunStatus status, String reason, long taskId) {}
+    record AgentResult(String answer, RunStatus status, String reason, long taskId, String executionId) {
+        AgentResult(String answer, RunStatus status, String reason, long taskId) {
+            this(answer, status, reason, taskId, "");
+        }
+    }
 
     static RunStatus loopStatus(AgentLoop.LoopOutcome outcome) {
         if (outcome == null) return RunStatus.FAILURE;
         if (outcome.cancelled()) return RunStatus.CANCELED;
         if (outcome.awaitingHuman()) return RunStatus.WAITING;
         return outcome.successful() ? RunStatus.SUCCESS : RunStatus.FAILURE;
+    }
+
+    static RunStatus planningStatus(PlanningLoop.RunOutcome outcome) {
+        if (outcome == null) return RunStatus.FAILURE;
+        if ("CANCELLED".equals(outcome.reason()) || "CANCELED".equals(outcome.reason()))
+            return RunStatus.CANCELED;
+        if (AgentLoop.DEADLINE_EXCEEDED.equals(outcome.reason())
+                || AgentLoop.RESOURCE_QUOTA_EXCEEDED.equals(outcome.reason())
+                || "RESOURCE_QUOTA_EXCEEDED".equals(outcome.reason())
+                || "TOOL_BUDGET_EXCEEDED".equals(outcome.reason())
+                || "TENANT_QUOTA_EXCEEDED".equals(outcome.reason()))
+            return RunStatus.FAILURE;
+        return switch (outcome.outcome()) {
+            case COMPLETED -> RunStatus.SUCCESS;
+            case BLOCKED_ON_HUMAN -> RunStatus.WAITING;
+            case UNFINISHED, FAILED -> RunStatus.FAILURE;
+        };
     }
 
     private static String exceptionDetail(Exception error) {
@@ -673,12 +733,15 @@ public class AgentChatApplicationService {
         String answer;
         String endReason = "SUCCESS";
         boolean planApprovalRequired = false;
+        boolean dagInvoked = false;
+        String progressExecutionId = traceRecorder == null ? null : traceRecorder.currentExecutionId();
         try {
             String executionId = Objects.nonNull(traceRecorder)
                     ? traceRecorder.currentExecutionId() : null;
             var planningRoute = planningLoop.selectRoute(effectiveChat, taskPlan, sessionId,
                     userMessage, multimodalMsg, history);
-            if (planningRoute != null && planningRoute.useDag()) {
+            if (planningRoute == null || !planningRoute.resolved() || planningRoute.useDag()) {
+                dagInvoked = true;
                 PlanningLoop.RunOutcome outcome = planningLoop.runWithOutcome(
                         effectiveChat, systemPrompt, userMessage, multimodalMsg,
                         history, taskPlan, sessionId, run.fencingToken(), executionId,
@@ -690,11 +753,7 @@ public class AgentChatApplicationService {
                     eventCenter.publish(sessionId, "plan_approval",
                             Map.of("required", true, "reason", outcome.reason()), streamToken);
                 }
-                if (meansUnfinished(outcome)) {
-                    runStatus = RunStatus.FAILURE;
-                } else if (outcome.outcome() == PlanningLoop.Outcome.BLOCKED_ON_HUMAN) {
-                    runStatus = RunStatus.WAITING;
-                }
+                runStatus = planningStatus(outcome);
             } else {
                 AgentLoop.LoopOutcome outcome = hasMedia
                         ? agentLoop.runWithMultimodalOutcome(effectiveChat, systemPrompt, multimodalMsg,
@@ -710,10 +769,36 @@ public class AgentChatApplicationService {
                 runStatus = RunStatus.CANCELED;
                 endReason = "CANCELLED";
             }
+        } catch (ModelCallControl.StoppedException stopped) {
+            // Routing and compilation run outside AgentLoop, but must share its
+            // persisted terminal status and SSE contract when a model wait stops.
+            boolean cancelled = stopped.reason() == ExecutionControl.StopReason.CANCELLED;
+            runStatus = cancelled ? RunStatus.CANCELED : RunStatus.FAILURE;
+            endReason = stopped.reason() == ExecutionControl.StopReason.NONE
+                    ? "EXECUTION_STOPPED" : stopped.reason().name();
+            answer = switch (stopped.reason()) {
+                case CANCELLED -> "任务已取消。";
+                case DEADLINE_EXCEEDED -> "任务已达到执行时限，已停止后续操作。已取得的进度已保留。";
+                case TOOL_BUDGET_EXCEEDED -> "任务已达到工具调用上限，已停止后续操作。";
+                case TENANT_QUOTA_EXCEEDED -> "任务已达到可用配额，已停止后续操作。";
+                default -> "任务已停止，尚未完成。";
+            };
         } finally {
             PermissionContext.clear();
             AgentLoop.clearCurrentModels();
             AgentLoop.clearCurrentSession();
+        }
+
+        // A resumed DAG retains its original execution identity while this reply
+        // has a new trace identity. Review APIs must address the DAG, not the turn.
+        if (dagInvoked && plannerStates != null) {
+            try {
+                progressExecutionId = plannerStates.get(sessionId)
+                        .map(com.miniagent.agent.planner.StateSnapshot::executionId)
+                        .filter(StringUtils::isNotBlank).orElse(progressExecutionId);
+            } catch (RuntimeException projectionFailure) {
+                log.warn("Cannot resolve task progress execution identity session={}", sessionId, projectionFailure);
+            }
         }
 
         // A blank `end` event is rendered as a successful completion by the chat UI.
@@ -734,6 +819,12 @@ public class AgentChatApplicationService {
         } else {
             memory.add(UserMessage.from(userMessage));
         }
+        if (runStatus == RunStatus.FAILURE) {
+            answer = com.miniagent.agent.core.UserFacingFailure.summarize(answer,
+                    AgentLoop.OUTCOME_UNKNOWN.equals(endReason)
+                            ? "操作结果尚未确认，已停止自动重试。请先核验实际状态。"
+                            : "本次任务未完成，请查看执行日志中的失败步骤。");
+        }
         memory.add(AiMessage.from(answer));
 
         ChatTask task = new ChatTask();
@@ -742,7 +833,7 @@ public class AgentChatApplicationService {
         task.setQuestion(displayQuestion);
         task.setAnswer(answer);
         task.setTaskProgressJson(TaskProgressSnapshot.capture(
-                traceRecorder == null ? null : traceRecorder.currentExecutionId(), loaded.taskId(),
+                progressExecutionId, loaded.taskId(),
                 runStatus.name(), endReason, taskTodoStore == null ? List.of() : taskTodoStore.get(sessionId))
                 .toJson());
         if (!allSavedPaths.isEmpty()) {
@@ -753,7 +844,8 @@ public class AgentChatApplicationService {
                 StringUtils.isNotBlank(userMessage) ? userMessage : displayQuestion,
                 answer,
                 memoryMediaPaths.isEmpty() ? null : memoryMediaPaths);
-        return new AgentResult(answer, runStatus, endReason, loaded.taskId());
+        return new AgentResult(answer, runStatus, endReason, loaded.taskId(),
+                Objects.requireNonNullElse(progressExecutionId, ""));
         }
         } catch (Exception e) {
             runStatus = RunStatus.FAILURE;
@@ -867,7 +959,8 @@ public class AgentChatApplicationService {
                         finalFileRefs, prepared, stream.runToken());
                 streamingService.markCompleting(finalSid);
                 streamingService.getEventCenter().publish(finalSid, "task_outcome",
-                        Map.of("status", result.status().name(), "reason", result.reason()), stream.runToken());
+                        Map.of("status", result.status().name(), "reason", result.reason(),
+                                "executionId", result.executionId(), "taskId", result.taskId()), stream.runToken());
                 if (result.status() == RunStatus.FAILURE) {
                     streamingService.getEventCenter().error(finalSid, result.answer(), stream.runToken());
                 } else {

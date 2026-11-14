@@ -609,7 +609,7 @@ class LiveComputerBrowserAgentIntegrationTest {
                 "model", resolved.settings().modelName(), "host", URI.create(resolved.settings().baseUrl()).getHost(),
                 "visionPreset", environment.getProperty("agent.multimodal.vision-preset", "default"),
                 "startedAt", Instant.now().toString(), "session", session));
-        return new Fixture(loop, resolved, control, session, evidence);
+        return new Fixture(loop, resolved, control, session, evidence, journal);
     }
 
     private static StandardEnvironment loadEnvironment() throws Exception {
@@ -668,14 +668,17 @@ class LiveComputerBrowserAgentIntegrationTest {
     }
 
     private record Fixture(AgentLoop loop, ModelClientFactory.ResolvedModels model, ExecutionControl control,
-                           String session, Path evidence) implements AutoCloseable {
+                           String session, Path evidence, FileActionJournal journal) implements AutoCloseable {
         AgentLoop.LoopOutcome run(String task, String system) {
             return run(task, system, 15);
         }
         AgentLoop.LoopOutcome run(String task, String system, int iterations) {
             return loop.runOutcome(model.chat(), system, task, List.of(), iterations, TaskPlan.of(task), null);
         }
-        @Override public void close() { control.cancel(session); control.finish(session); }
+        @Override public void close() {
+            try { control.cancel(session); control.finish(session); }
+            finally { journal.close(); }
+        }
     }
 
     /** Guard changes only test scope, never supplies coordinates or substitutes OS input. */

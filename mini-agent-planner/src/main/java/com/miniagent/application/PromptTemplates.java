@@ -162,6 +162,22 @@ public final class PromptTemplates {
             URL、关键词、API名称保持原始形态，不要翻译。
             不确定的事情说"不确定"，不要装。
             用户纠正你 → 立刻接受，记录到记忆，不要辩解。
+
+            # 多媒体交付
+            推荐或查询电影、视频、歌曲/音频时，用一个 miniagent-media JSON 代码块交付媒体卡片，避免只列文字表格：
+            ```miniagent-media
+            {"title":"列表标题","items":[]}
+            ```
+            检索时一并查找真实封面、详情/观看/收听入口；有可核验的媒体直链时再提供播放，不要只检索片名或歌名。
+            items 放真实结果（每组最多8项，更多结果分组输出，不遗漏用户要求的范围），每项必填 type（movie/video/song，audio兼容）和 title；
+            可选 description、posterUrl（封面）、pageUrl（观看/收听/详情页）、mediaUrl（可播放媒体直链或工具返回的站内媒体URL）、
+            mimeType、creator、releaseDate、duration、source（对象：label 为来源名，url 为来源页）。没有的字段省略。
+            只有 mediaUrl 用于直接播放，pageUrl/source.url 只用于打开网页，不能把网页链接填进 mediaUrl。
+            movie 的 mediaUrl 仅使用真实预告片/片段，并在 title 或 description 明确标注“预告片”或“片段”，不得暗示能播放完整电影。
+            标题、封面、页面与媒体URL须来自可核验来源或工具结果；不按片名猜地址，不虚构可播放资源，不把示例内容当作结果。
+            无媒体直链时省略 mediaUrl，保留真实 pageUrl；两者都没有时只展示信息并说明尚无播放来源。
+            工具生成的音视频也可直接保留原始 Markdown 媒体格式 ![说明](真实媒体URL)，不要改成纯文本地址。
+            普通链接用 [清晰中文标题](原始URL)，让用户点击直接打开；不要把页面链接伪装成媒体或图片。
             """;
 
     public static final String BROWSER_GUIDANCE = """

@@ -13,7 +13,7 @@ import java.util.Map;
 
 /** Durable UI projection of actual task nodes, never inferred from tool iterations. */
 public record TaskProgressSnapshot(String executionId, long taskId, String status,
-                                   String reason, List<Item> items) {
+                                   String reason, List<Item> items, List<String> outcomeReviewReceipts) {
     private static final ObjectMapper JSON = new ObjectMapper()
             .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
 
@@ -21,7 +21,14 @@ public record TaskProgressSnapshot(String executionId, long taskId, String statu
         public Item { dependsOn = dependsOn == null ? List.of() : List.copyOf(dependsOn); }
     }
 
-    public TaskProgressSnapshot { items = items == null ? List.of() : List.copyOf(items); }
+    public TaskProgressSnapshot(String executionId, long taskId, String status, String reason, List<Item> items) {
+        this(executionId, taskId, status, reason, items, List.of());
+    }
+
+    public TaskProgressSnapshot {
+        items = items == null ? List.of() : List.copyOf(items);
+        outcomeReviewReceipts = outcomeReviewReceipts == null ? List.of() : List.copyOf(outcomeReviewReceipts);
+    }
 
     public static TaskProgressSnapshot capture(String executionId, long taskId, String status,
                                                String reason, List<TaskTodoStore.TodoItem> todos) {
@@ -65,6 +72,8 @@ public record TaskProgressSnapshot(String executionId, long taskId, String statu
             try { taskId = Long.parseLong(snapshot.sessionId().substring(snapshot.sessionId().lastIndexOf('#') + 1)); }
             catch (NumberFormatException ignored) { }
         }
-        return new TaskProgressSnapshot(snapshot.executionId(), taskId, status, "LEGACY_DAG", items);
+        boolean unknown = snapshot.graph().nodes().stream().anyMatch(n -> n.status() == TaskNodeStatus.OUTCOME_UNKNOWN
+                || n.toolStatus() == com.miniagent.agent.tool.ToolStatus.UNKNOWN);
+        return new TaskProgressSnapshot(snapshot.executionId(), taskId, status, unknown ? "OUTCOME_UNKNOWN" : "LEGACY_DAG", items);
     }
 }

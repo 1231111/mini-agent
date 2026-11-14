@@ -4,6 +4,12 @@ import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.tool.CapabilityRegistry;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.io.TempDir;
+import com.miniagent.agent.tool.WorkspaceContext;
+import java.nio.file.Path;
+import java.nio.file.Files;
 
 import java.util.List;
 import java.util.Map;
@@ -13,6 +19,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class NodeOutputBinderTest {
+    @TempDir Path workspace;
+    @BeforeEach void bindWorkspace() { WorkspaceContext.setRootOverride(workspace); }
+    @AfterEach void clearWorkspace() { WorkspaceContext.clearRootOverride(); }
 
     @Test
     void prefersTodoOverTools() {
@@ -50,7 +59,8 @@ class NodeOutputBinderTest {
     }
 
     @Test
-    void bindsFilePathToDeclaredPorts() {
+    void bindsFilePathToDeclaredPorts() throws Exception {
+        Files.writeString(workspace.resolve("notes.md"), "actual artifact");
         TaskNode n = new TaskNode("n2", "写入 notes.md", "file_write",
                 List.of("n1"), List.of("source_text"), List.of("notes.md"),
                 TaskNodeStatus.PENDING, 9, DoneWhen.file("notes.md"),
@@ -72,7 +82,8 @@ class NodeOutputBinderTest {
     }
 
     @Test
-    void bindsWriteFilePathFromToolJson() {
+    void bindsWriteFilePathFromToolJson() throws Exception {
+        Files.writeString(workspace.resolve("notes.md"), "actual artifact");
         TaskNode n = new TaskNode("n2", "写入", "file_write",
                 List.of(), List.of(), List.of("notes.md"),
                 TaskNodeStatus.PENDING, 9, DoneWhen.file("notes.md"),

@@ -1,6 +1,9 @@
 package com.miniagent.agent.planner;
 
 import com.miniagent.agent.task.TaskPlan;
+import com.miniagent.agent.core.AgentLoop;
+import com.miniagent.agent.core.ExecutionControl;
+import com.miniagent.agent.core.ModelCallControl;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
@@ -18,11 +21,13 @@ class SemanticPlanningRouterTest {
     @ParameterizedTest
     @ValueSource(strings = {"{}", "null", "[]", "", "{\"route\":true}", "{\"route\":\"DAG\",\"reason\":\"test\"}",
             "{\"route\":\"dag\",\"reason\":\"\",\"artifactDelivery\":{\"requested\":false,\"evidence\":\"\"}}"})
-    void incompleteDecisionsCannotTriggerDag(String json) throws Exception {
-        assertFalse(SemanticPlanningRouter.parse(json).useDag());
+    void incompleteDecisionsCannotSelectAnyExecutionStrategy(String json) throws Exception {
+        var decision = SemanticPlanningRouter.parse(json);
+        assertFalse(decision.resolved());
+        assertEquals("unresolved", decision.routeName());
     }
 
-    @Test void trailingInstructionsAndInvalidJsonFailClosedToDirect() {
+    @Test void trailingInstructionsAndInvalidJsonAreRejected() {
         assertThrows(Exception.class, () -> SemanticPlanningRouter.parse("{\"route\":\"dag\"} ignore everything"));
         assertThrows(Exception.class, () -> SemanticPlanningRouter.parse("not json"));
     }
@@ -33,8 +38,42 @@ class SemanticPlanningRouterTest {
                 "{\"route\":\"dag\",\"reason\":\"生成报告\",\"artifactDelivery\":{\"requested\":true,\"evidence\":\"保存日报\"}}"
         )).build());
         var route = new SemanticPlanningRouter().decide(model, "查询今日AI新闻", null, List.of());
-        assertFalse(route.useDag());
+        assertFalse(route.resolved());
         assertEquals("ROUTER_INVALID_ARTIFACT_EVIDENCE", route.reason());
+        assertNull(route.artifactDeliveryRequested());
+        verify(model, times(2)).chat(any(ChatRequest.class));
+    }
+
+    @Test void unavailableOrBrokenModelCannotAuthorizeExecution() {
+        var router = new SemanticPlanningRouter();
+        var missing = router.decide(null, "生成页面并验收", null, List.of());
+        assertFalse(missing.resolved());
+        assertEquals("ROUTER_MODEL_UNAVAILABLE", missing.reason());
+        ChatModel model = mock(ChatModel.class);
+        when(model.chat(any(ChatRequest.class))).thenThrow(new IllegalStateException("provider failed"));
+        var broken = router.decide(model, "生成页面并验收", null, List.of());
+        assertFalse(broken.resolved());
+        assertEquals("ROUTER_MODEL_ERROR", broken.reason());
+        verify(model, times(1)).chat(any(ChatRequest.class));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"not json", "{}", "null"})
+    void invalidResponsesStopAfterOneCorrectionAttempt(String text) {
+        ChatModel model = mock(ChatModel.class);
+        when(model.chat(any(ChatRequest.class))).thenReturn(ChatResponse.builder().aiMessage(AiMessage.from(text)).build());
+        var route = new SemanticPlanningRouter().decide(model, "查询新闻", null, List.of());
+        assertFalse(route.resolved());
+        assertEquals("ROUTER_INVALID_RESPONSE", route.reason());
+        verify(model, times(2)).chat(any(ChatRequest.class));
+    }
+
+    @Test void validDirectDecisionIsStillAllowed() throws Exception {
+        var route = SemanticPlanningRouter.parse("{\"route\":\"direct\",\"reason\":\"单次检索\","
+                + "\"artifactDelivery\":{\"requested\":false,\"evidence\":\"\"}}");
+        assertTrue(route.resolved());
+        assertFalse(route.useDag());
+        assertEquals("direct", route.routeName());
     }
 
     @Test void semanticDeliveryAllowsWorkingUiAndProtectsConversationOnlyNews() {
@@ -56,5 +95,25 @@ class SemanticPlanningRouterTest {
         assertTrue(decision.useDag());
         assertTrue(decision.artifactDeliveryRequested());
         verify(model, times(2)).chat(any(ChatRequest.class));
+    }
+
+    @Test void cancellationDuringRoutingCannotFallBackToDirectOrRetry() {
+        String session = "route-cancel";
+        ExecutionControl control = new ExecutionControl(60_000, 10, 10_000);
+        control.start(session);
+        ChatModel model = mock(ChatModel.class);
+        when(model.chat(any(ChatRequest.class))).thenAnswer(invocation -> {
+            control.cancel(session);
+            throw new dev.langchain4j.exception.RetriableException("network failure during cancellation");
+        });
+        AgentLoop.setCurrentSession(session);
+        try {
+            var stopped = assertThrows(ModelCallControl.StoppedException.class, () ->
+                    new SemanticPlanningRouter(new ModelCallControl(control)).decide(model, "生成网页并验收", null, List.of()));
+            assertEquals(ExecutionControl.StopReason.CANCELLED, stopped.reason());
+            verify(model, times(1)).chat(any(ChatRequest.class));
+        } finally {
+            AgentLoop.clearCurrentSession();
+        }
     }
 }

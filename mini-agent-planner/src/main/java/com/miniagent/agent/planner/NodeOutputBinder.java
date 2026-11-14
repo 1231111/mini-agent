@@ -2,6 +2,7 @@ package com.miniagent.agent.planner;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.miniagent.agent.tool.CapabilityRegistry;
+import com.miniagent.agent.todo.AcceptanceEvidenceFiles;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import org.apache.commons.lang3.StringUtils;
@@ -28,6 +29,8 @@ final class NodeOutputBinder {
             if (node == null) {
                 return false;
             }
+            if (node.doneWhen() != null && node.doneWhen().isFile()
+                    && AcceptanceEvidenceFiles.resolveDeclaredFile(node.doneWhen().path()) == null) return false;
             if (node.outputs() == null || node.outputs().isEmpty()) {
                 return StringUtils.isNotBlank(evidence);
             }

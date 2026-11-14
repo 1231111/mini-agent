@@ -16,6 +16,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -44,10 +47,10 @@ class SessionEventCenterRunTokenTest {
 
         assertTrue(center.hasRunningSession("s"));
         assertEquals(0, emitter.completions);
-        assertEquals(List.of("session", "user"), emitter.names);
+        awaitFrames(emitter, List.of("session", "user"));
         center.publish("s", "token", "new text", currentRun);
         center.complete("s", "new final", currentRun);
-        assertEquals(List.of("session", "user", "token", "end"), emitter.names);
+        awaitFrames(emitter, List.of("session", "user", "token", "end"));
         assertFalse(emitter.wire.toString().contains("old"));
         assertEquals(1, emitter.completions);
     }
@@ -60,7 +63,7 @@ class SessionEventCenterRunTokenTest {
         center.complete("s", "waiting", run);
 
         RecordingEmitter emitter = attach();
-        assertEquals(List.of("session", "user", "permission_ask", "task_outcome", "end"), emitter.names);
+        awaitFrames(emitter, List.of("session", "user", "permission_ask", "task_outcome", "end"));
         assertTrue(emitter.wire.toString().contains("WAITING"));
         assertTrue(emitter.wire.toString().contains("grantToken"));
         assertEquals(1, emitter.completions);
@@ -73,7 +76,7 @@ class SessionEventCenterRunTokenTest {
         center.error("s", "iteration budget exhausted", run);
 
         RecordingEmitter emitter = attach();
-        assertEquals(List.of("session", "user", "task_outcome", "error"), emitter.names);
+        awaitFrames(emitter, List.of("session", "user", "task_outcome", "error"));
         assertTrue(emitter.wire.toString().contains("MAX_ITERATIONS"));
     }
 
@@ -89,14 +92,14 @@ class SessionEventCenterRunTokenTest {
         receive("complete", "end", "stale completion", "old");
         receive("error", "error", "stale error", "old");
         assertTrue(center.hasRunningSession("s"));
-        assertEquals(List.of("session", "user"), emitter.names);
+        awaitFrames(emitter, List.of("session", "user"));
         assertEquals(0, emitter.completions);
 
         receive("event", "token", "current answer", "new");
         receive("event", "task_outcome", Map.of("status", "SUCCESS", "reason", "SUCCESS"), "new");
         receive("complete", "end", "current final", "new");
         assertFalse(center.hasRunningSession("s"));
-        assertEquals(List.of("session", "user", "token", "task_outcome", "end"), emitter.names);
+        awaitFrames(emitter, List.of("session", "user", "token", "task_outcome", "end"));
         assertFalse(emitter.wire.toString().contains("stale"));
         assertEquals(1, emitter.completions);
     }
@@ -107,7 +110,7 @@ class SessionEventCenterRunTokenTest {
         receive("event", "token", "preserved", "run");
         receive("start", "user", "work", "run");
         RecordingEmitter emitter = attach();
-        assertEquals(List.of("session", "user", "token"), emitter.names);
+        awaitFrames(emitter, List.of("session", "user", "token"));
         assertTrue(emitter.wire.toString().contains("preserved"));
     }
 
@@ -117,7 +120,7 @@ class SessionEventCenterRunTokenTest {
         receive("event", "token", "legacy answer", null);
         receive("complete", "end", "legacy final", null);
         RecordingEmitter emitter = attach();
-        assertEquals(List.of("session", "user", "token", "end"), emitter.names);
+        awaitFrames(emitter, List.of("session", "user", "token", "end"));
         assertEquals(1, emitter.completions);
     }
 
@@ -131,7 +134,7 @@ class SessionEventCenterRunTokenTest {
         when(properties.isRedisMode()).thenReturn(true);
         ReflectionTestUtils.setField(center, "redis", redis);
         ReflectionTestUtils.setField(center, "replicaProperties", properties);
-        List<JsonNode> published = new ArrayList<>();
+        List<JsonNode> published = new CopyOnWriteArrayList<>();
         doAnswer(invocation -> {
             published.add(JSON.readTree(invocation.getArgument(1, String.class)));
             return null;
@@ -143,6 +146,7 @@ class SessionEventCenterRunTokenTest {
         String second = center.startRun("s", "second");
         center.error("s", "failed", second);
 
+        await(() -> published.size() == 5);
         assertEquals(List.of("start", "event", "complete", "start", "error"),
                 published.stream().map(node -> node.path("type").asText()).toList());
         assertEquals(List.of(first, first, first, second, second),
@@ -154,6 +158,20 @@ class SessionEventCenterRunTokenTest {
         RecordingEmitter emitter = new RecordingEmitter();
         assertTrue(center.attachClient("s", 1L, emitter));
         return emitter;
+    }
+
+    private static void awaitFrames(RecordingEmitter emitter, List<String> expected) {
+        boolean terminal = expected.contains("end") || expected.contains("error");
+        await(() -> expected.equals(emitter.names) && (!terminal || emitter.completions > 0));
+    }
+
+    private static void await(BooleanSupplier condition) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+            try { Thread.sleep(5); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
+        }
+        assertTrue(condition.getAsBoolean(), "queued event delivery did not finish");
     }
 
     private void receive(String type, String name, Object data, String runToken) throws Exception {
@@ -170,9 +188,9 @@ class SessionEventCenterRunTokenTest {
     }
 
     private static final class RecordingEmitter extends SseEmitter {
-        final List<String> names = new ArrayList<>();
+        final List<String> names = new CopyOnWriteArrayList<>();
         final StringBuilder wire = new StringBuilder();
-        int completions;
+        volatile int completions;
 
         @Override
         public void send(SseEventBuilder event) {
@@ -180,8 +198,8 @@ class SessionEventCenterRunTokenTest {
             event.build().forEach(part -> frame.append(part.getData()));
             var matcher = Pattern.compile("event:([^\\n]+)").matcher(frame);
             assertTrue(matcher.find(), () -> "Missing event name: " + frame);
-            names.add(matcher.group(1));
             wire.append(frame);
+            names.add(matcher.group(1));
         }
 
         @Override

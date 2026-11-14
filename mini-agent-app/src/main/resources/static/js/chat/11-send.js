@@ -233,6 +233,15 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             removeTyping();
             ensureAnswer();
             answerEl.classList.toggle('has-content', !!answer.trim());
+            if (typeof setMarkdownContent === 'function' && answerEl.querySelector('audio[data-media-key],video[data-media-key]')) {
+                setMarkdownContent(answerEl, renderMDStreaming(dropLeadBlanks(answer)));
+                answerTailEl = null;
+                renderedFrozen = '';
+                renderedTail = '';
+                renderedAnswer = answer;
+                scrollToBottom();
+                return;
+            }
             // 自愈：正文容器被整段替换过（finish / 历史回放）时 .md-tail 已经脱离 DOM，
             // 此时游标全部作废，重建结构后从头画。
             if (!answerTailEl || !answerTailEl.isConnected) {
@@ -351,7 +360,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             botBody.classList.remove('streaming');
             // 保留助手气泡里的执行卡片、思考与时间线，只定稿答案区域
             ensureAnswer();
-            answerEl.innerHTML = html;
+            if (typeof setMarkdownContent === 'function') setMarkdownContent(answerEl, html);
+            else answerEl.innerHTML = html;
             // Errors and stop notices may have no streamed answer, but their
             // terminal content still needs to be visible after removing status cards.
             answerEl.classList.toggle('has-content', !!String(html || '').trim());
@@ -477,7 +487,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             if (previousRow && previousRow.classList.contains('plan-row')) previousRow.remove();
             todoEl = renderTaskProgress(botBody, todoItems, {
                 live: isStreaming && !done, waiting: turnWaiting, incomplete: turnIncomplete,
-                failed: turnFailed, cancelled: turnCancelled, status: taskOutcomeStatus, allowConfirm: true
+                failed: turnFailed, cancelled: turnCancelled, status: taskOutcomeStatus,
+                reason: taskOutcomeReason, allowConfirm: true
             });
         }
         function removeTyping() {
@@ -710,6 +721,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                     if (['SUCCESS', 'WAITING', 'CANCELED', 'FAILURE'].includes(status)) {
                         taskOutcomeStatus = status;
                         taskOutcomeReason = String(payload.reason || '');
+                        if (payload.executionId) botBody.dataset.executionId = String(payload.executionId);
                     }
                 } catch (_) { /* Legacy streams may not carry a structured outcome. */ }
             } else if (name === 'end') {
@@ -720,7 +732,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 } else if (taskOutcomeStatus === 'CANCELED') {
                     answer = String(data || '').trim() || answer || '任务已取消。';
                 } else if (taskOutcomeStatus === 'FAILURE') {
-                    answer = String(data || '').trim() || answer || '任务执行失败，请查看执行日志。';
+                    answer = compactTaskFailure(String(data || '').trim() || answer || '任务执行失败，请查看执行日志。');
                 } else {
                     answer = resolveStreamFinalAnswer(data, answer);
                 }
@@ -731,7 +743,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                     if (!turnCancelled) taskOutcomeStatus = 'FAILURE';
                 }
                 answer = (taskOutcomeStatus === 'WAITING' ? '' : '❌ ')
-                    + (data || (taskOutcomeStatus === 'WAITING' ? '等待你的操作后继续。' : '服务处理出错'));
+                    + compactTaskFailure(data || (taskOutcomeStatus === 'WAITING' ? '等待你的操作后继续。' : '服务处理出错'));
                 finish(renderMD(answer), turnCancelled);
             } else if (name === 'user') {
                 renderUserEchoIfNeeded(botBody, data);

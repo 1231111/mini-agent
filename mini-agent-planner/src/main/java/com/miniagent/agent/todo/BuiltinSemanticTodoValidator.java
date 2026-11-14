@@ -21,20 +21,20 @@ public class BuiltinSemanticTodoValidator implements TodoStepValidator {
         if (Objects.isNull(item)) {
             return "校验项为空";
         }
-        String dw = Objects.isNull(item.doneWhen()) ? "" : item.doneWhen().trim();
+        String dw = Objects.isNull(item.doneWhen()) ? "" : TaskTodoStore.legacyDoneWhen(item.doneWhen()).trim();
         // llm_judge 交给专用校验器
         if (dw.regionMatches(true, 0, "llm_judge:", 0, "llm_judge:".length())) {
             return null;
         }
         TodoSemanticValidator.Result r = TodoSemanticValidator.validate(
-                item.content(), item.doneWhen(), evidence);
+                item.content(), dw, evidence);
         return r.ok() ? null : r.error();
     }
 
     /** 供 Store 写入 validation_hash */
     public static String hashOf(TaskTodoStore.TodoItem item, String evidence) {
         TodoSemanticValidator.Result r = TodoSemanticValidator.validate(
-                item.content(), item.doneWhen(), evidence);
+                item.content(), TaskTodoStore.legacyDoneWhen(item.doneWhen()), evidence);
         return r.ok() ? r.contentHash() : "";
     }
 }

@@ -6,6 +6,7 @@ import com.microsoft.playwright.options.AriaRole;
 import com.microsoft.playwright.options.Proxy;
 import com.microsoft.playwright.options.RequestOptions;
 import com.microsoft.playwright.options.SelectOption;
+import com.microsoft.playwright.options.ServiceWorkerPolicy;
 import com.microsoft.playwright.options.WaitUntilState;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.security.NetworkGuard;
@@ -31,7 +32,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -67,9 +67,12 @@ import org.apache.commons.lang3.StringUtils;
 @Service
 public class BrowserService {
 
-    /** 与 mini-agent-app/pom.xml 中 playwright 依赖版本一致，用于在 classpath 未展开时定位 jar */
-    private static final String PLAYWRIGHT_MAVEN_VERSION = "1.49.0";
+    /** 与 mini-agent-tools/pom.xml 中 playwright 依赖版本一致，用于在 classpath 未展开时定位 jar */
+    private static final String PLAYWRIGHT_MAVEN_VERSION = "1.59.0";
     private static final int CLICK_TIMEOUT_MS = 2000;
+    private static final int CLICK_ACTIONABILITY_TIMEOUT_MS = 3000;
+    private static final int CLICK_DISPATCH_TIMEOUT_MS = 5000;
+    private static final int CLICK_OBSERVATION_TIMEOUT_MS = 3000;
     private static final int EXTRACT_MAX_STEPS = 120;
     private static final int EXTRACT_PAUSE_MS = 50;
     private static final int EXTRACT_MIN_CHARS = 20;
@@ -675,6 +678,12 @@ public class BrowserService {
     private Playwright playwright;
     private Browser browser;
     private final Map<String, Page> pages = new ConcurrentHashMap<>();
+    /** Includes queued work and work whose caller has already stopped waiting. */
+    private final Map<String, Integer> pendingSessionOperations = new ConcurrentHashMap<>();
+    private final Map<String, BrowserContext> sessionContexts = new LinkedHashMap<>();
+    private final Map<String, String> statePersistenceWarnings = new LinkedHashMap<>();
+    /** Disk deletion has committed; the old authenticated context must never be used or saved again. */
+    private final Set<String> pendingSessionClears = new LinkedHashSet<>();
     private final Map<String, PointerPosition> lastPointerPositions = new ConcurrentHashMap<>();
     private final Map<String, Observation> observations = new LinkedHashMap<>();
     private final ReentrantLock pageLock = new ReentrantLock();
@@ -701,33 +710,86 @@ public class BrowserService {
         final List<String> consoleErrors = new ArrayList<>();
         final List<String> pageErrors = new ArrayList<>();
         final Set<String> requestOrigins = new LinkedHashSet<>();
+        final List<Map<String, String>> blockedRequests = new ArrayList<>();
     }
     private final Map<String, PageDiagnostics> pageDiagnostics = new ConcurrentHashMap<>();
+    private record FrameDocument(Frame frame, ElementHandle root, String url) { }
     private record Observation(String id, String url, String rawSnapshot, Map<String, ObservedElement> elements,
-                               String formFingerprint) {
+                               String formFingerprint, List<FrameDocument> frameDocuments) {
         Observation(String id, String url, String rawSnapshot, Map<String, ObservedElement> elements) {
-            this(id, url, rawSnapshot, elements, null);
+            this(id, url, rawSnapshot, elements, null, List.of());
         }
     }
 
+    /** A caller may stop preparation without interrupting Playwright's shared event loop. */
+    private static final class ActorInputGate {
+        private static final int STOPPED = 1, INPUT_STARTED = 2;
+        private final AtomicInteger state = new AtomicInteger();
+        void stop() { state.getAndUpdate(current -> current | STOPPED); }
+        boolean stopped() { return (state.get() & STOPPED) != 0; }
+        boolean inputStarted() { return (state.get() & INPUT_STARTED) != 0; }
+        boolean beginInput() {
+            int current;
+            do {
+                current = state.get();
+                if ((current & STOPPED) != 0) return false;
+            } while (!state.compareAndSet(current, current | INPUT_STARTED));
+            return true;
+        }
+    }
+    private final ThreadLocal<ActorInputGate> actorInputGate = new ThreadLocal<>();
+
+    private static final class ActorInputStopped extends RuntimeException { }
+
+    /** Every distinct input in a multi-step operation needs its own cancellation boundary. */
+    private void requireActorInput() {
+        ActorInputGate gate = actorInputGate.get();
+        if (gate != null && !gate.beginInput()) throw new ActorInputStopped();
+    }
+
+    private void checkActorPreparation() {
+        ActorInputGate gate = actorInputGate.get();
+        if (gate != null && gate.stopped()) throw new ActorInputStopped();
+    }
+
     private String onActor(Callable<String> operation) {
+        return onActor(operation, () -> {});
+    }
+
+    private String onActor(Callable<String> operation, Runnable completed) {
         if (Thread.currentThread() == actorThread) {
             try { return operation.call(); }
             catch (RuntimeException error) { throw error; }
             catch (Exception error) { throw new IllegalStateException(error); }
+            finally { completed.run(); }
         }
         if (Thread.currentThread().isInterrupted()) {
+            completed.run();
             return browserError("CANCELLED", "浏览器操作在派发前已取消");
         }
+        ActorInputGate inputGate = new ActorInputGate();
         AtomicInteger state = new AtomicInteger(); // queued / running / cancelled / finished
-        Future<String> pending = actor.submit(() -> {
-            if (!state.compareAndSet(0, 1)) return browserError("CANCELLED", "浏览器操作在执行前已取消");
-            try { return operation.call(); }
-            finally { state.set(3); }
-        });
+        Future<String> pending;
+        try {
+            pending = actor.submit(() -> {
+                try {
+                    if (!state.compareAndSet(0, 1)) return browserError("CANCELLED", "浏览器操作在执行前已取消");
+                    actorInputGate.set(inputGate);
+                    try { return operation.call(); }
+                    finally { actorInputGate.remove(); state.set(3); }
+                } finally {
+                    // A stopped caller does not imply that Playwright has finished its input.
+                    completed.run();
+                }
+            });
+        } catch (RuntimeException | Error rejected) {
+            completed.run();
+            throw rejected;
+        }
         try {
             return pending.get();
         } catch (InterruptedException interrupted) {
+            inputGate.stop(); // Stops later input boundaries, including after an earlier input.
             boolean beforeStart = state.compareAndSet(0, 2);
             Thread.currentThread().interrupt();
             // Never interrupt the shared Playwright event loop: an already-dispatched click
@@ -747,37 +809,117 @@ public class BrowserService {
                 .put("error", message).toString();
     }
 
-    public String navigate(String sessionId, String url) { return onActor(() -> navigateOnActor(sessionId, url)); }
-    public String snapshot(String sessionId, boolean full) { return onActor(() -> snapshotOnActor(sessionId, full)); }
-    public String formInspect(String sessionId) { return onActor(() -> formInspectOnActor(sessionId)); }
+    /** The key must be the trusted session resource key used to dispatch browser tools. */
+    public boolean hasPendingOperations(String trustedSessionResourceKey) {
+        return trustedSessionResourceKey != null
+                && pendingSessionOperations.getOrDefault(trustedSessionResourceKey, 0) > 0;
+    }
+
+    private String onTrackedSessionActor(String sessionId, Callable<String> operation) {
+        String rootResource = BrowserSessionIdentity.operationGroupResourceKey(sessionId);
+        List<String> activityKeys = sessionId.equals(rootResource)
+                ? List.of(sessionId) : List.of(sessionId, rootResource);
+        activityKeys.forEach(key -> pendingSessionOperations.merge(key, 1, Integer::sum));
+        return onActor(operation, () -> activityKeys.forEach(activityKey ->
+                pendingSessionOperations.computeIfPresent(activityKey,
+                        (key, count) -> count == 1 ? null : count - 1)));
+    }
+
+    private String onSessionActor(String sessionId, Callable<String> operation) {
+        return onTrackedSessionActor(sessionId, () -> {
+            if (pendingSessionClears.contains(sessionId)) return browserError("CONFLICT",
+                    "LOGIN_STATE_CLEAR_PENDING: 已清除保存的登录态，但旧页面关闭未完成；请显式重新清除或关闭当前浏览器会话");
+            String result;
+            try { result = operation.call(); }
+            catch (ActorInputStopped stopped) { result = browserError("CANCELLED", "浏览器操作已取消"); }
+            finally { persistSessionState(sessionId); }
+            ActorInputGate gate = actorInputGate.get();
+            if (gate != null && gate.stopped()) {
+                invalidateObservation(sessionId);
+                return gate.inputStarted() ? unknownAction("浏览器操作已停止，先前派发的输入可能已生效")
+                        : browserError("CANCELLED", "浏览器操作在实际输入前已取消；恢复任务时请重新观察");
+            }
+            String warning = statePersistenceWarnings.get(sessionId);
+            if (warning == null) return result;
+            // Keep success/unknown and the original action result intact; this is not an input failure.
+            try {
+                var parsed = resultJson.readTree(result);
+                if (parsed != null && parsed.isObject()) {
+                    ((com.fasterxml.jackson.databind.node.ObjectNode) parsed).put("statePersistenceWarning", warning);
+                    return parsed.toString();
+                }
+            } catch (Exception ignored) { /* Legacy browser responses are plain text. */ }
+            return result + "\n[浏览器登录态恢复警告] " + warning;
+        });
+    }
+
+    private void persistSessionState(String sessionId) {
+        if (sessionStateStore == null || pendingSessionClears.contains(sessionId)) return;
+        BrowserContext context = sessionContexts.get(sessionId);
+        if (context == null) return;
+        try {
+            sessionStateStore.save(sessionId, context.storageState());
+            statePersistenceWarnings.remove(sessionId);
+        } catch (Exception failed) {
+            // An action may already have taken effect. Never turn a save failure into an input retry.
+            statePersistenceWarnings.put(sessionId, "登录态保存失败；当前页面操作未回滚，重启后可能需要重新登录");
+            log.warn("浏览器会话登录态保存失败 session={} type={}", sessionId, failed.getClass().getSimpleName());
+        }
+    }
+
+    public String navigate(String sessionId, String url) { return onSessionActor(sessionId, () -> navigateOnActor(sessionId, url)); }
+    public String snapshot(String sessionId, boolean full) { return onSessionActor(sessionId, () -> snapshotOnActor(sessionId, full)); }
+    public String formInspect(String sessionId) { return onSessionActor(sessionId, () -> formInspectOnActor(sessionId)); }
     public String formVerify(String sessionId, String ref, String expectedValue, Boolean expectedChecked,
                              List<String> expectedValues, List<String> expectedFiles) {
-        return onActor(() -> formVerifyOnActor(sessionId, ref, expectedValue, expectedChecked, expectedValues, expectedFiles));
+        return onSessionActor(sessionId, () -> formVerifyOnActor(sessionId, ref, expectedValue, expectedChecked, expectedValues, expectedFiles));
     }
     public String click(String sessionId, String ref) { return click(sessionId, ref, "auto"); }
-    public String click(String sessionId, String ref, String by) { return onActor(() -> clickOnActor(sessionId, ref, by)); }
-    public String type(String sessionId, String ref, String text) { return onActor(() -> typeOnActor(sessionId, ref, text)); }
+    public String click(String sessionId, String ref, String by) { return onSessionActor(sessionId, () -> clickOnActor(sessionId, ref, by)); }
+    public String type(String sessionId, String ref, String text) { return onSessionActor(sessionId, () -> typeOnActor(sessionId, ref, text)); }
     public String select(String sessionId, String ref, List<String> values, String by) {
-        return onActor(() -> selectOnActor(sessionId, ref, values, by));
+        return onSessionActor(sessionId, () -> selectOnActor(sessionId, ref, values, by));
     }
     public String setChecked(String sessionId, String ref, boolean checked) {
-        return onActor(() -> setCheckedOnActor(sessionId, ref, checked));
+        return onSessionActor(sessionId, () -> setCheckedOnActor(sessionId, ref, checked));
     }
     public String upload(String sessionId, String ref, List<Path> trustedPaths) {
-        return onActor(() -> uploadOnActor(sessionId, ref, trustedPaths));
+        return onSessionActor(sessionId, () -> uploadOnActor(sessionId, ref, trustedPaths));
     }
-    public String press(String sessionId, String key) { return onActor(() -> pressOnActor(sessionId, key)); }
-    public String scroll(String sessionId, String direction) { return onActor(() -> scrollOnActor(sessionId, direction)); }
-    public String screenshot(String sessionId, Path workspaceRoot) { return onActor(() -> screenshotOnActor(sessionId, workspaceRoot)); }
-    public String close(String sessionId) { return onActor(() -> closeOnActor(sessionId)); }
+    public String press(String sessionId, String key) { return onSessionActor(sessionId, () -> pressOnActor(sessionId, key)); }
+    public String scroll(String sessionId, String direction) { return onSessionActor(sessionId, () -> scrollOnActor(sessionId, direction)); }
+    public String screenshot(String sessionId, Path workspaceRoot) { return onSessionActor(sessionId, () -> screenshotOnActor(sessionId, workspaceRoot)); }
+    public String close(String sessionId) { return onTrackedSessionActor(sessionId, () -> closeOnActor(sessionId)); }
     public String extractArticleText(String sessionId) { return extractArticleText(sessionId, null); }
-    public String extractArticleText(String sessionId, Path imageDir) { return onActor(() -> extractArticleTextOnActor(sessionId, imageDir)); }
-    public String evaluate(String sessionId, String expression) { return onActor(() -> evaluateOnActor(sessionId, expression)); }
+    public String extractArticleText(String sessionId, Path imageDir) { return onSessionActor(sessionId, () -> extractArticleTextOnActor(sessionId, imageDir)); }
+    public String evaluate(String sessionId, String expression) { return onSessionActor(sessionId, () -> evaluateOnActor(sessionId, expression)); }
+
+    /** Explicitly discard this chat's saved authentication; never implied by an ordinary close. */
+    public String clearSessionState(String sessionId) {
+        return onTrackedSessionActor(sessionId, () -> {
+            try {
+                if (sessionStateStore == null) return browserError("DEPENDENCY_UNAVAILABLE", "浏览器登录态持久化未配置");
+                // Delete first: a failure must leave the still-live context available for diagnosis.
+                sessionStateStore.clear(sessionId);
+                pendingSessionClears.add(sessionId);
+                closeSessionContext(sessionId);
+                statePersistenceWarnings.remove(sessionId);
+                return "已清除此聊天的浏览器登录态；下次打开网页需要重新登录。";
+            } catch (Exception failed) {
+                return browserError("EXECUTION_FAILED", pendingSessionClears.contains(sessionId)
+                        ? "已清除保存的登录态，但旧页面关闭失败；此会话已锁定，请显式重试清除或关闭，未自动重试"
+                        : "清除浏览器登录态失败，原会话仍可使用，未自动重试");
+            }
+        });
+    }
 
     private record PointerPosition(double x, double y, int viewportWidth, int viewportHeight) {}
 
     @Autowired
     private NetworkGuard networkGuard;
+
+    @Autowired(required = false)
+    private BrowserSessionStateStore sessionStateStore;
 
     @Value("${agent.browser.headless:true}")
     private boolean headless;
@@ -790,9 +932,16 @@ public class BrowserService {
         if (Objects.isNull(playwright)) {
             // 检测 Chromium 是否已下载，没有就自动安装
             ensureChromiumInstalled();
-            playwright = Playwright.create();
+            // Browser installation is controlled above, with the exact dependency revision and headless mode.
+            // Driver initialization must not silently install Firefox/WebKit/full Chromium as well.
+            playwright = Playwright.create(new Playwright.CreateOptions()
+                    .setEnv(Map.of("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")));
         }
-        if (Objects.isNull(browser)) {
+        if (Objects.isNull(browser) || (sessionStateStore != null && !browser.isConnected())) {
+            if (browser != null) {
+                for (String sid : new ArrayList<>(observations.keySet())) invalidateObservation(sid);
+                pages.clear(); sessionContexts.clear(); pageDiagnostics.clear();
+            }
             BrowserType.LaunchOptions opts = new BrowserType.LaunchOptions()
                     .setHeadless(headless);
             String proxy = firstProxyEnv();
@@ -843,22 +992,12 @@ public class BrowserService {
      */
     private void ensureChromiumInstalled() {
         Path browsersRoot = resolveBrowsersRoot();
-        String dirPrefix = headless ? HEADLESS_SHELL_DIR_PREFIX : CHROMIUM_DIR_PREFIX;
+        String expectedDirectory = expectedBrowserDirectory(headless);
 
-        // 目录版本号因 Playwright 版本而异，所以按前缀扫。
+        // Match this dependency's revision; an older intact cache cannot satisfy the current driver.
         // 注意：仅判断目录存在不够——残缺安装（完整包表现为 chrome.exe 在但 chrome.dll
         // 缺失或截断）会导致启动时报 "Failed to load Chrome DLL ... 0x7E"。必须校验关键文件。
-        boolean installed = false;
-        if (Files.exists(browsersRoot)) {
-            try (var stream = Files.list(browsersRoot)) {
-                installed = stream.anyMatch(p -> {
-                    String n = p.getFileName().toString();
-                    return n.startsWith(dirPrefix) && isBrowserDirValid(p, headless);
-                });
-            } catch (IOException e) {
-                // ignore
-            }
-        }
+        boolean installed = isBrowserDirValid(browsersRoot.resolve(expectedDirectory), headless);
 
         if (installed) {
             log.debug("浏览器已就绪（{}，目录 {}）",
@@ -879,7 +1018,7 @@ public class BrowserService {
                     浏览器类工具将不可用，其余功能不受影响。
                     修复方式：重新安装 MiniAgent。
                     ═══════════════════════════════════════════
-                    """, browsersRoot, dirPrefix,
+                    """, browsersRoot, expectedDirectory,
                     headless
                             ? "headless 模式所需的 headless shell"
                             : "有头模式所需的完整 Chromium；本安装包默认只含 headless shell，"
@@ -890,7 +1029,33 @@ public class BrowserService {
         log.info("{} 未安装或安装残缺，开始重新下载，请耐心等待 ...",
                 headless ? "Chromium headless shell" : "Chromium");
 
-        tryInstallViaCommand();
+        try {
+            tryInstallViaCommand();
+            checkInstallerInterrupted();
+        } catch (InterruptedException cancelled) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("浏览器安装已取消，未继续尝试其他安装方式", cancelled);
+        }
+    }
+
+    /** Read the revision shipped by this dependency, so an older valid cache cannot satisfy a newer driver. */
+    private static String expectedBrowserDirectory(boolean headlessShell) {
+        String name = headlessShell ? "chromium-headless-shell" : "chromium";
+        for (String platform : List.of("win32_x64", "darwin-arm64", "darwin", "linux", "linux-arm64")) {
+            String resource = "driver/" + platform + "/package/browsers.json";
+            try (var input = BrowserService.class.getClassLoader().getResourceAsStream(resource)) {
+                if (input == null) continue;
+                var browsers = new ObjectMapper().readTree(input).path("browsers");
+                for (var browserEntry : browsers) {
+                    if (name.equals(browserEntry.path("name").asText())) {
+                        String revision = browserEntry.path("revision").asText();
+                        if (!revision.matches("[0-9]+")) throw new IOException("Invalid browser revision");
+                        return name.replace('-', '_') + "-" + revision;
+                    }
+                }
+            } catch (IOException invalid) { throw new IllegalStateException("无法读取当前Playwright的浏览器版本清单", invalid); }
+        }
+        throw new IllegalStateException("缺少当前Playwright的浏览器版本清单，不能复用不匹配的浏览器");
     }
 
     /**
@@ -925,9 +1090,11 @@ public class BrowserService {
             }
         }
 
-        Path chromeWin = dir.resolve("chrome-win");
+        Path chromeWin = dir.resolve(headlessShell ? "chrome-headless-shell-win64" : "chrome-win64");
+        boolean modernLayout = Files.isDirectory(chromeWin);
+        if (!modernLayout) chromeWin = dir.resolve("chrome-win");
         Path main = headlessShell
-                ? chromeWin.resolve("headless_shell.exe")
+                ? chromeWin.resolve(modernLayout ? "chrome-headless-shell.exe" : "headless_shell.exe")
                 : chromeWin.resolve("chrome.dll");
 
         try {
@@ -1011,19 +1178,23 @@ public class BrowserService {
     /**
      * 自动安装 Chromium：优先用当前 JDK 执行 {@code com.microsoft.playwright.CLI}（不要用 {@code java -jar}，官方 jar 无 Runnable 清单）。
      */
-    private void tryInstallViaCommand() {
+    private void tryInstallViaCommand() throws InterruptedException {
+        checkInstallerInterrupted();
         if (tryInstallViaClasspathCli()) {
             return;
         }
 
+        checkInstallerInterrupted();
         if (commandOnPath("npx") && tryInstallViaNpx()) {
             return;
         }
 
+        checkInstallerInterrupted();
         if (commandOnPath("mvn") && tryInstallViaMaven()) {
             return;
         }
 
+        checkInstallerInterrupted();
         // 手动指引里也要带上 --only-shell，否则用户照着敲会把 314MB 的完整包又装回来 ——
         // 那正是本次安装要避免的东西。
         String onlyShell = headless ? " --only-shell" : "";
@@ -1032,14 +1203,14 @@ public class BrowserService {
                 浏览器自动安装失败。请在本机手动执行（二选一）：
 
                   1) 使用当前 JDK（推荐，注意 -cp 不要写成 -jar）：
-                     "%JAVA_HOME%\\bin\\java.exe" -cp "<playwright.jar路径>" com.microsoft.playwright.CLI install chromium{}
+                     "%JAVA_HOME%\\bin\\java.exe" -cp "<playwright、driver、driver-bundle三组件的classpath>" com.microsoft.playwright.CLI install chromium{}
 
-                  2) 已安装 Node 时：npx playwright install chromium{}
+                  2) 已安装 Node 时：npx --yes playwright@{} install chromium{}
 
                 下载慢或超时时可设置环境变量 PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=600000（毫秒）后重试。
                 安装完成后重启应用。
                 ═══════════════════════════════════════════
-                """, onlyShell, onlyShell);
+                """, onlyShell, PLAYWRIGHT_MAVEN_VERSION, onlyShell);
     }
 
     /**
@@ -1049,7 +1220,7 @@ public class BrowserService {
      * 模式下永远不会被加载的完整包（约 314MB）。理由见 {@link #ensureChromiumInstalled()}。
      * 对出厂形态这不算"顺手省流量"式的优化 —— 装进去的是一份必然不被读取的 314MB。
      *
-     * <p>注意 {@code --only-shell} 是 Playwright 1.49 才有的选项（本类用的就是 1.49.0）。
+     * <p>注意 {@code --only-shell} 是 Playwright 1.49 起提供的选项。
      * 升级 Playwright 时若该选项被改名，这里会退化成"命令报错→走下一个兜底"，不会静默装错包。
      */
     private List<String> installArgsForCurrentMode() {
@@ -1065,24 +1236,24 @@ public class BrowserService {
         return com.miniagent.agent.tool.HostCommand.onPath(name);
     }
 
-    /** 使用 java -cp playwright.jar com.microsoft.playwright.CLI install chromium */
-    private boolean tryInstallViaClasspathCli() {
+    /** CLI needs all three exact-version components; the playwright jar alone cannot initialize its driver. */
+    private boolean tryInstallViaClasspathCli() throws InterruptedException {
         try {
-            String playwrightJar = resolvePlaywrightJarPath();
-            if (Objects.isNull(playwrightJar)) {
-                log.debug("未解析到 playwright jar 路径");
+            String installerClasspath = resolvePlaywrightInstallerClasspath();
+            if (Objects.isNull(installerClasspath)) {
+                log.debug("未找到当前版本完整的Playwright安装器三组件");
                 return false;
             }
 
             String javaExe = resolveJavaExecutable();
-            log.info("找到 playwright jar: {}", playwrightJar);
+            log.info("已定位当前版本Playwright安装器三组件");
             log.info("正在通过 CLI 安装浏览器（{}），弱网请耐心等待或增大 PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT ...",
                     headless ? "headless shell" : "完整 Chromium");
 
             List<String> cmd = new ArrayList<>();
             cmd.add(javaExe);
             cmd.add("-cp");
-            cmd.add(playwrightJar);
+            cmd.add(installerClasspath);
             cmd.add("com.microsoft.playwright.CLI");
             cmd.add("install");
             cmd.add("chromium");
@@ -1091,33 +1262,20 @@ public class BrowserService {
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
             Map<String, String> env = pb.environment();
+            env.put("PLAYWRIGHT_SKIP_BROWSER_GC", "1");
             if (Objects.isNull(env.get("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT"))) {
                 env.put("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT", "600000");
             }
 
-            Process p = pb.start();
-
-            try (var in = p.getInputStream()) {
-                byte[] buf = new byte[4096];
-                int len;
-                while ((len = in.read(buf)) != -1) {
-                    String chunk = new String(buf, 0, len, StandardCharsets.UTF_8);
-                    for (String line : chunk.split("\\R")) {
-                        line = line.trim();
-                        if (!StringUtils.isBlank(line)) {
-                            log.info("  playwright: {}", line);
-                        }
-                    }
-                }
-            }
-
-            boolean done = p.waitFor(600, java.util.concurrent.TimeUnit.SECONDS);
-            if (done && p.exitValue() == 0) {
+            int exitCode = runBrowserInstaller(pb, "playwright");
+            if (verifiedInstallation(exitCode)) {
                 log.info("Chromium 安装成功！");
                 return true;
             }
-            log.error("Chromium 安装失败，退出码: {}", done ? p.exitValue() : "超时");
+            log.error("Chromium 安装失败，退出码: {}", exitCode);
             return false;
+        } catch (InterruptedException cancelled) {
+            throw cancelled;
         } catch (Exception e) {
             log.debug("CLI classpath 方式安装失败", e);
         }
@@ -1133,40 +1291,28 @@ public class BrowserService {
         return "java";
     }
 
-    private static String resolvePlaywrightJarPath() {
-        String classpath = System.getProperty("java.class.path");
-        if (Objects.nonNull(classpath)) {
-            for (String entry : classpath.split(File.pathSeparator)) {
-                if (entry.contains("playwright") && entry.endsWith(".jar") && Files.isRegularFile(Paths.get(entry))) {
-                    return entry;
-                }
-            }
-        }
-
-        String ver = PLAYWRIGHT_MAVEN_VERSION;
-        String jarName = "playwright-" + ver + ".jar";
-        List<String> fallbacks = new ArrayList<>();
+    private static String resolvePlaywrightInstallerClasspath() {
+        List<Path> repositories = new ArrayList<>();
         String m2Local = System.getProperty("maven.repo.local");
-        if (StringUtils.isNotBlank(m2Local)) {
-            fallbacks.add(Paths.get(m2Local, "com", "microsoft", "playwright", "playwright", ver, jarName).toString());
-        }
-        fallbacks.add(Paths.get(System.getProperty("user.home"), ".m2", "repository", "com", "microsoft", "playwright", "playwright", ver, jarName).toString());
+        if (StringUtils.isNotBlank(m2Local)) repositories.add(Paths.get(m2Local));
+        repositories.add(Paths.get(System.getProperty("user.home"), ".m2", "repository"));
+        return BrowserInstallerSupport.resolveClasspath(PLAYWRIGHT_MAVEN_VERSION, System.getProperty("java.class.path"), repositories);
+    }
 
-        for (String fp : fallbacks) {
-            if (Files.isRegularFile(Paths.get(fp))) {
-                return fp;
-            }
-        }
-        return null;
+    private boolean verifiedInstallation(int exitCode) {
+        String expected = expectedBrowserDirectory(headless);
+        boolean valid = BrowserInstallerSupport.installationSucceeded(exitCode, resolveBrowsersRoot(), expected,
+                candidate -> isBrowserDirValid(candidate, headless));
+        if (exitCode == 0 && !valid) log.warn("安装器已退出但当前版本浏览器仍不可用，要求目录: {}", expected);
+        return valid;
     }
 
     /** 方式2：npx playwright install chromium */
-    private boolean tryInstallViaNpx() {
+    private boolean tryInstallViaNpx() throws InterruptedException {
         try {
             log.info("通过 npx 安装浏览器（{}）...", headless ? "headless shell" : "完整 Chromium");
 
-            List<String> cmd = new ArrayList<>(List.of("npx", "playwright", "install", "chromium"));
-            cmd.addAll(installArgsForCurrentMode());
+            List<String> cmd = BrowserInstallerSupport.npxCommand(PLAYWRIGHT_MAVEN_VERSION, headless, isWindows());
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
 
@@ -1174,32 +1320,18 @@ public class BrowserService {
             // start() 之后再改 pb.environment() 不会传下去（这里原先是 start() 在前、设环境在后，
             // 那句超时等于没写）。
             Map<String, String> env = pb.environment();
+            env.put("PLAYWRIGHT_SKIP_BROWSER_GC", "1");
             if (Objects.isNull(env.get("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT"))) {
                 env.put("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT", "600000");
             }
 
-            Process p = pb.start();
-
-            try (var in = p.getInputStream()) {
-                byte[] buf = new byte[4096];
-                int len;
-                while ((len = in.read(buf)) != -1) {
-                    String chunk = new String(buf, 0, len, StandardCharsets.UTF_8);
-                    if (chunk.contains("%") || chunk.contains("Downloading") || chunk.contains("installed")) {
-                        for (String line : chunk.split("\\R")) {
-                            if (!StringUtils.isBlank(line)) {
-                                log.info("  {}", line.trim());
-                            }
-                        }
-                    }
-                }
-            }
-
-            boolean done = p.waitFor(600, java.util.concurrent.TimeUnit.SECONDS);
-            if (done && p.exitValue() == 0) {
+            int exitCode = runBrowserInstaller(pb, "npx");
+            if (verifiedInstallation(exitCode)) {
                 log.info("浏览器安装成功 (npx)");
                 return true;
             }
+        } catch (InterruptedException cancelled) {
+            throw cancelled;
         } catch (Exception e) {
             log.debug("npx 方式安装失败", e);
         }
@@ -1207,7 +1339,7 @@ public class BrowserService {
     }
 
     /** 方式3：mvn exec:java（需本机 PATH 中有 mvn） */
-    private boolean tryInstallViaMaven() {
+    private boolean tryInstallViaMaven() throws InterruptedException {
         try {
             log.info("通过 mvn 安装浏览器（{}）...", headless ? "headless shell" : "完整 Chromium");
             ProcessBuilder pb = new ProcessBuilder("mvn", "-q", "exec:java",
@@ -1217,25 +1349,34 @@ public class BrowserService {
             pb.redirectErrorStream(true);
             pb.directory(new java.io.File(System.getProperty("user.dir")));
             Map<String, String> env = pb.environment();
+            env.put("PLAYWRIGHT_SKIP_BROWSER_GC", "1");
             if (Objects.isNull(env.get("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT"))) {
                 env.put("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT", "600000");
             }
-            Process p = pb.start();
-
-            try (var in = p.getInputStream()) {
-                byte[] buf = new byte[4096];
-                while (in.read(buf) != -1) { /* 读完防阻塞 */ }
-            }
-
-            boolean done = p.waitFor(600, java.util.concurrent.TimeUnit.SECONDS);
-            if (done && p.exitValue() == 0) {
+            int exitCode = runBrowserInstaller(pb, "mvn");
+            if (verifiedInstallation(exitCode)) {
                 log.info("Chromium 安装成功 (mvn)");
                 return true;
             }
+        } catch (InterruptedException cancelled) {
+            throw cancelled;
         } catch (Exception e) {
             log.debug("mvn 方式安装失败", e);
         }
         return false;
+    }
+
+    private static void checkInstallerInterrupted() throws InterruptedException {
+        if (Thread.currentThread().isInterrupted()) throw new InterruptedException("浏览器安装已取消");
+    }
+
+    private static int runBrowserInstaller(ProcessBuilder builder, String backend)
+            throws IOException, InterruptedException, java.util.concurrent.TimeoutException {
+        return BrowserInstallerSupport.runInstaller(builder, java.time.Duration.ofMinutes(10), chunk -> {
+            for (String line : chunk.split("\\R")) {
+                if (StringUtils.isNotBlank(line)) log.info("  {}: {}", backend, line.trim());
+            }
+        });
     }
 
     /**
@@ -1245,9 +1386,36 @@ public class BrowserService {
         if (StringUtils.isBlank(sessionId)) {
             throw new IllegalArgumentException("浏览器操作需要明确的可信会话");
         }
+        if (pendingSessionClears.contains(sessionId))
+            throw new IllegalStateException("LOGIN_STATE_CLEAR_PENDING: 旧页面关闭未完成，请显式重试清除或关闭浏览器会话");
+        // A disconnected browser invalidates all maps; do it before computeIfAbsent mutates pages.
+        if (sessionStateStore != null) ensureBrowser();
+        Page current = pages.get(sessionId);
+        if (current != null && !current.isClosed()) return current;
+        if (current != null) { pages.remove(sessionId); invalidateObservation(sessionId); }
         return pages.computeIfAbsent(sessionId, id -> {
-            ensureBrowser();
-            Page page = browser.newPage();
+            if (sessionStateStore == null) ensureBrowser();
+            BrowserContext context = sessionContexts.get(id);
+            if (context == null) {
+                try {
+                    String state = sessionStateStore == null ? null : sessionStateStore.load(id).orElse(null);
+                    Browser.NewContextOptions options = new Browser.NewContextOptions()
+                            .setServiceWorkers(ServiceWorkerPolicy.BLOCK);
+                    if (state != null) options.setStorageState(state);
+                    context = browser.newContext(options);
+                    try {
+                        new BrowserNetworkBoundary(context, networkGuard,
+                                (surface, origin) -> addBlockedRequest(id, surface, origin)).install();
+                    } catch (RuntimeException boundaryFailed) {
+                        try { context.close(); } catch (Exception ignored) { }
+                        throw boundaryFailed;
+                    }
+                    sessionContexts.put(id, context);
+                } catch (IOException invalid) {
+                    throw new IllegalStateException(invalid.getMessage(), invalid);
+                }
+            }
+            Page page = context.newPage();
             pageDiagnostics.put(id, new PageDiagnostics());
             page.onConsoleMessage(message -> {
                 if ("error".equals(message.type())) addPageError(id, false, message.text());
@@ -1290,6 +1458,7 @@ public class BrowserService {
             }
             invalidateObservation(sessionId);
             pageDiagnostics.put(sessionId, new PageDiagnostics());
+            requireActorInput();
             page.navigate(url, new Page.NavigateOptions()
                     .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
                     .setTimeout(15000));
@@ -1361,9 +1530,8 @@ public class BrowserService {
             if (loc.count() != 1) return browserError("CONFLICT", "点击目标匹配不唯一或不存在，请重新观察");
             return clickAndSnap(sessionId, page, loc, mode, ref);
         } catch (Exception e) {
-            log.error("点击失败: ref={} by={}", ref, mode, e);
-            invalidateObservation(sessionId);
-            return unknownAction("点击结果尚未确认：" + e.getMessage());
+            // Target resolution and initialization have not invoked any input API.
+            return clickFailure(sessionId, pages.get(sessionId), false, "target_resolution", e);
         } finally {
             pageLock.unlock();
         }
@@ -1372,16 +1540,7 @@ public class BrowserService {
     private String clickBySnapshotRef(String sessionId, Page page, String ref) {
         ObservedElement element = resolveObservedElement(sessionId, page, ref);
         if (element == null) return staleObservation();
-        try {
-            var box = element.handle().boundingBox();
-            element.handle().click(new ElementHandle.ClickOptions().setTimeout(CLICK_TIMEOUT_MS));
-            rememberPointer(sessionId, page, box);
-            page.waitForTimeout(100);
-            return "点击成功 (ref): " + ref + "\n\n" + observe(sessionId, page, page.locator("body").ariaSnapshot());
-        } catch (Exception e) {
-            invalidateObservation(sessionId);
-            return unknownAction("点击结果尚未确认：" + e.getMessage());
-        }
+        return clickHandleAndSnap(sessionId, page, element.handle(), "ref", ref, true);
     }
 
     private Locator roleLocator(Page page, String ref) {
@@ -1396,35 +1555,74 @@ public class BrowserService {
     }
 
     private String clickAndSnap(String sessionId, Page page, Locator locator, String strategy, String label) {
+        ElementHandle target = locator.elementHandle(new Locator.ElementHandleOptions().setTimeout(CLICK_ACTIONABILITY_TIMEOUT_MS));
+        if (target == null) return browserError("CONFLICT", "点击目标已消失，请重新观察");
+        try { return clickHandleAndSnap(sessionId, page, target, strategy, label, false); }
+        finally { try { target.dispose(); } catch (Exception ignored) { } }
+    }
+
+    private String clickHandleAndSnap(String sessionId, Page page, ElementHandle target,
+                                      String strategy, String label, boolean observedRef) {
+        boolean dispatched = false;
+        String phase = "actionability";
         try {
-            locator.scrollIntoViewIfNeeded();
-        } catch (Exception ignored) {}
-        double clickX = Double.NaN;
-        double clickY = Double.NaN;
-        try {
-            var clickBox = locator.boundingBox();
-            if (clickBox != null) {
-                clickX = clickBox.x + clickBox.width / 2d;
-                clickY = clickBox.y + clickBox.height / 2d;
-            }
-        } catch (Exception ignored) {}
-        // A timeout does not prove that a click did not happen. Never follow it with a JS click.
-        locator.click(new Locator.ClickOptions().setTimeout(CLICK_TIMEOUT_MS));
-        if (Double.isFinite(clickX) && Double.isFinite(clickY)) {
-            try {
-                var viewport = page.viewportSize();
-                if (viewport != null && viewport.width > 0 && viewport.height > 0) {
-                    lastPointerPositions.put(sessionId, new PointerPosition(
-                            clickX,
-                            clickY,
-                            viewport.width,
-                            viewport.height));
-                }
-            } catch (Exception ignored) {}
+            ActorInputGate inputGate = actorInputGate.get();
+            if (inputGate != null && inputGate.stopped()) return cancelledClick(sessionId);
+            // Playwright's trial runs visibility/stability/enabled/hit-target checks
+            // without sending input. Its failure is evidence that no click was invoked.
+            target.click(new ElementHandle.ClickOptions().setTrial(true).setTimeout(CLICK_ACTIONABILITY_TIMEOUT_MS));
+            if (inputGate != null && inputGate.stopped()) return cancelledClick(sessionId);
+            phase = "target_revalidation";
+            // Trial may scroll and run page script. Never carry a stale ref across it.
+            if (observedRef && resolveObservedElement(sessionId, page, label) == null) return staleObservation();
+            if (!Boolean.TRUE.equals(target.evaluate("el => el.isConnected"))) return staleObservation();
+            var box = target.boundingBox();
+            phase = "dispatch";
+            // After this boundary even a TimeoutError can follow delivered input.
+            // There is no JS/force/fallback click and no automatic second dispatch.
+            if (inputGate != null && !inputGate.beginInput()) return cancelledClick(sessionId);
+            dispatched = true;
+            target.click(new ElementHandle.ClickOptions().setTimeout(CLICK_DISPATCH_TIMEOUT_MS));
+            rememberPointer(sessionId, page, box);
+            phase = "observation";
+            String raw = page.locator("body").ariaSnapshot(new AriaSnapshotOptions().setTimeout(CLICK_OBSERVATION_TIMEOUT_MS));
+            return String.format(MessageConstants.BROWSER_CLICK_SUCCESS, strategy, label) + "\n\n"
+                    + observe(sessionId, page, raw);
+        } catch (Exception failed) {
+            return clickFailure(sessionId, page, dispatched, phase, failed);
         }
-        page.waitForTimeout(400);
-        return String.format(MessageConstants.BROWSER_CLICK_SUCCESS, strategy, label) + "\n\n"
-                + observe(sessionId, page, page.locator("body").ariaSnapshot());
+    }
+
+    private String cancelledClick(String sessionId) {
+        invalidateObservation(sessionId);
+        return resultJson.createObjectNode().put("success", false).put("status", "cancelled")
+                .put("errorCode", "CANCELLED").put("inputDispatched", false).put("phase", "before_dispatch")
+                .put("error", "点击在实际输入前已取消；恢复任务时请重新观察").toString();
+    }
+
+    private String clickFailure(String sessionId, Page page, boolean dispatched, String phase, Exception failed) {
+        String diagnosticId = java.util.UUID.randomUUID().toString();
+        log.warn("浏览器点击失败 diagnosticId={} session={} phase={} inputDispatched={}",
+                diagnosticId, sessionId, phase, dispatched, failed);
+        invalidateObservation(sessionId);
+        var result = resultJson.createObjectNode().put("success", false)
+                .put("status", dispatched ? "unknown" : "failed")
+                .put("errorCode", dispatched ? "OUTCOME_UNKNOWN" : "CONFLICT")
+                .put("inputDispatched", dispatched).put("phase", phase).put("diagnosticId", diagnosticId)
+                .put("retriable", false).put("nextAction", "browser_snapshot")
+                .put("error", dispatched ? "点击可能已生效，当前页面结果尚未确认；请重新观察实际状态，禁止直接重复点击"
+                        : "点击未执行：目标暂不可操作或页面状态已变化；请重新观察后选择可操作目标");
+        // A failed trial can be recovered by the normal observe/decide loop. Do not
+        // turn a snapshot error into an unknown click or attempt input here.
+        if (!dispatched && page != null) {
+            try {
+                if (!page.isClosed()) result.put("observation", observe(sessionId, page, page.locator("body").ariaSnapshot(
+                        new AriaSnapshotOptions().setTimeout(CLICK_OBSERVATION_TIMEOUT_MS))));
+            } catch (Exception observationFailed) {
+                log.debug("点击恢复观察失败 diagnosticId={}", diagnosticId, observationFailed);
+            }
+        }
+        return result.toString();
     }
 
     static boolean sameDocPath(String currentUrl, String targetUrl) {
@@ -1457,6 +1655,15 @@ public class BrowserService {
     private ObservedElement resolveObservedElement(String sessionId, Page page, String ref) {
         Observation observation = observations.get(sessionId);
         if (observation == null || !observation.elements().containsKey(ref)) return null;
+        try {
+            for (FrameDocument document : observation.frameDocuments()) {
+                assertFrameAccess(document.frame());
+                if (document.frame().isDetached() || !document.url().equals(document.frame().url())
+                        || !Boolean.TRUE.equals(document.root().evaluate("el => el.isConnected"))) {
+                    invalidateObservation(sessionId);
+                    return null;
+                }
+            }
         if (!observation.url().equals(page.url())
                 || !interactionFingerprint(observation.rawSnapshot())
                     .equals(interactionFingerprint(page.locator("body").ariaSnapshot()))) {
@@ -1474,6 +1681,12 @@ public class BrowserService {
             return null;
         }
         return element;
+        } catch (RuntimeException changedFrame) {
+            // A frame navigation destroys its execution context. This is a stale read,
+            // not evidence that the requested click/fill/upload has been dispatched.
+            invalidateObservation(sessionId);
+            return null;
+        }
     }
 
     /** Live clocks/telemetry do not change a DOM ref; changed controls and link targets do. */
@@ -1490,6 +1703,9 @@ public class BrowserService {
         if (old != null) old.elements().values().forEach(element -> {
             try { element.handle().dispose(); } catch (Exception ignored) {}
         });
+        if (old != null) old.frameDocuments().forEach(document -> {
+            try { document.root().dispose(); } catch (Exception ignored) {}
+        });
     }
 
     private void addPageError(String sessionId, boolean uncaught, String message) {
@@ -1499,6 +1715,12 @@ public class BrowserService {
         if (errors.size() < 20) errors.add(message.substring(0, Math.min(message.length(), 500)));
     }
 
+    private void addBlockedRequest(String sessionId, String surface, String origin) {
+        PageDiagnostics diagnostics = pageDiagnostics.get(sessionId);
+        if (diagnostics != null && diagnostics.blockedRequests.size() < 20)
+            diagnostics.blockedRequests.add(Map.of("surface", surface, "origin", origin));
+    }
+
     private String diagnosticsText(String sessionId) {
         PageDiagnostics diagnostics = pageDiagnostics.get(sessionId);
         if (diagnostics == null) return "";
@@ -1506,7 +1728,9 @@ public class BrowserService {
                 "scope", "Observed since last navigation; up to 20 entries per category; request origins only",
                 "consoleErrors", diagnostics.consoleErrors,
                 "pageErrors", diagnostics.pageErrors,
-                "requestOrigins", diagnostics.requestOrigins)) + "\n";
+                "requestOrigins", diagnostics.requestOrigins,
+                "blockedRequests", diagnostics.blockedRequests,
+                "statePersistenceWarning", statePersistenceWarnings.getOrDefault(sessionId, ""))) + "\n";
     }
 
     /** Bind references to the exact DOM nodes observed, never to a future snapshot's line numbers. */
@@ -1533,8 +1757,12 @@ public class BrowserService {
     }
 
     private String redactPasswordValues(Page page, String text) {
-        Locator passwords = page.locator("input[type=password]");
-        if (passwords == null) return text; // mock-only pages may not implement this locator
+        List<Locator> scopes = new ArrayList<>();
+        List<Frame> frames = page.frames();
+        if (frames == null || frames.isEmpty()) scopes.add(page.locator("input[type=password]"));
+        else for (Frame frame : frames) if (!frame.isDetached()) scopes.add(frame.locator("input[type=password]"));
+        for (Locator passwords : scopes) {
+        if (passwords == null) continue; // mock-only pages may not implement this locator
         Object raw = passwords.evaluateAll("els => els.map(el => el.value).filter(Boolean)");
         if (raw instanceof List<?> values) {
             for (Object value : values) {
@@ -1546,6 +1774,7 @@ public class BrowserService {
                     if (encoded.length() > 2) text = redactSnapshotText(text, encoded.substring(1, encoded.length() - 1));
                 }
             }
+        }
         }
         return text;
     }
@@ -1573,75 +1802,190 @@ public class BrowserService {
         } catch (Exception ignored) { return null; }
     }
 
+    private ElementHandle observedHandle(Frame frame, String description) {
+        Matcher role = Pattern.compile("^-\\s+([a-z]+)(?:\\s+\"((?:\\\\.|[^\"\\\\])*)\")?").matcher(description);
+        if (!role.find()) return null;
+        try {
+            AriaRole ariaRole = AriaRole.valueOf(role.group(1).toUpperCase(Locale.ROOT));
+            Frame.GetByRoleOptions options = new Frame.GetByRoleOptions().setExact(true);
+            if (role.group(2) != null) options.setName(resultJson.readValue("\"" + role.group(2) + "\"", String.class));
+            Locator locator = frame.getByRole(ariaRole, options);
+            return locator.count() == 1 ? locator.elementHandle() : null;
+        } catch (Exception ignored) { return null; }
+    }
+
     private record FormField(ElementHandle handle, Map<String, Object> state) {}
+    private record FormScan(List<FormField> fields, List<FrameDocument> documents,
+                            List<Map<String, Object>> frames, int candidateCount, boolean truncated) { }
 
     @SuppressWarnings("unchecked")
     private Map<String, Object> readFormField(ElementHandle handle) {
         return new LinkedHashMap<>((Map<String, Object>) handle.evaluate(BrowserFormSupport.READ_FIELD));
     }
 
-    private List<FormField> scanFormFields(Page page) {
+    private FormScan scanFormFields(Page page) {
         List<FormField> fields = new ArrayList<>();
-        Locator candidates = page.locator(BrowserFormSupport.SELECTOR);
+        List<FrameDocument> documents = new ArrayList<>();
+        List<Map<String, Object>> frameStates = new ArrayList<>();
+        int scanned = 0, total = 0;
+        boolean truncated = false;
         try {
-            int count = Math.min(candidates.count(), BrowserFormSupport.MAX_FIELDS);
+            List<Frame> frames = page.frames();
+            if (frames == null || frames.isEmpty()) frames = Collections.singletonList(page.mainFrame());
+            int frameCount = Math.min(frames.size(), BrowserFormSupport.MAX_FRAMES);
+            truncated = frames.size() > frameCount;
+            for (int frameIndex = 0; frameIndex < frameCount; frameIndex++) {
+            Frame frame = frames.get(frameIndex);
+            if (frame == null || frame.isDetached()) throw new IllegalStateException("页面框架发生变化，请重新识别表单");
+            assertFrameAccess(frame);
+            String path = framePath(frame);
+            boolean frameVisible = isFrameVisible(frame);
+            ElementHandle root = frame.locator(":root").elementHandle();
+            if (root == null) throw new IllegalStateException("页面框架尚未加载，请稍后重新识别表单");
+            documents.add(new FrameDocument(frame, root, frame.url()));
+            String aria = frameAriaSnapshot(frame);
+            Map<String, Object> frameState = new LinkedHashMap<>();
+            frameState.put("path", path); frameState.put("name", frame.name()); frameState.put("url", frame.url());
+            frameState.put("interactions", interactionFingerprint(aria));
+            frameStates.add(frameState);
+            Locator candidates = frame.locator(BrowserFormSupport.SELECTOR);
+            int available = candidates.count();
+            total += available;
+            int count = Math.min(available, BrowserFormSupport.MAX_FIELDS - scanned);
+            truncated |= available > count;
             for (int i = 0; i < count; i++) {
+                scanned++;
                 ElementHandle handle = candidates.nth(i).elementHandle();
                 if (handle == null) continue;
                 try {
                     Map<String, Object> state = readFormField(handle);
+                    state.put("framePath", path); state.put("frameName", frame.name()); state.put("frameUrl", frame.url());
+                    if (Boolean.TRUE.equals(state.get("visible")) && !frameVisible) state.put("visible", false);
                     if (Boolean.TRUE.equals(state.get("visible")) || "file".equals(state.get("type"))) {
                         fields.add(new FormField(handle, state));
                         handle = null; // ownership transferred to the result
                     }
                 } finally { if (handle != null) handle.dispose(); }
             }
-            return fields;
+            }
+            return new FormScan(fields, documents, frameStates, total, truncated);
         } catch (RuntimeException error) {
             fields.forEach(field -> { try { field.handle().dispose(); } catch (Exception ignored) {} });
+            documents.forEach(document -> { try { document.root().dispose(); } catch (Exception ignored) {} });
             throw error;
         }
     }
 
+    private String framePath(Frame frame) {
+        // A path is the location in this observation's tree, not a durable frame identity.
+        // Only opaque refs plus the bound document handle authorize later actions.
+        List<Integer> indices = new ArrayList<>();
+        for (Frame current = frame; current.parentFrame() != null; current = current.parentFrame()) {
+            int index = current.parentFrame().childFrames().indexOf(current);
+            if (index < 0) throw new IllegalStateException("页面框架已被替换，请重新识别表单");
+            indices.add(0, index);
+        }
+        return "main" + indices.stream().map(index -> "/" + index).collect(java.util.stream.Collectors.joining());
+    }
+
+    private String frameAriaSnapshot(Frame frame) {
+        Locator body = frame.locator("body");
+        // SVG/XML/PDF embeds can have a document root without an HTML body.
+        return body.count() == 0 ? "" : body.ariaSnapshot();
+    }
+
+    private boolean isFrameVisible(Frame frame) {
+        for (Frame current = frame; current.parentFrame() != null; current = current.parentFrame()) {
+            ElementHandle embedding = current.frameElement();
+            try { if (!embedding.isVisible()) return false; }
+            finally { embedding.dispose(); }
+        }
+        return true;
+    }
+
+    private void assertFrameAccess(Frame frame) {
+        for (Frame current = frame; current != null; current = current.parentFrame()) {
+            String url = current.url();
+            // Inline documents have no independently addressable endpoint. Their entire
+            // embedding chain must still terminate at a URL accepted by the network policy.
+            if (current.parentFrame() != null && ("about:blank".equals(url)
+                    || "about:srcdoc".equals(url) || url.startsWith("data:"))) continue;
+            String blocked = networkGuard == null ? null : networkGuard.validateUrl(url);
+            if (blocked != null) throw new SecurityException("框架 URL 被网络策略拒绝：" + blocked);
+        }
+    }
+
+    private String formFingerprint(FormScan scan) {
+        return resultJson.valueToTree(Map.of("fields", scan.fields().stream().map(FormField::state).toList(),
+                "frames", scan.frames(), "candidateCount", scan.candidateCount(), "truncated", scan.truncated())).toString();
+    }
+
     private String formFingerprint(Page page) {
-        List<FormField> fields = scanFormFields(page);
-        try { return resultJson.valueToTree(fields.stream().map(FormField::state).toList()).toString(); }
-        finally { fields.forEach(field -> { try { field.handle().dispose(); } catch (Exception ignored) {} }); }
+        FormScan scan = scanFormFields(page);
+        try { return formFingerprint(scan); }
+        finally { disposeFormScan(scan); }
+    }
+
+    private void disposeFormScan(FormScan scan) {
+        scan.fields().forEach(field -> { try { field.handle().dispose(); } catch (Exception ignored) {} });
+        scan.documents().forEach(document -> { try { document.root().dispose(); } catch (Exception ignored) {} });
     }
 
     private String formInspectOnActor(String sessionId) {
-        List<FormField> fields = List.of();
+        FormScan scan = null;
+        List<ElementHandle> frameHandles = new ArrayList<>();
         boolean retained = false;
         try {
             Page page = getPage(sessionId);
+            scan = scanFormFields(page);
             String raw = page.locator("body").ariaSnapshot();
             String snapshot = observe(sessionId, page, raw);
-            fields = scanFormFields(page);
             Observation base = observations.get(sessionId);
             Map<String, ObservedElement> elements = new LinkedHashMap<>(base.elements());
+            StringBuilder frameSnapshot = new StringBuilder(snapshot);
+            int index = elements.size();
+            for (FrameDocument document : scan.documents()) {
+                Frame frame = document.frame();
+                if (frame.parentFrame() == null || !isFrameVisible(frame)) continue;
+                frameSnapshot.append("\nframe=").append(framePath(frame)).append(" url=").append(frame.url()).append('\n');
+                for (String line : frameAriaSnapshot(frame).split("\n")) {
+                    String trimmed = line.trim();
+                    ElementHandle handle = isSnapshotRefLine(trimmed) ? observedHandle(frame, trimmed) : null;
+                    if (handle == null) frameSnapshot.append(line).append('\n');
+                    else {
+                        String ref = base.id() + "." + (++index);
+                        elements.put(ref, new ObservedElement(trimmed, handle));
+                        frameHandles.add(handle);
+                        frameSnapshot.append('[').append(ref).append("] ").append(trimmed).append('\n');
+                    }
+                }
+            }
             var result = resultJson.createObjectNode().put("success", true).put("observationId", base.id())
-                    .put("url", page.url()).put("snapshot", snapshot)
-                    .put("truncated", page.locator(BrowserFormSupport.SELECTOR).count() > BrowserFormSupport.MAX_FIELDS)
-                    .put("scope", "Current document and open shadow roots; iframe contents need separate support")
+                    .put("url", page.url()).put("snapshot", redactPasswordValues(page, frameSnapshot.toString()))
+                    .put("truncated", scan.truncated()).put("candidateCount", scan.candidateCount())
+                    .put("scope", "Current document, open shadow roots and attached frames; bounded to 200 candidates across 64 frames")
                     .put("message", "按字段类型填写；页面/值/约束变化后重新识别。valid只反映当前浏览器约束，不证明提交成功。");
             var output = result.putArray("fields");
-            int index = elements.size();
-            for (FormField field : fields) {
+            for (FormField field : scan.fields()) {
                 String ref = base.id() + "." + (++index);
                 elements.put(ref, new ObservedElement("form field " + field.state().get("label"), field.handle()));
                 var node = resultJson.valueToTree(field.state());
                 ((com.fasterxml.jackson.databind.node.ObjectNode) node).put("ref", ref);
                 output.add(node);
             }
-            String fingerprint = resultJson.valueToTree(fields.stream().map(FormField::state).toList()).toString();
-            observations.put(sessionId, new Observation(base.id(), base.url(), raw, Map.copyOf(elements), fingerprint));
+            result.set("frames", resultJson.valueToTree(scan.frames().stream().map(frame -> Map.of(
+                    "path", frame.get("path"), "name", frame.get("name"), "url", frame.get("url"))).toList()));
+            String fingerprint = formFingerprint(scan);
+            observations.put(sessionId, new Observation(base.id(), base.url(), raw, Map.copyOf(elements), fingerprint, scan.documents()));
             retained = true;
             return result.toString();
         } catch (Exception error) {
             invalidateObservation(sessionId);
-            return browserError("EXECUTION_FAILED", "识别表单失败：" + error.getMessage());
+            return browserError(error instanceof SecurityException ? "PERMISSION_DENIED" : "EXECUTION_FAILED",
+                    "识别表单失败：" + error.getMessage());
         } finally {
-            if (!retained) fields.forEach(field -> { try { field.handle().dispose(); } catch (Exception ignored) {} });
+            if (!retained && scan != null) disposeFormScan(scan);
+            if (!retained) frameHandles.forEach(handle -> { try { handle.dispose(); } catch (Exception ignored) {} });
         }
     }
 
@@ -1732,16 +2076,16 @@ public class BrowserService {
             Page page = getPage(sessionId);
             ObservedElement element = resolveObservedElement(sessionId, page, ref);
             if (element == null) return staleObservation();
-            Map<String, Object> info = (Map<String, Object>) element.handle().evaluate("""
-                    el => ({tag:el.tagName.toLowerCase(), multiple:!!el.multiple,
-                      disabled:el.matches(':disabled') || el.getAttribute('aria-disabled')==='true',
-                      options:el.options ? Array.from(el.options, o=>({value:o.value,label:o.label,
-                        disabled:o.disabled || (o.parentElement.tagName==='OPTGROUP' && o.parentElement.disabled)})) : []})
-                    """);
-            if (!"select".equals(info.get("tag")))
-                return browserError("INVALID_ARGUMENT", "目标不是原生下拉框；自定义组合框请依据新快照点击选项或使用按键");
+            Map<String, Object> info = readFormField(element.handle());
+            boolean nativeSelect = "select".equals(info.get("tag"));
+            if (Boolean.TRUE.equals(info.get("valueRedacted")))
+                return browserError("PERMISSION_DENIED", "密码字段不能使用下拉选项回读接口");
+            if (!nativeSelect && !Boolean.TRUE.equals(info.get("customSelectSupported")))
+                return browserError("INVALID_ARGUMENT", "自定义下拉需要唯一 aria-controls/aria-owns listbox、明确 aria-selected 状态和单选语义；请重新观察后操作");
             if (Boolean.TRUE.equals(info.get("disabled")))
                 return browserError("CONFLICT", "下拉框处于禁用状态，未执行选择");
+            if (Boolean.TRUE.equals(info.get("optionsTruncated")))
+                return browserError("CONFLICT", "下拉选项超过回读上限，无法确认唯一匹配，未执行选择");
             if (!Boolean.TRUE.equals(info.get("multiple")) && values.size() != 1)
                 return browserError("INVALID_ARGUMENT", "单选下拉框只能指定一个选项");
             List<Map<String, Object>> options = (List<Map<String, Object>>) info.get("options");
@@ -1751,7 +2095,7 @@ public class BrowserService {
                 if (matches.size() != 1)
                     return browserError("CONFLICT", "选项不存在或匹配不唯一，未执行选择；请重新识别表单并提供唯一 value");
                 if (Boolean.TRUE.equals(matches.get(0).get("disabled")))
-                    return browserError("CONFLICT", "选项已禁用，未执行选择");
+                    return browserError("CONFLICT", "选项已禁用或隐藏，未执行选择");
                 String selectedValue = (String) matches.get(0).get("value");
                 if (options.stream().filter(option -> selectedValue.equals(option.get("value"))).count() != 1)
                     return browserError("CONFLICT", "选项 value 重复，无法唯一选择，请使用页面控件人工确认");
@@ -1759,9 +2103,35 @@ public class BrowserService {
             }
             List<String> before = selectedValues(element.handle());
             if (!new LinkedHashSet<>(before).equals(expected)) {
-                SelectOption[] selection = expected.stream().map(value -> new SelectOption().setValue(value)).toArray(SelectOption[]::new);
-                dispatched = true;
-                element.handle().selectOption(selection, new ElementHandle.SelectOptionOptions().setTimeout(CLICK_TIMEOUT_MS));
+                if (nativeSelect) {
+                    SelectOption[] selection = expected.stream().map(value -> new SelectOption().setValue(value)).toArray(SelectOption[]::new);
+                    requireActorInput();
+                    dispatched = true;
+                    element.handle().selectOption(selection, new ElementHandle.SelectOptionOptions().setTimeout(CLICK_TIMEOUT_MS));
+                } else {
+                    JSHandle target = element.handle().evaluateHandle(BrowserFormSupport.CUSTOM_OPTION_HANDLE,
+                            Map.of("by", mode, "value", values.get(0)));
+                    try {
+                        ElementHandle option = target.asElement();
+                        if (option == null) return browserError("CONFLICT", "关联选项已变化或不唯一，未执行选择");
+                        if (!option.isVisible() || Boolean.TRUE.equals(info.get("customPopupHidden"))) {
+                            if (!"combobox".equals(info.get("role")))
+                                return browserError("CONFLICT", "关联列表不可见，请先展开控件后重新识别表单");
+                            requireActorInput();
+                            dispatched = true;
+                            element.handle().click(new ElementHandle.ClickOptions().setTimeout(CLICK_TIMEOUT_MS));
+                        }
+                        // Expansion may replace the list, change its ownership or leave it ARIA-hidden.
+                        // Keep the original target and verify the current association before dispatching.
+                        JSHandle ready = element.handle().ownerFrame().waitForFunction(BrowserFormSupport.CUSTOM_OPTION_READY,
+                                Map.of("control", element.handle(), "target", option, "by", mode, "value", values.get(0)),
+                                new Frame.WaitForFunctionOptions().setTimeout(CLICK_TIMEOUT_MS));
+                        ready.dispose();
+                        requireActorInput();
+                        dispatched = true;
+                        option.click(new ElementHandle.ClickOptions().setTimeout(CLICK_TIMEOUT_MS));
+                    } finally { target.dispose(); }
+                }
             }
             List<String> actual = selectedValues(element.handle());
             if (!new LinkedHashSet<>(actual).equals(expected)) {
@@ -1778,7 +2148,10 @@ public class BrowserService {
 
     @SuppressWarnings("unchecked")
     private List<String> selectedValues(ElementHandle handle) {
-        return (List<String>) handle.evaluate("el => Array.from(el.selectedOptions, o=>o.value)");
+        Map<String, Object> state = readFormField(handle);
+        if (!"select".equals(state.get("tag")) && !Boolean.TRUE.equals(state.get("customSelectSupported")))
+            throw new IllegalStateException("自定义下拉缺少可核验的关联选项状态");
+        return (List<String>) state.get("selectedValues");
     }
 
     @SuppressWarnings("unchecked")
@@ -1790,24 +2163,28 @@ public class BrowserService {
             Page page = getPage(sessionId);
             ObservedElement element = resolveObservedElement(sessionId, page, ref);
             if (element == null) return staleObservation();
-            Map<String, Object> info = (Map<String, Object>) element.handle().evaluate("""
-                    el => ({tag:el.tagName.toLowerCase(),type:el.type,checked:!!el.checked,
-                      disabled:el.matches(':disabled') || el.getAttribute('aria-disabled')==='true'})
-                    """);
+            Map<String, Object> info = readFormField(element.handle());
             String type = String.valueOf(info.get("type"));
-            if (!"input".equals(info.get("tag")) || !Set.of("checkbox", "radio").contains(type))
-                return browserError("INVALID_ARGUMENT", "目标不是原生复选框或单选框；自定义控件请依据新快照操作并核验状态");
+            boolean nativeCheck = "input".equals(info.get("tag")) && Set.of("checkbox", "radio").contains(type);
+            String role = String.valueOf(info.get("role"));
+            Object state = info.get("checked");
+            if (!nativeCheck && (!Set.of("checkbox", "radio", "switch").contains(role)
+                    || !("true".equals(state) || "false".equals(state))))
+                return browserError("INVALID_ARGUMENT", "目标需要原生复选/单选框或明确 aria-checked=true/false 的 checkbox/radio/switch；不猜测 mixed 状态");
             if (Boolean.TRUE.equals(info.get("disabled")))
                 return browserError("CONFLICT", "目标处于禁用状态，未更改勾选状态");
-            boolean before = Boolean.TRUE.equals(info.get("checked"));
-            if ("radio".equals(type) && before && !checked)
+            boolean before = Boolean.TRUE.equals(state) || "true".equals(state);
+            if (("radio".equals(type) || "radio".equals(role)) && before && !checked)
                 return browserError("INVALID_ARGUMENT", "单选框不能直接取消；请选择同一组选项中的其他单选框");
             if (before != checked) {
+                requireActorInput();
                 dispatched = true;
-                element.handle().setChecked(checked, new ElementHandle.SetCheckedOptions().setTimeout(CLICK_TIMEOUT_MS));
+                if (nativeCheck) element.handle().setChecked(checked, new ElementHandle.SetCheckedOptions().setTimeout(CLICK_TIMEOUT_MS));
+                else element.handle().click(new ElementHandle.ClickOptions().setTimeout(CLICK_TIMEOUT_MS));
             }
-            boolean actual = element.handle().isChecked();
-            if (actual != checked) {
+            Object actualState = readFormField(element.handle()).get("checked");
+            boolean actual = Boolean.TRUE.equals(actualState) || "true".equals(actualState);
+            if (!(actualState instanceof Boolean || "true".equals(actualState) || "false".equals(actualState)) || actual != checked) {
                 invalidateObservation(sessionId);
                 return unknownAction("勾选动作后的实际状态与目标不一致");
             }
@@ -1846,6 +2223,7 @@ public class BrowserService {
                 return browserError("INVALID_ARGUMENT", "该上传控件仅接受单个文件");
             List<Map<String, Object>> expected = new ArrayList<>();
             for (Path path : trustedPaths) expected.add(Map.of("name", path.getFileName().toString(), "size", Files.size(path)));
+            requireActorInput();
             dispatched = true;
             element.handle().setInputFiles(trustedPaths.toArray(Path[]::new),
                     new ElementHandle.SetInputFilesOptions().setTimeout(CLICK_TIMEOUT_MS));
@@ -1896,11 +2274,13 @@ public class BrowserService {
             if (ref.startsWith("b") && ref.contains(".") || ref.chars().allMatch(Character::isDigit)) {
                 ObservedElement element = resolveObservedElement(sessionId, page, ref);
                 if (element == null) return staleObservation();
+                requireActorInput();
                 element.handle().fill(text, new ElementHandle.FillOptions().setTimeout(CLICK_TIMEOUT_MS));
             } else {
                 Locator input = page.getByPlaceholder(ref, new Page.GetByPlaceholderOptions().setExact(true));
                 if (input.count() != 1) input = page.getByLabel(ref, new Page.GetByLabelOptions().setExact(true));
                 if (input.count() != 1) return browserError("CONFLICT", "输入框匹配不唯一或不存在，请重新获取快照");
+                requireActorInput();
                 input.fill(text, new Locator.FillOptions().setTimeout(CLICK_TIMEOUT_MS));
             }
             return "输入成功: ref=" + ref + "\n\n" + observe(sessionId, page, page.locator("body").ariaSnapshot());
@@ -1916,6 +2296,7 @@ public class BrowserService {
     private String pressOnActor(String sessionId, String key) {
         try {
             Page page = getPage(sessionId);
+            requireActorInput();
             page.keyboard().press(key);
             return String.format(MessageConstants.BROWSER_PRESS_SUCCESS, key) + "\n\n"
                     + observe(sessionId, page, page.locator("body").ariaSnapshot());
@@ -1932,6 +2313,7 @@ public class BrowserService {
     private String scrollOnActor(String sessionId, String direction) {
         try {
             Page page = getPage(sessionId);
+            requireActorInput();
             if ("up".equalsIgnoreCase(direction)) {
                 page.mouse().wheel(0, -500);
             } else {
@@ -2050,15 +2432,29 @@ public class BrowserService {
      * 关闭当前 session 的浏览器页面
      */
     private String closeOnActor(String sessionId) {
+        boolean existed = pages.containsKey(sessionId) || sessionContexts.containsKey(sessionId);
+        boolean cleared = pendingSessionClears.contains(sessionId);
+        persistSessionState(sessionId);
+        try { closeSessionContext(sessionId); }
+        catch (Exception failed) { return browserError("EXECUTION_FAILED", "关闭浏览器页面失败；保留会话引用供后续显式关闭"); }
+        if (existed) return String.format(MessageConstants.BROWSER_PAGE_CLOSED, sessionId)
+                + (cleared ? "；已清除此聊天的登录态" : sessionStateStore == null ? "" : statePersistenceWarnings.containsKey(sessionId)
+                ? "；登录态保存失败，重启后可能需要重新登录" : "；已保留此聊天的登录态");
+        return "没有找到 session: " + sessionId;
+    }
+
+    private void closeSessionContext(String sessionId) {
         invalidateObservation(sessionId);
-        Page page = pages.remove(sessionId);
+        Page page = pages.get(sessionId);
+        BrowserContext context = sessionContexts.get(sessionId);
+        // Keep the live handle if closing fails so explicit close/clear can be attempted again.
+        if (context != null) context.close();
+        else if (page != null && !page.isClosed()) page.close();
+        pages.remove(sessionId);
+        sessionContexts.remove(sessionId);
+        pendingSessionClears.remove(sessionId);
         pageDiagnostics.remove(sessionId);
         lastPointerPositions.remove(sessionId);
-        if (Objects.nonNull(page)) {
-            page.close();
-            return String.format(MessageConstants.BROWSER_PAGE_CLOSED, sessionId);
-        }
-        return "没有找到 session: " + sessionId;
     }
 
     /**
@@ -2075,6 +2471,7 @@ public class BrowserService {
             }
             String home = page.url();
             waitForWikiTree(page);
+            requireActorInput();
             page.evaluate(TOC_EXPAND_JS);
             List<String> urls = jsStringList(page.evaluate(TOC_TOKENS_JS));
             if (urls.size() <= 1) {
@@ -2086,6 +2483,7 @@ public class BrowserService {
             int ok = 0;
             if (urls.size() > 1) {
                 for (String url : urls) {
+                    checkActorPreparation();
                     if (ok >= EXTRACT_MAX_PAGES) {
                         break;
                     }
@@ -2105,6 +2503,7 @@ public class BrowserService {
                 log.info("目录标题 {} 条 {}", titles.size(),
                         titles.size() > 12 ? titles.subList(0, 12) : titles);
                 for (String title : titles) {
+                    checkActorPreparation();
                     if (ok >= EXTRACT_MAX_PAGES) {
                         break;
                     }
@@ -2144,6 +2543,7 @@ public class BrowserService {
                 .replace("__MAX__", String.valueOf(EXTRACT_MAX_STEPS))
                 .replace("__PAUSE__", String.valueOf(EXTRACT_PAUSE_MS))
                 .replace("__IMGMIN__", String.valueOf(EXTRACT_IMAGE_MIN_PX));
+        requireActorInput();
         Object result = page.evaluate(script);
         String body = result == null ? "" : result.toString().trim();
         if (body.length() < EXTRACT_MIN_CHARS) {
@@ -2194,11 +2594,13 @@ public class BrowserService {
             return;
         }
         try {
+            requireActorInput();
             page.goBack(new Page.GoBackOptions()
                     .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
                     .setTimeout(15000));
             page.waitForTimeout(EXTRACT_NAV_PAUSE_MS);
             if ((isLoginPage(page) || isPasswordGate(page)) && !isLoginUrl(home)) {
+                requireActorInput();
                 page.navigate(home, new Page.NavigateOptions()
                         .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
                         .setTimeout(15000));
@@ -2235,6 +2637,7 @@ public class BrowserService {
             return true;
         }
         try {
+            requireActorInput();
             page.navigate(url, new Page.NavigateOptions()
                     .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
                     .setTimeout(15000));
@@ -2253,6 +2656,7 @@ public class BrowserService {
 
     private void waitForWikiTree(Page page) {
         for (int i = 0; i < TREE_WAIT_ROUNDS; i++) {
+            checkActorPreparation();
             Object n = page.evaluate(TREE_COUNT_JS);
             if (n instanceof Number && ((Number) n).intValue() > 0) {
                 return;
@@ -2263,6 +2667,7 @@ public class BrowserService {
 
     private void clickCatalogTitle(Page page, String title) {
         String before = wikiKey(page.url());
+        requireActorInput();
         Object hit = page.evaluate("""
                 (want) => {
                 """ + PICK_CAT_FN + """
@@ -2299,6 +2704,7 @@ public class BrowserService {
                 """, title);
         if (!Boolean.TRUE.equals(hit)) {
             Locator loc = page.getByText(title, new Page.GetByTextOptions().setExact(true));
+            requireActorInput();
             loc.first().evaluate("el => el.click()");
         }
         page.waitForTimeout(EXTRACT_NAV_PAUSE_MS);
@@ -2373,12 +2779,14 @@ public class BrowserService {
             }
             return null;
         }
-        if (!allowExtractImageUrl(page.url(), url)) {
+        if (!allowExtractImageUrl(page.url(), url) || networkGuard.validateUrl(url) != null) {
             return screenshotFallback(page, url, imageDir, dirName, fileName);
         }
         try {
             APIResponse resp = page.request().get(url, RequestOptions.create()
                     .setTimeout(EXTRACT_IMAGE_TIMEOUT_MS)
+                    // APIRequestContext does not pass through BrowserContext.route; never follow unchecked redirects.
+                    .setMaxRedirects(0)
                     .setHeader("Referer", page.url()));
             byte[] body = resp.body();
             String ct = "";
@@ -2510,6 +2918,7 @@ public class BrowserService {
         try {
             invalidateObservation(sessionId);
             Page page = getPage(sessionId);
+            requireActorInput();
             Object result = page.evaluate(expression);
             return String.format(MessageConstants.BROWSER_EVAL_RESULT,
                     Objects.nonNull(result) ? result.toString() : "null");
@@ -2553,14 +2962,19 @@ public class BrowserService {
     private void shutdownOnActor() {
         log.info("关闭所有浏览器会话...");
         for (String session : new ArrayList<>(observations.keySet())) invalidateObservation(session);
-        pages.values().forEach(Page::close);
+        for (String session : new ArrayList<>(sessionContexts.keySet())) persistSessionState(session);
+        sessionContexts.values().forEach(context -> {
+            try { context.close(); }
+            catch (Exception failed) { log.warn("关闭浏览器会话失败 type={}", failed.getClass().getSimpleName()); }
+        });
+        sessionContexts.clear();
+        pages.values().forEach(page -> {
+            try { if (!page.isClosed()) page.close(); }
+            catch (Exception failed) { log.warn("关闭浏览器页面失败 type={}", failed.getClass().getSimpleName()); }
+        });
         pages.clear();
         pageDiagnostics.clear();
-        if (Objects.nonNull(browser)) {
-            browser.close();
-        }
-        if (Objects.nonNull(playwright)) {
-            playwright.close();
-        }
+        try { if (Objects.nonNull(browser)) browser.close(); }
+        finally { if (Objects.nonNull(playwright)) playwright.close(); }
     }
 }

@@ -1,0 +1,5 @@
+{
+  "providerId": "evaluation-provider",
+  "modelId": "replace-with-actual-model-id",
+  "configurationRevision": "eval-config-v1"
+}

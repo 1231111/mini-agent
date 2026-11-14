@@ -1,10 +1,12 @@
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog, shell, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog, shell, screen, safeStorage } = require('electron');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const { restoreWindowBounds, animateWindowBounds } = require('./src/window-bounds.cjs');
+const { openWebLink, installExternalLinkHandling } = require('./src/external-links.cjs');
+const { ensureDesktopModelConfigKey } = require('./src/model-config-key.cjs');
 
 /** 只弹出全息浮层或启动页预览，不拉后端、不占正式客户端的单实例锁。 */
 const holoPreview = process.argv.includes('--holo-preview');
@@ -306,6 +308,11 @@ function startBackend(rt, nonce) {
   // Supplying a per-install key here prevents clean machines from either
   // failing to boot or falling back to a repository-known signing key.
   env.JWT_SECRET = ensureDesktopJwtSecret();
+  env.MODEL_CONFIG_ENCRYPTION_KEY = ensureDesktopModelConfigKey({
+    keyPath: path.join(app.getPath('userData'), 'model-config-key.json'),
+    configuredKey: process.env.MODEL_CONFIG_ENCRYPTION_KEY,
+    safeStorage
+  });
   if (!env.CLOUD_AUTH_BASE_URL || !String(env.CLOUD_AUTH_BASE_URL).trim()) {
     env.CLOUD_AUTH_BASE_URL = portalUrl();
   }
@@ -641,25 +648,11 @@ function createWindow() {
     show: false
   });
 
-  // Markdown links use target="_blank". Do not let Electron create a second
-  // app window for them (that window has no trusted page and may show the
-  // platform's whaleguard block page); send web links to the system browser.
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    try {
-      const parsed = new URL(String(url));
-      if ((parsed.protocol === 'https:' || parsed.protocol === 'http:')
-          && !parsed.username && !parsed.password) {
-        shell.openExternal(parsed.toString()).catch((error) => {
-          console.warn('Unable to open external link:', error.message || error);
-        });
-      } else {
-        console.warn('Blocked non-web popup URL:', String(url));
-      }
-    } catch (error) {
-      console.warn('Blocked invalid popup URL:', String(url));
-    }
-    return { action: 'deny' };
-  });
+  // Both _blank links and links without a target belong in the system browser;
+  // neither can replace the running chat with a third-party page.
+  installExternalLinkHandling(mainWindow.webContents, url => shell.openExternal(url),
+    () => new URL(getApiBase()).origin,
+    error => console.warn('Unable to open external link:', error.message || error));
 
   /* 渲染层的报错默认只出现在 F12 控制台里 —— 客户机上没人会按 F12。
      落一份到 <数据目录>/logs/renderer.log，让「界面卡住」这类问题第一次就能定位。
@@ -902,21 +895,10 @@ ipcMain.handle('get-portal-url', () => portalUrl());
  * 不用黑名单：黑名单漏一个就是漏一个。
  */
 ipcMain.handle('open-external', async (event, rawUrl) => {
-  let parsed;
-  try {
-    parsed = new URL(String(rawUrl));
-  } catch (e) {
-    return { ok: false, error: '不是合法的 URL' };
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    return { ok: false, error: `只允许 http/https，收到 ${parsed.protocol}` };
-  }
-  try {
-    await shell.openExternal(parsed.toString());
-    return { ok: true };
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents)
+    return { ok: false, error: '当前窗口无法打开外部链接。' };
+  return openWebLink(rawUrl, url => shell.openExternal(url),
+    error => console.warn('Unable to open external link:', error.message || error));
 });
 
 /* ────────── 自绘标题栏的窗口控制（preload 里那三个按钮走这里） ────────── */

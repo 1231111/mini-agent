@@ -2,6 +2,7 @@ package com.miniagent.agent.planner;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.miniagent.agent.core.ModelCallControl;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
@@ -17,6 +18,10 @@ import java.util.Map;
 
 /** Selects an execution strategy using semantics, without task keyword/length rules. */
 final class SemanticPlanningRouter {
+    private final ModelCallControl modelCallControl;
+
+    SemanticPlanningRouter() { this(null); }
+    SemanticPlanningRouter(ModelCallControl modelCallControl) { this.modelCallControl = modelCallControl; }
     private static final Logger log = LoggerFactory.getLogger(SemanticPlanningRouter.class);
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String SYSTEM = """
@@ -42,7 +47,7 @@ final class SemanticPlanningRouter {
             """;
 
     PlanningRoute decide(ChatModel model, String request, UserMessage multimodal, List<ChatMessage> history) {
-        if (model == null) return PlanningRoute.direct("fallback", "ROUTER_MODEL_UNAVAILABLE");
+        if (model == null) return PlanningRoute.unresolved("ROUTER_MODEL_UNAVAILABLE");
         try {
             String payload = JSON.writeValueAsString(Map.of(
                     "currentRequest", bounded(request, 32_000),
@@ -51,21 +56,23 @@ final class SemanticPlanningRouter {
                             .anyMatch(content -> !(content instanceof TextContent)),
                     "recentConversation", recentConversation(history)));
             List<ChatMessage> messages = new java.util.ArrayList<>(List.of(SystemMessage.from(SYSTEM), UserMessage.from(payload)));
-            PlanningRoute route = PlanningRoute.direct("fallback", "ROUTER_INVALID_RESPONSE");
+            PlanningRoute route = PlanningRoute.unresolved("ROUTER_INVALID_RESPONSE");
             for (int attempt = 0; attempt < 2; attempt++) {
-                var response = model.chat(ChatRequest.builder().messages(messages).build());
+                var requestBody = ChatRequest.builder().messages(messages).build();
+                var response = modelCallControl == null ? model.chat(requestBody)
+                        : modelCallControl.call(() -> model.chat(requestBody));
                 String result = response == null || response.aiMessage() == null ? null : response.aiMessage().text();
                 try {
                     route = parse(result);
                     if (Boolean.TRUE.equals(route.artifactDeliveryRequested())) {
                         String evidence = JSON.readTree(unfence(result)).path("artifactDelivery").path("evidence").asText();
                         if (evidence.isBlank() || evidence.length() > 500 || request == null || !request.contains(evidence))
-                            route = PlanningRoute.direct("fallback", "ROUTER_INVALID_ARTIFACT_EVIDENCE");
+                            route = PlanningRoute.unresolved("ROUTER_INVALID_ARTIFACT_EVIDENCE");
                     }
                 } catch (Exception invalid) {
-                    route = PlanningRoute.direct("fallback", "ROUTER_INVALID_RESPONSE");
+                    route = PlanningRoute.unresolved("ROUTER_INVALID_RESPONSE");
                 }
-                if (!"fallback".equals(route.source())) return route;
+                if (route.resolved()) return route;
                 if (attempt == 0) {
                     if (result != null && !result.isBlank()) messages.add(AiMessage.from(bounded(result, 4_000)));
                     messages.add(UserMessage.from("路由响应未通过校验：" + route.reason()
@@ -75,15 +82,17 @@ final class SemanticPlanningRouter {
             }
             return route;
         } catch (Exception failure) {
+            ModelCallControl.rethrowIfStopped(failure);
             // Do not log model input, credentials, or provider error bodies here.
-            log.warn("任务策略路由失败，保留直跑路径: {}", failure.getClass().getSimpleName());
-            return PlanningRoute.direct("fallback", "ROUTER_MODEL_ERROR");
+            String reason = RoutingModelFailure.reason(failure);
+            log.warn("任务策略路由失败，停止本轮执行: reason={}, type={}", reason, failure.getClass().getSimpleName());
+            return PlanningRoute.unresolved(reason);
         }
     }
 
     static PlanningRoute parse(String text) throws Exception {
         if (text == null || text.isBlank() || text.length() > 4_000)
-            return PlanningRoute.direct("fallback", "ROUTER_INVALID_RESPONSE");
+            return PlanningRoute.unresolved("ROUTER_INVALID_RESPONSE");
         String raw = unfence(text);
         JsonNode node = JSON.reader().with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
                 .readTree(raw);
@@ -91,13 +100,13 @@ final class SemanticPlanningRouter {
                 || !node.path("reason").isTextual() || node.path("reason").asText().isBlank()
                 || !node.path("artifactDelivery").path("requested").isBoolean()
                 || !node.path("artifactDelivery").path("evidence").isTextual())
-            return PlanningRoute.direct("fallback", "ROUTER_INVALID_RESPONSE");
+            return PlanningRoute.unresolved("ROUTER_INVALID_RESPONSE");
         String reason = bounded(node.path("reason").asText(), 300);
         boolean artifact = node.path("artifactDelivery").path("requested").asBoolean();
         return switch (node.path("route").asText()) {
             case "dag" -> new PlanningRoute(true, "model", reason, artifact);
             case "direct" -> new PlanningRoute(false, "model", reason, artifact);
-            default -> PlanningRoute.direct("fallback", "ROUTER_INVALID_RESPONSE");
+            default -> PlanningRoute.unresolved("ROUTER_INVALID_RESPONSE");
         };
     }
 

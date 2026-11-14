@@ -46,9 +46,9 @@ public final class TodoSemanticValidator {
 
         if (dw.startsWith("file_exists:")) {
             String path = dw.substring("file_exists:".length()).trim();
-            Path p = resolveExisting(path, ev);
+            Path p = AcceptanceEvidenceFiles.resolveDeclaredFile(path);
             if (Objects.isNull(p)) {
-                return Result.fail("语义验收失败：找不到可校验文件（done_when/evidence）");
+                return Result.fail("语义验收失败：声明的产物文件不存在或无权访问 " + path);
             }
             return validateFile(p);
         }
@@ -218,29 +218,6 @@ public final class TodoSemanticValidator {
                 || name.endsWith(".webp") || name.endsWith(".gif") || name.endsWith(".svg");
     }
 
-    private static Path resolveExisting(String doneWhenPath, String evidence) {
-        Path p = tryResolve(doneWhenPath);
-        if (Objects.nonNull(p) && Files.exists(p)) {
-            return p;
-        }
-        if (StringUtils.isNotBlank(evidence)) {
-            // evidence 可能是路径，或 markdown 里夹路径
-            Path e = tryResolve(evidence.trim());
-            if (Objects.nonNull(e) && Files.exists(e)) {
-                return e;
-            }
-            var m = Pattern.compile("(?:workspace|generated-images|static/images)[^\\s)'\"]+")
-                    .matcher(evidence.replace('\\', '/'));
-            if (m.find()) {
-                Path fromEv = tryResolve(m.group());
-                if (Objects.nonNull(fromEv) && Files.exists(fromEv)) {
-                    return fromEv;
-                }
-            }
-        }
-        return null;
-    }
-
     private static Path tryResolve(String path) {
         if (StringUtils.isBlank(path)) {
             return null;
@@ -344,7 +321,7 @@ public final class TodoSemanticValidator {
     private static String sha256(byte[] data) {
         try {
             byte[] dig = MessageDigest.getInstance("SHA-256").digest(data);
-            return HexFormat.of().formatHex(dig).substring(0, 16);
+            return HexFormat.of().formatHex(dig);
         } catch (Exception e) {
             return "";
         }

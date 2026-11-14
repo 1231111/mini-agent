@@ -43,6 +43,14 @@ class ContextWindowResolverTest {
     }
 
     @Test
+    void hardLimitAlsoCapsDefaultWhenNoSupportedCandidateSurvives() {
+        assertEquals(128_000, ContextWindowResolver.resolve(1_000_000, List.of(), 128_000));
+        assertEquals(128_000, ContextWindowResolver.resolve(1_000_000, List.of(1_000_000), 128_000));
+        assertEquals(32_000, ContextWindowResolver.resolve(32_000, List.of(), 128_000));
+        assertEquals(1_000_000, ContextWindowResolver.resolve(1_000_000, List.of(), 0));
+    }
+
+    @Test
     void fallsBackToMaxInputTokensWhenNoWindowDeclared() {
         assertEquals(64_000, ContextWindowResolver.resolve(0, List.of(), 64_000));
         assertEquals(0, ContextWindowResolver.resolve(0, List.of(), 0),

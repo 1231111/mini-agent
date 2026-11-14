@@ -26,7 +26,7 @@ function balancedUrl(s, open) {
  * `![alt](url)` → 图片或音频。
  *
  * 同一个 markdown 语法承担两种交付物：图片出 <img>，音频出 <audio controls>。
- * 判据只看 URL 扩展名（复用上传校验用的 AUDIO_EXTS，避免两套扩展名清单漂移），
+ * Markdown 媒体按 URL 扩展名识别；结构化卡片也可提供真实媒体的 MIME 类型。
  * 所以 song_generate 返回的 `![生成的歌曲](/api/generated-media/<owner>/xxx.mp3)`
  * 会渲染成播放器；以前一律拼 <img>，音频就变成一张碎图。
  *
@@ -39,12 +39,96 @@ function balancedUrl(s, open) {
  */
 function isAudioUrl(url) {
     const clean = String(url).split('?')[0].split('#')[0];
-    return AUDIO_EXTS.has(fileExt(clean));
+    return /\.(?:mp3|wav|flac|m4a|ogg|oga|opus|aac)$/i.test(clean);
 }
 
 function isVideoUrl(url) {
     const clean = String(url).split('?')[0].split('#')[0];
-    return VIDEO_EXTS.has(fileExt(clean));
+    return /\.(?:mp4|webm|ogv|m4v|mov|avi|wmv)$/i.test(clean);
+}
+
+/** Only real web resources and the owner-scoped media endpoints may become src attributes. */
+function safeMediaUrl(value) {
+    if (typeof value !== 'string' || value.length > 8192 || /[\x00-\x20\\]/.test(value)) return '';
+    if (/^\/api\/(?:generated-media|conversation-media)\/[A-Za-z0-9._~-]+\/[A-Za-z0-9._%~-]+$/i.test(value)
+            || /^\/api\/workspace-media\/[A-Za-z0-9._%~-]+(?:\?sid=[A-Za-z0-9._%~-]+)?$/i.test(value)) return value;
+    try {
+        const url = new URL(value);
+        return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? url.href : '';
+    } catch (_) { return ''; }
+}
+
+function safeMediaPageUrl(value) {
+    const url = safeMediaUrl(value);
+    return /^https?:\/\//i.test(url) ? url : '';
+}
+
+function renderNativeMedia(url, kind, title, posterUrl) {
+    const tag = kind === 'audio' ? 'audio' : 'video';
+    const label = title || (tag === 'audio' ? '音频' : '视频');
+    const poster = tag === 'video' && posterUrl && !posterUrl.startsWith('/api/')
+        ? ` poster="${escA(posterUrl)}"` : '';
+    return `<div class="media-player-shell"><${tag} controls${tag === 'video' ? ' playsinline class="chat-video"' : ''} preload="metadata" aria-label="${escA(label)}" data-media-key="${escA(tag + '|' + url)}" data-media-url="${escA(url)}"${poster} ${mediaSrcAttr(url)}></${tag}></div>`;
+}
+
+function renderMediaCardBlock(language, rawJson) {
+    if (String(language).toLowerCase() !== 'miniagent-media') return null;
+    const pending = '<div class="media-card-pending" role="status">正在整理媒体内容…</div>';
+    if (rawJson.length > 100000) return '<div class="media-card-pending">媒体内容过长，暂无法展示。</div>';
+    let data;
+    try { data = JSON.parse(rawJson); } catch (_) { return pending; }
+    if (!data || typeof data !== 'object' || !Array.isArray(data.items)) return pending;
+    const text = (value, limit = 240) => typeof value === 'string' || typeof value === 'number'
+        ? esc(String(value).slice(0, limit)) : '';
+    const icon = kind => `<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">${kind === 'song'
+        ? '<path d="M20 32V13l19-4v20M20 17l19-4"/><ellipse cx="14" cy="33" rx="6" ry="4"/><ellipse cx="33" cy="30" rx="6" ry="4"/>'
+        : '<rect x="7" y="10" width="34" height="28" rx="5"/><path d="m21 18 10 6-10 6z"/>'}</svg>`;
+    const cards = data.items.slice(0, 16).map(item => {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return '';
+        const kind = item.type === 'audio' ? 'song' : item.type;
+        if (!['movie', 'song', 'video'].includes(kind)) return '';
+        const title = text(item.title, 160) || (kind === 'movie' ? '电影' : kind === 'song' ? '歌曲' : '视频');
+        const poster = safeMediaUrl(item.posterUrl);
+        const page = safeMediaPageUrl(item.pageUrl);
+        const source = safeMediaPageUrl(item.source?.url);
+        const media = safeMediaUrl(item.mediaUrl);
+        const mime = typeof item.mimeType === 'string' ? item.mimeType.toLowerCase() : '';
+        const playable = media && (kind === 'song' ? isAudioUrl(media) || /^audio\/[\w.+-]+(?:;|$)/.test(mime)
+            : isVideoUrl(media) || /^video\/[\w.+-]+(?:;|$)/.test(mime));
+        const meta = [item.creator, item.releaseDate, item.duration].map(value => text(value, 100)).filter(Boolean).join(' · ');
+        const cover = `<div class="media-cover media-cover--${kind}">${icon(kind)}${poster
+            ? `<img ${mediaSrcAttr(poster)} alt="${escA(typeof item.title === 'string' ? item.title.slice(0, 160) : '媒体封面')}" loading="lazy" referrerpolicy="no-referrer" data-media-poster="1">` : ''}</div>`;
+        const player = playable ? renderNativeMedia(media, kind === 'song' ? 'audio' : 'video',
+            (kind === 'movie' ? '预告片：' : '') + (typeof item.title === 'string' ? item.title.slice(0, 160) : ''), poster) : '';
+        return `<article class="media-item" data-media-type="${kind}"><div class="media-item-top">${cover}<div class="media-details"><span class="media-kind">${kind === 'movie' ? '电影' : kind === 'song' ? '音乐' : '视频'}</span><h3>${title}</h3>${meta ? `<div class="media-meta">${meta}</div>` : ''}${item.description ? `<p class="media-description">${text(item.description, 480)}</p>` : ''}<div class="media-actions">${page ? `<a class="media-page-link" href="${escA(page)}" target="_blank" rel="noopener noreferrer">${kind === 'movie' ? '详情 / 观看入口' : '打开原网页'} <span aria-hidden="true">↗</span></a>` : ''}${source && source !== page ? `<a class="media-source-link" href="${escA(source)}" target="_blank" rel="noopener noreferrer">${text(item.source.label, 80) || '查看来源'}</a>` : ''}</div>${kind === 'song' ? player : ''}</div></div>${kind !== 'song' && player ? (kind === 'movie' ? '<span class="media-preview-label">预告片</span>' : '') + player : ''}</article>`;
+    }).join('');
+    return `<section class="media-result-card" aria-label="媒体推荐"><header class="media-result-heading">${text(data.title, 160) || '为你推荐'}</header><div class="media-result-items">${cards || '<div class="media-card-pending">暂无可展示的媒体内容。</div>'}</div></section>`;
+}
+
+/** Reuse native players across streamed/final renders so an ongoing playback keeps its DOM and time. */
+function setMarkdownContent(root, markup) {
+    const players = new Map();
+    root.querySelectorAll('audio[data-media-key],video[data-media-key]').forEach(player => {
+        const key = player.getAttribute('data-media-key');
+        if (!players.has(key)) players.set(key, []);
+        players.get(key).push(player);
+    });
+    const template = document.createElement('template');
+    template.innerHTML = markup;
+    const replacements = [...template.content.querySelectorAll('audio[data-media-key],video[data-media-key]')];
+    const oldChildren = [...root.childNodes];
+    root.appendChild(template.content);
+    replacements.forEach(player => {
+        const existing = players.get(player.getAttribute('data-media-key'))?.shift();
+        if (!existing) return;
+        // Chromium supports state-preserving moves within the document. Unlike
+        // innerHTML or detach/reattach, this keeps an active native player playing.
+        if (typeof player.parentNode.moveBefore === 'function' && existing.isConnected) {
+            player.parentNode.moveBefore(existing, player);
+            player.remove();
+        } else player.replaceWith(existing);
+    });
+    oldChildren.forEach(node => node.remove());
 }
 
 function parseMediaBang(s) {
@@ -63,8 +147,8 @@ function parseMediaBang(s) {
         if (workspaceName) {
             const ext = fileExt(workspaceName).toLowerCase();
             const inlineImage = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif'].includes(ext);
-            const inlineVideo = VIDEO_EXTS.has(ext);
-            if (inlineImage || inlineVideo) {
+            const inlineVideo = isVideoUrl(workspaceName);
+            if (inlineImage || inlineVideo || isAudioUrl(workspaceName)) {
                 url = '/api/workspace-media/' + workspaceName + workspaceSidQuery();
             } else {
                 out += s.slice(p, u.end + 1);
@@ -72,12 +156,12 @@ function parseMediaBang(s) {
                 continue;
             }
         }
-        if (!/^https?:\/\//i.test(url) && !/^\/api\/generated-media\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/i.test(url) && !/^\/api\/conversation-media\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/i.test(url) && !/^\/api\/workspace-media\/[A-Za-z0-9._%~-]+(?:\?sid=[A-Za-z0-9._~-]+)?$/i.test(url) && !/^data:image\//i.test(url))
+        if (!safeMediaUrl(url) && !/^data:image\/(?:png|jpeg|gif|webp|avif|bmp);base64,[a-z0-9+/=]+$/i.test(url))
             { out += s.slice(p, u.end + 1); i = u.end + 1; continue; }
         if (isAudioUrl(url)) {
-            out += `<audio controls preload="metadata" ${mediaSrcAttr(url)}></audio>`;
+            out += renderNativeMedia(url, 'audio', alt.replace(/&(?:amp|lt|gt|quot);/g, ''), '');
         } else if (isVideoUrl(url)) {
-            out += `<video controls playsinline preload="metadata" class="chat-video" ${mediaSrcAttr(url)}></video>`;
+            out += renderNativeMedia(url, 'video', alt.replace(/&(?:amp|lt|gt|quot);/g, ''), '');
         } else {
             // alt 取自已经过 renderMD 全文转义文本，这里只需补引号（再走 escA 会把 &lt; 二次转义成字面量）
             out += `<img ${mediaSrcAttr(url)} alt="${escQ(alt)}" referrerpolicy="no-referrer" loading="lazy">`;
@@ -104,8 +188,9 @@ function mediaSrcAttr(url) {
     // 已经取回来的直接挂 objectURL：重新渲染时浏览器从内存解码，不会出现「无尺寸 → 撑开」的跳动。
     // 还在路上的留 data-auth-src，由 hydrateProtectedMedia 挂同一个 promise 的结果。
     const cached = MEDIA_BLOB_CACHE.get(url);
-    if (cached && cached.objectUrl) return `src="${escA(cached.objectUrl)}"`;
-    return `data-auth-src="${escA(url)}"`;
+    const origin = `data-media-origin="${escA(url)}"`;
+    if (cached && cached.objectUrl) return `${origin} src="${escA(cached.objectUrl)}"`;
+    return `${origin} data-auth-src="${escA(url)}"`;
 }
 
 /** Bare filenames in prose are code references; only explicit paths or attachment-only lines become files. */

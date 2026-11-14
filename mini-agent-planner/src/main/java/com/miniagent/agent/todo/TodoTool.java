@@ -181,7 +181,9 @@ public class TodoTool {
                     return out;
                 }
                 case "clear" -> {
-                    todoStore.clear(sid);
+                    if (!todoStore.clearFromModel(sid)) {
+                        return error("DAG 任务清单由调度器管理，不能通过 todo clear 删除验收条件；用户可使用任务暂停/取消操作");
+                    }
                     traceTodo("TASK_CLEAR", sid, "clear", List.of(), null);
                     return MAPPER.writeValueAsString(Map.of("success", true, "action", "clear"));
                 }
@@ -227,6 +229,7 @@ public class TodoTool {
                 }
             }
         } catch (Exception e) {
+            com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(e);
             log.error("todo 工具执行失败", e);
             return error("todo 工具执行失败: " + e.getMessage());
         }

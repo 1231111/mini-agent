@@ -104,11 +104,13 @@ final class DataflowNormalizer {
             }
             String path = pathFromName(n.name());
             if (!path.isBlank()) {
-                next.add(n.withDoneWhen(DoneWhen.file(path)));
+                next.add(n.withDoneWhen(new DoneWhen(DoneWhen.FILE, n.doneWhen().criteria(), path,
+                        n.doneWhen().checks())));
                 continue;
             }
             if ("image".equalsIgnoreCase(n.capability())) {
-                next.add(n.withDoneWhen(DoneWhen.media()));
+                next.add(n.withDoneWhen(new DoneWhen(DoneWhen.MEDIA, n.doneWhen().criteria(), "",
+                        n.doneWhen().checks())));
             } else {
                 next.add(n);
             }

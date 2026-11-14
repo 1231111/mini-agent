@@ -2036,7 +2036,18 @@ public class MiniAgentChatPageController {
         String baseUrl = Objects.isNull(body) ? null : strOrNull(body.get("baseUrl"));
         String modelName = Objects.isNull(body) ? null : strOrNull(body.get("modelName"));
         String apiKey = Objects.isNull(body) ? null : strOrNull(body.get("apiKey"));
-        return userModelConfigService.save(userId, presetId, baseUrl, modelName, apiKey);
+        Integer contextWindow = null;
+        Object rawWindow = body == null ? null : body.get("contextWindowTokens");
+        if (rawWindow != null) {
+            try {
+                if (!(rawWindow instanceof Number || rawWindow instanceof String)) throw new IllegalArgumentException();
+                contextWindow = new java.math.BigDecimal(rawWindow.toString()).intValueExact();
+            } catch (ArithmeticException | IllegalArgumentException invalid) {
+                return Map.of("success", false, "errorCode", "INVALID_CONTEXT_WINDOW",
+                        "message", "上下文窗口须为0（自动），或1024至10000000之间的整数；本次配置未保存。");
+            }
+        }
+        return userModelConfigService.save(userId, presetId, baseUrl, modelName, apiKey, contextWindow);
     }
 
     private static String strOrNull(Object v) {

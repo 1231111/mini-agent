@@ -657,15 +657,22 @@
                     <label>Model Name
                         <input type="text" id="modelNameInput" placeholder="如 gpt-4o-mini">
                     </label>
+                    <label>输入上下文窗口（token）
+                        <input type="number" id="modelContextWindowTokens" min="0" max="10000000" step="1" value="0">
+                    </label>
                     <label>API Key
                         <input type="password" id="modelApiKey" placeholder="已配置则留空不改" autocomplete="off">
                     </label>
                 </div>
+                <div class="model-menu-hint">0 为自动：原预设使用声明窗口；自定义模型暂按8192 token预算。容量不会自动识别，请按服务商实际输入上限填写；已知预设不会超过其声明窗口。</div>
+                <div class="model-menu-hint" id="modelContextWindowHint"></div>
+                <label class="model-menu-hint"><input type="checkbox" id="modelClearApiKey">清除已保存的自定义 Key</label>
+                <div class="model-menu-hint" id="modelBaseUrlPolicy"></div>
                 <div class="model-menu-actions">
-                    <button type="button" class="model-btn-secondary" onclick="resetModelConfig()">
+                    <button type="button" class="model-btn-secondary" id="modelResetButton" onclick="resetModelConfig()">
                         恢复默认
                     </button>
-                    <button type="button" class="model-btn-primary" onclick="saveModelConfig()">
+                    <button type="button" class="model-btn-primary" id="modelSaveButton" onclick="saveModelConfig()" disabled>
                         保存
                     </button>
                 </div>

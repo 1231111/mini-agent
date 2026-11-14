@@ -36,6 +36,111 @@ import static org.mockito.Mockito.when;
 class TaskRunServiceTest {
 
     @Test
+    void terminalTransactionBeginFailureStillReleasesItsTokenWithoutWritingTheDatabase() {
+        AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
+        RedisTaskConcurrency concurrency = mock(RedisTaskConcurrency.class);
+        TaskRunService service = service(repository, concurrency);
+        org.springframework.transaction.PlatformTransactionManager manager =
+                mock(org.springframework.transaction.PlatformTransactionManager.class);
+        ReflectionTestUtils.setField(service, "transactionManager", manager);
+        when(manager.getTransaction(any())).thenThrow(
+                new org.springframework.transaction.CannotCreateTransactionException("injected begin failure"));
+        TaskRunService.RunHandle run = new TaskRunService.RunHandle(11L, 7L, "s1", "token-11");
+
+        assertThrows(org.springframework.transaction.CannotCreateTransactionException.class,
+                () -> service.markCompleted(run));
+
+        verifyNoInteractions(repository);
+        verify(concurrency).unlockSession("s1", "token-11");
+        verify(concurrency).releaseUserQuota(7L, "s1", "token-11");
+    }
+
+    @Test
+    void terminalTransactionRollbackFailureStillReleasesItsOwnResources() {
+        AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
+        RedisTaskConcurrency concurrency = mock(RedisTaskConcurrency.class);
+        TaskRunService service = service(repository, concurrency);
+        org.springframework.transaction.PlatformTransactionManager manager =
+                mock(org.springframework.transaction.PlatformTransactionManager.class);
+        org.springframework.transaction.TransactionStatus transaction =
+                mock(org.springframework.transaction.TransactionStatus.class);
+        ReflectionTestUtils.setField(service, "transactionManager", manager);
+        when(manager.getTransaction(any())).thenReturn(transaction);
+        when(repository.finishIfRunning(any(), any(), any(), any(), any()))
+                .thenThrow(new IllegalStateException("injected database failure"));
+        doThrow(new org.springframework.transaction.TransactionSystemException("injected rollback failure"))
+                .when(manager).rollback(transaction);
+        TaskRunService.RunHandle run = new TaskRunService.RunHandle(11L, 7L, "s1", "token-11");
+
+        org.springframework.transaction.TransactionSystemException failure = assertThrows(
+                org.springframework.transaction.TransactionSystemException.class, () -> service.markFailed(run, "failed"));
+
+        assertEquals("injected database failure", failure.getApplicationException().getMessage());
+        verify(concurrency).unlockSession("s1", "token-11");
+        verify(concurrency).releaseUserQuota(7L, "s1", "token-11");
+    }
+
+    @Test
+    void missingTerminalTransactionManagerFailsClosedInsteadOfWritingWithoutItsOwnTransaction() {
+        AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
+        RedisTaskConcurrency concurrency = mock(RedisTaskConcurrency.class);
+        TaskRunService service = service(repository, concurrency);
+        ReflectionTestUtils.setField(service, "transactionManager", null);
+        TaskRunService.RunHandle run = new TaskRunService.RunHandle(11L, 7L, "s1", "token-11");
+
+        assertThrows(NullPointerException.class, () -> service.markCompleted(run));
+
+        verifyNoInteractions(repository);
+        verify(concurrency).unlockSession("s1", "token-11");
+        verify(concurrency).releaseUserQuota(7L, "s1", "token-11");
+    }
+
+    @Test
+    void busyOldHandlerReleasesOnlyItsLocalAdmissionAndAllowsRetryAfterItExits() {
+        AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
+        TaskRunService service = service(repository, null);
+        ReflectionTestUtils.setField(service, "maxPerUser", 1);
+        TaskAdmissionGuard guard = mock(TaskAdmissionGuard.class);
+        ReflectionTestUtils.setField(service, "admissionGuard", guard);
+        when(guard.check(7L, "s1")).thenReturn(TaskAdmissionGuard.Decision.BUSY, TaskAdmissionGuard.Decision.ALLOW);
+        when(repository.save(any(AgentTaskRun.class))).thenAnswer(call -> {
+            AgentTaskRun run = call.getArgument(0); run.setId(21L); return run;
+        });
+
+        TaskRunService.StartResult blocked = service.tryStart(7L, "s1");
+
+        assertFalse(blocked.accepted());
+        assertTrue(blocked.error().contains("尚未结束"));
+        assertFalse(service.isRunning("s1"));
+        verifyNoInteractions(repository);
+        TaskRunService.StartResult retried = service.tryStart(7L, "s1");
+        assertTrue(retried.accepted(), "rejected admission must release its user quota too");
+        service.markCompleted(retried.handle());
+    }
+
+    @Test
+    void unavailableActivityReadRejectsRedisAdmissionBeforeAnyDatabaseMutation() {
+        AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
+        RedisTaskConcurrency concurrency = mock(RedisTaskConcurrency.class);
+        TaskRunService service = service(repository, concurrency);
+        TaskAdmissionGuard guard = mock(TaskAdmissionGuard.class);
+        ReflectionTestUtils.setField(service, "admissionGuard", guard);
+        when(concurrency.tryLockSession(eq("s1"), any())).thenReturn(true);
+        when(concurrency.tryOccupyUserQuota(eq(7L), eq("s1"), any(), eq(2))).thenReturn(true);
+        when(guard.check(7L, "s1")).thenThrow(new IllegalStateException("status unavailable"));
+
+        TaskRunService.StartResult blocked = service.tryStart(7L, "s1");
+
+        assertFalse(blocked.accepted());
+        assertEquals("暂时无法确认上一轮执行状态，请稍后重试", blocked.error());
+        var token = org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(concurrency).tryLockSession(eq("s1"), token.capture());
+        verify(concurrency).unlockSession("s1", token.getValue());
+        verify(concurrency).releaseUserQuota(7L, "s1", token.getValue());
+        verifyNoInteractions(repository);
+    }
+
+    @Test
     void terminalTransitionUsesRunIdAndFencingToken() {
         AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
         RedisTaskConcurrency concurrency = mock(RedisTaskConcurrency.class);
@@ -241,6 +346,7 @@ class TaskRunServiceTest {
         if (concurrency != null) {
             when(concurrency.tryLockSession(eq("s1"), any())).thenReturn(true);
             when(concurrency.tryOccupyUserQuota(eq(7L), eq("s1"), any(), eq(2))).thenReturn(true);
+            when(concurrency.renewSessionLock(eq("s1"), any())).thenReturn(true);
         }
         AgentTaskRun snapshot = run("s1");
         snapshot.setId(11L);
@@ -498,6 +604,8 @@ class TaskRunServiceTest {
             RedisTaskConcurrency concurrency) {
         TaskRunService service = new TaskRunService();
         ReflectionTestUtils.setField(service, "repository", repository);
+        ReflectionTestUtils.setField(service, "transactionManager",
+                mock(org.springframework.transaction.PlatformTransactionManager.class));
         ReflectionTestUtils.setField(service, "taskConcurrency", concurrency);
         return service;
     }

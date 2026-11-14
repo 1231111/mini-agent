@@ -15,6 +15,7 @@ import com.miniagent.agent.permission.SessionPermissionStore;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.agent.tool.ToolResult;
+import com.miniagent.agent.tool.ToolStatus;
 import com.miniagent.agent.trace.TraceRecorder;
 import com.miniagent.common.permission.ExecPolicy;
 import com.miniagent.config.entity.AgentTraceStep;
@@ -63,7 +64,8 @@ class ToolPipelineTest {
         assertEquals(1, calls.get());
 
         ToolInvocation again = pipeline.invoke(ToolRequest.of("s", "write_file", "{}", 0, "r1"));
-        assertTrue(again.result().isSuccess());
+        assertEquals(ToolStatus.UNKNOWN, again.result().status());
+        assertTrue(again.text().contains("requiresReadback"));
         assertTrue(again.text().contains("deduplicated"));
         assertEquals(1, calls.get());
     }
@@ -87,6 +89,8 @@ class ToolPipelineTest {
                 .withActionBinding(binding));
 
         assertTrue(first.result().isSuccess());
+        assertEquals(ToolStatus.UNKNOWN, replay.result().status());
+        assertTrue(replay.text().contains("requiresReadback"));
         assertTrue(replay.text().contains("deduplicated"));
         assertEquals(1, calls.get());
     }

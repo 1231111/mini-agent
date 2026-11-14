@@ -41,6 +41,8 @@ class ToolPipelineBoundedExecutionTest {
             assertTrue(write.started.await(1, TimeUnit.SECONDS));
             ToolInvocation result = running.get(2, TimeUnit.SECONDS);
             assertEquals(ToolStatus.UNKNOWN, result.result().status());
+            assertEquals(ToolInvocation.Outcome.EXECUTED, result.outcome());
+            assertEquals(ExecutionControl.StopReason.NONE, result.controlStopReason());
             assertEquals(ActionExecutionStatus.UNKNOWN, fixture.journal.status());
             assertTrue(fixture.pipeline.invoke(request).result().status() == ToolStatus.UNKNOWN);
             assertEquals(1, write.calls.get(), "an unresolved side effect cannot be replayed");
@@ -95,6 +97,7 @@ class ToolPipelineBoundedExecutionTest {
             ToolInvocation result = running.get(1, TimeUnit.SECONDS);
             assertEquals(ToolInvocation.Outcome.CONTROL_STOP, result.outcome());
             assertEquals(ToolErrorCode.OUTCOME_UNKNOWN, result.result().errorCode());
+            assertEquals(ExecutionControl.StopReason.CANCELLED, result.controlStopReason());
             assertEquals(ExecutionControl.StopReason.CANCELLED, fixture.control.stopReason(SESSION));
             assertEquals(ActionExecutionStatus.UNKNOWN, fixture.journal.status());
         } finally {
@@ -115,6 +118,7 @@ class ToolPipelineBoundedExecutionTest {
             ToolInvocation result = running.get(2, TimeUnit.SECONDS);
             assertEquals(ToolInvocation.Outcome.CONTROL_STOP, result.outcome());
             assertEquals(ToolErrorCode.OUTCOME_UNKNOWN, result.result().errorCode());
+            assertEquals(ExecutionControl.StopReason.DEADLINE_EXCEEDED, result.controlStopReason());
             assertEquals(ExecutionControl.StopReason.DEADLINE_EXCEEDED, fixture.control.stopReason(SESSION));
             assertEquals(ActionExecutionStatus.UNKNOWN, fixture.journal.status());
         } finally {
@@ -139,6 +143,7 @@ class ToolPipelineBoundedExecutionTest {
         ToolInvocation result = running.get(2, TimeUnit.SECONDS);
         assertEquals(ToolInvocation.Outcome.CONTROL_STOP, result.outcome());
         assertEquals(ToolErrorCode.TIMEOUT, result.result().errorCode());
+        assertEquals(ExecutionControl.StopReason.DEADLINE_EXCEEDED, result.controlStopReason());
         String token = fixture.store.grant.get().token();
         assertFalse(fixture.store.hasAttachedAskResume(SESSION, token));
         assertTrue(fixture.store.grantAskTokenForResume(SESSION, token, "exec_command").isEmpty());
@@ -163,6 +168,7 @@ class ToolPipelineBoundedExecutionTest {
         ToolInvocation result = running.get(1, TimeUnit.SECONDS);
         assertEquals(ToolInvocation.Outcome.CONTROL_STOP, result.outcome());
         assertEquals(ToolErrorCode.CANCELLED, result.result().errorCode());
+        assertEquals(ExecutionControl.StopReason.CANCELLED, result.controlStopReason());
         String token = fixture.store.grant.get().token();
         assertTrue(fixture.store.grantAskTokenForResume(SESSION, token, "exec_command").isEmpty());
         assertEquals(0, calls.get());
@@ -295,6 +301,12 @@ class ToolPipelineBoundedExecutionTest {
 
     private static class RecordingJournal implements ActionJournal {
         final Map<ActionJournalKey, ActionJournalEntry> entries = new ConcurrentHashMap<>();
+        public Claim claim(ActionJournalKey key, String tool, String hash, boolean retry) {
+            return InMemoryActionJournal.claimEntry(entries, key, tool, hash, retry);
+        }
+        public Claim claimEffect(ActionJournalKey key, String tool, String hash) {
+            return InMemoryActionJournal.claimEffectEntry(entries, key, tool, hash);
+        }
         public void append(ActionJournalEntry entry) { entries.put(entry.key(), entry); }
         public Optional<ActionJournalEntry> latest(ActionJournalKey key) {
             return Optional.ofNullable(entries.get(key));

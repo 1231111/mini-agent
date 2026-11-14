@@ -61,8 +61,40 @@ env:
 # "${productName}-${version}-${os}-${arch}.${ext}" 对齐（os 展开为 win / mac / linux），
 # 这样从 artifact 名能直接推出里面的安装包叫什么。
 jobs:
+  browser-contracts:
+    name: Release Chromium execution and client recovery (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Build isolated test runtime
+        shell: pwsh
+        run: ./mvnw.cmd -B -ntp -pl mini-agent-app -am package '-DskipTests'
+      - name: Install Chromium matching the packaged Java driver
+        run: node scripts/build-desktop.mjs --skip-jar --skip-jre --skip-ffmpeg --skip-models --skip-package
+      - name: Verify browser fixtures and production client recovery
+        run: node scripts/run-browser-contracts.mjs "--evidence-dir=${{ runner.temp }}/miniagent-release-browser-contracts"
+      - name: Save release fixture diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-chromium-contract-results
+          path: |
+            **/target/surefire-reports/
+            ${{ runner.temp }}/miniagent-release-browser-contracts/
+          retention-days: 7
+
   desktop:
     name: ${{ matrix.label }}
+    needs: [browser-contracts]
     runs-on: ${{ matrix.os }}
     # 单平台约 15 分钟（fat jar 3 + jlink 1 + Chromium 1 + electron-builder 5 + 上传 3），
     # 留 3 倍余量给冷缓存和网络抖动。
@@ -122,10 +154,15 @@ jobs:
           java-version: '21'
           cache: maven
 
-      - name: Set up Node 20
+      - name: Set up Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
+
+      # This gate tests client behavior and validator contracts without a model key.
+      # Real task acceptance is an explicit paid run, not implied by fixture success.
+      - name: Offline client and acceptance contract gate
+        run: node scripts/agent-eval/run-offline-checks.mjs
 
       # AppImage 与 deb 的打包工具链不在基础镜像里。
       # 这一步只在 Linux 上跑：macOS / Windows 没有 apt-get。

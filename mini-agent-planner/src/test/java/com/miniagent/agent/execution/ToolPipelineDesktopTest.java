@@ -3,6 +3,8 @@ package com.miniagent.agent.execution;
 import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.core.ExecutionTurnContext;
 import com.miniagent.agent.core.LoopTurnContext;
+import com.miniagent.agent.core.SessionEventCenter;
+import com.miniagent.agent.desktop.DesktopInteractionService;
 import com.miniagent.agent.hook.ToolHookChain;
 import com.miniagent.agent.permission.AskGrant;
 import com.miniagent.agent.permission.ConfirmPolicy;
@@ -19,6 +21,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.time.Instant;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
@@ -27,6 +30,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
 /** Pipeline-only regression tests: no native input or real desktop is touched. */
 class ToolPipelineDesktopTest {
@@ -60,6 +64,71 @@ class ToolPipelineDesktopTest {
         assertEquals(ToolInvocation.Outcome.PERMISSION_ASK, fixture.pipeline.invoke(ToolRequest.of(
                 SESSION, "desktop_act", CLICK.replace("20", "21"), 0, "three")).outcome());
         assertEquals(1, calls.get(), "approving a click cannot approve a later screen or a different position");
+    }
+
+    @Test
+    void desktopApprovalExpiresAtObservationDeadlineInsteadOfTheFiveMinuteDefault() throws Exception {
+        Fixture fixture = new Fixture();
+        SessionEventCenter events = mock(SessionEventCenter.class);
+        fixture.pipeline.setEventCenter(events);
+        AtomicInteger calls = new AtomicInteger();
+        fixture.registerAction(calls);
+        assertEquals(ToolInvocation.Outcome.PERMISSION_ASK, fixture.pipeline.invoke(
+                ToolRequest.of(SESSION, "desktop_act", CLICK, 0, "one")).outcome());
+        assertEquals(fixture.observationExpiry.get().toEpochMilli(),
+                fixture.permissions.grant.get().expiresAtEpochMillis());
+        var payload = org.mockito.ArgumentCaptor.forClass(Object.class);
+        verify(events).publish(eq(SESSION), eq("permission_ask"), payload.capture());
+        assertEquals(fixture.observationExpiry.get().toEpochMilli(), new com.fasterxml.jackson.databind.ObjectMapper()
+                .readTree(payload.getValue().toString()).path("expiresAt").asLong(),
+                "the UI countdown must use the same actual deadline as the server token");
+        assertEquals(0, calls.get());
+    }
+
+    @Test
+    void shorterConfiguredApprovalWindowIsStillRespected() {
+        Fixture fixture = new Fixture();
+        org.springframework.test.util.ReflectionTestUtils.setField(fixture.pipeline, "askGrantTtlSeconds", 1L);
+        fixture.registerAction(new AtomicInteger());
+        long before = System.currentTimeMillis();
+        fixture.pipeline.invoke(ToolRequest.of(SESSION, "desktop_act", CLICK, 0, "one"));
+        long expiry = fixture.permissions.grant.get().expiresAtEpochMillis();
+        assertTrue(expiry >= before + 1_000L);
+        assertTrue(expiry <= System.currentTimeMillis() + 1_000L);
+        assertTrue(expiry < fixture.observationExpiry.get().toEpochMilli());
+    }
+
+    @Test
+    void staleObservationDoesNotOfferApprovalOrDispatchInput() {
+        Fixture fixture = new Fixture();
+        AtomicInteger calls = new AtomicInteger();
+        fixture.registerAction(calls);
+        fixture.observationExpiry.set(Instant.now().minusMillis(1));
+        ToolInvocation result = fixture.pipeline.invoke(ToolRequest.of(SESSION, "desktop_act", CLICK, 0, "one"));
+        assertEquals(ToolErrorCode.CONFLICT, result.result().errorCode());
+        assertTrue(result.text().contains("desktop_observe"));
+        assertNull(fixture.permissions.grant.get());
+        assertEquals(0, calls.get());
+    }
+
+    @Test
+    void expiredObservationApprovalWakesWaiterAndCannotBeApprovedLater() throws Exception {
+        Fixture fixture = new Fixture();
+        AtomicInteger calls = new AtomicInteger();
+        fixture.registerAction(calls);
+        fixture.observationExpiry.set(Instant.ofEpochMilli(System.currentTimeMillis() + 700L));
+        FutureTask<ToolInvocation> running = start(() -> fixture.pipeline.invoke(
+                ToolRequest.of(SESSION, "desktop_act", CLICK, 0, "one").withApprovalWait()));
+        try {
+            assertTrue(fixture.permissions.attached.await(1, TimeUnit.SECONDS));
+            AskGrant grant = fixture.permissions.grant.get();
+            assertEquals(fixture.observationExpiry.get().toEpochMilli(), grant.expiresAtEpochMillis(),
+                    "sub-second observation lifetime must not be rounded up to the normal TTL floor");
+            assertEquals(ToolInvocation.Outcome.PERMISSION_DENIED, running.get(2, TimeUnit.SECONDS).outcome());
+            assertFalse(fixture.permissions.hasAttachedAskResume(SESSION, grant.token()));
+            assertTrue(fixture.permissions.grantAskTokenForResume(SESSION, grant.token(), "desktop_act").isEmpty());
+            assertEquals(0, calls.get());
+        } finally { running.cancel(true); }
     }
 
     @Test
@@ -289,6 +358,7 @@ class ToolPipelineDesktopTest {
     }
 
     private static final class Fixture {
+        final AtomicReference<Instant> observationExpiry = new AtomicReference<>(Instant.now().plusSeconds(120));
         final ToolRegistry registry = new ToolRegistry();
         final ExecutionControl control = new ExecutionControl(60_000, 20, 10_000);
         final TrackingPermissions permissions = new TrackingPermissions();
@@ -296,6 +366,13 @@ class ToolPipelineDesktopTest {
         final ToolPipeline pipeline = new ToolPipeline(control, new ToolHookChain(List.of()), permissions,
                 journal, new ToolExecutionGuards(registry, new AgentToolsProperties(4)), registry,
                 new ExecPolicyService("allow", "", permissions));
+
+        Fixture() {
+            DesktopInteractionService desktop = mock(DesktopInteractionService.class);
+            when(desktop.observationExpiresAt(any(), any(), any(), any()))
+                    .thenAnswer(i -> Optional.ofNullable(observationExpiry.get()));
+            pipeline.setDesktopInteractionService(desktop);
+        }
 
         void registerAction(AtomicInteger calls) {
             registry.register("desktop_act", "act", Map.of(), ignored -> {
@@ -309,8 +386,8 @@ class ToolPipelineDesktopTest {
         final AtomicReference<AskGrant> grant = new AtomicReference<>();
         final CountDownLatch attached = new CountDownLatch(1);
 
-        @Override public AskGrant issueAskGrant(String sid, String name, String args, long ttl) {
-            AskGrant issued = super.issueAskGrant(sid, name, args, ttl);
+        @Override public AskGrant issueAskGrantUntil(String sid, String name, String args, long expiry) {
+            AskGrant issued = super.issueAskGrantUntil(sid, name, args, expiry);
             grant.set(issued);
             return issued;
         }
@@ -324,6 +401,12 @@ class ToolPipelineDesktopTest {
 
     private static final class RecordingJournal implements ActionJournal {
         final Map<ActionJournalKey, ActionJournalEntry> entries = new ConcurrentHashMap<>();
+        public Claim claim(ActionJournalKey key, String tool, String hash, boolean retry) {
+            return InMemoryActionJournal.claimEntry(entries, key, tool, hash, retry);
+        }
+        public Claim claimEffect(ActionJournalKey key, String tool, String hash) {
+            return InMemoryActionJournal.claimEffectEntry(entries, key, tool, hash);
+        }
         public void append(ActionJournalEntry entry) { entries.put(entry.key(), entry); }
         public Optional<ActionJournalEntry> latest(ActionJournalKey key) {
             return Optional.ofNullable(entries.get(key));

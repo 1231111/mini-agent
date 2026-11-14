@@ -98,12 +98,41 @@ class PlanningLoopRoutingTest {
         verifyNoInteractions(model);
     }
 
-    @Test void missingOrBrokenModelFallsBackWithoutInventingAPlan() {
-        assertFalse(planner.selectRoute(null, plans.build(DOCUMENT_TASK), "session", DOCUMENT_TASK, null, List.of()).useDag());
+    @Test void missingOrBrokenModelStopsWithoutInventingAPlan() {
+        assertFalse(planner.selectRoute(null, plans.build(DOCUMENT_TASK), "session", DOCUMENT_TASK, null, List.of()).resolved());
         ChatModel model = mock(ChatModel.class);
         when(model.chat(any(ChatRequest.class))).thenThrow(new IllegalStateException("provider failed"));
-        assertEquals("fallback", planner.selectRoute(model, plans.build(DOCUMENT_TASK), "session", DOCUMENT_TASK, null, List.of()).source());
+        assertFalse(planner.selectRoute(model, plans.build(DOCUMENT_TASK), "session", DOCUMENT_TASK, null, List.of()).resolved());
         assertTrue(state.get("session").isEmpty());
+    }
+
+    @Test void explicitDagSelectionSurvivesUnavailableSemanticRouter() {
+        PermissionContext.force("session", PermissionMode.PLAN, ConfirmPolicy.DANGEROUS, false);
+        var route = planner.selectRoute(null, plans.build(DOCUMENT_TASK), "session", DOCUMENT_TASK, null, List.of());
+        assertTrue(route.resolved());
+        assertTrue(route.useDag());
+        assertNull(route.artifactDeliveryRequested());
+        assertFalse(PermissionContext.planApproved());
+    }
+
+    @Test void unresolvedRouteCannotInvokeCompilerOrExecutor() {
+        var route = PlanningRoute.unresolved("ROUTER_INVALID_RESPONSE");
+        var result = planner.runWithOutcome(null, "system", DOCUMENT_TASK, null, List.of(),
+                plans.build(DOCUMENT_TASK), "session", "fence", "exec", null, route);
+        assertEquals(PlanningLoop.Outcome.FAILED, result.outcome());
+        assertEquals(route.reason(), result.reason());
+        assertTrue(state.get("session").isEmpty());
+        verify(compiler, never()).compile(any(), anyString(), any());
+    }
+
+    @Test void alreadySelectedDagCannotTurnIntoDirectWhenPlannerIsDisabled() {
+        properties.setEnabled(false);
+        var result = planner.runWithOutcome(null, "system", DOCUMENT_TASK, null, List.of(),
+                plans.build(DOCUMENT_TASK), "session", "fence", "exec", null,
+                PlanningRoute.dag("model", "多个阶段"));
+        assertEquals(PlanningLoop.Outcome.FAILED, result.outcome());
+        assertEquals("PLANNER_UNAVAILABLE", result.reason());
+        verify(compiler, never()).compile(any(), anyString(), any());
     }
 
     @Test void clearNewQuestionDoesNotResumeAnOldClarificationGraph() {

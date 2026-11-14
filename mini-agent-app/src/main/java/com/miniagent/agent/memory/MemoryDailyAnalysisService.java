@@ -88,7 +88,7 @@ public class MemoryDailyAnalysisService {
         }
 
         // 绑定归属与模型：归属让快照读取与写入都落到该用户的目录，
-        // 模型让分析走该用户自己配置的那套（全局 Bean 仅在解析失败时兜底）。
+        // 模型配置无效时中止该用户分析，不能把对话改发给全局服务。
         try (var ignored = userModelBinder.bindUser(userId)) {
             String analysis = analyzeWithLLM(transcript);
             if (StringUtils.isBlank(analysis)) {

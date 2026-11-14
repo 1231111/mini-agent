@@ -435,3 +435,36 @@ for (const partialAnswer of ['部分结果，尚未完成', '']) {
     else assert.match(answer.innerHTML, /连接多次中断/);
     console.log(`PASS: exhausted reconnect without a terminal frame is incomplete ${partialAnswer ? 'with' : 'without'} a partial answer`);
 }
+
+{
+    const h = createHarness();
+    const answer = await consume(h, [
+        event('todo', JSON.stringify({ items: [
+            { id: 1, content: '检索今日飞郑州航班', status: 'completed' },
+            { id: 2, content: '核验候选航班可订性', status: 'in_progress' }
+        ] })),
+        event('task_outcome', JSON.stringify({ status: 'FAILURE', reason: 'OUTCOME_UNKNOWN' })),
+        event('error', "点击结果尚未确认：Error {\nmessage='Timeout 2000ms exceeded.\nstack='TimeoutError\n at ProgressController.run (C:\\Users\\abc\\private.js:12:2)")
+    ]);
+    assert.doesNotMatch(answer.innerHTML, /ProgressController|C:\\Users|stack=|TimeoutError/);
+    assert.match(answer.innerHTML, /工具执行日志/);
+    assert.match(h.bot.querySelector('.todo-progress-title').textContent, /结果待核验/);
+    assert.equal(h.bot.querySelector('.todo-item.in_progress .todo-node-state'), null); // substitute does not implement descendant selectors
+    assert.equal(h.bot.querySelector('.todo-item.in_progress').querySelector('.todo-node-state').textContent, '待核验');
+    assert.ok(h.bot.querySelector('.outcome-review-open'));
+    assert.equal(h.bot.querySelector('.todo-progress-meta').textContent, '1/2 已完成');
+    console.log('PASS: screenshot click failure hides driver stacks and shows a review action instead of misleading continue state');
+}
+
+{
+    const h = createHarness();
+    const body = new Element(); body.className = 'bot-body';
+    h.context.historicalReviewBody = body;
+    vm.runInContext(`restoreTaskProgress(historicalReviewBody, { progress: { executionId: 'old-exec',
+        status: 'FAILURE', reason: 'OUTCOME_UNKNOWN', items: [{ id: 1, content: '核验航班', status: 'blocked' }] } });`, h.context);
+    assert.equal(body.dataset.taskReason, 'OUTCOME_UNKNOWN');
+    assert.match(body.querySelector('.todo-progress-title').textContent, /待核验/);
+    assert.equal(body.querySelector('.todo-node-state').textContent, '待核验');
+    assert.ok(body.querySelector('.outcome-review-open'));
+    console.log('PASS: reloaded unknown task retains review status and explicit recovery entry');
+}

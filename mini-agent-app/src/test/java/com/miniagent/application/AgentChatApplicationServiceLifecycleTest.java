@@ -8,6 +8,7 @@ import com.miniagent.agent.core.ContextCompressor;
 import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.core.ExecutionProperties;
 import com.miniagent.agent.core.ExecutionSignalStore;
+import com.miniagent.agent.core.ModelCallControl;
 import com.miniagent.agent.core.SessionEventCenter;
 import com.miniagent.agent.core.TaskExecutionContext;
 import com.miniagent.agent.delegate.ClientMultiAgent;
@@ -33,6 +34,10 @@ import com.miniagent.config.repository.UserRepository;
 import com.miniagent.config.service.DatabaseConversationStore;
 import com.miniagent.config.service.TaskRunService;
 import com.miniagent.config.service.TaskRunLeaseRenewer;
+import com.miniagent.config.service.TaskAdmissionGuard;
+import com.miniagent.agent.execution.ToolExecutionGuards;
+import com.miniagent.agent.browser.BrowserService;
+import org.springframework.beans.factory.ObjectProvider;
 import com.miniagent.memory.MemoryService;
 import com.miniagent.memory.MemoryStore;
 import dev.langchain4j.data.message.UserMessage;
@@ -43,12 +48,18 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.nio.file.Path;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -73,6 +84,8 @@ class AgentChatApplicationServiceLifecycleTest {
         app = new AgentChatApplicationService();
         loop = mock(AgentLoop.class);
         planner = mock(PlanningLoop.class);
+        when(planner.selectRoute(any(), any(), anyString(), anyString(), any(), anyList()))
+                .thenReturn(com.miniagent.agent.planner.PlanningRoute.direct("test", "single goal"));
         runs = mock(TaskRunService.class);
         run = new TaskRunService.RunHandle(1L, 7L, "s1", "fence");
         when(runs.tryStart(7L, "s1")).thenReturn(new TaskRunService.StartResult(run, null));
@@ -185,6 +198,29 @@ class AgentChatApplicationServiceLifecycleTest {
         assertEquals("核验生成页面", progress.items().getFirst().content());
         assertEquals("completed", progress.items().getFirst().status());
         assertEquals(List.of(1), progress.items().getFirst().dependsOn());
+    }
+
+    @Test
+    void resumedDagProgressKeepsOriginalExecutionIdentityInsteadOfNewTurnTrace() {
+        when(trace.currentExecutionId()).thenReturn("new-turn-trace");
+        when(planner.selectRoute(any(), any(), anyString(), anyString(), any(), anyList()))
+                .thenReturn(com.miniagent.agent.planner.PlanningRoute.dag("model", "resume"));
+        when(planner.runWithOutcome(any(), anyString(), anyString(), any(), anyList(), any(), anyString(), anyString(), any(), any(), any()))
+                .thenReturn(new PlanningLoop.RunOutcome("需要核验原操作。", PlanningLoop.Outcome.FAILED, "OUTCOME_UNKNOWN"));
+        var states = new com.miniagent.agent.planner.PlannerStateStore();
+        states.init("s1", "original-dag-execution", null, new com.miniagent.agent.planner.TaskGraph(List.of()));
+        put(app, "plannerStates", states);
+        var savedTasks = mock(ChatTaskRepository.class);
+        put(app, "chatTaskRepository", savedTasks);
+
+        app.chat(7L, "s1", "goal");
+
+        var captured = org.mockito.ArgumentCaptor.forClass(com.miniagent.config.entity.ChatTask.class);
+        verify(savedTasks).save(captured.capture());
+        var progress = TaskProgressSnapshot.fromJson(captured.getValue().getTaskProgressJson());
+        assertEquals("original-dag-execution", progress.executionId());
+        assertEquals("OUTCOME_UNKNOWN", progress.reason());
+        assertEquals("new-turn-trace", trace.currentExecutionId());
     }
 
     @Test
@@ -372,6 +408,174 @@ class AgentChatApplicationServiceLifecycleTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"SUCCESS", "USER_QUESTION", "MAX_ITERATIONS", "CANCELLED"})
+    void synchronousCleanupKeepsAdmissionUntilOldSessionStateCannotAffectTheNextRun(String reason) throws Exception {
+        AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
+        AtomicInteger ids = new AtomicInteger();
+        when(repository.save(any(AgentTaskRun.class))).thenAnswer(call -> {
+            AgentTaskRun entity = call.getArgument(0);
+            entity.setId((long) ids.incrementAndGet());
+            return entity;
+        });
+        TaskRunService realRuns = new TaskRunService();
+        ReflectionTestUtils.setField(realRuns, "transactionManager",
+                mock(org.springframework.transaction.PlatformTransactionManager.class));
+        put(realRuns, "repository", repository);
+        put(realRuns, "maxPerUser", 1);
+        put(app, "taskRunService", realRuns);
+        put(streams, "taskRunService", realRuns);
+        TaskRunLeaseRenewer renewer = mock(TaskRunLeaseRenewer.class);
+        TaskRunLeaseRenewer.Guard renewal = mock(TaskRunLeaseRenewer.Guard.class);
+        when(renewer.start(any())).thenReturn(renewal);
+        put(app, "taskRunLeaseRenewer", renewer);
+        CountDownLatch cleanupEntered = new CountDownLatch(1);
+        CountDownLatch releaseCleanup = new CountDownLatch(1);
+        CountDownLatch nextLoopEntered = new CountDownLatch(1);
+        CountDownLatch releaseNextLoop = new CountDownLatch(1);
+        AtomicInteger cleanupCalls = new AtomicInteger();
+        AtomicInteger loopCalls = new AtomicInteger();
+        AtomicBoolean workerOpen = new AtomicBoolean();
+        doAnswer(call -> { workerOpen.set(true); return null; }).when(workers).open("s1");
+        doAnswer(call -> { workerOpen.set(false); return null; }).when(workers).close("s1");
+        doAnswer(call -> {
+            if (cleanupCalls.incrementAndGet() == 1) {
+                cleanupEntered.countDown();
+                assertTrue(releaseCleanup.await(5, TimeUnit.SECONDS));
+            }
+            return null;
+        }).when(desktop).releaseFor(7L, "1", "s1");
+        when(loop.runOutcome(any(), anyString(), anyString(), anyList(), anyInt(), any(), nullable(AgentStreamSink.class)))
+                .thenAnswer(call -> {
+                    if (loopCalls.incrementAndGet() == 1) return outcome(reason, ANSWER);
+                    nextLoopEntered.countDown();
+                    assertTrue(releaseNextLoop.await(5, TimeUnit.SECONDS));
+                    return outcome("SUCCESS", "下一轮完成");
+                });
+        var executor = Executors.newFixedThreadPool(2);
+        try {
+            var old = executor.submit(() -> app.chat(7L, "s1", "goal"));
+            assertTrue(cleanupEntered.await(5, TimeUnit.SECONDS));
+            var replacement = realRuns.tryStart(7L, "s1");
+            if (replacement.accepted()) realRuns.markCancelled(replacement.handle(), "test cleanup");
+            assertFalse(replacement.accepted(), "native cleanup must still own the session admission");
+            verify(renewal, never()).close();
+            verify(repository, never()).finishIfRunning(any(), any(), any(), any(), any());
+
+            releaseCleanup.countDown();
+            assertEquals(ANSWER, old.get(5, TimeUnit.SECONDS));
+            assertFalse(realRuns.isRunning("s1"));
+            assertFalse(workerOpen.get());
+            verify(renewal).close();
+            var next = executor.submit(() -> app.chat(7L, "s1", "goal"));
+            assertTrue(nextLoopEntered.await(5, TimeUnit.SECONDS));
+            assertTrue(workerOpen.get(), "old close must not remove the new worker");
+            assertTrue(streams.isTaskRunning("s1"), "old markIdle must not erase the next run");
+            assertTrue(realRuns.isRunning("s1"));
+            releaseNextLoop.countDown();
+            assertEquals("下一轮完成", next.get(5, TimeUnit.SECONDS));
+        } finally {
+            releaseCleanup.countDown();
+            releaseNextLoop.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void terminalPersistenceFailureCannotSkipCleanupOrReplaceTheWorkerFailure() {
+        IllegalStateException workerFailure = new IllegalStateException("worker initialization failed");
+        IllegalStateException databaseFailure = new IllegalStateException("terminal database failed");
+        doThrow(workerFailure).when(workers).open("s1");
+        doThrow(databaseFailure).when(runs).markFailed(eq(run), anyString());
+
+        assertSame(workerFailure, assertThrows(IllegalStateException.class, () -> app.chat(7L, "s1", "goal")));
+
+        assertTrue(List.of(workerFailure.getSuppressed()).contains(databaseFailure));
+        var order = inOrder(desktop, workers, streams, runs);
+        order.verify(desktop).releaseFor(7L, "1", "s1");
+        order.verify(workers).close("s1");
+        order.verify(streams).markIdle("s1");
+        order.verify(runs).markFailed(eq(run), contains("worker initialization failed"));
+    }
+
+    @Test
+    void synchronousIdleFailureCannotSkipControlOrReleaseOfTheRun() {
+        stubLoop("SUCCESS", "已交付全部结果。");
+        ExecutionControl control = spy(new ExecutionControl(60_000, 20, 10_000));
+        put(app, "executionControl", control);
+        doThrow(new IllegalStateException("stream state cleanup failed")).when(streams).markIdle("s1");
+
+        assertEquals("已交付全部结果。", app.chat(7L, "s1", "goal"));
+
+        var order = inOrder(workers, streams, control, runs);
+        order.verify(workers).close("s1");
+        order.verify(streams).markIdle("s1");
+        order.verify(control).finish("s1", "fence");
+        order.verify(runs).markCompleted(run);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void oldSseFinalizationReservationBlocksSynchronousAdmissionAfterItsTaskLeaseWasReleased() throws Exception {
+        AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
+        AtomicInteger ids = new AtomicInteger();
+        when(repository.save(any(AgentTaskRun.class))).thenAnswer(call -> {
+            AgentTaskRun entity = call.getArgument(0); entity.setId((long) ids.incrementAndGet()); return entity;
+        });
+        TaskRunService realRuns = new TaskRunService();
+        ReflectionTestUtils.setField(realRuns, "transactionManager",
+                mock(org.springframework.transaction.PlatformTransactionManager.class));
+        put(realRuns, "repository", repository);
+        UserRepository users = (UserRepository) ReflectionTestUtils.getField(app, "userRepository");
+        when(users.findLocalTenantIdById(7L)).thenReturn(Optional.of(1L));
+        ObjectProvider<ToolExecutionGuards> toolProvider = mock(ObjectProvider.class);
+        ObjectProvider<BrowserService> browserProvider = mock(ObjectProvider.class);
+        ObjectProvider<ChatStreamingService> streamProvider = mock(ObjectProvider.class);
+        when(toolProvider.getObject()).thenReturn(mock(ToolExecutionGuards.class));
+        when(browserProvider.getObject()).thenReturn(mock(BrowserService.class));
+        when(streamProvider.getObject()).thenReturn(streams);
+        put(realRuns, "admissionGuard", new TaskAdmissionGuard(toolProvider, browserProvider, users, streamProvider));
+        put(app, "taskRunService", realRuns);
+        put(streams, "taskRunService", realRuns);
+        CountDownLatch finalizationEntered = new CountDownLatch(1);
+        CountDownLatch releaseFinalization = new CountDownLatch(1);
+        CountDownLatch finalizationIdle = new CountDownLatch(1);
+        doAnswer(call -> {
+            finalizationEntered.countDown();
+            assertTrue(releaseFinalization.await(5, TimeUnit.SECONDS));
+            return call.callRealMethod();
+        }).when(streams).markCompleting("s1");
+        doAnswer(call -> {
+            Object value = call.callRealMethod();
+            finalizationIdle.countDown();
+            return value;
+        }).when(streams).markIdle("s1");
+        stubLoop("SUCCESS", "页面已完成");
+        try {
+            startStream(List.of());
+            assertTrue(finalizationEntered.await(5, TimeUnit.SECONDS));
+            assertFalse(realRuns.isRunning("s1"), "inner worker has released its durable lease");
+            assertTrue(streams.hasLocalLifecycleReservation("s1"));
+
+            assertFalse(realRuns.tryStart(7L, "s1").accepted());
+            var blocked = assertThrows(IllegalStateException.class, () -> app.chat(7L, "s1", "goal"));
+            assertTrue(blocked.getMessage().contains("尚未结束"));
+            verify(loop, times(1)).runOutcome(any(), anyString(), anyString(), anyList(), anyInt(), any(), nullable(AgentStreamSink.class));
+            assertEquals(1, ids.get(), "rejected reservations must not create extra durable run rows");
+
+            releaseFinalization.countDown();
+            assertTrue(finalizationIdle.await(5, TimeUnit.SECONDS));
+            assertFalse(streams.hasLocalLifecycleReservation("s1"));
+            assertEquals("页面已完成", app.chat(7L, "s1", "goal"));
+            assertEquals(2, ids.get());
+            assertFalse(realRuns.isRunning("s1"));
+        } finally {
+            releaseFinalization.countDown();
+            assertTrue(finalizationIdle.await(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"SUCCESS", "MAX_ITERATIONS", "USER_QUESTION", "CANCELLED"})
     void leaseRenewalStopsBeforeAnyTerminalTransitionReleasesTheLock(String reason) throws Exception {
         TaskRunLeaseRenewer renewer = mock(TaskRunLeaseRenewer.class);
@@ -382,8 +586,11 @@ class AgentChatApplicationServiceLifecycleTest {
 
         app.chat(7L, "s1", "goal");
 
-        var order = inOrder(renewer, renewal, runs);
+        var order = inOrder(renewer, desktop, workers, streams, renewal, runs);
         order.verify(renewer).start(run);
+        order.verify(desktop).releaseFor(7L, "1", "s1");
+        order.verify(workers).close("s1");
+        order.verify(streams).markIdle("s1");
         order.verify(renewal).close();
         switch (reason) {
             case "SUCCESS" -> order.verify(runs).markCompleted(run);
@@ -509,6 +716,129 @@ class AgentChatApplicationServiceLifecycleTest {
         verify(runs, never()).markCompleted(any());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"ROUTER_MODEL_UNAVAILABLE", "ROUTER_MODEL_ERROR", "ROUTER_INVALID_RESPONSE",
+            "ROUTER_MODEL_AUTHENTICATION_FAILED", "ROUTER_MODEL_PERMISSION_DENIED", "ROUTER_MODEL_NOT_FOUND",
+            "ROUTER_MODEL_RATE_LIMITED", "ROUTER_MODEL_TIMEOUT", "ROUTER_MODEL_CONNECTION_FAILED",
+            "ROUTER_MODEL_SERVICE_UNAVAILABLE", "ROUTER_MODEL_INVALID_REQUEST"})
+    void unresolvedStrategyCannotBypassPlanningAndExecuteDirectly(String reason) {
+        when(planner.selectRoute(any(), any(), eq("s1"), eq("goal"), any(), anyList()))
+                .thenReturn(com.miniagent.agent.planner.PlanningRoute.unresolved(reason));
+        when(planner.runWithOutcome(any(), anyString(), anyString(), any(), anyList(), any(), anyString(), anyString(), any(), any(), any()))
+                .thenReturn(new PlanningLoop.RunOutcome("执行策略生成失败，请重试。", PlanningLoop.Outcome.FAILED, reason));
+
+        assertEquals("执行策略生成失败，请重试。", app.chat(7L, "s1", "goal"));
+
+        verifyNoInteractions(loop);
+        verify(runs).markFailed(eq(run), contains(reason));
+        verify(runs, never()).markCompleted(any());
+        verify(runs, never()).markWaiting(any(), anyString());
+        verify(trace).endExecution("FAILURE");
+    }
+
+    @Test
+    void modelAuthenticationFailureReachesTheChatStreamWithItsActualReason() {
+        String reason = "ROUTER_MODEL_AUTHENTICATION_FAILED";
+        String answer = "模型服务认证失败（401）。请在设置中核对服务地址、模型名称和 API Key。";
+        when(planner.selectRoute(any(), any(), anyString(), anyString(), any(), anyList()))
+                .thenReturn(com.miniagent.agent.planner.PlanningRoute.unresolved(reason));
+        when(planner.runWithOutcome(any(), anyString(), anyString(), any(), anyList(), any(), anyString(), any(), any(), any(), any()))
+                .thenReturn(new PlanningLoop.RunOutcome(answer, PlanningLoop.Outcome.FAILED, reason));
+
+        startStream(List.of());
+
+        verify(streams, timeout(5_000)).markIdle("s1");
+        verify(events).publish(eq("s1"), eq("task_outcome"),
+                argThat(payload -> payload instanceof Map<?, ?> fields && "FAILURE".equals(fields.get("status"))
+                        && reason.equals(fields.get("reason")) && fields.containsKey("executionId") && fields.containsKey("taskId")), anyString());
+        verify(events).error(eq("s1"), eq(answer), anyString());
+        verify(events, never()).complete(anyString(), anyString(), anyString());
+        verify(runs).markFailed(eq(run), contains(reason));
+        verifyNoInteractions(loop);
+        verify(runs, never()).markCompleted(any());
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = ExecutionControl.StopReason.class, names = {"CANCELLED", "DEADLINE_EXCEEDED", "TOOL_BUDGET_EXCEEDED", "TENANT_QUOTA_EXCEEDED"})
+    void stoppedRoutingPersistsTheActualTerminalStatus(ExecutionControl.StopReason reason) {
+        when(planner.selectRoute(any(), any(), anyString(), anyString(), any(), anyList()))
+                .thenThrow(new ModelCallControl.StoppedException(reason));
+
+        String answer = app.chat(7L, "s1", "goal");
+
+        assertFalse(answer.isBlank());
+        verifyNoInteractions(loop);
+        verifyStoppedTurnWasPersisted(reason);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = ExecutionControl.StopReason.class, names = {"CANCELLED", "DEADLINE_EXCEEDED"})
+    void stoppedCompilationPersistsTheActualTerminalStatus(ExecutionControl.StopReason reason) {
+        when(planner.selectRoute(any(), any(), anyString(), anyString(), any(), anyList()))
+                .thenReturn(com.miniagent.agent.planner.PlanningRoute.dag("model", "依赖与验收"));
+        when(planner.runWithOutcome(any(), anyString(), anyString(), any(), anyList(), any(), anyString(), anyString(), any(), any(), any()))
+                .thenThrow(new ModelCallControl.StoppedException(reason));
+
+        assertFalse(app.chat(7L, "s1", "goal").isBlank());
+
+        verifyNoInteractions(loop);
+        verifyStoppedTurnWasPersisted(reason);
+    }
+
+    @Test
+    void routingCancellationEmitsCancelledOutcomeAndCompletesWithoutAProcessingError() {
+        when(planner.selectRoute(any(), any(), anyString(), anyString(), any(), anyList()))
+                .thenThrow(new ModelCallControl.StoppedException(ExecutionControl.StopReason.CANCELLED));
+
+        startStream(List.of());
+
+        verify(streams, timeout(5_000)).markIdle("s1");
+        verify(events).publish(eq("s1"), eq("task_outcome"),
+                argThat(payload -> payload instanceof Map<?, ?> fields && "CANCELED".equals(fields.get("status"))
+                        && "CANCELLED".equals(fields.get("reason")) && fields.containsKey("executionId")), anyString());
+        verify(events).complete(eq("s1"), eq("任务已取消。"), anyString());
+        verify(events, never()).error(anyString(), anyString(), anyString());
+        verifyStoppedTurnWasPersisted(ExecutionControl.StopReason.CANCELLED);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = ExecutionControl.StopReason.class,
+            names = {"CANCELLED", "DEADLINE_EXCEEDED", "TOOL_BUDGET_EXCEEDED", "TENANT_QUOTA_EXCEEDED"})
+    void stoppedDagOutcomePersistsStatusWithoutRequiringTheCancellationFlag(ExecutionControl.StopReason reason) {
+        when(planner.selectRoute(any(), any(), anyString(), anyString(), any(), anyList()))
+                .thenReturn(com.miniagent.agent.planner.PlanningRoute.dag("model", "依赖与验收"));
+        when(planner.runWithOutcome(any(), anyString(), anyString(), any(), anyList(), any(), anyString(), anyString(), any(), any(), any()))
+                .thenReturn(new PlanningLoop.RunOutcome("任务已停止，进度已保留。", PlanningLoop.Outcome.FAILED, reason.name()));
+
+        assertEquals("任务已停止，进度已保留。", app.chat(7L, "s1", "goal"));
+
+        verifyNoInteractions(loop);
+        verifyStoppedTurnWasPersisted(reason);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"DEADLINE_EXCEEDED", "RESOURCE_QUOTA_EXCEEDED", "TOOL_BUDGET_EXCEEDED", "TENANT_QUOTA_EXCEEDED"})
+    void stoppedReasonCannotMapToSuccessEvenIfCompletionWasReported(String reason) {
+        assertEquals(com.miniagent.common.RunStatus.FAILURE,
+                AgentChatApplicationService.planningStatus(new PlanningLoop.RunOutcome(
+                        "stopped", PlanningLoop.Outcome.COMPLETED, reason)));
+    }
+
+    private void verifyStoppedTurnWasPersisted(ExecutionControl.StopReason reason) {
+        boolean cancelled = reason == ExecutionControl.StopReason.CANCELLED;
+        String status = cancelled ? "CANCELED" : "FAILURE";
+        if (cancelled) verify(runs).markCancelled(eq(run), anyString());
+        else verify(runs).markFailed(eq(run), contains(reason.name()));
+        verify(runs, never()).markCompleted(any());
+        verify(trace).endExecution(status);
+        ChatTaskRepository repository = (ChatTaskRepository) ReflectionTestUtils.getField(app, "chatTaskRepository");
+        var task = org.mockito.ArgumentCaptor.forClass(com.miniagent.config.entity.ChatTask.class);
+        verify(repository).save(task.capture());
+        assertFalse(task.getValue().getAnswer().isBlank());
+        assertTrue(task.getValue().getTaskProgressJson().contains(status));
+        assertTrue(task.getValue().getTaskProgressJson().contains(reason.name()));
+    }
+
     @Test
     void failedCancellationReadCannotSkipTerminalCleanupOrMaskTheWorkerFailure() {
         ExecutionSignalStore signals = mock(ExecutionSignalStore.class);
@@ -579,7 +909,8 @@ class AgentChatApplicationServiceLifecycleTest {
         String status = "USER_QUESTION".equals(reason) ? "WAITING" : "CANCELED";
         var order = inOrder(events);
         order.verify(events).publish(eq("s1"), eq("task_outcome"),
-                eq(Map.of("status", status, "reason", reason)), anyString());
+                argThat(payload -> payload instanceof Map<?, ?> fields && status.equals(fields.get("status"))
+                        && reason.equals(fields.get("reason")) && fields.containsKey("executionId")), anyString());
         order.verify(events).complete(eq("s1"), eq(ANSWER), anyString());
         verify(runs, never()).markCompleted(any());
     }
@@ -670,6 +1001,8 @@ class AgentChatApplicationServiceLifecycleTest {
             return entity;
         });
         TaskRunService realRuns = new TaskRunService();
+        ReflectionTestUtils.setField(realRuns, "transactionManager",
+                mock(org.springframework.transaction.PlatformTransactionManager.class));
         put(realRuns, "repository", repository);
         put(realRuns, "maxPerUser", 1);
         put(app, "taskRunService", realRuns);

@@ -10,6 +10,7 @@ public final class WorkspaceContext {
     private static final ThreadLocal<Path> ROOT_OVERRIDE = new ThreadLocal<>();
     private static final ThreadLocal<String> TASK_OVERRIDE = new ThreadLocal<>();
     private static final ThreadLocal<String> SESSION_OVERRIDE = new ThreadLocal<>();
+    private static final ThreadLocal<String> OPERATION_ROOT_SESSION = new ThreadLocal<>();
 
     private WorkspaceContext() {}
 
@@ -51,6 +52,16 @@ public final class WorkspaceContext {
         SESSION_OVERRIDE.remove();
     }
 
+    /** Immutable ownership group captured by RunScope; detached child work still belongs to its root. */
+    public static void setOperationRootSession(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) OPERATION_ROOT_SESSION.remove();
+        else OPERATION_ROOT_SESSION.set(sessionId);
+    }
+
+    public static String getOperationRootSession() {
+        return OPERATION_ROOT_SESSION.get();
+    }
+
     public static void setTaskOverride(String task) {
         TASK_OVERRIDE.set(task);
     }
@@ -67,5 +78,6 @@ public final class WorkspaceContext {
         clearRootOverride();
         clearTaskOverride();
         clearSessionOverride();
+        OPERATION_ROOT_SESSION.remove();
     }
 }

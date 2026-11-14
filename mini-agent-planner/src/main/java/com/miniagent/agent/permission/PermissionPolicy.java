@@ -35,6 +35,7 @@ public final class PermissionPolicy {
             "browser_click", "browser_type", "browser_press", "browser_scroll",
             "browser_select", "browser_set_checked", "browser_upload",
             "browser_evaluate", "browser_extract_text",
+            "browser_clear_session",
             SongGenerateParams.TOOL_NAME,
             "delegate_task", "desktop_act"
     );

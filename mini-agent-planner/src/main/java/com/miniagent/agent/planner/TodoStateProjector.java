@@ -45,7 +45,8 @@ public class TodoStateProjector {
             m.put("id", id);
             m.put("content", n.name());
             m.put("status", toTodoStatus(n.status()));
-            m.put("done_when", n.doneWhen().wire());
+            m.put("done_when", n.doneWhen());
+            m.put("evidence", n.output());
             m.put("depends_on", deps);
             if (n.lastError() != null && !n.lastError().isBlank()) {
                 m.put("note", n.lastError());

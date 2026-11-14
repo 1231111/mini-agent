@@ -231,18 +231,10 @@ agent:
     auto-planning: true
     storage: db
 
-  # 防止出厂包里的 base-url 被改到任意地址，把 API key 送到非预期端点。
-  #
-  # 闸门执行者是 UserModelConfigService（save() 拒写 + resolve() 忽略存量值），
-  # 不是 ProductionReadinessValidator —— 后者读同一个键，但只在 prod 档运行
-  # （它还要求 ddl-auto=validate / flyway 开启 / replica.mode=redis），
-  # 客户端档一次都跑不到。曾经只有那一处读它，等于这条配置形同注释。
-  #
-  # 为什么值钱：resolve() 里 baseUrl 与 apiKey 是分别回退的。用户填自定义
-  # baseUrl、apiKey 留空 → 拿到的是出厂的全局 apiKey。不需要知道密钥内容，
-  # 改一个地址就能把出厂密钥引到任意端点。
+  # 本地桌面允许用户使用自己的模型服务；独立端点必须自带 Key。
+  # UserModelConfigService 将端点与凭据绑定，禁止跨端点回退/复用平台或旧 Key。
   models:
-    custom-base-url-enabled: false
+    custom-base-url-enabled: true
 
   codebase:
     # 内联 ONNX：进程内推理，取代 embedding-server 这个 Python sidecar。

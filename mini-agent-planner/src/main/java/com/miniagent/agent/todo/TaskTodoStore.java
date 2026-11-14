@@ -9,6 +9,7 @@ import com.miniagent.agent.permission.ConfirmPolicy;
 import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.tool.BuiltinTools;
+import com.miniagent.agent.planner.DoneWhen;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -255,6 +256,10 @@ public class TaskTodoStore {
         String key = safeKey(sessionId);
         ensureLoaded(key);
         List<TodoItem> prev = todos.getOrDefault(key, Collections.emptyList());
+        // A model cannot replace the frozen DAG contract through task.set (including by renaming IDs).
+        if (mergeRanks && containsDagProjection(key)) {
+            return new ArrayList<>(prev);
+        }
         List<TodoItem> items = new ArrayList<>();
         if (rawItems != null) {
             int autoId = 1;
@@ -269,7 +274,7 @@ public class TaskTodoStore {
                 }
                 Status status = parseStatus(String.valueOf(raw.getOrDefault("status", "pending")));
                 String note = str(raw.get("note"));
-                String doneWhen = str(raw.getOrDefault("done_when", raw.get("doneWhen")));
+                String doneWhen = serializeDoneWhen(raw.getOrDefault("done_when", raw.get("doneWhen")), !mergeRanks);
                 String evidence = str(raw.get("evidence"));
                 String hash = str(raw.getOrDefault("validation_hash", raw.get("validationHash")));
                 int id = raw.get("id") instanceof Number n ? n.intValue() : autoId;
@@ -310,6 +315,10 @@ public class TaskTodoStore {
                     }
                 }
 
+                if (mergeRanks && status == Status.completed && structuredSemanticContract(doneWhen)) {
+                    status = Status.in_progress;
+                    note = "语义条件尚未验证，须由 DAG 验收后完成";
+                }
                 items.add(new TodoItem(
                         id, content, status, note, doneWhen, evidence, hash, deps));
                 prevId = id;
@@ -333,6 +342,48 @@ public class TaskTodoStore {
             case cancelled -> 1;
             case pending -> 0;
         };
+    }
+
+    /** Keep structured contracts losslessly in the legacy persisted string field. */
+    private static String serializeDoneWhen(Object raw, boolean dagProjection) {
+        if (raw == null) return "";
+        if (raw instanceof CharSequence text) return text.toString().trim();
+        try {
+            JsonNode node = MAPPER.valueToTree(raw);
+            DoneWhen contract = DoneWhen.parse(node);
+            if (!contract.valid()) return "{\"invalid\":true}";
+            var structured = MAPPER.valueToTree(contract);
+            if (dagProjection) ((com.fasterxml.jackson.databind.node.ObjectNode) structured).put("dagManaged", true);
+            return MAPPER.writeValueAsString(structured);
+        } catch (Exception invalid) {
+            return "{\"invalid\":true}";
+        }
+    }
+
+    private static boolean dagManaged(String contract) {
+        if (contract == null || !contract.startsWith("{")) return false;
+        try { return MAPPER.readTree(contract).path("dagManaged").asBoolean(false); }
+        catch (Exception invalid) { return false; }
+    }
+
+    private boolean containsDagProjection(String key) {
+        return todos.getOrDefault(key, List.of()).stream().anyMatch(it -> dagManaged(it.doneWhen()))
+                || archived.getOrDefault(key, List.of()).stream().anyMatch(it -> dagManaged(it.doneWhen()));
+    }
+
+    private static boolean structuredSemanticContract(String contract) {
+        if (contract == null || !contract.startsWith("{")) return false;
+        try {
+            JsonNode node = MAPPER.readTree(contract);
+            DoneWhen parsed = DoneWhen.parse(node);
+            return node.path("invalid").asBoolean(false) || !parsed.valid() || !parsed.semanticChecks().isEmpty();
+        } catch (Exception invalid) { return true; }
+    }
+
+    static String legacyDoneWhen(String contract) {
+        if (contract == null || !contract.startsWith("{")) return contract;
+        try { return DoneWhen.parse(MAPPER.readTree(contract)).wire(); }
+        catch (Exception invalid) { return contract; }
     }
 
     static boolean needsConfirmGate(TodoItem it) {
@@ -654,6 +705,7 @@ public class TaskTodoStore {
                     return "[" + v.name() + "] " + err;
                 }
             } catch (Exception e) {
+                com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(e);
                 return "[" + v.name() + "] 校验异常: " + e.getMessage();
             }
         }
@@ -675,12 +727,12 @@ public class TaskTodoStore {
             }
             if (dep.validationHash() != null && !dep.validationHash().isBlank()) {
                 TodoSemanticValidator.Result again = TodoSemanticValidator.validate(
-                        dep.content(), dep.doneWhen(), dep.evidence());
+                        dep.content(), legacyDoneWhen(dep.doneWhen()), dep.evidence());
                 if (!again.ok()) {
                     return "上游产物失效：#" + depId + " " + again.error()
                             + "。请先 todo(action=reopen, id=" + depId + ")";
                 }
-                if (!dep.validationHash().equals(again.contentHash())) {
+                if (!validationHashMatches(dep.validationHash(), again.contentHash())) {
                     return "上游产物指纹不匹配：#" + depId + " 期望 hash="
                             + dep.validationHash() + " 实际=" + again.contentHash()
                             + "。请先 reopen #" + depId;
@@ -688,6 +740,12 @@ public class TaskTodoStore {
             }
         }
         return null;
+    }
+
+    /** New validations store all SHA256 bits; existing 16-character persisted prefixes remain readable. */
+    private static boolean validationHashMatches(String expected, String actual) {
+        if (expected == null || actual == null) return false;
+        return expected.equals(actual) || (expected.length() == 16 && actual.length() == 64 && actual.startsWith(expected));
     }
 
     private static void promoteReadyItems(List<TodoItem> list) {
@@ -810,7 +868,11 @@ public class TaskTodoStore {
     private static final String FILE_EXISTS_PREFIX = "file_exists:";
 
     public String verifyCompletion(String doneWhen, String evidence) {
-        String dw = doneWhen == null ? "" : doneWhen.trim();
+        if (dagManaged(doneWhen) || structuredSemanticContract(doneWhen)) {
+            return "语义条件尚未验证，须由 DAG 验收后完成；请保留 in_progress 并提交实际 evidence";
+        }
+        String legacy = legacyDoneWhen(doneWhen);
+        String dw = legacy == null ? "" : legacy.trim();
         String ev = evidence == null ? "" : evidence.trim();
 
         if (dw.isBlank()) {
@@ -821,18 +883,14 @@ public class TaskTodoStore {
         }
 
         if (dw.regionMatches(true, 0, FILE_EXISTS_PREFIX, 0, FILE_EXISTS_PREFIX.length())) {
-            String path = extractPathSpec(dw);
+            String path = dw.substring(FILE_EXISTS_PREFIX.length()).trim();
             if (path.isEmpty()) {
                 return "done_when 的 file_exists 路径为空";
             }
-            Path p = resolvePath(path);
-            if (p == null || !Files.exists(p)) {
-                Path alt = resolvePath(ev);
-                if (alt != null && Files.exists(alt)) {
-                    return null;
-                }
+            Path p = AcceptanceEvidenceFiles.resolveDeclaredFile(path);
+            if (p == null) {
                 return "验收失败：文件不存在 " + path
-                        + "（可先 write_file 再 completed，或把实际路径写入 evidence）";
+                        + "（请生成声明路径对应的产物，evidence 不能替换冻结的交付路径）";
             }
             return null;
         }
@@ -948,6 +1006,15 @@ public class TaskTodoStore {
         persistRow(sessionOf(key));
         log.info("todo 已作废（保留可恢复）session={} key={} items={}",
                 sessionOf(key), key, items == null ? 0 : items.size());
+    }
+
+    /** Model-driven todo clearing cannot erase a graph's frozen acceptance contract. */
+    public synchronized boolean clearFromModel(String sessionId) {
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        if (containsDagProjection(key)) return false;
+        clear(sessionId);
+        return true;
     }
 
     /**

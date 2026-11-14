@@ -97,7 +97,7 @@ class GoalCompilerGranularityTest {
                 new TaskNode("n2", "统计", "code", List.of(), List.of(), List.of(),
                         TaskNodeStatus.PENDING, 9,
                         DoneWhen.judge("统计覆盖各月销售额"), "", "", 0, "")));
-        assertEquals(List.of("统计覆盖各月销售额"),
+        assertEquals(List.of("统计覆盖各月销售额", "文档要写全"),
                 GoalCompiler.checkableCriteria(
                         List.of("统计覆盖各月销售额", "文档要写全"), "统计", g));
     }

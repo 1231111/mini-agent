@@ -1,6 +1,7 @@
 package com.miniagent.agent.core;
 
 import com.miniagent.agent.execution.ToolPipeline;
+import com.miniagent.agent.execution.ToolInvocation;
 import com.miniagent.agent.execution.ToolRequest;
 import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.tool.ToolResult;
@@ -52,12 +53,16 @@ public class NodeExecutor {
      * 已经没有等待中的调用点可以唤醒 —— 于是模型下一轮再提一次同样的调用、再弹一次窗。</p>
      */
     public ToolResult executeBound(String toolName, String argumentsJson) {
+        return executeBoundInvocation(toolName, argumentsJson).result();
+    }
+
+    /** Bound DAG actions must retain permission and execution-control outcomes as well as the tool result. */
+    public ToolInvocation executeBoundInvocation(String toolName, String argumentsJson) {
         requireFence();
         RunScope scope = RunScope.capture();
         return toolPipeline.invoke(
                         ToolRequest.bound(scope, toolName, argumentsJson).withApprovalWait()
-                                .withExecutionBudget(toolPipeline.timeoutSeconds(toolName, argumentsJson)))
-                .result();
+                                .withExecutionBudget(toolPipeline.timeoutSeconds(toolName, argumentsJson)));
     }
 
     public String runDirect(ChatModel chat, String system, String user,

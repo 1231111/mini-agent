@@ -25,6 +25,7 @@
         <java.version>21</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <miniagent.test.reports-directory>${project.build.directory}/surefire-reports</miniagent.test.reports-directory>
         <spring-boot.version>3.4.5</spring-boot.version>
         <langchain4j.version>1.15.0</langchain4j.version>
         <lombok.version>1.18.40</lombok.version>
@@ -100,6 +101,7 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
                 <configuration>
+                    <reportsDirectory>${miniagent.test.reports-directory}</reportsDirectory>
                     <!-- ponytail: Byte Buddy 1.15.11 只认到 Java 24。
                          升到支持 JDK 26 的版本后删掉。 -->
                     <systemPropertyVariables>

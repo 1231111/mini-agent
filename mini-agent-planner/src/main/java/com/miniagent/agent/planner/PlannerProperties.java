@@ -1,13 +1,17 @@
 package com.miniagent.agent.planner;
 
 import lombok.Data;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.DeprecatedConfigurationProperty;
 import org.springframework.stereotype.Component;
 
 @Component
 @ConfigurationProperties(prefix = "agent.planner")
 @Data
 public class PlannerProperties {
+    private static final Logger log = LoggerFactory.getLogger(PlannerProperties.class);
 
     private boolean enabled = true;
 
@@ -36,8 +40,6 @@ public class PlannerProperties {
     private int maxOuterRounds = 24;
     /** Proposal 硬闸门：锁定工具面 + 禁止改其它 todo */
     private boolean hardProposal = true;
-    /** 步骤验收收紧：禁止宽松放行 */
-    private boolean strictEval = true;
     private int maxLocalRepair = 3;
     private int maxReplaceTool = 2;
     private int maxRewriteGraph = 2;
@@ -95,8 +97,20 @@ public class PlannerProperties {
     public boolean isHardProposal() { return hardProposal; }
     public void setHardProposal(boolean hardProposal) { this.hardProposal = hardProposal; }
 
-    public boolean isStrictEval() { return strictEval; }
-    public void setStrictEval(boolean strictEval) { this.strictEval = strictEval; }
+    /**
+     * @deprecated 步骤始终按 doneWhen 验收；保留旧配置绑定入口，不再支持宽松放行。
+     */
+    @Deprecated(since = "0.0.1", forRemoval = false)
+    @DeprecatedConfigurationProperty(reason = "步骤始终按 doneWhen 验收；此兼容配置不能关闭验收，也不强制所有节点使用 llm_judge。")
+    public boolean isStrictEval() { return true; }
+
+    /** @deprecated 兼容旧配置，false 也不能关闭步骤验收。 */
+    @Deprecated(since = "0.0.1", forRemoval = false)
+    public void setStrictEval(boolean strictEval) {
+        if (!strictEval) {
+            log.warn("agent.planner.strict-eval 已弃用，false 不再生效：步骤始终按 doneWhen 验收，不支持关闭验收。请删除此配置。");
+        }
+    }
 
     public int getMaxLocalRepair() { return maxLocalRepair; }
     public void setMaxLocalRepair(int maxLocalRepair) { this.maxLocalRepair = maxLocalRepair; }

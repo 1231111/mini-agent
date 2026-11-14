@@ -9,6 +9,7 @@ const WORKSPACE_CODE_EXTENSIONS = new Set(['HTML', 'HTM', 'JS', 'MJS', 'CJS', 'C
     'JSON', 'PY', 'JAVA', 'GO', 'RS', 'C', 'H', 'CPP', 'HPP', 'SH', 'BAT', 'PS1', 'SQL', 'XML', 'YML', 'YAML']);
 const WORKSPACE_FILE_CHECKS = new Map();
 let mediaBlobCacheBytes = 0;
+const MEDIA_EVENT_BINDINGS = new WeakSet();
 
 /**
  * 同一个 URL 只取一次，重新渲染出来的新节点直接复用 objectURL。
@@ -63,7 +64,33 @@ function evictMediaBlobCache() {
 function hydrateProtectedMedia(root) {
     if (!root || !root.querySelectorAll) return;
     hydrateWorkspaceFileReferences(root);
-    root.querySelectorAll('[data-auth-src]').forEach(el => {
+    // Local history may contain a blob URL from an earlier process. Always keep
+    // the canonical protected URL and resolve it against this process's cache.
+    const origins = [...root.querySelectorAll('[data-media-origin]')];
+    if (root.matches?.('[data-media-origin]')) origins.push(root);
+    origins.forEach(el => {
+        const url = safeMediaUrl(el.getAttribute('data-media-origin'));
+        if (!url.startsWith('/api/')) return;
+        const cached = MEDIA_BLOB_CACHE.get(url);
+        if (!cached?.objectUrl || el.getAttribute('src') !== cached.objectUrl) el.setAttribute('data-auth-src', url);
+    });
+    const mediaNodes = [...root.querySelectorAll('audio,video,img[data-media-poster]')];
+    if (root.matches?.('audio,video,img[data-media-poster]')) mediaNodes.push(root);
+    mediaNodes.forEach(el => {
+        if (MEDIA_EVENT_BINDINGS.has(el)) return;
+        MEDIA_EVENT_BINDINGS.add(el);
+        el.addEventListener('loadedmetadata', () => {
+            el.removeAttribute('data-media-error');
+            el.parentNode?.querySelector('.media-preview-error')?.remove();
+        });
+        el.addEventListener('error', () => {
+            if (el.tagName === 'IMG') el.hidden = true;
+            else showMediaPreviewError(el, el.dataset.mediaUrl || el.getAttribute('src'), '当前资源暂无法播放，请打开原网页或下载文件。');
+        });
+    });
+    const protectedNodes = [...root.querySelectorAll('[data-auth-src]')];
+    if (root.matches?.('[data-auth-src]')) protectedNodes.push(root);
+    protectedNodes.forEach(el => {
         const url = el.getAttribute('data-auth-src');
         if (!url) return;
         el.removeAttribute('data-auth-src');   // 同一节点只排队一次
@@ -72,33 +99,42 @@ function hydrateProtectedMedia(root) {
             if (el.isConnected) el.src = objectUrl;
         }).catch(err => {
             el.setAttribute('data-media-error', '1');
-            if (el.tagName === 'VIDEO' && !el.nextElementSibling?.classList.contains('media-preview-error')) {
-                const fallback = document.createElement('div');
-                fallback.className = 'media-preview-error';
-                fallback.textContent = err.message.includes('40 MB')
-                    ? '视频超过 40 MB，暂不支持内联预览。'
-                    : '视频预览暂不可用。';
-                const sourceUrl = el.getAttribute('data-auth-src') || url;
-                if (sourceUrl.startsWith('/api/conversation-media/')) {
-                    const filename = sourceUrl.split('/').pop().split('?')[0];
-                    const session = sourceUrl.split('/')[3];
-                    appendAuthenticatedDownload(fallback, '/api/conversation-download/' + session + '/' + filename,
-                        decodeURIComponentSafe(filename));
-                } else if (sourceUrl.startsWith('/api/workspace-media/')) {
-                    const parts = sourceUrl.split('/');
-                    const filename = parts.pop().split('?')[0];
-                    const query = sourceUrl.includes('?') ? sourceUrl.slice(sourceUrl.indexOf('?')) : '';
-                    appendAuthenticatedDownload(fallback, '/api/workspace-download/' + filename + query,
-                        decodeURIComponentSafe(filename));
-                } else if (sourceUrl.startsWith('/api/generated-media/')) {
-                    const filename = sourceUrl.split('/').pop();
-                    appendAuthenticatedDownload(fallback, sourceUrl, decodeURIComponentSafe(filename));
-                }
-                el.parentNode?.appendChild(fallback);
-            }
+            if (el.tagName === 'VIDEO' || el.tagName === 'AUDIO') showMediaPreviewError(el, url,
+                err.message.includes('40 MB') ? '视频超过 40 MB，请下载后播放。' : '媒体加载失败，请下载文件或打开原网页。');
+            else if (el.matches?.('[data-media-poster]')) el.hidden = true;
             console.warn('受保护媒体加载失败:', url, err.message);
         });
     });
+}
+
+function showMediaPreviewError(el, sourceUrl, message) {
+    const parent = el.parentNode;
+    if (!parent || parent.querySelector('.media-preview-error')) return;
+    const fallback = document.createElement('div');
+    fallback.className = 'media-preview-error';
+    fallback.setAttribute('role', 'status');
+    fallback.textContent = message;
+    sourceUrl = typeof sourceUrl === 'string' ? sourceUrl : '';
+    if (sourceUrl.startsWith('/api/conversation-media/')) {
+        const filename = sourceUrl.split('/').pop().split('?')[0];
+        appendAuthenticatedDownload(fallback, '/api/conversation-download/' + sourceUrl.split('/')[3] + '/' + filename,
+            decodeURIComponentSafe(filename));
+    } else if (sourceUrl.startsWith('/api/workspace-media/')) {
+        const filename = sourceUrl.split('/').pop().split('?')[0];
+        const query = sourceUrl.includes('?') ? sourceUrl.slice(sourceUrl.indexOf('?')) : '';
+        appendAuthenticatedDownload(fallback, '/api/workspace-download/' + filename + query, decodeURIComponentSafe(filename));
+    } else if (sourceUrl.startsWith('/api/generated-media/')) {
+        appendAuthenticatedDownload(fallback, sourceUrl, decodeURIComponentSafe(sourceUrl.split('/').pop()));
+    } else {
+        const url = safeMediaPageUrl(sourceUrl);
+        if (url) {
+            const link = document.createElement('a');
+            link.href = url; link.target = '_blank'; link.rel = 'noopener noreferrer';
+            link.textContent = '打开媒体链接';
+            fallback.appendChild(link);
+        }
+    }
+    parent.appendChild(fallback);
 }
 
 function appendAuthenticatedDownload(parent, url, name) {
@@ -106,8 +142,8 @@ function appendAuthenticatedDownload(parent, url, name) {
     link.href = '#';
     link.className = 'conversation-download-link';
     link.dataset.authDownload = url;
-    link.dataset.downloadName = name || 'video';
-    link.textContent = '下载视频';
+    link.dataset.downloadName = name || 'media';
+    link.textContent = '下载文件';
     parent.appendChild(link);
 }
 
@@ -313,8 +349,8 @@ function linkWorkspacePaths(s) {
         const ext = fileExt(displayName);
         const mediaUrl = '/api/workspace-media/' + href + workspaceSidQuery();
         const isImage = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif'].includes(ext);
-        const isVideo = VIDEO_EXTS.has(ext);
-        if (isImage || isVideo) {
+        const isVideo = isVideoUrl(displayName);
+        if (isImage || isVideo || isAudioUrl(displayName)) {
             out += text.slice(cursor, candidate.start) + '![' + displayName + '](' + mediaUrl + ')';
         } else {
             out += text.slice(cursor, candidate.start) + '[查看文件：' + displayName
@@ -355,16 +391,19 @@ function parseLinks(s) {
                 if (u) {
                     const href = u.url.replace(/&amp;/g, '&');
                     const workspacePath = workspaceDownloadPath(href);
-                    if (workspacePath) {
+                    const mediaUrl = workspacePath ? '/api/workspace-media/' + workspacePath + workspaceSidQuery() : safeMediaUrl(href);
+                    if (mediaUrl && (isAudioUrl(mediaUrl) || isVideoUrl(mediaUrl))) {
+                        out += renderNativeMedia(mediaUrl, isAudioUrl(mediaUrl) ? 'audio' : 'video', label.replace(/<[^>]*>/g, ''), '');
+                    } else if (workspacePath) {
                         let downloadName = workspacePath;
                         try { downloadName = decodeURIComponent(workspacePath); } catch (_) { }
                         out += workspaceFileDownloadLink(workspacePath, downloadName, null, label);
                     } else if (!/^(?:https?:|\/\/|\/api\/)/i.test(href) && inlineMarkdownFileLink(href)) {
                         out += inlineMarkdownFileLink(href, label);
-                    } else if (!/^https?:\/\//i.test(href) && !/^\/\w/.test(href)) {
+                    } else if (!safeMediaPageUrl(href) && (!/^\/(?!\/|\\)[\w/-]/.test(href) || /[\x00-\x20\\]/.test(href))) {
                         out += s.slice(i, u.end + 1);
                     } else {
-                        out += `<a href="${escA(href)}" target="_blank" rel="noopener">${label}</a>`;
+                        out += `<a href="${escA(href)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
                     }
                     i = u.end + 1;
                     continue;
@@ -382,8 +421,11 @@ function parseLinks(s) {
                 url = url.slice(0, -1);
             while (url.endsWith(']') && (url.match(/\]/g) || []).length > (url.match(/\[/g) || []).length)
                 url = url.slice(0, -1);
-            if (url.length > 8) {
-                out += `<a href="${escA(url.replace(/&amp;/g, '&'))}" target="_blank" rel="noopener" class="source-link">查看原文</a>`;
+            const href = safeMediaPageUrl(url.replace(/&amp;/g, '&'));
+            if (url.length > 8 && href) {
+                out += isAudioUrl(href) || isVideoUrl(href)
+                    ? renderNativeMedia(href, isAudioUrl(href) ? 'audio' : 'video', '', '')
+                    : `<a href="${escA(href)}" target="_blank" rel="noopener noreferrer" class="source-link">查看原文</a>`;
                 i += url.length;
                 continue;
             }
@@ -497,17 +539,22 @@ function renderTravelCardBlock(language, rawJson) {
  */
 function renderMD(t) {
     if (t == null) return '';
-    t = String(t);
+    t = String(t).replace(/\r\n?/g, '\n');
 
     // 1) 摘出 fenced code：内容不参与 markdown 结构替换，也不会被二次转义
     const codeBlocks = [];
     t = t.replace(/```([\w-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
-        const travelCard = renderTravelCardBlock(lang, code);
-        if (travelCard) {
-            codeBlocks.push({ rendered: travelCard });
+        const card = renderMediaCardBlock(lang, code) || renderTravelCardBlock(lang, code);
+        if (card) {
+            codeBlocks.push({ rendered: card });
         } else {
             codeBlocks.push({ lang: lang || 'code', code: code });
         }
+        return '\u0000CB' + (codeBlocks.length - 1) + '\u0000';
+    });
+    // A streamed or interrupted protocol payload must never expose partial JSON to the conversation.
+    t = t.replace(/```miniagent-media\b[^\n]*\n[\s\S]*$/i, () => {
+        codeBlocks.push({ rendered: '<div class="media-card-pending" role="status">正在整理媒体内容…</div>' });
         return '\u0000CB' + (codeBlocks.length - 1) + '\u0000';
     });
 

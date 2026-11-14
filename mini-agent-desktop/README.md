@@ -572,6 +572,20 @@ node scripts/desktop-cdp-inspect.mjs "JSON.stringify({
 所以「页面里到底有没有抛过异常」不需要复现故障，连上去那一刻就能拿到 ——
 上面那条 `SyntaxError` 就是这么一次定性的。
 
+## 模型 API Key 的本机保护
+
+正常桌面启动会在 Java 后端启动前准备稳定的 `MODEL_CONFIG_ENCRYPTION_KEY`，用于后端现有 AES-256-GCM 凭据加密和历史明文迁移。Windows 使用 Electron `safeStorage` 对接 DPAPI，macOS 使用系统 Keychain；明文保护密钥只通过子进程环境交给本机后端，不进入 renderer、日志或前端配置。
+
+自动管理的密钥保存在 Electron `userData` 的 `model-config-key.json`，内容是系统安全存储加密后的记录；同目录 `.managed` 文件仅保存一致性指纹。请随用户配置保留这组文件。重启复用原密钥；文件损坏、已安装的密钥丢失、系统用户无法解密或安全存储不可用时，会显示启动错误并保留原文件，不会自动更换密钥或退回明文。复制数据库到另一台机器时，仅复制加密密钥文件通常不能跨系统用户解密，需要原环境或显式提供原加密密钥。
+
+显式设置的 `MODEL_CONFIG_ENCRYPTION_KEY` 优先，格式为标准 Base64 编码的 32 字节密钥。桌面仅记录不含密钥的 `.external` 模式标记，不覆盖已管理的密钥；下次启动若缺少该环境变量会要求恢复原值，避免无声切换到另一把密钥。此处不提供自动密钥轮换，轮换必须迁移对应密文。
+
+Linux 只接受系统密钥环后端（例如 libsecret/KWallet）；`basic_text` 或不可用的后端不会作为保护方式。没有系统密钥环时可以显式配置稳定的环境密钥。
+
+后端 `ModelConfigSecretMigrator` 在加密启用后迁移当前数据库中的历史明文。已有无法解密的密文保留并记录诊断，其他用户配置可以继续启动；受影响配置在设置页显示不可用，须恢复旧加密密钥或重新保存该用户的 API Key。迁移不会猜测缺失的端点绑定，也不会清除旧备份中的历史明文；现有开发模式下直接运行未配置加密密钥的后端行为不变。
+
+验证入口：`node --test scripts/test-desktop-model-key.mjs`，使用临时目录和替身系统安全存储，不读取用户真实密钥。后端迁移覆盖见 `ModelConfigSecretMigratorTest`、`UserModelConfigSecretTest`。
+
 ## 相关链接
 
 - [Electron 官方文档](https://www.electronjs.org/)

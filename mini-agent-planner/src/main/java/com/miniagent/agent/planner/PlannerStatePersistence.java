@@ -26,10 +26,35 @@ public interface PlannerStatePersistence {
     boolean compareAndSet(String sessionId, long expectedVersion,
                           StateSnapshot next, List<DomainEvent> events);
 
+    /** Atomic CAS also fences a replaced execution whose version restarted at the same value. */
+    default boolean compareAndSet(String sessionId, long expectedVersion, String expectedExecutionId,
+                                  StateSnapshot next, List<DomainEvent> events) {
+        throw new UnsupportedOperationException("PLANNER_EXECUTION_CAS_REQUIRED");
+    }
+
+    /** Atomically commits the graph and appends only these new events to the latest retained history. */
+    default boolean compareAndSetAppending(String sessionId, long expectedVersion, String expectedExecutionId,
+                                          StateSnapshot next, List<DomainEvent> appended) {
+        throw new UnsupportedOperationException("PLANNER_ATOMIC_EVENT_APPEND_REQUIRED");
+    }
+
     /**
-     * 仅追加审计事件（不升 planner_version）；expectedVersion 不匹配则 false。
+     * Legacy audit API; implementations merge additions without removing committed events.
+     * Production callers use appendEvents with a delta, never a previously loaded full history.
      */
     boolean updateEvents(String sessionId, long expectedVersion, List<DomainEvent> events);
+
+    /** Audit writes must never attach an old execution's event to its successor. */
+    default boolean updateEvents(String sessionId, long expectedVersion, String expectedExecutionId,
+                                 List<DomainEvent> events) {
+        throw new UnsupportedOperationException("PLANNER_EXECUTION_CAS_REQUIRED");
+    }
+
+    /** Appends a delta under the same stream lock as graph commits, without changing graph version. */
+    default boolean appendEvents(String sessionId, long expectedVersion, String expectedExecutionId,
+                                 List<DomainEvent> appended) {
+        throw new UnsupportedOperationException("PLANNER_ATOMIC_EVENT_APPEND_REQUIRED");
+    }
 
     void delete(String sessionId);
 }

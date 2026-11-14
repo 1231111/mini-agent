@@ -51,9 +51,6 @@ public class PlannerStateStore {
         public long actual() { return actual; }
     }
 
-    private static final int MAX_EVENTS = 500;
-    private static final int TRIM_TO = 400;
-
     private final ConcurrentHashMap<String, StateSnapshot> memory = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, List<DomainEvent>> memoryEvents = new ConcurrentHashMap<>();
     private final PlannerStatePersistence persistence;
@@ -133,8 +130,10 @@ public class PlannerStateStore {
         if (persistence != null) {
             persistence.replace(k, snap, events);
         } else {
-            memory.put(k, snap);
-            memoryEvents.put(k, new ArrayList<>(events));
+            synchronized (memory) {
+                memory.put(k, snap);
+                memoryEvents.put(k, new ArrayList<>(events));
+            }
         }
         return snap;
     }
@@ -143,26 +142,33 @@ public class PlannerStateStore {
      * CAS：仅当 expectedVersion 匹配时提交新快照（版本自动 +1）。
      */
     public StateSnapshot commit(String sessionId, long expectedVersion, StateSnapshot next) {
+        return commit(sessionId, expectedVersion, next, List.of());
+    }
+
+    /** Graph transition and its business audit events succeed or fail as one persistence operation. */
+    public StateSnapshot commit(String sessionId, long expectedVersion, StateSnapshot next, List<DomainEvent> appended) {
         String k = key(sessionId);
         Objects.requireNonNull(k, "sessionId");
         Objects.requireNonNull(next, "next");
+        List<DomainEvent> additions = appended == null ? List.of() : List.copyOf(appended);
         if (persistence != null)
-            return commitPersistent(k, expectedVersion, next);
-        return commitMemory(k, expectedVersion, next);
+            return commitPersistent(k, expectedVersion, next, additions);
+        return commitMemory(k, expectedVersion, next, additions);
     }
 
-    private StateSnapshot commitPersistent(String sessionId, long expectedVersion, StateSnapshot next) {
+    private StateSnapshot commitPersistent(String sessionId, long expectedVersion, StateSnapshot next, List<DomainEvent> appended) {
         PlannerStatePersistence.Bundle cur = persistence.load(sessionId)
                 .orElseThrow(() -> new IllegalStateException("no planner state for session " + sessionId));
         if (cur.snapshot().version() != expectedVersion)
             throw new VersionConflictException(expectedVersion, cur.snapshot().version());
 
         StateSnapshot committed = buildCommitted(sessionId, cur.snapshot(), next);
-        List<DomainEvent> events = appendLocal(cur.events(), new DomainEvent(
+        List<DomainEvent> events = new ArrayList<>(appended);
+        events.add(new DomainEvent(
                 "ev_" + UUID.randomUUID().toString().substring(0, 8),
                 DomainEventType.STATE_COMMITTED, null, null,
                 Map.of("version", committed.version(), "planVersion", committed.planVersion()), null));
-        if (!persistence.compareAndSet(sessionId, expectedVersion, committed, events)) {
+        if (!persistence.compareAndSetAppending(sessionId, expectedVersion, cur.snapshot().executionId(), committed, events)) {
             long actual = persistence.load(sessionId)
                     .map(b -> b.snapshot().version()).orElse(-1L);
             throw new VersionConflictException(expectedVersion, actual);
@@ -170,7 +176,8 @@ public class PlannerStateStore {
         return committed;
     }
 
-    private StateSnapshot commitMemory(String sessionId, long expectedVersion, StateSnapshot next) {
+    private StateSnapshot commitMemory(String sessionId, long expectedVersion, StateSnapshot next, List<DomainEvent> appended) {
+        synchronized (memory) {
         for (;;) {
             StateSnapshot cur = memory.get(sessionId);
             if (cur == null)
@@ -179,12 +186,15 @@ public class PlannerStateStore {
                 throw new VersionConflictException(expectedVersion, cur.version());
             StateSnapshot committed = buildCommitted(sessionId, cur, next);
             if (memory.replace(sessionId, cur, committed)) {
-                appendEvent(sessionId, new DomainEvent(
+                List<DomainEvent> events = new ArrayList<>(appended);
+                events.add(new DomainEvent(
                         "ev_" + UUID.randomUUID().toString().substring(0, 8),
                         DomainEventType.STATE_COMMITTED, null, null,
                         Map.of("version", committed.version(), "planVersion", committed.planVersion()), null));
+                memoryEvents.compute(sessionId, (ignored, current) -> PlannerEventHistory.append(current, events));
                 return committed;
             }
+        }
         }
     }
 
@@ -270,25 +280,45 @@ public class PlannerStateStore {
     }
 
     public void appendEvent(String sessionId, DomainEvent event) {
+        appendEventInternal(sessionId, null, event);
+    }
+
+    /** Caller-bound audit append: never move a stale event into a new scope or execution. */
+    public boolean appendEvent(String sessionId, StateSnapshot expected, DomainEvent event) {
+        return appendEventInternal(sessionId, Objects.requireNonNull(expected, "expected"), event);
+    }
+
+    private boolean appendEventInternal(String sessionId, StateSnapshot expected, DomainEvent event) {
         String k = key(sessionId);
         if (k == null || event == null) {
-            return;
+            return false;
         }
+        if (expected != null && !Objects.equals(k, expected.sessionId())) return false;
         if (persistence != null) {
+            String executionId = expected == null ? null : expected.executionId();
+            boolean identityRead = expected != null;
             for (int i = 0; i < 3; i++) {
                 Optional<PlannerStatePersistence.Bundle> loaded = persistence.load(k);
                 if (loaded.isEmpty()) {
-                    return;
+                    return false;
                 }
+                if (identityRead && !Objects.equals(executionId, loaded.get().snapshot().executionId())) return false;
+                executionId = loaded.get().snapshot().executionId();
+                identityRead = true;
                 long ver = loaded.get().snapshot().version();
-                List<DomainEvent> events = appendLocal(loaded.get().events(), event);
-                if (persistence.updateEvents(k, ver, events)) {
-                    return;
+                if (persistence.appendEvents(k, ver, executionId, List.of(event))) {
+                    return true;
                 }
             }
-            return;
+            return false;
         }
-        memoryEvents.compute(k, (x, v) -> appendLocal(v, event));
+        synchronized (memory) {
+            StateSnapshot current = memory.get(k);
+            if (current == null || (expected != null && !Objects.equals(expected.executionId(), current.executionId())))
+                return false;
+            memoryEvents.compute(k, (x, v) -> appendLocal(v, event));
+            return true;
+        }
     }
 
     /**
@@ -306,8 +336,10 @@ public class PlannerStateStore {
         if (persistence != null) {
             persistence.delete(k);
         }
-        memory.remove(k);
-        memoryEvents.remove(k);
+        synchronized (memory) {
+            memory.remove(k);
+            memoryEvents.remove(k);
+        }
     }
 
     public boolean hasIncompleteGraph(String sessionId) {
@@ -327,10 +359,6 @@ public class PlannerStateStore {
     }
 
     private static List<DomainEvent> appendLocal(List<DomainEvent> cur, DomainEvent event) {
-        List<DomainEvent> list = cur == null ? new ArrayList<>() : new ArrayList<>(cur);
-        list.add(event);
-        if (list.size() > MAX_EVENTS)
-            list = new ArrayList<>(list.subList(list.size() - TRIM_TO, list.size()));
-        return list;
+        return PlannerEventHistory.append(cur, List.of(event));
     }
 }

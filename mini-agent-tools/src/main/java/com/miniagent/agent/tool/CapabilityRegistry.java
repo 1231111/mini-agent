@@ -69,7 +69,7 @@ public class CapabilityRegistry implements SmartInitializingSingleton {
             "browser_form_inspect", "browser_form_verify", "browser_select",
             "browser_set_checked", "browser_upload",
             "browser_evaluate", "browser_screenshot", "browser_extract_text",
-            "browser_close");
+            "browser_close", "browser_clear_session");
 
     private static final List<String> DESKTOP = List.of(
             "desktop_observe", "desktop_act", "desktop_release");

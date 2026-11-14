@@ -195,11 +195,26 @@ let modelConfigState = {
     presets: [],
     customBaseUrl: '',
     customModelName: '',
-    hasCustomApiKey: false
+    customContextWindowTokens: 0,
+    hasCustomApiKey: false,
+    customBaseUrlAllowed: false,
+    loaded: false,
+    saving: false
 };
 
 function selectModelPreset(presetId) {
+    const changed = modelConfigState.presetId !== (presetId || 'default');
     modelConfigState.presetId = presetId || 'default';
+    if (changed) {
+        // A deliberate preset switch starts a new destination. Stored credentials stay
+        // server-side until the user explicitly replaces or clears them when saving.
+        document.getElementById('modelBaseUrl').value = '';
+        document.getElementById('modelNameInput').value = '';
+        document.getElementById('modelContextWindowTokens').value = '0';
+        document.getElementById('modelApiKey').value = '';
+        document.getElementById('modelClearApiKey').checked = false;
+        document.getElementById('modelMenuHint').textContent = '已切换预设，请保存后生效。原 Key 属于其他端点时，需重新输入对应 Key 或明确清除旧 Key。';
+    }
     const preset = (modelConfigState.presets || []).find(p => p.id === presetId);
     document.querySelectorAll('.model-preset-item').forEach(el => {
         el.classList.toggle('active', el.dataset.id === modelConfigState.presetId);
@@ -210,6 +225,8 @@ function selectModelPreset(presetId) {
         const nameEl = document.getElementById('modelNameInput');
         if (!baseEl.value) baseEl.placeholder = preset.baseUrl || '留空则用预设/全局默认';
         if (!nameEl.value) nameEl.placeholder = preset.modelName || '如 gpt-4o-mini';
+        document.getElementById('modelContextWindowHint').textContent = '预设窗口：'
+            + (preset.contextWindowTokens || '未声明') + ' token。切换模型后请核对服务商输入窗口。';
     }
 }
 
@@ -220,9 +237,12 @@ function applyModelConfigView(data) {
     modelConfigState.presets = data.presets || [];
     modelConfigState.customBaseUrl = cur.customBaseUrl || '';
     modelConfigState.customModelName = cur.customModelName || '';
+    modelConfigState.customContextWindowTokens = cur.customContextWindowTokens || 0;
     modelConfigState.hasCustomApiKey = !!cur.hasCustomApiKey;
+    modelConfigState.customBaseUrlAllowed = data.customBaseUrlAllowed === true;
+    modelConfigState.loaded = true;
 
-    const label = cur.label || cur.modelName || '模型';
+    const label = cur.configurationValid === false ? '模型配置待修复' : (cur.label || cur.modelName || '模型');
     document.getElementById('modelBadgeLabel').textContent = label;
     try { localStorage.setItem('mini_agent_model_label', label); } catch (_) {}
 
@@ -239,37 +259,76 @@ function applyModelConfigView(data) {
         list.appendChild(div);
     });
 
-    document.getElementById('modelBaseUrl').value = modelConfigState.customBaseUrl;
+    const baseEl = document.getElementById('modelBaseUrl');
+    baseEl.value = modelConfigState.customBaseUrl;
+    baseEl.disabled = !modelConfigState.customBaseUrlAllowed;
+    document.getElementById('modelBaseUrlPolicy').textContent = modelConfigState.customBaseUrlAllowed
+        ? '自定义端点必须使用自己的 Key；切换端点时请重新输入对应 Key。'
+        : '当前服务禁止自定义地址。保存时使用所选预设；原有自定义 Key 需重新填写或明确清除。';
     document.getElementById('modelNameInput').value = modelConfigState.customModelName;
+    document.getElementById('modelContextWindowTokens').value = String(modelConfigState.customContextWindowTokens);
+    document.getElementById('modelContextWindowHint').textContent = cur.configurationValid === false
+        ? '修复模型配置后显示生效窗口；请填写服务商实际支持的输入 token 上限。'
+        : (cur.contextWindowWarning || ('当前输入窗口预算：' + (cur.contextWindowTokens || '预设未声明') + ' token。'));
     document.getElementById('modelApiKey').value = '';
-    document.getElementById('modelApiKey').placeholder = modelConfigState.hasCustomApiKey
-        ? '已配置自定义 Key，留空不改'
-        : (cur.apiKeyMasked ? ('全局/预设 ' + cur.apiKeyMasked + '，填新值可覆盖') : '已配置则留空不改');
-    document.getElementById('modelMenuHint').textContent =
-        '当前生效：' + (cur.modelName || '-') + ' @ ' + (cur.baseUrl || '-')
-        + (cur.apiKeyMasked ? ' · key ' + cur.apiKeyMasked : '');
+    document.getElementById('modelClearApiKey').checked = false;
+    document.getElementById('modelClearApiKey').disabled = !modelConfigState.hasCustomApiKey;
+    document.getElementById('modelApiKey').placeholder = cur.configurationValid === false
+        ? '请重新输入此端点的 Key，或清除后使用预设'
+        : modelConfigState.hasCustomApiKey ? '已配置自定义 Key，留空不改'
+        : (cur.hasApiKey ? '当前预设已配置 Key；新端点请填写自己的 Key' : '请填写所选端点的 API Key');
+    document.getElementById('modelMenuHint').textContent = cur.configurationValid === false
+        ? '配置未生效：' + (cur.configurationError || data.configurationError || '请重新保存模型配置')
+        : '当前生效：' + (cur.modelName || '-') + ' @ ' + (cur.baseUrl || '-')
+            + (cur.apiKeyMasked ? ' · key ' + cur.apiKeyMasked : '');
+    setModelConfigBusy(modelConfigState.saving);
+}
+
+function setModelConfigBusy(busy) {
+    modelConfigState.saving = busy;
+    document.getElementById('modelSaveButton').disabled = busy || !modelConfigState.loaded;
+    document.getElementById('modelResetButton').disabled = busy;
 }
 
 async function loadModelConfig() {
     try {
         const resp = await fetch('/api/model');
-        if (!resp.ok) return;
+        if (!resp.ok) throw new Error('读取模型设置失败（HTTP ' + resp.status + '）');
         const data = await resp.json();
+        if (!data.success) throw new Error(data.message || '读取模型设置失败');
         applyModelConfigView(data);
     } catch (e) {
         console.warn('loadModelConfig failed', e);
+        document.getElementById('modelMenuHint').textContent = e.message + '，请重新打开设置或刷新页面。';
         const cached = localStorage.getItem('mini_agent_model_label');
         if (cached) document.getElementById('modelBadgeLabel').textContent = cached;
     }
 }
 
 async function saveModelConfig() {
+    if (modelConfigState.saving) return;
+    if (!modelConfigState.loaded) {
+        document.getElementById('modelMenuHint').textContent = '模型设置尚未加载成功，请刷新页面后重试。';
+        return;
+    }
+    const key = document.getElementById('modelApiKey').value;
+    const windowValue = Number(document.getElementById('modelContextWindowTokens').value || 0);
+    if (!Number.isInteger(windowValue) || (windowValue !== 0 && (windowValue < 1024 || windowValue > 10000000))) {
+        document.getElementById('modelMenuHint').textContent = '上下文窗口须为0（自动），或1024至10000000之间的整数；本次未保存。';
+        return;
+    }
+    if (document.getElementById('modelClearApiKey').checked && key.trim()) {
+        document.getElementById('modelMenuHint').textContent = '重新输入 Key 和清除旧 Key 只能选择一种；本次未保存。';
+        return;
+    }
     const body = {
         presetId: modelConfigState.presetId,
-        baseUrl: document.getElementById('modelBaseUrl').value.trim(),
+        baseUrl: modelConfigState.customBaseUrlAllowed ? document.getElementById('modelBaseUrl').value.trim() : '',
         modelName: document.getElementById('modelNameInput').value.trim(),
-        apiKey: document.getElementById('modelApiKey').value
+        contextWindowTokens: windowValue,
+        apiKey: document.getElementById('modelClearApiKey').checked ? '__CLEAR__' : key
     };
+    setModelConfigBusy(true);
     try {
         const resp = await fetch('/api/model', {
             method: 'PUT',
@@ -277,17 +336,21 @@ async function saveModelConfig() {
             body: JSON.stringify(body)
         });
         const data = await resp.json();
-        if (!data.success) {
-            document.getElementById('modelMenuHint').textContent = data.message || '保存失败';
+        if (!resp.ok || !data.success || data.customBaseUrlRejected) {
+            document.getElementById('modelMenuHint').textContent = data.message || '保存失败，配置未变更';
             return;
         }
         applyModelConfigView(data);
     } catch (e) {
         document.getElementById('modelMenuHint').textContent = '保存失败: ' + e.message;
+    } finally {
+        setModelConfigBusy(false);
     }
 }
 
 async function resetModelConfig() {
+    if (modelConfigState.saving) return;
+    setModelConfigBusy(true);
     try {
         const resp = await fetch('/api/model', {
             method: 'PUT',
@@ -295,9 +358,12 @@ async function resetModelConfig() {
             body: JSON.stringify({ reset: true })
         });
         const data = await resp.json();
+        if (!resp.ok || !data.success) throw new Error(data.message || '恢复默认失败');
         applyModelConfigView(data);
     } catch (e) {
         document.getElementById('modelMenuHint').textContent = '恢复失败: ' + e.message;
+    } finally {
+        setModelConfigBusy(false);
     }
 }
 

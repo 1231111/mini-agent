@@ -69,8 +69,9 @@ public class GraphScheduler {
      * 幂等键 = 计划版本 + 节点 + **绑定参数摘要**。
      *
      * <p>为什么必须带参数摘要：动作日志（{@code ActionJournalKey}）用它判"这个动作做过没有"，
-     * 而 {@code ToolPipeline} 命中 {@code SUCCEEDED} 时直接返回
-     * {@code {"success":true,"deduplicated":true}} —— 不会再执行。</p>
+     * 而 {@code ToolPipeline} 命中 {@code SUCCEEDED} 时不会再执行，返回
+     * {@code UNKNOWN + deduplicated + requiresReadback}，要求只读回验实际业务结果；
+     * 执行回执本身不能代替节点验收证据。</p>
      *
      * <p>此前键里只有 {@code planVersion + nodeId}，于是"上一步参数写错但被记为成功 → 用改正的
      * 参数重试"会命中同一条日志、被判成重复动作而**静默跳过**，节点还被标成成功，

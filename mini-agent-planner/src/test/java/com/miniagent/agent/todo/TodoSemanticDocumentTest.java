@@ -6,6 +6,9 @@ import org.apache.poi.xslf.usermodel.XMLSlideShow;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.apache.poi.xwpf.usermodel.XWPFDocument;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterEach;
+import com.miniagent.agent.tool.WorkspaceContext;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
@@ -17,6 +20,9 @@ import static org.junit.jupiter.api.Assertions.*;
 class TodoSemanticDocumentTest {
     @TempDir
     Path dir;
+
+    @BeforeEach void bindWorkspace() { WorkspaceContext.setRootOverride(dir); }
+    @AfterEach void clearWorkspace() { WorkspaceContext.clearRootOverride(); }
 
     @Test
     void rejectsPlainTextMasqueradingAsOfficeOrPdf() throws Exception {

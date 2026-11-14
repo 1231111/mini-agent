@@ -18,6 +18,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -31,6 +32,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ScheduledFuture;
 
 /**
  * 会话事件中心：事件生产与 HTTP 连接解耦。
@@ -48,6 +51,10 @@ public class SessionEventCenter {
     private static final String PENDING_USER_MSG_STATE_PREFIX = "pending-user-msg-state:";
     private static final String PENDING_USER_MSG_RUN_PREFIX = "pending-user-msg-run:";
     private static final Duration PENDING_USER_MSG_TTL = Duration.ofHours(2);
+    private static final int DELIVERY_QUEUE_LIMIT = 128;
+    private static final Semaphore DELIVERY_WORKERS = new Semaphore(64);
+    private static final Semaphore CLOSE_WORKERS = new Semaphore(16);
+    private static final long SEND_TIMEOUT_MS = 5_000L;
     private static final org.springframework.data.redis.core.script.DefaultRedisScript<Long> REDIS_APPEND_SCRIPT =
             new org.springframework.data.redis.core.script.DefaultRedisScript<>(
                     "local runToken = redis.call('GET', KEYS[1]) "
@@ -86,6 +93,10 @@ public class SessionEventCenter {
      * 只按 sessionId 记账的话，退出登录后已建立的长连接不会被摘掉，仍会继续收到该会话的推送。
      */
     private final Map<SseEmitter, Long> emitterOwner = new ConcurrentHashMap<>();
+    private final Map<SseEmitter, DeliveryQueue> clientDeliveries = new ConcurrentHashMap<>();
+    /** Reused across executions of a session, so Redis start/event/end frames retain their order. */
+    private final Map<String, DeliveryQueue> redisDeliveries = new ConcurrentHashMap<>();
+    private final long sendTimeoutMillis;
     private final String instanceId = UUID.randomUUID().toString();
     private final ScheduledExecutorService cleaner =
             Executors.newSingleThreadScheduledExecutor(r -> {
@@ -101,14 +112,189 @@ public class SessionEventCenter {
     @Autowired(required = false)
     private ReplicaProperties replicaProperties;
 
-    public SessionEventCenter() {
+    public SessionEventCenter() { this(SEND_TIMEOUT_MS); }
+
+    SessionEventCenter(long sendTimeoutMillis) {
+        this.sendTimeoutMillis = Math.max(50L, sendTimeoutMillis);
         cleaner.scheduleWithFixedDelay(this::removeExpiredChannels, 60, 60, TimeUnit.SECONDS);
+        cleaner.scheduleWithFixedDelay(() -> redisDeliveries.values().forEach(DeliveryQueue::start),
+                250, 250, TimeUnit.MILLISECONDS);
     }
 
     /** Stop the cleaner on context shutdown/reload so old application contexts do not retain it. */
     @PreDestroy
     void shutdown() {
+        clientDeliveries.values().forEach(DeliveryQueue::close);
+        redisDeliveries.values().forEach(DeliveryQueue::close);
+        clientDeliveries.clear();
+        redisDeliveries.clear();
         cleaner.shutdownNow();
+    }
+
+    /** External writes never hold a channel state lock. Stuck writes retain a globally bounded worker slot. */
+    private final class DeliveryQueue {
+        private final ArrayDeque<Runnable> pending = new ArrayDeque<>();
+        private final boolean dropSlowClient;
+        private final Runnable onDrop;
+        private Thread worker;
+        private boolean closed;
+
+        DeliveryQueue(boolean dropSlowClient, Runnable onDrop) {
+            this.dropSlowClient = dropSlowClient;
+            this.onDrop = onDrop;
+        }
+
+        void offer(Runnable delivery, Runnable recovery) {
+            boolean overflow = false;
+            synchronized (this) {
+                if (closed) return;
+                if (pending.size() >= DELIVERY_QUEUE_LIMIT) {
+                    if (dropSlowClient) overflow = true;
+                    else {
+                        // Redis notifications are best effort. Preserve a fresh start and the latest frame;
+                        // final end/error carries the full answer, and durable task/history data repairs gaps.
+                        pending.clear();
+                        if (recovery != null) pending.add(recovery);
+                        log.warn("SSE Redis notification backlog compacted; task state remains available from history");
+                    }
+                }
+                if (!overflow) pending.add(delivery);
+            }
+            if (overflow) drop();
+            else start();
+        }
+
+        void start() {
+            boolean saturated = false;
+            synchronized (this) {
+                if (closed || worker != null || pending.isEmpty()) return;
+                if (!DELIVERY_WORKERS.tryAcquire()) saturated = dropSlowClient;
+                else {
+                    worker = Thread.ofVirtual().name("session-event-delivery").unstarted(this::drain);
+                    worker.start();
+                }
+            }
+            if (saturated) drop();
+        }
+
+        private void drain() {
+            try {
+                while (true) {
+                    Runnable delivery;
+                    synchronized (this) {
+                        if (closed || pending.isEmpty()) return;
+                        delivery = pending.removeFirst();
+                    }
+                    Thread.interrupted(); // A previous transport timeout must not poison the next notification.
+                    Thread active = Thread.currentThread();
+                    Object deadlineGate = new Object();
+                    boolean[] finished = { false };
+                    ScheduledFuture<?> timeout = cleaner.schedule(() -> {
+                        synchronized (deadlineGate) {
+                            if (finished[0]) return;
+                            finished[0] = true;
+                            if (dropSlowClient) drop();
+                            else active.interrupt();
+                        }
+                    }, sendTimeoutMillis, TimeUnit.MILLISECONDS);
+                    try { delivery.run(); }
+                    catch (RuntimeException failed) {
+                        if (dropSlowClient) { drop(); return; }
+                        log.debug("Redis event notification failed: {}", failed.getClass().getSimpleName());
+                    } finally {
+                        synchronized (deadlineGate) { finished[0] = true; }
+                        timeout.cancel(false);
+                    }
+                }
+            } finally {
+                synchronized (this) { worker = null; }
+                DELIVERY_WORKERS.release();
+                start(); // An enqueue may race the final empty-queue check.
+            }
+        }
+
+        private void drop() {
+            if (closeOnce() && onDrop != null) onDrop.run();
+        }
+
+        void close() { closeOnce(); }
+
+        private boolean closeOnce() {
+            Thread active;
+            synchronized (this) {
+                if (closed) return false;
+                closed = true; pending.clear(); active = worker;
+            }
+            if (active != null && active != Thread.currentThread()) active.interrupt();
+            return true;
+        }
+    }
+
+    private static void closeEmitterAsync(SseEmitter emitter) {
+        if (!CLOSE_WORKERS.tryAcquire()) return; // Already detached: servlet timeout will also close its transport.
+        Thread.ofVirtual().name("session-event-close").start(() -> {
+            try { emitter.complete(); } catch (RuntimeException ignored) { }
+            finally { CLOSE_WORKERS.release(); }
+        });
+    }
+
+    private DeliveryQueue deliveryFor(SessionChannel channel, SseEmitter emitter) {
+        return clientDeliveries.computeIfAbsent(emitter, ignored -> new DeliveryQueue(true, () -> {
+            detachClient(channel, emitter);
+            closeEmitterAsync(emitter);
+        }));
+    }
+
+    private void enqueueClient(SessionChannel channel, SseEmitter emitter, String name, Object data) {
+        DeliveryQueue queue = clientDeliveries.get(emitter);
+        if (queue == null) return;
+        Object payload = data instanceof Map<?, ?> || data instanceof List<?> ? JSON.valueToTree(data) : data;
+        queue.offer(() -> {
+            if (!sendEvent(emitter, name, payload)) throw new IllegalStateException("SSE connection unavailable");
+        }, null);
+    }
+
+    private void enqueueClientTerminal(SessionChannel channel, SseEmitter emitter, String name, Object data) {
+        DeliveryQueue queue = clientDeliveries.get(emitter);
+        if (queue == null) return;
+        queue.offer(() -> {
+            try {
+                sendEvent(emitter, name, data);
+                emitter.complete();
+            } finally { detachClient(channel, emitter); }
+        }, null);
+    }
+
+    private void enqueueRedis(SessionChannel channel, String type, String name, Object data) {
+        if (!redisMode()) return;
+        String sid = channel.sessionId;
+        String token = channel.runToken;
+        Object payload = data instanceof Map<?, ?> || data instanceof List<?> ? JSON.valueToTree(data) : data;
+        String user = channel.userMessage;
+        // A terminal enqueue can be the frame that overflows the queue. Preserve the frozen
+        // classification and pending interaction, rather than replaying an unclassified end/error.
+        Object outcome = freezeNotificationState(channel.taskOutcome);
+        Object planApproval = freezeNotificationState(channel.planApproval);
+        Object permissionAsk = freezeNotificationState(channel.permissionAsk);
+        Object userQuestion = freezeNotificationState(channel.userQuestion);
+        redisDeliveries.computeIfAbsent(sid, ignored -> new DeliveryQueue(false, null)).offer(
+                () -> publishToOtherInstances(sid, type, name, payload, token),
+                () -> {
+                    publishToOtherInstances(sid, "start", "user", user, token);
+                    if (planApproval != null && !"plan_approval".equals(name))
+                        publishToOtherInstances(sid, "event", "plan_approval", planApproval, token);
+                    if (permissionAsk != null && !"permission_ask".equals(name))
+                        publishToOtherInstances(sid, "event", "permission_ask", permissionAsk, token);
+                    if (userQuestion != null && !"user_question".equals(name))
+                        publishToOtherInstances(sid, "event", "user_question", userQuestion, token);
+                    if (outcome != null && !"task_outcome".equals(name))
+                        publishToOtherInstances(sid, "event", "task_outcome", outcome, token);
+                });
+    }
+
+    private static Object freezeNotificationState(Object data) {
+        if (data instanceof JsonNode node) return node.deepCopy();
+        return data instanceof Map<?, ?> || data instanceof List<?> ? JSON.valueToTree(data) : data;
     }
 
     @PostConstruct
@@ -205,7 +391,7 @@ public class SessionEventCenter {
                 log.warn("Redis 追加消息状态初始化失败: sessionId={}, err={}", k, e.getMessage());
             }
         }
-        publishToOtherInstances(k, "start", "user", channel.userMessage, channel.runToken);
+        enqueueRedis(channel, "start", "user", channel.userMessage);
         return channel.runToken;
     }
 
@@ -224,7 +410,7 @@ public class SessionEventCenter {
             }
             applyPayload(channel, name, data);
             sendToLocalClients(channel, name, data);
-            publishToOtherInstances(key(sessionId), "event", name, data, channel.runToken);
+            enqueueRedis(channel, "event", name, data);
         }
     }
 
@@ -238,12 +424,15 @@ public class SessionEventCenter {
         if (Objects.isNull(channel)) {
             return;
         }
-        channel.subgoalText = Optional.ofNullable(subText).orElse("");
-        channel.subgoalDone = done;
-        channel.subgoalTotal = total;
-        Object payload = subgoalPayload(subText, done, total);
-        sendToLocalClients(channel, "subgoal", payload);
-        publishToOtherInstances(key(sessionId), "event", "subgoal", payload, channel.runToken);
+        synchronized (channel.bufferLock) {
+            if (channel.status != Status.running) return;
+            channel.subgoalText = Optional.ofNullable(subText).orElse("");
+            channel.subgoalDone = done;
+            channel.subgoalTotal = total;
+            Object payload = subgoalPayload(subText, done, total);
+            sendToLocalClients(channel, "subgoal", payload);
+            enqueueRedis(channel, "event", "subgoal", payload);
+        }
     }
 
     /** 推送完整 todo/计划列表（前端勾选列表）。 */
@@ -252,11 +441,14 @@ public class SessionEventCenter {
         if (Objects.isNull(channel)) {
             return;
         }
-        List<Map<String, Object>> copy = items == null ? List.of() : List.copyOf(items);
-        channel.todoItems = copy;
-        Map<String, Object> payload = todoPayload(copy);
-        sendToLocalClients(channel, "todo", payload);
-        publishToOtherInstances(key(sessionId), "event", "todo", payload, channel.runToken);
+        synchronized (channel.bufferLock) {
+            if (channel.status != Status.running) return;
+            List<Map<String, Object>> copy = items == null ? List.of() : List.copyOf(items);
+            channel.todoItems = copy;
+            Map<String, Object> payload = todoPayload(copy);
+            sendToLocalClients(channel, "todo", payload);
+            enqueueRedis(channel, "event", "todo", payload);
+        }
     }
 
     private static Map<String, Object> subgoalPayload(String text, int done, int total) {
@@ -274,10 +466,9 @@ public class SessionEventCenter {
     }
 
     private void sendToLocalClients(SessionChannel channel, String name, Object data) {
-        for (SseEmitter client : channel.clients) {
-            if (!sendEvent(client, name, data)) {
-                channel.clients.remove(client);
-            }
+        Object payload = data instanceof Map<?, ?> || data instanceof List<?> ? JSON.valueToTree(data) : data;
+        synchronized (channel.bufferLock) {
+            for (SseEmitter client : channel.clients) enqueueClient(channel, client, name, payload);
         }
     }
 
@@ -305,51 +496,47 @@ public class SessionEventCenter {
         // Replay and registration share the terminal lock: no end/error can fall
         // between the status check and adding a reconnecting client.
         synchronized (channel.bufferLock) {
-            sendEvent(emitter, "session", Optional.ofNullable(channel.sessionId).orElse(""));
+            deliveryFor(channel, emitter); // Only attachment can create a queue; detached snapshots cannot resurrect it.
+            if (Objects.nonNull(userId)) emitterOwner.put(emitter, userId);
+            emitter.onCompletion(() -> detachClient(channel, emitter));
+            emitter.onTimeout(() -> detachClient(channel, emitter));
+            emitter.onError(e -> detachClient(channel, emitter));
+            channel.clients.add(emitter);
+            enqueueClient(channel, emitter, "session", Optional.ofNullable(channel.sessionId).orElse(""));
             if (Objects.nonNull(channel.userMessage) && !channel.userMessage.isEmpty()) {
-                sendEvent(emitter, "user", channel.userMessage);
+                enqueueClient(channel, emitter, "user", channel.userMessage);
             }
             String thinkSnapshot = snapshot(channel, channel.think);
             if (!thinkSnapshot.isEmpty()) {
-                sendEvent(emitter, "thinking", thinkSnapshot);
+                enqueueClient(channel, emitter, "thinking", thinkSnapshot);
             }
             if (channel.planApproval != null) {
-                sendEvent(emitter, "plan_approval", channel.planApproval);
+                enqueueClient(channel, emitter, "plan_approval", channel.planApproval);
             }
             if (channel.permissionAsk != null) {
-                sendEvent(emitter, "permission_ask", channel.permissionAsk);
+                enqueueClient(channel, emitter, "permission_ask", channel.permissionAsk);
             }
             if (channel.userQuestion != null) {
-                sendEvent(emitter, "user_question", channel.userQuestion);
+                enqueueClient(channel, emitter, "user_question", channel.userQuestion);
             }
             if (channel.todoItems != null && !channel.todoItems.isEmpty()) {
-                sendEvent(emitter, "todo", todoPayload(channel.todoItems));
+                enqueueClient(channel, emitter, "todo", todoPayload(channel.todoItems));
             } else if (channel.subgoalTotal > 0) {
-                sendEvent(emitter, "subgoal", subgoalPayload(
+                enqueueClient(channel, emitter, "subgoal", subgoalPayload(
                         channel.subgoalText, channel.subgoalDone, channel.subgoalTotal));
             }
             String answerSnapshot = snapshot(channel, channel.answer);
             if (!answerSnapshot.isEmpty()) {
-                sendEvent(emitter, "token", answerSnapshot);
+                enqueueClient(channel, emitter, "token", answerSnapshot);
             }
             if (channel.taskOutcome != null) {
-                sendEvent(emitter, "task_outcome", channel.taskOutcome);
+                enqueueClient(channel, emitter, "task_outcome", channel.taskOutcome);
             }
 
             if (channel.status == Status.done) {
-                sendEvent(emitter, "end", Optional.ofNullable(channel.finalAnswer).orElse(""));
-                try { emitter.complete(); } catch (Exception ignored) {}
+                enqueueClientTerminal(channel, emitter, "end", Optional.ofNullable(channel.finalAnswer).orElse(""));
             } else if (channel.status == Status.error) {
-                sendEvent(emitter, "error", Optional.ofNullable(channel.errorMsg).orElse("处理出错"));
-                try { emitter.complete(); } catch (Exception ignored) {}
-            } else {
-                if (Objects.nonNull(userId)) {
-                    emitterOwner.put(emitter, userId);
-                }
-                emitter.onCompletion(() -> detachClient(channel, emitter));
-                emitter.onTimeout(() -> detachClient(channel, emitter));
-                emitter.onError(e -> detachClient(channel, emitter));
-                channel.clients.add(emitter);
+                enqueueClientTerminal(channel, emitter, "error", Optional.ofNullable(channel.errorMsg).orElse("处理出错"));
             }
             return true;
         }
@@ -359,6 +546,8 @@ public class SessionEventCenter {
     private void detachClient(SessionChannel channel, SseEmitter emitter) {
         channel.clients.remove(emitter);
         emitterOwner.remove(emitter);
+        DeliveryQueue queue = clientDeliveries.remove(emitter);
+        if (queue != null) queue.close();
     }
 
     /**
@@ -374,24 +563,15 @@ public class SessionEventCenter {
             return 0;
         }
         int removed = 0;
-        for (SessionChannel channel : channels.values()) {
-            for (SseEmitter emitter : channel.clients) {
-                if (!userId.equals(emitterOwner.get(emitter))) {
-                    continue;
-                }
-                try {
-                    emitter.send(SseEmitter.event().name("logout").data(""));
-                } catch (Exception ignored) {
-                    // 对端已断开，直接摘
-                }
-                try {
-                    emitter.complete();
-                } catch (Exception ignored) {
-                    // 同上
-                }
-                detachClient(channel, emitter);
-                removed++;
-            }
+        // Terminal frames are also queued. Their clients may already be absent from channel.clients,
+        // but logout must still discard those not-yet-delivered frames.
+        for (Map.Entry<SseEmitter, Long> entry : emitterOwner.entrySet()) {
+            SseEmitter emitter = entry.getKey();
+            if (!userId.equals(entry.getValue()) || !emitterOwner.remove(emitter, userId)) continue;
+            DeliveryQueue queue = clientDeliveries.get(emitter);
+            if (queue != null) queue.drop();
+            else closeEmitterAsync(emitter);
+            removed++;
         }
         if (removed > 0) {
             log.info("登出摘流 userId={} 关闭连接数={}", userId, removed);
@@ -420,11 +600,9 @@ public class SessionEventCenter {
             }
             channel.doneAt = System.currentTimeMillis();
             for (SseEmitter client : channel.clients) {
-                sendEvent(client, "end", channel.finalAnswer);
-                try { client.complete(); } catch (Exception ignored) {}
+                enqueueClientTerminal(channel, client, "end", channel.finalAnswer);
             }
-            channel.clients.clear();
-            publishToOtherInstances(key(sessionId), "complete", "end", channel.finalAnswer, channel.runToken);
+            enqueueRedis(channel, "complete", "end", channel.finalAnswer);
         }
     }
 
@@ -449,11 +627,9 @@ public class SessionEventCenter {
             }
             channel.doneAt = System.currentTimeMillis();
             for (SseEmitter client : channel.clients) {
-                sendEvent(client, "error", channel.errorMsg);
-                try { client.complete(); } catch (Exception ignored) {}
+                enqueueClientTerminal(channel, client, "error", channel.errorMsg);
             }
-            channel.clients.clear();
-            publishToOtherInstances(key(sessionId), "error", "error", channel.errorMsg, channel.runToken);
+            enqueueRedis(channel, "error", "error", channel.errorMsg);
         }
     }
 
@@ -490,7 +666,7 @@ public class SessionEventCenter {
         String value = Objects.requireNonNullElse(message, "");
         String ack = value.length() > 50 ? value.substring(0, 50) + "..." : value;
         sendToLocalClients(channel, "append_ack", ack);
-        publishToOtherInstances(k, "event", "append_ack", ack, channel.runToken);
+        enqueueRedis(channel, "event", "append_ack", ack);
         log.info("用户追加消息入队: sessionId={}, length={}", sessionId, value.length());
         return true;
     }
@@ -631,7 +807,7 @@ public class SessionEventCenter {
             node.put("name", name == null ? "" : name);
             node.put("sessionId", sessionId);
             if (runToken != null) node.put("runToken", runToken);
-            if (data instanceof Map<?, ?> || data instanceof List<?>) {
+            if (data instanceof Map<?, ?> || data instanceof List<?> || data instanceof JsonNode) {
                 node.set("data", JSON.valueToTree(data));
             } else {
                 node.put("data", data == null ? "" : String.valueOf(data));
@@ -708,10 +884,8 @@ public class SessionEventCenter {
                         channel.status = Status.done;
                         channel.doneAt = System.currentTimeMillis();
                         for (SseEmitter client : channel.clients) {
-                            sendEvent(client, "end", channel.finalAnswer);
-                            try { client.complete(); } catch (Exception ignored) {}
+                            enqueueClientTerminal(channel, client, "end", channel.finalAnswer);
                         }
-                        channel.clients.clear();
                     }
                     case "error" -> {
                         if (channel.status != Status.running) return;
@@ -719,10 +893,8 @@ public class SessionEventCenter {
                         channel.status = Status.error;
                         channel.doneAt = System.currentTimeMillis();
                         for (SseEmitter client : channel.clients) {
-                            sendEvent(client, "error", channel.errorMsg);
-                            try { client.complete(); } catch (Exception ignored) {}
+                            enqueueClientTerminal(channel, client, "error", channel.errorMsg);
                         }
-                        channel.clients.clear();
                     }
                     default -> {
                         if (channel.status != Status.running) return;
@@ -819,9 +991,14 @@ public class SessionEventCenter {
         long now = System.currentTimeMillis();
         channels.entrySet().removeIf(e -> {
             SessionChannel channel = e.getValue();
-            return channel.status != Status.running
+            boolean expired = channel.status != Status.running
                     && channel.doneAt > 0
                     && (now - channel.doneAt) > DONE_TTL_MS;
+            if (expired) {
+                DeliveryQueue notifications = redisDeliveries.remove(e.getKey());
+                if (notifications != null) notifications.close();
+            }
+            return expired;
         });
     }
 }

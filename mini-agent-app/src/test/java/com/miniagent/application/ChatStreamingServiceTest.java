@@ -14,6 +14,8 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 class ChatStreamingServiceTest {
 
@@ -76,5 +78,26 @@ class ChatStreamingServiceTest {
         emitter.complete();
         emitter.complete();
 
+    }
+
+    @Test
+    void localLifecycleReservationCoversPendingRunningAndCompletingWithoutCallingOtherServices() {
+        TaskRunService runs = mock(TaskRunService.class);
+        ReflectionTestUtils.setField(service, "taskRunService", runs);
+        assertThat(service.tryCreateStreamForAcceptedRun("s1", "hello", 7L).accepted()).isTrue();
+        clearInvocations(eventCenter, runs);
+
+        assertThat(service.hasLocalLifecycleReservation("s1")).isTrue();
+        assertThat(service.hasLocalLifecycleReservation("s2")).isFalse();
+        service.markRunning("s1");
+        assertThat(service.hasLocalLifecycleReservation("s1")).isTrue();
+        service.markCompleting("s1");
+        assertThat(service.hasLocalLifecycleReservation("s1")).isTrue();
+        assertThat(service.hasLocalLifecycleReservation("s2")).isFalse();
+        service.markIdle("s1");
+        assertThat(service.hasLocalLifecycleReservation("s1")).isFalse();
+        assertThat(service.hasLocalLifecycleReservation(null)).isFalse();
+        assertThat(service.hasLocalLifecycleReservation("  ")).isFalse();
+        verifyNoInteractions(eventCenter, runs);
     }
 }

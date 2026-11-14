@@ -70,7 +70,9 @@ public class ModelClientFactory {
         String key = settings.cacheKey() + "|think=" + thinking;
         ResolvedModels hit = cache.get(key);
         if (Objects.nonNull(hit)) {
-            return hit;
+            // Connection parameters can share clients, but request budgets and preset
+            // metadata belong to this resolution, not the first user of this cache key.
+            return new ResolvedModels(hit.chat(), hit.streaming(), settings);
         }
 
         log.info("构建用户模型客户端: preset={}, model={}, baseUrl={}, thinking={}",

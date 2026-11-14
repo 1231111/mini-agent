@@ -2,7 +2,10 @@ package com.miniagent.agent.execution;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import com.miniagent.agent.coding.DiagnosticCollector;
+import com.miniagent.agent.desktop.DesktopInteractionService;
 import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.core.ExecutionTurnContext;
 import com.miniagent.agent.core.RunScope;
@@ -87,6 +90,7 @@ public class ToolPipeline {
      * 缺席时只是没有诊断反馈，不影响任何工具执行。
      */
     private DiagnosticCollector diagnosticCollector;
+    private DesktopInteractionService desktopInteractionService;
     @Value("${agent.browser.evaluate-enabled:false}")
     private boolean browserEvaluateEnabled;
     @Value("${agent.permissions.ask-grant-ttl-seconds:300}")
@@ -122,6 +126,11 @@ public class ToolPipeline {
     @Autowired(required = false)
     public void setDiagnosticCollector(DiagnosticCollector diagnosticCollector) {
         this.diagnosticCollector = diagnosticCollector;
+    }
+
+    @Autowired(required = false)
+    public void setDesktopInteractionService(DesktopInteractionService desktopInteractionService) {
+        this.desktopInteractionService = desktopInteractionService;
     }
 
     /**
@@ -172,7 +181,7 @@ public class ToolPipeline {
         ExecutionControl.StopReason stop = executionControl.beforeTool(sid);
         if (stop != ExecutionControl.StopReason.NONE) {
             return ToolInvocation.controlStop(name, ToolResult.failure(
-                    controlErrorCode(stop), controlMessage(stop), false));
+                    controlErrorCode(stop), controlMessage(stop), false), stop);
         }
         ExecutionTurnContext.Scope fence = run.execution();
         if (fence != null && !fence.isValid()) {
@@ -256,8 +265,20 @@ public class ToolPipeline {
                     RunStatus.SUCCESS.name());
         }
         if (needsGrant && !granted) {
-            AskGrant grant = permissionStore.issueAskGrant(
-                    sid, name, effective, askGrantTtlSeconds() * 1000L);
+            AskGrant grant;
+            if ("desktop_act".equals(name)) {
+                long observationExpiry = desktopObservationExpiry(run, effective);
+                if (observationExpiry <= System.currentTimeMillis()) return staleDesktopObservation(name);
+                long ttl = TimeUnit.SECONDS.toMillis(askGrantTtlSeconds());
+                long now = System.currentTimeMillis();
+                long normalExpiry = now > Long.MAX_VALUE - ttl ? Long.MAX_VALUE : now + ttl;
+                grant = permissionStore.issueAskGrantUntil(sid, name, effective,
+                        Math.min(normalExpiry, observationExpiry));
+                if (grant == null) return staleDesktopObservation(name);
+            } else {
+                grant = permissionStore.issueAskGrant(sid, name, effective,
+                        TimeUnit.SECONDS.toMillis(askGrantTtlSeconds()));
+            }
             boolean attached = request.waitForApproval() && grant != null
                     && permissionStore.attachAskResume(sid, grant.token());
             emitPermissionAsk(sid, name, effective, grant == null ? null : grant.token(),
@@ -280,7 +301,7 @@ public class ToolPipeline {
                             "{\"tool\":\"" + name + "\",\"reason\":\"control_stop\"}",
                             RunStatus.FAILURE.name());
                     return ToolInvocation.controlStop(name, ToolResult.failure(
-                            controlErrorCode(waitStop), controlMessage(waitStop), false));
+                            controlErrorCode(waitStop), controlMessage(waitStop), false), waitStop);
                 }
                 var approval = permissionStore.awaitAskApproval(sid, grant.token(),
                         Math.max(1L, grant.expiresAtEpochMillis() - System.currentTimeMillis()),
@@ -289,7 +310,7 @@ public class ToolPipeline {
                     waitStop = executionControl.stopReason(sid);
                     if (waitStop != ExecutionControl.StopReason.NONE) {
                         return ToolInvocation.controlStop(name, ToolResult.failure(
-                                controlErrorCode(waitStop), controlMessage(waitStop), false));
+                                controlErrorCode(waitStop), controlMessage(waitStop), false), waitStop);
                     }
                     // 拒绝、超时、取消都会走到这里。必须留一条 PERM_DENY：
                     // 前端那句「用户未在有效期内批准」和真实原因（点了拒绝 / 超时）
@@ -320,7 +341,7 @@ public class ToolPipeline {
                         "{\"tool\":\"" + name + "\",\"reason\":\"interrupted\"}",
                         RunStatus.FAILURE.name());
                 return ToolInvocation.controlStop(name, ToolResult.failure(
-                        ToolErrorCode.CANCELLED, "等待批准时任务已取消", false));
+                        ToolErrorCode.CANCELLED, "等待批准时任务已取消", false), ExecutionControl.StopReason.CANCELLED);
             } finally {
                 executionControl.markHumanWaitpoint(sid, false);
             }
@@ -359,13 +380,28 @@ public class ToolPipeline {
         return ToolInvocation.executed(name, result);
     }
 
+    private long desktopObservationExpiry(RunScope run, String arguments) {
+        if (desktopInteractionService == null) return 0L;
+        try {
+            JsonNode args = ARGS_JSON.readTree(arguments);
+            String id = args == null ? "" : args.path("observationId").asText("");
+            return desktopInteractionService.observationExpiresAt(run.owner().userId(), run.owner().tenantId(),
+                    run.sessionId(), id).map(java.time.Instant::toEpochMilli).orElse(0L);
+        } catch (Exception invalid) { return 0L; }
+    }
+
+    private static ToolInvocation staleDesktopObservation(String name) {
+        return ToolInvocation.policyDenied(name, ToolResult.failure(ToolErrorCode.CONFLICT,
+                "STALE_OBSERVATION: 桌面观察已过期、已撤销或不属于当前任务，请重新desktop_observe并为新动作重新申请授权。", false));
+    }
+
     /** Recheck after every blocking boundary, including the resource lock wait. */
     private ToolInvocation executionBoundary(RunScope run, String name, int turn) {
         String sid = run.sessionId();
         ExecutionControl.StopReason stop = executionControl.checkpoint(sid);
         if (stop != ExecutionControl.StopReason.NONE) {
             return ToolInvocation.controlStop(name, ToolResult.failure(
-                    controlErrorCode(stop), controlMessage(stop), false));
+                    controlErrorCode(stop), controlMessage(stop), false), stop);
         }
         ExecutionTurnContext.Scope fence = run.execution();
         if (fence != null && !fence.isValid()) {
@@ -443,40 +479,105 @@ public class ToolPipeline {
         ActionJournalKey key = journalKey(run, sessionId, name, arguments, turn, runId,
                 actionBinding);
         String argumentsHash = sha256(arguments);
-        int attempt = 1;
+        ExecutionTurnContext.Scope effectScope = run.execution();
+        String effectHash = effectScope != null && descriptor.sideEffect() != ToolSideEffect.READ_ONLY
+                ? effectArgumentsHash(arguments) : null;
+        ActionJournalKey effectKey = effectHash == null ? null : new ActionJournalKey(effectScope.sessionId(),
+                sha256(effectScope.executionId()) + ":" + effectScope.planVersion(),
+                "effect-" + effectScope.effectNamespace(), sha256(name + "\n" + effectHash));
+        int attempt;
         try {
-            Optional<ActionJournalEntry> previous = actionJournal.latest(key);
-            if (previous.isPresent()) {
-                ActionJournalEntry entry = previous.get();
+            if (effectKey != null) {
+                Optional<ActionJournalEntry> pendingEffect = actionJournal.latest(effectKey);
+                if (pendingEffect.isPresent() && (pendingEffect.get().status() == ActionExecutionStatus.RUNNING
+                        || pendingEffect.get().status() == ActionExecutionStatus.UNKNOWN)) {
+                    return ToolInvocation.executed(name, ToolResult.unknown(
+                            "相同副作用已有未确认记录，禁止变更调用编号后自动重试", null));
+                }
+            }
+            // Pre-upgrade DAG receipts have no execution identity. They cannot
+            // prove a new task succeeded, but unresolved side effects must still
+            // stop a resumed task until explicit human review revises its plan.
+            ActionJournalKey legacy = legacyJournalKey(run, name, arguments, turn, actionBinding);
+            if (legacy != null) {
+                Optional<ActionJournalEntry> old = actionJournal.latest(legacy);
+                if (old.isPresent() && (old.get().status() == ActionExecutionStatus.RUNNING
+                        || old.get().status() == ActionExecutionStatus.UNKNOWN))
+                    return ToolInvocation.executed(name,
+                            ToolResult.unknown("旧动作仍有未确认执行记录，需人工核验后再继续", null));
+                // The preceding format already included execution identity but
+                // used the planner binding directly for the first model call.
+                ExecutionTurnContext.ActionBinding original = run.execution().legacyBinding(actionBinding != null
+                        ? actionBinding : run.execution().resolve(name + "@" + turn + "@" + sha256(arguments), name));
+                ActionJournalKey oldOperation = journalKey(run, sessionId, name, arguments, turn, runId, original);
+                if (!oldOperation.equals(key)) {
+                    old = actionJournal.latest(oldOperation);
+                    if (old.isPresent() && (old.get().status() == ActionExecutionStatus.RUNNING
+                            || old.get().status() == ActionExecutionStatus.UNKNOWN))
+                        return ToolInvocation.executed(name,
+                                ToolResult.unknown("旧操作仍有未确认执行记录，需先核验实际状态", null));
+                }
+            }
+            ActionJournal.Claim claim = actionJournal.claim(key, name, argumentsHash, descriptor.idempotent());
+            ActionJournalEntry entry = claim.entry();
+            if (!name.equals(entry.toolName()) || !argumentsHash.equals(entry.argumentsHash())) {
+                return ToolInvocation.executed(name, ToolResult.failure(ToolErrorCode.CONFLICT,
+                        "动作幂等键与原工具或参数不一致", false));
+            }
+            if (!claim.acquired()) {
                 if (entry.status() == ActionExecutionStatus.UNKNOWN
                         || entry.status() == ActionExecutionStatus.RUNNING) {
                     return ToolInvocation.executed(name,
                             ToolResult.unknown("动作已有未确认执行记录，禁止自动重试", null));
                 }
                 if (entry.status() == ActionExecutionStatus.SUCCEEDED) {
+                    // A receipt proves execution, not the original business
+                    // result. Never feed an empty success into DAG acceptance.
                     return ToolInvocation.executed(name,
-                            ToolResult.success("{\"success\":true,\"deduplicated\":true}"));
+                            ToolResult.unknown("动作已确认执行过，本次已去重；原业务结果不可回放，请只读回验实际结果后再完成验收",
+                                    "{\"success\":false,\"status\":\"unknown\",\"errorCode\":\"OUTCOME_UNKNOWN\","
+                                            + "\"deduplicated\":true,\"requiresReadback\":true,"
+                                            + "\"error\":\"动作已确认执行过，禁止重复执行；原业务结果不可回放，请先只读回验\"}"));
                 }
-                if (!descriptor.idempotent() || !entry.status().terminal()) {
-                    return ToolInvocation.executed(name, ToolResult.failure(ToolErrorCode.CONFLICT,
-                            "动作已有终态记录且不满足安全重试条件: " + entry.status(),
-                            false));
-                }
-                attempt = entry.attempt() + 1;
-                journal(key, name, argumentsHash, ActionExecutionStatus.READY, attempt,
-                        ToolErrorCode.NONE, "幂等动作恢复重试", "");
-            } else {
-                journal(key, name, argumentsHash, ActionExecutionStatus.PLANNED, 0,
-                        ToolErrorCode.NONE, "", "");
-                journal(key, name, argumentsHash, ActionExecutionStatus.READY, attempt,
-                        ToolErrorCode.NONE, "", "");
+                return ToolInvocation.executed(name, ToolResult.failure(ToolErrorCode.CONFLICT,
+                        "动作已有记录且不满足安全重试条件: " + entry.status(), false));
             }
-            journal(key, name, argumentsHash, ActionExecutionStatus.RUNNING, attempt,
-                    ToolErrorCode.NONE, "", "");
+            if (entry.status() != ActionExecutionStatus.RUNNING || entry.attempt() < 1)
+                throw new IllegalStateException("ACTION_JOURNAL_INVALID_PERMIT");
+            attempt = entry.attempt();
         } catch (Exception e) {
             log.error("Action Journal 预写失败，拒绝工具 {}: {}", name, e.getMessage());
             return ToolInvocation.executed(name, ToolResult.failure(
                     ToolErrorCode.INTERNAL_ERROR, "无法持久化工具执行计划", false));
+        }
+
+        EffectPermit effect = null;
+        if (effectKey != null) {
+            try {
+                ActionJournal.Claim permit = actionJournal.claimEffect(effectKey, name, effectHash);
+                ActionJournalEntry receipt = permit.entry();
+                if (!permit.acquired() || receipt.status() != ActionExecutionStatus.RUNNING
+                        || receipt.attempt() < 1 || !name.equals(receipt.toolName())
+                        || !effectHash.equals(receipt.argumentsHash())) {
+                    ToolResult blocked = ToolResult.unknown(
+                            "相同副作用已有未确认记录，变更工具调用编号也不能重放；请先核验实际状态", null);
+                    journal(key, name, argumentsHash, ActionExecutionStatus.UNKNOWN, attempt,
+                            blocked.errorCode(), blocked.message(), sha256(blocked.legacyText()));
+                    return ToolInvocation.executed(name, blocked);
+                }
+                effect = new EffectPermit(effectKey, effectHash, receipt.attempt());
+            } catch (Exception unavailable) {
+                // This operation owns a receipt but has no effect permission. It
+                // must be closed before returning, and must never reach a handler.
+                ToolResult blocked = ToolResult.unknown("无法确认副作用执行许可，禁止自动重试", null);
+                try {
+                    journal(key, name, argumentsHash, ActionExecutionStatus.UNKNOWN, attempt,
+                            blocked.errorCode(), blocked.message(), sha256(blocked.legacyText()));
+                } catch (Exception persistenceFailure) {
+                    log.error("工具 {} 副作用许可及操作收口失败，保留 RUNNING 记录", name);
+                }
+                return ToolInvocation.executed(name, blocked);
+            }
         }
 
         ToolResult result;
@@ -507,6 +608,12 @@ public class ToolPipeline {
         try {
             journal(key, name, argumentsHash, terminalStatus(journalResult), attempt,
                     journalResult.errorCode(), journalResult.message(), sha256(journalResult.legacyText()));
+            // Never release the stable effect quarantine until its operation
+            // outcome committed. A failure in either write leaves it blocking.
+            if (effect != null) {
+                journal(effect.key(), name, effect.argumentsHash(), terminalStatus(journalResult), effect.attempt(),
+                        journalResult.errorCode(), journalResult.message(), sha256(journalResult.legacyText()));
+            }
         } catch (Exception e) {
             log.error("工具 {} 已执行但无法写入终态 Journal: {}", name, e.getMessage());
             return ToolInvocation.executed(name,
@@ -520,6 +627,20 @@ public class ToolPipeline {
 
     private record GuardedExecution(ToolInvocation invocation, ToolResult journalResult,
                                     boolean interrupted) { }
+
+    private record EffectPermit(ActionJournalKey key, String argumentsHash, int attempt) { }
+
+    /** Sort every JSON object, retaining array order and the exact tool arguments. */
+    private static String effectArgumentsHash(String arguments) {
+        try {
+            Object value = ARGS_JSON.readerFor(Object.class)
+                    .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readValue(arguments);
+            return sha256(ARGS_JSON.writer().with(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS)
+                    .writeValueAsString(value));
+        } catch (Exception invalidJson) {
+            return sha256(arguments);
+        }
+    }
 
     /**
      * Keep locks on the actual handler thread until it really exits. Interrupting
@@ -540,7 +661,8 @@ public class ToolPipeline {
                     if (rejection != null) return rejection;
                     synchronized (gate) {
                         if (abandoned.get()) return ToolInvocation.controlStop(name,
-                                ToolResult.failure(ToolErrorCode.CANCELLED, "工具调用已停止", false));
+                                ToolResult.failure(ToolErrorCode.CANCELLED, "工具调用已停止", false),
+                                ExecutionControl.StopReason.CANCELLED);
                         handlerStarted.set(true);
                         // Approval, pauses and resource-lock waits have their own bounds.
                         budget.start();
@@ -560,7 +682,7 @@ public class ToolPipeline {
                 if (stop != ExecutionControl.StopReason.NONE) {
                     return abandonExecution(name, descriptor, gate, abandoned, handlerStarted, worker,
                             ToolInvocation.controlStop(name, ToolResult.failure(
-                                    controlErrorCode(stop), controlMessage(stop), false)), false);
+                                    controlErrorCode(stop), controlMessage(stop), false), stop), false);
                 }
                 if (budget.expired()) {
                     // Give cooperative handlers a short opportunity to release resources.
@@ -587,7 +709,8 @@ public class ToolPipeline {
         } catch (InterruptedException e) {
             return abandonExecution(name, descriptor, gate, abandoned, handlerStarted, worker,
                     ToolInvocation.controlStop(name,
-                            ToolResult.failure(ToolErrorCode.CANCELLED, "工具执行被取消", false)), true);
+                            ToolResult.failure(ToolErrorCode.CANCELLED, "工具执行被取消", false),
+                            ExecutionControl.StopReason.CANCELLED), true);
         } catch (ExecutionException e) {
             if (budget.expired()) {
                 ToolResult timedOut = budget.timeoutResult(descriptor);
@@ -645,12 +768,22 @@ public class ToolPipeline {
                     ? suppliedBinding
                     : fence.resolve(name + "@" + turn + "@" + sha256(arguments), name);
             return new ActionJournalKey(
-                    fence.sessionId(), fence.planVersion(),
-                    binding.nodeId(), binding.idempotencyKey());
+                    fence.sessionId(), sha256(fence.executionId()) + ":" + fence.planVersion(),
+                    binding.nodeId(), sha256(binding.idempotencyKey() + "\n" + name + "\n" + sha256(arguments)));
         }
         return new ActionJournalKey(
                 sessionId, "run-" + runId, "turn-" + turn + "-" + name,
                 sha256(name + "\n" + Objects.requireNonNullElse(arguments, "")));
+    }
+
+    private ActionJournalKey legacyJournalKey(RunScope run, String name, String arguments, int turn,
+                                              ExecutionTurnContext.ActionBinding suppliedBinding) {
+        ExecutionTurnContext.Scope fence = run == null ? null : run.execution();
+        if (fence == null) return null;
+        ExecutionTurnContext.ActionBinding binding = suppliedBinding != null ? suppliedBinding
+                : fence.resolve(name + "@" + turn + "@" + sha256(arguments), name);
+        binding = fence.legacyBinding(binding);
+        return new ActionJournalKey(fence.sessionId(), fence.planVersion(), binding.nodeId(), binding.idempotencyKey());
     }
 
     private void journal(

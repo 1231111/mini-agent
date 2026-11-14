@@ -26,7 +26,7 @@ public class DesktopInteractionService {
     private final DesktopBackend backend;
     private final Clock clock;
     @Value("${agent.desktop.enabled:false}") private boolean enabled;
-    private Observation observation;
+    private volatile Observation observation;
     private String leaseOwner;
     private volatile InputLease inputLease;
     private Instant leaseUntil = Instant.EPOCH;
@@ -43,6 +43,21 @@ public class DesktopInteractionService {
     }
     private record Observation(String id, String owner, DesktopBackend.Window window,
                                List<DesktopBackend.Window> windows, Instant expires) {}
+
+    /** Trusted approval boundary: never extend an observation or consume native input here. */
+    public Optional<Instant> observationExpiresAt(Long userId, String tenant, String session, String id) {
+        String requestedOwner;
+        try { requestedOwner = identity(userId, tenant, session); }
+        catch (IllegalArgumentException invalidOwner) { return Optional.empty(); }
+        // Approval must not wait on a native action holding the service monitor.
+        Observation observed = observation;
+        InputLease lease = inputLease;
+        if (!enabled || observed == null || lease == null || lease.revoked.get()
+                || !Objects.equals(session, lease.session) || !requestedOwner.equals(observed.owner())
+                || !observed.id().equals(id) || !clock.instant().isBefore(observed.expires())
+                || observation != observed) return Optional.empty();
+        return Optional.of(observed.expires());
+    }
 
     public DesktopInteractionService() { this(new WindowsDesktopBackend(), Clock.systemUTC(), false); }
     DesktopInteractionService(DesktopBackend backend, Clock clock, boolean enabled) {

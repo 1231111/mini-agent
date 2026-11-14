@@ -215,7 +215,44 @@ function bindLightbox(row) {
     });
 }
 
+/** Open answer links through the desktop bridge, without popup windows or leaving the chat. */
+function handleChatExternalLink(event) {
+    const link = event.target?.closest?.('a[href]');
+    if (!link || !link.closest?.('.bot-body') || link.hasAttribute('data-auth-download')
+            || link.hasAttribute('download') || event.defaultPrevented) return false;
+    const href = link.getAttribute('href') || '';
+    let parsed;
+    try { parsed = new URL(href, window.location.href); } catch (_) { return false; }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.origin === window.location.origin) return false;
+    if (parsed.username || parsed.password) {
+        event.preventDefault(); showChatLinkError(link, '链接包含账号密码，请使用不含凭据的网页地址。'); return true;
+    }
+    link.target = '_blank'; link.rel = 'noopener noreferrer';
+    const bridge = window.electronAPI;
+    if (!bridge || typeof bridge.openExternal !== 'function') return false;
+    event.preventDefault();
+    if (link.getAttribute('data-external-opening') === 'true') return true;
+    link.setAttribute('data-external-opening', 'true');
+    Promise.resolve().then(() => bridge.openExternal(parsed.href)).then(result => {
+        if (!result?.ok) throw new Error(result?.error || '无法打开系统浏览器，请稍后重试。');
+        const notice = link.nextElementSibling;
+        if (notice?.classList?.contains('chat-link-error')) notice.remove();
+    }).catch(error => showChatLinkError(link, error?.message || '无法打开系统浏览器，请稍后重试。'))
+        .finally(() => link.removeAttribute('data-external-opening'));
+    return true;
+}
+
+function showChatLinkError(link, message) {
+    let notice = link.nextElementSibling;
+    if (!notice?.classList?.contains('chat-link-error')) {
+        notice = document.createElement('span'); notice.className = 'chat-link-error';
+        notice.setAttribute('role', 'alert'); link.after(notice);
+    }
+    notice.textContent = message;
+}
+
 document.addEventListener('click', async event => {
+    if (handleChatExternalLink(event)) return;
     const link = event.target.closest('a[data-auth-download], a.workspace-download-link[aria-disabled="true"]');
     if (!link) return;
     event.preventDefault();

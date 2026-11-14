@@ -6,7 +6,6 @@ import com.miniagent.common.model.EffectiveModelContext;
 import com.miniagent.config.entity.User;
 import com.miniagent.config.repository.UserRepository;
 import com.miniagent.config.service.DatabaseConversationStore;
-import com.miniagent.memory.MemoryStore;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -32,8 +31,8 @@ import java.util.Optional;
  *   <li>{@link #bindUser} —— 模型 + 归属（租户自动从 {@code users} 表解析）</li>
  * </ul>
  *
- * <p>所有绑定都用 try-with-resources 保证退出时精确恢复，支持嵌套。解析不到用户或模型
- * 解析失败时返回空绑定，调用方随后自然回退到全局 Bean。
+ * <p>所有绑定都用 try-with-resources 保证退出时精确恢复，支持嵌套。没有用户时可返回空绑定；
+ * 已知用户的模型解析失败必须中止调用，不能将其会话内容改发给全局模型。
  */
 @Slf4j
 @Component
@@ -53,12 +52,9 @@ public class UserModelBinder {
         if (sessionId == null || sessionId.isBlank()) {
             return Optional.empty();
         }
-        try {
-            return conversationStore.findUserIdBySession(sessionId);
-        } catch (Exception e) {
-            log.debug("会话归属查询失败: session={}, {}", sessionId, e.getMessage());
-            return Optional.empty();
-        }
+        // A lookup failure is not evidence that the session has no owner.
+        // Propagate it so background callers cannot silently use platform models.
+        return conversationStore.findUserIdBySession(sessionId);
     }
 
     /** 按 sessionId 反查归属用户后一次绑好模型与归属；无归属用户时返回空绑定。 */
@@ -77,22 +73,21 @@ public class UserModelBinder {
             return Binding.noop();
         }
         Binding owner = bindOwner(userId, resolveTenantId(userId));
-        Binding model = bindModel(userId);
-        return Binding.of(model, owner);
+        try {
+            Binding model = bindModel(userId);
+            return Binding.of(model, owner);
+        } catch (RuntimeException | Error failed) {
+            owner.close();
+            throw failed;
+        }
     }
 
-    /** 只绑该用户的模型。解析失败时返回空绑定（回退全局模型）。 */
+    /** 只绑该用户的模型。配置无效时抛出异常，由后台任务保留未处理状态并提示修复。 */
     public Binding bindModel(Long userId) {
         if (userId == null) {
             return Binding.noop();
         }
-        ModelClientFactory.ResolvedModels models;
-        try {
-            models = modelClientFactory.resolve(userId);
-        } catch (Exception e) {
-            log.warn("解析用户模型失败，回退全局模型: userId={}, {}", userId, e.getMessage());
-            return Binding.noop();
-        }
+        ModelClientFactory.ResolvedModels models = modelClientFactory.resolve(userId);
         log.debug("已绑定用户模型: userId={}, model={}", userId, models.settings().modelName());
         // 窗口必须一起绑：后台线程（记忆巩固、每日画像、压缩摘要）用的是同一条绑定量，
         // 不传窗口时这些线程按「窗口未知」处理，压缩判据退化到配置上限。
@@ -125,8 +120,7 @@ public class UserModelBinder {
     }
 
     /**
-     * 绑定句柄。{@link #of} 按「先 model 后 owner」的顺序构造，
-     * 关闭时反向恢复（先 owner 后 model），与绑定时相反。
+     * 绑定句柄。先绑定 owner 再绑定 model，关闭时反向恢复（先 model 后 owner）。
      */
     @FunctionalInterface
     public interface Binding extends AutoCloseable {
@@ -156,8 +150,11 @@ public class UserModelBinder {
             Binding model = modelBinding == null ? noop() : modelBinding;
             Binding owner = ownerBinding == null ? noop() : ownerBinding;
             return () -> {
-                owner.close();
-                model.close();
+                try {
+                    model.close();
+                } finally {
+                    owner.close();
+                }
             };
         }
     }

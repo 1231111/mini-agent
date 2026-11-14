@@ -12,8 +12,8 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 /**
  * 幂等键必须包含**绑定参数摘要**。
  *
- * <p>背景：{@code ToolPipeline} 命中动作日志里的 {@code SUCCEEDED} 时会直接返回
- * {@code {"success":true,"deduplicated":true}} 而不执行。此前幂等键只有
+ * <p>背景：{@code ToolPipeline} 命中动作日志里的 {@code SUCCEEDED} 时不会再次执行，
+ * 而是返回 {@code UNKNOWN + deduplicated + requiresReadback}，要求只读回验。此前幂等键只有
  * {@code planVersion + nodeId}，于是"上一步参数写错但被记为成功 → 用改正的参数重试"
  * 会命中同一条日志被静默跳过，节点还被标成成功 —— 表面全绿、实际没做。
  * 这些用例锁住"参数变则键变"，同时锁住"参数不变则键不变"（崩溃恢复的去重语义要保留）。</p>

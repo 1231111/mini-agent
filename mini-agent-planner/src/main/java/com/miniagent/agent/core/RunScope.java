@@ -44,7 +44,8 @@ public record RunScope(
         int contextWindowTokens,
         String projectId,
         String executionRunToken,
-        SearchDateContext.Window searchDateWindow
+        SearchDateContext.Window searchDateWindow,
+        String operationRootSession
 ) {
     @FunctionalInterface
     public interface Binding extends AutoCloseable {
@@ -82,14 +83,16 @@ public record RunScope(
                 AgentLoop.getCurrentChatModel(),
                 AgentLoop.getCurrentStreamingModel(),
                 EffectiveModelContext.currentContextWindow(),
-                OwnerContext.currentProjectId(), TaskExecutionContext.currentRunToken(), SearchDateContext.current());
+                OwnerContext.currentProjectId(), TaskExecutionContext.currentRunToken(), SearchDateContext.current(),
+                WorkspaceContext.getOperationRootSession());
     }
 
     public RunScope withSession(String sid) {
         return new RunScope(
                 sid, owner, turnPolicy, permissionMode, confirmPolicy, planApproved, permissionForced,
                 subagent, parentSessionId, role, taskName, writeTask, workspaceRoot,
-                execution, taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken, searchDateWindow);
+                execution, taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken, searchDateWindow,
+                subagent ? operationRootSession : sid);
     }
 
     /**
@@ -106,13 +109,17 @@ public record RunScope(
     public RunScope asSubagent(
             String subSessionId, String roleId, PermissionMode childMode, Path subWorkspace) {
         String parent = sessionId == null ? "" : sessionId;
+        String root = operationRootSession == null || operationRootSession.isBlank()
+                ? (subagent && !parentSessionId.isBlank() ? parentSessionId : parent) : operationRootSession;
         PermissionMode mode = childMode == null ? permissionMode : childMode;
         return new RunScope(
                 subSessionId, owner, LoopTurnPolicy.NONE,
                 mode, confirmPolicy,
                 planApproved, true, true, parent,
                 roleId == null ? "" : roleId, taskName, "out", subWorkspace,
-                null, taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken, searchDateWindow);
+                execution == null ? null : execution.forSubagent(subSessionId),
+                taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken, searchDateWindow,
+                root);
     }
 
     /**
@@ -171,6 +178,7 @@ public record RunScope(
         }
         // 会话标识与工作区根必须同源安装：工具结果里的媒体地址要靠它指回正确的根
         WorkspaceContext.setSessionOverride(sessionId);
+        WorkspaceContext.setOperationRootSession(operationRootSession);
         ExecutionTurnContext.set(execution);
         TaskExecutionContext.set(taskId, executionRunToken);
         SearchDateContext.set(searchDateWindow);

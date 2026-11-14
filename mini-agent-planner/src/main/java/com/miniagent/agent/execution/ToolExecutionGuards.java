@@ -7,6 +7,7 @@ import com.miniagent.agent.tool.ToolDescriptor;
 import com.miniagent.agent.tool.ToolExecutionProfile;
 import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.agent.tool.ToolSideEffect;
+import com.miniagent.agent.tool.WorkspaceContext;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.stereotype.Component;
@@ -17,6 +18,7 @@ import java.util.Optional;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 全局有界并发加上固定条带资源锁。
@@ -51,6 +53,12 @@ public class ToolExecutionGuards implements SmartInitializingSingleton {
     private final AgentToolsProperties properties;
     private final Semaphore globalConcurrency;
     private final Semaphore[] resourceLocks = new Semaphore[LOCK_STRIPES];
+    private final ConcurrentHashMap<String, Integer> activeHandlers = new ConcurrentHashMap<>();
+
+    /** Handler lifetime, including uncooperative work after the caller has timed out. */
+    public boolean hasActiveHandlers(String sessionId) {
+        return sessionId != null && activeHandlers.getOrDefault(sessionId, 0) > 0;
+    }
 
     public ToolExecutionGuards(ToolRegistry registry, AgentToolsProperties properties) {
         this.registry = registry;
@@ -209,9 +217,18 @@ public class ToolExecutionGuards implements SmartInitializingSingleton {
                 resourceAcquired = true;
             }
             if (budget != null) budget.start();
+            // Capture before the handler can detach/restore its child scope. This
+            // closure owns both counts until the actual handler thread exits.
+            String rootSession = WorkspaceContext.getOperationRootSession();
+            List<String> activityKeys = sessionId == null ? List.of()
+                    : rootSession == null || rootSession.isBlank() || rootSession.equals(sessionId)
+                    ? List.of(sessionId) : List.of(sessionId, rootSession);
+            activityKeys.forEach(key -> activeHandlers.merge(key, 1, Integer::sum));
             try {
                 return operation.call();
             } finally {
+                activityKeys.forEach(activityKey -> activeHandlers.computeIfPresent(activityKey,
+                        (key, count) -> count <= 1 ? null : count - 1));
                 if (budget != null) budget.finish();
             }
         } finally {

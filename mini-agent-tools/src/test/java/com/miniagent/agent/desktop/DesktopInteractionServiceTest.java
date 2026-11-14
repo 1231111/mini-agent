@@ -49,6 +49,55 @@ class DesktopInteractionServiceTest {
         return json.path("observationId").asText();
     }
     private static DesktopBackend.Action click(int x, int y) { return new DesktopBackend.Action("click", x, y, null, null, null, null); }
+    @Test void approvalExpiryIsOwnedAndDoesNotExtendOrConsumeTheObservation() throws Exception {
+        String id = observe();
+        Instant expiry = Instant.parse("2026-11-12T04:02:00Z");
+        assertEquals(expiry, service.observationExpiresAt(7L, "tenant", "chat-a", id).orElseThrow());
+        assertTrue(service.observationExpiresAt(8L, "tenant", "chat-a", id).isEmpty());
+        assertTrue(service.observationExpiresAt(7L, "other", "chat-a", id).isEmpty());
+        assertTrue(service.observationExpiresAt(7L, "tenant", "chat-b", id).isEmpty());
+        assertTrue(service.observationExpiresAt(7L, "tenant", "chat-a", "old-id").isEmpty());
+        assertTrue(service.observationExpiresAt(null, "tenant", "chat-a", id).isEmpty());
+        verify(backend, never()).execute(any(), any());
+        assertTrue(service.act(id, click(1, 1)).isSuccess(), "reading approval metadata must not consume the observation");
+        assertTrue(service.observationExpiresAt(7L, "tenant", "chat-a", id).isEmpty());
+    }
+    @Test void expiredAndRevokedObservationsCannotIssueApprovalMetadata() throws Exception {
+        Clock clock = mock(Clock.class);
+        var now = new java.util.concurrent.atomic.AtomicReference<>(Instant.parse("2026-11-12T04:00:00Z"));
+        when(clock.instant()).thenAnswer(i -> now.get());
+        service = new DesktopInteractionService(backend, clock, true);
+        String id = observe();
+        now.set(now.get().plusSeconds(120));
+        assertTrue(service.observationExpiresAt(7L, "tenant", "chat-a", id).isEmpty());
+        assertEquals(ToolErrorCode.CONFLICT, service.act(id, click(1, 1)).errorCode());
+        String fresh = observe();
+        service.revokeSession("chat-a");
+        assertTrue(service.observationExpiresAt(7L, "tenant", "chat-a", fresh).isEmpty());
+        verify(backend, never()).execute(any(), any());
+    }
+    @Test void approvalMetadataDoesNotBlockBehindAnInFlightNativeAction() throws Exception {
+        String id = observe();
+        CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+        doAnswer(i -> { entered.countDown(); assertTrue(release.await(3, TimeUnit.SECONDS)); return null; })
+                .when(backend).execute(any(), any());
+        try (var pool = Executors.newSingleThreadExecutor()) {
+            var action = pool.submit(() -> {
+                bind("chat-a");
+                try { return service.act(id, click(1, 1)); }
+                finally {
+                    OwnerContext.clearCurrentUser(); OwnerContext.clearCurrentTenant();
+                    WorkspaceContext.clearSessionOverride(); WorkspaceContext.clearRootOverride();
+                }
+            });
+            try {
+                assertTrue(entered.await(1, TimeUnit.SECONDS));
+                assertTimeoutPreemptively(Duration.ofMillis(300), () ->
+                        assertTrue(service.observationExpiresAt(7L, "tenant", "chat-a", id).isEmpty()));
+            } finally { release.countDown(); }
+            assertTrue(action.get(2, TimeUnit.SECONDS).isSuccess());
+        }
+    }
     @Test void observesActsAndReturnsNewObservationWithoutReplayingOldInput() throws Exception {
         String id = observe();
         var result = service.act(id, click(10, 20)); assertTrue(result.isSuccess(), result.legacyText());

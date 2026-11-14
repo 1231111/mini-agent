@@ -38,8 +38,19 @@ for (const file of ['13-markdown.js', '14-media-src.js', '12-message.js']) {
 
 const inline = text => String.fromCharCode(96) + text + String.fromCharCode(96);
 const tick = () => new Promise(resolve => setImmediate(resolve));
+// This suite checks reference recognition and authenticated downloads. Attachment
+// grid layout needs a real DOM and is covered by the browser render checks.
+function render(text) {
+    const document = context.document;
+    try {
+        context.document = undefined;
+        return context.renderMD(text);
+    } finally {
+        context.document = document;
+    }
+}
 function candidate(name) {
-    const html = context.renderMD(inline(name));
+    const html = render(inline(name));
     const match = html.match(/data-workspace-file-check="([^"]+)"/);
     assert.ok(match, html);
     const url = match[1].replace(/&amp;/g, '&');
@@ -61,15 +72,17 @@ function candidate(name) {
 }
 
 {
-    const html = context.renderMD(inline('start_*.bat') + '、' + inline('package.json'));
+    const html = render(inline('start_*.bat') + '、' + inline('package.json'));
     assert.match(html, /<code>start_\*\.bat<\/code>/);
+    assert.match(html, /<code>package\.json<\/code>/);
     assert.doesNotMatch(html, /start_.*<em>/);
-    assert.doesNotMatch(html, /data-auth-download/);
-    assert.match(html, /data-workspace-file-check/);
-    console.log('PASS: wildcard references stay literal and cannot corrupt download URLs');
+    assert.doesNotMatch(html, /data-auth-download|data-workspace-file-check/);
+    assert.match(render(inline('package.json')), /data-workspace-file-check/);
+    assert.doesNotMatch(render(inline('start_*.bat')), /data-auth-download|data-workspace-file-check/);
+    console.log('PASS: prose filenames and wildcards stay literal; standalone exact filenames are checked');
 }
 {
-    const html = context.renderMD(inline('<img src=x onerror=alert(1)>.html'));
+    const html = render(inline('<img src=x onerror=alert(1)>.html'));
     assert.doesNotMatch(html, /<img src=x/);
     assert.match(html, /&lt;img/);
     console.log('PASS: protected inline code remains escaped');
@@ -108,13 +121,13 @@ function candidate(name) {
 {
     const file = candidate('workspace/docs/readme.md');
     assert.match(file.url, /^\/api\/workspace-download\?path=docs%2Freadme.md&sid=/);
-    const html = context.renderMD('交付文件： workspace/docs/readme.md');
+    const html = render('交付文件： workspace/docs/readme.md');
     assert.match(html, /data-workspace-file-check="\/api\/workspace-download\?path=docs%2Freadme.md&amp;sid=/);
     console.log('PASS: nested workspace references resolve relative to the workspace root');
 }
 {
     vm.runInContext('currentId = null', context);
-    const html = context.renderMD(inline('README.md'));
+    const html = render(inline('README.md'));
     assert.doesNotMatch(html, /data-workspace-file-check|data-auth-download/);
     vm.runInContext("currentId = 'owned-session'", context);
     console.log('PASS: references without an owned session cannot become download links');

@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "responsive-ui-interaction",
+      "category": "ui",
+      "tier": "smoke",
+      "prompt": "生成一个中文 AI 工作台网页，保存为当前会话工作目录中的 index.html。页面使用内联 CSS 和 JavaScript，离线可运行，不使用 CDN、网络请求、外部字体、图片依赖或构建命令。页面包含顶部导航 nav、标题 h1、任务摘要卡片，以及一个 id 为 create-task 的可点击按钮和一个 id 为 task-status 的可见状态区域。点击 create-task 按钮后，task-status 的 textContent 必须精确变为：任务已创建。不要隐藏导航、按钮或状态区域。界面在 1280×800 与 390×844 两种视口均能正常使用且没有横向滚动，卡片适应窄屏。最终回复实际生成的 index.html 文件链接。",
+      "sloMs": 120000,
+      "timeoutMs": 180000,
+      "checks": [
+        {
+          "type": "ui-artifact",
+          "viewports": [
+            { "width": 1280, "height": 800 },
+            { "width": 390, "height": 844 }
+          ],
+          "requiredSelectors": ["nav", "h1", "#create-task", "#task-status"],
+          "requiredActions": [
+            {
+              "id": "create-task",
+              "action": "click",
+              "selector": "#create-task",
+              "observe": { "selector": "#task-status", "property": "textContent" },
+              "expectedState": "任务已创建"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

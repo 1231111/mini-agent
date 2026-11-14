@@ -141,6 +141,11 @@ public final class ToolConcurrencyPolicy {
             ToolTimeoutRecovery.ABORT,
             "，表单动作结果未知；先 browser_form_inspect 或 browser_form_verify 核验当前字段，禁止自动重复填写、上传或提交", 0);
 
+    /** Clearing authentication is explicit and must never race or automatically repeat after a lost reply. */
+    private static final ToolExecutionProfile BROWSER_CLEAR_SESSION = new ToolExecutionProfile(
+            10, 0, 10, ToolConcurrencyScope.SESSION, "", "",
+            ToolTimeoutRecovery.ABORT, "，登录态清除结果未知；请核验当前会话，禁止自动重新登录或重复清除", 0);
+
     /** The foreground input device is shared by every chat on this host. */
     private static final ToolExecutionProfile DESKTOP_OBSERVE = new ToolExecutionProfile(
             15, 0, 3, ToolConcurrencyScope.SHARED_RESOURCE, "", "desktop:local-input",
@@ -270,6 +275,7 @@ public final class ToolConcurrencyPolicy {
 
             // ── 浏览器（同一个页面必须串行） ──
             case "browser_close" -> BROWSER.withBudget(10);
+            case "browser_clear_session" -> BROWSER_CLEAR_SESSION;
             case "browser_snapshot", "browser_evaluate" -> BROWSER.withBudget(15);
             case "browser_form_inspect", "browser_form_verify" -> BROWSER.withBudget(15);
             case "browser_select", "browser_set_checked", "browser_upload" -> BROWSER_FORM_ACTION;
@@ -441,7 +447,7 @@ public final class ToolConcurrencyPolicy {
             return ToolSideEffect.READ_ONLY;
         }
         if (Set.of("write_file", "edit_file", "todo", "memory", "skill_manage",
-                "browser_screenshot").contains(name)) return ToolSideEffect.WRITE;
+                "browser_screenshot", "browser_clear_session").contains(name)) return ToolSideEffect.WRITE;
         return ToolSideEffect.EXTERNAL_WRITE;
     }
 

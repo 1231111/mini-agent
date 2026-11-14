@@ -45,7 +45,8 @@
         <dependency>
             <groupId>com.microsoft.playwright</groupId>
             <artifactId>playwright</artifactId>
-            <version>1.49.0</version>
+            <!-- 1.59 fixes optional WebSocket close fields that crashed 1.49–1.58 routing/teardown. -->
+            <version>1.59.0</version>
         </dependency>
         <dependency>
             <groupId>net.java.dev.jna</groupId>

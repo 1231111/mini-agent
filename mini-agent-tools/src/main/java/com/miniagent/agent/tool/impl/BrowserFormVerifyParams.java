@@ -14,7 +14,7 @@ public class BrowserFormVerifyParams extends ToolParams {
     private String expectedValue;
     @ToolParamSchema(description = "期望勾选状态")
     private Boolean expectedChecked;
-    @ToolParamSchema(description = "期望选中的原生select选项value数组，顺序不影响核验")
+    @ToolParamSchema(description = "期望选中的原生select或受支持ARIA下拉的选项value数组，顺序不影响核验")
     private List<String> expectedValues;
     @ToolParamSchema(description = "期望的上传文件名数组，只传文件名而非本地路径")
     private List<String> expectedFiles;

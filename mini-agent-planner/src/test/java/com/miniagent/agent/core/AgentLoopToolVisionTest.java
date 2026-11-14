@@ -295,6 +295,32 @@ class AgentLoopToolVisionTest {
     }
 
     @Test
+    void insufficientModelWindowDoesNotInflateBudgetOrCallTheProvider() {
+        Fixture f = fixture(false);
+        register(f.registry, "read_file", ToolResult.success("fixture"));
+        EffectiveModelContext.set(f.text, null, 1_024);
+
+        var outcome = run(f, null);
+
+        assertFalse(outcome.successful());
+        assertEquals(ToolErrorCode.INVALID_ARGUMENT, outcome.lastToolResult().errorCode());
+        assertTrue(outcome.text().contains("上下文窗口不足"));
+        verifyNoInteractions(f.text, f.vision, f.compressor);
+    }
+
+    @Test
+    void smallUsableModelWindowIsPassedToCompressionWithoutIncreasingIt() {
+        Fixture f = fixture(false);
+        register(f.registry, "read_file", ToolResult.success("fixture"));
+        EffectiveModelContext.set(f.text, null, 2_048);
+        when(f.text.chat(any(ChatRequest.class))).thenReturn(answer("Hello."));
+
+        assertTrue(run(f, null).successful());
+
+        verify(f.compressor).maybeCompress(anyList(), eq(2_048 - 170), eq(SESSION), anyInt());
+    }
+
+    @Test
     void observationMessagesDoNotResetTheBrowserProbeLoopGuard() throws Exception {
         Path image = ToolObservationProjectorTest.png(workspace.resolve("screen.png"), 2, 2);
         WorkspaceContext.setRootOverride(workspace);

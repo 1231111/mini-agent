@@ -572,6 +572,7 @@ public class AgentLoop {
         boolean goalAnchorInjected = false;     // 是否已注入任务目标锚定
         volatile String permissionAskTool = null;
         volatile String userQuestionText = null;
+        volatile ExecutionControl.StopReason controlStopReason = ExecutionControl.StopReason.NONE;
         volatile boolean unknownOutcome = false;
         volatile String unknownOutcomeMessage = "";
         volatile Set<String> allowedToolsForTurn = Set.of();
@@ -839,7 +840,17 @@ public class AgentLoop {
                 window = visionWindow > 0 ? Math.min(configuredWindow, visionWindow) : configuredWindow;
             }
             int schemaTokens = toolSchemaTokenEstimate(specsForTurn.size());
-            int budget = Math.max(1000, window - schemaTokens);
+            int budget = window - schemaTokens;
+            if (budget < 1000) {
+                // Raising the message budget here would exceed the model window.
+                // Fail before a model request instead of reporting a provider/network error.
+                state.loopEndReason = RunStatus.FAILURE.name();
+                state.noteStructuredResult("context_budget", ToolResult.failure(
+                        ToolErrorCode.INVALID_ARGUMENT,
+                        "当前模型上下文窗口不足以容纳本轮工具定义和任务内容。"
+                                + "请在模型设置中核对服务商的上下文窗口，或选择更大窗口的模型。", false));
+                return finish(state.lastToolResult.message(), state, messages);
+            }
             // 压缩是**同步阻塞**的：执行到这里本轮就不再往下走，压完才发请求。
             // 只有工程压缩不够小时才会再插一次摘要用的 LLM 调用。
             int observed = observedMessageTokens(sessionId, schemaTokens);
@@ -1083,10 +1094,21 @@ public class AgentLoop {
                 }
 
                 executeToolCalls(toolCalls, messages, state);
+                if (state.controlStopReason != ExecutionControl.StopReason.NONE) {
+                    state.loopEndReason = state.controlStopReason.name();
+                    String stopped = controlMessage(state.controlStopReason);
+                    if (state.unknownOutcome) {
+                        stopped += "。工具调用可能已产生副作用，但终态无法确认。"
+                                + UserFacingFailure.summarize(state.unknownOutcomeMessage, "操作回执未确认。")
+                                + " 请先核验实际状态，再决定是否重试或补偿。";
+                    }
+                    return finish(stopped, state, messages);
+                }
                 if (state.unknownOutcome) {
                     state.loopEndReason = OUTCOME_UNKNOWN;
                     return finish("工具调用可能已产生副作用，但终态无法确认。"
-                            + state.unknownOutcomeMessage + " 请先核验实际状态，再决定是否重试或补偿。",
+                            + UserFacingFailure.summarize(state.unknownOutcomeMessage, "操作回执未确认。")
+                            + " 请先核验实际状态，再决定是否重试或补偿。",
                             state, messages);
                 }
                 if (state.observationProjectionFailed) {
@@ -1178,6 +1200,12 @@ public class AgentLoop {
         log.warn("Agent 循环达到最大迭代次数 {}", iterations);
         state.loopEndReason = LOOP_MAX_ITERATIONS;
         return finish(buildMaxIterationFallback(state, iterations), state, messages);
+        } catch (ModelCallControl.StoppedException stopped) {
+            state.loopEndReason = stopped.reason().name();
+            return finish(controlMessage(stopped.reason()), state, messages);
+        } catch (java.util.concurrent.CancellationException cancelled) {
+            state.loopEndReason = CANCELLED;
+            return finish("任务已取消", state, messages);
         } finally {
             if (Objects.nonNull(traceRecorder)) {
                 if (SubagentContext.isActive()) {
@@ -1460,7 +1488,11 @@ public class AgentLoop {
             case GATE_DENIED -> state.noteGateDenied(invocation.toolName());
             case PERMISSION_ASK -> state.permissionAskTool = invocation.toolName();
             case USER_QUESTION -> state.userQuestionText = invocation.loopSignal();
-            case EXECUTED, POLICY_DENIED, PERMISSION_DENIED, CONTROL_STOP, FENCE_REJECTED -> {
+            case CONTROL_STOP -> {
+                ExecutionControl.StopReason stop = invocation.controlStopReason();
+                if (stop != ExecutionControl.StopReason.NONE) state.controlStopReason = stop;
+            }
+            case EXECUTED, POLICY_DENIED, PERMISSION_DENIED, FENCE_REJECTED -> {
             }
         }
         return invocation.text();
@@ -1503,18 +1535,26 @@ public class AgentLoop {
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
             boolean resetBeforeCall = attempted && streamSink != null;
             attempted = true;
+            java.util.concurrent.atomic.AtomicBoolean acceptingCallbacks = new java.util.concurrent.atomic.AtomicBoolean(true);
             try {
-                ChatResponse response = Objects.isNull(streamSink) || selectedStreamingModel == null
+                ChatResponse response = new ModelCallControl(executionControl).call(() ->
+                        Objects.isNull(streamSink) || selectedStreamingModel == null
                         ? chatModel.chat(request)
-                        : callLlmStreaming(selectedStreamingModel, request, streamSink, resetBeforeCall);
+                        : callLlmStreaming(selectedStreamingModel, request, streamSink, resetBeforeCall, acceptingCallbacks));
+                acceptingCallbacks.set(false);
                 // Some configured vision endpoints expose only a synchronous client.
                 // Never send images to a different, global text streaming client.
                 if (streamSink != null && selectedStreamingModel == null && response != null
                         && response.aiMessage() != null && StringUtils.isNotBlank(response.aiMessage().text())) {
                     try {
-                        if (resetBeforeCall) streamSink.onAnswerReset();
-                        streamSink.onAnswerToken(response.aiMessage().text());
+                        ChatResponse completed = response;
+                        new ModelCallControl(executionControl).call(() -> {
+                            if (resetBeforeCall) streamSink.onAnswerReset();
+                            streamSink.onAnswerToken(completed.aiMessage().text());
+                            return null;
+                        });
                     } catch (Exception ignored) {
+                        ModelCallControl.rethrowIfStopped(ignored);
                         // Client display failures must not replay a completed model response.
                     }
                 }
@@ -1535,26 +1575,27 @@ public class AgentLoop {
                         try {
                             // 前端显示"上下文已用 X%"，分母必须是**本轮真实窗口**（模型窗口或配置上限），
                             // 否则换个 128k 模型还会按 512k 显示 5%，用户以为离上限很远。
-                            streamSink.onContext(
-                                    response.tokenUsage().inputTokenCount(),
-                                    effectiveContextTokens());
+                            ChatResponse completed = response;
+                            new ModelCallControl(executionControl).call(() -> {
+                                streamSink.onContext(completed.tokenUsage().inputTokenCount(), effectiveContextTokens());
+                                return null;
+                            });
                         } catch (Exception ignored) {
+                            ModelCallControl.rethrowIfStopped(ignored);
                             // 用量推送失败不影响本轮
                         }
                     }
                 }
                 return response;
             } catch (Exception e) {
-                if (e instanceof java.util.concurrent.CancellationException) {
-                    log.info("LLM 调用已取消: {}", describe(e));
-                    return null;
-                }
+                acceptingCallbacks.set(false);
+                ModelCallControl.rethrowIfStopped(e);
                 if (isRetriable(e) && attempt < maxRetries) {
                     long backoff = retryBackoffMillis(attempt);
                     log.warn("LLM 调用可重试失败（尝试 {}/{}，{}s 后重试）: {}",
                             attempt + 1, maxRetries + 1,
                             String.format("%.1f", backoff / 1000.0), describe(e));
-                    sleepQuietly(backoff);
+                    new ModelCallControl(executionControl).call(() -> { Thread.sleep(backoff); return null; });
                     continue;
                 }
                 if (isRetriable(e)) {
@@ -1563,6 +1604,8 @@ public class AgentLoop {
                     log.error("LLM 调用失败（不可重试）: {}", describe(e));
                 }
                 return null;
+            } finally {
+                acceptingCallbacks.set(false);
             }
         }
         return null; // 所有重试耗尽
@@ -1671,7 +1714,8 @@ public class AgentLoop {
      *                        拼成一段重复文本（前端的 token 事件是累加的）。
      */
     private ChatResponse callLlmStreaming(StreamingChatModel model, ChatRequest request, AgentStreamSink streamSink,
-                                          boolean resetBeforeCall) throws Exception {
+                                          boolean resetBeforeCall,
+                                          java.util.concurrent.atomic.AtomicBoolean acceptingCallbacks) throws Exception {
         if (resetBeforeCall) {
             try {
                 streamSink.onAnswerReset();
@@ -1687,6 +1731,7 @@ public class AgentLoop {
         // 超长库表/建表类 prompt + 思考链，首包常超过 90s；按输入规模自适应
         long firstTokenTimeoutSec = estimateFirstTokenTimeoutSec(request);
         log.info("流式 LLM 等待首包超时={}s（大上下文会自动加长）", firstTokenTimeoutSec);
+        RunScope callbackScope = RunScope.capture();
 
         model.chat(request, new StreamingChatResponseHandler() {
             @Override
@@ -1697,7 +1742,7 @@ public class AgentLoop {
                 receivedAny.set(true);
                 String t = partialThinking.text();
                 if (Objects.nonNull(t) && !t.isEmpty()) {
-                    try { streamSink.onThinking(t); } catch (Exception ignored) {}
+                    publishModelDelta(acceptingCallbacks, callbackScope, () -> streamSink.onThinking(t));
                 }
             }
 
@@ -1705,18 +1750,20 @@ public class AgentLoop {
             public void onPartialResponse(String token) {
                 if (Objects.nonNull(token) && !token.isEmpty()) {
                     receivedAny.set(true);
-                    try { streamSink.onAnswerToken(token); } catch (Exception ignored) {}
+                    publishModelDelta(acceptingCallbacks, callbackScope, () -> streamSink.onAnswerToken(token));
                 }
             }
 
             @Override
             public void onCompleteResponse(ChatResponse response) {
+                if (!acceptingCallbacks.get()) return;
                 responseRef.set(response);
                 latch.countDown();
             }
 
             @Override
             public void onError(Throwable error) {
+                if (!acceptingCallbacks.get()) return;
                 errorRef.set(error);
                 latch.countDown();
             }
@@ -1731,6 +1778,21 @@ public class AgentLoop {
             throw new RuntimeException(err);
         }
         return responseRef.get();
+    }
+
+    /** Provider callbacks may run outside our worker. Preserve controls and never publish after a stopped attempt. */
+    private void publishModelDelta(java.util.concurrent.atomic.AtomicBoolean acceptingCallbacks,
+                                   RunScope scope, Runnable publish) {
+        if (!acceptingCallbacks.get()) return;
+        try (var ignored = scope.bind()) {
+            if (executionControl != null && scope.sessionId() != null)
+                new ModelCallControl(executionControl).checkpointForCallback(scope.sessionId());
+            // The sink may perform I/O. Closing this gate must never wait for an in-flight sink.
+            // Production SSE sinks also fence writes by run token, including an already-started write.
+            if (acceptingCallbacks.get()) publish.run();
+        } catch (Exception ignored) {
+            // A stopped run or display error must never replay the provider request.
+        }
     }
 
     /**
@@ -1839,7 +1901,7 @@ public class AgentLoop {
         } else {
             for (var tc : toolCalls) {
                 executeToolCallSingle(tc, messages, state, bindings.get(toolIdOf(tc)));
-                if (state.unknownOutcome) break;
+                if (state.unknownOutcome || state.controlStopReason != ExecutionControl.StopReason.NONE) break;
             }
         }
         ToolObservationProjector.Projection projection = ToolObservationProjector.projectBatch(state.pendingObservations);
@@ -1869,7 +1931,7 @@ public class AgentLoop {
         for (Object call : toolCalls) {
             String callId = toolIdOf(call);
             if (!callId.isBlank()) {
-                bindings.put(callId, execution.resolve(callId, toolNameOf(call)));
+                bindings.put(callId, execution.resolveInvocation(callId, toolNameOf(call)));
             }
         }
         return Map.copyOf(bindings);
@@ -2145,7 +2207,7 @@ public class AgentLoop {
                             ? ToolResult.failure(stop == ExecutionControl.StopReason.CANCELLED
                                     ? ToolErrorCode.CANCELLED : ToolErrorCode.TIMEOUT, controlMessage(stop), false)
                             : unconfirmedToolStop(request, controlMessage(stop) + "，工具结果未确认");
-                    return ToolInvocation.controlStop(request.name(), result);
+                    return ToolInvocation.controlStop(request.name(), result, stop);
                 }
             }
             if (request.budget() != null && request.budget().expired()) {

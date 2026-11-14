@@ -697,18 +697,18 @@ public class BuiltinTools {
                 BrowserSnapshotParams.class,
                 params -> withBrowserSession(params.getSessionId(), session -> browserService.snapshot(session, params.isFullOrDefault())));
 
-        registry.register("browser_form_inspect", "识别当前网页表单：返回字段ref、类型、标签、必填、约束、选项、当前值和校验错误；包含隐藏上传控件，密码值不回显。每次填写后重新识别获取最新ref。",
+        registry.register("browser_form_inspect", "识别当前网页及嵌套/跨源iframe表单：返回字段ref、frame位置、类型、标签、必填、约束、选项、当前值和校验错误；最多64个frame共享200候选上限，truncated表示未完整扫描。包含隐藏上传控件，密码值不回显。每次填写或frame变化后重新识别获取最新ref。",
                 BrowserFormInspectParams.class,
                 params -> withBrowserSession(params.getSessionId(), browserService::formInspect));
         registry.register("browser_form_verify", "回读一个最新字段ref，检查实际值及页面约束。可传一种expected参数核对文本、勾选、选中value或文件名；核验通过不代表已提交。",
                 BrowserFormVerifyParams.class,
                 params -> withBrowserSession(params.getSessionId(), session -> browserService.formVerify(session,
                         params.getRef(), params.getExpectedValue(), params.getExpectedChecked(), params.getExpectedValues(), params.getExpectedFiles())));
-        registry.register("browser_select", "选择原生select下拉框的指定选项，支持多选；只用最新ref。values传value或by=label传精确显示名称。返回实际选值及新快照；自定义下拉使用快照click/press。",
+        registry.register("browser_select", "选择原生select（支持多选）或form_inspect中customSelectSupported=true的ARIA单选下拉；只用最新ref。values传value或by=label传精确名称，并回读实际选值。自定义下拉须有唯一关联listbox和明确aria-selected；懒加载选项先按快照展开后重新识别，不猜测全页列表。",
                 BrowserSelectParams.class,
                 params -> withBrowserSession(params.getSessionId(), session -> browserService.select(session,
                         params.getRef(), params.getValues(), params.getByOrDefault())));
-        registry.register("browser_set_checked", "将原生复选框或单选框设为明确的checked状态，不进行盲目翻转；使用最新ref。单选框不能直接取消，应选择同组其他项。",
+        registry.register("browser_set_checked", "将原生复选框/单选框或具有明确aria-checked=true/false的ARIA checkbox/radio/switch设为目标状态并回读，不进行盲目翻转；使用最新ref。mixed状态不能猜测，单选框不能直接取消，应选择同组其他项。",
                 BrowserSetCheckedParams.class,
                 params -> params.getChecked() == null ? errorJson(ToolErrorCode.INVALID_ARGUMENT, "checked必须明确为true或false")
                         : withBrowserSession(params.getSessionId(), session -> browserService.setChecked(session, params.getRef(), params.getChecked())));
@@ -794,9 +794,12 @@ public class BuiltinTools {
                     return written;
                 }));
 
-        registry.register("browser_close", "关闭浏览器会话",
+        registry.register("browser_close", "关闭当前聊天的浏览器页面，保留已保存的登录态供下次恢复",
                 BrowserCloseParams.class,
                 params -> withBrowserSession(params.getSessionId(), browserService::close));
+        registry.register("browser_clear_session", "显式清除当前聊天的浏览器登录态并关闭当前自动化页面，相当于退出此自动化会话；下次访问需要重新登录。仅在用户要求退出或清除损坏登录态时使用，不影响其他聊天。",
+                BrowserClearSessionParams.class,
+                params -> withBrowserSession(params.getSessionId(), browserService::clearSessionState));
     }
 
     private String withBrowserSession(String requestedSession, java.util.function.Function<String, String> operation) {

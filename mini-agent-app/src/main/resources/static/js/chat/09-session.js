@@ -133,7 +133,8 @@ async function loadMoreMessages(sessionId, prepend) {
                         imgs.map(src => ({ src, name: attachmentNameFromSource(src) })));
                     if (row && m.task.id != null) row.dataset.chatTaskId = String(m.task.id);
                 } else {
-                    const bd = renderBotMsg(renderMD(m.content || ''), false);
+                    const bd = renderBotMsg(renderMD(m.task?.progress?.status === 'FAILURE'
+                        ? compactTaskFailure(m.content) : m.content || ''), false);
                     restoreTaskProgress(bd, m.task);
                     bindLightbox(bd.closest('.bot-row'));
                 }
@@ -165,6 +166,7 @@ function buildUserRow(text, images = []) {
 }
 
 function buildBotRow(text, task) {
+    if (task?.progress?.status === 'FAILURE') text = compactTaskFailure(text);
     const row = document.createElement('div');
     row.className = 'msg-row bot-row';
     const bid = nextBotBodyId();

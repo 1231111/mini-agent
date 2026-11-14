@@ -15,6 +15,14 @@ function insertAt(parent, node, ref) {
 }
 
 /** One renderer for SSE and persisted turns. Only real DAG/todo items enter here. */
+function compactTaskFailure(detail) {
+    const text = String(detail || '');
+    if (/stack=['"]|\n\s*at\s|Error\s*\{[\r\n]|playwright-java-|ElementHandleDispatcher\./.test(text)) {
+        return '操作未能完成，详细原因请查看工具执行日志。若结果尚未确认，请先核验实际页面，避免重复操作。';
+    }
+    return text;
+}
+
 function renderTaskProgress(botBody, items, options = {}) {
     if (!botBody || !Array.isArray(items)) return null;
     let card = botBody.querySelector('.todo-panel');
@@ -54,7 +62,10 @@ function renderTaskProgress(botBody, items, options = {}) {
         || items.find(i => i.status === 'in_progress') || items.find(i => i.status === 'blocked')
         || items.find(i => i.status === 'pending');
     let heading, state;
-    if (options.waiting || options.status === 'WAITING') {
+    const needsReview = options.reason === 'OUTCOME_UNKNOWN';
+    if (needsReview) {
+        heading = '操作结果待核验，已停止自动重试'; state = 'blocked';
+    } else if (options.waiting || options.status === 'WAITING') {
         heading = current ? '等待你的操作：' + current.content : '任务等待你的操作'; state = 'waiting';
     } else if (options.incomplete) {
         heading = '任务未完成，连接已中断'; state = 'blocked';
@@ -92,7 +103,10 @@ function renderTaskProgress(botBody, items, options = {}) {
         const mark = document.createElement('span'); mark.className = 'todo-mark';
         mark.setAttribute('aria-hidden', 'true');
         const text = document.createElement('span'); text.className = 'todo-text'; text.textContent = item.content || '';
-        const label = document.createElement('span'); label.className = 'todo-node-state'; label.textContent = labels[status] || '待执行';
+        const label = document.createElement('span'); label.className = 'todo-node-state';
+        label.textContent = needsReview && ['blocked', 'in_progress'].includes(status) ? '待核验'
+            : !live && (options.failed || options.status === 'FAILURE') && status === 'in_progress' ? '已中断'
+            : labels[status] || '待执行';
         li.append(mark, text, label);
         if (status === 'awaiting_confirm' && options.allowConfirm) {
             const button = document.createElement('button'); button.type = 'button';
@@ -102,6 +116,15 @@ function renderTaskProgress(botBody, items, options = {}) {
         }
         list.appendChild(li);
     }
+    let reviewButton = card.querySelector('.outcome-review-open');
+    if (needsReview && !live) {
+        if (!reviewButton) {
+            reviewButton = document.createElement('button'); reviewButton.type = 'button';
+            reviewButton.className = 'outcome-review-open'; reviewButton.textContent = '核验实际结果';
+            reviewButton.onclick = () => showOutcomeReview(botBody);
+            card.appendChild(reviewButton);
+        }
+    } else if (reviewButton) reviewButton.remove();
     return card;
 }
 
@@ -113,7 +136,83 @@ function restoreTaskProgress(botBody, task) {
     if (!snapshot) return;
     botBody.dataset.taskStatus = snapshot.status || '';
     botBody.dataset.executionId = snapshot.executionId || '';
-    renderTaskProgress(botBody, snapshot.items, { status: snapshot.status, live: false, allowConfirm: false });
+    botBody.dataset.taskReason = snapshot.reason || '';
+    renderTaskProgress(botBody, snapshot.items, { status: snapshot.status, reason: snapshot.reason, live: false, allowConfirm: false });
+}
+
+/** Human review is inline and never silently dispatches another click or submission. */
+async function showOutcomeReview(botBody) {
+    const sessionId = currentId;
+    let panel = botBody.querySelector('.outcome-review');
+    if (panel) return;
+    panel = document.createElement('section'); panel.className = 'outcome-review';
+    panel.setAttribute('aria-label', '核验操作结果'); botBody.appendChild(panel);
+    const notice = document.createElement('p'); notice.textContent = '正在读取待核验步骤…'; panel.appendChild(notice);
+    const offerReload = () => {
+        if (panel.querySelector('.outcome-review-reload')) return;
+        const reload = document.createElement('button'); reload.type = 'button';
+        reload.className = 'outcome-review-reload'; reload.textContent = '重新读取任务状态';
+        reload.onclick = () => { panel.remove(); showOutcomeReview(botBody); };
+        panel.appendChild(reload);
+    };
+    try {
+        const response = await fetch('/api/conversations/' + encodeURIComponent(sessionId) + '/outcome-review');
+        const body = await response.json();
+        if (currentId !== sessionId || !panel.isConnected) return;
+        if (!response.ok || !body.success) throw new Error(body.message || '无法读取待核验步骤');
+        const review = body.data;
+        if (botBody.dataset.executionId && botBody.dataset.executionId !== review.executionId)
+            throw new Error('这张卡片属于历史任务，请在当前任务中核验。');
+        if (!review.nodes?.length) throw new Error('当前没有结果待核验的步骤，请刷新任务状态。');
+        notice.textContent = '请先查看实际页面或业务回执。核验只处理原步骤状态，不会立即执行操作。确认已生效时仍须通过原验收条件，可能调用你配置的评判模型。';
+        const form = document.createElement('form');
+        const nodeLabel = document.createElement('label'); nodeLabel.textContent = '待核验步骤';
+        const node = document.createElement('select');
+        review.nodes.forEach(item => { const option = document.createElement('option'); option.value = item.id;
+            option.textContent = item.name; node.appendChild(option); }); nodeLabel.appendChild(node);
+        const decisionLabel = document.createElement('label'); decisionLabel.textContent = '实际核验结果';
+        const decision = document.createElement('select');
+        [['', '请选择核验结果'], ['CONFIRMED_APPLIED', '已确认操作生效，提交证据验收'],
+            ['CONFIRMED_NOT_APPLIED', '已确认完全未生效，允许后续重新尝试']].forEach(([value, title]) => {
+            const option = document.createElement('option'); option.value = value; option.textContent = title; decision.appendChild(option);
+        }); decision.required = true; decisionLabel.appendChild(decision);
+        const evidenceLabel = document.createElement('label'); evidenceLabel.textContent = '核验依据（回执编号、实际状态或已检查的文件）';
+        const evidence = document.createElement('textarea'); evidence.required = true; evidence.maxLength = 8000;
+        evidence.rows = 3; evidenceLabel.appendChild(evidence);
+        const confirmLabel = document.createElement('label'); confirmLabel.className = 'outcome-review-confirm';
+        const confirmed = document.createElement('input'); confirmed.type = 'checkbox'; confirmed.required = true;
+        const confirmText = document.createElement('span'); confirmText.textContent = '我已检查实际结果；结果仍不确定时不提交核验';
+        confirmLabel.append(confirmed, confirmText);
+        const submit = document.createElement('button'); submit.type = 'submit'; submit.textContent = '提交核验';
+        const status = document.createElement('p'); status.setAttribute('role', 'status');
+        form.append(nodeLabel, decisionLabel, evidenceLabel, confirmLabel, submit, status); panel.appendChild(form);
+        form.onsubmit = async event => {
+            event.preventDefault();
+            if (!confirmed.checked || !decision.value || !evidence.value.trim() || currentId !== sessionId) return;
+            submit.disabled = true; status.textContent = '正在验收核验依据…';
+            try {
+                const result = await fetch('/api/conversations/' + encodeURIComponent(sessionId) + '/outcome-review', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ executionId: review.executionId, version: review.version,
+                        planVersion: review.planVersion, nodeId: node.value, decision: decision.value,
+                        evidence: evidence.value.trim(), confirmed: true })
+                });
+                const resolved = await result.json();
+                if (!result.ok || !resolved.success) throw new Error(resolved.message || '核验未通过');
+                if (currentId !== sessionId || !panel.isConnected) return;
+                const progress = resolved.data.progress;
+                renderTaskProgress(botBody, progress.items, { status: progress.status, reason: progress.reason, live: false });
+                form.remove();
+                if (resolved.data.nodes?.length) {
+                    notice.textContent = '核验已记录。原任务还有操作结果待核验，请继续检查其他步骤。';
+                    offerReload();
+                } else notice.textContent = '核验已记录。请在输入框发送“继续”，从原任务的未完成步骤继续执行。';
+                botBody.dataset.taskReason = progress.reason || '';
+            } catch (error) {
+                status.textContent = compactTaskFailure(error.message); submit.disabled = false; offerReload();
+            }
+        };
+    } catch (error) { notice.textContent = compactTaskFailure(error.message); offerReload(); }
 }
 
 /**

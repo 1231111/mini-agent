@@ -380,11 +380,18 @@ public class PlanValidator {
             return;
         }
         for (String c : goal.successCriteria()) {
-            if (Goal.isPlaceholderCriterion(c)) {
+            if (c == null || c.isBlank() || Goal.isPlaceholderCriterion(c) || StepEvaluator.hasMatchingJudge(g, c)) {
                 continue;
             }
             String path = DataflowNormalizer.pathFromName(c);
-            if (path.isBlank() || StepEvaluator.hasFileDeliverable(g, path)) {
+            if (path.isBlank() || !path.equals(c.trim())) {
+                errors.add(new PlanValidationReport.ValidationError(
+                        PlanValidationReport.ValidationError.Type.GOAL_GRAPH_MISMATCH,
+                        null, "successCriteria 缺少可执行验收，尚未验证: " + c,
+                        "将完成条件原文绑定到节点 doneWhen.criteria 或 checks；文件存在条件只填写精确路径。"));
+                continue;
+            }
+            if (StepEvaluator.hasFileDeliverable(g, path)) {
                 continue;
             }
             errors.add(new PlanValidationReport.ValidationError(

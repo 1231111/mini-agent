@@ -36,7 +36,7 @@ class BrowserFailureTest {
         ReflectionTestUtils.setField(service, "networkGuard", mock(NetworkGuard.class));
         ReflectionTestUtils.setField(service, "playwright", mock(Playwright.class));
         ReflectionTestUtils.setField(service, "browser", browser);
-        when(browser.newPage()).thenThrow(new IllegalStateException("Failed to create driver"));
+        when(browser.newContext(any(Browser.NewContextOptions.class))).thenThrow(new IllegalStateException("Failed to create driver"));
     }
 
     @AfterEach void close() { service.shutdown(); }
@@ -59,7 +59,6 @@ class BrowserFailureTest {
 
     @Test void unconfirmedInteractiveFailuresRemainUnknownInsteadOfSuccessful() throws Exception {
         List<Supplier<String>> actions = List.of(
-                () -> service.click("chat", "Save", "text"),
                 () -> service.type("chat", "Name", "Fixture"),
                 () -> service.press("chat", "Enter"),
                 () -> service.scroll("chat", "down"),
@@ -71,9 +70,16 @@ class BrowserFailureTest {
         }
     }
 
+    @Test void clickInitializationFailureIsKnownNotToHaveSentInput() throws Exception {
+        var result = assertFailure(service.click("chat", "Save", "text"), ToolErrorCode.CONFLICT);
+        assertEquals(ToolStatus.FAILED, result.status());
+        assertFalse(new ObjectMapper().readTree(result.legacyText()).path("inputDispatched").asBoolean(true));
+        assertFalse(result.message().contains("Failed to create driver"), "SDK details belong to server diagnostics");
+    }
+
     @Test void emptyTargetAndUnknownStrategyAreStructuredInvalidArguments() throws Exception {
         assertFailure(service.click("chat", "", "ref"), ToolErrorCode.INVALID_ARGUMENT);
-        verify(browser, never()).newPage();
+        verify(browser, never()).newContext(any(Browser.NewContextOptions.class));
         putPage(mock(Page.class));
         assertFailure(service.click("chat", "Save", "invalid-strategy"), ToolErrorCode.INVALID_ARGUMENT);
     }
@@ -83,7 +89,8 @@ class BrowserFailureTest {
         putPage(page);
         assertFailure(service.click("chat", "b9.1", "ref"), ToolErrorCode.CONFLICT);
         assertFailure(service.type("chat", "b9.1", "Fixture"), ToolErrorCode.CONFLICT);
-        verifyNoInteractions(page);
+        verify(page, times(2)).isClosed();
+        verifyNoMoreInteractions(page);
     }
 
     @Test void readableSnapshotKeepsTheExistingSuccessTextContract() {

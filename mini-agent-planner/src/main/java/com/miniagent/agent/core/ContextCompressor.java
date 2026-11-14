@@ -58,6 +58,9 @@ public class ContextCompressor {
     @Autowired(required = false)
     private TaskScopeRegistry taskScopeRegistry;
 
+    @Autowired(required = false)
+    private ModelCallControl modelCallControl;
+
     // ─── 阈值配置 ───
     /** 工程压缩阈值：下一次请求前达到该比例时压缩，默认与 WorkBuddy preMessage 对齐。 */
     @Value("${agent.context.pre-message-threshold:0.5}")
@@ -410,8 +413,10 @@ public class ContextCompressor {
         try {
             List<ChatMessage> req = List.of(new UserMessage(prompt));
             // 压缩摘要属辅助调用，必须跟随本轮生效模型（用户配置），全局 Bean 仅兜底
-            ChatResponse resp = EffectiveModelContext.chatOr(chatModel)
-                    .chat(ChatRequest.builder().messages(req).build());
+            var model = EffectiveModelContext.chatOr(chatModel);
+            var request = ChatRequest.builder().messages(req).build();
+            ChatResponse resp = modelCallControl == null ? model.chat(request)
+                    : modelCallControl.call(() -> model.chat(request));
             String summary = resp.aiMessage().text();
             if (Objects.isNull(summary)) {
                 return null;
@@ -420,6 +425,7 @@ public class ContextCompressor {
             state.previousSummary = summary;
             return summary;
         } catch (Exception e) {
+            ModelCallControl.rethrowIfStopped(e);
             log.error("摘要生成失败: {}", e.getMessage());
             return null;
         }
@@ -601,8 +607,10 @@ public class ContextCompressor {
             // 异步线程不继承 ThreadLocal：把本轮生效模型显式带进去，
             // 否则后台摘要会回退到全局 Bean（全局 key 失效时这条链路静默失败）。
             ChatModel inheritedModel = EffectiveModelContext.currentChat();
+            RunScope inheritedScope = RunScope.capture();
             CompletableFuture.runAsync(() -> {
-                try (var ignoredModel = EffectiveModelContext.bind(inheritedModel, null)) {
+                try (var ignoredScope = inheritedScope.bind();
+                     var ignoredModel = EffectiveModelContext.bind(inheritedModel, null)) {
                     String s = generateSummaryAndExtractMemory(middleCopy, summaryBudget, state);
                     if (StringUtils.isNotBlank(s)) {
                         state.previousSummary = s;

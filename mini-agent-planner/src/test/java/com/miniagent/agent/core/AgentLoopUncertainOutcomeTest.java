@@ -116,6 +116,12 @@ class AgentLoopUncertainOutcomeTest {
 
     private static class RecordingJournal implements ActionJournal {
         final Map<ActionJournalKey, ActionJournalEntry> entries = new ConcurrentHashMap<>();
+        public Claim claim(ActionJournalKey key, String tool, String hash, boolean retry) {
+            return com.miniagent.agent.execution.InMemoryActionJournal.claimEntry(entries, key, tool, hash, retry);
+        }
+        public Claim claimEffect(ActionJournalKey key, String tool, String hash) {
+            return com.miniagent.agent.execution.InMemoryActionJournal.claimEffectEntry(entries, key, tool, hash);
+        }
         public void append(ActionJournalEntry entry) { entries.put(entry.key(), entry); }
         public Optional<ActionJournalEntry> latest(ActionJournalKey key) { return Optional.ofNullable(entries.get(key)); }
         public List<ActionJournalEntry> unresolved() { return entries.values().stream()

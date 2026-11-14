@@ -87,15 +87,25 @@ public final class IntentGraphValidator {
         }
 
         for (String constraint : intent.constraints()) {
-            String value = normalize(constraint);
-            if (value.length() < 4) {
+            if (constraint == null || constraint.isBlank()) {
                 continue;
             }
-            if (!hasLanding(graph, value)) {
-                warnings.add(new PlanValidationReport.ValidationWarning(
-                        PlanValidationReport.ValidationWarning.Type.GENERAL,
+            if (!hasSemanticCheck(graph, constraint)) {
+                errors.add(new PlanValidationReport.ValidationError(
+                        PlanValidationReport.ValidationError.Type.GOAL_GRAPH_MISMATCH,
                         null,
-                        "约束未在任务图中找到明确落点: " + constraint));
+                        "约束缺少可执行验收，尚未验证: " + constraint,
+                        "将约束原文写入负责节点的 doneWhen.criteria 或 checks；"
+                                + "无法验证时先澄清，不能仅在 name/toolArguments 提及后宣称完成。"));
+            }
+        }
+        for (String criterion : intent.acceptanceCriteria()) {
+            if (criterion == null || criterion.isBlank() || Goal.isPlaceholderCriterion(criterion)) continue;
+            if (!hasSemanticCheck(graph, criterion) && !hasExactFileCheck(graph, criterion)) {
+                errors.add(new PlanValidationReport.ValidationError(
+                        PlanValidationReport.ValidationError.Type.GOAL_GRAPH_MISMATCH,
+                        null, "完成条件缺少可执行验收，尚未验证: " + criterion,
+                        "为该条件提供精确对应的 doneWhen.criteria/checks，文件存在条件须对应 doneWhen.path。"));
             }
         }
         return new PlanValidationReport(errors, warnings);
@@ -167,15 +177,17 @@ public final class IntentGraphValidator {
         return false;
     }
 
-    private static boolean hasLanding(TaskGraph graph, String value) {
+    static boolean hasSemanticCheck(TaskGraph graph, String requirement) {
         for (TaskNode node : graph.nodes()) {
-            if (matches(normalize(node.name()), value)
-                    || matches(normalize(String.valueOf(node.doneWhen())), value)
-                    || matches(normalize(node.toolArguments().toString()), value)) {
-                return true;
-            }
+            if (node.doneWhen() != null && node.doneWhen().valid() && node.doneWhen().verifies(requirement)) return true;
         }
         return false;
+    }
+
+    private static boolean hasExactFileCheck(TaskGraph graph, String criterion) {
+        String expected = normalizePath(criterion);
+        return graph.nodes().stream().anyMatch(node -> node.doneWhen() != null && node.doneWhen().isFile()
+                && expected.equals(normalizePath(node.doneWhen().path())));
     }
 
     private static boolean matches(String text, String expected) {

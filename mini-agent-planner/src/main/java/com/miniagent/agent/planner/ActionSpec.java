@@ -35,5 +35,10 @@ public record ActionSpec(
                 "", 0, ActionRetryPolicy.none(), "");
     }
 
-    public String expectedResult() { return acceptance.wire(); }
+    public String expectedResult() {
+        String wire = acceptance.wire();
+        if (acceptance.checks().isEmpty()
+                && (acceptance.criteria().isBlank() || acceptance.isJudge() || acceptance.isValidation())) return wire;
+        return wire + "\n逐项语义验收（每项均需实际证据）: " + acceptance.semanticChecks();
+    }
 }

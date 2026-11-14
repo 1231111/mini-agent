@@ -28,6 +28,8 @@ import dev.langchain4j.model.chat.response.ChatResponse;
 import dev.langchain4j.model.output.FinishReason;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
@@ -185,6 +187,25 @@ class AgentLoopMediaContinuationTest {
 
         assertEquals(AgentLoop.OUTCOME_UNKNOWN, outcome.endReason());
         assertEquals(ToolStatus.UNKNOWN, outcome.lastToolResult().status());
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = ExecutionControl.StopReason.class, mode = EnumSource.Mode.EXCLUDE, names = "NONE")
+    void typedControlStopRetainsItsReasonAndUnknownSideEffectWithoutAnotherDispatch(ExecutionControl.StopReason reason) {
+        Fixture fixture = fixture();
+        doReturn(ToolInvocation.controlStop("write_file", ToolResult.unknown("write effect unconfirmed", null), reason))
+                .when(fixture.pipeline).invoke(any());
+        AtomicInteger turns = responses(fixture.model, tools("write_file", "image_generate"), text("must not be reached"));
+
+        AgentLoop.LoopOutcome outcome = runPlain(fixture, 4);
+
+        assertEquals(reason.name(), outcome.endReason());
+        assertFalse(outcome.successful());
+        assertEquals(ToolStatus.UNKNOWN, outcome.lastToolResult().status());
+        assertEquals(ToolErrorCode.OUTCOME_UNKNOWN, outcome.lastErrorCode());
+        assertEquals(1, turns.get());
+        verify(fixture.pipeline, times(1)).invoke(any());
+        assertEquals(List.of("write_file"), outcome.toolsInvoked());
     }
 
     @Test

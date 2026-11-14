@@ -399,7 +399,6 @@ agent:
     compiler-retry: 1
     max-outer-rounds: 24
     hard-proposal: true
-    strict-eval: true
     max-local-repair: 3
     max-replace-tool: 2
     max-rewrite-graph: 2

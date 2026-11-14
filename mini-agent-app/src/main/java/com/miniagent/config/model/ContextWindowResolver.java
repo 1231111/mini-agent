@@ -40,7 +40,7 @@ public final class ContextWindowResolver {
             return supported.get(0);
         }
         if (defaultLength > 0) {
-            return defaultLength;
+            return maxInputTokens > 0 ? Math.min(defaultLength, maxInputTokens) : defaultLength;
         }
         return Math.max(0, maxInputTokens);
     }

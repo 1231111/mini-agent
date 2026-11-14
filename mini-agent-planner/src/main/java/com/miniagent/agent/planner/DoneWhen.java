@@ -8,12 +8,15 @@ import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import org.apache.commons.lang3.StringUtils;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
 
 /**
  * 节点完成条件。快照里兼容旧的字符串 wire（file_exists:path）。
  */
 @JsonDeserialize(using = DoneWhen.Json.class)
-public record DoneWhen(String type, String criteria, String path) {
+public record DoneWhen(String type, String criteria, String path, List<String> checks) {
 
     public static final String NOTE = "note_required";
     public static final String FILE = "file_exists";
@@ -26,6 +29,30 @@ public record DoneWhen(String type, String criteria, String path) {
         type = type == null ? NOTE : type.trim();
         criteria = criteria == null ? "" : criteria.trim();
         path = path == null ? "" : path.trim();
+        checks = checks == null ? List.of() : checks.stream()
+                .map(check -> check == null ? "" : check.trim()).toList();
+    }
+
+    /** Compatibility for existing callers and snapshots without additional semantic checks. */
+    public DoneWhen(String type, String criteria, String path) {
+        this(type, criteria, path, List.of());
+    }
+
+    /** Each declared requirement is evaluated, rather than merely mentioned in a node's description. */
+    public List<String> semanticChecks() {
+        LinkedHashSet<String> all = new LinkedHashSet<>();
+        if (!criteria.isBlank()) all.add(criteria);
+        all.addAll(checks);
+        return List.copyOf(all);
+    }
+
+    public DoneWhen withChecks(List<String> checks) {
+        return new DoneWhen(type, criteria, path, checks);
+    }
+
+    public boolean verifies(String requirement) {
+        return requirement != null && !requirement.isBlank()
+                && semanticChecks().contains(requirement.trim());
     }
 
     public static DoneWhen note() {
@@ -85,6 +112,7 @@ public record DoneWhen(String type, String criteria, String path) {
     }
 
     public boolean valid() {
+        if (checks.stream().anyMatch(String::isBlank)) return false;
         if (isFile()) {
             return StringUtils.isNotBlank(path);
         }
@@ -112,9 +140,9 @@ public record DoneWhen(String type, String criteria, String path) {
         int slash = p.lastIndexOf('/');
         String name = slash >= 0 ? p.substring(slash + 1) : p;
         if (StringUtils.isBlank(name)) {
-            return note();
+            return new DoneWhen(FILE, criteria, "", checks);
         }
-        return file(name, criteria);
+        return new DoneWhen(FILE, criteria, name, checks);
     }
 
     /** Todo / 语义校验仍吃前缀字符串。 */
@@ -147,7 +175,16 @@ public record DoneWhen(String type, String criteria, String path) {
             return note();
         }
         String t = text(n, "type", NOTE);
-        return new DoneWhen(t, text(n, "criteria", ""), text(n, "path", "")).sandboxWritePath();
+        List<String> checks = new ArrayList<>();
+        JsonNode checkNodes = n.get("checks");
+        if (checkNodes != null && !checkNodes.isNull()) {
+            if (!checkNodes.isArray()) {
+                checks.add(""); // Reject malformed contracts through valid(), rather than silently dropping them.
+            } else {
+                for (JsonNode check : checkNodes) checks.add(check.isTextual() ? check.asText() : "");
+            }
+        }
+        return new DoneWhen(t, text(n, "criteria", ""), text(n, "path", ""), checks).sandboxWritePath();
     }
 
     public static DoneWhen parseWire(String s) {

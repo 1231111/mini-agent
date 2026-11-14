@@ -214,6 +214,25 @@ class DefaultConsolidationServiceTest {
         assertEquals("sk-1...wxyz", OpenAiModelProperties.keyHint("sk-1234567890wxyz"));
     }
 
+    @Test
+    void invalidUserModelLeavesConsolidationEventsUnprocessed() {
+        var factory = mock(com.miniagent.config.model.ModelClientFactory.class);
+        var conversations = mock(com.miniagent.config.service.DatabaseConversationStore.class);
+        when(conversations.findUserIdBySession("session-a")).thenReturn(Optional.of(7L));
+        when(factory.resolve(7L)).thenThrow(new IllegalStateException("invalid user model"));
+        var binder = new com.miniagent.config.model.UserModelBinder();
+        ReflectionTestUtils.setField(binder, "modelClientFactory", factory);
+        ReflectionTestUtils.setField(binder, "conversationStore", conversations);
+        ReflectionTestUtils.setField(service, "userModelBinder", binder);
+        var global = mock(dev.langchain4j.model.chat.ChatModel.class);
+        ReflectionTestUtils.setField(service, "chatModel", global);
+
+        assertThrows(IllegalStateException.class, () -> service.consolidate("tenant-a", "session-a"));
+
+        verifyNoInteractions(global, eventRepository, episodeRepository, transactionManager, taskLock);
+        assertNull(OwnerContext.currentUserId());
+    }
+
     private AgentEventEntity event(Long id, String tenant, String session, String task) {
         AgentEventEntity event = new AgentEventEntity();
         event.setId(id);

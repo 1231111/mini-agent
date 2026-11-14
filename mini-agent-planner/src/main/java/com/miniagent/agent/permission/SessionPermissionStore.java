@@ -361,6 +361,15 @@ public class SessionPermissionStore {
      */
     public AskGrant issueAskGrant(String sessionId, String toolName,
                                   String arguments, long ttlMillis) {
+        long now = System.currentTimeMillis();
+        long ttl = Math.max(1_000L, ttlMillis);
+        return issueAskGrantUntil(sessionId, toolName, arguments,
+                now > Long.MAX_VALUE - ttl ? Long.MAX_VALUE : now + ttl);
+    }
+
+    /** Absolute upper bound, including deadlines shorter than the normal one-second TTL floor. */
+    public AskGrant issueAskGrantUntil(String sessionId, String toolName,
+                                      String arguments, long expiresAtEpochMillis) {
         if (StringUtils.isBlank(sessionId) || StringUtils.isBlank(toolName)) {
             return null;
         }
@@ -369,15 +378,19 @@ public class SessionPermissionStore {
         long now = System.currentTimeMillis();
         String prefix = sessionId + "\u0000";
         synchronized (approvedAskWaiters) {
+            if (expiresAtEpochMillis <= System.currentTimeMillis()) return null;
             // Reuse a still-pending approval for the same exact invocation. This
             // avoids an unbounded token stream while an SSE client is reconnecting.
             for (Map.Entry<String, AskGrant> entry : pendingAskGrants.entrySet()) {
                 AskGrant existing = entry.getValue();
-                if (entry.getKey().startsWith(prefix)
-                        && !existing.expired(now)
-                        && existing.toolName().equals(tool)
+                if (entry.getKey().startsWith(prefix) && existing.toolName().equals(tool)
                         && existing.argumentsDigest().equals(digest)) {
-                    return existing;
+                    if (!existing.expired(now) && existing.expiresAtEpochMillis() <= expiresAtEpochMillis)
+                        return existing;
+                    // A previously longer approval cannot remain usable past a tighter deadline.
+                    pendingAskGrants.remove(entry.getKey(), existing);
+                    approvedAskWaiters.remove(entry.getKey());
+                    approvedAskWaiters.notifyAll();
                 }
             }
             purgeExpiredLocked(now);
@@ -389,7 +402,7 @@ public class SessionPermissionStore {
                 evictOnePendingLocked();
             }
             AskGrant grant = new AskGrant(
-                    newToken(), tool, digest, now + Math.max(1_000L, ttlMillis));
+                    newToken(), tool, digest, expiresAtEpochMillis);
             String key = pendingKey(sessionId, grant.token());
             approvedAskWaiters.put(key, new ApprovedAsk(grant, false, false));
             pendingAskGrants.put(key, grant);

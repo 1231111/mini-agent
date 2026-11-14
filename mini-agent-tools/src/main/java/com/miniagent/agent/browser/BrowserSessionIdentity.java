@@ -23,6 +23,22 @@ public final class BrowserSessionIdentity {
                 && !"default".equals(requestedSessionId) && !session.equals(requestedSessionId)) {
             throw new SecurityException("不能操作其他聊天的浏览器会话；请省略 sessionId");
         }
+        return resourceKey(tenant, user, session);
+    }
+
+    /** Groups only lifecycle accounting; each child keeps its own browser context and authentication. */
+    static String operationGroupResourceKey(String trustedResourceKey) {
+        String rootSession = WorkspaceContext.getOperationRootSession();
+        if (rootSession == null || rootSession.isBlank()) return trustedResourceKey;
+        String session = WorkspaceContext.getSessionOverride();
+        Long user = OwnerContext.currentUserId();
+        String tenant = OwnerContext.currentTenantId();
+        if (session == null || user == null || tenant == null || tenant.isBlank()
+                || !trustedResourceKey.equals(resourceKey(tenant, user, session))) return trustedResourceKey;
+        return resourceKey(tenant, user, rootSession);
+    }
+
+    private static String resourceKey(String tenant, Long user, String session) {
         try {
             byte[] digest = MessageDigest.getInstance("SHA-256").digest(
                     (tenant + "\u0000" + user + "\u0000" + session).getBytes(StandardCharsets.UTF_8));
