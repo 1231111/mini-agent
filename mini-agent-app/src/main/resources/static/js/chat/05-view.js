@@ -266,7 +266,14 @@ function applyModelConfigView(data) {
         ? '自定义端点必须使用自己的 Key；切换端点时请重新输入对应 Key。'
         : '当前服务禁止自定义地址。保存时使用所选预设；原有自定义 Key 需重新填写或明确清除。';
     document.getElementById('modelNameInput').value = modelConfigState.customModelName;
-    document.getElementById('modelContextWindowTokens').value = String(modelConfigState.customContextWindowTokens);
+    // 存量值可能越界（历史数据或手改）。越界值直接回填到输入框的话，用户会看到一串
+    // 莫名其妙的大数字，点保存又被"上下文窗口须为…"整批拒绝 —— 而且提示藏在弹窗底部，
+    // 看上去就像"API Key 存不进去"。这里只回填合法值，越界一律显示 0（自动）。
+    const rawWindow = Number(modelConfigState.customContextWindowTokens || 0);
+    const safeWindow = (Number.isInteger(rawWindow)
+        && (rawWindow === 0 || (rawWindow >= 1024 && rawWindow <= 10000000))) ? rawWindow : 0;
+    modelConfigState.customContextWindowTokens = safeWindow;
+    document.getElementById('modelContextWindowTokens').value = String(safeWindow);
     document.getElementById('modelContextWindowHint').textContent = cur.configurationValid === false
         ? '修复模型配置后显示生效窗口；请填写服务商实际支持的输入 token 上限。'
         : (cur.contextWindowWarning || ('当前输入窗口预算：' + (cur.contextWindowTokens || '预设未声明') + ' token。'));
@@ -308,17 +315,17 @@ async function loadModelConfig() {
 async function saveModelConfig() {
     if (modelConfigState.saving) return;
     if (!modelConfigState.loaded) {
-        document.getElementById('modelMenuHint').textContent = '模型设置尚未加载成功，请刷新页面后重试。';
+        setModelHint('模型设置尚未加载成功，请刷新页面后重试。', true);
         return;
     }
     const key = document.getElementById('modelApiKey').value;
     const windowValue = Number(document.getElementById('modelContextWindowTokens').value || 0);
     if (!Number.isInteger(windowValue) || (windowValue !== 0 && (windowValue < 1024 || windowValue > 10000000))) {
-        document.getElementById('modelMenuHint').textContent = '上下文窗口须为0（自动），或1024至10000000之间的整数；本次未保存。';
+        setModelHint('上下文窗口须为0（自动），或1024至10000000之间的整数；本次未保存（API Key 也没有保存）。', true);
         return;
     }
     if (document.getElementById('modelClearApiKey').checked && key.trim()) {
-        document.getElementById('modelMenuHint').textContent = '重新输入 Key 和清除旧 Key 只能选择一种；本次未保存。';
+        setModelHint('重新输入 Key 和清除旧 Key 只能选择一种；本次未保存。', true);
         return;
     }
     const body = {
@@ -337,14 +344,32 @@ async function saveModelConfig() {
         });
         const data = await resp.json();
         if (!resp.ok || !data.success || data.customBaseUrlRejected) {
-            document.getElementById('modelMenuHint').textContent = data.message || '保存失败，配置未变更';
+            setModelHint(data.message || '保存失败，配置未变更', true);
             return;
         }
         applyModelConfigView(data);
+        setModelHint('已保存', false);
     } catch (e) {
-        document.getElementById('modelMenuHint').textContent = '保存失败: ' + e.message;
+        setModelHint('保存失败: ' + e.message, true);
     } finally {
         setModelConfigBusy(false);
+    }
+}
+
+/**
+ * 设置弹窗底部的提示行。
+ *
+ * 保存失败以前只改文字、样式不变，而这行提示在弹窗最底部、字号又小 —— 用户点了保存、
+ * 什么都没发生，很自然会以为"存进去了但没生效"。失败必须显眼：红色 + 加粗 + 滚到可见。
+ */
+function setModelHint(text, isError) {
+    const el = document.getElementById('modelMenuHint');
+    if (!el) return;
+    el.textContent = text;
+    el.style.color = isError ? '#A32D2D' : '';
+    el.style.fontWeight = isError ? '500' : '';
+    if (isError && el.scrollIntoView) {
+        try { el.scrollIntoView({ block: 'nearest' }); } catch (_) {}
     }
 }
 

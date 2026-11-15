@@ -116,6 +116,11 @@ public class UserModelConfigService {
         current.put("customModelName", Objects.isNull(row) ? "" : nullToEmpty(row.getCustomModelName()));
         current.put("hasCustomApiKey", Objects.nonNull(row) && Objects.nonNull(row.getCustomApiKey()) && StringUtils.isNotBlank(row.getCustomApiKey()));
         int requestedWindow = row == null || row.getCustomContextWindowTokens() == null ? 0 : row.getCustomContextWindowTokens();
+        // 与 resolve() 同一套清洗规则：视图回显的、前端据此回填输入框的，必须是
+        // 「会被采信的值」。否则脏值原样回填进设置表单，用户点保存又被整批拒绝。
+        if (requestedWindow != 0 && (requestedWindow < MIN_CONTEXT_WINDOW || requestedWindow > MAX_CONTEXT_WINDOW)) {
+            requestedWindow = 0;
+        }
         boolean unknownCustomWindow = configurationValid && requestedWindow <= 0
                 && !matchesPresetModel(eff, resolvePresetOnly(eff.presetId()));
         current.put("customContextWindowTokens", requestedWindow);
@@ -172,7 +177,8 @@ public class UserModelConfigService {
         String wantedModelName = blankToNull(modelName);
         if (contextWindowTokens != null && contextWindowTokens != 0
                 && (contextWindowTokens < MIN_CONTEXT_WINDOW || contextWindowTokens > MAX_CONTEXT_WINDOW))
-            return saveFailure("INVALID_CONTEXT_WINDOW", "上下文窗口须为0（自动），或1024至10000000之间的整数；本次配置未保存。", false);
+            return saveFailure("INVALID_CONTEXT_WINDOW",
+                    "上下文窗口须为0（自动），或1024至10000000之间的整数；本次配置未保存（API Key 也没有保存）。", false);
         if ((wantedBaseUrl != null && wantedBaseUrl.length() > 512)
                 || (wantedModelName != null && wantedModelName.length() > 128))
             return saveFailure("CONFIGURATION_TOO_LONG", "Base URL 最多512字符，Model Name 最多128字符；本次配置未保存。", wantedBaseUrl != null && wantedBaseUrl.length() > 512);
@@ -308,8 +314,17 @@ public class UserModelConfigService {
             }
         }
         int requestedWindow = row == null || row.getCustomContextWindowTokens() == null ? 0 : row.getCustomContextWindowTokens();
-        if (requestedWindow != 0 && (requestedWindow < MIN_CONTEXT_WINDOW || requestedWindow > MAX_CONTEXT_WINDOW))
-            throw new IllegalStateException("已保存的上下文窗口无效；请打开模型设置填写0或1024至10000000之间的整数。");
+        // 越界的存量值按「自动(0)」处理，而不是抛异常。
+        //
+        // 这里原先是 throw：一个脏的 custom_context_window_tokens 会让该用户的整份模型配置
+        // 不可用，而症状出现在「取生效配置」阶段 —— 用户以为是自己的 API Key 没生效。
+        // 上下文窗口只是一个可选覆盖项，它坏了不该连累 key / 端点 / 模型名。忽略它、留一条
+        // 日志，用户下次打开设置看到的也是干净的 0，可以正常保存。
+        if (requestedWindow != 0 && (requestedWindow < MIN_CONTEXT_WINDOW || requestedWindow > MAX_CONTEXT_WINDOW)) {
+            log.warn("已保存的上下文窗口越界（{}），按自动(0)处理: configId={}", requestedWindow,
+                    Objects.isNull(row) ? null : row.getId());
+            requestedWindow = 0;
+        }
         boolean presetModel = sameEndpoint(baseUrl, base.baseUrl()) && Objects.equals(modelName, base.modelName());
         int window = requestedWindow > 0 ? requestedWindow
                 : presetModel ? base.contextWindowTokens() : UNKNOWN_CUSTOM_CONTEXT_WINDOW;

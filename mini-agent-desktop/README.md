@@ -32,6 +32,24 @@ macOS Intel 不支持是硬约束，不是没做：内联 embedding 用的
 | Node.js | 18+ | Electron 运行时与打包 |
 | npm | 9+ | 依赖安装 |
 
+**Windows 一键准备**（幂等，已就绪的机器上只做检测，不下载也不改配置）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\prepare-win.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\prepare-win.ps1 -NoInstall   # 只检测，不动手
+```
+
+它做四件事：检查 Node；找 JDK 21（找不到就从华为云镜像下载到 `%USERPROFILE%\.jdks`，
+并写用户级 `JAVA_HOME`）；`~/.m2/settings.xml` 不存在时补一个阿里云镜像（**已存在一律不覆盖**）；
+最后按字节数自检模型/tokenizer 是否齐备。`mini-agent-desktop\package-win.bat` 已经内置调用这一步，
+直接跑那个也是一样的。
+
+> 配完 `JAVA_HOME` 之后**必须重开终端**：环境变量写进注册表不会影响已经在运行的进程。
+> 在 IDE 内置终端里跑的话，新开标签页也不行 —— 标签页继承同一个父进程的环境块，得重启 IDE。
+>
+> 构建脚本本身只认 `JAVA_HOME`（和 PATH 上的 `java`），找不到就明确报错，不会去猜 JDK 装在哪 ——
+> 环境是「一台机器装一次」的事，不该混进每次都要跑的构建逻辑。
+
 ## 快速开始（开发态）
 
 ```bash

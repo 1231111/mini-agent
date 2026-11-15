@@ -32,11 +32,19 @@ export class ModelSourceError extends Error {
  *
  * 注意 fp32 的文件名里**没有** .fp32 —— 它是导出基准档，就叫 xxx.onnx。
  * 这个不对称是 manifest.json 里定的，别按变体名去推文件名。
+ *
+ * int8 的字节数在 2026-11-14 随一次重新导出更新过：329,744,186 → 328,059,205。
+ * 原因是导出工具链版本变了（torch 2.15.0+cpu / sentence-transformers 3.4.1），
+ * ONNX 的序列化布局跟着变，字节数就不再等于最初那次的 `manifest.json`。
+ * 数值等价性已验证：int8 与同次导出的 fp32 相比，逐条 cosine 在 0.976~0.989，
+ * 输出仍是 1792 维归一化向量，导出脚本自带的前向自检（PyTorch 包装 vs
+ * sentence-transformers）cosine_min = 1.0。只发布 int8，fp16 / fp32 两档
+ * 仍保留最初导出时的字节数（它们的 external data 切分方式同样变了，但不出包）。
  */
 export const MODEL_VARIANTS = {
   int8: {
     file: 'yuan-embedding-2.0-zh.int8.onnx',
-    bytes: 329744186,
+    bytes: 328059205, // 2026-11-14 重新导出（torch 2.15.0+cpu / ST 3.4.1）
     companion: null
   },
   fp16: {
