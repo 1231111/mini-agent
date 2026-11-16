@@ -667,7 +667,7 @@ public class ToolPipeline {
                         // Approval, pauses and resource-lock waits have their own bounds.
                         budget.start();
                     }
-                    try {
+                    try (var deadlineScope = com.miniagent.agent.tool.ToolExecutionDeadline.bind(budget.deadline())) {
                         return ToolInvocation.executed(name, toolRegistry.executeResult(name, arguments));
                     } finally {
                         budget.finish();

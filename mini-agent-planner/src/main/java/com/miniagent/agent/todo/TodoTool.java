@@ -39,9 +39,11 @@ public class TodoTool {
                 .name("todo")
                 .description("""
                         管理当前任务的执行计划（子任务列表）。
-                        - 复杂任务必须先 action=set；每步必须含 done_when。
+                        - 自主管理且尚无清单的复杂任务先 action=set；每步必须含 done_when；已有 DAG 投影时禁止 set。
                         - 默认后一步 depends_on 前一步；可显式设 depends_on:[1,2] 或 depends_on:[]（无依赖/可并行）。
                         - completed 会做存在性 + 可插拔语义校验；依赖未满足或上游 hash 失效会拒绝。
+                        - 调度器管理的 DAG 节点完成操作后，用 action=submit 附实际 evidence；
+                          节点保持 in_progress，最终完成由调度器验收，不自行标 completed。
                         - 危险操作确认策略下，上线/删除等步骤会进入 awaiting_confirm，
                           只能由用户在页面显式确认后执行。
                         - 缺密钥或须用户提供信息：update status=awaiting_confirm，直接向用户提问。
@@ -58,7 +60,7 @@ public class TodoTool {
         Map<String, Object> params = new LinkedHashMap<>();
         params.put("action", Map.of(
                 "type", "string",
-                "description", "操作：set / update / list / clear / reopen / resume / restore",
+                "description", "操作：set / update / submit / list / clear / reopen / resume / restore",
                 "required", true
         ));
         params.put("items", Map.of(
@@ -69,7 +71,7 @@ public class TodoTool {
         ));
         params.put("id", Map.of(
                 "type", "integer",
-                "description", "update/reopen 时的子任务 id"
+                "description", "update/submit/reopen 时的子任务 id"
         ));
         params.put("status", Map.of(
                 "type", "string",
@@ -81,7 +83,7 @@ public class TodoTool {
         ));
         params.put("evidence", Map.of(
                 "type", "string",
-                "description", "completed 时必填：文件路径 / 图片 markdown / 验证摘要"
+                "description", "submit 或 completed 时必填本次实际证据：文件路径 / 图片 markdown / 验证摘要"
         ));
         return params;
     }
@@ -99,6 +101,9 @@ public class TodoTool {
             String action = String.valueOf(args.getOrDefault("action", "list")).trim().toLowerCase();
             switch (action) {
                 case "set" -> {
+                    if (todoStore.hasDagManagedPlan(sid)) {
+                        return error("DAG 任务清单由调度器管理，不能通过 todo set 替换；请完成当前节点并 submit evidence");
+                    }
                     Object rawItems = args.get("items");
                     List<Map<String, Object>> items = parseItems(rawItems);
                     if (items.isEmpty()) {
@@ -128,6 +133,12 @@ public class TodoTool {
                     String status = (String) args.get("status");
                     String note = (String) args.get("note");
                     String evidence = (String) args.get("evidence");
+                    if ("completed".equalsIgnoreCase(status == null ? "" : status.trim())
+                            && todoStore.isDagManaged(sid, id)) {
+                        // Compatibility with older prompts/models. This is a successful evidence
+                        // submission, not a terminal verdict and not an execution failure.
+                        return submitEvidence(sid, id, note, evidence, "update", true);
+                    }
                     String[] err = new String[1];
                     var updated = todoStore.update(sid, id, status, note, evidence, err);
                     if (Objects.isNull(updated)) {
@@ -146,6 +157,11 @@ public class TodoTool {
                                     "evidence", Optional.ofNullable(evidence).orElse("")));
                     maybeTraceWaitingHuman(sid, updated);
                     return out;
+                }
+                case "submit" -> {
+                    int id = resolveTodoId(sid, coercePositiveInt(args.get("id")));
+                    if (id <= 0) return error("submit 缺少有效 id");
+                    return submitEvidence(sid, id, (String) args.get("note"), (String) args.get("evidence"), "submit", false);
                 }
                 case "reopen" -> {
                     int id = resolveTodoId(sid, coercePositiveInt(args.get("id")));
@@ -225,7 +241,7 @@ public class TodoTool {
                 default -> {
                     return error(
                             "未知 action: " + action
-                                    + "（支持 set/update/list/clear/reopen/resume/restore）");
+                                    + "（支持 set/update/submit/list/clear/reopen/resume/restore）");
                 }
             }
         } catch (Exception e) {
@@ -233,6 +249,27 @@ public class TodoTool {
             log.error("todo 工具执行失败", e);
             return error("todo 工具执行失败: " + e.getMessage());
         }
+    }
+
+    private String submitEvidence(String sid, int id, String note, String evidence,
+                                  String requestedAction, boolean legacyCompletion) throws Exception {
+        TaskTodoStore.EvidenceSubmission submission = todoStore.submitDagEvidence(sid, id, note, evidence);
+        if (!submission.accepted()) return error(submission.error());
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("success", true);
+        response.put("action", requestedAction);
+        response.put("status", "in_progress");
+        response.put("pendingValidation", true);
+        response.put("completionOwner", "planner");
+        response.put("message", "执行证据已提交，完成状态由调度器验收；本次节点执行可以返回实际结果。");
+        if (legacyCompletion) response.put("requestedStatus", "completed");
+        response.put("todo", TaskTodoStore.renderItems(submission.items()));
+        response.put("stats", TaskTodoStore.statsOf(submission.items()));
+        response.put("items", submission.items());
+        traceTodo("TASK_UPDATE", sid, requestedAction, submission.items(),
+                Map.of("id", id, "status", "in_progress", "pendingValidation", true,
+                        "evidence", evidence.trim()));
+        return MAPPER.writeValueAsString(response);
     }
 
     /**
@@ -246,7 +283,7 @@ public class TodoTool {
             }
             var node = MAPPER.readTree(Optional.ofNullable(json).orElse("{}"));
             String action = node.path("action").asText("").trim().toLowerCase();
-            if (!"update".equals(action) && !"reopen".equals(action)) {
+            if (!"update".equals(action) && !"submit".equals(action) && !"reopen".equals(action)) {
                 return json;
             }
             int id = node.path("id").asInt(0);
@@ -317,8 +354,18 @@ public class TodoTool {
             if (Objects.isNull(dw) || StringUtils.isBlank(String.valueOf(dw))) {
                 return "每项必须含 done_when（如 file_exists:workspace/xxx.md 或 media_delivered）。缺省项 content=" + content;
             }
+            if (declaresDagOwnership(dw)) {
+                return "dagManaged 归属只能由调度器设置，todo set 不能创建 DAG 投影";
+            }
         }
         return null;
+    }
+
+    private static boolean declaresDagOwnership(Object raw) {
+        try {
+            var node = raw instanceof CharSequence text ? MAPPER.readTree(text.toString()) : MAPPER.valueToTree(raw);
+            return node != null && node.isObject() && node.has("dagManaged");
+        } catch (Exception legacyString) { return false; }
     }
 
     @SuppressWarnings("unchecked")
@@ -353,7 +400,8 @@ public class TodoTool {
         return -1;
     }
 
-    private void traceTodo(String stepType, String sid, String action, Object items, Map<String, Object> extra) {
+    private void traceTodo(String stepType, String sid, String action, List<TaskTodoStore.TodoItem> items,
+                           Map<String, Object> extra) {
         if (Objects.isNull(traceRecorder) || !traceRecorder.isActive()) {
             return;
         }
@@ -365,11 +413,12 @@ public class TodoTool {
                 payload.putAll(extra);
             }
             payload.put("items", items);
-            if (Objects.nonNull(items) && items instanceof List<?> list) {
-                payload.put("itemCount", list.size());
+            if (Objects.nonNull(items)) {
+                payload.put("itemCount", items.size());
             }
-            payload.put("render", todoStore.render(sid));
-            payload.put("stats", todoStore.stats(sid));
+            List<TaskTodoStore.TodoItem> snapshot = items == null ? List.of() : items;
+            payload.put("render", TaskTodoStore.renderItems(snapshot));
+            payload.put("stats", TaskTodoStore.statsOf(snapshot));
             traceRecorder.recordNode(stepType, MAPPER.writeValueAsString(payload), RunStatus.SUCCESS.name(), 0);
         } catch (Exception e) {
             log.debug("todo trace 写入跳过: {}", e.getMessage());

@@ -117,6 +117,14 @@ async function consume(harness, chunks, reconnectAttempt = 0) {
     return harness.bot.querySelector('.answer-stream');
 }
 
+{
+    const h = createHarness(), refreshes = [];
+    h.context.scheduleInspectorMemoryRefresh = sid => refreshes.push(sid);
+    await consume(h, [event('token', '已保存你的偏好'), event('end', '已保存你的偏好')]);
+    assert.deepEqual(refreshes, ['regression-session']);
+    console.log('PASS: completing a chat refreshes persisted preferences even without a trace stream');
+}
+
 for (const answerFirst of [true, false]) {
     const h = createHarness();
     const nodes = event('todo', JSON.stringify({ items: [{ id: 1, content: '核验来源', status: 'completed' }] }));

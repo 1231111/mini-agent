@@ -1,6 +1,8 @@
 package com.miniagent.config.service;
 
 import com.miniagent.agent.planner.DomainEvent;
+import com.miniagent.agent.planner.ActionProposal;
+import com.miniagent.agent.planner.PlannerDispatchFence;
 import com.miniagent.agent.planner.PlannerStateJson;
 import com.miniagent.agent.planner.PlannerStatePersistence;
 import com.miniagent.agent.planner.StateSnapshot;
@@ -11,6 +13,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Propagation;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -31,6 +34,17 @@ public class DbPlannerStatePersistence implements PlannerStatePersistence {
             return Optional.empty();
         }
         return repo.findById(sessionId).map(this::toBundle);
+    }
+
+    @Override
+    @Transactional(readOnly = true, propagation = Propagation.REQUIRES_NEW)
+    public boolean dispatchFenceValid(String sessionId, ActionProposal proposal) {
+        if (sessionId == null || proposal == null || proposal.actions().isEmpty()) return false;
+        // A separate read transaction cannot inherit a cached entity or a repeatable-read
+        // snapshot held by an enclosing operation. Database failures must propagate, not authorize.
+        return repo.readDispatchState(sessionId)
+                .map(state -> PlannerDispatchFence.matchesJson(state.getStateJson(), state.getExecutionId(), sessionId, proposal))
+                .orElse(false);
     }
 
     @Override

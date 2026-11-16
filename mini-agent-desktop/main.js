@@ -339,7 +339,10 @@ function startBackend(rt, nonce) {
 
   backend = spawn(
     rt.java,
-    ['-jar', rt.jar, '--spring.profiles.active=desktop', '--server.port=0'],
+    // The desktop H2 is a different identity store from the cloud account DB.
+    // Keep this invariant above inherited environment / external production YAML.
+    ['-jar', rt.jar, '--spring.profiles.active=desktop', '--server.port=0',
+      '--agent.auth.cloud.shared-database=false'],
     {
       cwd: resolveDataDir(),
       env,

@@ -164,6 +164,46 @@ public class TaskTodoStore {
         return list != null && !list.isEmpty();
     }
 
+    /** Whether the current plan belongs to the scheduler, rather than a model-created checklist. */
+    public synchronized boolean hasDagManagedPlan(String sessionId) {
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        return containsDagProjection(key);
+    }
+
+    /** Ownership is read from the stored, trusted projection; tool arguments cannot assert it. */
+    public synchronized boolean isDagManaged(String sessionId, int todoId) {
+        TodoItem item = findById(get(sessionId), todoId);
+        return item != null && dagManaged(item.doneWhen());
+    }
+
+    public record EvidenceSubmission(List<TodoItem> items, String error) {
+        public EvidenceSubmission { items = items == null ? List.of() : List.copyOf(items); }
+        public boolean accepted() { return error == null; }
+    }
+
+    /**
+     * Store evidence without granting completion. The planner remains the sole owner of a DAG
+     * terminal verdict. Reuse normal in_progress transitions so dependencies and human gates apply.
+     */
+    public synchronized EvidenceSubmission submitDagEvidence(String sessionId, int todoId,
+                                                             String note, String evidence) {
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        TodoItem item = findById(todos.getOrDefault(key, List.of()), todoId);
+        if (item == null) return new EvidenceSubmission(null, "未找到 id=" + todoId + " 的子任务");
+        if (!dagManaged(item.doneWhen()))
+            return new EvidenceSubmission(null, "submit 仅用于调度器管理的 DAG 节点；普通清单请使用 update");
+        if (evidence == null || evidence.isBlank())
+            return new EvidenceSubmission(null, "submit 必须提供本次实际 evidence，不能用空值、旧证据或 note 代替");
+        if (item.status() == Status.completed || item.status() == Status.cancelled || item.status() == Status.blocked)
+            return new EvidenceSubmission(null, "该节点当前状态为 " + item.status() + "，不能提交新的执行证据");
+        String[] error = new String[1];
+        List<TodoItem> updated = updateLoaded(key, todoId, "in_progress", note, evidence, error);
+        return updated == null ? new EvidenceSubmission(null,
+                error[0] == null ? "提交 evidence 失败" : error[0]) : new EvidenceSubmission(updated, null);
+    }
+
     public synchronized boolean hasIncomplete(String sessionId) {
         for (TodoItem it : get(sessionId)) {
             if (it.status() == Status.pending || it.status() == Status.in_progress
@@ -347,9 +387,13 @@ public class TaskTodoStore {
     /** Keep structured contracts losslessly in the legacy persisted string field. */
     private static String serializeDoneWhen(Object raw, boolean dagProjection) {
         if (raw == null) return "";
-        if (raw instanceof CharSequence text) return text.toString().trim();
+        // Legacy strings remain supported. Structured strings must pass the same parser as objects,
+        // otherwise a model could smuggle dagManaged=true through the persisted string field.
+        if (raw instanceof CharSequence text && !text.toString().trim().startsWith("{"))
+            return text.toString().trim();
         try {
-            JsonNode node = MAPPER.valueToTree(raw);
+            JsonNode node = raw instanceof CharSequence text
+                    ? MAPPER.readTree(text.toString()) : MAPPER.valueToTree(raw);
             DoneWhen contract = DoneWhen.parse(node);
             if (!contract.valid()) return "{\"invalid\":true}";
             var structured = MAPPER.valueToTree(contract);
@@ -402,6 +446,11 @@ public class TaskTodoStore {
                                               String note, String evidence, String[] errorOut) {
         String key = safeKey(sessionId);
         ensureLoaded(key);
+        return updateLoaded(key, id, statusStr, note, evidence, errorOut);
+    }
+
+    private List<TodoItem> updateLoaded(String key, int id, String statusStr,
+                                      String note, String evidence, String[] errorOut) {
         List<TodoItem> list = todos.computeIfAbsent(key, k -> new ArrayList<>());
         for (int i = 0; i < list.size(); i++) {
             TodoItem it = list.get(i);
@@ -1170,14 +1219,20 @@ public class TaskTodoStore {
     }
 
     public synchronized SubGoal currentSubGoalDetail(String sessionId) {
-        List<TodoItem> list = new ArrayList<>(get(sessionId));
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        List<TodoItem> previous = todos.getOrDefault(key, List.of());
+        List<TodoItem> list = new ArrayList<>(previous);
         if (list.isEmpty()) {
             return null;
         }
         // 确保指针落在依赖已满足的项上
         promoteReadyItems(list);
-        todos.put(safeKey(sessionId), list);
-        persist(safeKey(sessionId), list);
+        // Reading the current focus must not rewrite the session row or replay the same UI event.
+        // Always load authoritative state above; only the actual promotion needs persistence.
+        if (!list.equals(previous)) {
+            persist(key, list);
+        }
 
         int total = list.size();
         int done = (int) list.stream().filter(t -> t.status() == Status.completed).count();
@@ -1277,7 +1332,11 @@ public class TaskTodoStore {
     }
 
     public synchronized String render(String sessionId) {
-        List<TodoItem> list = get(sessionId);
+        return renderItems(get(sessionId));
+    }
+
+    /** Render one already validated operation snapshot without reloading a newer store version. */
+    static String renderItems(List<TodoItem> list) {
         if (list.isEmpty()) {
             return "";
         }
@@ -1796,7 +1855,11 @@ public class TaskTodoStore {
     }
 
     public synchronized Map<String, Object> stats(String sessionId) {
-        List<TodoItem> list = get(sessionId);
+        return statsOf(get(sessionId));
+    }
+
+    /** Receipt statistics and its item list must describe the same operation snapshot. */
+    static Map<String, Object> statsOf(List<TodoItem> list) {
         int pending = 0, inProg = 0, awaiting = 0, done = 0, cancelled = 0, blocked = 0;
         for (TodoItem item : list) {
             switch (item.status()) {

@@ -60,6 +60,16 @@ function evictMediaBlobCache() {
     }
 }
 
+/** Keep an absent cover distinct from a supplied image that failed to load. */
+function setMediaCoverState(image, state) {
+    const cover = image.closest?.('[data-cover-state]');
+    if (!cover) return;
+    cover.setAttribute('data-cover-state', state);
+    const label = cover.querySelector('[data-cover-status]');
+    if (label && state === 'failed') label.textContent = cover.classList.contains('news-thumbnail')
+        ? '配图加载失败' : '封面加载失败';
+}
+
 /** 把 root 下所有 data-auth-src 元素挂上真实 src。 */
 function hydrateProtectedMedia(root) {
     if (!root || !root.querySelectorAll) return;
@@ -84,9 +94,23 @@ function hydrateProtectedMedia(root) {
             el.parentNode?.querySelector('.media-preview-error')?.remove();
         });
         el.addEventListener('error', () => {
-            if (el.tagName === 'IMG') el.hidden = true;
+            if (el.tagName === 'IMG') {
+                el.hidden = true;
+                setMediaCoverState(el, 'failed');
+            }
             else showMediaPreviewError(el, el.dataset.mediaUrl || el.getAttribute('src'), '当前资源暂无法播放，请打开原网页或下载文件。');
         });
+        if (el.tagName === 'IMG') {
+            el.addEventListener('load', () => {
+                el.hidden = false;
+                setMediaCoverState(el, 'loaded');
+            });
+            // Cached failures may finish before hydration installs its listener.
+            if (el.complete && el.getAttribute('src')) {
+                el.hidden = el.naturalWidth === 0;
+                setMediaCoverState(el, el.hidden ? 'failed' : 'loaded');
+            }
+        }
     });
     const protectedNodes = [...root.querySelectorAll('[data-auth-src]')];
     if (root.matches?.('[data-auth-src]')) protectedNodes.push(root);
@@ -101,7 +125,10 @@ function hydrateProtectedMedia(root) {
             el.setAttribute('data-media-error', '1');
             if (el.tagName === 'VIDEO' || el.tagName === 'AUDIO') showMediaPreviewError(el, url,
                 err.message.includes('40 MB') ? '视频超过 40 MB，请下载后播放。' : '媒体加载失败，请下载文件或打开原网页。');
-            else if (el.matches?.('[data-media-poster]')) el.hidden = true;
+            else if (el.matches?.('[data-media-poster]')) {
+                el.hidden = true;
+                setMediaCoverState(el, 'failed');
+            }
             console.warn('受保护媒体加载失败:', url, err.message);
         });
     });
@@ -544,7 +571,7 @@ function renderMD(t) {
     // 1) 摘出 fenced code：内容不参与 markdown 结构替换，也不会被二次转义
     const codeBlocks = [];
     t = t.replace(/```([\w-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
-        const card = renderMediaCardBlock(lang, code) || renderTravelCardBlock(lang, code);
+        const card = renderMediaCardBlock(lang, code) || renderNewsCardBlock(lang, code) || renderTravelCardBlock(lang, code);
         if (card) {
             codeBlocks.push({ rendered: card });
         } else {
@@ -553,8 +580,10 @@ function renderMD(t) {
         return '\u0000CB' + (codeBlocks.length - 1) + '\u0000';
     });
     // A streamed or interrupted protocol payload must never expose partial JSON to the conversation.
-    t = t.replace(/```miniagent-media\b[^\n]*\n[\s\S]*$/i, () => {
-        codeBlocks.push({ rendered: '<div class="media-card-pending" role="status">正在整理媒体内容…</div>' });
+    t = t.replace(/```miniagent-(media|news)\b[^\n]*\n[\s\S]*$/i, (_, kind) => {
+        codeBlocks.push({ rendered: kind.toLowerCase() === 'news'
+            ? '<div class="media-card-pending news-card-pending" role="status">正在整理新闻…</div>'
+            : '<div class="media-card-pending" role="status">正在整理媒体内容…</div>' });
         return '\u0000CB' + (codeBlocks.length - 1) + '\u0000';
     });
 

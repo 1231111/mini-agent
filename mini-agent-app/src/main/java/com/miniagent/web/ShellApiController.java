@@ -13,11 +13,14 @@ import com.miniagent.agent.permission.SessionPermissionStore;
 import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.common.ApiResponse;
 import com.miniagent.common.ErrorCode;
+import com.miniagent.common.context.OwnerContext;
 import com.miniagent.config.OpenAiModelProperties;
 import com.miniagent.config.security.AuthenticatedUser;
 import com.miniagent.config.security.JwtSessionService;
 import com.miniagent.config.security.SessionAuthorizationService;
 import com.miniagent.config.service.UserModelConfigService;
+import com.miniagent.memory.MemoryKeys;
+import com.miniagent.memory.MemoryService;
 import jakarta.servlet.http.HttpServletRequest;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -78,6 +81,8 @@ public class ShellApiController {
     private AgentProcedureRepository procedureRepository;
     @Autowired(required = false)
     private AgentEpisodeRepository episodeRepository;
+    @Autowired(required = false)
+    private MemoryService memoryService;
 
     // ==================== GET /api/shell/status ====================
 
@@ -196,6 +201,7 @@ public class ShellApiController {
         // 上限由调用方给：检查器只要看几条，知识库整页要拉满一屏。
         // 夹在 1..500，避免有人传 0 或一亿把响应撑爆。
         int cap = Math.max(1, Math.min(500, limit));
+        PreferenceSnapshot preferences = readUserPreferences(userId, tenant, cap);
         List<Map<String, Object>> related = new ArrayList<>();
         for (AgentEpisodeEntity ep : episodes) {
             if (related.size() >= cap) {
@@ -254,7 +260,10 @@ public class ShellApiController {
 
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("sessionId", scoped ? sessionId : "");
+        // Compatibility: saved reports an episode summary, never a preference write receipt.
         data.put("saved", !episodes.isEmpty());
+        data.put("userPreferences", preferences.entries());
+        data.put("preferencesAvailable", preferences.available());
         data.put("related", related);
         data.put("tags", new ArrayList<>(tags));
         data.put("stats", stats);
@@ -304,6 +313,35 @@ public class ShellApiController {
     }
 
     // ==================== 内部辅助 ====================
+
+    private record PreferenceSnapshot(boolean available, List<Map<String, Object>> entries) { }
+
+    private PreferenceSnapshot readUserPreferences(Long userId, String tenant, int cap) {
+        if (memoryService == null) {
+            return new PreferenceSnapshot(false, List.of());
+        }
+        try (var ignored = OwnerContext.bind(new OwnerContext(userId, tenant))) {
+            List<String> stored = memoryService.read(MemoryKeys.TARGET_USER);
+            if (stored == null) {
+                return new PreferenceSnapshot(false, List.of());
+            }
+            List<Map<String, Object>> entries = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            // Read the newest entries first, independently of the related episode limit.
+            for (int i = stored.size() - 1; i >= 0 && entries.size() < cap; i--) {
+                String content = stored.get(i);
+                if (StringUtils.isBlank(content) || !seen.add(content)) {
+                    continue;
+                }
+                entries.add(Map.of("content", content, "target", MemoryKeys.TARGET_USER,
+                        "persisted", true));
+            }
+            return new PreferenceSnapshot(true, entries);
+        } catch (RuntimeException unavailable) {
+            // An unavailable store must not look like a successful read with no preferences.
+            return new PreferenceSnapshot(false, List.of());
+        }
+    }
 
     /**
      * 与现有端点同款取当前用户：优先读过滤器放在 request 上的 userId，

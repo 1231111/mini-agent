@@ -327,6 +327,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         function finish(html, cancelled, incomplete) {
             if (!isCurrentStream()) return;
             if (done) return; done = true;
+            if (typeof scheduleInspectorMemoryRefresh === 'function') scheduleInspectorMemoryRefresh(sessionId);
             turnWaiting = taskOutcomeStatus === 'WAITING';
             turnCancelled = taskOutcomeStatus === 'CANCELED' || (!taskOutcomeStatus && !!cancelled);
             turnIncomplete = !!incomplete;

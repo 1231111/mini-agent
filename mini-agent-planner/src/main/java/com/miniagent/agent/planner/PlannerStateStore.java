@@ -95,6 +95,14 @@ public class PlannerStateStore {
         return Optional.ofNullable(memory.get(k));
     }
 
+    /** Read only the authoritative state needed by dispatch; audit events do not grant execution. */
+    public boolean dispatchFenceValid(String sessionId, ActionProposal proposal) {
+        String k = key(sessionId);
+        if (k == null || proposal == null || proposal.actions().isEmpty()) return false;
+        return persistence != null ? persistence.dispatchFenceValid(k, proposal)
+                : PlannerDispatchFence.matches(memory.get(k), k, proposal);
+    }
+
     /** 当前是否有整图计划等待用户批准。 */
     public boolean hasPendingPlanApproval(String sessionId) {
         return get(sessionId)

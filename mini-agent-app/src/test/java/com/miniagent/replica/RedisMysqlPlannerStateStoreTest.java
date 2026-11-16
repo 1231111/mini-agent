@@ -1,6 +1,7 @@
 package com.miniagent.replica;
 
 import com.miniagent.agent.planner.DomainEvent;
+import com.miniagent.agent.planner.ActionProposal;
 import com.miniagent.agent.planner.DomainEventType;
 import com.miniagent.agent.planner.Goal;
 import com.miniagent.agent.planner.PlannerStateJson;
@@ -43,6 +44,21 @@ class RedisMysqlPlannerStateStoreTest {
         assertEquals(fixture.database.current.get(), loaded);
         assertEquals(3, loaded.snapshot().version());
         verifyNoInteractions(fixture.redis);
+    }
+
+    @Test void dispatchFenceAlwaysUsesCurrentMysqlAuthorityWithoutReadingRedisOrAuditBundles() {
+        DbPlannerStatePersistence database = mock(DbPlannerStatePersistence.class);
+        StringRedisTemplate redis = mock(StringRedisTemplate.class);
+        RedisMysqlPlannerStateStore store = store(database, redis);
+        ActionProposal proposal = new ActionProposal("dispatch", 1, "execution", List.of());
+        when(database.dispatchFenceValid(SESSION, proposal)).thenReturn(true, false)
+                .thenThrow(new DataAccessResourceFailureException("database unavailable"));
+        assertTrue(store.dispatchFenceValid(SESSION, proposal));
+        assertFalse(store.dispatchFenceValid(SESSION, proposal));
+        assertThrows(DataAccessResourceFailureException.class, () -> store.dispatchFenceValid(SESSION, proposal));
+        verify(database, times(3)).dispatchFenceValid(SESSION, proposal);
+        verify(database, never()).load(anyString());
+        verifyNoInteractions(redis);
     }
 
     @Test

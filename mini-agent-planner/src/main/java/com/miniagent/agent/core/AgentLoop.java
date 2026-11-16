@@ -538,6 +538,7 @@ public class AgentLoop {
         final Set<String> toolsInvoked = new LinkedHashSet<>();
         ToolErrorCode lastErrorCode = ToolErrorCode.NONE;
         ToolResult lastToolResult;
+        ToolResult lastActionResult;
         final List<ToolObservationProjector.Observation> pendingObservations = new ArrayList<>();
         UserMessage latestObservation;
         ToolVisionModelResolver.Models visionModels;
@@ -593,14 +594,20 @@ public class AgentLoop {
                 unknownOutcome = true;
                 unknownOutcomeMessage = Objects.requireNonNullElse(result.message(), "");
             }
-            // Todo bookkeeping must not hide a failed real action. Once UNKNOWN
-            // is observed, collecting other in-flight results cannot clear it.
-            if ((!unknownOutcome || unknown)
-                    && (!com.miniagent.agent.tool.CapabilityRegistry.FALLBACK_TOOL.equals(toolName)
-                    || lastToolResult == null || !result.isSuccess())) {
+            // UNKNOWN stays sticky even when later bookkeeping or concurrent tools finish.
+            if (unknownOutcome && !unknown) return;
+            if (com.miniagent.agent.tool.CapabilityRegistry.FALLBACK_TOOL.equals(toolName)) {
+                // A corrected bookkeeping request may clear its own error, but may
+                // never turn an actual failed action into a successful execution.
+                // A bookkeeping-only success has no action receipt. Keeping it
+                // null also prevents a scheduler acknowledgement from becoming
+                // the artifact/evidence of a synthesis-only DAG node.
+                lastToolResult = result.isSuccess() ? lastActionResult : result;
+            } else {
+                lastActionResult = result;
                 lastToolResult = result;
-                lastErrorCode = result.errorCode();
             }
+            lastErrorCode = lastToolResult == null ? ToolErrorCode.NONE : lastToolResult.errorCode();
         }
 
         void noteToolFinished(String name, String args, ToolResult result) {
@@ -792,7 +799,8 @@ public class AgentLoop {
                 messages.add(new SystemMessage(
                         "【规划器已投影任务图】禁止 todo.set/clear。"
                                 + "不要 list_files 探盘，不要重建计划。"
-                                + "立刻执行 ActionProposal 中的当前步骤。"));
+                                + "立刻执行 ActionProposal 中的当前步骤。"
+                                + MessageConstants.DAG_EVIDENCE_SUBMISSION));
             }
 
             // 挂上 todo 的当前子目标作为可刷新指针；本轮没有清单时它不会注入任何内容
@@ -1190,7 +1198,7 @@ public class AgentLoop {
                 if (Objects.nonNull(traceRecorder)) {
                     traceRecorder.recordAnswer(sessionId, turn, result);
                 }
-                state.loopEndReason = !LoopTurnContext.current().hardGate() && hasBlockingTodos(sessionId)
+                state.loopEndReason = hasBlockingTodos(sessionId)
                         ? "INCOMPLETE_TODO" : RunStatus.SUCCESS.name();
                 return finish(result, state, messages);
             }
@@ -1256,8 +1264,10 @@ public class AgentLoop {
         }
         if (Objects.isNull(sg)) return; // 无可执行子目标：不注入
 
+        boolean plannerOwned = plannerOwnsTodos(sessionId);
         String pointer = "当前子目标 (#" + sg.position() + "/" + sg.total() + ")：" + sg.text()
-                + "\n聚焦完成这一步即可，完成后用 todo 工具把它标记为 completed 再进入下一步。";
+                + "\n" + (plannerOwned ? MessageConstants.DAG_EVIDENCE_SUBMISSION
+                : "聚焦完成这一步即可，完成后用 todo 工具把它标记为 completed 再进入下一步。");
         SystemMessage msg = new SystemMessage(pointer);
         messages.add(msg);
         state.currentSubGoalMsg = msg;
@@ -2499,7 +2509,7 @@ public class AgentLoop {
 
         if (Objects.nonNull(sessionId) && taskTodoStore.hasPlan(sessionId)) {
             boolean runnable = taskTodoStore.hasRunnableIncomplete(sessionId);
-            if (!turnPolicy.hardGate() && runnable
+            if (!plannerOwnsTodos(sessionId) && runnable
                     && state.incompleteTodoReminders >= 2) {
                 log.warn("todo 未完成但已提醒多次，附带未完成清单后放行。轮次 {}",
                         turn + 1);
@@ -2548,7 +2558,7 @@ public class AgentLoop {
             return finalText;
         }
 
-        if (turnPolicy.hardGate()) {
+        if (plannerOwnsTodos(sessionId)) {
             return finalText;
         }
 
@@ -2581,7 +2591,7 @@ public class AgentLoop {
                 SubagentContext.isActive(),
                 PermissionContext.mode(),
                 PermissionContext.planApproved(),
-                turnPolicy.hardGate(),
+                plannerOwnsTodos(sessionId),
                 hasPlan,
                 runnable,
                 state.incompleteTodoReminders,
@@ -2596,8 +2606,15 @@ public class AgentLoop {
 
     private boolean hasBlockingTodos(String sessionId) {
         return Objects.nonNull(sessionId)
+                && !plannerOwnsTodos(sessionId)
                 && taskTodoStore.hasPlan(sessionId)
                 && taskTodoStore.hasRunnableIncomplete(sessionId);
+    }
+
+    /** Todo ownership is independent of whether the proposal enforces a hard tool whitelist. */
+    private boolean plannerOwnsTodos(String sessionId) {
+        return LoopTurnContext.current().hardGate()
+                || (sessionId != null && taskTodoStore.hasDagManagedPlan(sessionId));
     }
 
     private boolean focusTodosCompleted(String sessionId) {

@@ -16,6 +16,12 @@ public interface PlannerStatePersistence {
 
     Optional<Bundle> load(String sessionId);
 
+    /** Fresh authoritative dispatch read. Implementations may omit audit history, never use a stale cache. */
+    default boolean dispatchFenceValid(String sessionId, ActionProposal proposal) {
+        return load(sessionId).map(bundle -> PlannerDispatchFence.matches(bundle.snapshot(), sessionId, proposal))
+                .orElse(false);
+    }
+
     /** 覆盖写入（init / 强制重置），version 以 snapshot 为准。 */
     void replace(String sessionId, StateSnapshot snapshot, List<DomainEvent> events);
 

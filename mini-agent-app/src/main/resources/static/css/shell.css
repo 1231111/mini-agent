@@ -848,6 +848,10 @@
     overflow-wrap: anywhere;
 }
 
+.insp-memory-more { margin-top: 5px; font-size: 11px; line-height: 1.6; }
+.insp-memory-more summary { cursor: pointer; color: var(--text-secondary, #667085); }
+.insp-memory-full { margin-top: 6px; max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+
 .insp-memory-stats {
     display: flex;
     flex-wrap: wrap;

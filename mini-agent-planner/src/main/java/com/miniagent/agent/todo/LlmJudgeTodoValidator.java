@@ -23,6 +23,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
 import org.apache.commons.lang3.StringUtils;
 
 /**
@@ -57,6 +60,25 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
     private int judgeTimeoutSeconds;
 
     private volatile ChatModel dedicatedJudge;
+    private record ModelIdentity(WeakReference<ChatModel> model, String identity) { }
+    private final List<ModelIdentity> acceptanceModelIdentities = new ArrayList<>();
+
+    /**
+     * An identity for the actual model instance and this judge policy, without exposing its credentials.
+     * New model instances and process restarts intentionally invalidate persisted verdict reuse.
+     * This records provenance only; no acceptance result is cached in this validator.
+     */
+    public synchronized String acceptanceIdentity() {
+        ChatModel model = resolveJudgeChat();
+        if (model == null) return "";
+        acceptanceModelIdentities.removeIf(entry -> entry.model().get() == null);
+        for (ModelIdentity entry : acceptanceModelIdentities) {
+            if (entry.model().get() == model) return entry.identity();
+        }
+        String identity = "judge-policy-v1:" + UUID.randomUUID();
+        acceptanceModelIdentities.add(new ModelIdentity(new WeakReference<>(model), identity));
+        return identity;
+    }
 
     @PostConstruct
     void initDedicatedJudge() {

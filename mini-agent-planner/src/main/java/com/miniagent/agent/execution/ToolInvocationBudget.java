@@ -4,6 +4,7 @@ import com.miniagent.agent.tool.ToolDescriptor;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.ToolResult;
 import com.miniagent.agent.tool.ToolSideEffect;
+import com.miniagent.agent.tool.ToolExecutionDeadline;
 
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -17,6 +18,7 @@ public final class ToolInvocationBudget {
     private Thread handler;
     private boolean active;
     private boolean expired;
+    private ToolExecutionDeadline.Deadline operationDeadline;
 
     public ToolInvocationBudget(long timeoutSeconds) {
         this.timeoutSeconds = Math.max(1L, timeoutSeconds);
@@ -29,7 +31,13 @@ public final class ToolInvocationBudget {
         if (active || deadline != null) throw new IllegalStateException("Tool invocation budget already started");
         handler = Thread.currentThread();
         active = true;
+        operationDeadline = ToolExecutionDeadline.after(timeoutSeconds, TimeUnit.SECONDS);
         deadline = DEADLINES.schedule(this::expire, timeoutSeconds, TimeUnit.SECONDS);
+    }
+
+    public synchronized ToolExecutionDeadline.Deadline deadline() {
+        if (operationDeadline == null) throw new IllegalStateException("Tool invocation budget not started");
+        return operationDeadline;
     }
 
     public synchronized void finish() {

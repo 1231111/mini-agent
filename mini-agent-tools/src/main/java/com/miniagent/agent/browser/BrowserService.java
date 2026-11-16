@@ -10,6 +10,9 @@ import com.microsoft.playwright.options.ServiceWorkerPolicy;
 import com.microsoft.playwright.options.WaitUntilState;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.security.NetworkGuard;
+import com.miniagent.agent.tool.ToolExecutionDeadline;
+import com.miniagent.agent.tool.ToolConcurrencyPolicy;
+import com.miniagent.agent.web.WebSearchService;
 import com.miniagent.common.MessageConstants;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
@@ -49,6 +52,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.Objects;
 import java.util.regex.Matcher;
@@ -122,14 +126,21 @@ public class BrowserService {
               const maxSteps = __MAX__;
               const pauseMs = __PAUSE__;
               const imgMin = __IMGMIN__;
+              const extractionUrl = location.href;
               const wait = () => new Promise(r => setTimeout(r, pauseMs));
-              for (let w = 0; w < 25; w++) {
-                const named = document.querySelector(
-                  '.bear-web-x-container,.wiki-content,.docx-container');
-                if (named && (named.innerText || '').trim().length > 40) {
-                  break;
+              const contentSelector = '.bear-web-x-container,.wiki-content,.docx-container';
+              // Only a recognized document shell can still be loading document blocks.
+              // A normal, already-rendered article must not wait for a wiki DOM it never has.
+              const documentShell = document.querySelector(contentSelector
+                  + ',.wiki-tree-inner-container,.workspace-tree-view-container,.workspace-nav-tree-wrapper');
+              if (documentShell) {
+                for (let w = 0; w < 25; w++) {
+                  const named = document.querySelector(contentSelector);
+                  if (named && (named.innerText || '').trim().length > 40) {
+                    break;
+                  }
+                  await wait();
                 }
-                await wait();
               }
               const chrome = /catalogue-container|sidebar|comment-list/i;
               const pick = () => {
@@ -200,7 +211,7 @@ public class BrowserService {
                 const t = el.innerText || '';
                 const langs = 'Python|JavaScript|TypeScript|Java|Go|Shell|'
                     + 'Bash|SQL|JSON|YAML|HTML|CSS|XML|Kotlin|Rust|'
-                    + 'C\\+\\+|C#|Swift|Markdown|Dockerfile|Plain Text';
+                    + 'C\\\\+\\\\+|C#|Swift|Markdown|Dockerfile|Plain Text';
                 const m = t.match(new RegExp('\\b(' + langs + ')\\b', 'i'));
                 if (!m) {
                   return '';
@@ -428,6 +439,10 @@ public class BrowserService {
               };
               const scrollAll = async (fn) => {
                 scroller.scrollTop = 0;
+                if (scroller.scrollHeight <= scroller.clientHeight + 1) {
+                  fn();
+                  return;
+                }
                 await wait();
                 let stable = 0;
                 let lastH = -1;
@@ -451,15 +466,6 @@ public class BrowserService {
                 }
                 fn();
               };
-              await scrollAll(() => {
-                harvestBlocks();
-                if (blockHits > 0) {
-                  harvestOrphans();
-                }
-              });
-              if (blockHits > 0) {
-                return [...seen.values()].filter(Boolean).join('\\n\\n');
-              }
               const dup = new Set();
               const lines = [];
               const add = raw => {
@@ -476,13 +482,41 @@ public class BrowserService {
                   lines.push(t);
                 }
               };
-              await scrollAll(() => add(scroller.innerText || ''));
+              // Harvest structured blocks, fallback text and lazy media on the same traversal.
+              // Rewinding a virtual list for a second pass doubles work and can lose its old rows.
+              await scrollAll(() => {
+                harvestBlocks();
+                if (blockHits === 0) add(scroller.innerText || '');
+                harvestOrphans();
+              });
+              // Capture source metadata in this existing extraction evaluation.
+              // No page HTML, unrelated head scripts, image downloads or extra
+              // browser round trip is needed to present the page's own cover.
+              const finish = text => {
+                const metadata = [];
+                let length = 0;
+                const wanted = /^(og:image(?::(?:url|secure_url))?|twitter:image(?::src)?|og:title|twitter:title|article:published_time|og:published_time|datepublished|date|pubdate|parsely-pub-date|sailthru\\.date|dc\\.date\\.issued|citation_publication_date|published_time)$/i;
+                for (const node of document.querySelectorAll('head meta,script[type="application/ld+json"]')) {
+                  if (node.tagName === 'META') {
+                    const key = node.getAttribute('property') || node.getAttribute('name') || node.getAttribute('itemprop') || '';
+                    if (!wanted.test(key.trim())) continue;
+                  }
+                  const html = node.outerHTML || '';
+                  if (length + html.length > 65536) continue;
+                  metadata.push(html); length += html.length;
+                }
+                return {text, url: location.href, title: document.title || '',
+                  metadataHtml: metadata.join('\\n'), pageChanged: extractionUrl !== location.href};
+              };
+              if (blockHits > 0) {
+                return finish([...seen.values()].filter(Boolean).join('\\n\\n'));
+              }
               harvestOrphans();
               const extra = [...seen.values()].filter(Boolean);
               if (extra.length === 0) {
-                return lines.join('\\n');
+                return finish(lines.join('\\n'));
               }
-              return lines.join('\\n') + '\\n\\n' + extra.join('\\n\\n');
+              return finish(lines.join('\\n') + '\\n\\n' + extra.join('\\n\\n'));
             }
             """;
     private static final String PICK_CAT_FN = """
@@ -768,6 +802,7 @@ public class BrowserService {
             return browserError("CANCELLED", "浏览器操作在派发前已取消");
         }
         ActorInputGate inputGate = new ActorInputGate();
+        ToolExecutionDeadline.Deadline operationDeadline = ToolExecutionDeadline.current();
         AtomicInteger state = new AtomicInteger(); // queued / running / cancelled / finished
         Future<String> pending;
         try {
@@ -775,7 +810,7 @@ public class BrowserService {
                 try {
                     if (!state.compareAndSet(0, 1)) return browserError("CANCELLED", "浏览器操作在执行前已取消");
                     actorInputGate.set(inputGate);
-                    try { return operation.call(); }
+                    try (var deadlineScope = ToolExecutionDeadline.bind(operationDeadline)) { return operation.call(); }
                     finally { actorInputGate.remove(); state.set(3); }
                 } finally {
                     // A stopped caller does not imply that Playwright has finished its input.
@@ -891,7 +926,39 @@ public class BrowserService {
     public String screenshot(String sessionId, Path workspaceRoot) { return onSessionActor(sessionId, () -> screenshotOnActor(sessionId, workspaceRoot)); }
     public String close(String sessionId) { return onTrackedSessionActor(sessionId, () -> closeOnActor(sessionId)); }
     public String extractArticleText(String sessionId) { return extractArticleText(sessionId, null); }
-    public String extractArticleText(String sessionId, Path imageDir) { return onSessionActor(sessionId, () -> extractArticleTextOnActor(sessionId, imageDir)); }
+    public String extractArticleText(String sessionId, Path imageDir) { return extractArticleWithMetadata(sessionId, imageDir).text(); }
+
+    /** Metadata belongs only to pages successfully extracted by this exact operation. */
+    public record ArticleExtractionResult(boolean success, String text, List<WebSearchService.PageMetadata> sources) {
+        public ArticleExtractionResult {
+            text = StringUtils.defaultString(text);
+            sources = !success || sources == null ? List.of() : List.copyOf(sources);
+        }
+        static ArticleExtractionResult failed(String error) { return new ArticleExtractionResult(false, error, List.of()); }
+    }
+
+    public ArticleExtractionResult extractArticleWithMetadata(String sessionId) {
+        return extractArticleWithMetadata(sessionId, null);
+    }
+
+    public ArticleExtractionResult extractArticleWithMetadata(String sessionId, Path imageDir) {
+        AtomicReference<ArticleExtractionResult> completed = new AtomicReference<>();
+        String delivered = onSessionActor(sessionId, () -> {
+            ArticleExtractionResult extracted = extractArticleWithMetadataOnActor(sessionId, imageDir);
+            completed.set(extracted);
+            return extracted.text();
+        });
+        ArticleExtractionResult extracted = completed.get();
+        // The actor wrapper can replace an already-produced value with cancellation
+        // or unknown outcome. Never expose its metadata in that case, nor let an
+        // interrupted caller share a mutable collector with the still-running actor.
+        if (extracted == null || !extracted.success()
+                || !(delivered.equals(extracted.text())
+                || delivered.startsWith(extracted.text() + "\n[浏览器登录态恢复警告]"))) {
+            return ArticleExtractionResult.failed(delivered);
+        }
+        return new ArticleExtractionResult(true, delivered, extracted.sources());
+    }
     public String evaluate(String sessionId, String expression) { return onSessionActor(sessionId, () -> evaluateOnActor(sessionId, expression)); }
 
     /** Explicitly discard this chat's saved authentication; never implied by an ordinary close. */
@@ -1443,6 +1510,8 @@ public class BrowserService {
      */
     private String navigateOnActor(String sessionId, String url) {
         pageLock.lock();
+        boolean dispatched = false;
+        boolean navigationConfirmed = false;
         try {
             String blocked = networkGuard.validateUrl(url);
             if (Objects.nonNull(blocked)) {
@@ -1459,9 +1528,11 @@ public class BrowserService {
             invalidateObservation(sessionId);
             pageDiagnostics.put(sessionId, new PageDiagnostics());
             requireActorInput();
+            dispatched = true;
             page.navigate(url, new Page.NavigateOptions()
                     .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
                     .setTimeout(15000));
+            navigationConfirmed = true;
 
             String title = page.title();
             String snapshot = page.locator("body").ariaSnapshot();
@@ -1471,6 +1542,9 @@ public class BrowserService {
 
         } catch (Exception e) {
             log.error("导航失败: {}", url, e);
+            if (dispatched && (navigationConfirmed || e instanceof ToolExecutionDeadline.Expired
+                    || e instanceof com.microsoft.playwright.TimeoutError || e instanceof ActorInputStopped))
+                return unknownAction("网页导航已派发，但后续观察未确认；请先重新观察页面，禁止直接重复导航");
             return browserError("EXECUTION_FAILED", String.format(MessageConstants.BROWSER_NAV_FAILED, e.getMessage()));
         } finally {
             pageLock.unlock();
@@ -1482,17 +1556,26 @@ public class BrowserService {
      */
     private String snapshotOnActor(String sessionId, boolean full) {
         pageLock.lock();
-        try {
+        ToolExecutionDeadline.Deadline requested = ToolExecutionDeadline.current();
+        if (requested == null && full) requested = ToolExecutionDeadline.after(
+                ToolConcurrencyPolicy.profileOf("browser_snapshot").executionBudgetSeconds(), TimeUnit.SECONDS);
+        try (var snapshotScope = ToolExecutionDeadline.bind(requested)) {
+            checkActorPreparation();
+            checkObservationBudget();
             Page page = getPage(sessionId);
             String snapshot;
-            if (full) {
+            ToolExecutionDeadline.Deadline deadline = ToolExecutionDeadline.current();
+            if (deadline != null) {
                 snapshot = page.locator("body").ariaSnapshot(
-                        new AriaSnapshotOptions().setTimeout(120_000));
+                        new AriaSnapshotOptions().setTimeout(deadline.timeoutMillis(100L)));
             } else {
                 snapshot = page.locator("body").ariaSnapshot();
             }
             return observe(sessionId, page, snapshot);
 
+        } catch (ToolExecutionDeadline.Expired | com.microsoft.playwright.TimeoutError timeout) {
+            invalidateObservation(sessionId);
+            return browserError("TIMEOUT", "浏览器快照未在本次执行预算内完成，请重新观察页面");
         } catch (Exception e) {
             log.error("获取快照失败", e);
             return browserError("EXECUTION_FAILED", String.format(MessageConstants.BROWSER_SNAPSHOT_FAILED, e.getMessage()));
@@ -1738,9 +1821,13 @@ public class BrowserService {
         invalidateObservation(sessionId);
         String id = "b" + (++observationSequence);
         Map<String, ObservedElement> elements = new LinkedHashMap<>();
+        boolean retained = false;
+        try {
         StringBuilder text = new StringBuilder("observationId=" + id + " url=" + page.url() + "\n");
         int number = 0;
         for (String line : rawSnapshot.split("\n")) {
+            checkActorPreparation();
+            checkObservationBudget();
             String trimmed = line.trim();
             if (trimmed.isEmpty()) continue;
             ElementHandle handle = isSnapshotRefLine(trimmed) ? observedHandle(page, trimmed) : null;
@@ -1752,8 +1839,21 @@ public class BrowserService {
                 text.append('[').append(ref).append("] ").append(trimmed).append('\n');
             }
         }
+        String redacted = redactPasswordValues(page, text + diagnosticsText(sessionId));
+        checkObservationBudget();
         observations.put(sessionId, new Observation(id, page.url(), rawSnapshot, Map.copyOf(elements)));
-        return redactPasswordValues(page, text + diagnosticsText(sessionId));
+        retained = true;
+        return redacted;
+        } finally {
+            if (!retained) elements.values().forEach(element -> {
+                try { element.handle().dispose(); } catch (Exception ignored) { }
+            });
+        }
+    }
+
+    private static void checkObservationBudget() {
+        ToolExecutionDeadline.Deadline deadline = ToolExecutionDeadline.current();
+        if (deadline != null) deadline.timeoutMillis(100L);
     }
 
     private String redactPasswordValues(Page page, String text) {
@@ -1762,6 +1862,7 @@ public class BrowserService {
         if (frames == null || frames.isEmpty()) scopes.add(page.locator("input[type=password]"));
         else for (Frame frame : frames) if (!frame.isDetached()) scopes.add(frame.locator("input[type=password]"));
         for (Locator passwords : scopes) {
+        checkObservationBudget();
         if (passwords == null) continue; // mock-only pages may not implement this locator
         Object raw = passwords.evaluateAll("els => els.map(el => el.value).filter(Boolean)");
         if (raw instanceof List<?> values) {
@@ -1798,7 +1899,12 @@ public class BrowserService {
             Page.GetByRoleOptions options = new Page.GetByRoleOptions().setExact(true);
             if (role.group(2) != null) options.setName(resultJson.readValue("\"" + role.group(2) + "\"", String.class));
             Locator locator = page.getByRole(ariaRole, options);
-            return locator.count() == 1 ? locator.elementHandle() : null;
+            return observationHandle(locator);
+        } catch (ToolExecutionDeadline.Expired | ActorInputStopped stopped) {
+            throw stopped;
+        } catch (com.microsoft.playwright.TimeoutError timeout) {
+            if (ToolExecutionDeadline.current() != null) throw timeout;
+            return null;
         } catch (Exception ignored) { return null; }
     }
 
@@ -1810,8 +1916,22 @@ public class BrowserService {
             Frame.GetByRoleOptions options = new Frame.GetByRoleOptions().setExact(true);
             if (role.group(2) != null) options.setName(resultJson.readValue("\"" + role.group(2) + "\"", String.class));
             Locator locator = frame.getByRole(ariaRole, options);
-            return locator.count() == 1 ? locator.elementHandle() : null;
+            return observationHandle(locator);
+        } catch (ToolExecutionDeadline.Expired | ActorInputStopped stopped) {
+            throw stopped;
+        } catch (com.microsoft.playwright.TimeoutError timeout) {
+            if (ToolExecutionDeadline.current() != null) throw timeout;
+            return null;
         } catch (Exception ignored) { return null; }
+    }
+
+    private ElementHandle observationHandle(Locator locator) {
+        checkActorPreparation();
+        checkObservationBudget();
+        if (locator.count() != 1) return null;
+        ToolExecutionDeadline.Deadline deadline = ToolExecutionDeadline.current();
+        return deadline == null ? locator.elementHandle() : locator.elementHandle(
+                new Locator.ElementHandleOptions().setTimeout(deadline.timeoutMillis(100L)));
     }
 
     private record FormField(ElementHandle handle, Map<String, Object> state) {}
@@ -2461,15 +2581,16 @@ public class BrowserService {
      * 滚完主内容区（含虚拟列表）并返回去重后的正文。
      * 侧栏有目录时按项点击，一次抽完全部章节。
      */
-    private String extractArticleTextOnActor(String sessionId, Path imageDir) {
+    private ArticleExtractionResult extractArticleWithMetadataOnActor(String sessionId, Path imageDir) {
         pageLock.lock();
         try {
             invalidateObservation(sessionId);
             Page page = getPage(sessionId);
             if (isPasswordGate(page)) {
-                return browserError("PERMISSION_DENIED", "抽取失败: 当前是登录或密码页，先 browser_type 填密码再抽取");
+                return ArticleExtractionResult.failed(browserError("PERMISSION_DENIED", "抽取失败: 当前是登录或密码页，先 browser_type 填密码再抽取"));
             }
             String home = page.url();
+            if (!hasWikiCatalog(page)) return extractCurrentPage(page, imageDir);
             waitForWikiTree(page);
             requireActorInput();
             page.evaluate(TOC_EXPAND_JS);
@@ -2479,6 +2600,7 @@ public class BrowserService {
             }
             log.info("目录链接 {} 条", urls.size());
             StringBuilder all = new StringBuilder();
+            List<WebSearchService.PageMetadata> sources = new ArrayList<>();
             Set<String> seen = new LinkedHashSet<>();
             int ok = 0;
             if (urls.size() > 1) {
@@ -2496,7 +2618,7 @@ public class BrowserService {
                     if (!seen.add(key)) {
                         continue;
                     }
-                    ok += appendExtract(all, page, imageDir);
+                    ok += appendExtract(all, page, imageDir, sources);
                 }
             } else {
                 List<String> titles = jsStringList(page.evaluate(TOC_TITLES_JS));
@@ -2522,39 +2644,46 @@ public class BrowserService {
                     if (!seen.add(key)) {
                         continue;
                     }
-                    ok += appendExtract(all, page, imageDir);
+                    ok += appendExtract(all, page, imageDir, sources);
                 }
             }
             if (all.length() < EXTRACT_MIN_CHARS) {
                 return extractCurrentPage(page, imageDir);
             }
             log.info("抽取知识库 chapters={} chars={}", ok, all.length());
-            return all.toString();
+            return new ArticleExtractionResult(true, all.toString(), sources);
         } catch (Exception e) {
-            return browserError("EXECUTION_FAILED", String.format(MessageConstants.BROWSER_EXTRACT_FAILED,
-                    e.getMessage()));
+            return ArticleExtractionResult.failed(browserError("EXECUTION_FAILED", String.format(MessageConstants.BROWSER_EXTRACT_FAILED,
+                    e.getMessage())));
         } finally {
             pageLock.unlock();
         }
     }
 
-    private String extractCurrentPage(Page page, Path imageDir) {
+    private ArticleExtractionResult extractCurrentPage(Page page, Path imageDir) {
         String script = EXTRACT_JS
                 .replace("__MAX__", String.valueOf(EXTRACT_MAX_STEPS))
                 .replace("__PAUSE__", String.valueOf(EXTRACT_PAUSE_MS))
                 .replace("__IMGMIN__", String.valueOf(EXTRACT_IMAGE_MIN_PX));
         requireActorInput();
         Object result = page.evaluate(script);
-        String body = result == null ? "" : result.toString().trim();
+        var extracted = resultJson.valueToTree(result);
+        if (extracted != null && extracted.path("pageChanged").asBoolean()) {
+            return ArticleExtractionResult.failed(browserError("CONFLICT", "抽取失败: 页面在正文抽取期间发生导航，请重新观察后抽取"));
+        }
+        String body = extracted == null ? "" : extracted.path("text").asText("").trim();
         if (body.length() < EXTRACT_MIN_CHARS) {
-            return browserError("EMPTY_RESULT", String.format(MessageConstants.BROWSER_EXTRACT_EMPTY,
-                    page.url()));
+            return ArticleExtractionResult.failed(browserError("EMPTY_RESULT", String.format(MessageConstants.BROWSER_EXTRACT_EMPTY,
+                    page.url())));
         }
         body = localizeImages(page, body, imageDir);
-        String title = StringUtils.defaultString(page.title());
-        String url = StringUtils.defaultString(page.url());
+        String url = extracted.path("url").asText("");
+        WebSearchService.PageMetadata metadata = WebSearchService.extractPageMetadata(
+                extracted.path("metadataHtml").asText(""), url);
+        String title = StringUtils.defaultIfBlank(extracted.path("title").asText(""), metadata.title());
+        metadata = new WebSearchService.PageMetadata(title, metadata.publicationDate(), metadata.thumbnailUrl(), url);
         log.info("抽取正文 chars={} url={}", body.length(), url);
-        return "# " + title + "\n\n" + url + "\n\n" + body;
+        return new ArticleExtractionResult(true, "# " + title + "\n\n" + url + "\n\n" + body, List.of(metadata));
     }
 
     private static List<String> jsStringList(Object raw) {
@@ -2611,18 +2740,19 @@ public class BrowserService {
         }
     }
 
-    private int appendExtract(StringBuilder all, Page page, Path imageDir) {
+    private int appendExtract(StringBuilder all, Page page, Path imageDir, List<WebSearchService.PageMetadata> sources) {
         if (isLoginPage(page)) {
             return 0;
         }
-        String part = extractCurrentPage(page, imageDir);
-        if (part.startsWith("抽取失败")) {
+        ArticleExtractionResult part = extractCurrentPage(page, imageDir);
+        if (!part.success()) {
             return 0;
         }
         if (all.length() > 0) {
             all.append("\n\n---\n\n");
         }
-        all.append(part);
+        all.append(part.text());
+        sources.addAll(part.sources());
         return 1;
     }
 
@@ -2653,6 +2783,19 @@ public class BrowserService {
             "() => document.querySelectorAll('[data-node-uid]').length";
     private static final int TREE_WAIT_ROUNDS = 25;
     private static final int TREE_WAIT_MS = 200;
+
+    private boolean hasWikiCatalog(Page page) {
+        return Boolean.TRUE.equals(page.evaluate("""
+                () => {
+                """ + PICK_CAT_FN + """
+                  // Empty known tree shells can populate asynchronously; keep their bounded wait.
+                  return !!document.querySelector('[data-node-uid],.wiki-tree-inner-container,'
+                    + '.workspace-tree-view-container,.workspace-nav-tree-wrapper,'
+                    + '[class*="directory-tree"],[class*="wiki-tree"],[class*="sidebar-tree"],.wiki-catalog')
+                    || !!pickCat();
+                }
+                """));
+    }
 
     private void waitForWikiTree(Page page) {
         for (int i = 0; i < TREE_WAIT_ROUNDS; i++) {

@@ -123,7 +123,7 @@ class PlanningLoopDurableSettlementTest {
             StateSnapshot original = f.store.get("chat").orElseThrow();
             f.store.init("chat", "replacement-execution", original.goal(), graph());
             return StepEvaluator.GraphEval.pass();
-        }).when(f.evaluator).evaluateGraph(any(), any());
+        }).when(f.evaluator).evaluateGraph(any(), any(), any());
 
         PlanningLoop.RunOutcome result = run(f);
 
@@ -142,7 +142,7 @@ class PlanningLoopDurableSettlementTest {
         doAnswer(call -> {
             when(f.lock.renewSessionLock(anyString(), anyString())).thenReturn(false);
             return accepted ? StepEvaluator.GraphEval.pass() : StepEvaluator.GraphEval.fail("node", "fixture rejection");
-        }).when(f.evaluator).evaluateGraph(any(), any());
+        }).when(f.evaluator).evaluateGraph(any(), any(), any());
         PlanningLoop.RunOutcome result = run(f);
         assertFalse(result.goalSatisfied());
         assertEquals("SESSION_LOCK_LOST", result.reason());

@@ -13,12 +13,15 @@ import com.miniagent.agent.permission.SessionPermissionStore;
 import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.common.ApiResponse;
 import com.miniagent.common.ErrorCode;
+import com.miniagent.common.context.OwnerContext;
 import com.miniagent.config.OpenAiModelProperties;
 import com.miniagent.config.entity.UserRole;
 import com.miniagent.config.security.AuthenticatedUser;
 import com.miniagent.config.security.JwtSessionService;
 import com.miniagent.config.security.SessionAuthorizationService;
 import com.miniagent.config.service.UserModelConfigService;
+import com.miniagent.memory.MemoryKeys;
+import com.miniagent.memory.MemoryService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.mock.web.MockHttpServletRequest;
@@ -58,6 +61,7 @@ class ShellApiControllerTest {
     private AgentSemanticFactRepository semanticFactRepository;
     private AgentProcedureRepository procedureRepository;
     private AgentEpisodeRepository episodeRepository;
+    private MemoryService memoryService;
 
     @BeforeEach
     void setUp() {
@@ -76,6 +80,8 @@ class ShellApiControllerTest {
         semanticFactRepository = mock(AgentSemanticFactRepository.class);
         procedureRepository = mock(AgentProcedureRepository.class);
         episodeRepository = mock(AgentEpisodeRepository.class);
+        memoryService = mock(MemoryService.class);
+        when(memoryService.read(MemoryKeys.TARGET_USER)).thenReturn(List.of());
 
         ReflectionTestUtils.setField(controller, "jwtSessionService", jwtSessionService);
         ReflectionTestUtils.setField(controller, "sessionAuthorization", sessionAuthorization);
@@ -88,6 +94,7 @@ class ShellApiControllerTest {
         ReflectionTestUtils.setField(controller, "semanticFactRepository", semanticFactRepository);
         ReflectionTestUtils.setField(controller, "procedureRepository", procedureRepository);
         ReflectionTestUtils.setField(controller, "episodeRepository", episodeRepository);
+        ReflectionTestUtils.setField(controller, "memoryService", memoryService);
     }
 
     private MockHttpServletRequest authed() {
@@ -124,6 +131,7 @@ class ShellApiControllerTest {
                 ErrorCode.AUTH_NOT_AUTHENTICATED);
         // 未登录时不应走到会话归属校验
         verify(sessionAuthorization, never()).requireOwner(any(), any());
+        verify(memoryService, never()).read(any());
     }
 
     /** 「始终允许」三个端点仍然要求 sessionId；memory-insights 不要求（租户视图）。 */
@@ -162,6 +170,7 @@ class ShellApiControllerTest {
         assertEquals(ErrorCode.AUTH_FORBIDDEN.getCode(), handled.getBody().getCode());
         // 越权时没有写入任何 always 数据
         assertTrue(permissionStore.alwaysAllowedTools("not-mine").isEmpty());
+        verify(memoryService, never()).read(any());
     }
 
     // ==================== /api/shell/status ====================
@@ -235,9 +244,11 @@ class ShellApiControllerTest {
                 controller.memoryInsights("s-empty", 30, authed());
         assertTrue(resp.isSuccess());
         Map<String, Object> data = resp.getData();
-        assertEquals(5, data.size());
+        assertEquals(7, data.size());
         assertEquals("s-empty", data.get("sessionId"));
         assertEquals(Boolean.FALSE, data.get("saved"));
+        assertEquals(Boolean.TRUE, data.get("preferencesAvailable"));
+        assertTrue(((List<?>) data.get("userPreferences")).isEmpty());
         assertTrue(((List<?>) data.get("related")).isEmpty());
         assertTrue(((List<?>) data.get("tags")).isEmpty());
         Map<String, Object> stats = (Map<String, Object>) data.get("stats");
@@ -345,5 +356,73 @@ class ShellApiControllerTest {
 
         ApiResponse<Map<String, Object>> huge = controller.memoryInsights(null, 100000, authed());
         assertEquals(40, ((List<?>) huge.getData().get("related")).size());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void persistedPreferencesHaveIndependentLimitAndNewestFirstOrder() {
+        AgentEpisodeEntity episode = new AgentEpisodeEntity();
+        episode.setTaskSummary("An old task summary");
+        when(episodeRepository.findBySessionId("s-memory"))
+                .thenReturn(List.of(episode, episode));
+        when(memoryService.read(MemoryKeys.TARGET_USER))
+                .thenReturn(List.of("旧偏好", "人物简介须包含真实照片与来源链接"));
+
+        Map<String, Object> data = controller.memoryInsights("s-memory", 1, authed()).getData();
+        assertEquals(1, ((List<?>) data.get("related")).size());
+        List<Map<String, Object>> preferences =
+                (List<Map<String, Object>>) data.get("userPreferences");
+        assertEquals(List.of(Map.of("content", "人物简介须包含真实照片与来源链接",
+                "target", "user", "persisted", true)), preferences);
+        assertEquals(Boolean.TRUE, data.get("preferencesAvailable"));
+    }
+
+    @Test
+    void preferencesReadUsesAuthenticatedOwnerAndRestoresAmbientContext() {
+        try (var ignored = OwnerContext.bind(new OwnerContext(99L, "other-tenant"))) {
+            OwnerContext.setCurrentProjectId("ambient-project");
+            when(memoryService.read(MemoryKeys.TARGET_USER)).thenAnswer(call -> {
+                assertEquals(7L, OwnerContext.currentUserId());
+                assertEquals("1", OwnerContext.currentTenantId());
+                assertEquals(null, OwnerContext.currentProjectId());
+                return List.of("当前用户偏好");
+            });
+
+            Map<String, Object> data = controller.memoryInsights(null, 30, authed()).getData();
+            assertEquals(Boolean.TRUE, data.get("preferencesAvailable"));
+            assertEquals(99L, OwnerContext.currentUserId());
+            assertEquals("other-tenant", OwnerContext.currentTenantId());
+            assertEquals("ambient-project", OwnerContext.currentProjectId());
+        }
+    }
+
+    @Test
+    void preferenceReadFailureIsExplicitAndRestoresAmbientContext() {
+        when(memoryService.read(MemoryKeys.TARGET_USER))
+                .thenThrow(new IllegalStateException("private storage failure details"));
+        try (var ignored = OwnerContext.bind(new OwnerContext(99L, "other-tenant"))) {
+            OwnerContext.setCurrentProjectId("ambient-project");
+            Map<String, Object> data = controller.memoryInsights(null, 30, authed()).getData();
+            assertEquals(Boolean.FALSE, data.get("preferencesAvailable"));
+            assertTrue(((List<?>) data.get("userPreferences")).isEmpty());
+            assertFalse(data.toString().contains("private storage"));
+            assertEquals(99L, OwnerContext.currentUserId());
+            assertEquals("other-tenant", OwnerContext.currentTenantId());
+            assertEquals("ambient-project", OwnerContext.currentProjectId());
+        }
+    }
+
+    @Test
+    void absentPreferenceServiceAndNullReadAreUnavailableRatherThanEmptySuccess() {
+        ReflectionTestUtils.setField(controller, "memoryService", null);
+        Map<String, Object> absent = controller.memoryInsights(null, 30, authed()).getData();
+        assertEquals(Boolean.FALSE, absent.get("preferencesAvailable"));
+        assertTrue(((List<?>) absent.get("userPreferences")).isEmpty());
+
+        ReflectionTestUtils.setField(controller, "memoryService", memoryService);
+        when(memoryService.read(MemoryKeys.TARGET_USER)).thenReturn(null);
+        Map<String, Object> nullRead = controller.memoryInsights(null, 30, authed()).getData();
+        assertEquals(Boolean.FALSE, nullRead.get("preferencesAvailable"));
+        assertTrue(((List<?>) nullRead.get("userPreferences")).isEmpty());
     }
 }

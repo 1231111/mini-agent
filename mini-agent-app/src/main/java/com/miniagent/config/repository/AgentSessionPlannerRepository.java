@@ -14,6 +14,18 @@ public interface AgentSessionPlannerRepository extends JpaRepository<AgentSessio
 
     List<AgentSessionPlanner> findBySessionIdOrSessionIdStartingWith(String sessionId, String scopePrefix);
 
+    /** Scalar query deliberately excludes the potentially large audit event LOB and managed entities. */
+    interface DispatchState {
+        String getExecutionId();
+        String getStateJson();
+    }
+
+    @Query("""
+            SELECT p.executionId AS executionId, p.stateJson AS stateJson
+            FROM AgentSessionPlanner p WHERE p.sessionId = :sessionId
+            """)
+    Optional<DispatchState> readDispatchState(@Param("sessionId") String sessionId);
+
     /** Scalar projection reads the database state even if an enclosing JPA context cached the entity. */
     interface LockedStream {
         long getPlannerVersion();

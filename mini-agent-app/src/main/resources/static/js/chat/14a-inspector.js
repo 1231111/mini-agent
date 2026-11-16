@@ -6,7 +6,7 @@
      执行步骤   GET /api/conversations/{sid}/todos 优先展示任务拆分；没有 todo 时回退到执行轨迹
                 GET /api/conversations/{sid}/executions + /api/executions/{id}/steps
      执行工具   同一份 steps 聚合调用状态，并补充注册表描述和参数摘要
-     记忆与知识 GET /api/shell/memory-insights?sessionId=  → episode / fact / procedure
+     记忆与知识 GET /api/shell/memory-insights?sessionId=  → 已保存用户偏好 / episode / fact / procedure
      系统状态   GET /api/shell/status                      → 模型 / 工具数 / 堆状态
 
    刷新时机有三处，都不做定时轮询（security.js 给全站 fetch 打了 request/response
@@ -27,6 +27,7 @@ const INSP_RECONNECT_BASE_MS = 1000;
 const INSP_RECONNECT_MAX_MS = 30000;
 const INSP_MAX_STEPS = 6;      // 侧栏只保留少量 DAG 节点；完整轨迹在 /trace
 const INSP_MAX_TOOLS = 3;
+const INSP_MAX_PREFERENCES = 3;
 
 /** stepType → 中文标签，来源是 /api/trace-nodes（AgentStepNode.catalog()）。 */
 let inspLabels = {};
@@ -40,6 +41,8 @@ let inspRefreshTimer = null;
 let inspStepRefreshTimer = null;
 let inspReconnectTimer = null;
 let inspDataRetryTimer = null;
+let inspMemoryRefreshTimer = null;
+let inspMemoryRequestId = 0;
 let inspReconnectAttempt = 0;
 let inspDataRetryAttempt = 0;
 let inspLastStepRefreshAt = 0;
@@ -848,6 +851,7 @@ function setInspectorStateFromExecution(exec, steps) {
 /* -------- 记忆与知识 -------- */
 
 async function renderInspectorMemory(sid) {
+    const requestId = ++inspMemoryRequestId;
     const $el = document.getElementById('inspMemory');
     if (!$el) return;
     if (!sid) {
@@ -857,46 +861,86 @@ async function renderInspectorMemory(sid) {
     try {
         const resp = await fetch('/api/shell/memory-insights?sessionId='
             + encodeURIComponent(sid));
+        if (sid !== currentId || requestId !== inspMemoryRequestId) return;
         if (!resp.ok) {
             $el.innerHTML = '<div class="insp-empty">记忆接口不可用（HTTP ' + resp.status + '）。</div>';
             return;
         }
         const data = await apiJson(resp) || {};
-        if (sid !== currentId) return;
-        const stats = data.stats || {};
-        const related = Array.isArray(data.related) ? data.related : [];
-        const episodes = related.filter(item => item && item.type === 'episode');
-        let html = '<div class="insp-memory-list">';
-        if (episodes.length) {
-            const summary = shortText(episodes[0].summary || '', 88);
-            html += memoryRow('episode', '✦', '本会话已保存到记忆',
-                summary || '已生成本次对话的经验记录');
-        }
-        html += '</div>';
-        const counts = [
-            ['长期记忆', stats.memoryCount], ['知识事实', stats.factCount], ['可复用流程', stats.procedureCount]
-        ].filter(([, value]) => value != null);
-        if (counts.length) {
-            html += `<div class="insp-memory-stats">${counts.map(([label, value]) =>
-                `<span class="insp-memory-chip">${esc(label)} ${esc(String(value))}</span>`).join('')}</div>`;
-        }
-        if (!episodes.length && !counts.length) {
-            html = '<div class="insp-empty">当前还没有可展示的记忆或知识沉淀。</div>';
-        }
-        $el.innerHTML = html;
+        if (sid !== currentId || requestId !== inspMemoryRequestId) return;
+        $el.innerHTML = buildInspectorMemory(data);
     } catch (e) {
+        if (sid !== currentId || requestId !== inspMemoryRequestId) return;
         console.warn('[Inspector] memory insights failed:', e);
         $el.innerHTML = '<div class="insp-empty">记忆数据加载失败。</div>';
     }
 }
 
-function memoryRow(kind, icon, title, detail) {
+function buildInspectorMemory(data) {
+    data = data && typeof data === 'object' ? data : {};
+    const stats = data.stats || {};
+    const related = Array.isArray(data.related) ? data.related : [];
+    const episodes = related.filter(item => item && item.type === 'episode');
+    // A conversational promise or episode summary is not a persisted preference receipt.
+    const preferences = data.preferencesAvailable === true && Array.isArray(data.userPreferences)
+        ? data.userPreferences.filter(item => item && item.persisted === true && item.target === 'user'
+            && typeof item.content === 'string' && item.content.trim()) : [];
+    let html = '<div class="insp-memory-list">';
+    if (preferences.length) {
+        const rows = preferences.map((item, index) => {
+            const content = item.content.trim();
+            return memoryRow('fact', '◇', '已保存的用户偏好' + (preferences.length > 1 ? ' ' + (index + 1) : ''),
+                shortText(content, 180), content);
+        });
+        // The endpoint returns newest first; keep the sidebar compact without discarding older entries.
+        html += rows.slice(0, INSP_MAX_PREFERENCES).join('');
+        if (rows.length > INSP_MAX_PREFERENCES) {
+            html += `<details class="insp-memory-more"><summary>查看其余 ${rows.length - INSP_MAX_PREFERENCES} 条已保存偏好</summary>`
+                + `<div class="insp-memory-list">${rows.slice(INSP_MAX_PREFERENCES).join('')}</div></details>`;
+        }
+    } else if (data.preferencesAvailable === false) {
+        html += memoryRow('fact', '◇', '用户偏好暂时无法读取', '读取失败，请稍后重试；这不表示已保存的偏好被删除。');
+    } else if (data.preferencesAvailable === true) {
+        html += memoryRow('fact', '◇', '尚未保存用户偏好', '当前没有可展示的已保存偏好。');
+    } else {
+        html += memoryRow('fact', '◇', '用户偏好状态未知', '当前服务未提供已保存的偏好数据。');
+    }
+    if (episodes.length) {
+        const summary = shortText(episodes[0].summary || '', 88);
+        html += memoryRow('episode', '✦', '会话经验摘要',
+            summary || '已生成本次对话的经验记录');
+    }
+    html += '</div>';
+    const counts = [
+        ['长期记忆', stats.memoryCount], ['知识事实', stats.factCount], ['可复用流程', stats.procedureCount]
+    ].filter(([, value]) => value != null);
+    if (counts.length) {
+        html += `<div class="insp-memory-stats">${counts.map(([label, value]) =>
+            `<span class="insp-memory-chip">${esc(label)} ${esc(String(value))}</span>`).join('')}</div>`;
+    }
+    return html;
+}
+
+/** Refresh persisted memory after a terminal event, without polling every tool trace. */
+function scheduleInspectorMemoryRefresh(sid) {
+    if (!sid || sid !== currentId || !inspectorIsOpen()) return;
+    if (inspMemoryRefreshTimer) clearTimeout(inspMemoryRefreshTimer);
+    inspMemoryRefreshTimer = setTimeout(() => {
+        inspMemoryRefreshTimer = null;
+        if (sid === currentId && inspectorIsOpen()) renderInspectorMemory(sid);
+    }, INSP_PUSH_DEBOUNCE_MS);
+}
+
+function memoryRow(kind, icon, title, detail, fullDetail) {
+    const more = typeof fullDetail === 'string' && fullDetail !== detail
+        ? `<details class="insp-memory-more"><summary>查看已保存内容</summary><div class="insp-memory-full">${esc(fullDetail)}</div></details>` : '';
     return `<div class="insp-memory-item">
         <span class="insp-memory-icon kind-${kind}">${icon}</span>
-        <span class="insp-memory-main">
+        <div class="insp-memory-main">
             <span class="insp-memory-title">${esc(title)}</span>
             <span class="insp-memory-detail">${esc(detail)}</span>
-        </span>
+            ${more}
+        </div>
     </div>`;
 }
 
@@ -952,6 +996,7 @@ function closeInspectorStream() {
     if (inspStepRefreshTimer) { clearTimeout(inspStepRefreshTimer); inspStepRefreshTimer = null; }
     if (inspReconnectTimer) { clearTimeout(inspReconnectTimer); inspReconnectTimer = null; }
     if (inspDataRetryTimer) { clearTimeout(inspDataRetryTimer); inspDataRetryTimer = null; }
+    if (inspMemoryRefreshTimer) { clearTimeout(inspMemoryRefreshTimer); inspMemoryRefreshTimer = null; }
     inspReconnectAttempt = 0;
     inspDataRetryAttempt = 0;
 }
@@ -1052,6 +1097,7 @@ function handleInspectorFrame(frame, sid) {
     let data = null;
     try { data = JSON.parse(dataLines.join('\n')); } catch (_) { return; }
     if (!data || data.sessionId !== sid) return;
+    if (data.stepType === 'RUN_END') scheduleInspectorMemoryRefresh(sid);
     if (inspPushTimer) clearTimeout(inspPushTimer);
     inspPushTimer = setTimeout(() => {
         inspPushTimer = null;

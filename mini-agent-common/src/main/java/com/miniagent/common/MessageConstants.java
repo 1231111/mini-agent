@@ -69,8 +69,13 @@ public final class MessageConstants {
             "任务还没做完。已写入的部分在 workspace/，回复「继续」会接着当前进度做。";
     public static final String PLANNER_CONTINUE_HINT =
             "本段轮次用尽。接着当前工具上下文继续，不要重复已经完成的打开/导航。";
+    public static final String DAG_EVIDENCE_SUBMISSION =
+            "当前步骤由 DAG 调度器验收：实际操作完成后，用 todo(action=submit,id=当前步骤ID,evidence=真实证据)提交结果，"
+                    + "状态保持 in_progress。提交成功后返回本步可核验结果并交回调度器，completed 由调度器验收后设置。"
+                    + "不要为了自行完成 todo 重复执行已经成功的操作；不要把内部调度状态或工具错误说明混入用户交付正文。";
     public static final String PLANNER_FOCUS_RULES =
-            "框架已过滤工具表。禁止 todo.set/clear；只能 update 当前 focusTodoIds。"
+            "框架已过滤工具表。禁止 todo.set/clear；只能 submit/update 当前 focusTodoIds。"
+                    + DAG_EVIDENCE_SUBMISSION
                     + "缺密钥或须用户提供信息时：todo update status=awaiting_confirm，"
                     + "然后直接向用户提问并结束本段；禁止为凑完成写无法执行的脚本。"
                     + "缺终端执行或 HTTP POST 时直接调用 exec_command / http_post，"
@@ -84,8 +89,8 @@ public final class MessageConstants {
                     + "完成后 todo update 标 completed 并提供 evidence。"
                     + "缺密钥时 todo update awaiting_confirm 并直接向用户提问。";
     public static final String TASK_GRAPH_OWNED =
-            "【任务图由规划器持有】禁止 todo.set/clear。只 update 当前 focus 步骤并附 evidence。"
-                    + "本段只完成当前步骤，不要重建计划，也不要按整张清单收尾。";
+            "【任务图由规划器持有】禁止 todo.set/clear。本段只执行当前步骤，不要重建计划。"
+                    + DAG_EVIDENCE_SUBMISSION;
     public static final String SSE_PERMISSION_ASK = "permission_ask";
     public static final String SSE_USER_QUESTION = "user_question";
     public static final String AGENT_PERM_ASK_WAIT =

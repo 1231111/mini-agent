@@ -1,6 +1,7 @@
 package com.miniagent.agent.tool;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.miniagent.agent.browser.BrowserService;
 import com.miniagent.agent.browser.BrowserSessionIdentity;
 import com.miniagent.agent.browser.BrowserUploadFiles;
@@ -49,6 +50,7 @@ import com.miniagent.agent.tool.impl.*;
 public class BuiltinTools {
 
     private static final String BROWSER_EVALUATE = "browser_evaluate";
+    private static final ObjectMapper RESULT_JSON = new ObjectMapper();
 
     @Autowired
     private  ToolRegistry registry;
@@ -341,14 +343,15 @@ public class BuiltinTools {
 
     private void registerWebSearchTools() {
         registry.register("web_search",
-                "搜索网页，返回结构化结果以及搜索服务提供的发布日期线索。查询涉及今天/今日/昨天或明确日期时，必须按上下文时区换算并传 dateFrom/dateTo（YYYY-MM-DD）；服务会加入日期限定并剔除已知超窗结果。搜索发布日期尚未经过原文核验；所有新闻候选都必须用 web_extract 核验原文发布日期后才能引用。\n"
+                "搜索网页，返回结构化结果以及搜索服务提供的发布日期线索。仅当用户限定新闻/网页的发布日期范围（如今日新闻）时，必须按上下文时区换算并传 dateFrom/dateTo（YYYY-MM-DD）；服务会按网页发布日期剔除超窗结果。电影上映/上线、航班出发等事件日期写入 query 并核对正文，不用 dateFrom/dateTo 过滤网页，除非用户同时要求页面发表于该范围。搜索发布日期尚未经过原文核验；交付新闻报道前必须用 web_extract 核验原文发布日期。\n"
                         + "搜索用简洁关键词，不用完整句子（用 \"Spring Boot 事务失效\" 而不是 \"我想知道 Spring Boot 里事务为什么会失效\"）。\n"
-                        + "对结果准确性不确定时，用 web_extract 提取原文确认，不要直接拿搜索摘要下结论。",
+                        + "对结果准确性不确定时，用 web_extract 提取原文确认，不要直接拿搜索摘要下结论。\n"
+                        + "有可靠来源图时返回 thumbnail_url、thumbnail_source_url；新闻报道用 miniagent-news 的 thumbnailUrl，电影/歌曲/视频名单用 miniagent-media 的 posterUrl。按用户要的对象选卡片，不能因为资料来自新闻就把电影当新闻；查询作品时一并核验对应详情与海报，聚合片单的封面不能充当每部电影的海报。无图时省略，不猜测或混用其他条目的封面。",
                 WebSearchParams.class,
                 params -> webSearchService.search(params.getQuery(), params.getLimitOrDefault(),
-                        params.getDateFrom(), params.getDateTo()));
+                        params.getDateFrom(), params.getDateTo(), Boolean.TRUE.equals(params.getIncludeImages())));
 
-        registry.register("web_extract", "抓取网页原文，返回正文及页面可识别的发布日期。用它核验新闻发布日期；date_verified=true 仅表示原文页面元数据中找到发布日期。对于大页面会截断到合理长度。",
+        registry.register("web_extract", "抓取网页原文，返回正文、页面可识别的发布日期及来源封面 thumbnail_url（若存在）。用它核验新闻发布日期；date_verified=true 仅表示原文页面元数据中找到发布日期，不代表作品上映/上线日期已核实。电影应提取对应作品详情页以核验海报与上线信息。封面与 thumbnail_source_url 对应，仅代表页面配图，不代表可播放媒体直链，不能把聚合片单封面套到多部作品。对于大页面会截断到合理长度。",
                 WebExtractParams.class,
                 params -> webSearchService.extract(params.getUrl()));
     }
@@ -765,7 +768,9 @@ public class BuiltinTools {
         registry.register("browser_extract_text",
                 "抽取当前页正文并写入文件。飞书/wiki 有侧栏目录时会按目录逐章抽取，"
                         + "一次调用覆盖全部章节。代码块写成 Markdown 围栏，图片保存到"
-                        + "同目录 images/。禁止 browser_evaluate 手动滚屏。",
+                        + "同目录 images/。成功回执的 source_page_metadata 按来源页提供真实封面 thumbnail_url（若存在）；"
+                        + "新闻报道映射到 miniagent-news 的 thumbnailUrl，电影/歌曲/视频名单映射到 miniagent-media 的 posterUrl。"
+                        + "按交付对象选择卡片；电影应核验对应作品详情的海报，不把聚合片单或其他章节的封面套到多部作品。禁止 browser_evaluate 手动滚屏。",
                 BrowserExtractTextParams.class,
                 params -> withBrowserSession(params.getSessionId(), session -> {
                     String path = params.getPath();
@@ -777,8 +782,9 @@ public class BuiltinTools {
                     Path mdParent = mdFile.getParent();
                     Path imgDir = (mdParent == null ? mdFile : mdParent)
                             .resolve(EXTRACT_IMAGES_DIR);
-                    String text = browserService.extractArticleText(session, imgDir);
-                    if (text.startsWith("抽取失败")) {
+                    BrowserService.ArticleExtractionResult extracted = browserService.extractArticleWithMetadata(session, imgDir);
+                    String text = extracted.text();
+                    if (!extracted.success()) {
                         return text;
                     }
                     String chunk = append ? "\n\n" + text : text;
@@ -788,10 +794,11 @@ public class BuiltinTools {
                     boolean toolOwnedArtifact = StringUtils.isBlank(params.getPath())
                             || pathFileName(path).equalsIgnoreCase("_source.md");
                     String written = writeFile(path, chunk, append, toolOwnedArtifact);
-                    if (!append && pathFileName(path).equalsIgnoreCase("_source.md")) {
+                    if (!append && pathFileName(path).equalsIgnoreCase("_source.md")
+                            && ToolResult.fromLegacy(written).isSuccess()) {
                         writeFile("notes.md", chunk, false, true);
                     }
-                    return written;
+                    return browserExtractionReceipt(written, extracted.sources());
                 }));
 
         registry.register("browser_close", "关闭当前聊天的浏览器页面，保留已保存的登录态供下次恢复",
@@ -800,6 +807,32 @@ public class BuiltinTools {
         registry.register("browser_clear_session", "显式清除当前聊天的浏览器登录态并关闭当前自动化页面，相当于退出此自动化会话；下次访问需要重新登录。仅在用户要求退出或清除损坏登录态时使用，不影响其他聊天。",
                 BrowserClearSessionParams.class,
                 params -> withBrowserSession(params.getSessionId(), browserService::clearSessionState));
+    }
+
+    /** Keep page covers in the tool receipt without injecting metadata into the extracted document. */
+    private static String browserExtractionReceipt(String written, List<WebSearchService.PageMetadata> sources) {
+        if (sources == null || sources.isEmpty()) return written;
+        try {
+            if (!(RESULT_JSON.readTree(written) instanceof ObjectNode receipt)
+                    || !receipt.path("success").asBoolean(false)) return written;
+            var pages = receipt.putArray("source_page_metadata");
+            for (var source : sources) {
+                if (source == null || StringUtils.isBlank(source.sourceUrl())) continue;
+                ObjectNode page = pages.addObject();
+                page.put("url", source.sourceUrl());
+                page.put("title", source.title());
+                if (source.publicationDate() != null) page.put("publication_date", source.publicationDate());
+                if (source.thumbnailUrl() != null) {
+                    page.put("thumbnail_url", source.thumbnailUrl());
+                    page.put("thumbnail_source_url", source.sourceUrl());
+                    page.put("thumbnail_source", "source_page_metadata");
+                }
+            }
+            return RESULT_JSON.writeValueAsString(receipt);
+        } catch (Exception ignored) {
+            // Presentation metadata must never turn an already-written document into a failed tool call.
+            return written;
+        }
     }
 
     private String withBrowserSession(String requestedSession, java.util.function.Function<String, String> operation) {

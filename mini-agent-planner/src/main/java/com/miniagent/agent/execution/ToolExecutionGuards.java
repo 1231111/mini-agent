@@ -188,7 +188,8 @@ public class ToolExecutionGuards implements SmartInitializingSingleton {
     /**
      * 在有界锁等待下执行工具。
      *
-     * <p>两段锁（先全局并发额度、再资源锁）都用 {@code tryAcquire}，到点抛
+     * <p>先取得资源锁，再取得全局执行额度，避免同一繁忙资源的等待者占满执行额度。
+     * 两段锁共用一个单调时钟等待预算，用 {@code tryAcquire}，到点抛
      * {@link ToolLockTimeoutException} 退让。释放顺序与获取顺序相反，
      * 且只有真正拿到的锁才释放 —— 中途退让不会把没拿的锁放掉。</p>
      */
@@ -204,18 +205,21 @@ public class ToolExecutionGuards implements SmartInitializingSingleton {
         Semaphore resource = resourceKey.isEmpty() ? null
                 : resourceLocks[Math.floorMod(resourceKey.hashCode(), resourceLocks.length)];
         long lockWaitSeconds = descriptor.lockWaitSeconds();
-
-        if (!globalConcurrency.tryAcquire(lockWaitSeconds, TimeUnit.SECONDS)) {
-            throw new ToolLockTimeoutException(toolName, "全局并发额度", lockWaitSeconds);
-        }
+        long queueStarted = System.nanoTime();
+        long waitNanos = TimeUnit.SECONDS.toNanos(lockWaitSeconds);
         boolean resourceAcquired = false;
+        boolean globalAcquired = false;
         try {
             if (resource != null) {
-                if (!resource.tryAcquire(lockWaitSeconds, TimeUnit.SECONDS)) {
+                if (!resource.tryAcquire(remainingWaitNanos(queueStarted, waitNanos), TimeUnit.NANOSECONDS)) {
                     throw new ToolLockTimeoutException(toolName, "资源锁 " + resourceKey, lockWaitSeconds);
                 }
                 resourceAcquired = true;
             }
+            if (!globalConcurrency.tryAcquire(remainingWaitNanos(queueStarted, waitNanos), TimeUnit.NANOSECONDS)) {
+                throw new ToolLockTimeoutException(toolName, "全局并发额度", lockWaitSeconds);
+            }
+            globalAcquired = true;
             if (budget != null) budget.start();
             // Capture before the handler can detach/restore its child scope. This
             // closure owns both counts until the actual handler thread exits.
@@ -224,7 +228,8 @@ public class ToolExecutionGuards implements SmartInitializingSingleton {
                     : rootSession == null || rootSession.isBlank() || rootSession.equals(sessionId)
                     ? List.of(sessionId) : List.of(sessionId, rootSession);
             activityKeys.forEach(key -> activeHandlers.merge(key, 1, Integer::sum));
-            try {
+            try (var deadlineScope = com.miniagent.agent.tool.ToolExecutionDeadline.bind(
+                    budget == null ? null : budget.deadline())) {
                 return operation.call();
             } finally {
                 activityKeys.forEach(activityKey -> activeHandlers.computeIfPresent(activityKey,
@@ -232,11 +237,17 @@ public class ToolExecutionGuards implements SmartInitializingSingleton {
                 if (budget != null) budget.finish();
             }
         } finally {
+            if (globalAcquired) {
+                globalConcurrency.release();
+            }
             if (resourceAcquired) {
                 resource.release();
             }
-            globalConcurrency.release();
         }
+    }
+
+    private static long remainingWaitNanos(long started, long budgetNanos) {
+        return Math.max(0, budgetNanos - (System.nanoTime() - started));
     }
 
     static String resourceKey(ToolDescriptor descriptor, String args, String sessionId) {

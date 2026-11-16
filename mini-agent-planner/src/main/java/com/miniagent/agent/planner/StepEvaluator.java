@@ -28,7 +28,8 @@ public class StepEvaluator {
     private static final Pattern EXIT_CODE =
             Pattern.compile("^\\s*exit_code\\s*=\\s*(-?\\d+)(?:\\s|$)", Pattern.CASE_INSENSITIVE);
 
-    public record EvalResult(boolean ok, String reason) {
+    public record EvalResult(boolean ok, String reason, SemanticAcceptanceReceipts.Proof acceptanceProof) {
+        public EvalResult(boolean ok, String reason) { this(ok, reason, null); }
         public static EvalResult pass() { return new EvalResult(true, ""); }
         public static EvalResult fail(String r) { return new EvalResult(false, r == null ? "" : r); }
     }
@@ -78,6 +79,11 @@ public class StepEvaluator {
 
     private EvalResult evaluate(TaskNode node, String toolResult, String evidence,
                                 boolean structuredSuccess) {
+        return evaluate(node, toolResult, evidence, structuredSuccess, null);
+    }
+
+    private EvalResult evaluate(TaskNode node, String toolResult, String evidence,
+                                boolean structuredSuccess, StateSnapshot acceptedSnapshot) {
         if (node == null) {
             return reject("missing node");
         }
@@ -132,11 +138,40 @@ public class StepEvaluator {
             semanticEvidence = fileContentForSemanticCheck(dw.path(), artifactHash);
             if (semanticEvidence == null) return reject("文件结构验收通过，但内容尚未验证：无法读取完整文本；请提供独立验证节点");
         }
+        // Only stable file content is reusable. Browser/desktop/command and other external state
+        // still run their original semantic checks. Structural checks above always execute.
+        SemanticAcceptanceReceipts.Proof proof = fileAcceptanceProof(node, semanticEvidence);
+        if (SemanticAcceptanceReceipts.matches(acceptedSnapshot, node, proof)) {
+            return stableFileProof(node, semanticEvidence, artifactHash, proof) ? EvalResult.pass()
+                    : reject("复用语义验收期间文件或评判模型发生变化，请重新验证");
+        }
         for (String criterion : dw.semanticChecks()) {
             EvalResult checked = judge(node, criterion, semanticEvidence);
             if (!checked.ok()) return checked;
         }
-        return EvalResult.pass();
+        if (proof != null && !stableFileProof(node, semanticEvidence, artifactHash, proof)) {
+            // A changing file/model cannot produce a reusable verdict, or certify stale file content.
+            return reject("语义验收期间文件或评判模型发生变化，请重新验证");
+        }
+        return new EvalResult(true, "", proof);
+    }
+
+    private boolean stableFileProof(TaskNode node, String evidence, String artifactHash,
+                                    SemanticAcceptanceReceipts.Proof proof) {
+        return proof.equals(fileAcceptanceProof(node, evidence))
+                && evidence.equals(fileContentForSemanticCheck(node.doneWhen().path(), artifactHash));
+    }
+
+    private SemanticAcceptanceReceipts.Proof fileAcceptanceProof(TaskNode node, String evidence) {
+        if (node.doneWhen() == null || !node.doneWhen().isFile() || llmJudge == null) return null;
+        try {
+            java.nio.file.Path file = AcceptanceEvidenceFiles.resolveDeclaredFile(node.doneWhen().path());
+            return file == null ? null : SemanticAcceptanceReceipts.proof(node, evidence,
+                    file.toRealPath().toString(), llmJudge.acceptanceIdentity());
+        } catch (Exception unavailable) {
+            com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(unavailable);
+            return null;
+        }
     }
 
     private EvalResult evaluateFile(TaskNode node, String evidence, String pathHint) {
@@ -172,6 +207,10 @@ public class StepEvaluator {
     }
 
     public GraphEval evaluateGraph(Goal goal, TaskGraph graph) {
+        return evaluateGraph(goal, graph, null);
+    }
+
+    public GraphEval evaluateGraph(Goal goal, TaskGraph graph, StateSnapshot acceptedSnapshot) {
         if (graph == null || graph.isEmpty()) {
             return GraphEval.fail("", "eval: empty graph");
         }
@@ -185,7 +224,7 @@ public class StepEvaluator {
             if (!NodeOutputBinder.ofNode(n).complete(n)) {
                 return GraphEval.fail(n.id(), "eval: outputs 未绑定");
             }
-            EvalResult ev = evaluate(n, n.output(), n.output(), n.toolStatus() == ToolStatus.SUCCESS);
+            EvalResult ev = evaluate(n, n.output(), n.output(), n.toolStatus() == ToolStatus.SUCCESS, acceptedSnapshot);
             if (!ev.ok()) {
                 return GraphEval.fail(n.id(), ev.reason());
             }

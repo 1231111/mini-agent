@@ -33,6 +33,17 @@ class ClientMediaPresentationIntegrationTest {
     private static final String POSTER = "<svg xmlns='http://www.w3.org/2000/svg' width='320' height='480'>"
             + "<rect width='320' height='480' fill='#dcd7ff'/><circle cx='160' cy='180' r='65' fill='#7264d8'/>"
             + "<text x='160' y='340' text-anchor='middle' font-size='30'>本地电影封面</text></svg>";
+    private static final String NEWS_COVER = "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='400'>"
+            + "<defs><linearGradient id='g'><stop stop-color='#b8a7f1'/><stop offset='1' stop-color='#536ac8'/></linearGradient></defs>"
+            + "<rect width='640' height='400' fill='url(#g)'/><rect x='220' y='80' width='200' height='200' rx='40' fill='#eeeaff'/>"
+            + "<path d='M190 120h-60m60 60h-60m60 60h-60m320-120h60m-60 60h60m-60 60h60' stroke='#d5ccff' stroke-width='12'/>"
+            + "<text x='320' y='214' text-anchor='middle' font-family='sans-serif' font-size='84' fill='#7264ba'>AI</text></svg>";
+    private static final String ALBUM_COVER = "<svg xmlns='http://www.w3.org/2000/svg' width='300' height='300'>"
+            + "<rect width='300' height='300' fill='#d5b8df'/><circle cx='150' cy='150' r='112' fill='#61577a'/>"
+            + "<circle cx='150' cy='150' r='46' fill='#e5bfe0'/><circle cx='150' cy='150' r='10' fill='#61577a'/></svg>";
+    private static final String VIDEO_COVER = "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='360'>"
+            + "<rect width='640' height='360' fill='#708cbc'/><circle cx='320' cy='180' r='80' fill='#dbe3f3'/>"
+            + "<path d='m300 134 64 46-64 46z' fill='#708cbc'/></svg>";
 
     private record Fixture(Page page, Map<String, Map<String, String>> requestHeaders,
                            AtomicReference<byte[]> video) {}
@@ -67,6 +78,9 @@ class ClientMediaPresentationIntegrationTest {
                 route.fulfill(new Route.FulfillOptions().setContentType("audio/wav").setBodyBytes(WAV));
             } else if (path.endsWith(".webm")) {
                 route.fulfill(new Route.FulfillOptions().setContentType("video/webm").setBodyBytes(video.get()));
+            } else if (path.equals("/news-cover.svg") || path.equals("/album.svg") || path.equals("/video-cover.svg")) {
+                String cover = path.equals("/news-cover.svg") ? NEWS_COVER : path.equals("/album.svg") ? ALBUM_COVER : VIDEO_COVER;
+                route.fulfill(new Route.FulfillOptions().setContentType("image/svg+xml").setBody(cover));
             } else if (path.endsWith(".svg")) {
                 route.fulfill(new Route.FulfillOptions().setContentType("image/svg+xml").setBody(POSTER));
             } else if (url.equals(ORIGIN + "/")) {
@@ -129,7 +143,7 @@ class ClientMediaPresentationIntegrationTest {
             assertEquals(0, page.locator("#reply article[data-media-type='movie'] video").count());
             assertEquals(1, page.locator("#reply img[src='" + EXTERNAL + "/poster.svg']").count());
             assertTrue(page.locator("#reply").innerText().contains("星海旅程"));
-            assertEquals(1, page.locator("#reply a[href='" + EXTERNAL + "/movie/1']").count());
+            assertEquals(1, page.locator("#reply a.media-page-link[href='" + EXTERNAL + "/movie/1']").count());
             // Movie metadata has no stream: only the separate video recommendation may create a video element.
             assertFalse(page.locator("#reply").innerText().contains("miniagent-media"));
             page.waitForFunction("() => [...document.querySelectorAll('#reply audio,#reply video')].every(m=>m.readyState>=2)");
@@ -195,7 +209,8 @@ class ClientMediaPresentationIntegrationTest {
             Locator placeholder = page.locator("#reply article[data-media-type='movie'] .media-cover");
             assertTrue(placeholder.isVisible());
             assertTrue(placeholder.locator("svg").isVisible());
-            assertTrue(page.locator("#reply a[href='" + EXTERNAL + "/movie/missing-poster']").isVisible());
+            assertTrue(page.locator("#reply a.media-page-link[href='" + EXTERNAL + "/movie/missing-poster']").isVisible());
+            assertTrue(page.locator("#reply a.media-cover[href='" + EXTERNAL + "/movie/missing-poster']").isVisible());
             assertEquals(0, page.locator("#reply article[data-media-type='movie'] audio,#reply article[data-media-type='movie'] video").count());
             saveEvidence(page, "media-failed-resources.png");
             page.close();
@@ -306,8 +321,171 @@ class ClientMediaPresentationIntegrationTest {
             assertEquals(completedStream, restoredHistory);
             render(page, complete);
             assertTrue(page.locator("#reply").innerText().contains("历史电影推荐"));
-            assertEquals(1, page.locator("#reply a[href='" + EXTERNAL + "/movie/history']").count());
+            assertEquals(1, page.locator("#reply a.media-page-link[href='" + EXTERNAL + "/movie/history']").count());
+            assertEquals(1, page.locator("#reply a.media-cover[href='" + EXTERNAL + "/movie/history']").count());
             assertEquals(0, page.locator("#reply audio,#reply video,#reply pre").count());
+            page.close();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {900, 390})
+    void newsThumbnailsOpenTheSourceAndSurviveHistoryReplay(int width) throws Exception {
+        try (Playwright playwright = runtime(); Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions().setHeadless(true))) {
+            Fixture fixture = prepare(browser, width);
+            Page page = fixture.page();
+            String article = EXTERNAL + "/news/release?lang=zh&source=original";
+            String markdown = "```miniagent-news\n" + JSON.writeValueAsString(Map.of(
+                    "title", "今日 AI 资讯", "items", List.of(
+                            Map.of("title", "开源模型发布新的视觉能力", "summary", "研究团队公开了模型和评测方法，详细能力以原文报告为准。",
+                                    "url", article, "source", "研究团队公告", "publishedAt", "2026-11-16",
+                                    "thumbnail_url", EXTERNAL + "/news-cover.svg"),
+                            Map.of("title", "没有配图的可靠消息", "summary", "原始来源没有提供封面，仍然保留正文和来源入口。",
+                                    "url", EXTERNAL + "/news/no-image", "source", "官方博客")))) + "\n```";
+            render(page, markdown);
+            page.waitForFunction("() => [...document.querySelectorAll('#reply .news-item img')].length === 1 && "
+                    + "[...document.querySelectorAll('#reply .news-item img')].every(img=>img.complete&&img.naturalWidth>0)");
+            assertEquals(2, page.locator("#reply .news-item").count());
+            assertEquals(1, page.locator("#reply img[src='" + EXTERNAL + "/news-cover.svg']").count());
+            assertEquals(0, page.locator("#reply pre").count());
+            assertTrue(page.locator("#reply .news-item").nth(1).innerText().contains("没有配图"));
+            assertEquals(Boolean.FALSE, page.evaluate("() => document.documentElement.scrollWidth > window.innerWidth"));
+            page.evaluate("() => {window.__lightboxCalls=0;window.openLightbox=()=>{window.__lightboxCalls++};bindLightbox(document.getElementById('reply'));}");
+            page.locator("#reply a.news-thumbnail img").click();
+            page.waitForFunction("() => window.__externalOpens.length===1");
+            assertEquals(article, page.evaluate("() => window.__externalOpens[0]"));
+            assertEquals(0, ((Number) page.evaluate("() => window.__lightboxCalls")).intValue());
+            assertEquals(ORIGIN + "/", page.url());
+            assertFalse(fixture.requestHeaders().get(EXTERNAL + "/news-cover.svg").containsKey("authorization"));
+            String completed = (String) page.evaluate("text=>renderMDStreaming(text)", markdown);
+            String restored = (String) page.evaluate("text=>renderMD(text)", markdown);
+            assertEquals(completed, restored);
+            render(page, markdown);
+            page.waitForFunction("() => document.querySelector('#reply .news-item img').naturalWidth>0");
+            assertEquals(2, page.locator("#reply .news-item").count());
+            saveEvidence(page, "news-thumbnails-" + width + ".png");
+            page.close();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {900, 390})
+    void musicAndVideoCoversRenderProviderAliasesWithoutInventingPlayableMedia(int width) throws Exception {
+        try (Playwright playwright = runtime(); Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions().setHeadless(true))) {
+            Fixture fixture = prepare(browser, width);
+            Page page = fixture.page();
+            String songPage = EXTERNAL + "/music/album";
+            String videoPage = EXTERNAL + "/video/watch";
+            render(page, mediaMarkdown(List.of(
+                    Map.of("type", "song", "title", "晨光", "creator", "测试歌手", "poster_url", EXTERNAL + "/album.svg",
+                            "pageUrl", songPage, "mediaUrl", EXTERNAL + "/song.wav", "mimeType", "audio/wav"),
+                    Map.of("type", "video", "title", "模型发布会", "thumbnail_url", EXTERNAL + "/video-cover.svg",
+                            "pageUrl", videoPage))));
+            page.waitForFunction("() => document.querySelectorAll('#reply .media-cover img').length===2 && "
+                    + "[...document.querySelectorAll('#reply .media-cover img')].every(img=>img.complete&&img.naturalWidth>0)");
+            assertEquals(1, page.locator("#reply audio[controls]").count());
+            assertEquals(0, page.locator("#reply video").count());
+            assertEquals(1, page.locator("#reply a.media-cover[href='" + songPage + "']").count());
+            assertEquals(1, page.locator("#reply a.media-cover[href='" + videoPage + "']").count());
+            page.evaluate("() => {window.__lightboxCalls=0;window.openLightbox=()=>{window.__lightboxCalls++};bindLightbox(document.getElementById('reply'));}");
+            page.locator("#reply article[data-media-type='video'] .media-cover img").click();
+            page.waitForFunction("() => window.__externalOpens.length===1");
+            assertEquals(videoPage, page.evaluate("() => window.__externalOpens[0]"));
+            assertEquals(0, ((Number) page.evaluate("() => window.__lightboxCalls")).intValue());
+            assertEquals(Boolean.FALSE, page.evaluate("() => document.documentElement.scrollWidth > window.innerWidth"));
+            assertFalse(fixture.requestHeaders().get(EXTERNAL + "/album.svg").containsKey("authorization"));
+            assertFalse(fixture.requestHeaders().get(EXTERNAL + "/video-cover.svg").containsKey("authorization"));
+            saveEvidence(page, "music-video-covers-" + width + ".png");
+            page.close();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {900, 390})
+    void explicitMoviesInsideNewsFenceRenderRealPostersAndMovieLabels(int width) throws Exception {
+        try (Playwright playwright = runtime(); Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions().setHeadless(true))) {
+            Fixture fixture = prepare(browser, width);
+            Page page = fixture.page();
+            String moviePage = EXTERNAL + "/movie/recent";
+            String markdown = "```miniagent-news\n" + JSON.writeValueAsString(Map.of(
+                    "title", "近一个月上线的电影", "items", List.of(
+                            Map.of("type", "movie", "title", "已核实的电影测试条目", "summary", "保留上映信息和原始来源。",
+                                    "source", "电影发行方", "url", moviePage, "thumbnail_url", EXTERNAL + "/poster.svg")))) + "\n```";
+            render(page, markdown);
+            page.waitForFunction("() => {const img=document.querySelector('#reply article[data-media-type=movie] img');"
+                    + "return img&&img.complete&&img.naturalWidth>0;}");
+            assertEquals(1, page.locator("#reply article[data-media-type='movie']").count());
+            assertEquals(0, page.locator("#reply .news-item,#reply .news-thumbnail").count());
+            assertEquals("电影", page.locator("#reply .media-kind").innerText());
+            assertTrue(page.locator("#reply").innerText().contains("电影发行方"));
+            assertTrue(page.locator("#reply").innerText().contains("保留上映信息"));
+            assertFalse(page.locator("#reply [data-cover-status]").isVisible());
+            assertEquals(0, page.locator("#reply audio,#reply video,#reply pre").count());
+            assertEquals(Boolean.FALSE, page.evaluate("() => document.documentElement.scrollWidth>window.innerWidth"));
+            page.locator("#reply .media-cover img").click();
+            page.waitForFunction("() => window.__externalOpens.length===1");
+            assertEquals(moviePage, page.evaluate("() => window.__externalOpens[0]"));
+            render(page, markdown.replace("\n", "\r\n"));
+            page.waitForFunction("() => document.querySelector('#reply .media-cover img').naturalWidth>0");
+            assertEquals("电影", page.locator("#reply .media-kind").innerText());
+            assertFalse(fixture.requestHeaders().get(EXTERNAL + "/poster.svg").containsKey("authorization"));
+            saveEvidence(page, "movie-news-fence-poster-" + width + ".png");
+            page.close();
+        }
+    }
+
+    @Test void missingMoviePosterAndFailedPosterRemainDistinctAndRecoverOnRealImageLoad() throws Exception {
+        try (Playwright playwright = runtime(); Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions().setHeadless(true))) {
+            Fixture fixture = prepare(browser, 900);
+            Page page = fixture.page();
+            page.route(EXTERNAL + "/missing-movie-poster.svg", route -> route.fulfill(
+                    new Route.FulfillOptions().setStatus(404).setBody("No poster")));
+            render(page, mediaMarkdown(List.of(
+                    Map.of("type", "movie", "title", "来源未提供海报", "pageUrl", EXTERNAL + "/movie/no-image"),
+                    Map.of("type", "movie", "title", "海报地址返回404", "pageUrl", EXTERNAL + "/movie/failed-image",
+                            "posterUrl", EXTERNAL + "/missing-movie-poster.svg"))));
+            Locator missing = page.locator("#reply article[data-media-type='movie']").nth(0);
+            Locator failed = page.locator("#reply article[data-media-type='movie']").nth(1);
+            page.waitForFunction("() => document.querySelectorAll('#reply .media-cover')[1].getAttribute('data-cover-state')==='failed'");
+            assertEquals(0, missing.locator("img").count());
+            assertEquals("暂无海报", missing.locator("[data-cover-status]").innerText());
+            assertTrue(missing.locator("[data-cover-status]").isVisible());
+            assertEquals("封面加载失败", failed.locator("[data-cover-status]").innerText());
+            assertTrue(failed.locator("[data-cover-status]").isVisible());
+            assertTrue((Boolean) failed.locator("img").evaluate("img=>img.complete&&img.naturalWidth===0&&img.hidden"));
+            saveEvidence(page, "movie-missing-versus-failed-posters.png");
+            // A later valid image response must recover this same DOM node, with
+            // actual decoding rather than a synthetic load event.
+            failed.locator("img").evaluate("(img,url)=>{img.src=url;}", EXTERNAL + "/poster.svg");
+            page.waitForFunction("() => {const img=document.querySelectorAll('#reply .media-cover img')[0];"
+                    + "return img.complete&&img.naturalWidth>0&&!img.hidden;}");
+            assertFalse(failed.locator("[data-cover-status]").isVisible());
+            assertEquals("loaded", failed.locator(".media-cover").getAttribute("data-cover-state"));
+            assertEquals("missing", missing.locator(".media-cover").getAttribute("data-cover-state"));
+            assertTrue(missing.locator("[data-cover-status]").isVisible());
+            assertEquals(0, page.locator("#reply audio,#reply video").count());
+            page.close();
+        }
+    }
+
+    @Test void mixedMovieAndNewsResultsUseExplicitTypesWithoutGuessingFromMovieWords() throws Exception {
+        try (Playwright playwright = runtime(); Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions().setHeadless(true))) {
+            Page page = prepare(browser, 900).page();
+            String markdown = "```miniagent-news\n" + JSON.writeValueAsString(Map.of("items", List.of(
+                    Map.of("type", "movie", "title", "一部上映电影", "url", EXTERNAL + "/movie/typed",
+                            "posterUrl", EXTERNAL + "/poster.svg"),
+                    Map.of("title", "近一个月上线的电影产业新闻", "summary", "这是文章，不是电影实体。",
+                            "url", EXTERNAL + "/movie-industry-article")))) + "\n```";
+            render(page, markdown);
+            page.waitForFunction("() => document.querySelector('#reply .media-cover img').naturalWidth>0");
+            assertEquals(2, page.locator("#reply article").count());
+            assertEquals(1, page.locator("#reply article[data-media-type='movie']").count());
+            assertEquals(1, page.locator("#reply .news-item").count());
+            assertTrue(page.locator("#reply .news-item h3").innerText().contains("电影产业新闻"));
+            assertEquals("暂无配图", page.locator("#reply .news-item [data-cover-status]").innerText());
+            assertEquals(0, page.locator("#reply .news-item img").count());
+            assertEquals(1, page.locator("#reply article[data-media-type='movie'] img").count());
+            assertEquals(Boolean.FALSE, page.evaluate("() => document.documentElement.scrollWidth>window.innerWidth"));
             page.close();
         }
     }
