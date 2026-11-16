@@ -7,8 +7,8 @@ description: Research a question with current web sources, cross-check key claim
 
 Use this skill when the answer depends on current or source-specific information.
 
-1. Turn the request into a few focused search queries. Search for primary sources first, then use independent sources to verify important claims.
-2. Use `web_search` to find sources and `web_extract` to read the pages that support the answer. Search snippets alone are not evidence for important claims.
+1. Turn the request into the smallest useful set of queries. For a broad daily-news roundup, use one combined query covering the requested topics and date; add a second query only to fill a specific gap, not to repeat the same search by keyword or organization.
+2. Use `web_search` to find sources and `web_extract` only on the few pages that support the final answer (usually 2–3). Prefer search results that already contain reliable summaries; do not fetch every result. Search snippets alone are not evidence for important claims.
 3. Check publication dates and distinguish them from the date an event happened. If sources disagree, describe the disagreement instead of silently choosing one.
 4. Keep facts, estimates, and your interpretation separate. Say when a claim could not be verified.
 5. Answer the user's actual question directly. Include source titles and clickable URLs beside the claims they support; do not invent citations or imply broader coverage than you searched.

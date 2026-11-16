@@ -30,6 +30,9 @@ TAVILY_API_KEY: ''
 BING_API_KEY: ''
 GOOGLE_API_KEY: ''
 GOOGLE_CSE_ID: ''
+# 可选：现有搜索/抓取提供方失败或无有效结果时，才使用 DeepSeek Search/Fetch 付费降级
+DEEPSEEK_API_KEY: ''
+DEEPSEEK_API_BASE_URL: 'https://api.deepseek.com'
 
 # 图像生成 / 对话模型共用的 MiMo key。
 # application.yml 的 langchain4j.open-ai.chat-model.api-key 写法是

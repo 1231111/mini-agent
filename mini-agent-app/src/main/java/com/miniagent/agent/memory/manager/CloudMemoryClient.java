@@ -85,10 +85,11 @@ public class CloudMemoryClient implements ProjectAuthorizationPort {
     public Assembled assemble(String taskKey, String query) {
         String cloudTenant = null;
         try {
-            String token = memoryToken();
+            Long localUserId = OwnerContext.currentUserId();
+            if (localUserId == null) throw new BusinessException(ErrorCode.AUTH_NOT_AUTHENTICATED);
             cloudTenant = cloudTenantId();
-            AssembleResponse response = reads.call(HttpMethod.POST, MemoryApi.ASSEMBLE,
-                    new AssembleRequest(taskKey, query), token, AssembleResponse.class);
+            AssembleResponse response = callWithRefresh(localUserId, reads, HttpMethod.POST,
+                    MemoryApi.ASSEMBLE, new AssembleRequest(taskKey, query), AssembleResponse.class);
             cacheActive(cloudTenant, response);
             return new Assembled(response, false);
         } catch (RuntimeException e) {
@@ -246,28 +247,33 @@ public class CloudMemoryClient implements ProjectAuthorizationPort {
 
     public String envVersion() { return props.envVersion().isBlank() ? null : props.envVersion(); }
 
-    private String memoryToken() {
-        Long localUserId = OwnerContext.currentUserId();
-        if (localUserId == null) throw new BusinessException(ErrorCode.AUTH_NOT_AUTHENTICATED);
-        return users.findMemoryAccessTokenById(localUserId)
-                .filter(value -> !value.isBlank())
-                .orElseThrow(() -> new BusinessException(ErrorCode.AUTH_NOT_AUTHENTICATED,
-                        "当前本地账号没有有效的云端记忆凭证"));
-    }
-
     private <T> T callWithRefresh(Long localUserId, HttpMethod method, String uri,
                                   Object body, Class<T> responseType) {
-        return callWithRefresh(localUserId, method, uri, body,
+        return callWithRefresh(localUserId, writes, method, uri, body,
                 json.getTypeFactory().constructType(responseType));
     }
 
     private <T> T callWithRefresh(Long localUserId, HttpMethod method, String uri,
                                   Object body, JavaType responseType) {
+        return callWithRefresh(localUserId, writes, method, uri, body, responseType);
+    }
+
+    private <T> T callWithRefresh(Long localUserId, MemoryServiceClient service,
+                                  HttpMethod method, String uri, Object body,
+                                  Class<T> responseType) {
+        return callWithRefresh(localUserId, service, method, uri, body,
+                json.getTypeFactory().constructType(responseType));
+    }
+
+    private <T> T callWithRefresh(Long localUserId, MemoryServiceClient service,
+                                  HttpMethod method, String uri, Object body,
+                                  JavaType responseType) {
+        if (localUserId == null) throw new BusinessException(ErrorCode.AUTH_NOT_AUTHENTICATED);
         String token = users.findMemoryAccessTokenById(localUserId)
                 .filter(value -> !value.isBlank())
                 .orElseThrow(() -> new BusinessException(ErrorCode.AUTH_NOT_AUTHENTICATED));
         try {
-            return writes.call(method, uri, body, token, responseType);
+            return service.call(method, uri, body, token, responseType);
         } catch (CallFailed failure) {
             if (!isAuthenticationFailure(failure)) throw translate(failure);
         }
@@ -282,7 +288,7 @@ public class CloudMemoryClient implements ProjectAuthorizationPort {
                 : users.findMemoryAccessTokenById(localUserId)
                 .filter(value -> !value.isBlank()).orElse(refreshed.memoryToken());
         try {
-            return writes.call(method, uri, body, accessToken, responseType);
+            return service.call(method, uri, body, accessToken, responseType);
         } catch (CallFailed retryFailure) {
             throw translate(retryFailure);
         }
@@ -302,15 +308,11 @@ public class CloudMemoryClient implements ProjectAuthorizationPort {
     }
 
     private <T> T write(HttpMethod method, String uri, Object body, Class<T> type) {
-        try {
-            return writes.call(method, uri, body, memoryToken(), type);
-        } catch (CallFailed e) { throw translate(e); }
+        return callWithRefresh(OwnerContext.currentUserId(), writes, method, uri, body, type);
     }
     private <T> T write(HttpMethod method, String uri, Object body,
                         com.fasterxml.jackson.databind.JavaType type) {
-        try {
-            return writes.call(method, uri, body, memoryToken(), type);
-        } catch (CallFailed e) { throw translate(e); }
+        return callWithRefresh(OwnerContext.currentUserId(), writes, method, uri, body, type);
     }
     private static RuntimeException translate(CallFailed e) {
         ErrorCode code = ErrorCode.ofCode(e.code());

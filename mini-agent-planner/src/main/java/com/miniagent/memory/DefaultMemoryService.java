@@ -45,7 +45,7 @@ public class DefaultMemoryService implements MemoryService {
             if (StringUtils.isNotBlank(sessionId)) {
                 structured = formatStructured(loadStructured(sessionId, query, policy));
             } else if (policy.user()) {
-                structured = formatStructured(userOnlyContext());
+                structured = formatStructured(userOnlyContext(query));
             }
         }
         String blob = memoryStore.getSnapshotForQuery(
@@ -356,23 +356,29 @@ public class DefaultMemoryService implements MemoryService {
         if (!policy.user()) {
             raw.setPreferences(new ArrayList<>());
         } else {
-            for (SemanticFact fact : userFacts()) {
-                String value = fact.getObjectValue();
-                if (value != null && !raw.getPreferences().contains(value)) {
-                    raw.addPreference(value);
-                }
-            }
+            // User preferences are query-conditioned too. Injecting every saved
+            // preference makes unrelated tasks carry the whole profile into the prompt.
+            List<String> relevant = MemoryRelevance.topRelevant(query, userFacts(),
+                    SemanticFact::getObjectValue, 6).stream()
+                    .map(SemanticFact::getObjectValue)
+                    .filter(Objects::nonNull)
+                    .distinct()
+                    .toList();
+            raw.setPreferences(new ArrayList<>(relevant));
         }
         return raw;
     }
 
-    private MemoryContext userOnlyContext() {
+    private MemoryContext userOnlyContext(String query) {
         MemoryContext raw = new MemoryContext();
-        for (SemanticFact fact : userFacts()) {
-            String value = fact.getObjectValue();
-            if (value != null) {
-                raw.addPreference(value);
-            }
+        List<String> relevant = MemoryRelevance.topRelevant(query, userFacts(),
+                SemanticFact::getObjectValue, 6).stream()
+                .map(SemanticFact::getObjectValue)
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+        for (String value : relevant) {
+            raw.addPreference(value);
         }
         return raw;
     }

@@ -343,15 +343,15 @@ public class BuiltinTools {
 
     private void registerWebSearchTools() {
         registry.register("web_search",
-                "搜索网页，返回结构化结果以及搜索服务提供的发布日期线索。仅当用户限定新闻/网页的发布日期范围（如今日新闻）时，必须按上下文时区换算并传 dateFrom/dateTo（YYYY-MM-DD）；服务会按网页发布日期剔除超窗结果。电影上映/上线、航班出发等事件日期写入 query 并核对正文，不用 dateFrom/dateTo 过滤网页，除非用户同时要求页面发表于该范围。搜索发布日期尚未经过原文核验；交付新闻报道前必须用 web_extract 核验原文发布日期。\n"
+                "搜索网页，返回结构化结果以及搜索服务提供的发布日期线索。新闻/资讯查询优先把主题、机构、日期合并成一次覆盖面完整的 query，不要为同一请求按机构/关键词重复 web_search；只有首轮结果明显缺少关键主题或时效证据时才追加一次有针对性的搜索。仅当用户限定新闻/网页的发布日期范围（如今日新闻）时，必须按上下文时区换算并传 dateFrom/dateTo（YYYY-MM-DD）；服务会按网页发布日期剔除超窗结果。电影上映/上线、航班出发等事件日期写入 query 并核对正文，不用 dateFrom/dateTo 过滤网页，除非用户同时要求页面发表于该范围。搜索发布日期尚未经过原文核验；只对最终准备引用的少量新闻候选调用 web_extract 核验原文发布日期，通常最多 2-3 篇，不要逐条抓取所有结果。\n"
                         + "搜索用简洁关键词，不用完整句子（用 \"Spring Boot 事务失效\" 而不是 \"我想知道 Spring Boot 里事务为什么会失效\"）。\n"
-                        + "对结果准确性不确定时，用 web_extract 提取原文确认，不要直接拿搜索摘要下结论。\n"
+                        + "对最终引用的少量关键结果用 web_extract 提取原文确认；简单查询不需要抓取全部搜索结果。除非首轮搜索/提取失败或仍缺少决定性证据，不重复调用相同主题的搜索。\n"
                         + "有可靠来源图时返回 thumbnail_url、thumbnail_source_url；新闻报道用 miniagent-news 的 thumbnailUrl，电影/歌曲/视频名单用 miniagent-media 的 posterUrl。按用户要的对象选卡片，不能因为资料来自新闻就把电影当新闻；查询作品时一并核验对应详情与海报，聚合片单的封面不能充当每部电影的海报。无图时省略，不猜测或混用其他条目的封面。",
                 WebSearchParams.class,
                 params -> webSearchService.search(params.getQuery(), params.getLimitOrDefault(),
                         params.getDateFrom(), params.getDateTo(), Boolean.TRUE.equals(params.getIncludeImages())));
 
-        registry.register("web_extract", "抓取网页原文，返回正文、页面可识别的发布日期及来源封面 thumbnail_url（若存在）。用它核验新闻发布日期；date_verified=true 仅表示原文页面元数据中找到发布日期，不代表作品上映/上线日期已核实。电影应提取对应作品详情页以核验海报与上线信息。封面与 thumbnail_source_url 对应，仅代表页面配图，不代表可播放媒体直链，不能把聚合片单封面套到多部作品。对于大页面会截断到合理长度。",
+        registry.register("web_extract", "抓取网页原文，返回正文、页面可识别的发布日期及来源封面 thumbnail_url（若存在）。用它核验最终准备引用的新闻发布日期；date_verified=true 仅表示原文页面元数据中找到发布日期，不代表作品上映/上线日期已核实。电影应提取对应作品详情页以核验海报与上线信息。优先抓取少量高相关来源（通常最多 2-3 个），无需逐条抓取所有搜索结果；首选提供可靠正文的搜索结果以减少单独抓取。封面与 thumbnail_source_url 对应，仅代表页面配图，不代表可播放媒体直链，不能把聚合片单封面套到多部作品。对于大页面会截断到合理长度。",
                 WebExtractParams.class,
                 params -> webSearchService.extract(params.getUrl()));
     }

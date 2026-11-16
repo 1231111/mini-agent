@@ -26,6 +26,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.security.access.AccessDeniedException;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.Pageable;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
@@ -244,11 +246,12 @@ class ShellApiControllerTest {
                 controller.memoryInsights("s-empty", 30, authed());
         assertTrue(resp.isSuccess());
         Map<String, Object> data = resp.getData();
-        assertEquals(7, data.size());
+        assertEquals(9, data.size());
         assertEquals("s-empty", data.get("sessionId"));
         assertEquals(Boolean.FALSE, data.get("saved"));
         assertEquals(Boolean.TRUE, data.get("preferencesAvailable"));
         assertTrue(((List<?>) data.get("userPreferences")).isEmpty());
+        assertTrue(((List<?>) data.get("userMemories")).isEmpty());
         assertTrue(((List<?>) data.get("related")).isEmpty());
         assertTrue(((List<?>) data.get("tags")).isEmpty());
         Map<String, Object> stats = (Map<String, Object>) data.get("stats");
@@ -258,6 +261,13 @@ class ShellApiControllerTest {
         assertEquals(0L, stats.get("procedureCount"));
         assertEquals(0L, stats.get("episodeCount"));
         assertEquals(0L, stats.get("relatedCount"));
+        Map<String, Object> userStats = (Map<String, Object>) data.get("userStats");
+        assertEquals(5, userStats.size());
+        assertEquals(0L, userStats.get("memoryCount"));
+        assertEquals(0L, userStats.get("memoryEntryCount"));
+        assertEquals(0L, userStats.get("preferenceCount"));
+        assertEquals(0L, userStats.get("factCount"));
+        assertEquals(0L, userStats.get("procedureCount"));
     }
 
     @Test
@@ -276,17 +286,34 @@ class ShellApiControllerTest {
         AgentProcedureEntity proc = new AgentProcedureEntity();
         proc.setName("部署流程");
         proc.setProcedureVersion(2);
+        AgentMemoryEntryEntity memoryEntry = new AgentMemoryEntryEntity();
+        memoryEntry.setMemoryType(AgentMemoryEntryEntity.MemoryType.USER);
+        memoryEntry.setSummary("偏好摘要");
+        memoryEntry.setContent("用户偏好内容");
 
         when(episodeRepository.findBySessionId("s-real")).thenReturn(List.of(ep));
         when(memoryEntryRepository.countByTenantIdAndStatus(
                 eq("1"), eq(AgentMemoryEntryEntity.Status.ACTIVE))).thenReturn(5L);
         when(semanticFactRepository.countByTenantId("1")).thenReturn(3L);
         when(procedureRepository.countByTenantId("1")).thenReturn(2L);
-        when(semanticFactRepository.findByTenantIdAndScopeTypeAndScopeId(
+        when(memoryEntryRepository.countByTenantIdAndScopeTypeAndScopeIdAndStatus(
+                eq("1"), eq(AgentMemoryEntryEntity.ScopeType.USER), eq("7"),
+                eq(AgentMemoryEntryEntity.Status.ACTIVE))).thenReturn(1L);
+        when(memoryEntryRepository.findByTenantIdAndScopeTypeAndScopeIdAndStatusOrderByUpdatedAtDesc(
+                eq("1"), eq(AgentMemoryEntryEntity.ScopeType.USER), eq("7"),
+                eq(AgentMemoryEntryEntity.Status.ACTIVE), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(memoryEntry)));
+        when(semanticFactRepository.countActiveFacts(
+                eq("1"), eq(AgentMemoryEntryEntity.ScopeType.USER), eq("7"))).thenReturn(1L);
+        when(procedureRepository.countByTenantIdAndScopeTypeAndScopeIdAndStatus(
+                eq("1"), eq(AgentMemoryEntryEntity.ScopeType.USER), eq("7"),
+                eq(AgentMemoryEntryEntity.Status.ACTIVE))).thenReturn(1L);
+        when(semanticFactRepository.findActiveFacts(
                 eq("1"), eq(AgentMemoryEntryEntity.ScopeType.USER), eq("7")))
                 .thenReturn(List.of(fact));
-        when(procedureRepository.findByTenantIdAndScopeTypeAndScopeId(
-                eq("1"), eq(AgentMemoryEntryEntity.ScopeType.USER), eq("7")))
+        when(procedureRepository.findByTenantIdAndScopeTypeAndScopeIdAndStatus(
+                eq("1"), eq(AgentMemoryEntryEntity.ScopeType.USER), eq("7"),
+                eq(AgentMemoryEntryEntity.Status.ACTIVE)))
                 .thenReturn(List.of(proc));
 
         ApiResponse<Map<String, Object>> resp =
@@ -295,6 +322,7 @@ class ShellApiControllerTest {
         Map<String, Object> data = resp.getData();
         assertEquals(Boolean.TRUE, data.get("saved"));
         assertEquals(3, ((List<?>) data.get("related")).size());
+        assertEquals(1, ((List<?>) data.get("userMemories")).size());
         List<?> tags = (List<?>) data.get("tags");
         assertTrue(tags.contains("SUCCESS"));
         assertTrue(tags.contains("语言"));
@@ -306,6 +334,31 @@ class ShellApiControllerTest {
         assertEquals(2L, stats.get("procedureCount"));
         assertEquals(1L, stats.get("episodeCount"));
         assertEquals(3L, stats.get("relatedCount"));
+        Map<String, Object> userStats = (Map<String, Object>) data.get("userStats");
+        assertEquals(1L, userStats.get("memoryCount"));
+        assertEquals(1L, userStats.get("memoryEntryCount"));
+        assertEquals(0L, userStats.get("preferenceCount"));
+        assertEquals(1L, userStats.get("factCount"));
+        assertEquals(1L, userStats.get("procedureCount"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void memoryTotalIncludesAllDistinctPersistedPreferencesBeyondDisplayLimit() {
+        when(memoryService.read(MemoryKeys.TARGET_USER))
+                .thenReturn(List.of("偏好 A", "偏好 B", "偏好 A"));
+        when(memoryEntryRepository.countByTenantIdAndScopeTypeAndScopeIdAndStatus(
+                eq("1"), eq(AgentMemoryEntryEntity.ScopeType.USER), eq("7"),
+                eq(AgentMemoryEntryEntity.Status.ACTIVE))).thenReturn(2L);
+
+        ApiResponse<Map<String, Object>> response = controller.memoryInsights(null, 1, authed());
+        assertTrue(response.isSuccess());
+        Map<String, Object> data = response.getData();
+        Map<String, Object> userStats = (Map<String, Object>) data.get("userStats");
+        assertEquals(4L, userStats.get("memoryCount"));
+        assertEquals(2L, userStats.get("memoryEntryCount"));
+        assertEquals(2L, userStats.get("preferenceCount"));
+        assertEquals(1, ((List<?>) data.get("userPreferences")).size());
     }
 
     /**
@@ -347,7 +400,7 @@ class ShellApiControllerTest {
             f.setObjectValue("o");
             many.add(f);
         }
-        when(semanticFactRepository.findByTenantIdAndScopeTypeAndScopeId(
+        when(semanticFactRepository.findActiveFacts(
                 eq("1"), eq(AgentMemoryEntryEntity.ScopeType.USER), eq("7")))
                 .thenReturn(many);
 

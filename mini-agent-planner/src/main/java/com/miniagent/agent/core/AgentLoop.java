@@ -105,6 +105,8 @@ public class AgentLoop {
     private ToolPipeline toolPipeline;
     @Autowired
     private ExecutionProperties executionProperties;
+    @Value("${agent.tools.max-web-extract-calls:3}")
+    private int maxWebExtractCalls = WEB_EXTRACT_CALL_CAP;
     @Autowired
     private ExecutionControl executionControl;
     @Autowired
@@ -199,6 +201,7 @@ public class AgentLoop {
     private static final int MAX_EXPLORATION_CALLS = 40;  // read_file + list_files + exec_command 总上限（放开：复杂任务定位文件常需多次读取）
     /** 网页/HTTP 检索上限。浏览器交互由动作预算控制，不能八次点击就被当作搜索螺旋关掉。 */
     static final int RETRIEVAL_CALL_CAP = 8;
+    static final int WEB_EXTRACT_CALL_CAP = 3;
     /** 安全网关拒答只再试一轮。同一份长摘要重发会再次被拒。 */
     private static final int REFUSE_RECOVERY_CAP = 1;
     private static final int STREAM_POLL_SEC = 15;
@@ -555,7 +558,9 @@ public class AgentLoop {
         final Map<String, Integer> gateDenyCounter = new java.util.concurrent.ConcurrentHashMap<>();
         int explorationCount = 0;
         int retrievalCalls = 0;
+        int webExtractCalls = 0;
         boolean retrievalClosedNote = false;
+        boolean webExtractClosedNote = false;
         int consecutiveFailures = 0;  // 连续同类工具失败计数
         String lastFailedTool = null; // 上次失败的工具名
         SystemMessage currentSubGoalMsg = null; // 框架注入的「当前子目标」可刷新指针消息
@@ -1329,6 +1334,15 @@ public class AgentLoop {
             names.remove("exec_command");
             names.remove("read_package");
         }
+        if (closeWebExtract(state.webExtractCalls, maxWebExtractCalls)) {
+            names.remove("web_extract");
+            if (!state.webExtractClosedNote) {
+                messages.add(new SystemMessage("【原文抓取已达本轮上限】已提取 " + maxWebExtractCalls + " 个来源。"
+                        + "根据已有原文与搜索结果完成回答；如证据仍不足，明确说明缺口，不要逐条抓取其余候选。"));
+                state.webExtractClosedNote = true;
+                log.info("web_extract 调用已达本轮上限 {}", state.webExtractCalls);
+            }
+        }
         if (closeRetrieval(state.retrievalCalls)) {
             int before = names.size();
             names.removeIf(AgentLoop::isRetrievalTool);
@@ -1864,6 +1878,35 @@ public class AgentLoop {
         return retrievalCalls >= RETRIEVAL_CALL_CAP;
     }
 
+    static boolean closeWebExtract(int calls) {
+        return closeWebExtract(calls, WEB_EXTRACT_CALL_CAP);
+    }
+
+    static boolean closeWebExtract(int calls, int cap) {
+        return cap > 0 && calls >= cap;
+    }
+
+    record CappedToolCalls<T>(List<T> allowed, List<T> skipped) { }
+
+    static <T> CappedToolCalls<T> capWebExtractCalls(List<T> calls, int alreadyExecuted, int cap,
+                                                       java.util.function.Function<T, String> nameOf) {
+        if (cap <= 0) return new CappedToolCalls<>(List.copyOf(calls), List.of());
+        List<T> allowed = new ArrayList<>();
+        List<T> skipped = new ArrayList<>();
+        int remaining = Math.max(0, cap - alreadyExecuted);
+        for (T call : calls) {
+            if ("web_extract".equals(nameOf.apply(call))) {
+                if (remaining == 0) {
+                    skipped.add(call);
+                    continue;
+                }
+                remaining--;
+            }
+            allowed.add(call);
+        }
+        return new CappedToolCalls<>(List.copyOf(allowed), List.copyOf(skipped));
+    }
+
     /** 按请求体大小估计首包等待：思考模型 + 超长 schema 需要更久 */
     private static long estimateFirstTokenTimeoutSec(ChatRequest request) {
         long chars = 0;
@@ -1896,6 +1939,16 @@ public class AgentLoop {
      */
     private void executeToolCalls(List<?> toolCalls, List<ChatMessage> messages, LoopState state) {
         state.pendingObservations.clear();
+        CappedToolCalls<Object> capped = capWebExtractCalls(new ArrayList<>(toolCalls),
+                state.webExtractCalls, maxWebExtractCalls, AgentLoop::toolNameOf);
+        for (Object call : capped.skipped()) {
+            String name = toolNameOf(call);
+            String result = "{\"error_code\":\"WEB_EXTRACT_CAP_REACHED\",\"error\":\"本轮原文抓取已达上限。请使用已获得的来源完成回答，或明确说明证据缺口。\"}";
+            log.info("[检索上限] 跳过额外的 web_extract 调用 id={}", toolIdOf(call));
+            messages.add(ToolExecutionResultMessage.from(toolIdOf(call), name, result));
+        }
+        toolCalls = capped.allowed();
+        if (toolCalls.isEmpty()) return;
         Map<String, ExecutionTurnContext.ActionBinding> bindings = resolveToolBindings(toolCalls);
         if (!toolCalls.isEmpty()) {
             log.info("工具调用: {}", toolCalls.stream()
@@ -2430,6 +2483,7 @@ public class AgentLoop {
         if (isRetrievalTool(toolName)) {
             state.retrievalCalls++;
         }
+        if ("web_extract".equals(toolName)) state.webExtractCalls++;
         if ("read_package".equals(toolName)) {
             state.explorationCount += 3;
         }

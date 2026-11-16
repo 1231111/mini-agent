@@ -26,6 +26,14 @@ public interface AgentSemanticFactRepository extends JpaRepository<AgentSemantic
         @Param("scopeType") AgentMemoryEntryEntity.ScopeType scopeType,
         @Param("scopeId") String scopeId);
 
+    @Query("SELECT COUNT(f) FROM AgentSemanticFactEntity f WHERE f.tenantId = :tenantId " +
+           "AND f.scopeType = :scopeType AND f.scopeId = :scopeId " +
+           "AND f.supersededBy IS NULL AND f.validTo IS NULL")
+    long countActiveFacts(
+        @Param("tenantId") String tenantId,
+        @Param("scopeType") AgentMemoryEntryEntity.ScopeType scopeType,
+        @Param("scopeId") String scopeId);
+
     @Query("SELECT f FROM AgentSemanticFactEntity f WHERE f.tenantId = :tenantId " +
            "AND f.scopeType = :scopeType AND f.scopeId = :scopeId " +
            "AND f.subject = :subject AND f.predicate = :predicate " +

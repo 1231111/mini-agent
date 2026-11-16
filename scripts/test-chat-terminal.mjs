@@ -236,6 +236,31 @@ const finalAnswer = '已生成虚拟仿真交互页面。\n\n[查看 HTML 文件
 
 {
     const h = createHarness();
+    const answer = await consume(h, [
+        event('token', '正在整理查询结果'),
+        () => h.flushPaint(),
+        ask(),
+        () => {
+            const card = h.bot.querySelector('.permission-request-card');
+            const stream = h.bot.querySelector('.answer-stream');
+            assert.ok(card && stream);
+            assert.ok(h.bot.children.indexOf(card) < h.bot.children.indexOf(stream),
+                'a late authorization card must move ahead of an already-created answer');
+        },
+        async () => { await h.context.grantAskTool(); },
+        event('token', '授权后继续完成任务'),
+        event('end', finalAnswer)
+    ]);
+    const card = h.bot.querySelector('.permission-request-card');
+    assert.ok(h.bot.children.indexOf(card) < h.bot.children.indexOf(answer),
+        'terminal answer must remain below the authorization card');
+    assert.equal(card.querySelector('.permission-request-status')?.textContent,
+        '已批准，Agent 正在继续执行。');
+    console.log('PASS: authorization card stays before the final answer when it arrives after streamed text');
+}
+
+{
+    const h = createHarness();
     const answer = await consume(h, [ask(), event('end', finalAnswer)]);
     assert.equal(answer?.innerHTML, finalAnswer);
     assert.equal(vm.runInContext('pendingAskTool', h.context), null);

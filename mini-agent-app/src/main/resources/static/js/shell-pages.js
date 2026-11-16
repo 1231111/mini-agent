@@ -86,12 +86,13 @@ async function renderMemoryPage() {
         setHtml('memTags', emptyHtml(PAGE_LOAD_ERROR));
     }
     if (total) {
-        const stats = total.stats || {};
+        const stats = total.userStats || total.stats || {};
         renderStats('memStats', [
-            { key: '记忆条目（ACTIVE）', value: stats.memoryCount },
-            { key: '语义事实', value: stats.factCount },
-            { key: '流程', value: stats.procedureCount }
+            { key: '总记忆数', value: stats.memoryCount },
+            { key: '沉淀知识', value: stats.factCount },
+            { key: '可复用流程', value: stats.procedureCount }
         ]);
+        renderMemoryEntries(total, stats);
         renderMemoryPreferences(total);
 
         // 标签云：来自真实 fact subject / procedure name / episode outcome
@@ -116,6 +117,33 @@ async function renderMemoryPage() {
     await loadMemoryEpisodes('');
 }
 
+function renderMemoryEntries(data, stats) {
+    const entries = Array.isArray(data && data.userMemories) ? data.userMemories : [];
+    const count = Number(stats && (stats.memoryEntryCount ?? stats.memoryCount));
+    setText('memEntryCount', Number.isFinite(count)
+        ? `共 ${num(count)} 条 · 已载入 ${entries.length} 条`
+        : `已载入 ${entries.length} 条`);
+    if (!entries.length) {
+        setHtml('memEntryItems', emptyHtml('当前账号还没有沉淀的记忆条目。'));
+        return;
+    }
+    const labels = {
+        WORKING: '工作记忆', EPISODIC: '执行经验', SEMANTIC: '知识',
+        PROCEDURAL: '流程记忆', USER: '用户偏好', PROJECT: '项目记忆', ORGANIZATION: '组织记忆'
+    };
+    setHtml('memEntryItems', entries.map(entry => {
+        const content = String(entry.content || '').trim();
+        const summary = String(entry.summary || '').trim();
+        const preview = summary || (content.length > 220 ? content.slice(0, 220) + '…' : content);
+        const full = content && content !== preview
+            ? `<details class="memory-entry-more"><summary>查看完整内容</summary><div class="knowledge-row-content">${pe(content)}</div></details>` : '';
+        return `<div class="row row--fact memory-entry-row">
+            <span class="row-main"><span class="row-tag">${pe(labels[entry.type] || entry.type || '记忆')}</span>
+            <span class="knowledge-row-content">${pe(preview || '（暂无摘要）')}</span>${full}</span>
+        </div>`;
+    }).join(''));
+}
+
 function renderMemoryPreferences(data) {
     if (!data || data.preferencesAvailable !== true) {
         setHtml('memPreferences', emptyHtml(data && data.preferencesAvailable === false
@@ -128,7 +156,11 @@ function renderMemoryPreferences(data) {
     const preferences = Array.isArray(data.userPreferences) ? data.userPreferences.filter(item =>
         item && item.target === 'user' && item.persisted === true
             && typeof item.content === 'string' && item.content.trim()) : [];
-    setText('memPreferenceCount', '已载入 ' + preferences.length + ' 条 · 最新优先');
+    const totalRaw = data.userStats && data.userStats.preferenceCount;
+    const total = Number(totalRaw);
+    setText('memPreferenceCount', totalRaw != null && Number.isFinite(total)
+        ? `共 ${num(total)} 条 · 已载入 ${preferences.length} 条 · 最新优先`
+        : '已载入 ' + preferences.length + ' 条 · 最新优先');
     setHtml('memPreferences', preferences.length ? preferences.map(item => `<div class="row row--fact">
         <span class="row-main"><span class="row-tag">已保存偏好</span><span class="knowledge-row-content" style="white-space:pre-wrap;overflow-wrap:anywhere">${pe(item.content.trim())}</span></span>
     </div>`).join('') : emptyHtml('当前尚未保存用户偏好。'));
@@ -177,10 +209,10 @@ async function renderKnowledgePage() {
         setHtml('knProcedures', emptyHtml(PAGE_LOAD_ERROR));
         return;
     }
-    const stats = (data && data.stats) || {};
+    const stats = (data && (data.userStats || data.stats)) || {};
     renderStats('knStats', [
-        { key: '语义事实', value: stats.factCount },
-        { key: '流程', value: stats.procedureCount },
+        { key: '沉淀知识', value: stats.factCount },
+        { key: '可复用流程', value: stats.procedureCount },
         { key: '本页已载入', value: stats.relatedCount }
     ]);
 

@@ -17,6 +17,7 @@ import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
@@ -104,6 +105,12 @@ public class WebSearchService {
     @Value("${web.search.google-cse-id:#{null}}")
     private String googleCseId;
 
+    @Value("${web.search.deepseek-api-key:#{null}}")
+    private String deepSeekApiKey;
+
+    @Value("${web.search.deepseek-base-url:https://api.deepseek.com}")
+    private String deepSeekBaseUrl = "https://api.deepseek.com";
+
     @Value("${web.search.backend:}")
     private String configuredBackend;
 
@@ -149,31 +156,187 @@ public class WebSearchService {
         int fetchLimit = dateWindow == null ? requestedLimit : Math.min(20, requestedLimit * 3);
         log.info("Web搜索: query='{}' limit={} backend={} dateWindow={}", query, requestedLimit, backend, dateWindow);
 
+        SearchProviderResult primary = null;
+        Exception primaryFailure = null;
         try {
-            List<SearchImage> images = List.of();
-            List<SearchResult> results;
-            if ("tavily".equals(backend)) {
-                JsonNode provider = searchTavily(searchQuery, fetchLimit, includeImages);
-                results = mapTavilyResults(provider, searchZone);
-                if (includeImages) images = mapTavilyImages(provider);
-            } else {
-                results = switch (backend) {
-                    case "bing" -> searchBing(searchQuery, fetchLimit, dateWindow);
-                    case "google" -> searchGoogle(searchQuery, fetchLimit);
-                    default -> searchDuckDuckGo(searchQuery, fetchLimit);
-                };
-            }
-            if (dateWindow != null) {
-                results = filterDateWindow(results, dateWindow, requestedLimit);
-            } else {
-                results = results.stream().limit(requestedLimit).toList();
-            }
-            return buildSuccessResponse(results, dateWindow, searchZone, images);
+            ensureExtractionActive();
+            primary = searchConfiguredBackend(backend, searchQuery, fetchLimit, dateWindow,
+                    includeImages, searchZone);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return buildErrorResponse("SEARCH_INTERRUPTED", "网页搜索已中断，未启动后续请求");
+        } catch (CancellationException e) {
+            return buildErrorResponse("SEARCH_CANCELLED", "网页搜索已取消，未启动后续请求");
+        } catch (ToolExecutionDeadline.Expired e) {
+            return buildErrorResponse("SEARCH_DEADLINE", "网页搜索预算已耗尽，未启动后续请求");
         } catch (Exception e) {
-            log.error("Web搜索失败: backend={} error={}", backend, e.getMessage());
-            return buildErrorResponse("搜索失败: " + e.getMessage() + "。请检查 " + backend + " API 密钥是否正确配置。");
+            primaryFailure = e;
+            log.warn("主搜索 provider 失败: backend={} type={}", backend, e.getClass().getSimpleName());
+        }
+
+        List<SearchResult> primaryResults = primary == null ? List.of() : primary.results();
+        if (dateWindow != null) primaryResults = filterDateWindow(primaryResults, dateWindow, requestedLimit);
+        else primaryResults = primaryResults.stream().limit(requestedLimit).toList();
+        List<SearchResult> usablePrimary = usableSearchResults(primaryResults);
+        if (!usablePrimary.isEmpty()) {
+            try {
+                return buildSuccessResponse(usablePrimary, dateWindow, searchZone,
+                        primary == null ? List.of() : primary.images());
+            } catch (Exception e) {
+                return buildErrorResponse("搜索结果格式化失败: " + e.getMessage());
+            }
+        }
+
+        // DeepSeek is a paid fallback: never call it after a usable primary result.
+        // Empty DuckDuckGo Instant Answer placeholders are not treated as search results.
+        if (StringUtils.isNotBlank(deepSeekApiKey)) {
+            try {
+                ensureExtractionActive();
+                List<SearchResult> fallback = deepSeekSearch(searchQuery, fetchLimit, query, searchZone);
+                if (dateWindow != null) fallback = filterDateWindow(fallback, dateWindow, requestedLimit);
+                else fallback = fallback.stream().limit(requestedLimit).toList();
+                fallback = usableSearchResults(fallback);
+                String response = buildSuccessResponse(fallback, dateWindow, searchZone, List.of());
+                return fallback.isEmpty() ? response : withFallbackMetadata(response, backend, "deepseek_search");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return buildErrorResponse("SEARCH_INTERRUPTED", "网页搜索已中断，未启动收费降级请求");
+            } catch (CancellationException e) {
+                return buildErrorResponse("SEARCH_CANCELLED", "网页搜索已取消，未启动收费降级请求");
+            } catch (ToolExecutionDeadline.Expired e) {
+                return buildErrorResponse("SEARCH_DEADLINE", "网页搜索预算已耗尽，未启动收费降级请求");
+            } catch (Exception fallbackFailure) {
+                log.warn("DeepSeek 搜索降级失败: type={}", fallbackFailure.getClass().getSimpleName());
+                if (primaryFailure == null) {
+                    // A successful-but-empty primary is a valid empty result, not an error.
+                    try { return buildSuccessResponse(List.of(), dateWindow, searchZone); }
+                    catch (Exception ignored) { return buildErrorResponse("搜索结果格式化失败"); }
+                }
+            }
+        }
+
+        if (primaryFailure != null) {
+            log.error("Web搜索失败: backend={} error={}", backend, primaryFailure.getMessage());
+            return buildErrorResponse("搜索失败: " + primaryFailure.getMessage()
+                    + "。请检查 " + backend + " API 密钥是否正确配置。");
+        }
+        try { return buildSuccessResponse(usablePrimary, dateWindow, searchZone); }
+        catch (Exception e) { return buildErrorResponse("搜索结果格式化失败: " + e.getMessage()); }
+    }
+
+    SearchProviderResult searchConfiguredBackend(String backend, String query, int limit,
+                                                         DateWindow dateWindow, boolean includeImages,
+                                                         ZoneId zone) throws Exception {
+        if ("tavily".equals(backend)) {
+            JsonNode provider = searchTavily(query, limit, includeImages);
+            return new SearchProviderResult(mapTavilyResults(provider, zone),
+                    includeImages ? mapTavilyImages(provider) : List.of());
+        }
+        List<SearchResult> results = switch (backend) {
+            case "bing" -> searchBing(query, limit, dateWindow);
+            case "google" -> searchGoogle(query, limit);
+            default -> searchDuckDuckGo(query, limit);
+        };
+        return new SearchProviderResult(results, List.of());
+    }
+
+    private List<SearchResult> deepSeekSearch(String query, int limit, String originalQuestion,
+                                              ZoneId zone) throws Exception {
+        ObjectNode payload = MAPPER.createObjectNode();
+        payload.put("query", query);
+        payload.put("count", Math.max(1, Math.min(50, limit)));
+        payload.put("need_content", false);
+        if (StringUtils.isNotBlank(originalQuestion)) payload.put("ori_question", originalQuestion);
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(normalizeBaseUrl(deepSeekBaseUrl) + "/v1/tools/search"))
+                .header("Authorization", "Bearer " + deepSeekApiKey)
+                .header("Content-Type", "application/json")
+                .timeout(searchTimeout(Duration.ofSeconds(8)))
+                .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload)))
+                .build();
+        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new IOException("DeepSeek Search HTTP " + response.statusCode());
+        }
+        JsonNode root = MAPPER.readTree(response.body());
+        List<SearchResult> results = new ArrayList<>();
+        int position = 1;
+        for (JsonNode item : root.path("results")) {
+            String url = item.path("url").asText("").trim();
+            if (StringUtils.isBlank(url)) continue;
+            String description = StringUtils.defaultIfBlank(item.path("snippet").asText(""),
+                    item.path("summary").asText(""));
+            results.add(new SearchResult(item.path("title").asText(""), url, description,
+                    position++, normalizePublicationDate(item.path("date").asText(""), zone)));
+        }
+        return results;
+    }
+
+    private String deepSeekFetch(String url) throws InterruptedException {
+        try {
+            ObjectNode payload = MAPPER.createObjectNode();
+            payload.put("url", url);
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(normalizeBaseUrl(deepSeekBaseUrl) + "/v1/tools/fetch"))
+                    .header("Authorization", "Bearer " + deepSeekApiKey)
+                    .header("Content-Type", "application/json")
+                    .timeout(extractionTimeout(Duration.ofSeconds(12)))
+                    .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload)))
+                    .build();
+            HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() < 200 || response.statusCode() >= 300) return null;
+            JsonNode page = MAPPER.readTree(response.body());
+            String title = page.path("title").asText("");
+            String content = page.path("content").asText("");
+            if (StringUtils.isBlank(content)) return null;
+            ObjectNode result = MAPPER.createObjectNode();
+            result.put("success", true);
+            result.put("url", url);
+            result.put("title", title);
+            result.put("extraction_backend", "deepseek_fetch");
+            result.put("content", StringUtils.truncate(content, MAX_CONTENT_LENGTH));
+            result.put("content_length", content.length());
+            result.putNull("publication_date");
+            result.put("publication_date_source", "unknown");
+            result.put("date_verified", false);
+            return MAPPER.writeValueAsString(result);
+        } catch (ToolExecutionDeadline.Expired e) {
+            throw e;
+        } catch (InterruptedException e) {
+            throw e;
+        } catch (Exception e) {
+            return null;
         }
     }
+
+    private Duration searchTimeout(Duration maximum) throws InterruptedException {
+        ensureExtractionActive();
+        ToolExecutionDeadline.Deadline deadline = ToolExecutionDeadline.current();
+        return deadline == null ? maximum : Duration.ofMillis(Math.min(maximum.toMillis(), deadline.timeoutMillis(100)));
+    }
+
+    private static String normalizeBaseUrl(String raw) {
+        String value = StringUtils.defaultIfBlank(raw, "https://api.deepseek.com").trim();
+        while (value.endsWith("/")) value = value.substring(0, value.length() - 1);
+        return value;
+    }
+
+    private static List<SearchResult> usableSearchResults(List<SearchResult> results) {
+        return results == null ? List.of() : results.stream()
+                .filter(result -> result != null && StringUtils.isNotBlank(result.url()))
+                .toList();
+    }
+
+    private static String withFallbackMetadata(String response, String primary, String backend) {
+        try {
+            ObjectNode root = (ObjectNode) MAPPER.readTree(response);
+            root.put("fallback_from", primary);
+            root.put("search_backend", backend);
+            return MAPPER.writeValueAsString(root);
+        } catch (Exception ignored) { return response; }
+    }
+
+    record SearchProviderResult(List<SearchResult> results, List<SearchImage> images) { }
 
     /**
      * 抓取网页内容 — 对标 hermes-agent web_extract
@@ -215,7 +378,9 @@ public class WebSearchService {
                     4 * 1024 * 1024);
 
             if (response.statusCode() != 200) {
-                return buildErrorResponse("HTTP " + response.statusCode() + " - 无法访问该页面");
+                String directFailure = "HTTP " + response.statusCode() + " - 无法访问该页面";
+                String fallback = tryDeepSeekFetch(url, providerFallback ? "tavily" : "guarded_http");
+                return fallback == null ? buildErrorResponse(directFailure) : fallback;
             }
 
             String html = response.bodyText();
@@ -239,7 +404,10 @@ public class WebSearchService {
             addRequestedDatePolicy(result, publicationDate, publicationDate != null, SearchDateContext.current());
             result.put("content", text);
             result.put("content_length", text.length());
-            return MAPPER.writeValueAsString(result);
+            String direct = MAPPER.writeValueAsString(result);
+            String providerFallbackResult = tryDeepSeekFetchIfEmpty(url, text,
+                    providerFallback ? "tavily" : "guarded_http");
+            return providerFallbackResult == null ? direct : providerFallbackResult;
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -248,9 +416,42 @@ public class WebSearchService {
             return buildErrorResponse("EXTRACTION_CANCELLED", "网页提取已取消，未启动后续请求");
         } catch (ToolExecutionDeadline.Expired e) {
             return buildErrorResponse("EXTRACTION_DEADLINE", "网页提取预算已耗尽，未启动后续请求");
+        } catch (GuardedHttpClient.NetworkRejectedException e) {
+            // Do not bypass a blocked redirect by asking a third party to fetch it.
+            return buildErrorResponse("安全拦截: " + e.getMessage());
         } catch (Exception e) {
             log.error("Web抓取失败: url={} error={}", redactSensitive(url), e.getMessage());
-            return buildErrorResponse("抓取失败: " + e.getMessage());
+            String fallback = tryDeepSeekFetch(url, "guarded_http");
+            return fallback == null ? buildErrorResponse("抓取失败: " + e.getMessage()) : fallback;
+        }
+    }
+
+    private String tryDeepSeekFetchIfEmpty(String url, String content, String previousBackend) {
+        if (StringUtils.isNotBlank(content)) return null;
+        return tryDeepSeekFetch(url, previousBackend);
+    }
+
+    /** Third-party fetching is opt-in and only runs after the guarded local/provider path failed. */
+    private String tryDeepSeekFetch(String url, String previousBackend) {
+        if (StringUtils.isBlank(deepSeekApiKey)) return null;
+        String fallback;
+        try {
+            ensureExtractionActive();
+            fallback = deepSeekFetch(url);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (CancellationException | ToolExecutionDeadline.Expired e) {
+            return null;
+        }
+        if (!successfulExtractionResponse(fallback)) return null;
+        try {
+            ObjectNode result = (ObjectNode) MAPPER.readTree(fallback);
+            result.put("fallback_from", previousBackend);
+            result.put("extraction_backend", "deepseek_fetch");
+            return MAPPER.writeValueAsString(result);
+        } catch (Exception e) {
+            return null;
         }
     }
 

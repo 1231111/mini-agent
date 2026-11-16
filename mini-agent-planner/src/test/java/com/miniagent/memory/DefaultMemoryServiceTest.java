@@ -2,6 +2,7 @@ package com.miniagent.memory;
 
 import com.miniagent.common.context.OwnerContext;
 import com.miniagent.memory.model.MemoryScope;
+import com.miniagent.memory.model.MemoryReadPolicy;
 import com.miniagent.memory.model.SemanticFact;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -163,6 +164,32 @@ class DefaultMemoryServiceTest {
         assertEquals(true, result.get("success"));
         assertEquals("已在结构化记忆中，未写入非结构化笔记。", result.get("message"));
         assertTrue(service.read("user").isEmpty());
+    }
+
+    @Test
+    void promptOnlyInjectsPreferencesRelevantToCurrentQuery() {
+        SemanticFact movie = fact(41L, "内容偏好", "喜欢科幻电影和电影资讯");
+        SemanticFact music = fact(42L, "内容偏好", "喜欢古典音乐和音乐资讯");
+        when(manager.queryFacts("tenant-a", "USER", "7", null)).thenReturn(List.of(movie, music));
+        when(manager.buildContext(any())).thenReturn(new com.miniagent.memory.model.MemoryContext());
+
+        String prompt = service.retrieveForPrompt("session-1", "搜索今日电影新闻",
+                new MemoryReadPolicy(false, false, true, 0));
+
+        assertTrue(prompt.contains("科幻电影"));
+        assertFalse(prompt.contains("古典音乐"));
+    }
+
+    @Test
+    void emptyOrUnrelatedQueryDoesNotInjectAllPreferences() {
+        SemanticFact preference = fact(43L, "内容偏好", "喜欢古典音乐");
+        when(manager.queryFacts("tenant-a", "USER", "7", null)).thenReturn(List.of(preference));
+        when(manager.buildContext(any())).thenReturn(new com.miniagent.memory.model.MemoryContext());
+
+        assertEquals("", service.retrieveForPrompt("session-1", "",
+                new MemoryReadPolicy(false, false, true, 0)));
+        assertEquals("", service.retrieveForPrompt("session-1", "搜索今日电影新闻",
+                new MemoryReadPolicy(false, false, true, 0)));
     }
 
     private static SemanticFact fact(Long id, String subject, String value) {

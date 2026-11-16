@@ -5,6 +5,8 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Collection;
@@ -68,6 +70,14 @@ public interface AgentMemoryEntryRepository extends JpaRepository<AgentMemoryEnt
 
     long countByTenantIdAndScopeTypeAndScopeId(String tenantId,
         AgentMemoryEntryEntity.ScopeType scopeType, String scopeId);
+
+    long countByTenantIdAndScopeTypeAndScopeIdAndStatus(String tenantId,
+        AgentMemoryEntryEntity.ScopeType scopeType, String scopeId,
+        AgentMemoryEntryEntity.Status status);
+
+    Page<AgentMemoryEntryEntity> findByTenantIdAndScopeTypeAndScopeIdAndStatusOrderByUpdatedAtDesc(
+        String tenantId, AgentMemoryEntryEntity.ScopeType scopeType, String scopeId,
+        AgentMemoryEntryEntity.Status status, Pageable pageable);
 
     @Query("SELECT e.memoryType, COUNT(e) FROM AgentMemoryEntryEntity e " +
            "WHERE e.tenantId = :tenantId AND e.status = 'ACTIVE' GROUP BY e.memoryType")
