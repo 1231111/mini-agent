@@ -13,6 +13,9 @@ import com.miniagent.memory.contract.MemoryApi.ItemImport;
 import com.miniagent.memory.contract.MemoryApi.ItemPage;
 import com.miniagent.memory.contract.MemoryApi.ItemView;
 import com.miniagent.memory.contract.MemoryApi.ItemWrite;
+import com.miniagent.memory.contract.MemoryApi.UserFactSync;
+import com.miniagent.memory.contract.MemoryApi.UserFactSyncResult;
+import com.miniagent.memory.contract.MemoryApi.UserFactView;
 import com.miniagent.memory.contract.MemoryApi.LockRequest;
 import com.miniagent.memory.contract.MemoryApi.OutcomeBatch;
 import com.miniagent.memory.contract.MemoryApi.OutcomeBatchResult;
@@ -27,6 +30,7 @@ import com.miniagent.memoryservice.evolution.ContextAssembler;
 import com.miniagent.memoryservice.evolution.ExperimentService;
 import com.miniagent.memoryservice.evolution.ItemService;
 import com.miniagent.memoryservice.evolution.OutcomeIngestor;
+import com.miniagent.memoryservice.evolution.UserFactSyncService;
 import com.miniagent.memoryservice.store.ProjectAccess;
 import com.miniagent.memoryservice.store.ProposalState;
 import com.miniagent.memoryservice.store.ProposalStore;
@@ -59,16 +63,19 @@ public class MemoryController {
     private final ExperimentService experiments;
     private final ProposalStore proposals;
     private final ProjectAccess projects;
+    private final UserFactSyncService userFacts;
 
     public MemoryController(ContextAssembler assembler, OutcomeIngestor ingestor,
                             ItemService itemService, ExperimentService experiments,
-                            ProposalStore proposals, ProjectAccess projects) {
+                            ProposalStore proposals, ProjectAccess projects,
+                            UserFactSyncService userFacts) {
         this.assembler = assembler;
         this.ingestor = ingestor;
         this.itemService = itemService;
         this.experiments = experiments;
         this.proposals = proposals;
         this.projects = projects;
+        this.userFacts = userFacts;
     }
 
     @PostMapping(MemoryApi.ASSEMBLE)
@@ -119,6 +126,21 @@ public class MemoryController {
     public ApiResponse<ItemView> upsert(@RequestAttribute(PRINCIPAL_ATTR) Principal principal,
                                         @RequestBody ItemWrite write) {
         return ApiResponse.ok(itemService.upsert(principal, write));
+    }
+
+    /** Full authenticated user snapshot, including tombstones needed to converge offline clients. */
+    @GetMapping(MemoryApi.USER_FACTS)
+    public ApiResponse<List<UserFactView>> userFacts(
+            @RequestAttribute(PRINCIPAL_ATTR) Principal principal) {
+        return ApiResponse.ok(userFacts.list(principal));
+    }
+
+    /** Bounded idempotent fact upsert; tenant and user are derived only from the token. */
+    @PostMapping(MemoryApi.USER_FACTS)
+    public ApiResponse<UserFactSyncResult> syncUserFacts(
+            @RequestAttribute(PRINCIPAL_ATTR) Principal principal,
+            @RequestBody UserFactSync request) {
+        return ApiResponse.ok(userFacts.synchronize(principal, request));
     }
 
     /** 迁移导入只能写入当前用户自己的 USER 域数据。 */

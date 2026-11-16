@@ -27,6 +27,10 @@ import com.miniagent.memory.contract.MemoryApi.PolicyUpdate;
 import com.miniagent.memory.contract.MemoryApi.ProposalView;
 import com.miniagent.memory.contract.MemoryApi.ScopeType;
 import com.miniagent.memory.contract.MemoryApi.Verdict;
+import com.miniagent.memory.contract.MemoryApi.UserFactMutation;
+import com.miniagent.memory.contract.MemoryApi.UserFactSync;
+import com.miniagent.memory.contract.MemoryApi.UserFactSyncResult;
+import com.miniagent.memory.contract.MemoryApi.UserFactView;
 import com.miniagent.memory.contract.ProcedureContent;
 import com.miniagent.memory.contract.ServiceToken;
 import com.miniagent.memory.contract.ServiceToken.Principal;
@@ -258,6 +262,105 @@ class EvolutionClosedLoopTest {
                         user(c), null)).andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
         assertTrue(json.readTree(ownErase).path("success").asBoolean(),
                 "令牌主体仍可删除自己的数据");
+    }
+
+    @Test
+    void userFactsSyncIsAuthenticatedVersionedIdempotentAndIncludesTombstones() throws Exception {
+        Ctx owner = new Ctx("facts-tenant", 701);
+        String token = user(owner);
+        Instant authored = T0.plusSeconds(10);
+        UserFactMutation first = new UserFactMutation("人物简介展示格式", "preference",
+                "真实照片、事业时间线、来源链接", false, authored);
+
+        UserFactSyncResult initial = call(HttpMethod.POST, MemoryApi.USER_FACTS, token,
+                new UserFactSync(List.of(first)), UserFactSyncResult.class);
+        UserFactView saved = initial.facts().getFirst();
+        assertEquals(1, saved.revision());
+        assertFalse(saved.deleted());
+        Instant cloudUpdated = saved.updatedAt();
+
+        UserFactSyncResult duplicate = call(HttpMethod.POST, MemoryApi.USER_FACTS, token,
+                new UserFactSync(List.of(first)), UserFactSyncResult.class);
+        assertEquals(1, duplicate.facts().getFirst().revision(), "retry must be idempotent");
+        assertEquals(cloudUpdated, duplicate.facts().getFirst().updatedAt());
+
+        UserFactMutation stale = new UserFactMutation(first.subject(), first.predicate(),
+                "stale value", false, authored.minusSeconds(1));
+        UserFactView staleAck = call(HttpMethod.POST, MemoryApi.USER_FACTS, token,
+                new UserFactSync(List.of(stale)), UserFactSyncResult.class).facts().getFirst();
+        assertEquals(first.objectValue(), staleAck.objectValue(), "stale clients receive canonical cloud value");
+        assertEquals(1, staleAck.revision());
+
+        List<UserFactView> ownSnapshot = this.<List<UserFactView>>call(
+                HttpMethod.GET, MemoryApi.USER_FACTS, token,
+                null, json.getTypeFactory().constructCollectionType(List.class, UserFactView.class));
+        assertEquals(List.of(first.subject()), ownSnapshot.stream().map(UserFactView::subject).toList());
+        assertTrue(this.<List<UserFactView>>call(HttpMethod.GET,
+                MemoryApi.USER_FACTS, user(new Ctx("facts-tenant", 702)),
+                null, json.getTypeFactory().constructCollectionType(List.class, UserFactView.class)).isEmpty(),
+                "same-tenant user token must not see another user's snapshot");
+        assertTrue(this.<List<UserFactView>>call(HttpMethod.GET,
+                MemoryApi.USER_FACTS, user(new Ctx("other-tenant", 701)),
+                null, json.getTypeFactory().constructCollectionType(List.class, UserFactView.class)).isEmpty(),
+                "same user id in another tenant must not see the snapshot");
+
+        UserFactMutation delete = new UserFactMutation(first.subject(), first.predicate(),
+                first.objectValue(), true, authored.plusSeconds(1));
+        UserFactView tombstone = call(HttpMethod.POST, MemoryApi.USER_FACTS, token,
+                new UserFactSync(List.of(delete)), UserFactSyncResult.class).facts().getFirst();
+        assertTrue(tombstone.deleted());
+        assertEquals(2, tombstone.revision());
+        assertTrue(this.<List<UserFactView>>call(
+                HttpMethod.GET, MemoryApi.USER_FACTS, token, null,
+                json.getTypeFactory().constructCollectionType(List.class, UserFactView.class))
+                .getFirst().deleted(), "full snapshots preserve delete tombstones");
+        assertEquals(401, status(HttpMethod.GET, MemoryApi.USER_FACTS, null));
+
+        UserFactMutation tiedAlpha = new UserFactMutation("tie", "learned", "alpha", false, authored);
+        UserFactMutation tiedBeta = new UserFactMutation("tie", "learned", "beta", false, authored);
+        UserFactView alpha = call(HttpMethod.POST, MemoryApi.USER_FACTS, token,
+                new UserFactSync(List.of(tiedAlpha)), UserFactSyncResult.class).facts().getFirst();
+        UserFactView beta = call(HttpMethod.POST, MemoryApi.USER_FACTS, token,
+                new UserFactSync(List.of(tiedBeta)), UserFactSyncResult.class).facts().getFirst();
+        assertEquals("beta", beta.objectValue(), "equal-time updates use deterministic canonical ordering");
+        assertEquals(alpha.revision() + 1, beta.revision());
+        UserFactView replayAlpha = call(HttpMethod.POST, MemoryApi.USER_FACTS, token,
+                new UserFactSync(List.of(tiedAlpha)), UserFactSyncResult.class).facts().getFirst();
+        assertEquals("beta", replayAlpha.objectValue(), "replaying a losing equal-time value cannot oscillate");
+        assertEquals(beta.revision(), replayAlpha.revision());
+        UserFactMutation tiedTombstone = new UserFactMutation("tie", "learned", "beta", true, authored);
+        UserFactView tiedDeleted = call(HttpMethod.POST, MemoryApi.USER_FACTS, token,
+                new UserFactSync(List.of(tiedTombstone)), UserFactSyncResult.class).facts().getFirst();
+        assertTrue(tiedDeleted.deleted(), "same-time delete wins against an active value");
+    }
+
+    @Test
+    void userFactBatchRejectsDuplicateKeysAndMoreThanFiveHundredEntries() throws Exception {
+        Ctx owner = new Ctx("batch-tenant", 702);
+        Instant authored = T0.plusSeconds(20);
+        UserFactMutation one = new UserFactMutation("subject", "predicate", "value", false, authored);
+        String duplicate = mvc.perform(build(HttpMethod.POST, MemoryApi.USER_FACTS, user(owner),
+                        new UserFactSync(List.of(one, one))))
+                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+        assertFalse(json.readTree(duplicate).path("success").asBoolean());
+        assertTrue(jdbc.queryForObject("SELECT COUNT(*) FROM mem_user_fact WHERE tenant_id = ?",
+                Integer.class, owner.tenant()) == 0, "invalid batch must be atomic");
+
+        List<UserFactMutation> oversized = new ArrayList<>();
+        for (int i = 0; i <= 500; i++) {
+            oversized.add(new UserFactMutation("subject-" + i, "predicate", "value", false, authored));
+        }
+        String tooMany = mvc.perform(build(HttpMethod.POST, MemoryApi.USER_FACTS, user(owner),
+                        new UserFactSync(oversized)))
+                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+        assertFalse(json.readTree(tooMany).path("success").asBoolean());
+        assertTrue(jdbc.queryForObject("SELECT COUNT(*) FROM mem_user_fact WHERE tenant_id = ?",
+                Integer.class, owner.tenant()) == 0, "oversized batch must not partially persist");
+
+        String userless = mvc.perform(build(HttpMethod.GET, MemoryApi.USER_FACTS, system(owner), null))
+                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+        assertFalse(json.readTree(userless).path("success").asBoolean(),
+                "system app tokens without a user cannot read user facts");
     }
 
     // ---------- 闭环驱动 ----------

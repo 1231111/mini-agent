@@ -2,6 +2,7 @@ package com.miniagent.agent.memory.manager;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JavaType;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.common.ErrorCode;
 import com.miniagent.common.context.OwnerContext;
@@ -27,6 +28,9 @@ import com.miniagent.memory.contract.MemoryApi.OutcomeEvent;
 import com.miniagent.memory.contract.MemoryApi.ProposalView;
 import com.miniagent.memory.contract.MemoryApi.RevertRequest;
 import com.miniagent.memory.contract.MemoryApi.ReviewRequest;
+import com.miniagent.memory.contract.MemoryApi.UserFactSync;
+import com.miniagent.memory.contract.MemoryApi.UserFactSyncResult;
+import com.miniagent.memory.contract.MemoryApi.UserFactView;
 import com.miniagent.memory.contract.MemoryServiceClient;
 import com.miniagent.memory.contract.MemoryServiceClient.CallFailed;
 import com.miniagent.memory.port.ProjectAuthorizationCommand;
@@ -114,6 +118,26 @@ public class CloudMemoryClient implements ProjectAuthorizationPort {
                 + (name == null || name.isBlank() ? "" : "&name=" + name)
                 + (cursor == null ? "" : "&cursor=" + cursor);
         return write(HttpMethod.GET, uri, null, ItemPage.class);
+    }
+
+    /**
+     * Versioned synchronization of the authenticated user's semantic profile facts.
+     * Owner identity comes only from the Account-issued memory token; no tenant/user
+     * identifier is accepted from the caller.
+     */
+    public UserFactSyncResult syncUserFacts(UserFactSync request) {
+        Long localUserId = OwnerContext.currentUserId();
+        if (localUserId == null) throw new BusinessException(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        return callWithRefresh(localUserId, HttpMethod.POST, MemoryApi.USER_FACTS,
+                request, UserFactSyncResult.class);
+    }
+
+    /** Fetch the cloud's canonical profile facts for the current authenticated owner. */
+    public List<UserFactView> userFacts() {
+        Long localUserId = OwnerContext.currentUserId();
+        if (localUserId == null) throw new BusinessException(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        return callWithRefresh(localUserId, HttpMethod.GET, MemoryApi.USER_FACTS, null,
+                json.getTypeFactory().constructCollectionType(List.class, UserFactView.class));
     }
 
     public ItemView get(long id) { return write(HttpMethod.GET, MemoryApi.ITEMS + "/" + id, null, ItemView.class); }
@@ -233,6 +257,12 @@ public class CloudMemoryClient implements ProjectAuthorizationPort {
 
     private <T> T callWithRefresh(Long localUserId, HttpMethod method, String uri,
                                   Object body, Class<T> responseType) {
+        return callWithRefresh(localUserId, method, uri, body,
+                json.getTypeFactory().constructType(responseType));
+    }
+
+    private <T> T callWithRefresh(Long localUserId, HttpMethod method, String uri,
+                                  Object body, JavaType responseType) {
         String token = users.findMemoryAccessTokenById(localUserId)
                 .filter(value -> !value.isBlank())
                 .orElseThrow(() -> new BusinessException(ErrorCode.AUTH_NOT_AUTHENTICATED));

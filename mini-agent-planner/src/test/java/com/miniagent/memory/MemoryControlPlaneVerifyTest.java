@@ -98,7 +98,7 @@ class MemoryControlPlaneVerifyTest {
             written.add(inv.getArgument(0));
             return null;
         }).when(manager).writeFact(any());
-        when(manager.queryFacts(any(), any(), any(), any())).thenReturn(List.of());
+        when(manager.queryFacts(any(), any(), any(), any())).thenAnswer(inv -> List.copyOf(written));
 
         DefaultMemoryService withMgr = new DefaultMemoryService();
         ReflectionTestUtils.setField(withMgr, "memoryStore", store);
