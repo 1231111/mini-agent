@@ -121,7 +121,10 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
         if (StringUtils.isBlank(payload)) {
             return "llm_judge 无法读取 evidence 内容";
         }
-        if (payload.length() > 12000) return "llm_judge 完整 evidence 超出校验范围，尚未验证；请拆分材料";
+        // File acceptance reads are bounded at 48k chars.  Reject only when
+        // that bounded payload itself is exceeded; the following context
+        // budget check remains the authoritative per-model guard.
+        if (payload.length() > 48000) return "llm_judge 完整 evidence 超出校验范围，尚未验证；请拆分材料";
 
         String instructions = """
                 你是严格的任务验收裁判。根据「评判标准」判断「待验收内容」是否达标。

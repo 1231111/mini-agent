@@ -35,6 +35,7 @@ import com.miniagent.agent.tool.ToolStatus;
 import com.miniagent.agent.tool.impl.ExecCommandParams;
 import com.miniagent.agent.tool.impl.SongGenerateParams;
 import dev.langchain4j.agent.tool.ToolSpecification;
+import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.Content;
@@ -1939,6 +1940,13 @@ public class AgentLoop {
      */
     private void executeToolCalls(List<?> toolCalls, List<ChatMessage> messages, LoopState state) {
         state.pendingObservations.clear();
+        // Some OpenAI-compatible adapters occasionally leak an XML closing tag
+        // into the function name (for example {@code todo</parameter}).  The
+        // request is still unambiguous when the stripped name is one of the
+        // tools advertised for this turn.  Canonicalize only that bounded,
+        // allow-listed form before routing; arbitrary/unknown names remain
+        // rejected by ToolPipeline and are never executed.
+        toolCalls = normalizeToolCalls(toolCalls, state.allowedToolsForTurn);
         CappedToolCalls<Object> capped = capWebExtractCalls(new ArrayList<>(toolCalls),
                 state.webExtractCalls, maxWebExtractCalls, AgentLoop::toolNameOf);
         for (Object call : capped.skipped()) {
@@ -1983,6 +1991,52 @@ public class AgentLoop {
             state.noteStructuredResult("tool_vision", ToolResult.failure(ToolErrorCode.DEPENDENCY_UNAVAILABLE,
                     "工具已返回，但截图未通过工作目录或图片校验，视觉模型没有看到界面。已停止后续操作；请重新观察后再继续，禁止直接重放之前的动作。", false));
         }
+    }
+
+    /**
+     * Return tool requests with a vendor XML suffix removed when, and only
+     * when, the resulting name is present in the current allow-list.  This is
+     * intentionally performed at the adapter boundary so an invalid model
+     * token cannot bypass the permission surface or tool registry.
+     */
+    static List<?> normalizeToolCalls(List<?> toolCalls, Set<String> allowedTools) {
+        if (toolCalls == null || toolCalls.isEmpty() || allowedTools == null || allowedTools.isEmpty()) {
+            return toolCalls == null ? List.of() : toolCalls;
+        }
+        List<Object> normalized = new ArrayList<>(toolCalls.size());
+        for (Object call : toolCalls) {
+            String raw = toolNameOf(call);
+            String canonical = canonicalToolName(raw, allowedTools);
+            if (canonical.equals(raw) || !(call instanceof ToolExecutionRequest request)) {
+                normalized.add(call);
+                continue;
+            }
+            log.warn("模型返回了带 XML 尾缀的工具名，已按本轮 allow-list 规范化: raw={}, canonical={}",
+                    raw, canonical);
+            normalized.add(ToolExecutionRequest.builder()
+                    .id(request.id())
+                    .name(canonical)
+                    .arguments(request.arguments())
+                    .build());
+        }
+        return normalized;
+    }
+
+    /** Package-private for regression tests; no fuzzy matching is allowed. */
+    static String canonicalToolName(String raw, Set<String> allowedTools) {
+        if (raw == null || allowedTools == null || allowedTools.isEmpty()) {
+            return raw == null ? "" : raw;
+        }
+        String value = raw.trim();
+        if (allowedTools.contains(value)) {
+            return value;
+        }
+        // MiMo/OpenAI-compatible XML wrappers observed in production.  Keep
+        // this list explicit and require an exact allow-listed candidate.
+        String candidate = value.replaceFirst(
+                "(?i)</(?:parameter|parameters|tool|function|tool_call)>?$", "");
+        return !candidate.equals(value) && allowedTools.contains(candidate)
+                ? candidate : value;
     }
 
     private Map<String, ExecutionTurnContext.ActionBinding> resolveToolBindings(List<?> toolCalls) {

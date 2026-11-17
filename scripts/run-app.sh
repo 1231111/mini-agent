@@ -66,10 +66,10 @@ require() {
 }
 require MYSQL_ROOT_PASSWORD "在 .env 里设置，与宿主机 MySQL 的 root 口令一致"
 require REDIS_PASSWORD       "在 .env 里设置，与宿主机 Redis 的 requirepass 一致"
-# LLM_API_KEY 是对话模型密钥，MIMO_API_KEY 顶替不了它：前者喂 langchain4j
-# 客户端，后者是另一条通路。
 require MODEL_CONFIG_ENCRYPTION_KEY "32 字节 Base64（openssl rand -base64 32），用于加密用户填的模型配置"
-require LLM_API_KEY                "对话模型密钥，可直接用 MIMO_API_KEY 的值：export LLM_API_KEY=..."
+# 对话密钥由 Spring 从 LLM_API_KEY、MIMO_API_KEY 或
+# ~/.miniagent/config.yml 解析；不要在启动脚本里强制要求环境变量，否则
+# 使用桌面端生成的 MiMo 配置会在真正启动前被错误拦截。
 if [ "$missing" -eq 1 ]; then
   echo "修好上面的项再启动。" >&2
   exit 1

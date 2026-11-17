@@ -801,7 +801,8 @@ public class PlanningLoop {
                 String judgeAnswer = node.doneWhen() != null && node.doneWhen().isJudge()
                         ? step.text() : "";
                 NodeOutputBinder.Bound bound = NodeOutputBinder.bind(
-                        node, "", step.messages(), judgeAnswer, step.structuredResult());
+                        node, "", step.messages(), judgeAnswer, step.structuredResult(),
+                        predecessorOutputs(g, proposal));
                 StepEvaluator.EvalResult ev;
                 if (RunStatus.FAILURE.name().equals(step.endReason())) {
                     ev = StepEvaluator.EvalResult.fail("tool execution failed: " + clip(step.text(), 400));
@@ -1243,7 +1244,8 @@ public class PlanningLoop {
             if (!node.inputs().isEmpty()) {
                 for (String in : node.inputs()) {
                     TaskNode prod = producerOf(graph, node, in);
-                    if (prod == null || (StringUtils.isBlank(prod.output())
+                    if (prod == null || prod.status() != TaskNodeStatus.SUCCESS
+                            || (StringUtils.isBlank(prod.output())
                             && StringUtils.isBlank(prod.outputBindings().get(in)))) {
                         continue;
                     }

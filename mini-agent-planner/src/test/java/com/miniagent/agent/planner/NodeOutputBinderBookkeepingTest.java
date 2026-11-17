@@ -47,6 +47,53 @@ class NodeOutputBinderBookkeepingTest {
         assertEquals(failure.legacyText(), bound.evidence());
     }
 
+    @Test void submitOnlyDeliveryBindsTheSubmittedArtifactAndIgnoresDuplicateReceipts() {
+        TaskNode node = new TaskNode("deliver", "交付页面链接", "deliver", List.of("verify"),
+                List.of("verification"), List.of("page_link"), TaskNodeStatus.PENDING, 10,
+                new DoneWhen(DoneWhen.NOTE, "交付可打开的页面链接", ""), "", "", 0, "");
+        String receipt = "{\"success\":true,\"action\":\"submit\","
+                + "\"status\":\"in_progress\",\"pendingValidation\":true,"
+                + "\"evidence\":\"http://127.0.0.1:52848/index.html\"}";
+        List<ChatMessage> messages = List.of(
+                ToolExecutionResultMessage.from("todo-1", "todo", receipt),
+                ToolExecutionResultMessage.from("todo-2", "todo", receipt));
+
+        NodeOutputBinder.Bound bound = NodeOutputBinder.bind(node, "", messages, "", null);
+
+        assertTrue(bound.complete(node));
+        assertEquals("http://127.0.0.1:52848/index.html", bound.evidence());
+        assertEquals("http://127.0.0.1:52848/index.html", bound.bindings().get("page_link"));
+    }
+
+    @Test void failedLatestSubmitCannotFallBackToAnOlderSuccessfulDelivery() {
+        TaskNode node = new TaskNode("deliver", "交付页面链接", "deliver", List.of("verify"),
+                List.of("verification"), List.of("page_link"), TaskNodeStatus.PENDING, 10,
+                new DoneWhen(DoneWhen.NOTE, "交付可打开的页面链接", ""), "", "", 0, "");
+        String success = "{\"success\":true,\"action\":\"submit\",\"evidence\":\"https://example.test/old\"}";
+        String failure = "{\"success\":false,\"error\":\"submit rejected\"}";
+
+        NodeOutputBinder.Bound bound = NodeOutputBinder.bind(node, "", List.of(
+                ToolExecutionResultMessage.from("todo-1", "todo", success),
+                ToolExecutionResultMessage.from("todo-2", "todo", failure)), "", null);
+
+        assertFalse(bound.complete(node));
+        assertTrue(bound.evidence().contains("submit rejected"));
+        assertFalse(bound.evidence().contains("https://example.test/old"));
+    }
+
+    @Test void submitOnlyDeliveryBindsCommittedEvidenceFromItsPredecessor() {
+        TaskNode node = new TaskNode("deliver", "交付可打开的页面链接", "deliver", List.of("verify"),
+                List.of("浏览器验证记录"), List.of("可打开的页面链接"), TaskNodeStatus.PENDING, 10,
+                new DoneWhen(DoneWhen.NOTE, "交付可打开的页面链接", ""), "", "", 0, "");
+        String predecessor = "本节点工具执行记录：\n[browser_navigate] url=http://127.0.0.1:53112/index.html";
+
+        NodeOutputBinder.Bound bound = NodeOutputBinder.bind(node, "", List.of(), "", null, predecessor);
+
+        assertTrue(bound.complete(node));
+        assertEquals(predecessor, bound.evidence());
+        assertEquals("http://127.0.0.1:53112/index.html", bound.bindings().get("可打开的页面链接"));
+    }
+
     @Test void legacyHistoryStillDetectsARealFailureBeforeTheTodoSubmission() {
         TaskNode node = synthesis();
         String failure = "{\"success\":false,\"error\":\"Real request failed\"}";

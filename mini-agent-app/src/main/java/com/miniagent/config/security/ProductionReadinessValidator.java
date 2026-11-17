@@ -29,7 +29,12 @@ public class ProductionReadinessValidator {
         require("DB_USERNAME", errors);
         requireSecret("DB_PASSWORD", errors);
         requireSecret("REDIS_PASSWORD", errors);
-        requireSecret("LLM_API_KEY", errors);
+        // The desktop profile intentionally stores the MiMo credential as
+        // MIMO_API_KEY in ~/.miniagent/config.yml.  application.yml resolves
+        // that value into the effective LangChain4j property, so requiring
+        // the environment variable name here incorrectly rejects a valid
+        // MiMo-only configuration in prod.
+        requireConfiguredLlmKey(errors);
         require("ALLOWED_ORIGINS", errors);
         String encryptionKey = requireSecret("MODEL_CONFIG_ENCRYPTION_KEY", errors);
         validateEncryptionKey(encryptionKey, errors);
@@ -151,6 +156,30 @@ public class ProductionReadinessValidator {
             if (normalized.contains("replace-") || normalized.contains("changeme")) {
                 errors.add(key + " still contains a placeholder value");
             }
+        }
+        return value;
+    }
+
+    /**
+     * Validate the credential actually consumed by the chat client.  Keep
+     * environment-variable compatibility while accepting the supported MiMo
+     * configuration ({@code MIMO_API_KEY}) and its resolved property.
+     */
+    private String requireConfiguredLlmKey(List<String> errors) {
+        String value = environment.getProperty("langchain4j.open-ai.chat-model.api-key", "");
+        if (value == null || value.isBlank()) {
+            value = environment.getProperty("LLM_API_KEY", "");
+        }
+        if (value == null || value.isBlank()) {
+            value = environment.getProperty("MIMO_API_KEY", "");
+        }
+        if (value == null || value.isBlank()) {
+            errors.add("LLM_API_KEY or MIMO_API_KEY is required");
+            return value;
+        }
+        String normalized = value.trim().toLowerCase(java.util.Locale.ROOT);
+        if (normalized.contains("replace-") || normalized.contains("changeme")) {
+            errors.add("LLM_API_KEY/MIMO_API_KEY still contains a placeholder value");
         }
         return value;
     }

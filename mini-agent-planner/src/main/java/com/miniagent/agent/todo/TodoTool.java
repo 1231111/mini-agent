@@ -262,6 +262,10 @@ public class TodoTool {
         response.put("pendingValidation", true);
         response.put("completionOwner", "planner");
         response.put("message", "执行证据已提交，完成状态由调度器验收；本次节点执行可以返回实际结果。");
+        // Keep the submitted artifact in the receipt itself.  The scheduler's
+        // deliver node can bind a URL/file proof without treating the whole
+        // todo bookkeeping payload as execution evidence.
+        response.put("evidence", evidence.trim());
         if (legacyCompletion) response.put("requestedStatus", "completed");
         response.put("todo", TaskTodoStore.renderItems(submission.items()));
         response.put("stats", TaskTodoStore.statsOf(submission.items()));

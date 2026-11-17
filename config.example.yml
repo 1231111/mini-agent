@@ -36,7 +36,7 @@ DEEPSEEK_API_BASE_URL: 'https://api.deepseek.com'
 
 # 图像生成 / 对话模型共用的 MiMo key。
 # application.yml 的 langchain4j.open-ai.chat-model.api-key 写法是
-# ${LLM_API_KEY:${image.gen.mimo-api-key:}} —— LLM_API_KEY 优先级更高，
+# ${LLM_API_KEY:${MIMO_API_KEY:}} —— LLM_API_KEY 优先级更高，
 # 只想让对话走另一个 key 时才需要单独填 LLM_API_KEY。
 MIMO_API_KEY: ''
 LLM_API_KEY: ''

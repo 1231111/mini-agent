@@ -293,7 +293,10 @@ public class StepEvaluator {
             return reject("llm_judge 未启用");
         }
         if (StringUtils.isBlank(criteria) || StringUtils.isBlank(evidence)) return reject("语义验收缺少条件或 evidence");
-        if (evidence.length() > 12000) return reject("语义验收 evidence 超出完整校验范围，尚未验证；请拆分验证材料");
+        // AcceptanceEvidenceFiles bounds file reads at 48k bytes/chars.  Keep
+        // the evaluator aligned with that bound; the LLM judge performs the
+        // final context-window check using the active model's real budget.
+        if (evidence.length() > 48000) return reject("语义验收 evidence 超出完整校验范围，尚未验证；请拆分验证材料");
         String spec = DoneWhen.JUDGE + ":" + criteria;
         TaskTodoStore.TodoItem item = new TaskTodoStore.TodoItem(
                 0, node.name(), TaskTodoStore.Status.in_progress, "",

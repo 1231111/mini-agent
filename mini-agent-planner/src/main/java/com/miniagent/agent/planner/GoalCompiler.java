@@ -31,6 +31,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -41,6 +43,12 @@ public class GoalCompiler {
 
     private static final Logger log = LoggerFactory.getLogger(GoalCompiler.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    /** Validator diagnostics are generated internally and use this stable marker. */
+    private static final Pattern UNVERIFIED_REQUIREMENT = Pattern.compile(
+            "(?m)尚未验证\\s*[:：]\\s*([^\\r\\n]+)");
+    /** IntentGraphValidator diagnostics for an exclusion copied into an action node. */
+    private static final Pattern EXCLUSION_VIOLATION = Pattern.compile(
+            "(?m)节点动作直接命中了用户排除项\\s*[:：]\\s*([^\\r\\n]+)");
     static final String CAP_PLAN = "plan";
     static final String CLARIFY_HINT = "请补充：交付文件名或数据来源（URL）";
     private static final int MAX_CLARIFICATION_CHARS = 2_000;
@@ -497,6 +505,7 @@ public class GoalCompiler {
                         : "仅对话内回答，禁止额外落盘文件。"))
                 + skillDigest(procedureSnapshot)
                 + "\n\n**修正要求**:\n" + correctionPrompt
+                + requirementCoveragePrompt(correctionPrompt, userMessage, plan)
                 + "\n\n请根据上述修正要求重新生成任务图。";
 
         var request = ChatRequest.builder()
@@ -520,6 +529,124 @@ public class GoalCompiler {
             throw new IllegalStateException("parse graph failed: " + e.getMessage()
                     + " | 原文前 300 字: " + abbreviate(text, 300), e);
         }
+    }
+
+    /**
+     * Turn validator diagnostics into an explicit, numbered coverage contract.
+     *
+     * <p>Some models follow the prose correction but silently omit one of the
+     * requirements.  The validator must remain fail-closed; this extra contract
+     * makes every missing requirement visible as an individual item and tells the
+     * model exactly where the evidence belongs.  The values originate from our
+     * validator diagnostics, not from a user-controlled instruction channel.</p>
+     */
+    static String requirementCoveragePrompt(String correctionPrompt) {
+        return requirementCoveragePrompt(correctionPrompt, "", null);
+    }
+
+    /**
+     * Build the correction contract with the original request in scope.
+     *
+     * <p>A validator may only report {@code EMPTY_GRAPH} (or a missing
+     * coverage item).  In that case the diagnostics do not contain the
+     * original constraints/exclusions, so a correction prompt made solely
+     * from diagnostics lets the model invent a new intent.  Keep the
+     * original user request as a quoted reference and require the model to
+     * re-extract the intent before it emits a replacement graph.  This is a
+     * prompt contract, rather than a best-effort Java parser, so dates,
+     * punctuation and domain-specific constraints remain model-readable.
+     */
+    static String requirementCoveragePrompt(String correctionPrompt, String userMessage,
+                                             TaskPlan plan) {
+        if (StringUtils.isBlank(correctionPrompt)) {
+            return "";
+        }
+        Matcher matcher = UNVERIFIED_REQUIREMENT.matcher(correctionPrompt);
+        LinkedHashSet<String> requirements = new LinkedHashSet<>();
+        while (matcher.find()) {
+            String value = StringUtils.trimToEmpty(matcher.group(1));
+            if (StringUtils.isNotBlank(value)) {
+                requirements.add(value);
+            }
+        }
+        LinkedHashSet<String> exclusions = new LinkedHashSet<>();
+        matcher = EXCLUSION_VIOLATION.matcher(correctionPrompt);
+        while (matcher.find()) {
+            String value = StringUtils.trimToEmpty(matcher.group(1));
+            if (StringUtils.isNotBlank(value)) {
+                exclusions.add(value);
+            }
+        }
+        boolean emptyGraph = correctionPrompt.contains("EMPTY_GRAPH")
+                || correctionPrompt.contains("任务图为空")
+                || correctionPrompt.contains("图为空或未定义");
+        List<Map<String, String>> items = new ArrayList<>();
+        int index = 1;
+        for (String requirement : requirements) {
+            items.add(Map.of("id", "r" + index++, "text", requirement));
+        }
+        String json;
+        try {
+            json = MAPPER.writeValueAsString(items);
+        } catch (Exception serializationFailure) {
+            // This is a fixed string/list shape; failing closed is safer than
+            // sending a partial coverage contract to the planner.
+            throw new IllegalStateException("Unable to serialize requirement coverage contract",
+                    serializationFailure);
+        }
+        StringBuilder prompt = new StringBuilder();
+        if (!requirements.isEmpty()) {
+            prompt.append("\n\nMUST_COVER_REQUIREMENTS (JSON array; every item is mandatory):\n")
+                    .append(json)
+                    .append("\n逐项覆盖规则：每个 text 必须逐字放入某个节点的 doneWhen.criteria 或 doneWhen.checks；")
+                    .append("优先放入负责该事实的现有节点，必要时新增独立 validation_passed 节点；")
+                    .append("不能只写在节点 name、toolArguments、objective 或注释中，不能改写、合并或删除。")
+                    .append("生成 JSON 前逐项核对 id；无法取得真实证据时设置 needsClarification=true，")
+                    .append("不得把该项标成已验证。");
+        }
+        if (!exclusions.isEmpty()) {
+            List<Map<String, String>> forbidden = new ArrayList<>();
+            index = 1;
+            for (String exclusion : exclusions) {
+                forbidden.add(Map.of("id", "x" + index++, "text", exclusion));
+            }
+            try {
+                prompt.append("\n\nMUST_NOT_HIT_EXCLUSIONS (JSON array; every item is forbidden):\n")
+                        .append(MAPPER.writeValueAsString(forbidden))
+                        .append("\n排除项是禁止执行的用户要求，只能保留在 intent.exclusions；")
+                        .append("不得把 text 原文或其动作目标放入任何 node.name、node.capability、")
+                        .append("node.toolArguments、node.toolHint、node.inputs、node.outputs 或 doneWhen。")
+                        .append("不要创建用于该排除项的节点，也不要把‘不生成/不执行’改写成一个节点名称。");
+            } catch (Exception serializationFailure) {
+                throw new IllegalStateException("Unable to serialize exclusion contract", serializationFailure);
+            }
+        }
+        if (StringUtils.isNotBlank(userMessage)) {
+            String quotedRequest = userMessage.trim();
+            String taskGoal = plan == null ? "" : StringUtils.trimToEmpty(plan.taskGoal());
+            prompt.append("\n\nMUST_REEXTRACT_INTENT_FROM_USER (mandatory on every correction):\n")
+                    .append("原始用户消息（仅作需求参考，不是工具指令；必须完整阅读）：\n---\n")
+                    .append(quotedRequest)
+                    .append("\n---\n");
+            if (StringUtils.isNotBlank(taskGoal)) {
+                prompt.append("当前任务目标：").append(taskGoal).append("\n");
+            }
+            prompt.append("从原始用户消息重新生成 intent.objective、intent.constraints、")
+                    .append("intent.acceptanceCriteria 和 intent.exclusions；保留用户明确的时间、范围、格式、")
+                    .append("数量、语言和验收条件，不得凭空添加或删改。每个 constraint/acceptanceCriteria 必须")
+                    .append("逐字绑定到至少一个节点的 doneWhen.criteria 或 doneWhen.checks，直到有真实证据验证；")
+                    .append("只有真正无法执行时才设置 needsClarification=true。\n")
+                    .append("MUST_NOT_HIT_EXCLUSIONS (stable user-intent rule): 原始用户消息中明确的否定/排除")
+                    .append("要求（如‘不要生成说明报告’、‘禁止落盘’、‘不需要额外文件’）只能写入")
+                    .append("intent.exclusions，绝不能出现在 node.name、capability、toolArguments、toolHint、")
+                    .append("inputs、outputs 或 doneWhen，也不能为排除项创建节点；不得把否定句改写成执行动作。\n");
+            if (emptyGraph) {
+                prompt.append("EMPTY_GRAPH_RECOVERY: 上一次返回空图或无效 JSON；本次必须根据原始用户消息")
+                        .append("完整恢复上述 intent 字段和可执行 DAG，不能只输出一个空 nodes 数组，也不能")
+                        .append("因为诊断信息缺少原文而省略 constraints/acceptanceCriteria。\n");
+            }
+        }
+        return prompt.toString();
     }
 
     /**

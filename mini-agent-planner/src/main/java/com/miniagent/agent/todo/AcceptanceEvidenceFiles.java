@@ -20,7 +20,13 @@ import java.security.MessageDigest;
 /** One bounded, authorized UTF-8 snapshot; unreadable or changing artifacts are not evidence. */
 public final class AcceptanceEvidenceFiles {
     private static final int MAX_BYTES = 48_000;
-    private static final int MAX_CHARS = 12_000;
+    /**
+     * Keep the byte cap as the primary I/O bound, but do not reject ordinary
+     * self-contained HTML/JS artifacts merely because they exceed the old
+     * 12k-character judge payload.  The downstream judge still enforces the
+     * active model-context budget before making a request.
+     */
+    private static final int MAX_CHARS = 48_000;
 
     private AcceptanceEvidenceFiles() { }
 
