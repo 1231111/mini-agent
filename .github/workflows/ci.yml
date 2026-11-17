@@ -53,6 +53,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: scripts/release/schema-test-requirements.txt
+      - name: Install release Schema test dependencies
+        run: python -m pip install --disable-pip-version-check -r scripts/release/schema-test-requirements.txt
+      - name: Validate published release Schemas and document fixtures
+        run: python scripts/release/schema-contract-test.py
       - name: Run client regressions and business acceptance contract fixtures
         run: node scripts/agent-eval/run-offline-checks.mjs
 

@@ -35,6 +35,7 @@ import com.miniagent.agent.tool.ToolStatus;
 import com.miniagent.agent.tool.impl.ExecCommandParams;
 import com.miniagent.agent.tool.impl.SongGenerateParams;
 import dev.langchain4j.agent.tool.ToolSpecification;
+import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.Content;
@@ -105,6 +106,8 @@ public class AgentLoop {
     private ToolPipeline toolPipeline;
     @Autowired
     private ExecutionProperties executionProperties;
+    @Value("${agent.tools.max-web-extract-calls:3}")
+    private int maxWebExtractCalls = WEB_EXTRACT_CALL_CAP;
     @Autowired
     private ExecutionControl executionControl;
     @Autowired
@@ -199,6 +202,7 @@ public class AgentLoop {
     private static final int MAX_EXPLORATION_CALLS = 40;  // read_file + list_files + exec_command 总上限（放开：复杂任务定位文件常需多次读取）
     /** 网页/HTTP 检索上限。浏览器交互由动作预算控制，不能八次点击就被当作搜索螺旋关掉。 */
     static final int RETRIEVAL_CALL_CAP = 8;
+    static final int WEB_EXTRACT_CALL_CAP = 3;
     /** 安全网关拒答只再试一轮。同一份长摘要重发会再次被拒。 */
     private static final int REFUSE_RECOVERY_CAP = 1;
     private static final int STREAM_POLL_SEC = 15;
@@ -538,6 +542,7 @@ public class AgentLoop {
         final Set<String> toolsInvoked = new LinkedHashSet<>();
         ToolErrorCode lastErrorCode = ToolErrorCode.NONE;
         ToolResult lastToolResult;
+        ToolResult lastActionResult;
         final List<ToolObservationProjector.Observation> pendingObservations = new ArrayList<>();
         UserMessage latestObservation;
         ToolVisionModelResolver.Models visionModels;
@@ -554,7 +559,9 @@ public class AgentLoop {
         final Map<String, Integer> gateDenyCounter = new java.util.concurrent.ConcurrentHashMap<>();
         int explorationCount = 0;
         int retrievalCalls = 0;
+        int webExtractCalls = 0;
         boolean retrievalClosedNote = false;
+        boolean webExtractClosedNote = false;
         int consecutiveFailures = 0;  // 连续同类工具失败计数
         String lastFailedTool = null; // 上次失败的工具名
         SystemMessage currentSubGoalMsg = null; // 框架注入的「当前子目标」可刷新指针消息
@@ -593,14 +600,20 @@ public class AgentLoop {
                 unknownOutcome = true;
                 unknownOutcomeMessage = Objects.requireNonNullElse(result.message(), "");
             }
-            // Todo bookkeeping must not hide a failed real action. Once UNKNOWN
-            // is observed, collecting other in-flight results cannot clear it.
-            if ((!unknownOutcome || unknown)
-                    && (!com.miniagent.agent.tool.CapabilityRegistry.FALLBACK_TOOL.equals(toolName)
-                    || lastToolResult == null || !result.isSuccess())) {
+            // UNKNOWN stays sticky even when later bookkeeping or concurrent tools finish.
+            if (unknownOutcome && !unknown) return;
+            if (com.miniagent.agent.tool.CapabilityRegistry.FALLBACK_TOOL.equals(toolName)) {
+                // A corrected bookkeeping request may clear its own error, but may
+                // never turn an actual failed action into a successful execution.
+                // A bookkeeping-only success has no action receipt. Keeping it
+                // null also prevents a scheduler acknowledgement from becoming
+                // the artifact/evidence of a synthesis-only DAG node.
+                lastToolResult = result.isSuccess() ? lastActionResult : result;
+            } else {
+                lastActionResult = result;
                 lastToolResult = result;
-                lastErrorCode = result.errorCode();
             }
+            lastErrorCode = lastToolResult == null ? ToolErrorCode.NONE : lastToolResult.errorCode();
         }
 
         void noteToolFinished(String name, String args, ToolResult result) {
@@ -792,7 +805,8 @@ public class AgentLoop {
                 messages.add(new SystemMessage(
                         "【规划器已投影任务图】禁止 todo.set/clear。"
                                 + "不要 list_files 探盘，不要重建计划。"
-                                + "立刻执行 ActionProposal 中的当前步骤。"));
+                                + "立刻执行 ActionProposal 中的当前步骤。"
+                                + MessageConstants.DAG_EVIDENCE_SUBMISSION));
             }
 
             // 挂上 todo 的当前子目标作为可刷新指针；本轮没有清单时它不会注入任何内容
@@ -1190,7 +1204,7 @@ public class AgentLoop {
                 if (Objects.nonNull(traceRecorder)) {
                     traceRecorder.recordAnswer(sessionId, turn, result);
                 }
-                state.loopEndReason = !LoopTurnContext.current().hardGate() && hasBlockingTodos(sessionId)
+                state.loopEndReason = hasBlockingTodos(sessionId)
                         ? "INCOMPLETE_TODO" : RunStatus.SUCCESS.name();
                 return finish(result, state, messages);
             }
@@ -1256,8 +1270,10 @@ public class AgentLoop {
         }
         if (Objects.isNull(sg)) return; // 无可执行子目标：不注入
 
+        boolean plannerOwned = plannerOwnsTodos(sessionId);
         String pointer = "当前子目标 (#" + sg.position() + "/" + sg.total() + ")：" + sg.text()
-                + "\n聚焦完成这一步即可，完成后用 todo 工具把它标记为 completed 再进入下一步。";
+                + "\n" + (plannerOwned ? MessageConstants.DAG_EVIDENCE_SUBMISSION
+                : "聚焦完成这一步即可，完成后用 todo 工具把它标记为 completed 再进入下一步。");
         SystemMessage msg = new SystemMessage(pointer);
         messages.add(msg);
         state.currentSubGoalMsg = msg;
@@ -1318,6 +1334,15 @@ public class AgentLoop {
             names.remove("list_files");
             names.remove("exec_command");
             names.remove("read_package");
+        }
+        if (closeWebExtract(state.webExtractCalls, maxWebExtractCalls)) {
+            names.remove("web_extract");
+            if (!state.webExtractClosedNote) {
+                messages.add(new SystemMessage("【原文抓取已达本轮上限】已提取 " + maxWebExtractCalls + " 个来源。"
+                        + "根据已有原文与搜索结果完成回答；如证据仍不足，明确说明缺口，不要逐条抓取其余候选。"));
+                state.webExtractClosedNote = true;
+                log.info("web_extract 调用已达本轮上限 {}", state.webExtractCalls);
+            }
         }
         if (closeRetrieval(state.retrievalCalls)) {
             int before = names.size();
@@ -1854,6 +1879,35 @@ public class AgentLoop {
         return retrievalCalls >= RETRIEVAL_CALL_CAP;
     }
 
+    static boolean closeWebExtract(int calls) {
+        return closeWebExtract(calls, WEB_EXTRACT_CALL_CAP);
+    }
+
+    static boolean closeWebExtract(int calls, int cap) {
+        return cap > 0 && calls >= cap;
+    }
+
+    record CappedToolCalls<T>(List<T> allowed, List<T> skipped) { }
+
+    static <T> CappedToolCalls<T> capWebExtractCalls(List<T> calls, int alreadyExecuted, int cap,
+                                                       java.util.function.Function<T, String> nameOf) {
+        if (cap <= 0) return new CappedToolCalls<>(List.copyOf(calls), List.of());
+        List<T> allowed = new ArrayList<>();
+        List<T> skipped = new ArrayList<>();
+        int remaining = Math.max(0, cap - alreadyExecuted);
+        for (T call : calls) {
+            if ("web_extract".equals(nameOf.apply(call))) {
+                if (remaining == 0) {
+                    skipped.add(call);
+                    continue;
+                }
+                remaining--;
+            }
+            allowed.add(call);
+        }
+        return new CappedToolCalls<>(List.copyOf(allowed), List.copyOf(skipped));
+    }
+
     /** 按请求体大小估计首包等待：思考模型 + 超长 schema 需要更久 */
     private static long estimateFirstTokenTimeoutSec(ChatRequest request) {
         long chars = 0;
@@ -1886,6 +1940,23 @@ public class AgentLoop {
      */
     private void executeToolCalls(List<?> toolCalls, List<ChatMessage> messages, LoopState state) {
         state.pendingObservations.clear();
+        // Some OpenAI-compatible adapters occasionally leak an XML closing tag
+        // into the function name (for example {@code todo</parameter}).  The
+        // request is still unambiguous when the stripped name is one of the
+        // tools advertised for this turn.  Canonicalize only that bounded,
+        // allow-listed form before routing; arbitrary/unknown names remain
+        // rejected by ToolPipeline and are never executed.
+        toolCalls = normalizeToolCalls(toolCalls, state.allowedToolsForTurn);
+        CappedToolCalls<Object> capped = capWebExtractCalls(new ArrayList<>(toolCalls),
+                state.webExtractCalls, maxWebExtractCalls, AgentLoop::toolNameOf);
+        for (Object call : capped.skipped()) {
+            String name = toolNameOf(call);
+            String result = "{\"error_code\":\"WEB_EXTRACT_CAP_REACHED\",\"error\":\"本轮原文抓取已达上限。请使用已获得的来源完成回答，或明确说明证据缺口。\"}";
+            log.info("[检索上限] 跳过额外的 web_extract 调用 id={}", toolIdOf(call));
+            messages.add(ToolExecutionResultMessage.from(toolIdOf(call), name, result));
+        }
+        toolCalls = capped.allowed();
+        if (toolCalls.isEmpty()) return;
         Map<String, ExecutionTurnContext.ActionBinding> bindings = resolveToolBindings(toolCalls);
         if (!toolCalls.isEmpty()) {
             log.info("工具调用: {}", toolCalls.stream()
@@ -1920,6 +1991,52 @@ public class AgentLoop {
             state.noteStructuredResult("tool_vision", ToolResult.failure(ToolErrorCode.DEPENDENCY_UNAVAILABLE,
                     "工具已返回，但截图未通过工作目录或图片校验，视觉模型没有看到界面。已停止后续操作；请重新观察后再继续，禁止直接重放之前的动作。", false));
         }
+    }
+
+    /**
+     * Return tool requests with a vendor XML suffix removed when, and only
+     * when, the resulting name is present in the current allow-list.  This is
+     * intentionally performed at the adapter boundary so an invalid model
+     * token cannot bypass the permission surface or tool registry.
+     */
+    static List<?> normalizeToolCalls(List<?> toolCalls, Set<String> allowedTools) {
+        if (toolCalls == null || toolCalls.isEmpty() || allowedTools == null || allowedTools.isEmpty()) {
+            return toolCalls == null ? List.of() : toolCalls;
+        }
+        List<Object> normalized = new ArrayList<>(toolCalls.size());
+        for (Object call : toolCalls) {
+            String raw = toolNameOf(call);
+            String canonical = canonicalToolName(raw, allowedTools);
+            if (canonical.equals(raw) || !(call instanceof ToolExecutionRequest request)) {
+                normalized.add(call);
+                continue;
+            }
+            log.warn("模型返回了带 XML 尾缀的工具名，已按本轮 allow-list 规范化: raw={}, canonical={}",
+                    raw, canonical);
+            normalized.add(ToolExecutionRequest.builder()
+                    .id(request.id())
+                    .name(canonical)
+                    .arguments(request.arguments())
+                    .build());
+        }
+        return normalized;
+    }
+
+    /** Package-private for regression tests; no fuzzy matching is allowed. */
+    static String canonicalToolName(String raw, Set<String> allowedTools) {
+        if (raw == null || allowedTools == null || allowedTools.isEmpty()) {
+            return raw == null ? "" : raw;
+        }
+        String value = raw.trim();
+        if (allowedTools.contains(value)) {
+            return value;
+        }
+        // MiMo/OpenAI-compatible XML wrappers observed in production.  Keep
+        // this list explicit and require an exact allow-listed candidate.
+        String candidate = value.replaceFirst(
+                "(?i)</(?:parameter|parameters|tool|function|tool_call)>?$", "");
+        return !candidate.equals(value) && allowedTools.contains(candidate)
+                ? candidate : value;
     }
 
     private Map<String, ExecutionTurnContext.ActionBinding> resolveToolBindings(List<?> toolCalls) {
@@ -2420,6 +2537,7 @@ public class AgentLoop {
         if (isRetrievalTool(toolName)) {
             state.retrievalCalls++;
         }
+        if ("web_extract".equals(toolName)) state.webExtractCalls++;
         if ("read_package".equals(toolName)) {
             state.explorationCount += 3;
         }
@@ -2499,7 +2617,7 @@ public class AgentLoop {
 
         if (Objects.nonNull(sessionId) && taskTodoStore.hasPlan(sessionId)) {
             boolean runnable = taskTodoStore.hasRunnableIncomplete(sessionId);
-            if (!turnPolicy.hardGate() && runnable
+            if (!plannerOwnsTodos(sessionId) && runnable
                     && state.incompleteTodoReminders >= 2) {
                 log.warn("todo 未完成但已提醒多次，附带未完成清单后放行。轮次 {}",
                         turn + 1);
@@ -2548,7 +2666,7 @@ public class AgentLoop {
             return finalText;
         }
 
-        if (turnPolicy.hardGate()) {
+        if (plannerOwnsTodos(sessionId)) {
             return finalText;
         }
 
@@ -2581,7 +2699,7 @@ public class AgentLoop {
                 SubagentContext.isActive(),
                 PermissionContext.mode(),
                 PermissionContext.planApproved(),
-                turnPolicy.hardGate(),
+                plannerOwnsTodos(sessionId),
                 hasPlan,
                 runnable,
                 state.incompleteTodoReminders,
@@ -2596,8 +2714,15 @@ public class AgentLoop {
 
     private boolean hasBlockingTodos(String sessionId) {
         return Objects.nonNull(sessionId)
+                && !plannerOwnsTodos(sessionId)
                 && taskTodoStore.hasPlan(sessionId)
                 && taskTodoStore.hasRunnableIncomplete(sessionId);
+    }
+
+    /** Todo ownership is independent of whether the proposal enforces a hard tool whitelist. */
+    private boolean plannerOwnsTodos(String sessionId) {
+        return LoopTurnContext.current().hardGate()
+                || (sessionId != null && taskTodoStore.hasDagManagedPlan(sessionId));
     }
 
     private boolean focusTodosCompleted(String sessionId) {

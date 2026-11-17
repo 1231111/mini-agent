@@ -210,6 +210,9 @@ function renderBotMsg(initHtml, streaming = true) {
 
 function bindLightbox(row) {
     row?.querySelectorAll('img').forEach(img => {
+        // A linked cover opens its source page through the external-link handler.
+        // Keep ordinary standalone/workspace images available in the lightbox.
+        if (img.closest('a[href]')) return;
         img.style.cursor = 'zoom-in';
         img.onclick = () => openLightbox(img.src);
     });

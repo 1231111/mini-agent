@@ -57,6 +57,9 @@ class RecoveryExecutionIdentityTest {
         StateSnapshot recovered = recovery.recover("chat", current, diagnosis).orElseThrow();
         assertEquals(TaskNodeStatus.PENDING, recovered.graph().byId("node").status());
         assertEquals(1, recovered.graph().byId("node").retryCount());
+        assertEquals(1, states.events("chat").stream()
+                .filter(event -> event.type() == DomainEventType.RECOVERY_APPLIED)
+                .count(), "recovery state and its audit must be durable in one transition");
         assertTrue(recovery.recover("chat", current, diagnosis).isEmpty());
         assertEquals(recovered, states.get("chat").orElseThrow());
     }

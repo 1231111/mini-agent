@@ -52,8 +52,12 @@ public final class BrowserSessionStateStore {
         Path target = statePath(identity);
         byte[] plain = Objects.requireNonNull(state).getBytes(java.nio.charset.StandardCharsets.UTF_8);
         if (plain.length > MAX_STATE_BYTES) throw new IOException("浏览器会话状态超过4MiB保存上限");
-        // Corruption is a visible recovery problem, never permission to silently overwrite authentication.
-        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) load(identity);
+        // Re-read and authenticate the actual file on every save, even if the caller
+        // believes the state is unchanged. This detects replacement, corruption or
+        // missing keys without retaining plaintext state/key caches. Equal state
+        // needs no fresh nonce, encryption, forced write or atomic replacement.
+        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)
+                && load(identity).filter(state::equals).isPresent()) return;
         byte[] nonce = new byte[12]; RANDOM.nextBytes(nonce);
         try {
             Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");

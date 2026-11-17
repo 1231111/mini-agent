@@ -79,7 +79,7 @@ public final class ProposalTurnPolicy implements LoopTurnPolicy {
         if ("list".equals(a)) {
             return null;
         }
-        if ("update".equals(a) || "reopen".equals(a) || "confirm".equals(a)) {
+        if ("submit".equals(a) || "update".equals(a) || "reopen".equals(a) || "confirm".equals(a)) {
             if (focusTodoIds.isEmpty())
                 return err("Planner 硬闸门：未绑定 focusTodoIds，拒绝 todo." + a);
             if (!focusTodoIds.contains(todoId))

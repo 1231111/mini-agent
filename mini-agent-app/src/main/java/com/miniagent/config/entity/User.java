@@ -5,7 +5,7 @@ import lombok.Data;
 
 @Entity
 @Data
-@Table(name = "users")
+@Table(name = "users", uniqueConstraints = @UniqueConstraint(name = "ux_users_external_id", columnNames = "external_id"))
 public class User extends BaseEntity {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)

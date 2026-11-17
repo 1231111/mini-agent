@@ -190,4 +190,11 @@ class ContextContributorConfigurationTest {
         assertTrue(PromptTemplates.BEHAVIOR.contains("只有用户明确要求保存、导出或写入文件时才新建结果文件"));
         assertTrue(PromptTemplates.BEHAVIOR.contains("修改完成任务所必需的现有项目文件"));
     }
+
+    @Test
+    void 普通答复不复述内部资源下载诊断但用户排错时仍可说明() {
+        assertTrue(PromptTemplates.OUTPUT.contains("普通答复只给结果、交付物和必要缺项"));
+        assertTrue(PromptTemplates.OUTPUT.contains("下载/抓取诊断"));
+        assertTrue(PromptTemplates.OUTPUT.contains("用户主动排错时再说明"));
+    }
 }

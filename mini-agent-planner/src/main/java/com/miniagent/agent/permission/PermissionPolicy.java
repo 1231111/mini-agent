@@ -36,6 +36,10 @@ public final class PermissionPolicy {
             "browser_select", "browser_set_checked", "browser_upload",
             "browser_evaluate", "browser_extract_text",
             "browser_clear_session",
+            // Skills persist across sessions and are injected into future prompts.
+            // Treat their CRUD surface like file editing: it must never be silently
+            // writable by the model in the default ASK policy.
+            "skill_manage",
             SongGenerateParams.TOOL_NAME,
             "delegate_task", "desktop_act"
     );

@@ -6,7 +6,7 @@
      执行步骤   GET /api/conversations/{sid}/todos 优先展示任务拆分；没有 todo 时回退到执行轨迹
                 GET /api/conversations/{sid}/executions + /api/executions/{id}/steps
      执行工具   同一份 steps 聚合调用状态，并补充注册表描述和参数摘要
-     记忆与知识 GET /api/shell/memory-insights?sessionId=  → episode / fact / procedure
+     记忆与知识 从当前执行的 CONTEXT_LOAD 轨迹读取真实注入片段，并按类型合并展示
      系统状态   GET /api/shell/status                      → 模型 / 工具数 / 堆状态
 
    刷新时机有三处，都不做定时轮询（security.js 给全站 fetch 打了 request/response
@@ -27,6 +27,7 @@ const INSP_RECONNECT_BASE_MS = 1000;
 const INSP_RECONNECT_MAX_MS = 30000;
 const INSP_MAX_STEPS = 6;      // 侧栏只保留少量 DAG 节点；完整轨迹在 /trace
 const INSP_MAX_TOOLS = 3;
+const INSP_MAX_PREFERENCES = 3;
 
 /** stepType → 中文标签，来源是 /api/trace-nodes（AgentStepNode.catalog()）。 */
 let inspLabels = {};
@@ -40,6 +41,9 @@ let inspRefreshTimer = null;
 let inspStepRefreshTimer = null;
 let inspReconnectTimer = null;
 let inspDataRetryTimer = null;
+let inspMemoryRefreshTimer = null;
+let inspMemoryRequestId = 0;
+let inspMemoryStatsCache = { fetchedAt: 0, stats: null };
 let inspReconnectAttempt = 0;
 let inspDataRetryAttempt = 0;
 let inspLastStepRefreshAt = 0;
@@ -130,12 +134,9 @@ function refreshInspector(force, stepsOnly) {
     inspBusy = true;
     Promise.resolve()
         .then(() => stepsOnly
-            ? renderInspectorSteps(currentId)
-            : Promise.all([
-                renderInspectorStatus(),
-                renderInspectorMemory(currentId),
-                renderInspectorSteps(currentId)
-            ]))
+            ? renderInspectorSteps(currentId).then(snapshot => renderInspectorMemory(currentId, snapshot))
+            : Promise.all([renderInspectorStatus(), renderInspectorSteps(currentId)])
+                .then(([, snapshot]) => renderInspectorMemory(currentId, snapshot)))
         .catch(e => console.warn('[Inspector] refresh failed:', e))
         .finally(() => {
             inspBusy = false;
@@ -160,6 +161,8 @@ function scheduleInspectorRefresh() {
     }, 0);
     // 切会话时先清掉上一会话的步骤，避免串味
     inspLastSignature = '';
+    const $memory = document.getElementById('inspMemory');
+    if ($memory) $memory.innerHTML = '<div class="insp-empty">加载本轮注入的记忆信息…</div>';
 }
 
 async function loadInspectorCatalog() {
@@ -207,6 +210,7 @@ async function renderInspectorSteps(sid) {
     let taskRunning = false;
     let steps = [];
     let latestExecution = null;
+    let snapshot = null;
     try {
         const resp = await fetch('/api/conversations/' + encodeURIComponent(sid) + '/inspector-snapshot');
         if (!resp.ok) {
@@ -217,9 +221,9 @@ async function renderInspectorSteps(sid) {
             }
             // Keep the last good snapshot. A temporary 429 must not replace a
             // real execution with an empty list and an "idle" status.
-            return;
+            return null;
         }
-        const snapshot = await apiJson(resp) || {};
+        snapshot = await apiJson(resp) || {};
         todos = Array.isArray(snapshot.todos) ? snapshot.todos : [];
         taskRunning = snapshot.running === true;
         latestExecution = snapshot.execution || null;
@@ -228,7 +232,7 @@ async function renderInspectorSteps(sid) {
         console.warn('[Inspector] task details failed:', e);
         scheduleInspectorDataRetry(sid);
     }
-    if (sid !== currentId) return;
+    if (sid !== currentId) return null;
     if (!Array.isArray(todos)) todos = [];
     if (!Array.isArray(steps)) steps = [];
     if (inspToolLogSessionId !== sid) {
@@ -280,6 +284,7 @@ async function renderInspectorSteps(sid) {
     else if (latestExecution && INSP_SUCCESS_STATUS.has(String(latestExecution.status || '').toUpperCase()))
         setInspectorState('已完成', 'done');
     else setInspectorState('空闲', 'done');
+    return snapshot;
 }
 
 function buildInspectorCurrentTask(execution) {
@@ -677,6 +682,7 @@ function toolDescription(name) {
 }
 
 function toolDisplayName(name) {
+    name = canonicalToolName(name);
     const known = {
         read_file: '读取文件', file_read: '读取文件', read_package: '读取项目文件',
         search_web: '联网搜索', web_search: '联网搜索', browser_search: '联网搜索',
@@ -696,22 +702,124 @@ function toolDisplayName(name) {
     return clean || '执行工具';
 }
 
+function canonicalToolName(name) {
+    return String(name || '').replace(/^mcp__.+?__/, '').trim();
+}
+
 /** A tool's label describes its actual file target, not the overall task's completion. */
 function toolPresentation(name, rawArgs, rawOutput) {
-    const fallback = { title: toolDisplayName(name), kind: toolKind(name), htmlFile: false };
-    const actions = { write_file: '保存', edit_file: '编辑', read_file: '读取', file_read: '读取' };
-    if (!actions[name]) return fallback;
+    const canonical = canonicalToolName(name);
+    const fallback = { title: toolDisplayName(canonical), kind: toolKind(canonical), htmlFile: false };
     const args = parseJson(rawArgs);
     const output = parseJson(rawOutput);
-    const candidates = [args && args.path, args && args.file_path, args && args.filename,
-        args && args.fileName, args && args.file, output && output.path];
+    const values = args && typeof args === 'object' ? args : {};
+    const candidates = [values.path, values.file_path, values.filename,
+        values.fileName, values.file, output && output.path];
     const path = candidates.find(value => typeof value === 'string' && value.trim());
-    if (!path || !/\.html?$/i.test(path.trim())) return fallback;
-    return { title: actions[name] + ' HTML 页面', kind: 'code', htmlFile: true };
+    const fileAction = { write_file: '保存', edit_file: '编辑', read_file: '读取', file_read: '读取' }[canonical];
+    if (fileAction) {
+        if (path && /\.html?$/i.test(path.trim())) {
+            return { title: fileAction + ' HTML 页面', kind: 'code', htmlFile: true };
+        }
+        if (path) return { ...fallback, title: fileAction + '文件「' + fileBaseName(path) + '」' };
+    }
+
+    const query = firstToolValue(values, ['query', 'search_query', 'searchQuery', 'q', 'keyword', 'keywords', 'term']);
+    if (['search_web', 'web_search', 'browser_search'].includes(canonical)) {
+        return { ...fallback, title: query ? '搜索「' + shortText(query, 42) + '」' : '搜索网页' };
+    }
+    if (['search_code', 'codebase_search', 'ast_search'].includes(canonical)) {
+        return { ...fallback, title: query ? '检索代码「' + shortText(query, 42) + '」' : '检索代码' };
+    }
+    if (canonical === 'skill_view') {
+        const skill = firstToolValue(values, ['name', 'skill', 'skill_name']);
+        return { ...fallback, title: skill ? '读取技能「' + shortText(skill, 42) + '」' : '读取技能' };
+    }
+
+    const page = firstToolValue(values, ['url', 'href', 'page_url', 'pageUrl']);
+    const pageLabel = page ? safePageLabel(page) : '';
+    if (/^browser_.*scroll|^browser_scroll/.test(canonical)) {
+        const direction = firstToolValue(values, ['direction', 'scroll_direction', 'scrollDirection']);
+        const delta = Number(values.deltaY ?? values.scrollY ?? values.amount);
+        const directionLabels = { down: '向下', up: '向上', left: '向左', right: '向右' };
+        const resolved = directionLabels[direction.toLowerCase()] || direction
+            || (Number.isFinite(delta) && delta !== 0 ? delta > 0 ? '向下' : '向上' : '页面');
+        return { ...fallback, title: '滚动页面（' + shortText(resolved, 20) + '）' };
+    }
+    if (canonical === 'browser_navigate' || canonical === 'browser_open') {
+        return { ...fallback, title: pageLabel ? '打开网页「' + pageLabel + '」' : '打开网页' };
+    }
+    if (canonical === 'browser_click') {
+        const target = firstToolValue(values, ['text', 'label', 'name', 'selector', 'target', 'element'])
+            || (values.by === 'text' ? firstToolValue(values, ['ref']) : '');
+        return { ...fallback, title: target ? '点击网页元素「' + shortText(target, 36) + '」' : '点击网页元素' };
+    }
+    if (['browser_type', 'browser_fill', 'browser_fill_field'].includes(canonical)) {
+        const field = firstToolValue(values, ['field', 'label', 'name', 'selector', 'target']);
+        return { ...fallback, title: field ? '填写表单字段「' + shortText(field, 36) + '」' : '填写网页表单' };
+    }
+    if (canonical === 'browser_select') {
+        const field = firstToolValue(values, ['field', 'label', 'name', 'selector', 'target']);
+        const option = firstToolValue(values, ['option', 'value', 'selected'])
+            || (Array.isArray(values.values) ? values.values.map(value => String(value)).slice(0, 2).join(', ') : '');
+        const detail = [field, option].filter(Boolean).map(value => shortText(value, 24)).join(' → ');
+        return { ...fallback, title: detail ? '选择网页选项「' + detail + '」' : '选择网页选项' };
+    }
+    if (canonical === 'browser_set_checked') {
+        const field = firstToolValue(values, ['field', 'label', 'name', 'selector', 'target']);
+        const checked = values.checked === true ? '勾选' : values.checked === false ? '取消勾选' : '设置';
+        return { ...fallback, title: field ? checked + '「' + shortText(field, 36) + '」' : checked + '网页选项' };
+    }
+    if (canonical === 'browser_upload') {
+        const uploads = Array.isArray(values.paths) ? values.paths.filter(value => typeof value === 'string' && value.trim()) : [];
+        const upload = firstToolValue(values, ['file_path', 'path', 'filename', 'fileName', 'file'])
+            || (uploads[0] || '');
+        const suffix = uploads.length > 1 ? `等 ${uploads.length} 个文件` : '';
+        return { ...fallback, title: upload ? '上传文件「' + fileBaseName(upload) + '」' + suffix : '上传附件' };
+    }
+    if (canonical === 'browser_form_inspect') return { ...fallback, title: '识别网页表单' };
+    if (canonical === 'browser_form_verify') return { ...fallback, title: '核验表单字段' };
+    if (canonical === 'browser_press') {
+        const key = firstToolValue(values, ['key', 'text', 'value']);
+        return { ...fallback, title: key ? '按下按键「' + shortText(key, 24) + '」' : '按下网页按键' };
+    }
+    if (canonical === 'browser_snapshot') {
+        return { ...fallback, title: pageLabel ? '读取网页「' + pageLabel + '」' : '读取当前页面' };
+    }
+    if (canonical === 'browser_extract_text' || canonical === 'web_extract') {
+        return { ...fallback, title: pageLabel ? '提取网页内容「' + pageLabel + '」' : '提取网页内容' };
+    }
+    if (canonical === 'http_get') {
+        return { ...fallback, title: pageLabel ? '读取网页「' + pageLabel + '」' : '读取网页' };
+    }
+    return fallback;
+}
+
+function firstToolValue(args, keys) {
+    for (const key of keys) {
+        const value = args && args[key];
+        if (typeof value === 'string' && value.trim()) return value.trim();
+        if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    }
+    return '';
+}
+
+function fileBaseName(path) {
+    const value = String(path || '').trim().replace(/[\\/]+$/, '');
+    return shortText(value.split(/[\\/]/).filter(Boolean).pop() || value, 40);
+}
+
+function safePageLabel(value) {
+    try {
+        const url = new URL(String(value));
+        return shortText(url.hostname + (url.pathname && url.pathname !== '/' ? url.pathname : ''), 50);
+    } catch (_) {
+        return shortText(String(value).replace(/[?#].*$/, ''), 50);
+    }
 }
 
 function toolKind(name) {
-    const key = String(name || '').toLowerCase();
+    const key = canonicalToolName(name).toLowerCase();
     if (/file|read|write|document|pdf|directory|folder/.test(key)) return 'file';
     if (/search|browser|web|http|fetch/.test(key)) return 'web';
     if (/code|command|shell|exec|python|java|terminal/.test(key)) return 'code';
@@ -847,56 +955,166 @@ function setInspectorStateFromExecution(exec, steps) {
 
 /* -------- 记忆与知识 -------- */
 
-async function renderInspectorMemory(sid) {
+async function renderInspectorMemory(sid, snapshot) {
+    const requestId = ++inspMemoryRequestId;
     const $el = document.getElementById('inspMemory');
     if (!$el) return;
-    if (!sid) {
-        $el.innerHTML = '<div class="insp-empty">选择或新建一个会话后显示记忆命中情况。</div>';
-        return;
+    const stats = await loadInspectorMemoryStats();
+    if ((sid && sid !== currentId) || requestId !== inspMemoryRequestId) return;
+    $el.innerHTML = buildInspectorMemory(snapshot, stats, sid);
+}
+
+async function loadInspectorMemoryStats() {
+    const now = Date.now();
+    if (inspMemoryStatsCache.stats && now - inspMemoryStatsCache.fetchedAt < 30000) {
+        return inspMemoryStatsCache.stats;
     }
     try {
-        const resp = await fetch('/api/shell/memory-insights?sessionId='
-            + encodeURIComponent(sid));
-        if (!resp.ok) {
-            $el.innerHTML = '<div class="insp-empty">记忆接口不可用（HTTP ' + resp.status + '）。</div>';
-            return;
-        }
+        const resp = await fetch('/api/shell/memory-insights?limit=1');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const data = await apiJson(resp) || {};
-        if (sid !== currentId) return;
-        const stats = data.stats || {};
-        const related = Array.isArray(data.related) ? data.related : [];
-        const episodes = related.filter(item => item && item.type === 'episode');
-        let html = '<div class="insp-memory-list">';
-        if (episodes.length) {
-            const summary = shortText(episodes[0].summary || '', 88);
-            html += memoryRow('episode', '✦', '本会话已保存到记忆',
-                summary || '已生成本次对话的经验记录');
-        }
-        html += '</div>';
-        const counts = [
-            ['长期记忆', stats.memoryCount], ['知识事实', stats.factCount], ['可复用流程', stats.procedureCount]
-        ].filter(([, value]) => value != null);
-        if (counts.length) {
-            html += `<div class="insp-memory-stats">${counts.map(([label, value]) =>
-                `<span class="insp-memory-chip">${esc(label)} ${esc(String(value))}</span>`).join('')}</div>`;
-        }
-        if (!episodes.length && !counts.length) {
-            html = '<div class="insp-empty">当前还没有可展示的记忆或知识沉淀。</div>';
-        }
-        $el.innerHTML = html;
+        const stats = data.userStats || data.stats || null;
+        if (stats) inspMemoryStatsCache = { fetchedAt: now, stats };
+        return stats;
     } catch (e) {
-        console.warn('[Inspector] memory insights failed:', e);
-        $el.innerHTML = '<div class="insp-empty">记忆数据加载失败。</div>';
+        console.warn('[Inspector] memory stats unavailable:', e);
+        return inspMemoryStatsCache.stats;
     }
 }
 
-function memoryRow(kind, icon, title, detail) {
+function buildInspectorMemory(snapshot, stats, sid) {
+    const summary = buildInspectorMemorySummary(stats);
+    if (!sid && !snapshot) {
+        return summary + '<div class="insp-empty">选择或新建一个会话后显示本次命中的记忆。</div>';
+    }
+    if (!snapshot) {
+        return summary + '<div class="insp-empty">本次记忆信息暂时不可读取，请稍后重试。</div>';
+    }
+    const steps = Array.isArray(snapshot && snapshot.steps) ? snapshot.steps : [];
+    const contextStep = [...steps].reverse().find(step => step && step.stepType === 'CONTEXT_LOAD');
+    if (!snapshot || !snapshot.execution) {
+        return summary + '<div class="insp-empty">开始任务后显示本次实际使用的记忆信息。</div>';
+    }
+    if (!contextStep) {
+        return summary + '<div class="insp-empty">该任务没有记忆注入明细；旧任务需重新运行后查看。</div>';
+    }
+    const context = parseJson(contextStep.content) || {};
+    if (!Object.prototype.hasOwnProperty.call(context, 'memoryContext')) {
+        return summary + '<div class="insp-empty">该任务执行时未记录本次记忆明细；重新运行后可查看。</div>';
+    }
+    const raw = typeof context.memoryContext === 'string' ? context.memoryContext : '';
+    const groups = parseInspectorMemoryContext(raw);
+    if (!groups.length) {
+        const detail = context.injectMemory === false && context.injectUser === false
+            ? '本次任务关闭了记忆注入。'
+            : '检索没有返回可注入的记忆内容。';
+        return summary + '<div class="insp-memory-list">' + memoryRow('fact', '◇', '本轮注入的记忆信息', detail) + '</div>';
+    }
+
+    const kindConfig = {
+        preferences: ['fact', '◇', '用户偏好'], facts: ['fact', '◈', '相关事实'],
+        episodes: ['episode', '✦', '历史经验'], procedures: ['procedure', '↻', '可复用方法'],
+        notes: ['procedure', '▤', '记忆笔记']
+    };
+    const total = groups.reduce((count, group) => count + group.items.length, 0);
+    let html = '<div class="insp-memory-list">';
+    groups.forEach(group => {
+        const config = kindConfig[group.type] || kindConfig.notes;
+        const full = group.items.map((item, index) => `${index + 1}. ${item}`).join('\n\n');
+        const preview = shortText(group.items.join('；'), 180);
+        const title = config[2] + (group.items.length > 1 ? `（${group.items.length} 条）` : '');
+        html += memoryRow(config[0], config[1], title, preview, full,
+            `查看合并的原始记忆（${group.items.length} 条）`);
+    });
+    html += '</div><div class="insp-memory-stats"><span class="insp-memory-chip">本轮注入 '
+        + esc(String(total)) + ' 条</span>';
+    if (context.memoryContextTruncated === true) {
+        html += '<span class="insp-memory-chip">内容已截短</span>';
+    }
+    html += '</div>';
+    return summary + html;
+}
+
+function buildInspectorMemorySummary(stats) {
+    const value = key => {
+        const raw = stats && stats[key];
+        return raw != null && raw !== '' && Number.isFinite(Number(raw)) ? esc(String(raw)) : '—';
+    };
+    return `<div class="insp-memory-summary" aria-label="记忆统计">
+        <a class="insp-memory-stat" href="/memory#memAllContent" title="查看全部记忆内容">
+            <span>总记忆数</span><strong>${value('memoryCount')}</strong><em>查看内容 ›</em>
+        </a>
+        <a class="insp-memory-stat" href="/knowledge#knFactsSection" title="查看沉淀知识">
+            <span>沉淀知识</span><strong>${value('factCount')}</strong><em>查看内容 ›</em>
+        </a>
+        <a class="insp-memory-stat" href="/knowledge#knProceduresSection" title="查看可复用流程">
+            <span>可复用流程</span><strong>${value('procedureCount')}</strong><em>查看内容 ›</em>
+        </a>
+    </div>`;
+}
+
+/** Parse the exact final MEMORY prompt fragment recorded by CONTEXT_LOAD. */
+function parseInspectorMemoryContext(raw) {
+    if (typeof raw !== 'string' || !raw.trim()) return [];
+    let text = raw.replace(/^\s*<memory-data[^>]*>\s*/i, '').replace(/\s*<\/memory-data>\s*$/i, '');
+    const memoryStart = text.indexOf('## 记忆');
+    if (memoryStart >= 0) text = text.slice(memoryStart + '## 记忆'.length);
+    const groups = new Map();
+    let current = 'notes';
+    const headingTypes = [
+        [/^用户偏好\s*[：:]?\s*$/, 'preferences'], [/^用户画像(?:\s|$|\[)/, 'preferences'],
+        [/^相关用户偏好(?:\s|$|（|\()/, 'preferences'],
+        [/^相关记忆(?:\s|$|（|\()/, 'facts'],
+        [/^已知事实\s*[：:]?\s*$/, 'facts'], [/^历史经验\s*[：:]?\s*$/, 'episodes'],
+        [/^可用方法\s*[：:]?\s*$/, 'procedures'], [/^记忆笔记(?:\s|$|\[)/, 'notes'],
+        [/^跨会话中期记忆\b/, 'notes']
+    ];
+    const add = (type, value) => {
+        const item = String(value || '').replace(/^[-*•]\s*/, '').trim();
+        if (!item || /^(当前任务|当前步骤)\s*[：:]/.test(item)) return;
+        const list = groups.get(type) || [];
+        const key = item.replace(/\s+/g, ' ').toLocaleLowerCase('zh-CN');
+        if (!list.some(existing => existing.replace(/\s+/g, ' ').toLocaleLowerCase('zh-CN') === key)) {
+            list.push(item);
+            groups.set(type, list);
+        }
+    };
+    text.split(/\r?\n/).forEach(line => {
+        const value = line.trim();
+        if (!value || /^═+$/.test(value) || /^当前(?:任务|步骤)\s*[：:]/.test(value)
+            || /^以下是检索到的历史记忆/.test(value)
+            || /^用户偏好\s*[：:]?$/.test(value) && value.endsWith('：')) return;
+        const heading = headingTypes.find(([pattern]) => pattern.test(value));
+        if (heading) { current = heading[1]; return; }
+        if (/^(##\s*)?记忆$/.test(value) || /^<\/?memory-data\b/i.test(value)) return;
+        if (/^(已知事实|历史经验|可用方法|用户偏好)\s*[：:]$/.test(value)) return;
+        const parts = value.split(/\s*§\s*/).filter(Boolean);
+        parts.forEach(part => add(current, part));
+    });
+    return [...groups.entries()].filter(([, items]) => items.length)
+        .map(([type, items]) => ({ type, items }));
+}
+
+/** Reload the completed execution's actual context memory without polling every tool trace. */
+function scheduleInspectorMemoryRefresh(sid) {
+    if (!sid || sid !== currentId || !inspectorIsOpen()) return;
+    if (inspMemoryRefreshTimer) clearTimeout(inspMemoryRefreshTimer);
+    inspMemoryRefreshTimer = setTimeout(() => {
+        inspMemoryRefreshTimer = null;
+        if (sid === currentId && inspectorIsOpen()) refreshInspector(true, true);
+    }, INSP_PUSH_DEBOUNCE_MS);
+}
+
+function memoryRow(kind, icon, title, detail, fullDetail, fullDetailLabel) {
+    const more = typeof fullDetail === 'string' && fullDetail !== detail
+        ? `<details class="insp-memory-more"><summary>${esc(fullDetailLabel || '查看完整内容')}</summary><div class="insp-memory-full">${esc(fullDetail)}</div></details>` : '';
     return `<div class="insp-memory-item">
         <span class="insp-memory-icon kind-${kind}">${icon}</span>
-        <span class="insp-memory-main">
+        <div class="insp-memory-main">
             <span class="insp-memory-title">${esc(title)}</span>
             <span class="insp-memory-detail">${esc(detail)}</span>
-        </span>
+            ${more}
+        </div>
     </div>`;
 }
 
@@ -952,6 +1170,7 @@ function closeInspectorStream() {
     if (inspStepRefreshTimer) { clearTimeout(inspStepRefreshTimer); inspStepRefreshTimer = null; }
     if (inspReconnectTimer) { clearTimeout(inspReconnectTimer); inspReconnectTimer = null; }
     if (inspDataRetryTimer) { clearTimeout(inspDataRetryTimer); inspDataRetryTimer = null; }
+    if (inspMemoryRefreshTimer) { clearTimeout(inspMemoryRefreshTimer); inspMemoryRefreshTimer = null; }
     inspReconnectAttempt = 0;
     inspDataRetryAttempt = 0;
 }
@@ -1052,6 +1271,7 @@ function handleInspectorFrame(frame, sid) {
     let data = null;
     try { data = JSON.parse(dataLines.join('\n')); } catch (_) { return; }
     if (!data || data.sessionId !== sid) return;
+    if (data.stepType === 'RUN_END') scheduleInspectorMemoryRefresh(sid);
     if (inspPushTimer) clearTimeout(inspPushTimer);
     inspPushTimer = setTimeout(() => {
         inspPushTimer = null;

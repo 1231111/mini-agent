@@ -327,6 +327,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         function finish(html, cancelled, incomplete) {
             if (!isCurrentStream()) return;
             if (done) return; done = true;
+            if (typeof scheduleInspectorMemoryRefresh === 'function') scheduleInspectorMemoryRefresh(sessionId);
             turnWaiting = taskOutcomeStatus === 'WAITING';
             turnCancelled = taskOutcomeStatus === 'CANCELED' || (!taskOutcomeStatus && !!cancelled);
             turnIncomplete = !!incomplete;
@@ -474,8 +475,9 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             answerEl.appendChild(answerTailEl);
             renderedFrozen = '';
             renderedTail = '';
-            // 任务节点在前，最终回复在后；与 SSE 事件到达顺序无关。
-            insertAt(botBody, answerEl, firstInteractionCard() || panelEl);
+            // 交互卡（授权/补充信息）必须先于最终答复；任务进度也先于答案。
+            // 答案插在思考面板前，避免 SSE 事件先后改变消息阅读顺序。
+            insertAt(botBody, answerEl, panelEl);
         }
         /** The DAG/todo snapshot is the only source of node progress. */
         function paintTodo() {
@@ -636,7 +638,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             card.appendChild(question);
             if (options.length) card.appendChild(optionsBox);
             card.appendChild(status);
-            insertAt(botBody, card, panelEl);
+            // 用户需要先补充信息，交互卡应放在已创建的答案区域之前。
+            insertAt(botBody, card, answerEl || panelEl);
             registerUserQuestionCard(card);
             scrollToBottom();
         }
@@ -671,7 +674,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             deny.onclick = () => denyAskTool();
             actions.append(once, always, deny);
             card.append(title, detail, status, actions);
-            insertAt(botBody, card, panelEl);
+            // 授权是继续任务的前置动作，先显示授权卡，再显示答复。
+            insertAt(botBody, card, answerEl || panelEl);
             registerInlineAskCard(card, payload && (payload.tool || payload.name),
                 payload && payload.display, payload && payload.grantToken,
                 payload && payload.expiresAt);

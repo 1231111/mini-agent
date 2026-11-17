@@ -105,13 +105,29 @@
         </a>
         <span class="page-title-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4a3 3 0 0 0-3 3v1a3 3 0 0 0 0 6v1a3 3 0 0 0 6 0v-1a3 3 0 0 0 0-6V7a3 3 0 0 0-3-3z"/><path d="M12 4v16"/></svg></span>
         <h1 class="page-title">记忆管理</h1>
-        <span class="page-sub">这里显示当前账号真实的记忆沉淀：条目总量、可归纳的标签，以及每个会话留下的情节。</span>
+        <span class="page-sub">查看当前账号已保存的用户偏好、记忆总量，以及每个会话留下的情节。</span>
     </div>
 
     <div class="page-body">
         <div class="page-inner">
             <div class="stat-grid" id="memStats">
                 <div class="stat"><div class="stat-num">…</div><div class="stat-key">加载中</div></div>
+            </div>
+
+            <div id="memAllContent">
+                <div class="card" id="memEntries">
+                    <div class="card-head">沉淀记忆<span class="card-count" id="memEntryCount">加载中…</span></div>
+                    <div class="card-body" id="memEntryItems">
+                        <div class="empty">加载中…</div>
+                    </div>
+                </div>
+
+                <div class="card" id="memPreferencesSection">
+                    <div class="card-head">已保存的用户偏好<span class="card-count" id="memPreferenceCount">最新优先</span></div>
+                    <div class="card-body" id="memPreferences">
+                        <div class="empty">加载中…</div>
+                    </div>
+                </div>
             </div>
 
             <div class="card">

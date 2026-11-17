@@ -34,6 +34,9 @@ public class LocalHybridSearchEngine implements HybridSearchEngine {
     @Autowired
     private HybridScoreCalculator scoreCalculator;
 
+    @Autowired
+    private LocalMemoryEmbeddingCache vectorCache = new LocalMemoryEmbeddingCache();
+
     @Value("${agent.memory.vector.min-score:0.3}")
     private double minScore;
 
@@ -68,7 +71,12 @@ public class LocalHybridSearchEngine implements HybridSearchEngine {
                 .collect(Collectors.toList());
         }
 
-        // 评分
+        // A miss must not initialize the ONNX model or call a remote embedding provider.
+        if (candidates.isEmpty()) return List.of();
+
+        // 查询向量保持请求级；记忆内容向量按归属、内容和模型版本复用。
+        LocalMemoryEmbeddingCache.ModelIdentity modelIdentity = embeddingModel == null
+                ? null : vectorCache.modelIdentity(embeddingModel);
         float[] queryVec = (embeddingModel != null && embeddingModel.isEnabled())
             ? embeddingModel.embed(query.getQuery()) : new float[0];
 
@@ -79,7 +87,7 @@ public class LocalHybridSearchEngine implements HybridSearchEngine {
             // 语义分数
             double semanticScore = 0;
             if (queryVec.length > 0) {
-                float[] memVec = embeddingModel.embed(memory.getContent());
+                float[] memVec = vectorCache.contentVector(modelIdentity, memory, queryVec.length);
                 if (memVec.length > 0) {
                     semanticScore = SharedEmbeddingModel.cosine(queryVec, memVec);
                 }

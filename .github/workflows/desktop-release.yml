@@ -61,6 +61,31 @@ env:
 # "${productName}-${version}-${os}-${arch}.${ext}" 对齐（os 展开为 win / mac / linux），
 # 这样从 artifact 名能直接推出里面的安装包叫什么。
 jobs:
+  client-quality:
+    name: Release client and acceptance contract fixtures (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: scripts/release/schema-test-requirements.txt
+      - name: Install release Schema test dependencies
+        run: python -m pip install --disable-pip-version-check -r scripts/release/schema-test-requirements.txt
+      - name: Validate published release Schemas and document fixtures
+        run: python scripts/release/schema-contract-test.py
+      - name: Run offline client and acceptance contract regressions
+        run: node scripts/agent-eval/run-offline-checks.mjs
+
   browser-contracts:
     name: Release Chromium execution and client recovery (Windows)
     runs-on: windows-latest
@@ -94,7 +119,7 @@ jobs:
 
   desktop:
     name: ${{ matrix.label }}
-    needs: [browser-contracts]
+    needs: [browser-contracts, client-quality]
     runs-on: ${{ matrix.os }}
     # 单平台约 15 分钟（fat jar 3 + jlink 1 + Chromium 1 + electron-builder 5 + 上传 3），
     # 留 3 倍余量给冷缓存和网络抖动。

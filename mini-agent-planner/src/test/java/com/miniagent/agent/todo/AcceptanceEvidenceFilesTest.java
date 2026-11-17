@@ -42,7 +42,7 @@ class AcceptanceEvidenceFilesTest {
         Path outside = Files.writeString(temporary.resolve("secret.txt"), "outside secret");
         assertNull(AcceptanceEvidenceFiles.readText(outside.toString()));
         for (byte[] data : new byte[][]{new byte[128], new byte[]{(byte)0xc3, (byte)0x28},
-                "x".repeat(12_001).getBytes(StandardCharsets.UTF_8), new byte[48_001]}) {
+                "x".repeat(48_001).getBytes(StandardCharsets.UTF_8), new byte[48_001]}) {
             Path file = Files.write(workspace.resolve("invalid.bin"), data);
             assertNull(AcceptanceEvidenceFiles.readText(file.toString()));
         }

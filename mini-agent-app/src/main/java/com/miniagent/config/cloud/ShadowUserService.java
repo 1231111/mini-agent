@@ -118,6 +118,18 @@ public class ShadowUserService {
                         + "最常见的原因是 agent 与 account 没指向同一个库 —— "
                         + "请核对两者的 spring.datasource.url。"));
 
+        // 两个独立数据库可能恰好各有同一个自增 id。仅按 id 找到一行并不能
+        // 证明它就是刚在云端认证的账号；误配共享模式时必须拒绝，不能把另一人
+        // 的本地数据、角色或会话发给当前云端用户。校验必须早于任何字段更新。
+        if (!Objects.equals(user.getUsername(), cloudUser.username())
+                || user.getTenantId() == null
+                || !Objects.equals(user.getTenantId().toString(), cloudUser.cloudTenantId())) {
+            throw new CloudAccountException(ErrorCode.AUTH_CLOUD_INVALID_RESPONSE,
+                    "共享库模式下账号服务返回的身份与本地用户记录不一致。"
+                            + "请核对 agent 与 account 是否使用同一个数据库；"
+                            + "独立数据库的客户端必须使用 agent.auth.cloud.shared-database=false。");
+        }
+
         if (!user.isEnabled()) {
             throw new CloudAccountException(ErrorCode.AUTH_FORBIDDEN,
                     "账号已被停用（users.id=" + id + "），请联系管理员");

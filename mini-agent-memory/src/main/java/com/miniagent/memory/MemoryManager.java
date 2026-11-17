@@ -58,6 +58,9 @@ public interface MemoryManager {
     /** 写入一个三元组事实 */
     void writeFact(SemanticFact fact);
 
+    /** 软删除指定归属域内的一条有效事实；不能只凭全局 ID 删除其他用户的事实。 */
+    boolean removeFact(String tenantId, String scopeType, String scopeId, Long id);
+
     /** 查询事实 */
     List<SemanticFact> queryFacts(String tenantId, String scopeType, String scopeId, String subject);
 

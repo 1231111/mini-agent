@@ -31,6 +31,7 @@ import java.util.Set;
 public class ContextLoader {
 
     private static final ObjectMapper JSON = new ObjectMapper();
+    private static final int TRACE_MEMORY_CONTEXT_MAX_CHARS = 3200;
 
     @Autowired
     private TaskTodoStore taskTodoStore;
@@ -115,8 +116,9 @@ public class ContextLoader {
         // 用户在任务跑到一半时打开两个开关，下一步拼出来的提示词就已经是放行口径。
         boolean fullAuto = PermissionPolicy.isFullAuto(
                 PermissionContext.mode(), PermissionContext.confirmPolicy());
-        String systemPrompt = contextBuilder.build(new ContextBuildContext(
+        ContextBuildResult builtContext = contextBuilder.buildDetailed(new ContextBuildContext(
                 sessionId, query, policy, Set.of(), ref, hasMedia, fullAuto));
+        String systemPrompt = builtContext.systemPrompt();
 
         Map<String, Object> info = new HashMap<>();
         info.put("hasMedia", hasMedia);
@@ -130,6 +132,9 @@ public class ContextLoader {
         info.put("fullAuto", fullAuto);
         info.put("injectMemory", policy.injectMemory());
         info.put("injectUser", policy.injectUser());
+        String memoryContext = builtContext.textFor(ContextSlot.MEMORY);
+        info.put("memoryContext", truncate(memoryContext, TRACE_MEMORY_CONTEXT_MAX_CHARS));
+        info.put("memoryContextTruncated", memoryContext.length() > TRACE_MEMORY_CONTEXT_MAX_CHARS);
         info.put("injectSkills", policy.injectSkills());
         info.put("todoClosed", closed);
         info.put("scopeKey", scopeKey);
@@ -155,6 +160,11 @@ public class ContextLoader {
                 scopeKey, boundaryReason, 0);
 
         return new LoadedContext(systemPrompt, history, policy, scopeKey, taskId, info);
+    }
+
+    private static String truncate(String text, int maxChars) {
+        if (text == null || text.length() <= maxChars) return text == null ? "" : text;
+        return text.substring(0, maxChars) + "…";
     }
 
     /**

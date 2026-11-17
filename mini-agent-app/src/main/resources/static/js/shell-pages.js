@@ -68,7 +68,7 @@ function emptyHtml(text) {
    记忆管理（/memory）
    -----------------------------------------------------------------------
    数据源：GET /api/shell/memory-insights
-     · 不带 sessionId → 当前租户/用户的总量（记忆条目、事实、流程）
+     · 不带 sessionId → 当前用户已保存偏好，以及租户/用户总量（记忆条目、事实、流程）
      · 带 sessionId  → 这个会话沉淀的 episode（情节）
    会话列表来自 GET /api/conversations，供下拉切换。
    ======================================================================= */
@@ -78,22 +78,29 @@ async function renderMemoryPage() {
 
     let total = null;
     try {
-        total = await pageGet('/api/shell/memory-insights?limit=' + limit);
+        total = await pageGet('/api/shell/memory-insights?limit=' + limit) || {};
     } catch (e) {
         setHtml('memStats', emptyHtml(PAGE_LOAD_ERROR + '：' + e.message));
+        setHtml('memPreferences', emptyHtml('用户偏好加载失败：' + e.message));
+        setText('memPreferenceCount', '读取失败');
+        setHtml('memTags', emptyHtml(PAGE_LOAD_ERROR));
     }
-    const stats = (total && total.stats) || {};
-    renderStats('memStats', [
-        { key: '记忆条目（ACTIVE）', value: stats.memoryCount },
-        { key: '语义事实', value: stats.factCount },
-        { key: '流程', value: stats.procedureCount }
-    ]);
+    if (total) {
+        const stats = total.userStats || total.stats || {};
+        renderStats('memStats', [
+            { key: '总记忆数', value: stats.memoryCount },
+            { key: '沉淀知识', value: stats.factCount },
+            { key: '可复用流程', value: stats.procedureCount }
+        ]);
+        renderMemoryEntries(total, stats);
+        renderMemoryPreferences(total);
 
-    // 标签云：来自真实 fact subject / procedure name / episode outcome
-    const tags = (total && Array.isArray(total.tags)) ? total.tags : [];
-    setHtml('memTags', tags.length
-        ? tags.slice(0, 40).map(t => `<span class="tag-chip">${pe(t)}</span>`).join('')
-        : emptyHtml('还没有可归纳的标签 —— 记忆沉淀出事实或流程后这里会自动出现。'));
+        // 标签云：来自真实 fact subject / procedure name / episode outcome
+        const tags = Array.isArray(total.tags) ? total.tags : [];
+        setHtml('memTags', tags.length
+            ? tags.slice(0, 40).map(t => `<span class="tag-chip">${pe(t)}</span>`).join('')
+            : emptyHtml('还没有可归纳的标签 —— 记忆沉淀出事实或流程后这里会自动出现。'));
+    }
 
     // 会话下拉 + 该会话的情节
     let convs = [];
@@ -108,6 +115,55 @@ async function renderMemoryPage() {
         picker.onchange = () => loadMemoryEpisodes(picker.value);
     }
     await loadMemoryEpisodes('');
+}
+
+function renderMemoryEntries(data, stats) {
+    const entries = Array.isArray(data && data.userMemories) ? data.userMemories : [];
+    const count = Number(stats && (stats.memoryEntryCount ?? stats.memoryCount));
+    setText('memEntryCount', Number.isFinite(count)
+        ? `共 ${num(count)} 条 · 已载入 ${entries.length} 条`
+        : `已载入 ${entries.length} 条`);
+    if (!entries.length) {
+        setHtml('memEntryItems', emptyHtml('当前账号还没有沉淀的记忆条目。'));
+        return;
+    }
+    const labels = {
+        WORKING: '工作记忆', EPISODIC: '执行经验', SEMANTIC: '知识',
+        PROCEDURAL: '流程记忆', USER: '用户偏好', PROJECT: '项目记忆', ORGANIZATION: '组织记忆'
+    };
+    setHtml('memEntryItems', entries.map(entry => {
+        const content = String(entry.content || '').trim();
+        const summary = String(entry.summary || '').trim();
+        const preview = summary || (content.length > 220 ? content.slice(0, 220) + '…' : content);
+        const full = content && content !== preview
+            ? `<details class="memory-entry-more"><summary>查看完整内容</summary><div class="knowledge-row-content">${pe(content)}</div></details>` : '';
+        return `<div class="row row--fact memory-entry-row">
+            <span class="row-main"><span class="row-tag">${pe(labels[entry.type] || entry.type || '记忆')}</span>
+            <span class="knowledge-row-content">${pe(preview || '（暂无摘要）')}</span>${full}</span>
+        </div>`;
+    }).join(''));
+}
+
+function renderMemoryPreferences(data) {
+    if (!data || data.preferencesAvailable !== true) {
+        setHtml('memPreferences', emptyHtml(data && data.preferencesAvailable === false
+            ? '用户偏好暂时无法读取，请稍后重试；这不表示已保存的偏好被删除。'
+            : '当前服务未提供已保存的偏好数据。'));
+        setText('memPreferenceCount', data && data.preferencesAvailable === false ? '读取失败' : '状态未知');
+        return;
+    }
+    // Only persisted user records are preferences; learned facts and episode summaries stay in their own views.
+    const preferences = Array.isArray(data.userPreferences) ? data.userPreferences.filter(item =>
+        item && item.target === 'user' && item.persisted === true
+            && typeof item.content === 'string' && item.content.trim()) : [];
+    const totalRaw = data.userStats && data.userStats.preferenceCount;
+    const total = Number(totalRaw);
+    setText('memPreferenceCount', totalRaw != null && Number.isFinite(total)
+        ? `共 ${num(total)} 条 · 已载入 ${preferences.length} 条 · 最新优先`
+        : '已载入 ' + preferences.length + ' 条 · 最新优先');
+    setHtml('memPreferences', preferences.length ? preferences.map(item => `<div class="row row--fact">
+        <span class="row-main"><span class="row-tag">已保存偏好</span><span class="knowledge-row-content" style="white-space:pre-wrap;overflow-wrap:anywhere">${pe(item.content.trim())}</span></span>
+    </div>`).join('') : emptyHtml('当前尚未保存用户偏好。'));
 }
 
 async function loadMemoryEpisodes(sid) {
@@ -153,10 +209,10 @@ async function renderKnowledgePage() {
         setHtml('knProcedures', emptyHtml(PAGE_LOAD_ERROR));
         return;
     }
-    const stats = (data && data.stats) || {};
+    const stats = (data && (data.userStats || data.stats)) || {};
     renderStats('knStats', [
-        { key: '语义事实', value: stats.factCount },
-        { key: '流程', value: stats.procedureCount },
+        { key: '沉淀知识', value: stats.factCount },
+        { key: '可复用流程', value: stats.procedureCount },
         { key: '本页已载入', value: stats.relatedCount }
     ]);
 

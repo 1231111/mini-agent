@@ -84,8 +84,11 @@ $env:MINI_AGENT_EVAL_MODEL_MODE = 'live'
 | 校验器 | 业务结果与独立证据 |
 | --- | --- |
 | `news` | `delivery.news[]` 的 sourceId、标题、URL、发布时间逐条对应采集器 `newsSources[]`；来源须有HTTP 200、页面内容哈希、可信出版元数据证据。按 IANA 时区从来源时间戳计算日历日，拒绝把搜索时间、抓取时间或答案自己写的“今天”作为发布时间。支持来源域名白名单、必须引用的来源ID及最少独立域名数。未知发布时间不能自动视为当天。 |
+| `search` | 通用搜索结果必须逐条绑定采集器 `searchSources[]`；采集器提供 HTTP 200、来源正文 SHA-256、检索时间和来源域名，回复中的标题、URL、摘要不能脱离已观察来源。支持最少结果数、最少独立域名数和域名白名单。 |
 | `ui-artifact` | 对本案例真实HTML文件计算SHA256，独立浏览器加载所得哈希必须一致；要求桌面/手机两种视口、对应尺寸PNG截图、无脚本/请求错误、无水平溢出、必需控件可见；可要求操作后观测状态。只有文件存在、HTML中有按钮文字或模型说“已完成”都不通过。 |
 | `form-receipt` | 本地测试表单服务器独立读取的回执与本次nonce绑定；HTTP方法/路由、服务端收到的所有字段、控件回读值、上传文件名/字节数/内容哈希、回复回执号均须匹配。模型返回的success、页面上“提交成功”文字或旧回执均不充当服务端证据。 |
+| `browser-action` | 浏览器采集器必须为每个动作提供 `browser-observer` 来源、精确回读状态和快照 SHA-256；回复中的动作状态必须与采集器逐项一致，不能用模型文字或页面提示代替回读。 |
+| `desktop-action` | 桌面采集器必须为每个动作提供 `desktop-observer` 来源、精确回读状态和当前案例目录内的截图证据；截图路径和 SHA-256 由独立观察器绑定，回复状态必须逐项匹配。 |
 
 添加新业务检查时，在 `quality-gate.mjs` 注册纯校验函数并补正反向 fixture。Manifest 不能指定要执行的代码/命令；不支持的校验器直接失败。不要把模型生成的 `passed=true`、自行生成的日期或自己的文件当独立证据。
 
@@ -108,7 +111,8 @@ export async function createHarness({ runId, agentHome, artifactRoot, harnessDir
     },
     async observe({ caseDefinition, result, artifactDir, nonce, signal }) {
       // 由采集器读取来源原文、真实浏览器状态或fixture server回执。
-      // 返回{caseId, nonce, newsSources|ui|formReceipt|fieldReadback}，不能抄模型的“证据”。
+      // 返回{caseId, nonce, newsSources|searchSources|ui|formReceipt|fieldReadback|
+      // browserActions|desktopActions}，不能抄模型的“证据”。
     },
     async close({ signal }) { /* 取消/等待未完成任务、停止子进程、关闭浏览器和fixture server */ }
   };

@@ -59,18 +59,18 @@ class MemoryControlPlaneVerifyTest {
     }
 
     /**
-     * 没有挂起清单时按新任务加载，而不是整段清空。
-     *
-     * <p>旧实现里有一类「评审」意图会把记忆整段置空，随分类一起删掉了：
-     * 清空是不可恢复的（模型看不到任何记忆），而多注入只是可恢复的噪音。
-     * 现在只有 {@code injectMemory=false} 会削减记忆槽，而两档策略都开着它。</p>
+     * 打开记忆通道允许按当前任务检索，不代表将全部笔记和偏好注入。
+     * 新任务能召回相关记录，同时排除无关记录和遗留中期摘要。
      */
     @Test
-    void 无挂起清单时按新任务加载而非清空() {
+    void 无挂起清单时按当前任务加载相关记忆() {
         MemoryReadPolicy policy = ContextLoadPolicy.defaults().memoryPolicy();
-        String prompt = service.retrieveForPrompt("s1", "这图哪里不对", policy);
+        store.add("memory", "长期笔记：机票报销需要电子行程单");
+        String prompt = service.retrieveForPrompt("s1",
+                "检查仓库 JDK 21 配置，说明先结论后细节的沟通偏好", policy);
         assertTrue(prompt.contains("JDK 21"), prompt);
         assertTrue(prompt.contains("先结论后细节"), prompt);
+        assertFalse(prompt.contains("电子行程单"), prompt);
         assertFalse(prompt.contains("报表项目"), prompt);
     }
 
@@ -78,9 +78,43 @@ class MemoryControlPlaneVerifyTest {
     void newTask不再注入遗留midterm() {
         MemoryReadPolicy policy = ContextLoadPolicy
                 .defaults().memoryPolicy();
-        String prompt = service.retrieveForPrompt("s1", "写一份方案", policy);
+        String prompt = service.retrieveForPrompt("s1",
+                "使用 JDK 21 编写报表项目方案", policy);
         assertTrue(prompt.contains("JDK 21"), prompt);
         assertFalse(prompt.contains("报表项目"), prompt);
+    }
+
+    @Test
+    void 无关任务不回退注入全部记忆且不删除已保存记录() {
+        String prompt = service.retrieveForPrompt("s1", "搜索今日电影新闻",
+                ContextLoadPolicy.defaults().memoryPolicy());
+
+        assertEquals("", prompt);
+        assertTrue(store.readEntries("memory").contains("长期笔记：仓库用 JDK 21"));
+        assertTrue(store.readEntries("user").contains("沟通偏好：先结论后细节"));
+    }
+
+    @Test
+    void 空查询和关闭记忆通道均不注入匹配记录() {
+        MemoryReadPolicy policy = ContextLoadPolicy.defaults().memoryPolicy();
+        assertEquals("", service.retrieveForPrompt("s1", "", policy));
+        assertEquals("", service.retrieveForPrompt("s1", "   ", policy));
+        assertEquals("", service.retrieveForPrompt("s1",
+                "仓库 JDK 21，先结论后细节", MemoryReadPolicy.none()));
+    }
+
+    @Test
+    void 长期记忆和用户偏好通道分别遵守加载开关() {
+        String query = "仓库 JDK 21，先结论后细节";
+        String notes = service.retrieveForPrompt("s1", query,
+                new MemoryReadPolicy(false, true, false, 0));
+        assertTrue(notes.contains("JDK 21"), notes);
+        assertFalse(notes.contains("先结论后细节"), notes);
+
+        String preferences = service.retrieveForPrompt("s1", query,
+                new MemoryReadPolicy(false, false, true, 0));
+        assertTrue(preferences.contains("先结论后细节"), preferences);
+        assertFalse(preferences.contains("JDK 21"), preferences);
     }
 
     @Test
@@ -98,7 +132,7 @@ class MemoryControlPlaneVerifyTest {
             written.add(inv.getArgument(0));
             return null;
         }).when(manager).writeFact(any());
-        when(manager.queryFacts(any(), any(), any(), any())).thenReturn(List.of());
+        when(manager.queryFacts(any(), any(), any(), any())).thenAnswer(inv -> List.copyOf(written));
 
         DefaultMemoryService withMgr = new DefaultMemoryService();
         ReflectionTestUtils.setField(withMgr, "memoryStore", store);

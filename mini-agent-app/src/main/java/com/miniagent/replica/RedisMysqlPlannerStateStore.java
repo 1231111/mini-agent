@@ -1,6 +1,7 @@
 package com.miniagent.replica;
 
 import com.miniagent.agent.planner.DomainEvent;
+import com.miniagent.agent.planner.ActionProposal;
 import com.miniagent.agent.planner.PlannerStatePersistence;
 import com.miniagent.agent.planner.StateSnapshot;
 import com.miniagent.config.service.DbPlannerStatePersistence;
@@ -46,6 +47,12 @@ public class RedisMysqlPlannerStateStore implements PlannerStatePersistence {
         // Keep snapshot and events from the same database read. A Redis hit is
         // never a fallback, including while MySQL is unavailable.
         return mysql.load(sessionId);
+    }
+
+    @Override
+    public boolean dispatchFenceValid(String sessionId, ActionProposal proposal) {
+        // Redis cannot authorize dispatch, including while MySQL is unavailable.
+        return mysql.dispatchFenceValid(sessionId, proposal);
     }
 
     @Override

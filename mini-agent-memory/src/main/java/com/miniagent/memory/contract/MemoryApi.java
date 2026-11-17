@@ -17,6 +17,8 @@ public final class MemoryApi {
     public static final String OUTCOMES = MEMORY + "/outcomes:batch";
     public static final String FEEDBACK = MEMORY + "/feedback";
     public static final String ITEMS = MEMORY + "/items";
+    /** Cloud-synchronized, user-scoped semantic facts (never caller-scoped). */
+    public static final String USER_FACTS = MEMORY + "/user-facts";
     public static final String ITEMS_IMPORT = MEMORY + "/items:import";
     public static final String CHANGES = MEMORY + "/changes";
     public static final String PROPOSALS = MEMORY + "/proposals";
@@ -101,6 +103,23 @@ public final class MemoryApi {
     }
 
     public record ItemPage(List<ItemView> items, Long nextCursor) {
+    }
+
+    /** A client fact mutation. Ownership is always derived from the authenticated token. */
+    public record UserFactMutation(String subject, String predicate, String objectValue,
+                                   boolean deleted, Instant sourceUpdatedAt) {
+    }
+
+    public record UserFactSync(List<UserFactMutation> facts) {
+    }
+
+    /** Current cloud-authoritative fact value, including soft-delete tombstones. */
+    public record UserFactView(String subject, String predicate, String objectValue,
+                               boolean deleted, long revision, Instant sourceUpdatedAt,
+                               Instant updatedAt) {
+    }
+
+    public record UserFactSyncResult(List<UserFactView> facts) {
     }
 
     public record RevisionView(long id, int revisionNo, String origin, ProcedureContent content,

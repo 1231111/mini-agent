@@ -12,7 +12,9 @@ public enum ContextSlot {
     REASONING(1500),
     TOOLS(4000),
     TODO(2000),
-    CLOSING(1500);
+    // Includes the output/media contract plus the relative-date anchor; keep enough room
+    // so mandatory suffix guidance is not silently clipped from every model request.
+    CLOSING(2400);
 
     private final int defaultTokenBudget;
 

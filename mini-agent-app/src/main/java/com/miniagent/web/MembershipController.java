@@ -2,13 +2,16 @@ package com.miniagent.web;
 
 import com.miniagent.common.ApiResponse;
 import com.miniagent.common.ErrorCode;
+import com.miniagent.common.exception.BusinessException;
 import com.miniagent.config.cloud.CloudMembershipClient;
 import com.miniagent.config.cloud.CloudMembershipClient.MembershipView;
 import com.miniagent.config.cloud.CloudMembershipClient.OrderView;
 import com.miniagent.config.cloud.CloudMembershipClient.PlanView;
+import com.miniagent.config.repository.UserRepository;
 import com.miniagent.config.security.CurrentUser;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -28,7 +31,8 @@ import java.util.List;
  * 所以那边收到的 {@code userId} 完全是调用方说了算的。于是"这个 userId 是不是就是你"
  * 这件事只能在<b>这一层</b>判掉 —— 而本层手里有用户的 Bearer token。
  *
- * <p>因此三个端点都从 {@link CurrentUser} 取 {@code userId}，
+ * <p>因此涉及用户身份的端点都从 {@link CurrentUser} 取本地 {@code userId}，
+ * 独立本地库再按当前用户行的 {@code externalId} 映射为云端身份；仅共享库可复用主键。
  * <b>请求体里刻意没有 userId 字段</b>。不是"忽略了它"，是压根没有这个字段可填：
  * 只要契约上不给，将来也不会有人"顺手"把它接上。
  * 一旦哪天有人在请求体里加了 userId 并透传下去，任何人都能查到别人的会员和订单，
@@ -51,6 +55,12 @@ public class MembershipController {
     @Autowired
     private CurrentUser currentUser;
 
+    @Autowired
+    private UserRepository users;
+
+    @Value("${agent.auth.cloud.shared-database:false}")
+    private boolean sharedDatabase;
+
     /** 下单请求。只有套餐代码 —— 见类注释，userId 不在契约里。 */
     public record CreateOrderRequest(String planCode) {
     }
@@ -69,7 +79,7 @@ public class MembershipController {
     @GetMapping(value = "/current", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<MembershipView> current() {
-        return ApiResponse.ok(membership.current(currentUser.userId()));
+        return ApiResponse.ok(membership.current(cloudUserId()));
     }
 
     /**
@@ -89,6 +99,31 @@ public class MembershipController {
             // 那句话里带着 null，读日志的人会先去怀疑反序列化。
             return ApiResponse.fail(ErrorCode.MEMBER_PLAN_NOT_FOUND, "缺少 planCode");
         }
-        return ApiResponse.ok(membership.createOrder(currentUser.userId(), planCode));
+        return ApiResponse.ok(membership.createOrder(cloudUserId(), planCode));
+    }
+
+    /** Local and cloud primary keys are different identity spaces outside shared-database mode. */
+    private Long cloudUserId() {
+        Long localUserId = currentUser.userId();
+        if (localUserId == null || localUserId <= 0) {
+            throw new BusinessException(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        }
+        if (sharedDatabase) {
+            // Shared-database login validates that this session is the authoritative cloud row.
+            return localUserId;
+        }
+        String externalId = users.findExternalIdById(localUserId).orElse(null);
+        if (externalId != null) {
+            try {
+                long cloudUserId = Long.parseLong(externalId.trim());
+                if (cloudUserId > 0) {
+                    return cloudUserId;
+                }
+            } catch (NumberFormatException ignored) {
+                // A malformed mapping must never fall back to a possibly unrelated cloud user.
+            }
+        }
+        throw new BusinessException(ErrorCode.AUTH_FORBIDDEN,
+                "当前账号未关联有效的云端身份，请重新登录");
     }
 }

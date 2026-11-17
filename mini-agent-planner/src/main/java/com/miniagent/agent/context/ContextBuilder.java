@@ -21,6 +21,14 @@ public class ContextBuilder {
     }
 
     public String build(ContextBuildContext context) {
+        return buildDetailed(context).systemPrompt();
+    }
+
+    /**
+     * Build the prompt and retain its final fragments for observability. The returned
+     * fragments have already passed through the same per-slot budgets as the prompt.
+     */
+    public ContextBuildResult buildDetailed(ContextBuildContext context) {
         List<ContextFragment> fragments = new ArrayList<>();
         for (SystemContextContributor contributor : contributors) {
             ContextFragment fragment = contributor.contribute(context);
@@ -28,6 +36,7 @@ public class ContextBuilder {
                 fragments.add(fragment);
             }
         }
-        return budgetManager.assemble(fragments);
+        List<ContextFragment> fitted = budgetManager.fit(fragments);
+        return new ContextBuildResult(budgetManager.assembleFitted(fitted), fitted);
     }
 }

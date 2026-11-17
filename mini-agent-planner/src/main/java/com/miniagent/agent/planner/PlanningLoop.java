@@ -54,6 +54,10 @@ public class PlanningLoop {
     private static final int PRIOR_OUTPUT_CHARS = 6000;
     private static final int AWAITING_HINT_CHARS = 500;
     static final String EXECUTION_HUMAN_WAIT = "humanWait";
+    static final String RECOVERY_CLARIFICATION = "recoveryClarification";
+
+    /** Completed receipts stay outside the single-node clarification graph while it waits. */
+    private record RecoveryContinuation(String executionId, TaskGraph completed) {}
 
     private final PlannerProperties properties;
     private final GoalCompiler goalCompiler;
@@ -383,17 +387,44 @@ public class PlanningLoop {
             if (stored instanceof Boolean requested) taskPlan = taskPlan.withArtifactDeliveryRequested(requested);
         }
         if (clarifyRecompile) {
+            RecoveryContinuation continuation;
+            try {
+                continuation = recoveryContinuation(existing.get());
+            } catch (IllegalStateException invalid) {
+                return RunOutcome.failed("任务恢复信息无法验证，已保留原有进度，请先检查执行记录。",
+                        "RECOVERY_CONTEXT_INVALID");
+            }
             String merged = mergeClarifyObjective(
                     existing.get().goal().objective(), userMessage);
             TaskPlan nextPlan = taskPlan.withTaskGoal(merged);
-            compiled = compileAndValidate(chat, merged, nextPlan);
+            compiled = compileAndValidate(chat, merged, nextPlan, history,
+                    continuation == null ? null : continuation.completed(),
+                    existing.get().recoveryCount() + 1);
             if (!planValidator.accept(compiled.graph(), nextPlan, compiled.goal(), compiled.intent())) {
                 return invalidPlanOutcome(sessionId, compiled);
             }
-            String execId = StringUtils.isNotBlank(executionId)
-                    ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
-            snap = stateStore.init(sessionId, execId, compiled.goal(), compiled.graph(),
-                    compiled.intent(), compiled.source(), compiled.degraded());
+            if (continuation != null) {
+                StateSnapshot previous = existing.get();
+                if (!sessionLock.renewSessionLock(sessionId, fencingToken)) {
+                    return RunOutcome.failed("任务执行租约已失效，已停止恢复任务。", "SESSION_LOCK_LOST");
+                }
+                Map<String, Object> metadata = new LinkedHashMap<>(previous.execution());
+                if (!compiled.intent().needsClarification()) metadata.remove(RECOVERY_CLARIFICATION);
+                StateSnapshot replacement = previous.revisePlan(compiled.graph(), compiled.goal(),
+                        compiled.intent(), compiled.source(), compiled.degraded(), "recovery_clarification_reply")
+                        .withExecution(metadata);
+                try {
+                    snap = stateStore.commit(sessionId, previous.version(), replacement);
+                } catch (PlannerStateStore.VersionConflictException conflict) {
+                    metrics.casConflict();
+                    return RunOutcome.failed("任务进度已更新，请基于最新状态继续。", "STALE_EXECUTION");
+                }
+            } else {
+                String execId = StringUtils.isNotBlank(executionId)
+                        ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
+                snap = stateStore.init(sessionId, execId, compiled.goal(), compiled.graph(),
+                        compiled.intent(), compiled.source(), compiled.degraded());
+            }
             log.info("PlanningLoop 澄清后重编译 session={} nodes={} clarify={}",
                     sessionId, compiled.graph().nodes().size(),
                     compiled.goal().isClarify());
@@ -401,7 +432,7 @@ public class PlanningLoop {
             String merged = mergeClarifyObjective(
                     existing.get().goal().objective(), userMessage);
             TaskPlan nextPlan = taskPlan.withTaskGoal(merged);
-            compiled = compileAndValidate(chat, merged, nextPlan);
+            compiled = compileAndValidate(chat, merged, nextPlan, history);
             if (!planValidator.accept(compiled.graph(), nextPlan, compiled.goal(), compiled.intent())) {
                 // A revision is not approval to execute either the old or an invalid
                 // replacement plan. Retain the pending snapshot for another revision.
@@ -436,7 +467,7 @@ public class PlanningLoop {
             // ===========================================
 
         } else {
-            compiled = compileAndValidate(chat, userMessage, taskPlan);
+            compiled = compileAndValidate(chat, userMessage, taskPlan, history);
             if (!planValidator.accept(compiled.graph(), taskPlan, compiled.goal(), compiled.intent())) {
                 return invalidPlanOutcome(sessionId, compiled);
             }
@@ -499,7 +530,7 @@ public class PlanningLoop {
                     sessionId, compiled.source(), compiled.fallbackReason());
         }
 
-        String lastAnswer = "";
+        AcceptedNodeAnswer acceptedAnswer = null;
         int rounds = 0;
         // 只有"图全部通过终验"这一条路会把 completed 置真；其余出口都是"没做完"。
         String unfinishedReason = "NO_READY_NODES";
@@ -509,17 +540,21 @@ public class PlanningLoop {
                         sessionId, ErrorCode.AGENT_PLANNER_LOCK_LOST.getCode());
                 metrics.outerTimeout();
                 String msg = ErrorCode.AGENT_PLANNER_LOCK_LOST.getMessage();
-                String answer = StringUtils.isBlank(lastAnswer) ? msg : lastAnswer + "\n（" + msg + "）";
-                return RunOutcome.failed(answer, "SESSION_LOCK_LOST");
+                return RunOutcome.failed(msg, "SESSION_LOCK_LOST");
             }
             snap = stateStore.get(sessionId).orElse(snap);
             if (!java.util.Objects.equals(admittedExecutionId, snap.executionId())
                     || !java.util.Objects.equals(admittedScopeId, snap.sessionId())) {
                 return RunOutcome.failed("任务执行已被新的任务接替，旧执行已停止。", "STALE_EXECUTION");
             }
+            if (acceptedAnswer != null && !acceptedAnswer.matches(snap)) acceptedAnswer = null;
             unknownNode = unknownOutcomeNode(snap.graph());
             if (unknownNode != null) {
                 return stopUnknownOutcome(sessionId, snap, unknownNode);
+            }
+            if (snap.intent().needsClarification()) {
+                return RunOutcome.blockedOnHuman(snap.intent().clarificationQuestion(),
+                        "INTENT_NEEDS_CLARIFICATION");
             }
             TaskGraph normalized = snap.graph().normalizeForScheduling();
             if (!sameNodeStatuses(normalized, snap.graph())) {
@@ -538,7 +573,7 @@ public class PlanningLoop {
             }
             if (snap.graph().allTerminalSuccess()) {
                 StepEvaluator.GraphEval acc = stepEvaluator.evaluateGraph(
-                        snap.goal(), snap.graph());
+                        snap.goal(), snap.graph(), snap);
                 StateSnapshot evaluated = stateStore.get(sessionId).orElse(null);
                 if (evaluated == null || !java.util.Objects.equals(snap.sessionId(), evaluated.sessionId())
                         || !java.util.Objects.equals(snap.executionId(), evaluated.executionId())) {
@@ -549,6 +584,7 @@ public class PlanningLoop {
                     return RunOutcome.failed("任务执行租约已失效，已停止确认完成。", "SESSION_LOCK_LOST");
                 }
                 if (!acc.ok()) {
+                    acceptedAnswer = null;
                     log.warn("图终验失败 session={} node={} reason={}",
                             sessionId, acc.nodeId(), acc.reason());
                     TaskNode bad = resolveAcceptFailNode(snap.graph(), acc.nodeId());
@@ -570,8 +606,10 @@ public class PlanningLoop {
                         metrics.casConflict();
                         continue;
                     }
-                    snap = applyRecoveryOrCancel(sessionId, snap, bad, dx, bad.id(),
-                            chat, userMessage, taskPlan);
+                    RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap, bad, dx, bad.id(),
+                            chat, userMessage, taskPlan, history);
+                    if (recovery.stop() != null) return recovery.stop();
+                    snap = recovery.snapshot();
                     todoProjector.project(sessionId, snap.graph());
                     continue;
                 }
@@ -589,14 +627,11 @@ public class PlanningLoop {
                 log.info("PlanningLoop 图完成 session={} version={} metrics={}",
                         sessionId, snap.version(), metrics.snapshot());
                 metrics.graphCompleted();
-                // A node-level AgentLoop deliberately returns STEP_SEGMENT_DONE when the
-                // proposal's focus todo is complete.  That marker is useful for the
-                // scheduler, but it is not a user-facing answer.  If every node ended
-                // that way (bound actions are another common case), lastAnswer is empty
-                // after keepBetterAnswer filters the marker.  Never let a successful
-                // graph leak an empty SSE `end` event; derive a concrete summary from
-                // the persisted node outputs instead.
-                return RunOutcome.satisfied(buildCompletedAnswer(lastAnswer, snap.graph()),
+                // Only a durably accepted node from this execution and plan can
+                // supply delivery prose. Otherwise derive the response from the
+                // persisted outputs that have just passed graph acceptance.
+                return RunOutcome.satisfied(buildCompletedAnswer(
+                        acceptedAnswer != null && acceptedAnswer.matches(snap) ? acceptedAnswer.text() : "", snap.graph()),
                         compiled.degraded());
             }
             List<TaskNode> ready = graphScheduler.select(snap.graph());
@@ -604,9 +639,6 @@ public class PlanningLoop {
                 if (snap.graph().hasAwaitingConfirm()) {
                     log.info("PlanningLoop 等待人工 confirm session={}", sessionId);
                     String hint = firstAwaitingHint(snap.graph());
-                    if (StringUtils.isNotBlank(lastAnswer)) {
-                        return RunOutcome.blockedOnHuman(lastAnswer, "AWAITING_CONFIRM");
-                    }
                     if (StringUtils.isNotBlank(hint)) {
                         return RunOutcome.blockedOnHuman(hint, "AWAITING_CONFIRM");
                     }
@@ -623,8 +655,11 @@ public class PlanningLoop {
                 FailureDiagnosis dx = recoveryEngine.diagnose(
                         stuck, diagnoseTool(stuck, ""), "no ready nodes");
                 TaskGraph before = snap.graph();
-                snap = applyRecoveryOrCancel(sessionId, snap, stuck, dx, stuck.id(),
-                        chat, userMessage, taskPlan);
+                acceptedAnswer = null;
+                RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap, stuck, dx, stuck.id(),
+                        chat, userMessage, taskPlan, history);
+                if (recovery.stop() != null) return recovery.stop();
+                snap = recovery.snapshot();
                 if (sameNodeStatuses(before, snap.graph())) {
                     // 恢复动作没有改变任何节点状态 = 死锁（例如上游被写成 CANCELLED，
                     // 后继永远拿不到解锁条件）。这正是"卡住了却报成功"的典型现场。
@@ -678,7 +713,6 @@ public class PlanningLoop {
             StepExec step = executeProposal(chat, systemPrompt, stepUser,
                     multimodalUser, history, taskPlan, proposal, snap.graph(),
                     snap.version(), sessionId, streamSink);
-            lastAnswer = keepBetterAnswer(lastAnswer, step.text());
             boolean drifted = step.drifted();
             boolean quotaAbort = isResourceQuotaAbort(step.endReason())
                     || AgentLoop.LOOP_MAX_ITERATIONS.equals(step.endReason());
@@ -738,10 +772,11 @@ public class PlanningLoop {
                 if (awaiting) {
                     g = g.replace(node.withStatus(TaskNodeStatus.AWAITING_CONFIRM)
                             .withToolStatus(null)
-                            .withError(clip(lastAnswer, AWAITING_HINT_CHARS)));
+                            .withError(clip(step.text(), AWAITING_HINT_CHARS)));
                     continue;
                 }
                 if (drifted) {
+                    acceptedAnswer = null;
                     anyFail = true;
                     String reason = "drift:偏离子目标 " + node.name();
                     g = g.replace(node.withStatus(TaskNodeStatus.FAILED).withToolStatus(null).withError(reason));
@@ -756,15 +791,18 @@ public class PlanningLoop {
                         metrics.casConflict();
                         break;
                     }
-                    snap = applyRecoveryOrCancel(sessionId, snap, node, dx, action.taskId(),
-                            chat, userMessage, taskPlan);
+                    RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap, node, dx, action.taskId(),
+                            chat, userMessage, taskPlan, history);
+                    if (recovery.stop() != null) return recovery.stop();
+                    snap = recovery.snapshot();
                     g = snap.graph();
                     continue;
                 }
                 String judgeAnswer = node.doneWhen() != null && node.doneWhen().isJudge()
                         ? step.text() : "";
                 NodeOutputBinder.Bound bound = NodeOutputBinder.bind(
-                        node, "", step.messages(), judgeAnswer, step.structuredResult());
+                        node, "", step.messages(), judgeAnswer, step.structuredResult(),
+                        predecessorOutputs(g, proposal));
                 StepEvaluator.EvalResult ev;
                 if (RunStatus.FAILURE.name().equals(step.endReason())) {
                     ev = StepEvaluator.EvalResult.fail("tool execution failed: " + clip(step.text(), 400));
@@ -784,10 +822,11 @@ public class PlanningLoop {
                                     clipBindings(bound.bindings())));
                     pendingOutcomes.add(new NodeOutcome(action.actionId(), node,
                             NodeTerminalCommitPort.Result.SUCCESS,
-                            new NodeTerminalCommitPort.Detail(null, null, userMessage)));
+                            new NodeTerminalCommitPort.Detail(null, null, userMessage), ev.acceptanceProof()));
                 } else if (next == TaskNodeStatus.READY) {
                     g = g.replace(node.withStatus(TaskNodeStatus.READY).withToolStatus(null).withError(""));
                 } else {
+                    acceptedAnswer = null;
                     anyFail = true;
                     g = g.replace(node.withStatus(TaskNodeStatus.FAILED)
                             .withToolStatus(step.structuredResult() == null
@@ -805,8 +844,10 @@ public class PlanningLoop {
                         log.warn("状态冲突，触发 replan: {}", e.getMessage());
                         break;
                     }
-                    snap = applyRecoveryOrCancel(sessionId, snap, node, dx, action.taskId(),
-                            chat, userMessage, taskPlan);
+                    RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap, node, dx, action.taskId(),
+                            chat, userMessage, taskPlan, history);
+                    if (recovery.stop() != null) return recovery.stop();
+                    snap = recovery.snapshot();
                     g = snap.graph();
                 }
             }
@@ -820,29 +861,43 @@ public class PlanningLoop {
                         next = next.withExecution(metadata);
                     }
                     snap = commitNodeOutcomes(sessionId, fencingToken, snap, next, pendingOutcomes);
+                    // A model draft is eligible for delivery only after its own node's
+                    // accepted output and verdict have been durably committed. Never
+                    // retain failed, stale or CAS-rejected node prose as a fallback.
+                    if (!humanWait && !isStubStepAnswer(step.text()) && StringUtils.isNotBlank(step.text())) {
+                        for (NodeOutcome outcome : pendingOutcomes) {
+                            if (outcome.result() == NodeTerminalCommitPort.Result.SUCCESS) {
+                                acceptedAnswer = AcceptedNodeAnswer.fromCommitted(snap, outcome.node().id(), step.text());
+                            }
+                        }
+                    }
                     trace(sessionId, AgentStepNode.STATE_COMMIT,
                             "{\"version\":" + snap.version() + "}");
                 } catch (PlannerStateStore.VersionConflictException e) {
                     metrics.casConflict();
                     log.warn("成功提交冲突，replan: {}", e.getMessage());
+                    continue;
                 }
             }
             todoProjector.project(sessionId,
                     stateStore.get(sessionId).map(StateSnapshot::graph).orElse(g));
+            if (snap.intent().needsClarification()) {
+                return RunOutcome.blockedOnHuman(snap.intent().clarificationQuestion(),
+                        "INTENT_NEEDS_CLARIFICATION");
+            }
             if (humanWait) {
                 log.info("PlanningLoop 等待用户 session={} reason={}",
                         sessionId, step.endReason());
-                if (StringUtils.isNotBlank(lastAnswer)) {
-                    return RunOutcome.blockedOnHuman(lastAnswer, step.endReason());
+                if (StringUtils.isNotBlank(step.text())) {
+                    return RunOutcome.blockedOnHuman(step.text(), step.endReason());
                 }
                 return RunOutcome.blockedOnHuman("需要你确认后才能继续。", step.endReason());
             }
             TaskGraph latest = stateStore.get(sessionId).map(StateSnapshot::graph).orElse(g);
             if (latest.hasAwaitingConfirm() || g.hasAwaitingConfirm()) {
                 log.info("PlanningLoop 等待人工输入 session={}", sessionId);
-                if (StringUtils.isNotBlank(lastAnswer)) {
-                    return RunOutcome.blockedOnHuman(lastAnswer, "AWAITING_CONFIRM");
-                }
+                String hint = firstAwaitingHint(latest);
+                if (StringUtils.isNotBlank(hint)) return RunOutcome.blockedOnHuman(hint, "AWAITING_CONFIRM");
                 return RunOutcome.blockedOnHuman(
                         "关键步骤等待确认：请在页面点击「确认并继续」。", "AWAITING_CONFIRM");
             }
@@ -860,18 +915,15 @@ public class PlanningLoop {
             unfinishedReason = "OUTER_ROUNDS_EXHAUSTED";
         }
 
-        if (StringUtils.isBlank(lastAnswer))
-            lastAnswer = "已按规划图推进任务（version="
-                    + stateStore.get(sessionId).map(StateSnapshot::version).orElse(0L)
-                    + "，metrics=" + metrics.snapshot() + "）。";
+        String unfinishedAnswer = "任务尚未完成，已保留执行进度。";
         // 走到这里说明是"没做完"退出（死锁/恢复耗尽/轮次用尽/配额中止）。
         // 绝不能把这种结果报成完成：上层会据此决定任务状态与"完成率"口径，
-        // 而用户看到的这句"已按规划图推进"听起来像成功。附带未完成节点让用户知道差在哪。
+        // 附带未完成节点，不将失败或尚未验收的节点散文当成交付结果。
         String pending = pendingSummary(sessionId);
         if (StringUtils.isNotBlank(pending)) {
-            lastAnswer = lastAnswer + "\n\n⚠️ 任务未完成（" + unfinishedReason + "）。仍待处理：\n" + pending;
+            unfinishedAnswer = unfinishedAnswer + "\n\n仍待处理：\n" + pending;
         }
-        return RunOutcome.unfinished(lastAnswer, unfinishedReason);
+        return RunOutcome.unfinished(unfinishedAnswer, unfinishedReason);
     }
 
     /** 未达成目标时列出还没成功的节点，避免用户只看到一句"已推进"。 */
@@ -891,12 +943,9 @@ public class PlanningLoop {
                     sb.append("- …\n");
                     break;
                 }
-                sb.append("- [").append(n.status()).append("] ")
-                        .append(StringUtils.isBlank(n.name()) ? n.id() : n.name());
+                sb.append("- ").append(StringUtils.isBlank(n.name()) ? n.id() : n.name());
                 if (StringUtils.isNotBlank(n.lastError())) {
-                    String err = n.lastError();
-                    sb.append("（").append(err.length() <= 120 ? err : err.substring(0, 120) + "…")
-                            .append("）");
+                    sb.append("（详情见执行日志）");
                 }
                 sb.append('\n');
             }
@@ -915,6 +964,52 @@ public class PlanningLoop {
             return previous == null ? "" : previous;
         }
         return next;
+    }
+
+    /** A reply candidate is local to a successfully committed node, never a model draft. */
+    record AcceptedNodeAnswer(String sessionId, String executionId, long planVersion,
+                              long committedVersion, TaskNode source, String text) {
+        static AcceptedNodeAnswer fromCommitted(StateSnapshot committed, String nodeId, String text) {
+            if (committed == null || StringUtils.isBlank(committed.sessionId())
+                    || StringUtils.isBlank(committed.executionId()) || committed.graph() == null
+                    || StringUtils.isBlank(text) || isStubStepAnswer(text)) return null;
+            TaskNode node = committed.graph().byId(nodeId);
+            if (node == null || node.status() != TaskNodeStatus.SUCCESS || !NodeOutputBinder.ofNode(node).complete(node))
+                return null;
+            // Accepting a tool observation or a file does not certify unrelated
+            // model prose. File/media delivery uses the accepted artifact summary;
+            // text delivery must be the very output evaluated for this node.
+            if (node.doneWhen().isFile() || node.doneWhen().isMedia()
+                    || !text.trim().equals(node.output().trim())) return null;
+            List<TaskNode> terminalNodes = committed.graph().nodes().stream()
+                    .filter(candidate -> committed.graph().nodes().stream()
+                            .noneMatch(other -> other.dependsOn().contains(candidate.id())))
+                    .toList();
+            // A middle step or one of several independent terminal outputs is not
+            // an answer for the whole graph. Those graphs use accepted-output summaries.
+            if (terminalNodes.size() != 1 || !node.id().equals(terminalNodes.getFirst().id())) return null;
+            return new AcceptedNodeAnswer(committed.sessionId(), committed.executionId(), committed.planVersion(),
+                    committed.version(), node, text.trim());
+        }
+
+        boolean matches(StateSnapshot snapshot) {
+            return snapshot != null && sessionId.equals(snapshot.sessionId())
+                    && executionId.equals(snapshot.executionId()) && planVersion == snapshot.planVersion()
+                    && snapshot.version() >= committedVersion && snapshot.graph() != null
+                    && source.equals(snapshot.graph().byId(source.id()));
+        }
+    }
+
+    /** Node drafts remain internal until their verdict and graph acceptance are durable. */
+    static AgentStreamSink nodeEvidenceStream(AgentStreamSink userStream) {
+        if (userStream == null) return null;
+        return new AgentStreamSink() {
+            @Override public void onThinking(String delta) { userStream.onThinking(delta); }
+            @Override public void onAnswerToken(String delta) { /* unaccepted node draft */ }
+            @Override public void onAnswerReset() { /* cannot reset the user's answer */ }
+            @Override public void onSubGoal(String text, int done, int total) { userStream.onSubGoal(text, done, total); }
+            @Override public void onContext(int used, int limit) { userStream.onContext(used, limit); }
+        };
     }
 
     static boolean isStubStepAnswer(String text) {
@@ -1149,7 +1244,8 @@ public class PlanningLoop {
             if (!node.inputs().isEmpty()) {
                 for (String in : node.inputs()) {
                     TaskNode prod = producerOf(graph, node, in);
-                    if (prod == null || (StringUtils.isBlank(prod.output())
+                    if (prod == null || prod.status() != TaskNodeStatus.SUCCESS
+                            || (StringUtils.isBlank(prod.output())
                             && StringUtils.isBlank(prod.outputBindings().get(in)))) {
                         continue;
                     }
@@ -1216,6 +1312,7 @@ public class PlanningLoop {
                                      long dispatchStateVersion,
                                      String sessionId,
                                      AgentStreamSink streamSink) {
+        AgentStreamSink evidenceStream = nodeEvidenceStream(streamSink);
         List<String> allowed = toolRouter.allowedFor(
                 proposal, graph, properties.isHardProposal());
         String focusTask = proposal.actions().isEmpty() ? "" : proposal.actions().get(0).taskId();
@@ -1275,7 +1372,7 @@ public class PlanningLoop {
             }
             try {
                 AgentLoop.LoopOutcome out = nodeExecutor.execute(chat, focus, userMessage, multimodalUser,
-                        history, maxIter, taskPlan, streamSink);
+                        history, maxIter, taskPlan, evidenceStream);
                 ToolResult lastToolResult = out.lastToolResult();
                 boolean toolAttempted = !out.toolsInvoked().isEmpty() || lastToolResult != null;
                 int chunks = 1;
@@ -1285,7 +1382,7 @@ public class PlanningLoop {
                     ArrayList<ChatMessage> live = new ArrayList<>(out.messages());
                     live.add(new SystemMessage(MessageConstants.PLANNER_CONTINUE_HINT));
                     out = nodeExecutor.continueNode(chat, live, userMessage,
-                            maxIter, taskPlan, streamSink);
+                            maxIter, taskPlan, evidenceStream);
                     if (out.lastToolResult() != null) lastToolResult = out.lastToolResult();
                     toolAttempted |= !out.toolsInvoked().isEmpty() || out.lastToolResult() != null;
                     chunks++;
@@ -1367,7 +1464,7 @@ public class PlanningLoop {
     }
 
     private boolean dispatchFenceValid(String sessionId, ActionProposal proposal) {
-        return ownsRunningProposal(stateStore.get(sessionId).orElse(null), proposal);
+        return stateStore.dispatchFenceValid(sessionId, proposal);
     }
 
     static boolean ownsRunningProposal(StateSnapshot snapshot, ActionProposal proposal) {
@@ -1432,7 +1529,7 @@ public class PlanningLoop {
             }
             sb.append(" expected=").append(a.expectedResult()).append('\n');
         }
-        sb.append("完成后用 todo update（id∈focusTodoIds）标 completed 并附可校验 evidence。\n");
+        sb.append(MessageConstants.DAG_EVIDENCE_SUBMISSION).append('\n');
         return sb.toString();
     }
 
@@ -1563,26 +1660,43 @@ public class PlanningLoop {
      * Recovery 成功则升版；达总上限/分类熔断则 CANCELLED，避免 FAILED→READY 空转。
      * CAS 冲突等瞬时失败不取消。REWRITE/REVISE 优先 LLM 重编译并保留 SUCCESS 节点。
      */
-    private StateSnapshot applyRecoveryOrCancel(String sessionId, StateSnapshot snap,
+    private record RecoveryAttempt(StateSnapshot snapshot, RunOutcome stop) {
+        static RecoveryAttempt notApplicable() { return new RecoveryAttempt(null, null); }
+        static RecoveryAttempt applied(StateSnapshot snapshot) { return new RecoveryAttempt(snapshot, null); }
+    }
+
+    private RecoveryAttempt rejectRecovery(String sessionId, StateSnapshot snap, String reason) {
+        StateSnapshot latest = stateStore.get(sessionId).orElse(snap);
+        todoProjector.project(sessionId, latest.graph());
+        log.warn("任务恢复已停止 session={} reason={}", sessionId, reason);
+        return new RecoveryAttempt(latest, RunOutcome.failed(
+                "任务恢复未通过校验，已保留执行进度并停止自动重试。请查看执行记录后继续。", reason));
+    }
+
+    private RecoveryAttempt applyRecoveryOrCancel(String sessionId, String fencingToken, StateSnapshot snap,
                                                 TaskNode node, FailureDiagnosis dx,
                                                 String taskId, ChatModel chat,
-                                                String userMessage, TaskPlan taskPlan) {
-        Optional<StateSnapshot> llm = tryLlmReplan(
-                sessionId, snap, node, dx, chat, userMessage, taskPlan);
-        if (llm.isPresent()) {
+                                                String userMessage, TaskPlan taskPlan,
+                                                List<ChatMessage> history) {
+        RecoveryAttempt llm = tryLlmReplan(
+                sessionId, fencingToken, snap, node, dx, chat, userMessage, taskPlan, history);
+        // A rejected plan is not permission to retry the previous graph. In
+        // particular, FAILED nodes would otherwise normalize back to READY.
+        if (llm.stop() != null) return llm;
+        if (llm.snapshot() != null) {
             metrics.recovery();
-            return llm.get();
+            return llm;
         }
         boolean atLimit = snap.recoveryCount() >= properties.getMaxRecoveries()
                 || recoveryEngine.classCount(snap, dx.failureClass())
                 >= recoveryEngine.classLimit(dx.failureClass());
         if (recoveryEngine.recover(sessionId, snap, dx).isPresent()) {
             metrics.recovery();
-            return stateStore.get(sessionId).orElse(snap);
+            return RecoveryAttempt.applied(stateStore.get(sessionId).orElse(snap));
         }
         if (!atLimit) {
             log.warn("Recovery 失败 task={}", taskId);
-            return stateStore.get(sessionId).orElse(snap);
+            return RecoveryAttempt.applied(stateStore.get(sessionId).orElse(snap));
         }
         log.warn("Recovery 耗尽，取消节点 task={}", taskId);
         TaskNode latest = snap.graph().byId(node.id());
@@ -1592,31 +1706,31 @@ public class PlanningLoop {
         TaskGraph g = snap.graph().replace(
                 latest.withStatus(TaskNodeStatus.CANCELLED).withError("recovery_exhausted"));
         try {
-            return stateStore.commit(sessionId, snap.version(), snap.withGraph(g));
+            return RecoveryAttempt.applied(stateStore.commit(sessionId, snap.version(), snap.withGraph(g)));
         } catch (PlannerStateStore.VersionConflictException e) {
             metrics.casConflict();
             log.warn("取消耗尽节点冲突 task={}: {}", taskId, e.getMessage());
-            return stateStore.get(sessionId).orElse(snap);
+            return RecoveryAttempt.applied(stateStore.get(sessionId).orElse(snap));
         }
     }
 
-    private Optional<StateSnapshot> tryLlmReplan(String sessionId, StateSnapshot snap,
+    private RecoveryAttempt tryLlmReplan(String sessionId, String fencingToken, StateSnapshot snap,
                                                  TaskNode node, FailureDiagnosis dx,
                                                  ChatModel chat, String userMessage,
-                                                 TaskPlan taskPlan) {
+                                                 TaskPlan taskPlan, List<ChatMessage> history) {
         if (chat == null || snap == null || node == null || dx == null) {
-            return Optional.empty();
+            return RecoveryAttempt.notApplicable();
         }
         if (dx.failureClass() != FailureClass.REWRITE_GRAPH
                 && dx.failureClass() != FailureClass.REVISE_GOAL) {
-            return Optional.empty();
+            return RecoveryAttempt.notApplicable();
         }
         if (snap.recoveryCount() >= properties.getMaxRecoveries()) {
-            return Optional.empty();
+            return RecoveryAttempt.notApplicable();
         }
         int used = recoveryEngine.classCount(snap, dx.failureClass());
         if (used >= recoveryEngine.classLimit(dx.failureClass())) {
-            return Optional.empty();
+            return RecoveryAttempt.notApplicable();
         }
         String correction = "失败节点 id=" + node.id()
                 + " name=" + node.name()
@@ -1628,56 +1742,97 @@ public class PlanningLoop {
                 // 而失败分类正是这里做的判断（RecoveryEngine.classify），模型重推纯属重复劳动且会跑偏。
                 + "\n建议处置: " + dx.suggestedFix()
                 + "\n请重新规划未完成部分，不要重复已成功节点。"
+                + "\n已成功节点回执（只可引用，不得重新执行）："
+                + PlannerStateJson.MAPPER.valueToTree(snap.graph().nodes().stream()
+                        .filter(completed -> completed.status() == TaskNodeStatus.SUCCESS).toList())
                 + " 产出文件的步骤必须 doneWhen.type=file_exists 且 path 非空。";
+        TaskPlan recoveryPlan = taskPlan.withTaskGoal(snap.goal().objective());
         GoalCompiler.CompileResult compiled;
         try {
-            compiled = goalCompiler.compileWithCorrection(
-                    chat, userMessage, taskPlan, correction);
+            compiled = history == null || history.isEmpty()
+                    ? goalCompiler.compileWithCorrection(chat, userMessage, recoveryPlan, correction)
+                    : goalCompiler.compileWithCorrection(chat, userMessage, recoveryPlan, correction, history);
         } catch (Exception e) {
             com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(e);
             log.warn("运行时 LLM replan 失败: {}", e.getMessage());
-            return Optional.empty();
+            return rejectRecovery(sessionId, snap, "REPLAN_COMPILATION_FAILED");
         }
         if (compiled == null || compiled.degradedCompilation()
                 || compiled.graph() == null || compiled.graph().isEmpty()) {
-            return Optional.empty();
+            return rejectRecovery(sessionId, snap, "REPLAN_COMPILATION_INVALID");
         }
-        TaskGraph merged = mergeKeepSuccess(
-                snap.graph(), compiled.graph(), snap.recoveryCount() + 1);
+        boolean waiting = compiled.intent().needsClarification();
+        TaskGraph merged = waiting ? compiled.graph()
+                : mergeKeepSuccess(snap.graph(), compiled.graph(), snap.recoveryCount() + 1);
         if (merged == null || merged.isEmpty()) {
-            return Optional.empty();
+            return rejectRecovery(sessionId, snap, "REPLAN_IDENTITY_CONFLICT");
         }
         if (!mergeValidationReports(
-                planValidator.validate(merged, taskPlan, compiled.goal(), compiled.intent()),
+                planValidator.validate(merged, recoveryPlan, compiled.goal(), compiled.intent()),
                 intentGraphValidator.validate(compiled.intent(), merged)).valid()) {
             log.warn("运行时 LLM replan 图验收失败（结构或意图）session={}", sessionId);
-            return Optional.empty();
+            return rejectRecovery(sessionId, snap, "REPLAN_VALIDATION_FAILED");
         }
         Goal nextGoal = compiled.goal() != null ? compiled.goal() : snap.goal();
         Map<String, Object> exec = new HashMap<>(snap.execution());
+        if (waiting) {
+            try {
+                TaskGraph completed = new TaskGraph(snap.graph().nodes().stream()
+                        .filter(receipt -> receipt.status() == TaskNodeStatus.SUCCESS).toList());
+                exec.put(RECOVERY_CLARIFICATION, PlannerStateJson.MAPPER.writeValueAsString(
+                        new RecoveryContinuation(snap.executionId(), completed)));
+            } catch (Exception invalidReceipt) {
+                return rejectRecovery(sessionId, snap, "RECOVERY_CONTEXT_INVALID");
+            }
+        }
         exec.put("recovery." + dx.failureClass().name(), used + 1);
         exec.put("lastFailureKind", dx.kind().name());
         StateSnapshot patched = snap.revisePlan(merged, nextGoal, compiled.intent(),
                         "llm_replan_" + dx.failureClass().name().toLowerCase())
                 .withExecution(exec).withRecoveryInc();
+        if (!sessionLock.renewSessionLock(sessionId, fencingToken)) {
+            return rejectRecovery(sessionId, snap, "SESSION_LOCK_LOST");
+        }
         try {
-            StateSnapshot committed = stateStore.commit(sessionId, snap.version(), patched);
-            stateStore.appendEvent(sessionId, committed, new DomainEvent(
+            // Replan state and audit must be committed in the same CAS.  A worker
+            // restart after the graph write must not produce a state whose recovery
+            // history says nothing about why the plan changed.
+            DomainEvent recoveryEvent = new DomainEvent(
                     "ev_" + UUID.randomUUID().toString().substring(0, 8),
                     DomainEventType.RECOVERY_APPLIED, null, dx.taskId(),
                     Map.of("class", dx.failureClass().name(), "kind", dx.kind().name(),
                             "tool", dx.tool(), "llmReplan", true),
-                    null));
+                    null);
+            StateSnapshot committed = stateStore.commit(sessionId, snap.version(), patched,
+                    List.of(recoveryEvent));
             log.info("运行时 LLM replan 已提交 session={} nodes={}",
                     sessionId, committed.graph().nodes().size());
-            return Optional.of(committed);
+            return RecoveryAttempt.applied(committed);
         } catch (PlannerStateStore.VersionConflictException e) {
             metrics.casConflict();
-            return Optional.empty();
+            return rejectRecovery(sessionId, snap, "STALE_EXECUTION");
         }
     }
 
-    // ponytail: LLM 可能把已成功步骤再规划一遍；靠 prompt 约束，必要时再按 name 去重
+    private static RecoveryContinuation recoveryContinuation(StateSnapshot waiting) {
+        Object value = waiting.execution().get(RECOVERY_CLARIFICATION);
+        if (value == null) return null;
+        try {
+            if (!(value instanceof String json)) throw new IllegalStateException();
+            RecoveryContinuation receipt = PlannerStateJson.MAPPER.readValue(json, RecoveryContinuation.class);
+            if (!java.util.Objects.equals(waiting.executionId(), receipt.executionId())
+                    || receipt.completed() == null || receipt.completed().nodes().stream()
+                    .anyMatch(node -> node.status() != TaskNodeStatus.SUCCESS
+                            || node.toolStatus() == com.miniagent.agent.tool.ToolStatus.UNKNOWN)) {
+                throw new IllegalStateException();
+            }
+            return receipt;
+        } catch (Exception invalid) {
+            throw new IllegalStateException("Invalid recovery clarification receipt", invalid);
+        }
+    }
+
+    /** Reuse matching completed producers; a model cannot replay their effects under a fresh ID. */
     static TaskGraph mergeKeepSuccess(TaskGraph oldGraph, TaskGraph neu, int gen) {
         if (oldGraph == null || neu == null || neu.isEmpty()) {
             return null;
@@ -1697,11 +1852,43 @@ public class PlanningLoop {
                 return null;
             }
             String mapped = prefix + n.id();
-            if (newIds.putIfAbsent(n.id(), mapped) != null || successIds.contains(mapped)) {
+            // A generated ID must never alias an existing receipt and silently skip a new action.
+            if (successIds.contains(mapped)) return null;
+            for (TaskNode completed : out) {
+                boolean sameId = completed.id().equals(n.id());
+                boolean sameOutput = !completed.outputs().isEmpty()
+                        && completed.outputs().stream().anyMatch(n.outputs()::contains);
+                boolean sameBoundAction = StringUtils.isNotBlank(completed.toolHint())
+                        && !completed.toolArguments().isEmpty()
+                        && java.util.Objects.equals(completed.capability(), n.capability())
+                        && java.util.Objects.equals(completed.toolHint(), n.toolHint())
+                        && java.util.Objects.equals(completed.toolArguments(), n.toolArguments());
+                // Matching an output label is evidence of a collision, not proof that
+                // two unbound actions are the same. Refuse the merge rather than replay
+                // or silently skip a potentially different side effect.
+                if (sameOutput && !sameId && !sameBoundAction) {
+                    return null;
+                }
+                if (sameId || sameOutput || sameBoundAction) {
+                    if (!java.util.Objects.equals(completed.capability(), n.capability())
+                            || (!sameBoundAction && !java.util.Objects.equals(completed.name(), n.name()))
+                            || !java.util.Objects.equals(completed.toolHint(), n.toolHint())
+                            || !java.util.Objects.equals(completed.toolArguments(), n.toolArguments())
+                            || !java.util.Objects.equals(completed.doneWhen(), n.doneWhen())
+                            || !java.util.Objects.equals(completed.inputs(), n.inputs())
+                            || (!n.outputBindings().isEmpty()
+                                && !java.util.Objects.equals(completed.outputBindings(), n.outputBindings()))
+                            || !java.util.Objects.equals(completed.outputs(), n.outputs())) return null;
+                    mapped = completed.id();
+                    break;
+                }
+            }
+            if (newIds.putIfAbsent(n.id(), mapped) != null) {
                 return null;
             }
         }
         for (TaskNode n : neu.nodes()) {
+            if (successIds.contains(newIds.get(n.id()))) continue;
             Set<String> deps = new LinkedHashSet<>();
             for (String dependency : n.dependsOn()) {
                 String mapped = newIds.get(dependency);
@@ -1812,8 +1999,25 @@ public class PlanningLoop {
     private GoalCompiler.CompileResult compileAndValidate(ChatModel chat,
                                                          String userMessage,
                                                          TaskPlan taskPlan) {
+        return compileAndValidate(chat, userMessage, taskPlan, List.of());
+    }
+
+    private GoalCompiler.CompileResult compileAndValidate(ChatModel chat,
+                                                         String userMessage,
+                                                         TaskPlan taskPlan,
+                                                         List<ChatMessage> history) {
+        return compileAndValidate(chat, userMessage, taskPlan, history, null, 0);
+    }
+
+    private GoalCompiler.CompileResult compileAndValidate(ChatModel chat, String userMessage,
+                                                         TaskPlan taskPlan, List<ChatMessage> history,
+                                                         TaskGraph completed, int generation) {
         // 第一次编译
-        GoalCompiler.CompileResult compiled = goalCompiler.compile(chat, userMessage, taskPlan);
+        boolean hasHistory = history != null && !history.isEmpty();
+        GoalCompiler.CompileResult compiled = hasHistory
+                ? goalCompiler.compile(chat, userMessage, taskPlan, history)
+                : goalCompiler.compile(chat, userMessage, taskPlan);
+        compiled = mergeCompletedCompilation(compiled, completed, generation);
 
         // 结构化验证
         PlanValidationReport report = mergeValidationReports(
@@ -1838,8 +2042,10 @@ public class PlanningLoop {
             String correctionPrompt = report.toCorrectionPrompt();
 
             // 重新编译，注入修正提示
-            GoalCompiler.CompileResult replanned = goalCompiler.compileWithCorrection(
-                chat, userMessage, taskPlan, correctionPrompt);
+            GoalCompiler.CompileResult replanned = hasHistory
+                    ? goalCompiler.compileWithCorrection(chat, userMessage, taskPlan, correctionPrompt, history)
+                    : goalCompiler.compileWithCorrection(chat, userMessage, taskPlan, correctionPrompt);
+            replanned = mergeCompletedCompilation(replanned, completed, generation);
 
             // 验证重新编译的结果
             report = mergeValidationReports(
@@ -1863,6 +2069,15 @@ public class PlanningLoop {
         return new GoalCompiler.CompileResult(compiled.goal(), new TaskGraph(List.of()), true,
                 GoalCompiler.CompilationSource.VALIDATION_ERROR, fallbackReason,
                 compiled.intent());
+    }
+
+    private static GoalCompiler.CompileResult mergeCompletedCompilation(GoalCompiler.CompileResult compiled,
+                                                                         TaskGraph completed, int generation) {
+        if (completed == null || compiled.intent().needsClarification() || compiled.graph().isEmpty()) return compiled;
+        TaskGraph merged = mergeKeepSuccess(completed, compiled.graph(), generation);
+        return new GoalCompiler.CompileResult(compiled.goal(),
+                merged == null ? new TaskGraph(List.of()) : merged,
+                compiled.degradedCompilation(), compiled.source(), compiled.fallbackReason(), compiled.intent());
     }
 
     private static PlanValidationReport mergeValidationReports(PlanValidationReport first,
@@ -1928,7 +2143,10 @@ public class PlanningLoop {
      * 这是不能接受的耦合。失败只降级为 warn，图状态照常提交。</p>
      */
     private record NodeOutcome(String actionId, TaskNode node, NodeTerminalCommitPort.Result result,
-                               NodeTerminalCommitPort.Detail detail) {}
+                               NodeTerminalCommitPort.Detail detail, SemanticAcceptanceReceipts.Proof acceptanceProof) {
+        NodeOutcome(String actionId, TaskNode node, NodeTerminalCommitPort.Result result,
+                    NodeTerminalCommitPort.Detail detail) { this(actionId, node, result, detail, null); }
+    }
 
     /** The node and its audit verdict become durable together, before metrics or memory learn it. */
     private StateSnapshot commitNodeOutcomes(String sessionId, String fencingToken, StateSnapshot expected, StateSnapshot next,
@@ -1944,6 +2162,14 @@ public class PlanningLoop {
                     success ? DomainEventType.NODE_SUCCESS : DomainEventType.NODE_FAILED,
                     outcome.actionId(), outcome.node().id(), success ? Map.of() : Map.of("reason", reason), null);
         }).toList();
+        Map<String, SemanticAcceptanceReceipts.Proof> proofs = new LinkedHashMap<>();
+        Set<String> settledIds = new LinkedHashSet<>();
+        for (NodeOutcome outcome : outcomes) {
+            settledIds.add(outcome.node().id());
+            if (outcome.result() == NodeTerminalCommitPort.Result.SUCCESS && outcome.acceptanceProof() != null)
+                proofs.put(outcome.node().id(), outcome.acceptanceProof());
+        }
+        next = SemanticAcceptanceReceipts.withSettledProofs(expected, next, settledIds, proofs);
         StateSnapshot committed = stateStore.commit(sessionId, expected.version(), next, events);
         for (NodeOutcome outcome : outcomes) {
             boolean success = outcome.result() == NodeTerminalCommitPort.Result.SUCCESS;

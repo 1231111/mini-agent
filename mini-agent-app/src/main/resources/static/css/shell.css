@@ -731,6 +731,37 @@
     gap: 9px;
 }
 
+.insp-memory-summary {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    margin-bottom: 10px;
+}
+
+.insp-memory-stat {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 8px 7px;
+    border: 1px solid var(--border, #e3e7f2);
+    border-radius: 10px;
+    color: var(--text2, #65708b);
+    background: var(--surface, #fff);
+    text-decoration: none;
+    transition: border-color .15s, background .15s, transform .15s;
+}
+
+.insp-memory-stat:hover {
+    border-color: var(--accent, #7b61e8);
+    background: var(--surface2, #f7f7ff);
+    transform: translateY(-1px);
+}
+
+.insp-memory-stat span { font-size: 9px; line-height: 1.35; overflow-wrap: anywhere; }
+.insp-memory-stat strong { color: var(--heading, #222842); font-size: 18px; line-height: 1.15; }
+.insp-memory-stat em { color: var(--accent, #6554d8); font-size: 9px; font-style: normal; }
+
 .insp-memory-item {
     display: flex;
     align-items: flex-start;
@@ -847,6 +878,15 @@
     line-height: 1.4;
     overflow-wrap: anywhere;
 }
+
+.insp-memory-more { margin-top: 5px; font-size: 11px; line-height: 1.6; }
+.insp-memory-more summary { cursor: pointer; color: var(--text-secondary, #667085); }
+.insp-memory-full { margin-top: 6px; max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.memory-entry-more { margin-top: 6px; color: var(--text3); font-size: 11px; }
+.memory-entry-more summary { cursor: pointer; color: var(--accent, #6554d8); }
+.memory-entry-row .row-main { min-width: 0; }
+#memAllContent, #memEntries, #memPreferencesSection, #knFactsSection, #knProceduresSection { scroll-margin-top: 82px; }
 
 .insp-memory-stats {
     display: flex;

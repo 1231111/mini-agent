@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:miniagent:release-manifest:v2",
+  "title": "MiniAgent signed release manifest, version 2",
+  "description": "The final raw UTF-8 manifest file bytes are signed with Ed25519. Schema validation does not verify signatures, expected-source-commit, hashes, real filesystem containment or time limits.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "sourceCommit",
+    "createdAt",
+    "files",
+    "scanReports"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 2
+    },
+    "sourceCommit": {
+      "$ref": "#/$defs/sourceCommit"
+    },
+    "createdAt": {
+      "$ref": "#/$defs/utcTimestamp"
+    },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/releaseFile"
+      }
+    },
+    "scanReports": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "$ref": "#/$defs/scanReference"
+      },
+      "allOf": [
+        {
+          "contains": {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "dependency"
+              }
+            }
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "container"
+              }
+            }
+          },
+          "minContains": 1,
+          "maxContains": 1
+        }
+      ]
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "sourceCommit": {
+      "type": "string",
+      "minLength": 40,
+      "maxLength": 64,
+      "oneOf": [
+        { "minLength": 40, "maxLength": 40 },
+        { "minLength": 64, "maxLength": 64 }
+      ],
+      "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"
+    },
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "minLength": 24,
+      "maxLength": 24,
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![.]{1,2}(/|$))(?!.*?/[.]{1,2}(/|$))[^/:\\\\\\u0000]+(/[^/:\\\\\\u0000]+)*$",
+      "description": "Forward-slash path relative to the manifest directory. Runtime checks also resolve real paths and reject direct symlinks and directory escape."
+    },
+    "releaseFile": {
+      "type": "object",
+      "required": [
+        "path",
+        "sha256",
+        "bytes"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": true
+    },
+    "scanReference": {
+      "type": "object",
+      "required": [
+        "kind",
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "dependency",
+            "container"
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

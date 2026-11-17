@@ -12,7 +12,8 @@ const regressions = fs.readdirSync(scripts).filter(name => /^test-.*\.mjs$/.test
 if (!regressions.length) { console.error('NO_CLIENT_REGRESSIONS_FOUND'); process.exit(2); }
 const files = [...regressions,
     path.join(repository, 'mini-agent-desktop/test/window-bounds.test.cjs'),
-    path.join(repository, 'scripts/agent-eval/quality-gate.test.mjs')];
+    path.join(repository, 'scripts/agent-eval/quality-gate.test.mjs'),
+    path.join(repository, 'scripts/release/release-gate.test.mjs')];
 for (const file of files) {
     if (!fs.statSync(file).isFile()) { console.error('MISSING_REQUIRED_REGRESSION'); process.exit(2); }
 }

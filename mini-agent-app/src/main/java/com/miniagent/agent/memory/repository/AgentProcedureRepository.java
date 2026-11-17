@@ -35,6 +35,10 @@ public interface AgentProcedureRepository extends JpaRepository<AgentProcedureEn
     List<AgentProcedureEntity> findByTenantIdAndScopeTypeAndScopeId(
         String tenantId, AgentMemoryEntryEntity.ScopeType scopeType, String scopeId);
 
+    long countByTenantIdAndScopeTypeAndScopeIdAndStatus(String tenantId,
+        AgentMemoryEntryEntity.ScopeType scopeType, String scopeId,
+        AgentMemoryEntryEntity.Status status);
+
     long countByTenantId(String tenantId);
 
     /**

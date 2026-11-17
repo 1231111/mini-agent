@@ -117,6 +117,14 @@ async function consume(harness, chunks, reconnectAttempt = 0) {
     return harness.bot.querySelector('.answer-stream');
 }
 
+{
+    const h = createHarness(), refreshes = [];
+    h.context.scheduleInspectorMemoryRefresh = sid => refreshes.push(sid);
+    await consume(h, [event('token', '已保存你的偏好'), event('end', '已保存你的偏好')]);
+    assert.deepEqual(refreshes, ['regression-session']);
+    console.log('PASS: completing a chat refreshes persisted preferences even without a trace stream');
+}
+
 for (const answerFirst of [true, false]) {
     const h = createHarness();
     const nodes = event('todo', JSON.stringify({ items: [{ id: 1, content: '核验来源', status: 'completed' }] }));
@@ -224,6 +232,31 @@ const finalAnswer = '已生成虚拟仿真交互页面。\n\n[查看 HTML 文件
     assert.equal(h.bot.querySelector('.task-status-card'), null);
     assert.equal(h.bot.querySelector('.permission-request-status')?.textContent, '已批准，Agent 正在继续执行。');
     console.log('PASS: approval clears the pending tool, resumes tokens, and preserves the final SSE answer');
+}
+
+{
+    const h = createHarness();
+    const answer = await consume(h, [
+        event('token', '正在整理查询结果'),
+        () => h.flushPaint(),
+        ask(),
+        () => {
+            const card = h.bot.querySelector('.permission-request-card');
+            const stream = h.bot.querySelector('.answer-stream');
+            assert.ok(card && stream);
+            assert.ok(h.bot.children.indexOf(card) < h.bot.children.indexOf(stream),
+                'a late authorization card must move ahead of an already-created answer');
+        },
+        async () => { await h.context.grantAskTool(); },
+        event('token', '授权后继续完成任务'),
+        event('end', finalAnswer)
+    ]);
+    const card = h.bot.querySelector('.permission-request-card');
+    assert.ok(h.bot.children.indexOf(card) < h.bot.children.indexOf(answer),
+        'terminal answer must remain below the authorization card');
+    assert.equal(card.querySelector('.permission-request-status')?.textContent,
+        '已批准，Agent 正在继续执行。');
+    console.log('PASS: authorization card stays before the final answer when it arrives after streamed text');
 }
 
 {

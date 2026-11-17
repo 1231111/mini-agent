@@ -193,6 +193,9 @@ agent:
     # 留空则登录走本机账号。注册和套餐页面在账号服务上，不在桌面壳里。
     # 配了地址之后本机必须能访问它，否则谁都登不进去。
     cloud:
+      # 客户端 H2 与云端账号库分离；云端 userId 只能通过 external_id 映射，
+      # 不能继承统一档的共享库模式并拿它直接查本地主键。
+      shared-database: false
       base-url: ${CLOUD_AUTH_BASE_URL:}
       # 与账号服务 ACCOUNT_INTERNAL_KEY 同值。空着时用量上报不发出，门户数字停在 0。
       internal-key: ${ACCOUNT_INTERNAL_KEY:}

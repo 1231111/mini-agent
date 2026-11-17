@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
+import java.util.Optional;
 
 public interface AgentSemanticFactRepository extends JpaRepository<AgentSemanticFactEntity, Long> {
 
@@ -25,13 +26,27 @@ public interface AgentSemanticFactRepository extends JpaRepository<AgentSemantic
         @Param("scopeType") AgentMemoryEntryEntity.ScopeType scopeType,
         @Param("scopeId") String scopeId);
 
+    @Query("SELECT COUNT(f) FROM AgentSemanticFactEntity f WHERE f.tenantId = :tenantId " +
+           "AND f.scopeType = :scopeType AND f.scopeId = :scopeId " +
+           "AND f.supersededBy IS NULL AND f.validTo IS NULL")
+    long countActiveFacts(
+        @Param("tenantId") String tenantId,
+        @Param("scopeType") AgentMemoryEntryEntity.ScopeType scopeType,
+        @Param("scopeId") String scopeId);
+
     @Query("SELECT f FROM AgentSemanticFactEntity f WHERE f.tenantId = :tenantId " +
+           "AND f.scopeType = :scopeType AND f.scopeId = :scopeId " +
            "AND f.subject = :subject AND f.predicate = :predicate " +
            "AND f.supersededBy IS NULL AND f.validTo IS NULL")
     List<AgentSemanticFactEntity> findActiveByTriple(
         @Param("tenantId") String tenantId,
+        @Param("scopeType") AgentMemoryEntryEntity.ScopeType scopeType,
+        @Param("scopeId") String scopeId,
         @Param("subject") String subject,
         @Param("predicate") String predicate);
+
+    Optional<AgentSemanticFactEntity> findByIdAndTenantIdAndScopeTypeAndScopeId(
+        Long id, String tenantId, AgentMemoryEntryEntity.ScopeType scopeType, String scopeId);
 
     long countByTenantId(String tenantId);
 }

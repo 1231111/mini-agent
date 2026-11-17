@@ -40,7 +40,7 @@ if (Test-Path $envFile) {
 }
 
 $missing = @()
-foreach ($name in @('MYSQL_ROOT_PASSWORD', 'REDIS_PASSWORD', 'MODEL_CONFIG_ENCRYPTION_KEY', 'LLM_API_KEY')) {
+foreach ($name in @('MYSQL_ROOT_PASSWORD', 'REDIS_PASSWORD', 'MODEL_CONFIG_ENCRYPTION_KEY')) {
     if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name, 'Process'))) {
         $missing += $name
     }
@@ -49,7 +49,7 @@ if ($missing.Count -gt 0) {
     Write-Host ("Missing " + ($missing -join ', ')) -ForegroundColor Red
     Write-Host "MYSQL_ROOT_PASSWORD / REDIS_PASSWORD must match the local MySQL and Redis." -ForegroundColor Red
     Write-Host "MODEL_CONFIG_ENCRYPTION_KEY: 32-byte Base64 (openssl rand -base64 32)." -ForegroundColor Red
-    Write-Host "LLM_API_KEY: chat model key; the MIMO_API_KEY value works, but the key name must be LLM_API_KEY." -ForegroundColor Red
+    Write-Host "Chat model key: set LLM_API_KEY or MIMO_API_KEY, or configure it in %USERPROFILE%\\.miniagent\\config.yml." -ForegroundColor Red
     exit 1
 }
 

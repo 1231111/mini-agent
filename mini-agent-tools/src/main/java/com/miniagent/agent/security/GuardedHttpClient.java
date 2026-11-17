@@ -30,6 +30,11 @@ import java.util.regex.Pattern;
 @Component
 public class GuardedHttpClient {
 
+    /** A redirect target rejected by NetworkGuard must never be retried through an external fetch provider. */
+    public static class NetworkRejectedException extends IOException {
+        public NetworkRejectedException(String message) { super(message); }
+    }
+
     private static final int MAX_REQUEST_BODY_BYTES = 1024 * 1024;
     private static final int ABSOLUTE_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
     private static final Set<Integer> REDIRECT_STATUSES = Set.of(301, 302, 303, 307, 308);
@@ -160,7 +165,7 @@ public class GuardedHttpClient {
     private void requireAllowed(URI uri) throws IOException {
         String blocked = networkGuard.validateUrl(uri.toString());
         if (blocked != null) {
-            throw new IOException(blocked);
+            throw new NetworkRejectedException(blocked);
         }
     }
 

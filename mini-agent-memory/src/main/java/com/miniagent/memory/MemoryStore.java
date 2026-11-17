@@ -10,6 +10,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.function.Function;
 import org.apache.commons.lang3.StringUtils;
 import com.miniagent.common.context.OwnerContext;
 
@@ -273,10 +274,7 @@ public class MemoryStore {
         return String.join("\n\n", blocks);
     }
 
-    /**
-     * 面向当前对话的记忆快照：若向量召回可用，MEMORY 笔记按 query 语义召回 Top-K（按需注入，
-     * 避免全量注入稀释重点）；向量不可用时回退为 {@link #getCombinedSnapshot()} 全量注入。
-     */
+    /** 面向当前对话检索有限相关记忆；向量索引没有结果时使用词项匹配，绝不全量回退。 */
     public String getSnapshotForQuery(String query) {
         return getSnapshotForQuery(query, true, true, 0);
     }
@@ -288,36 +286,50 @@ public class MemoryStore {
      */
     public String getSnapshotForQuery(String query, boolean includeMemory, boolean includeUser,
                                       int userMaxChars) {
-        if (!includeMemory && !includeUser) {
+        if ((!includeMemory && !includeUser) || StringUtils.isBlank(query)) {
             return "";
         }
         UserMemory um = current();
         List<String> blocks = new ArrayList<>();
 
         if (includeMemory) {
+            List<String> recalled = List.of();
             if (Objects.nonNull(vectorStore) && vectorStore.isEnabled()) {
-                Long uid = effectiveUserId();
-                List<String> recalled = vectorStore.recall(uid, query);
-                if (Objects.nonNull(recalled) && !recalled.isEmpty()) {
-                    String content = String.join(ENTRY_DELIMITER, recalled);
-                    String sep = "═".repeat(46);
-                    blocks.add(sep + "\n相关记忆（按当前对话召回 " + recalled.size() + " 条）\n" + sep + "\n" + content);
-                } else if (!um.memorySnapshot.isEmpty()) {
-                    blocks.add(um.memorySnapshot);
-                }
-            } else if (!um.memorySnapshot.isEmpty()) {
-                blocks.add(um.memorySnapshot);
+                List<String> vectorResults = vectorStore.recall(effectiveUserId(), query);
+                if (vectorResults != null) recalled = vectorResults;
             }
+            if (recalled.isEmpty()) {
+                recalled = relevantEntries(query, um.memoryEntries, 6);
+            } else {
+                recalled = recalled.stream().filter(Objects::nonNull).limit(6).toList();
+            }
+            addRelevantBlock(blocks, "相关记忆", recalled);
         }
 
-        if (includeUser && !um.userSnapshot.isEmpty()) {
-            String user = um.userSnapshot;
-            if (userMaxChars > 0 && user.length() > userMaxChars) {
-                user = user.substring(0, userMaxChars) + "…";
+        if (includeUser) {
+            List<String> relevantUsers = relevantEntries(query, um.userEntries, 6);
+            if (!relevantUsers.isEmpty()) {
+                String user = String.join(ENTRY_DELIMITER, relevantUsers);
+                if (userMaxChars > 0 && user.length() > userMaxChars) {
+                    user = user.substring(0, userMaxChars) + "…";
+                }
+                addRelevantBlock(blocks, "相关用户偏好", List.of(user));
             }
-            blocks.add(user);
         }
         return String.join("\n\n", blocks);
+    }
+
+    private static List<String> relevantEntries(String query, List<String> entries, int limit) {
+        List<String> newestFirst = new ArrayList<>(entries == null ? List.of() : entries);
+        Collections.reverse(newestFirst);
+        return MemoryRelevance.topRelevant(query, newestFirst, Function.identity(), limit);
+    }
+
+    private static void addRelevantBlock(List<String> blocks, String label, List<String> entries) {
+        if (entries == null || entries.isEmpty()) return;
+        String sep = "═".repeat(46);
+        blocks.add(sep + "\n" + label + "（按当前任务匹配 " + entries.size() + " 条）\n"
+                + sep + "\n" + String.join(ENTRY_DELIMITER, entries));
     }
 
     // =========================================================================

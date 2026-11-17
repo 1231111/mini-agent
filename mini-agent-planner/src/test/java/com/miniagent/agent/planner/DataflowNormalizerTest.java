@@ -63,6 +63,22 @@ class DataflowNormalizerTest {
     }
 
     @Test
+    void successorCannotConsumeEvidenceRetainedByFailedPredecessor() {
+        TaskNode n1 = new TaskNode("n1", "获取资料", "web", List.of(),
+                List.of(), List.of("source"), TaskNodeStatus.FAILED, 10,
+                DoneWhen.note(), "", "", 0, "stale evidence");
+        TaskNode n2 = new TaskNode("n2", "交付", "deliver", List.of("n1"),
+                List.of("source"), List.of("link"), TaskNodeStatus.READY, 9,
+                DoneWhen.note(), "", "", 0, "");
+        TaskGraph graph = new TaskGraph(List.of(n1, n2));
+        ActionProposal proposal = new GraphScheduler().propose(
+                new StateSnapshot(1, "s", "e", null, graph, Map.of(), Map.of(), List.of(), 0),
+                List.of(n2), 1);
+
+        assertEquals("", PlanningLoop.predecessorOutputs(graph, proposal));
+    }
+
+    @Test
     void parseGraphWiresMissingPorts() throws Exception {
         GoalCompiler compiler = new GoalCompiler(new PlannerProperties());
         TaskGraph g = compiler.parseGraph("""

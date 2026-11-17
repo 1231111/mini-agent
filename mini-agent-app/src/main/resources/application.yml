@@ -94,8 +94,9 @@ management:
 langchain4j:
   open-ai:
     chat-model:
-      # LLM_API_KEY 未设置时复用 MiMo 配置，避免对话和 Episode 提炼使用占位 Key。
-      api-key: ${LLM_API_KEY:${image.gen.mimo-api-key:}}
+      # LLM_API_KEY 未设置时直接复用外部 config.yml 的 MIMO_API_KEY。
+      # 不通过 image.gen 间接引用，避免生产校验和聊天客户端看到不同的配置链路。
+      api-key: ${LLM_API_KEY:${MIMO_API_KEY:}}
       base-url: ${LLM_BASE_URL:https://token-plan-cn.xiaomimimo.com/v1}
       model-name: ${LLM_MODEL:mimo-v2.6-pro}
       timeout: 1200s
@@ -103,7 +104,7 @@ langchain4j:
       sendThinking: false
     streaming-chat-model:
       # 流式模型与普通模型保持同一套认证配置。
-      api-key: ${LLM_API_KEY:${image.gen.mimo-api-key:}}
+      api-key: ${LLM_API_KEY:${MIMO_API_KEY:}}
       base-url: ${LLM_BASE_URL:https://token-plan-cn.xiaomimimo.com/v1}
       model-name: ${LLM_MODEL:mimo-v2.6-pro}
       timeout: 1200s
@@ -272,7 +273,7 @@ agent:
         reasoning: 1500
         tools: 4000
         todo: 2000
-        closing: 1500
+        closing: 2400
     history:
       # QUESTION 指代：相关度精捞最多保留条数（非盲目最近 N）
       question-with-ref: 6
@@ -343,6 +344,8 @@ agent:
     block-private-network: true
     # 同时执行的工具调用数上限
     max-concurrency: 8
+    # 单轮最多抓取的网页原文数；0 表示不限制。新闻/资料查询默认只核验少量高相关来源。
+    max-web-extract-calls: 3
     # 逐工具外层闸门覆盖（秒）。键 = 工具名；exec_command 不接受覆盖。
     timeout-overrides: {}
   execution:
@@ -438,6 +441,9 @@ web:
     bing-api-key: ${BING_API_KEY:}
     google-api-key: ${GOOGLE_API_KEY:}
     google-cse-id: ${GOOGLE_CSE_ID:}
+    # 可选的付费降级。仅在当前搜索/抓取提供方失败或无有效结果时调用。
+    deepseek-api-key: ${DEEPSEEK_API_KEY:}
+    deepseek-base-url: ${DEEPSEEK_API_BASE_URL:https://api.deepseek.com}
 
 # 图像生成配置（密钥见 ${MINI_AGENT_HOME}/config.yml，模板 config.example.yml）
 image:

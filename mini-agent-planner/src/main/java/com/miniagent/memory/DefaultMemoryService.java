@@ -13,10 +13,12 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Blob 作非结构化层；结构化库作事实/情景/工作记忆。检索服从 {@link MemoryReadPolicy}。
@@ -43,7 +45,7 @@ public class DefaultMemoryService implements MemoryService {
             if (StringUtils.isNotBlank(sessionId)) {
                 structured = formatStructured(loadStructured(sessionId, query, policy));
             } else if (policy.user()) {
-                structured = formatStructured(userOnlyContext());
+                structured = formatStructured(userOnlyContext(query));
             }
         }
         String blob = memoryStore.getSnapshotForQuery(
@@ -81,13 +83,16 @@ public class DefaultMemoryService implements MemoryService {
     @Override
     public Map<String, Object> replace(String target, String oldText, String newContent) {
         if (MemoryKeys.TARGET_USER.equals(target) && memoryManager != null) {
-            return addUserFact(newContent);
+            return replaceUserFact(oldText, newContent);
         }
         return memoryStore.replace(target, oldText, newContent);
     }
 
     @Override
     public Map<String, Object> remove(String target, String oldText) {
+        if (MemoryKeys.TARGET_USER.equals(target) && memoryManager != null) {
+            return removeUserFact(oldText);
+        }
         return memoryStore.remove(target, oldText);
     }
 
@@ -96,8 +101,11 @@ public class DefaultMemoryService implements MemoryService {
         List<String> out = new ArrayList<>(memoryStore.readEntries(target));
         if (MemoryKeys.TARGET_USER.equals(target) && memoryManager != null) {
             for (SemanticFact fact : userFacts()) {
-                if (fact.getObjectValue() != null && !out.contains(fact.getObjectValue())) {
-                    out.add(fact.getObjectValue());
+                String value = fact.getObjectValue();
+                if (value != null) {
+                    // facts 按旧到新排列；同值保留最近一次保存的位置，供界面反向显示。
+                    out.remove(value);
+                    out.add(value);
                 }
             }
         }
@@ -125,36 +133,152 @@ public class DefaultMemoryService implements MemoryService {
     }
 
     private Map<String, Object> addUserFact(String content) {
+        return writeUserFact(content, null);
+    }
+
+    private Map<String, Object> writeUserFact(String content, String subject) {
         if (StringUtils.isBlank(content)) {
-            Map<String, Object> fail = new LinkedHashMap<>();
-            fail.put("success", false);
-            fail.put("target", MemoryKeys.TARGET_USER);
-            fail.put("message", "内容不能为空。");
-            return fail;
+            return userResult(false, "内容不能为空。");
         }
         content = content.trim();
         String scanErr = SecurityScanner.scan(content);
         if (scanErr != null) {
-            Map<String, Object> fail = new LinkedHashMap<>();
-            fail.put("success", false);
-            fail.put("target", MemoryKeys.TARGET_USER);
-            fail.put("message", scanErr);
-            return fail;
+            return userResult(false, scanErr);
         }
         SemanticFact fact = new SemanticFact();
         fact.setTenantId(OwnerContext.effectiveTenantId());
         fact.setScope(MemoryScope.ofUser(
                 OwnerContext.effectiveTenantId(), OwnerContext.effectiveUserId()));
-        fact.setSubject(clip(content, FACT_SUBJECT_MAX));
+        // 替换时保留原事实身份，writeFact 才会把旧值归档，而不是另加一条冲突偏好。
+        fact.setSubject(subject == null ? clip(content, FACT_SUBJECT_MAX) : subject);
         fact.setPredicate(MemoryKeys.PREDICATE_PREFERENCE);
         fact.setObjectValue(content);
         fact.setSource(MemoryKeys.SOURCE_MEMORY_TOOL);
         memoryManager.writeFact(fact);
-        Map<String, Object> ok = new LinkedHashMap<>();
-        ok.put("success", true);
-        ok.put("target", MemoryKeys.TARGET_USER);
-        ok.put("message", "已写入用户偏好（语义事实，未重复写入画像 blob）。");
+        SemanticFact persisted = userFacts().stream()
+                .filter(saved -> Objects.equals(saved.getSubject(), fact.getSubject())
+                        && Objects.equals(saved.getPredicate(), fact.getPredicate())
+                        && Objects.equals(saved.getObjectValue(), fact.getObjectValue()))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("用户偏好写入后回读校验失败，请读取记忆确认实际状态。"));
+        Map<String, Object> ok = userResult(true, "已写入用户偏好并完成回读校验。");
+        ok.put("storage", "semantic_fact");
+        if (persisted.getId() != null) {
+            ok.put("fact_id", persisted.getId());
+        }
+        ok.put("readback", persisted.getObjectValue());
         return ok;
+    }
+
+    private Map<String, Object> replaceUserFact(String oldText, String newContent) {
+        if (StringUtils.isBlank(oldText)) {
+            return userResult(false, "old_text 不能为空。");
+        }
+        if (StringUtils.isBlank(newContent)) {
+            return userResult(false, "内容不能为空。使用 remove 删除条目。");
+        }
+        List<SemanticFact> facts = userFacts();
+        List<String> matches = matchingUserEntries(oldText, facts);
+        if (matches.size() != 1) {
+            return userMatchFailure(matches);
+        }
+        String previous = matches.getFirst();
+        List<SemanticFact> matchedFacts = facts.stream()
+                .filter(fact -> previous.equals(fact.getObjectValue())).toList();
+        if (matchedFacts.isEmpty()) {
+            Map<String, Object> result = memoryStore.replace(MemoryKeys.TARGET_USER, previous, newContent);
+            if (Boolean.TRUE.equals(result.get("success"))) {
+                requireUserEntry(newContent.trim(), true);
+                result.put("persisted", true);
+                result.put("storage", "user_blob");
+                result.put("readback", newContent.trim());
+            }
+            return result;
+        }
+        SemanticFact original = matchedFacts.getFirst();
+        Map<String, Object> result = writeUserFact(newContent, original.getSubject());
+        if (!Boolean.TRUE.equals(result.get("success"))) {
+            return result;
+        }
+        // 遗留的同值不同身份事实也必须归档，避免旧偏好继续被注入提示。
+        for (SemanticFact duplicate : matchedFacts) {
+            if (!Objects.equals(duplicate.getSubject(), original.getSubject())
+                    || !Objects.equals(duplicate.getPredicate(), original.getPredicate())) {
+                removeOwnedFact(duplicate);
+            }
+        }
+        removeLegacyUserEntry(previous);
+        if (!previous.equals(newContent.trim())) {
+            requireUserEntry(previous, false);
+        }
+        result.put("message", "用户偏好已替换并完成回读校验。");
+        return result;
+    }
+
+    private Map<String, Object> removeUserFact(String oldText) {
+        if (StringUtils.isBlank(oldText)) {
+            return userResult(false, "old_text 不能为空。");
+        }
+        List<SemanticFact> facts = userFacts();
+        List<String> matches = matchingUserEntries(oldText, facts);
+        if (matches.size() != 1) {
+            return userMatchFailure(matches);
+        }
+        String previous = matches.getFirst();
+        for (SemanticFact fact : facts) {
+            if (previous.equals(fact.getObjectValue())) {
+                removeOwnedFact(fact);
+            }
+        }
+        removeLegacyUserEntry(previous);
+        requireUserEntry(previous, false);
+        Map<String, Object> result = userResult(true, "用户偏好已删除并完成回读校验。");
+        result.put("removed", previous);
+        return result;
+    }
+
+    private List<String> matchingUserEntries(String oldText, List<SemanticFact> facts) {
+        List<String> entries = new ArrayList<>(memoryStore.readEntries(MemoryKeys.TARGET_USER));
+        for (SemanticFact fact : facts) {
+            if (fact.getObjectValue() != null) {
+                entries.add(fact.getObjectValue());
+            }
+        }
+        return entries.stream().filter(entry -> entry.contains(oldText.trim())).distinct().toList();
+    }
+
+    private static Map<String, Object> userMatchFailure(List<String> matches) {
+        return userResult(false, matches.isEmpty() ? "没有找到匹配的用户偏好。请先读取记忆。"
+                : "多个用户偏好匹配，请提供更具体的 old_text。");
+    }
+
+    private void removeOwnedFact(SemanticFact fact) {
+        if (fact.getId() == null || !memoryManager.removeFact(OwnerContext.effectiveTenantId(),
+                MemoryScope.ScopeType.USER.name(), OwnerContext.effectiveUserId(), fact.getId())) {
+            throw new IllegalStateException("用户偏好删除失败，请读取记忆确认实际状态。");
+        }
+    }
+
+    private void removeLegacyUserEntry(String content) {
+        if (memoryStore.readEntries(MemoryKeys.TARGET_USER).contains(content)
+                && !Boolean.TRUE.equals(memoryStore.remove(MemoryKeys.TARGET_USER, content).get("success"))) {
+            throw new IllegalStateException("遗留用户偏好删除失败，请读取记忆确认实际状态。");
+        }
+    }
+
+    private void requireUserEntry(String content, boolean present) {
+        if (read(MemoryKeys.TARGET_USER).contains(content) != present) {
+            throw new IllegalStateException("用户偏好操作后回读校验失败，请读取记忆确认实际状态。");
+        }
+    }
+
+    private static Map<String, Object> userResult(boolean success, String message) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("success", success);
+        result.put("persisted", success);
+        result.put("target", MemoryKeys.TARGET_USER);
+        result.put("message", message);
+        return result;
     }
 
     private boolean alreadyInStructured(String content) {
@@ -165,7 +289,7 @@ public class DefaultMemoryService implements MemoryService {
         if (n.length() < OVERLAP_MIN_CHARS) {
             return false;
         }
-        for (SemanticFact fact : userFacts()) {
+        for (SemanticFact fact : activeUserFacts()) {
             if (normalize(fact.getObjectValue()).contains(n)
                     || n.contains(normalize(fact.getObjectValue()))) {
                 return true;
@@ -184,21 +308,30 @@ public class DefaultMemoryService implements MemoryService {
                 return true;
             }
         }
-        return alreadyInStructured(content);
+        return userFacts().stream().anyMatch(fact -> {
+            String value = normalize(fact.getObjectValue());
+            return value.length() >= OVERLAP_MIN_CHARS
+                    && (value.contains(n) || n.contains(value));
+        });
     }
 
     private List<SemanticFact> userFacts() {
-        try {
-            return memoryManager.queryFacts(
-                    OwnerContext.effectiveTenantId(),
-                    MemoryScope.ScopeType.USER.name(),
-                    OwnerContext.effectiveUserId(),
-                    null).stream()
-                    .filter(SemanticFact::isValid)
-                    .toList();
-        } catch (Exception e) {
-            return List.of();
-        }
+        return activeUserFacts().stream()
+                .filter(fact -> MemoryKeys.PREDICATE_PREFERENCE.equals(fact.getPredicate()))
+                .toList();
+    }
+
+    private List<SemanticFact> activeUserFacts() {
+        // 读取失败必须让工具报告失败；空列表会把存储故障伪装成“用户没有偏好”。
+        return memoryManager.queryFacts(
+                OwnerContext.effectiveTenantId(),
+                MemoryScope.ScopeType.USER.name(),
+                OwnerContext.effectiveUserId(),
+                null).stream()
+                .filter(SemanticFact::isValid)
+                .sorted(Comparator.comparingLong(SemanticFact::getCreatedAt)
+                        .thenComparing(SemanticFact::getId, Comparator.nullsFirst(Comparator.naturalOrder())))
+                .toList();
     }
 
     private MemoryContext loadStructured(String sessionId, String query, MemoryReadPolicy policy) {
@@ -223,23 +356,29 @@ public class DefaultMemoryService implements MemoryService {
         if (!policy.user()) {
             raw.setPreferences(new ArrayList<>());
         } else {
-            for (SemanticFact fact : userFacts()) {
-                String value = fact.getObjectValue();
-                if (value != null && !raw.getPreferences().contains(value)) {
-                    raw.addPreference(value);
-                }
-            }
+            // User preferences are query-conditioned too. Injecting every saved
+            // preference makes unrelated tasks carry the whole profile into the prompt.
+            List<String> relevant = MemoryRelevance.topRelevant(query, userFacts(),
+                    SemanticFact::getObjectValue, 6).stream()
+                    .map(SemanticFact::getObjectValue)
+                    .filter(Objects::nonNull)
+                    .distinct()
+                    .toList();
+            raw.setPreferences(new ArrayList<>(relevant));
         }
         return raw;
     }
 
-    private MemoryContext userOnlyContext() {
+    private MemoryContext userOnlyContext(String query) {
         MemoryContext raw = new MemoryContext();
-        for (SemanticFact fact : userFacts()) {
-            String value = fact.getObjectValue();
-            if (value != null) {
-                raw.addPreference(value);
-            }
+        List<String> relevant = MemoryRelevance.topRelevant(query, userFacts(),
+                SemanticFact::getObjectValue, 6).stream()
+                .map(SemanticFact::getObjectValue)
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+        for (String value : relevant) {
+            raw.addPreference(value);
         }
         return raw;
     }

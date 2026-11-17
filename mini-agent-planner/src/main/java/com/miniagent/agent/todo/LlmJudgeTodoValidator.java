@@ -23,6 +23,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
 import org.apache.commons.lang3.StringUtils;
 
 /**
@@ -57,6 +60,25 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
     private int judgeTimeoutSeconds;
 
     private volatile ChatModel dedicatedJudge;
+    private record ModelIdentity(WeakReference<ChatModel> model, String identity) { }
+    private final List<ModelIdentity> acceptanceModelIdentities = new ArrayList<>();
+
+    /**
+     * An identity for the actual model instance and this judge policy, without exposing its credentials.
+     * New model instances and process restarts intentionally invalidate persisted verdict reuse.
+     * This records provenance only; no acceptance result is cached in this validator.
+     */
+    public synchronized String acceptanceIdentity() {
+        ChatModel model = resolveJudgeChat();
+        if (model == null) return "";
+        acceptanceModelIdentities.removeIf(entry -> entry.model().get() == null);
+        for (ModelIdentity entry : acceptanceModelIdentities) {
+            if (entry.model().get() == model) return entry.identity();
+        }
+        String identity = "judge-policy-v1:" + UUID.randomUUID();
+        acceptanceModelIdentities.add(new ModelIdentity(new WeakReference<>(model), identity));
+        return identity;
+    }
 
     @PostConstruct
     void initDedicatedJudge() {
@@ -99,7 +121,10 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
         if (StringUtils.isBlank(payload)) {
             return "llm_judge 无法读取 evidence 内容";
         }
-        if (payload.length() > 12000) return "llm_judge 完整 evidence 超出校验范围，尚未验证；请拆分材料";
+        // File acceptance reads are bounded at 48k chars.  Reject only when
+        // that bounded payload itself is exceeded; the following context
+        // budget check remains the authoritative per-model guard.
+        if (payload.length() > 48000) return "llm_judge 完整 evidence 超出校验范围，尚未验证；请拆分材料";
 
         String instructions = """
                 你是严格的任务验收裁判。根据「评判标准」判断「待验收内容」是否达标。

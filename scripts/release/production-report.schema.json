@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:miniagent:production-scan-report:v1",
+  "title": "MiniAgent normalized dependency or container scan report, version 1",
+  "description": "Structural contract only. Authenticity, release identity, signatures, hashes, time limits and waiver authorization require runtime verification and a trusted CI evidence producer.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "kind",
+    "status",
+    "generatedBy",
+    "scanId",
+    "generatedAt",
+    "sourceCommit",
+    "artifactSha256",
+    "scannedTargets",
+    "scanner",
+    "findings"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "kind": {
+      "enum": [
+        "dependency",
+        "container"
+      ]
+    },
+    "status": {
+      "const": "pass"
+    },
+    "generatedBy": {
+      "const": "controlled-ci",
+      "description": "Descriptive label, not proof that a scanner ran."
+    },
+    "scanId": {
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "generatedAt": {
+      "$ref": "#/$defs/utcTimestamp"
+    },
+    "sourceCommit": {
+      "$ref": "#/$defs/sourceCommit"
+    },
+    "artifactSha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "scannedTargets": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991,
+      "description": "Claimed target coverage; actual scan coverage must be established by trusted CI."
+    },
+    "scanner": {
+      "$ref": "#/$defs/scanner"
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "sourceCommit": {
+      "type": "string",
+      "minLength": 40,
+      "maxLength": 64,
+      "oneOf": [
+        { "minLength": 40, "maxLength": 40 },
+        { "minLength": 64, "maxLength": 64 }
+      ],
+      "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"
+    },
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "utcTimestamp": {
+      "type": "string",
+      "minLength": 24,
+      "maxLength": 24,
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$"
+    },
+    "scanner": {
+      "type": "object",
+      "required": [
+        "name",
+        "version",
+        "databaseUpdatedAt"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "version": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "databaseUpdatedAt": {
+          "$ref": "#/$defs/utcTimestamp"
+        }
+      },
+      "additionalProperties": true
+    },
+    "waiver": {
+      "type": "object",
+      "required": [
+        "reason",
+        "approvedBy",
+        "ticket",
+        "expiresAt",
+        "approvalSignature"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 16,
+          "pattern": "\\S(?:[\\s\\S]{14,})\\S"
+        },
+        "approvedBy": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "ticket": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "expiresAt": {
+          "$ref": "#/$defs/utcTimestamp"
+        },
+        "approvalSignature": {
+          "type": "string",
+          "minLength": 88,
+          "maxLength": 88,
+          "contentEncoding": "base64",
+          "pattern": "^[A-Za-z0-9+/]{86}==$",
+          "description": "Ed25519 signature encoding only; canonical encoding and cryptographic validity are checked at runtime."
+        }
+      },
+      "additionalProperties": true
+    },
+    "finding": {
+      "type": "object",
+      "required": [
+        "id",
+        "severity",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "severity": {
+          "enum": [
+            "critical",
+            "high",
+            "medium",
+            "low",
+            "info"
+          ]
+        },
+        "status": {
+          "enum": [
+            "open",
+            "ignored-with-expiry"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "ignored-with-expiry"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "waiver"
+            ],
+            "properties": {
+              "waiver": {
+                "$ref": "#/$defs/waiver"
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": true
+    }
+  }
+}

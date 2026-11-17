@@ -13,15 +13,20 @@ import com.miniagent.agent.permission.SessionPermissionStore;
 import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.common.ApiResponse;
 import com.miniagent.common.ErrorCode;
+import com.miniagent.common.context.OwnerContext;
 import com.miniagent.config.OpenAiModelProperties;
 import com.miniagent.config.security.AuthenticatedUser;
 import com.miniagent.config.security.JwtSessionService;
 import com.miniagent.config.security.SessionAuthorizationService;
 import com.miniagent.config.service.UserModelConfigService;
+import com.miniagent.memory.MemoryKeys;
+import com.miniagent.memory.MemoryService;
 import jakarta.servlet.http.HttpServletRequest;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -78,6 +83,8 @@ public class ShellApiController {
     private AgentProcedureRepository procedureRepository;
     @Autowired(required = false)
     private AgentEpisodeRepository episodeRepository;
+    @Autowired(required = false)
+    private MemoryService memoryService;
 
     // ==================== GET /api/shell/status ====================
 
@@ -174,28 +181,53 @@ public class ShellApiController {
                         : episodeRepository.findBySessionId(sessionId))
                 : List.of();
 
-        long memoryCount = memoryEntryRepository == null ? 0L
-                : memoryEntryRepository.countByTenantIdAndStatus(
-                        tenant, AgentMemoryEntryEntity.Status.ACTIVE);
-        long factCount = semanticFactRepository == null ? 0L
-                : semanticFactRepository.countByTenantId(tenant);
-        long procedureCount = procedureRepository == null ? 0L
-                : procedureRepository.countByTenantId(tenant);
-
         List<AgentSemanticFactEntity> facts = nonNullList(
                 semanticFactRepository == null ? null
-                        : semanticFactRepository.findByTenantIdAndScopeTypeAndScopeId(
+                        : semanticFactRepository.findActiveFacts(
                                 tenant, AgentMemoryEntryEntity.ScopeType.USER,
                                 String.valueOf(userId)));
         List<AgentProcedureEntity> procedures = nonNullList(
                 procedureRepository == null ? null
-                        : procedureRepository.findByTenantIdAndScopeTypeAndScopeId(
+                        : procedureRepository.findByTenantIdAndScopeTypeAndScopeIdAndStatus(
                                 tenant, AgentMemoryEntryEntity.ScopeType.USER,
-                                String.valueOf(userId)));
+                                String.valueOf(userId), AgentMemoryEntryEntity.Status.ACTIVE));
 
         // 上限由调用方给：检查器只要看几条，知识库整页要拉满一屏。
         // 夹在 1..500，避免有人传 0 或一亿把响应撑爆。
         int cap = Math.max(1, Math.min(500, limit));
+        Page<AgentMemoryEntryEntity> memoryPage = memoryEntryRepository == null ? null
+                : memoryEntryRepository.findByTenantIdAndScopeTypeAndScopeIdAndStatusOrderByUpdatedAtDesc(
+                        tenant, AgentMemoryEntryEntity.ScopeType.USER, String.valueOf(userId),
+                        AgentMemoryEntryEntity.Status.ACTIVE, PageRequest.of(0, cap));
+        List<Map<String, Object>> userMemories = (memoryPage == null ? List.<AgentMemoryEntryEntity>of()
+                : memoryPage.getContent()).stream().map(entry -> {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("id", entry.getId());
+            item.put("type", entry.getMemoryType() == null ? "" : entry.getMemoryType().name());
+            item.put("summary", safe(entry.getSummary()));
+            item.put("content", safe(entry.getContent()));
+            item.put("updatedAt", entry.getUpdatedAt());
+            return item;
+        }).toList();
+        long tenantMemoryCount = memoryEntryRepository == null ? 0L
+                : memoryEntryRepository.countByTenantIdAndStatus(
+                        tenant, AgentMemoryEntryEntity.Status.ACTIVE);
+        long tenantFactCount = semanticFactRepository == null ? 0L
+                : semanticFactRepository.countByTenantId(tenant);
+        long tenantProcedureCount = procedureRepository == null ? 0L
+                : procedureRepository.countByTenantId(tenant);
+        long memoryEntryCount = memoryEntryRepository == null ? 0L
+                : memoryEntryRepository.countByTenantIdAndScopeTypeAndScopeIdAndStatus(
+                        tenant, AgentMemoryEntryEntity.ScopeType.USER, String.valueOf(userId),
+                        AgentMemoryEntryEntity.Status.ACTIVE);
+        long factCount = semanticFactRepository == null ? 0L
+                : semanticFactRepository.countActiveFacts(
+                        tenant, AgentMemoryEntryEntity.ScopeType.USER, String.valueOf(userId));
+        long procedureCount = procedureRepository == null ? 0L
+                : procedureRepository.countByTenantIdAndScopeTypeAndScopeIdAndStatus(
+                        tenant, AgentMemoryEntryEntity.ScopeType.USER, String.valueOf(userId),
+                        AgentMemoryEntryEntity.Status.ACTIVE);
+        PreferenceSnapshot preferences = readUserPreferences(userId, tenant, cap);
         List<Map<String, Object>> related = new ArrayList<>();
         for (AgentEpisodeEntity ep : episodes) {
             if (related.size() >= cap) {
@@ -246,15 +278,31 @@ public class ShellApiController {
         }
 
         Map<String, Object> stats = new LinkedHashMap<>();
-        stats.put("memoryCount", memoryCount);
-        stats.put("factCount", factCount);
-        stats.put("procedureCount", procedureCount);
+        stats.put("memoryCount", tenantMemoryCount);
+        stats.put("factCount", tenantFactCount);
+        stats.put("procedureCount", tenantProcedureCount);
         stats.put("episodeCount", (long) episodes.size());
         stats.put("relatedCount", (long) related.size());
 
+        // Counts and detail lists use the same authenticated user's active USER scope.
+        Map<String, Object> userStats = new LinkedHashMap<>();
+        // The memory total includes both structured agent memories and persisted user
+        // preferences shown on /memory. Do not derive this from the capped display list.
+        userStats.put("memoryCount", preferences.available()
+                ? memoryEntryCount + preferences.totalCount() : null);
+        userStats.put("memoryEntryCount", memoryEntryCount);
+        userStats.put("preferenceCount", preferences.available() ? preferences.totalCount() : null);
+        userStats.put("factCount", factCount);
+        userStats.put("procedureCount", procedureCount);
+
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("sessionId", scoped ? sessionId : "");
+        // Compatibility: saved reports an episode summary, never a preference write receipt.
         data.put("saved", !episodes.isEmpty());
+        data.put("userPreferences", preferences.entries());
+        data.put("preferencesAvailable", preferences.available());
+        data.put("userMemories", userMemories);
+        data.put("userStats", userStats);
         data.put("related", related);
         data.put("tags", new ArrayList<>(tags));
         data.put("stats", stats);
@@ -304,6 +352,40 @@ public class ShellApiController {
     }
 
     // ==================== 内部辅助 ====================
+
+    private record PreferenceSnapshot(boolean available, List<Map<String, Object>> entries,
+                                      long totalCount) { }
+
+    private PreferenceSnapshot readUserPreferences(Long userId, String tenant, int cap) {
+        if (memoryService == null) {
+            return new PreferenceSnapshot(false, List.of(), 0L);
+        }
+        try (var ignored = OwnerContext.bind(new OwnerContext(userId, tenant))) {
+            List<String> stored = memoryService.read(MemoryKeys.TARGET_USER);
+            if (stored == null) {
+                return new PreferenceSnapshot(false, List.of(), 0L);
+            }
+            List<Map<String, Object>> entries = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            long totalCount = 0;
+            // Read the newest entries first, independently of the related episode limit.
+            for (int i = stored.size() - 1; i >= 0; i--) {
+                String content = stored.get(i);
+                if (StringUtils.isBlank(content) || !seen.add(content)) {
+                    continue;
+                }
+                totalCount++;
+                if (entries.size() < cap) {
+                    entries.add(Map.of("content", content, "target", MemoryKeys.TARGET_USER,
+                            "persisted", true));
+                }
+            }
+            return new PreferenceSnapshot(true, entries, totalCount);
+        } catch (RuntimeException unavailable) {
+            // An unavailable store must not look like a successful read with no preferences.
+            return new PreferenceSnapshot(false, List.of(), 0L);
+        }
+    }
 
     /**
      * 与现有端点同款取当前用户：优先读过滤器放在 request 上的 userId，

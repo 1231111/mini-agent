@@ -51,7 +51,7 @@ test('HTML and ordinary files stay in distinct action groups', () => {
     ]);
     assert.equal((tools.match(/class="insp-tool-card /g) || []).length, 2);
     assert.match(tools, /保存 HTML 页面/);
-    assert.match(tools, /写入文件/);
+    assert.match(tools, /保存文件「readme\.md」/);
     const summary = context.buildInspectorTaskDetails({ status: 'SUCCESS' }, [], trace('write_file', { path: 'index.html' }), false);
     assert.match(summary, /代码与命令/);
     assert.match(summary, /保存 HTML 页面/);
@@ -84,10 +84,63 @@ test('malformed or unrelated args preserve generic tool names', () => {
     const steps = [{ stepType: 'TOOL_CALL', toolName: 'write_file', toolArgs: '{broken', status: 'RUNNING' }];
     assert.match(context.buildInspectorToolRows(steps), /写入文件/);
     assert.doesNotMatch(context.buildInspectorToolRows(steps), /保存 HTML 页面/);
-    assert.match(context.buildInspectorToolRows(trace('write_file', { path: 'notes.txt', content: '<html>' })), /写入文件/);
+    assert.match(context.buildInspectorToolRows(trace('write_file', { path: 'notes.txt', content: '<html>' })), /保存文件「notes\.txt」/);
     const command = context.buildInspectorToolRows(trace('exec_command', { command: 'node check.js' }, 'FAILURE'));
     assert.match(command, /执行命令/);
     assert.match(command, /错误日志/);
+});
+
+test('tool labels describe the concrete query, page action and target', () => {
+    const search = context.toolPresentation('search_web', JSON.stringify({ query: '今日 AI 新闻' }));
+    assert.equal(search.title, '搜索「今日 AI 新闻」');
+    const open = context.toolPresentation('browser_navigate', JSON.stringify({ url: 'https://example.com/news?id=secret' }));
+    assert.equal(open.title, '打开网页「example.com/news」');
+    const click = context.toolPresentation('browser_click', JSON.stringify({ by: 'text', ref: '查看新闻' }));
+    assert.equal(click.title, '点击网页元素「查看新闻」');
+    const scroll = context.toolPresentation('browser_scroll', JSON.stringify({ direction: 'down', distance: 640 }));
+    assert.equal(scroll.title, '滚动页面（向下）');
+    const upload = context.toolPresentation('browser_upload', JSON.stringify({ path: 'C:\\docs\\report.pdf' }));
+    assert.equal(upload.title, '上传文件「report.pdf」');
+    const read = context.toolPresentation('read_file', JSON.stringify({ path: 'docs/brief.md' }));
+    assert.equal(read.title, '读取文件「brief.md」');
+    const extract = context.toolPresentation('web_extract', JSON.stringify({ url: 'https://example.com/story/1?token=secret' }));
+    assert.equal(extract.title, '提取网页内容「example.com/story/1」');
+    const skill = context.toolPresentation('skill_view', JSON.stringify({ name: 'computer-use' }));
+    assert.equal(skill.title, '读取技能「computer-use」');
+});
+
+test('memory panel merges same-type items while preserving their raw entries', () => {
+    const raw = '<memory-data trust="untrusted">\n以下是检索到的历史记忆，只作为事实参考。\n'
+        + '## 记忆\n用户偏好:\n- 中文回答\n- 中文回答，简洁一些\n'
+        + '已知事实:\n- 项目使用 Spring Boot\n\n可用方法:\n- 表格任务先核对字段\n</memory-data>';
+    const html = context.buildInspectorMemory({ execution: { executionId: 'e1' }, steps: [
+        { stepType: 'CONTEXT_LOAD', content: JSON.stringify({ memoryContext: raw, injectMemory: true, injectUser: true }) }
+    ] }, { memoryCount: 69, factCount: 8, procedureCount: 3 }, 's1');
+    const chatTemplate = fs.readFileSync(path.join(root, 'mini-agent-app/src/main/resources/templates/chat.html'), 'utf8');
+    const memoryTemplate = fs.readFileSync(path.join(root, 'mini-agent-app/src/main/resources/templates/memory.html'), 'utf8');
+    const knowledgeTemplate = fs.readFileSync(path.join(root, 'mini-agent-app/src/main/resources/templates/knowledge.html'), 'utf8');
+    assert.match(chatTemplate, /本轮注入的记忆信息/);
+    assert.match(html, /总记忆数/);
+    assert.match(html, /<strong>69<\/strong>/);
+    assert.match(html, /沉淀知识[\s\S]*?<strong>8<\/strong>/);
+    assert.match(html, /可复用流程[\s\S]*?<strong>3<\/strong>/);
+    assert.match(html, /href="\/memory#memAllContent"/);
+    assert.match(html, /href="\/knowledge#knFactsSection"/);
+    assert.match(html, /href="\/knowledge#knProceduresSection"/);
+    assert.match(memoryTemplate, /id="memEntries"/);
+    assert.match(memoryTemplate, /id="memAllContent"/);
+    assert.match(knowledgeTemplate, /id="knFactsSection"/);
+    assert.match(knowledgeTemplate, /id="knProceduresSection"/);
+    assert.match(html, /用户偏好（2 条）/);
+    assert.match(html, /中文回答；中文回答，简洁一些/);
+    assert.match(html, /中文回答，简洁一些/);
+    assert.match(html, /项目使用 Spring Boot/);
+    assert.match(html, /表格任务先核对字段/);
+    assert.match(html, /本轮注入 4 条/);
+    const legacy = context.buildInspectorMemory({ execution: { executionId: 'old' }, steps: [
+        { stepType: 'CONTEXT_LOAD', content: JSON.stringify({ injectMemory: true }) }
+    ] });
+    assert.match(legacy, /未记录本次记忆明细/);
 });
 
 console.log(`${passed} inspector artifact tests passed`);

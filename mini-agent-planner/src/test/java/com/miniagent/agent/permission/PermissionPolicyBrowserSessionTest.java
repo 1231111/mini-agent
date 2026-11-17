@@ -19,4 +19,15 @@ class PermissionPolicyBrowserSessionTest {
         assertTrue(PermissionPolicy.isPlanSafe("browser_close"));
         assertFalse(PermissionPolicy.isAskDangerous("browser_close"));
     }
+
+    @Test
+    void persistentSkillChangesRequireApproval() {
+        String tool = "skill_manage";
+        assertFalse(PermissionPolicy.isPlanSafe(tool));
+        assertTrue(PermissionPolicy.isAskDangerous(tool));
+        assertTrue(PermissionPolicy.needsSessionGrant(PermissionMode.ASK, tool,
+                ExecPolicy.ALLOW, ConfirmPolicy.DANGEROUS));
+        assertTrue(PermissionPolicy.needsSessionGrant(PermissionMode.READ_ONLY, tool,
+                ExecPolicy.ALLOW, ConfirmPolicy.AUTO));
+    }
 }

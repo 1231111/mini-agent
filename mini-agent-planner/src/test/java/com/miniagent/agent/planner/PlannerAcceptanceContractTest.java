@@ -127,6 +127,28 @@ class PlannerAcceptanceContractTest {
     }
 
     @Test
+    void ordinaryLargeHtmlArtifactsRemainEligibleForSemanticAcceptance() throws Exception {
+        Path file = temporary.resolve("dashboard.html");
+        StringBuilder html = new StringBuilder("<html><body>");
+        while (html.length() < 15_000) html.append("<section>demo dashboard content</section>");
+        html.append("</body></html>");
+        Files.writeString(file, html);
+
+        LlmJudgeTodoValidator judge = mock(LlmJudgeTodoValidator.class);
+        when(judge.validate(any(), anyString())).thenReturn(null);
+
+        StepEvaluator.EvalResult result = evaluator(judge).evaluate(
+                node("生成大屏", "code", DoneWhen.file(file.toString(), "包含大屏模块")),
+                ToolResult.success("写入成功"), file.toString());
+
+        assertTrue(result.ok(), result.reason());
+        ArgumentCaptor<String> evidence = ArgumentCaptor.forClass(String.class);
+        verify(judge).validate(any(), evidence.capture());
+        assertTrue(evidence.getValue().length() > 12_000,
+                "完整 HTML 应进入语义验收，而不是被旧的 12k 截断门禁拒绝");
+    }
+
+    @Test
     void structuralFileSuccessStaysCompatibleButDeclaredQualityCannotPassWithoutAJudge() throws Exception {
         Path file = temporary.resolve("page.html");
         Files.writeString(file, "<html><body>A basic page</body></html>");
@@ -173,19 +195,15 @@ class PlannerAcceptanceContractTest {
     }
 
     @Test
-    void binaryOrLongFileIsExplicitlyUnverifiedInsteadOfJudgingItsPathOrTruncatedContent() throws Exception {
+    void binaryFileIsExplicitlyUnverifiedInsteadOfJudgingItsPath() throws Exception {
         LlmJudgeTodoValidator judge = mock(LlmJudgeTodoValidator.class);
         Path binary = temporary.resolve("image.bin");
         Files.write(binary, new byte[200]);
-        Path longFile = temporary.resolve("large.html");
-        Files.writeString(longFile, "x".repeat(13000));
-        for (Path path : List.of(binary, longFile)) {
-            StepEvaluator.EvalResult result = evaluator(judge).evaluate(
-                    node("生成文件", "file_write", DoneWhen.file(path.toString(), "内容符合要求")),
-                    ToolResult.success(path.toString()), path.toString());
-            assertFalse(result.ok());
-            assertTrue(result.reason().contains("尚未验证"));
-        }
+        StepEvaluator.EvalResult result = evaluator(judge).evaluate(
+                node("生成文件", "file_write", DoneWhen.file(binary.toString(), "内容符合要求")),
+                ToolResult.success(binary.toString()), binary.toString());
+        assertFalse(result.ok());
+        assertTrue(result.reason().contains("尚未验证"));
         verifyNoInteractions(judge);
     }
 

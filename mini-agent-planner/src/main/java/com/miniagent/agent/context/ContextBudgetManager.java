@@ -4,6 +4,7 @@ import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.StringJoiner;
 
 /**
  * 按槽位截断后拼接 system prompt。不精确分词；Loop 内压缩仍由 ContextCompressor 负责。
@@ -18,10 +19,13 @@ public class ContextBudgetManager {
     }
 
     public String assemble(List<ContextFragment> fragments) {
-        if (fragments == null || fragments.isEmpty()) {
-            return "";
-        }
-        List<String> parts = new ArrayList<>();
+        return assembleFitted(fit(fragments));
+    }
+
+    /** Apply exactly the same slot budgets used by the prompt assembler. */
+    public List<ContextFragment> fit(List<ContextFragment> fragments) {
+        if (fragments == null || fragments.isEmpty()) return List.of();
+        List<ContextFragment> fitted = new ArrayList<>();
         for (ContextFragment fragment : fragments) {
             if (fragment == null || !fragment.hasText()) {
                 continue;
@@ -32,9 +36,18 @@ public class ContextBudgetManager {
                         text, properties.maxChars(fragment.slot()));
             }
             if (!text.isBlank()) {
-                parts.add(text);
+                fitted.add(ContextFragment.of(fragment.slot(), text));
             }
         }
-        return String.join("\n\n", parts);
+        return List.copyOf(fitted);
+    }
+
+    public String assembleFitted(List<ContextFragment> fragments) {
+        if (fragments == null || fragments.isEmpty()) return "";
+        StringJoiner joined = new StringJoiner("\n\n");
+        for (ContextFragment fragment : fragments) {
+            if (fragment != null && fragment.hasText()) joined.add(fragment.text());
+        }
+        return joined.toString();
     }
 }

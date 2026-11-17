@@ -408,13 +408,16 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
         requireSafeForPrompt(
                 fact.getSubject() + " " + fact.getPredicate() + " " + fact.getObjectValue(),
                 null, "语义事实");
-        // 检查是否已有相同三元组
+        AgentMemoryEntryEntity.ScopeType scopeType =
+                AgentMemoryEntryEntity.ScopeType.valueOf(fact.getScope().scopeType().name());
+        // 三元组的身份包含归属域；同租户的其他用户/项目不能被这次写入归档。
         List<AgentSemanticFactEntity> existing = factRepository.findActiveByTriple(
-            fact.getTenantId(), fact.getSubject(), fact.getPredicate());
+            fact.getTenantId(), scopeType, fact.getScope().scopeId(),
+            fact.getSubject(), fact.getPredicate());
 
         AgentSemanticFactEntity entity = new AgentSemanticFactEntity();
         entity.setTenantId(fact.getTenantId());
-        entity.setScopeType(AgentMemoryEntryEntity.ScopeType.valueOf(fact.getScope().scopeType().name()));
+        entity.setScopeType(scopeType);
         entity.setScopeId(fact.getScope().scopeId());
         entity.setSubject(fact.getSubject());
         entity.setPredicate(fact.getPredicate());
@@ -430,6 +433,22 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
             old.setValidTo(LocalDateTime.now());
             factRepository.save(old);
         }
+    }
+
+    @Override
+    @Transactional
+    public boolean removeFact(String tenantId, String scopeType, String scopeId, Long id) {
+        Optional<AgentSemanticFactEntity> found =
+                factRepository.findByIdAndTenantIdAndScopeTypeAndScopeId(id, tenantId,
+                        AgentMemoryEntryEntity.ScopeType.valueOf(scopeType), scopeId);
+        if (found.isEmpty() || found.get().getValidTo() != null
+                || found.get().getSupersededBy() != null) {
+            return false;
+        }
+        AgentSemanticFactEntity fact = found.get();
+        fact.setValidTo(LocalDateTime.now());
+        factRepository.save(fact);
+        return true;
     }
 
     @Override
@@ -695,6 +714,14 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
         fact.setConfidence(entity.getConfidence() != null ? entity.getConfidence() : 0.9);
         fact.setSource(entity.getSource());
         fact.setSupersededBy(entity.getSupersededBy());
+        fact.setValidFrom(entity.getValidFrom() == null ? null :
+                entity.getValidFrom().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli());
+        fact.setValidTo(entity.getValidTo() == null ? null :
+                entity.getValidTo().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli());
+        fact.setCreatedAt(entity.getCreatedAt() == null ? 0 :
+                entity.getCreatedAt().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli());
+        fact.setUpdatedAt(entity.getUpdatedAt() == null ? 0 :
+                entity.getUpdatedAt().atZone(ZoneId.systemDefault()).toInstant().toEpochMilli());
         return fact;
     }
 

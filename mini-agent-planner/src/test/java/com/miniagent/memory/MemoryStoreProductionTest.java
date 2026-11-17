@@ -107,7 +107,7 @@ class MemoryStoreProductionTest {
     }
 
     @Test
-    void 向量召回为空时_回退全量快照() {
+    void 向量召回为空时_只使用词项匹配不回退全量快照() {
         OwnerContext.setCurrentUser(100L);
         store.add("memory", "向量库尚未建立时的笔记");
         store.loadFromDisk();
@@ -116,8 +116,8 @@ class MemoryStoreProductionTest {
         store.setVectorStore(vec);
 
         String snap = store.getSnapshotForQuery("无关查询", true, false, 0);
-        assertTrue(snap.contains("向量库尚未建立时的笔记"),
-                "recall 空集时应回退 memorySnapshot 全量注入");
+        assertFalse(snap.contains("向量库尚未建立时的笔记"),
+                "没有相关命中时不能把全量记忆注入提示词");
     }
 
     @Test
