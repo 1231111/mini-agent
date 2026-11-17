@@ -55,6 +55,84 @@ class PlanningLoopReplanMergeTest {
                 new TaskGraph(List.of(node("next", List.of("missing"), TaskNodeStatus.PENDING))), 2));
     }
 
+    @Test
+    void rejectsGeneratedIdCollisionWithSuccessfulReceipt() {
+        TaskGraph completed = new TaskGraph(List.of(node("rp1_submit", List.of(), TaskNodeStatus.SUCCESS)));
+        TaskGraph replacement = new TaskGraph(List.of(node("submit", List.of(), TaskNodeStatus.PENDING)));
+        assertNull(PlanningLoop.mergeKeepSuccess(completed, replacement, 1));
+    }
+
+    @Test
+    void reusesRenamedBoundActionAndRebindsItsConsumers() {
+        TaskNode completed = boundAction("written", TaskNodeStatus.SUCCESS, Map.of("path", "report.md"));
+        TaskNode renamed = completed.withIdentityAndDependencies("renamed", List.of())
+                .withStatus(TaskNodeStatus.PENDING);
+        TaskGraph merged = PlanningLoop.mergeKeepSuccess(new TaskGraph(List.of(completed)),
+                new TaskGraph(List.of(renamed, node("finish", List.of("renamed"), TaskNodeStatus.PENDING))), 1);
+        assertNotNull(merged);
+        assertEquals(2, merged.nodes().size());
+        assertSame(completed, merged.byId("written"));
+        assertNull(merged.byId("rp1_renamed"));
+        assertEquals(List.of("written"), merged.byId("rp1_finish").dependsOn());
+    }
+
+    @Test
+    void rejectsRenamedActionWithConflictingOutputBindings() {
+        TaskNode completed = boundAction("written", TaskNodeStatus.SUCCESS, Map.of("path", "report.md"));
+        TaskNode renamed = boundAction("renamed", TaskNodeStatus.PENDING, Map.of("path", "different.md"));
+        assertNull(PlanningLoop.mergeKeepSuccess(new TaskGraph(List.of(completed)),
+                new TaskGraph(List.of(renamed)), 1));
+    }
+
+    @Test
+    void reusesCompletedReceiptWhenNewPlanDoesNotDeclareRuntimeOutputBindings() {
+        TaskNode completed = boundAction("written", TaskNodeStatus.SUCCESS, Map.of("path", "report.md"));
+        TaskNode renamed = boundAction("renamed", TaskNodeStatus.PENDING, Map.of());
+        TaskGraph merged = PlanningLoop.mergeKeepSuccess(new TaskGraph(List.of(completed)),
+                new TaskGraph(List.of(renamed)), 1);
+        assertNotNull(merged);
+        assertEquals(List.of(completed), merged.nodes());
+        assertEquals(Map.of("path", "report.md"), merged.byId("written").outputBindings());
+    }
+
+    @Test
+    void doesNotDeduplicateUnboundPlanningStepsOnlyBecauseTheirMetadataMatches() {
+        TaskNode completed = node("completed", List.of(), TaskNodeStatus.SUCCESS);
+        TaskNode renamed = node("renamed", List.of(), TaskNodeStatus.PENDING);
+        TaskGraph merged = PlanningLoop.mergeKeepSuccess(new TaskGraph(List.of(completed)),
+                new TaskGraph(List.of(renamed)), 1);
+        assertNotNull(merged);
+        assertEquals(2, merged.nodes().size());
+        assertEquals(List.of("completed"), merged.byId("rp1_renamed").dependsOn());
+    }
+
+    @Test
+    void rejectsDifferentUnboundActionsThatShareOutputName() {
+        TaskNode completed = unboundQuery("query-a", "查询 A", TaskNodeStatus.SUCCESS);
+        TaskNode replacement = unboundQuery("query-b", "查询 B", TaskNodeStatus.PENDING);
+        assertNull(PlanningLoop.mergeKeepSuccess(new TaskGraph(List.of(completed)),
+                new TaskGraph(List.of(replacement)), 1));
+    }
+
+    @Test
+    void rejectsSameIdWhenBusinessMeaningChanges() {
+        TaskNode completed = unboundQuery("query", "查询 A", TaskNodeStatus.SUCCESS);
+        TaskNode replacement = unboundQuery("query", "查询 B", TaskNodeStatus.PENDING);
+        assertNull(PlanningLoop.mergeKeepSuccess(new TaskGraph(List.of(completed)),
+                new TaskGraph(List.of(replacement)), 1));
+    }
+
+    private static TaskNode unboundQuery(String id, String name, TaskNodeStatus status) {
+        return new TaskNode(id, name, "web", List.of(), List.of("query"),
+                List.of("query-result"), status, 10, DoneWhen.note(), "", "", 0, "");
+    }
+
+    private static TaskNode boundAction(String id, TaskNodeStatus status, Map<String, String> bindings) {
+        return new TaskNode(id, id, "file_write", List.of(), List.of(), List.of(), status,
+                10, DoneWhen.note(), "file_write", Map.of("path", "report.md", "content", "done"),
+                "", List.of(), "", 0, "", bindings);
+    }
+
     private static TaskNode node(String id, List<String> dependsOn, TaskNodeStatus status) {
         return new TaskNode(id, id, "research", dependsOn, List.of(), List.of(), status,
                 10, DoneWhen.note(), "", "", 0, "");

@@ -85,6 +85,23 @@ function dateInZone(timestamp, timeZone) {
     return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
+function evidenceUrl(value, code) {
+    requireValue(nonempty(value), code);
+    let url;
+    try {
+        url = new URL(value);
+    } catch {
+        throw new Error(code);
+    }
+    requireValue(['https:', 'http:'].includes(url.protocol) && !url.username && !url.password, code);
+    return url.href;
+}
+
+function evidenceHash(value, code) {
+    requireValue(typeof value === 'string' && /^[a-f0-9]{64}$/.test(value), code);
+    return value;
+}
+
 function news(check, result, observation) {
     requireValue(/^\d{4}-\d{2}-\d{2}$/.test(check.date) && nonempty(check.timeZone), 'NEWS_DATE_CONTRACT');
     requireValue(Number.isSafeInteger(check.minItems) && check.minItems > 0
@@ -97,7 +114,12 @@ function news(check, result, observation) {
             && nonempty(source.title) && nonempty(source.publisher)
             && /^[a-f0-9]{64}$/.test(source.bodySha256)
             && ['publisher-metadata', 'fixture-oracle'].includes(source.dateEvidence), 'SOURCE_EVIDENCE_INVALID');
-        const url = new URL(source.url);
+        let url;
+        try {
+            url = new URL(source.url);
+        } catch {
+            throw new Error('SOURCE_URL_INVALID');
+        }
         requireValue(['https:', 'http:'].includes(url.protocol) && !url.username && !url.password, 'SOURCE_URL_INVALID');
         sources.set(source.id, { ...source, url: url.href, host: url.hostname });
     }
@@ -115,6 +137,41 @@ function news(check, result, observation) {
     }
     requireValue(publishers.size >= check.minSources, 'NEWS_INSUFFICIENT_SOURCES');
     requireValue(!check.requiredSourceIds || check.requiredSourceIds.every(id => used.has(id)), 'NEWS_REQUIRED_SOURCE_MISSING');
+}
+
+/**
+ * Verify a generic web search independently of the model's answer.  The
+ * collector owns HTTP status, body hash and retrieval timestamp; the model can
+ * only cite a source that the collector actually observed.
+ */
+function search(check, result, observation) {
+    requireValue(Number.isSafeInteger(check.minItems) && check.minItems > 0
+        && Number.isSafeInteger(check.minSources) && check.minSources > 0, 'SEARCH_MINIMUM_CONTRACT');
+    requireValue(Array.isArray(observation.searchSources) && observation.searchSources.length > 0,
+        'SEARCH_SOURCE_EVIDENCE_REQUIRED');
+    const sources = new Map();
+    for (const source of observation.searchSources) {
+        const url = evidenceUrl(source.url, 'SEARCH_SOURCE_URL_INVALID');
+        requireValue(identifier(source.id) && !sources.has(source.id)
+            && source.httpStatus === 200 && nonempty(source.title)
+            && evidenceHash(source.bodySha256, 'SEARCH_BODY_HASH_REQUIRED')
+            && source.evidence === 'search-collector'
+            && isoTime(source.retrievedAt), 'SEARCH_SOURCE_EVIDENCE_INVALID');
+        sources.set(source.id, { ...source, url, host: new URL(url).hostname });
+    }
+    const items = result.delivery?.search;
+    requireValue(Array.isArray(items) && items.length >= check.minItems, 'SEARCH_ITEMS_MISSING');
+    const used = new Set(), hosts = new Set();
+    for (const item of items) {
+        const source = sources.get(item.sourceId);
+        requireValue(source && !used.has(item.sourceId), 'SEARCH_SOURCE_MISSING_OR_DUPLICATE');
+        requireValue(nonempty(item.title) && item.title === source.title
+            && item.url === source.url && nonempty(item.summary), 'SEARCH_CITATION_MISMATCH');
+        requireValue(!check.allowedHosts || check.allowedHosts.includes(source.host), 'SEARCH_SOURCE_HOST');
+        used.add(item.sourceId);
+        hosts.add(source.host);
+    }
+    requireValue(hosts.size >= check.minSources, 'SEARCH_INSUFFICIENT_SOURCES');
 }
 
 function uiArtifact(check, result, observation, context) {
@@ -166,7 +223,56 @@ function formReceipt(check, result, observation) {
     }
 }
 
-export const businessValidators = Object.freeze({ news, 'ui-artifact': uiArtifact, 'form-receipt': formReceipt });
+/** Validate browser interactions from a browser-side observer, not DOM text in the answer. */
+function browserAction(check, result, observation) {
+    requireValue(Array.isArray(check.requiredActions) && check.requiredActions.length > 0,
+        'BROWSER_ACTION_CONTRACT');
+    requireValue(Array.isArray(observation.browserActions), 'BROWSER_OBSERVATION_REQUIRED');
+    const actions = new Map();
+    for (const event of observation.browserActions) {
+        requireValue(identifier(event.id) && !actions.has(event.id)
+            && event.source === 'browser-observer' && event.verified === true
+            && nonempty(event.observedState) && evidenceHash(event.snapshotSha256, 'BROWSER_SNAPSHOT_HASH_REQUIRED'),
+        'BROWSER_ACTION_EVIDENCE_INVALID');
+        actions.set(event.id, event);
+    }
+    const delivered = new Map(Array.isArray(result.delivery?.browserActions)
+        ? result.delivery.browserActions.filter(item => identifier(item?.id)).map(item => [item.id, item]) : []);
+    for (const expected of check.requiredActions) {
+        const actual = actions.get(expected.id);
+        requireValue(actual && actual.observedState === expected.expectedState, 'BROWSER_ACTION_NOT_VERIFIED');
+        requireValue(delivered.get(expected.id)?.observedState === actual.observedState,
+            'BROWSER_REPLY_STATE_MISMATCH');
+    }
+}
+
+/** Validate native desktop actions against an independent screenshot observer. */
+function desktopAction(check, result, observation, context) {
+    requireValue(Array.isArray(check.requiredActions) && check.requiredActions.length > 0,
+        'DESKTOP_ACTION_CONTRACT');
+    requireValue(Array.isArray(observation.desktopActions), 'DESKTOP_OBSERVATION_REQUIRED');
+    const actions = new Map();
+    for (const event of observation.desktopActions) {
+        requireValue(identifier(event.id) && !actions.has(event.id)
+            && event.source === 'desktop-observer' && event.verified === true
+            && nonempty(event.observedState), 'DESKTOP_ACTION_EVIDENCE_INVALID');
+        requireValue(event.screenshot && typeof event.screenshot.path === 'string',
+            'DESKTOP_SCREENSHOT_REQUIRED');
+        inspectArtifact(context, event.screenshot);
+        actions.set(event.id, event);
+    }
+    const delivered = new Map(Array.isArray(result.delivery?.desktopActions)
+        ? result.delivery.desktopActions.filter(item => identifier(item?.id)).map(item => [item.id, item]) : []);
+    for (const expected of check.requiredActions) {
+        const actual = actions.get(expected.id);
+        requireValue(actual && actual.observedState === expected.expectedState, 'DESKTOP_ACTION_NOT_VERIFIED');
+        requireValue(delivered.get(expected.id)?.observedState === actual.observedState,
+            'DESKTOP_REPLY_STATE_MISMATCH');
+    }
+}
+
+export const businessValidators = Object.freeze({ news, search, 'ui-artifact': uiArtifact,
+    'form-receipt': formReceipt, 'browser-action': browserAction, 'desktop-action': desktopAction });
 
 /** Never trust a model's passed/success fields or cached checkResults. Only the harness supplies observation. */
 export function assessCase(definition, capture, context, validators = businessValidators) {

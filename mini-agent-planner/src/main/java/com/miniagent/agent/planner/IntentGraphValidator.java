@@ -14,6 +14,15 @@ import java.util.Locale;
 public final class IntentGraphValidator {
 
     public PlanValidationReport validate(TaskIntent intent, TaskGraph graph) {
+        if (intent != null && intent.needsClarification()) {
+            if (GoalCompiler.isClarificationWait(graph, intent)) {
+                return new PlanValidationReport(List.of(), List.of());
+            }
+            return new PlanValidationReport(List.of(new PlanValidationReport.ValidationError(
+                    PlanValidationReport.ValidationError.Type.GENERAL, null,
+                    "待澄清意图只能对应具体问题的等待节点，不能包含可执行动作",
+                    "先取得用户补充信息，再对交付物、输入、约束和验收条件重新编译校验")), List.of());
+        }
         if (intent == null || graph == null) {
             return new PlanValidationReport(List.of(), List.of());
         }

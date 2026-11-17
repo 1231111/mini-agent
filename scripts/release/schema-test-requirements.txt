@@ -1,0 +1,2 @@
+# Test-only dependencies for the published release Schema contracts.
+jsonschema[format-nongpl]==4.23.0

@@ -54,6 +54,10 @@ public class PlanningLoop {
     private static final int PRIOR_OUTPUT_CHARS = 6000;
     private static final int AWAITING_HINT_CHARS = 500;
     static final String EXECUTION_HUMAN_WAIT = "humanWait";
+    static final String RECOVERY_CLARIFICATION = "recoveryClarification";
+
+    /** Completed receipts stay outside the single-node clarification graph while it waits. */
+    private record RecoveryContinuation(String executionId, TaskGraph completed) {}
 
     private final PlannerProperties properties;
     private final GoalCompiler goalCompiler;
@@ -383,17 +387,44 @@ public class PlanningLoop {
             if (stored instanceof Boolean requested) taskPlan = taskPlan.withArtifactDeliveryRequested(requested);
         }
         if (clarifyRecompile) {
+            RecoveryContinuation continuation;
+            try {
+                continuation = recoveryContinuation(existing.get());
+            } catch (IllegalStateException invalid) {
+                return RunOutcome.failed("任务恢复信息无法验证，已保留原有进度，请先检查执行记录。",
+                        "RECOVERY_CONTEXT_INVALID");
+            }
             String merged = mergeClarifyObjective(
                     existing.get().goal().objective(), userMessage);
             TaskPlan nextPlan = taskPlan.withTaskGoal(merged);
-            compiled = compileAndValidate(chat, merged, nextPlan);
+            compiled = compileAndValidate(chat, merged, nextPlan, history,
+                    continuation == null ? null : continuation.completed(),
+                    existing.get().recoveryCount() + 1);
             if (!planValidator.accept(compiled.graph(), nextPlan, compiled.goal(), compiled.intent())) {
                 return invalidPlanOutcome(sessionId, compiled);
             }
-            String execId = StringUtils.isNotBlank(executionId)
-                    ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
-            snap = stateStore.init(sessionId, execId, compiled.goal(), compiled.graph(),
-                    compiled.intent(), compiled.source(), compiled.degraded());
+            if (continuation != null) {
+                StateSnapshot previous = existing.get();
+                if (!sessionLock.renewSessionLock(sessionId, fencingToken)) {
+                    return RunOutcome.failed("任务执行租约已失效，已停止恢复任务。", "SESSION_LOCK_LOST");
+                }
+                Map<String, Object> metadata = new LinkedHashMap<>(previous.execution());
+                if (!compiled.intent().needsClarification()) metadata.remove(RECOVERY_CLARIFICATION);
+                StateSnapshot replacement = previous.revisePlan(compiled.graph(), compiled.goal(),
+                        compiled.intent(), compiled.source(), compiled.degraded(), "recovery_clarification_reply")
+                        .withExecution(metadata);
+                try {
+                    snap = stateStore.commit(sessionId, previous.version(), replacement);
+                } catch (PlannerStateStore.VersionConflictException conflict) {
+                    metrics.casConflict();
+                    return RunOutcome.failed("任务进度已更新，请基于最新状态继续。", "STALE_EXECUTION");
+                }
+            } else {
+                String execId = StringUtils.isNotBlank(executionId)
+                        ? executionId : "exec_" + UUID.randomUUID().toString().substring(0, 8);
+                snap = stateStore.init(sessionId, execId, compiled.goal(), compiled.graph(),
+                        compiled.intent(), compiled.source(), compiled.degraded());
+            }
             log.info("PlanningLoop 澄清后重编译 session={} nodes={} clarify={}",
                     sessionId, compiled.graph().nodes().size(),
                     compiled.goal().isClarify());
@@ -401,7 +432,7 @@ public class PlanningLoop {
             String merged = mergeClarifyObjective(
                     existing.get().goal().objective(), userMessage);
             TaskPlan nextPlan = taskPlan.withTaskGoal(merged);
-            compiled = compileAndValidate(chat, merged, nextPlan);
+            compiled = compileAndValidate(chat, merged, nextPlan, history);
             if (!planValidator.accept(compiled.graph(), nextPlan, compiled.goal(), compiled.intent())) {
                 // A revision is not approval to execute either the old or an invalid
                 // replacement plan. Retain the pending snapshot for another revision.
@@ -436,7 +467,7 @@ public class PlanningLoop {
             // ===========================================
 
         } else {
-            compiled = compileAndValidate(chat, userMessage, taskPlan);
+            compiled = compileAndValidate(chat, userMessage, taskPlan, history);
             if (!planValidator.accept(compiled.graph(), taskPlan, compiled.goal(), compiled.intent())) {
                 return invalidPlanOutcome(sessionId, compiled);
             }
@@ -521,6 +552,10 @@ public class PlanningLoop {
             if (unknownNode != null) {
                 return stopUnknownOutcome(sessionId, snap, unknownNode);
             }
+            if (snap.intent().needsClarification()) {
+                return RunOutcome.blockedOnHuman(snap.intent().clarificationQuestion(),
+                        "INTENT_NEEDS_CLARIFICATION");
+            }
             TaskGraph normalized = snap.graph().normalizeForScheduling();
             if (!sameNodeStatuses(normalized, snap.graph())) {
                 try {
@@ -571,8 +606,10 @@ public class PlanningLoop {
                         metrics.casConflict();
                         continue;
                     }
-                    snap = applyRecoveryOrCancel(sessionId, snap, bad, dx, bad.id(),
-                            chat, userMessage, taskPlan);
+                    RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap, bad, dx, bad.id(),
+                            chat, userMessage, taskPlan, history);
+                    if (recovery.stop() != null) return recovery.stop();
+                    snap = recovery.snapshot();
                     todoProjector.project(sessionId, snap.graph());
                     continue;
                 }
@@ -619,8 +656,10 @@ public class PlanningLoop {
                         stuck, diagnoseTool(stuck, ""), "no ready nodes");
                 TaskGraph before = snap.graph();
                 acceptedAnswer = null;
-                snap = applyRecoveryOrCancel(sessionId, snap, stuck, dx, stuck.id(),
-                        chat, userMessage, taskPlan);
+                RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap, stuck, dx, stuck.id(),
+                        chat, userMessage, taskPlan, history);
+                if (recovery.stop() != null) return recovery.stop();
+                snap = recovery.snapshot();
                 if (sameNodeStatuses(before, snap.graph())) {
                     // 恢复动作没有改变任何节点状态 = 死锁（例如上游被写成 CANCELLED，
                     // 后继永远拿不到解锁条件）。这正是"卡住了却报成功"的典型现场。
@@ -752,8 +791,10 @@ public class PlanningLoop {
                         metrics.casConflict();
                         break;
                     }
-                    snap = applyRecoveryOrCancel(sessionId, snap, node, dx, action.taskId(),
-                            chat, userMessage, taskPlan);
+                    RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap, node, dx, action.taskId(),
+                            chat, userMessage, taskPlan, history);
+                    if (recovery.stop() != null) return recovery.stop();
+                    snap = recovery.snapshot();
                     g = snap.graph();
                     continue;
                 }
@@ -802,8 +843,10 @@ public class PlanningLoop {
                         log.warn("状态冲突，触发 replan: {}", e.getMessage());
                         break;
                     }
-                    snap = applyRecoveryOrCancel(sessionId, snap, node, dx, action.taskId(),
-                            chat, userMessage, taskPlan);
+                    RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap, node, dx, action.taskId(),
+                            chat, userMessage, taskPlan, history);
+                    if (recovery.stop() != null) return recovery.stop();
+                    snap = recovery.snapshot();
                     g = snap.graph();
                 }
             }
@@ -837,6 +880,10 @@ public class PlanningLoop {
             }
             todoProjector.project(sessionId,
                     stateStore.get(sessionId).map(StateSnapshot::graph).orElse(g));
+            if (snap.intent().needsClarification()) {
+                return RunOutcome.blockedOnHuman(snap.intent().clarificationQuestion(),
+                        "INTENT_NEEDS_CLARIFICATION");
+            }
             if (humanWait) {
                 log.info("PlanningLoop 等待用户 session={} reason={}",
                         sessionId, step.endReason());
@@ -1611,26 +1658,43 @@ public class PlanningLoop {
      * Recovery 成功则升版；达总上限/分类熔断则 CANCELLED，避免 FAILED→READY 空转。
      * CAS 冲突等瞬时失败不取消。REWRITE/REVISE 优先 LLM 重编译并保留 SUCCESS 节点。
      */
-    private StateSnapshot applyRecoveryOrCancel(String sessionId, StateSnapshot snap,
+    private record RecoveryAttempt(StateSnapshot snapshot, RunOutcome stop) {
+        static RecoveryAttempt notApplicable() { return new RecoveryAttempt(null, null); }
+        static RecoveryAttempt applied(StateSnapshot snapshot) { return new RecoveryAttempt(snapshot, null); }
+    }
+
+    private RecoveryAttempt rejectRecovery(String sessionId, StateSnapshot snap, String reason) {
+        StateSnapshot latest = stateStore.get(sessionId).orElse(snap);
+        todoProjector.project(sessionId, latest.graph());
+        log.warn("任务恢复已停止 session={} reason={}", sessionId, reason);
+        return new RecoveryAttempt(latest, RunOutcome.failed(
+                "任务恢复未通过校验，已保留执行进度并停止自动重试。请查看执行记录后继续。", reason));
+    }
+
+    private RecoveryAttempt applyRecoveryOrCancel(String sessionId, String fencingToken, StateSnapshot snap,
                                                 TaskNode node, FailureDiagnosis dx,
                                                 String taskId, ChatModel chat,
-                                                String userMessage, TaskPlan taskPlan) {
-        Optional<StateSnapshot> llm = tryLlmReplan(
-                sessionId, snap, node, dx, chat, userMessage, taskPlan);
-        if (llm.isPresent()) {
+                                                String userMessage, TaskPlan taskPlan,
+                                                List<ChatMessage> history) {
+        RecoveryAttempt llm = tryLlmReplan(
+                sessionId, fencingToken, snap, node, dx, chat, userMessage, taskPlan, history);
+        // A rejected plan is not permission to retry the previous graph. In
+        // particular, FAILED nodes would otherwise normalize back to READY.
+        if (llm.stop() != null) return llm;
+        if (llm.snapshot() != null) {
             metrics.recovery();
-            return llm.get();
+            return llm;
         }
         boolean atLimit = snap.recoveryCount() >= properties.getMaxRecoveries()
                 || recoveryEngine.classCount(snap, dx.failureClass())
                 >= recoveryEngine.classLimit(dx.failureClass());
         if (recoveryEngine.recover(sessionId, snap, dx).isPresent()) {
             metrics.recovery();
-            return stateStore.get(sessionId).orElse(snap);
+            return RecoveryAttempt.applied(stateStore.get(sessionId).orElse(snap));
         }
         if (!atLimit) {
             log.warn("Recovery 失败 task={}", taskId);
-            return stateStore.get(sessionId).orElse(snap);
+            return RecoveryAttempt.applied(stateStore.get(sessionId).orElse(snap));
         }
         log.warn("Recovery 耗尽，取消节点 task={}", taskId);
         TaskNode latest = snap.graph().byId(node.id());
@@ -1640,31 +1704,31 @@ public class PlanningLoop {
         TaskGraph g = snap.graph().replace(
                 latest.withStatus(TaskNodeStatus.CANCELLED).withError("recovery_exhausted"));
         try {
-            return stateStore.commit(sessionId, snap.version(), snap.withGraph(g));
+            return RecoveryAttempt.applied(stateStore.commit(sessionId, snap.version(), snap.withGraph(g)));
         } catch (PlannerStateStore.VersionConflictException e) {
             metrics.casConflict();
             log.warn("取消耗尽节点冲突 task={}: {}", taskId, e.getMessage());
-            return stateStore.get(sessionId).orElse(snap);
+            return RecoveryAttempt.applied(stateStore.get(sessionId).orElse(snap));
         }
     }
 
-    private Optional<StateSnapshot> tryLlmReplan(String sessionId, StateSnapshot snap,
+    private RecoveryAttempt tryLlmReplan(String sessionId, String fencingToken, StateSnapshot snap,
                                                  TaskNode node, FailureDiagnosis dx,
                                                  ChatModel chat, String userMessage,
-                                                 TaskPlan taskPlan) {
+                                                 TaskPlan taskPlan, List<ChatMessage> history) {
         if (chat == null || snap == null || node == null || dx == null) {
-            return Optional.empty();
+            return RecoveryAttempt.notApplicable();
         }
         if (dx.failureClass() != FailureClass.REWRITE_GRAPH
                 && dx.failureClass() != FailureClass.REVISE_GOAL) {
-            return Optional.empty();
+            return RecoveryAttempt.notApplicable();
         }
         if (snap.recoveryCount() >= properties.getMaxRecoveries()) {
-            return Optional.empty();
+            return RecoveryAttempt.notApplicable();
         }
         int used = recoveryEngine.classCount(snap, dx.failureClass());
         if (used >= recoveryEngine.classLimit(dx.failureClass())) {
-            return Optional.empty();
+            return RecoveryAttempt.notApplicable();
         }
         String correction = "失败节点 id=" + node.id()
                 + " name=" + node.name()
@@ -1676,56 +1740,97 @@ public class PlanningLoop {
                 // 而失败分类正是这里做的判断（RecoveryEngine.classify），模型重推纯属重复劳动且会跑偏。
                 + "\n建议处置: " + dx.suggestedFix()
                 + "\n请重新规划未完成部分，不要重复已成功节点。"
+                + "\n已成功节点回执（只可引用，不得重新执行）："
+                + PlannerStateJson.MAPPER.valueToTree(snap.graph().nodes().stream()
+                        .filter(completed -> completed.status() == TaskNodeStatus.SUCCESS).toList())
                 + " 产出文件的步骤必须 doneWhen.type=file_exists 且 path 非空。";
+        TaskPlan recoveryPlan = taskPlan.withTaskGoal(snap.goal().objective());
         GoalCompiler.CompileResult compiled;
         try {
-            compiled = goalCompiler.compileWithCorrection(
-                    chat, userMessage, taskPlan, correction);
+            compiled = history == null || history.isEmpty()
+                    ? goalCompiler.compileWithCorrection(chat, userMessage, recoveryPlan, correction)
+                    : goalCompiler.compileWithCorrection(chat, userMessage, recoveryPlan, correction, history);
         } catch (Exception e) {
             com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(e);
             log.warn("运行时 LLM replan 失败: {}", e.getMessage());
-            return Optional.empty();
+            return rejectRecovery(sessionId, snap, "REPLAN_COMPILATION_FAILED");
         }
         if (compiled == null || compiled.degradedCompilation()
                 || compiled.graph() == null || compiled.graph().isEmpty()) {
-            return Optional.empty();
+            return rejectRecovery(sessionId, snap, "REPLAN_COMPILATION_INVALID");
         }
-        TaskGraph merged = mergeKeepSuccess(
-                snap.graph(), compiled.graph(), snap.recoveryCount() + 1);
+        boolean waiting = compiled.intent().needsClarification();
+        TaskGraph merged = waiting ? compiled.graph()
+                : mergeKeepSuccess(snap.graph(), compiled.graph(), snap.recoveryCount() + 1);
         if (merged == null || merged.isEmpty()) {
-            return Optional.empty();
+            return rejectRecovery(sessionId, snap, "REPLAN_IDENTITY_CONFLICT");
         }
         if (!mergeValidationReports(
-                planValidator.validate(merged, taskPlan, compiled.goal(), compiled.intent()),
+                planValidator.validate(merged, recoveryPlan, compiled.goal(), compiled.intent()),
                 intentGraphValidator.validate(compiled.intent(), merged)).valid()) {
             log.warn("运行时 LLM replan 图验收失败（结构或意图）session={}", sessionId);
-            return Optional.empty();
+            return rejectRecovery(sessionId, snap, "REPLAN_VALIDATION_FAILED");
         }
         Goal nextGoal = compiled.goal() != null ? compiled.goal() : snap.goal();
         Map<String, Object> exec = new HashMap<>(snap.execution());
+        if (waiting) {
+            try {
+                TaskGraph completed = new TaskGraph(snap.graph().nodes().stream()
+                        .filter(receipt -> receipt.status() == TaskNodeStatus.SUCCESS).toList());
+                exec.put(RECOVERY_CLARIFICATION, PlannerStateJson.MAPPER.writeValueAsString(
+                        new RecoveryContinuation(snap.executionId(), completed)));
+            } catch (Exception invalidReceipt) {
+                return rejectRecovery(sessionId, snap, "RECOVERY_CONTEXT_INVALID");
+            }
+        }
         exec.put("recovery." + dx.failureClass().name(), used + 1);
         exec.put("lastFailureKind", dx.kind().name());
         StateSnapshot patched = snap.revisePlan(merged, nextGoal, compiled.intent(),
                         "llm_replan_" + dx.failureClass().name().toLowerCase())
                 .withExecution(exec).withRecoveryInc();
+        if (!sessionLock.renewSessionLock(sessionId, fencingToken)) {
+            return rejectRecovery(sessionId, snap, "SESSION_LOCK_LOST");
+        }
         try {
-            StateSnapshot committed = stateStore.commit(sessionId, snap.version(), patched);
-            stateStore.appendEvent(sessionId, committed, new DomainEvent(
+            // Replan state and audit must be committed in the same CAS.  A worker
+            // restart after the graph write must not produce a state whose recovery
+            // history says nothing about why the plan changed.
+            DomainEvent recoveryEvent = new DomainEvent(
                     "ev_" + UUID.randomUUID().toString().substring(0, 8),
                     DomainEventType.RECOVERY_APPLIED, null, dx.taskId(),
                     Map.of("class", dx.failureClass().name(), "kind", dx.kind().name(),
                             "tool", dx.tool(), "llmReplan", true),
-                    null));
+                    null);
+            StateSnapshot committed = stateStore.commit(sessionId, snap.version(), patched,
+                    List.of(recoveryEvent));
             log.info("运行时 LLM replan 已提交 session={} nodes={}",
                     sessionId, committed.graph().nodes().size());
-            return Optional.of(committed);
+            return RecoveryAttempt.applied(committed);
         } catch (PlannerStateStore.VersionConflictException e) {
             metrics.casConflict();
-            return Optional.empty();
+            return rejectRecovery(sessionId, snap, "STALE_EXECUTION");
         }
     }
 
-    // ponytail: LLM 可能把已成功步骤再规划一遍；靠 prompt 约束，必要时再按 name 去重
+    private static RecoveryContinuation recoveryContinuation(StateSnapshot waiting) {
+        Object value = waiting.execution().get(RECOVERY_CLARIFICATION);
+        if (value == null) return null;
+        try {
+            if (!(value instanceof String json)) throw new IllegalStateException();
+            RecoveryContinuation receipt = PlannerStateJson.MAPPER.readValue(json, RecoveryContinuation.class);
+            if (!java.util.Objects.equals(waiting.executionId(), receipt.executionId())
+                    || receipt.completed() == null || receipt.completed().nodes().stream()
+                    .anyMatch(node -> node.status() != TaskNodeStatus.SUCCESS
+                            || node.toolStatus() == com.miniagent.agent.tool.ToolStatus.UNKNOWN)) {
+                throw new IllegalStateException();
+            }
+            return receipt;
+        } catch (Exception invalid) {
+            throw new IllegalStateException("Invalid recovery clarification receipt", invalid);
+        }
+    }
+
+    /** Reuse matching completed producers; a model cannot replay their effects under a fresh ID. */
     static TaskGraph mergeKeepSuccess(TaskGraph oldGraph, TaskGraph neu, int gen) {
         if (oldGraph == null || neu == null || neu.isEmpty()) {
             return null;
@@ -1745,11 +1850,43 @@ public class PlanningLoop {
                 return null;
             }
             String mapped = prefix + n.id();
-            if (newIds.putIfAbsent(n.id(), mapped) != null || successIds.contains(mapped)) {
+            // A generated ID must never alias an existing receipt and silently skip a new action.
+            if (successIds.contains(mapped)) return null;
+            for (TaskNode completed : out) {
+                boolean sameId = completed.id().equals(n.id());
+                boolean sameOutput = !completed.outputs().isEmpty()
+                        && completed.outputs().stream().anyMatch(n.outputs()::contains);
+                boolean sameBoundAction = StringUtils.isNotBlank(completed.toolHint())
+                        && !completed.toolArguments().isEmpty()
+                        && java.util.Objects.equals(completed.capability(), n.capability())
+                        && java.util.Objects.equals(completed.toolHint(), n.toolHint())
+                        && java.util.Objects.equals(completed.toolArguments(), n.toolArguments());
+                // Matching an output label is evidence of a collision, not proof that
+                // two unbound actions are the same. Refuse the merge rather than replay
+                // or silently skip a potentially different side effect.
+                if (sameOutput && !sameId && !sameBoundAction) {
+                    return null;
+                }
+                if (sameId || sameOutput || sameBoundAction) {
+                    if (!java.util.Objects.equals(completed.capability(), n.capability())
+                            || (!sameBoundAction && !java.util.Objects.equals(completed.name(), n.name()))
+                            || !java.util.Objects.equals(completed.toolHint(), n.toolHint())
+                            || !java.util.Objects.equals(completed.toolArguments(), n.toolArguments())
+                            || !java.util.Objects.equals(completed.doneWhen(), n.doneWhen())
+                            || !java.util.Objects.equals(completed.inputs(), n.inputs())
+                            || (!n.outputBindings().isEmpty()
+                                && !java.util.Objects.equals(completed.outputBindings(), n.outputBindings()))
+                            || !java.util.Objects.equals(completed.outputs(), n.outputs())) return null;
+                    mapped = completed.id();
+                    break;
+                }
+            }
+            if (newIds.putIfAbsent(n.id(), mapped) != null) {
                 return null;
             }
         }
         for (TaskNode n : neu.nodes()) {
+            if (successIds.contains(newIds.get(n.id()))) continue;
             Set<String> deps = new LinkedHashSet<>();
             for (String dependency : n.dependsOn()) {
                 String mapped = newIds.get(dependency);
@@ -1860,8 +1997,25 @@ public class PlanningLoop {
     private GoalCompiler.CompileResult compileAndValidate(ChatModel chat,
                                                          String userMessage,
                                                          TaskPlan taskPlan) {
+        return compileAndValidate(chat, userMessage, taskPlan, List.of());
+    }
+
+    private GoalCompiler.CompileResult compileAndValidate(ChatModel chat,
+                                                         String userMessage,
+                                                         TaskPlan taskPlan,
+                                                         List<ChatMessage> history) {
+        return compileAndValidate(chat, userMessage, taskPlan, history, null, 0);
+    }
+
+    private GoalCompiler.CompileResult compileAndValidate(ChatModel chat, String userMessage,
+                                                         TaskPlan taskPlan, List<ChatMessage> history,
+                                                         TaskGraph completed, int generation) {
         // 第一次编译
-        GoalCompiler.CompileResult compiled = goalCompiler.compile(chat, userMessage, taskPlan);
+        boolean hasHistory = history != null && !history.isEmpty();
+        GoalCompiler.CompileResult compiled = hasHistory
+                ? goalCompiler.compile(chat, userMessage, taskPlan, history)
+                : goalCompiler.compile(chat, userMessage, taskPlan);
+        compiled = mergeCompletedCompilation(compiled, completed, generation);
 
         // 结构化验证
         PlanValidationReport report = mergeValidationReports(
@@ -1886,8 +2040,10 @@ public class PlanningLoop {
             String correctionPrompt = report.toCorrectionPrompt();
 
             // 重新编译，注入修正提示
-            GoalCompiler.CompileResult replanned = goalCompiler.compileWithCorrection(
-                chat, userMessage, taskPlan, correctionPrompt);
+            GoalCompiler.CompileResult replanned = hasHistory
+                    ? goalCompiler.compileWithCorrection(chat, userMessage, taskPlan, correctionPrompt, history)
+                    : goalCompiler.compileWithCorrection(chat, userMessage, taskPlan, correctionPrompt);
+            replanned = mergeCompletedCompilation(replanned, completed, generation);
 
             // 验证重新编译的结果
             report = mergeValidationReports(
@@ -1911,6 +2067,15 @@ public class PlanningLoop {
         return new GoalCompiler.CompileResult(compiled.goal(), new TaskGraph(List.of()), true,
                 GoalCompiler.CompilationSource.VALIDATION_ERROR, fallbackReason,
                 compiled.intent());
+    }
+
+    private static GoalCompiler.CompileResult mergeCompletedCompilation(GoalCompiler.CompileResult compiled,
+                                                                         TaskGraph completed, int generation) {
+        if (completed == null || compiled.intent().needsClarification() || compiled.graph().isEmpty()) return compiled;
+        TaskGraph merged = mergeKeepSuccess(completed, compiled.graph(), generation);
+        return new GoalCompiler.CompileResult(compiled.goal(),
+                merged == null ? new TaskGraph(List.of()) : merged,
+                compiled.degradedCompilation(), compiled.source(), compiled.fallbackReason(), compiled.intent());
     }
 
     private static PlanValidationReport mergeValidationReports(PlanValidationReport first,

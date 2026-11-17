@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.time.Instant;
 import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -47,6 +48,8 @@ public class SkillStore {
     );
 
     private final Path skillsDir;
+    private final Object auditLock = new Object();
+    private static final long MAX_AUDIT_BYTES = 4L * 1024 * 1024;
 
     private volatile List<Map<String, String>> cachedSkillList = Collections.emptyList();
     private volatile long lastScanTime = 0;
@@ -198,13 +201,13 @@ public class SkillStore {
         }
 
         if (Files.exists(skillDir)) {
+            auditResult(result, "CREATE_REJECTED", cleanName, content, false, "skill already exists");
             result.put("success", false);
             result.put("error", "skill already exists: " + cleanName);
             return result;
         }
 
         try {
-            Files.createDirectories(skillDir);
             StringBuilder md = new StringBuilder();
             md.append("---\n");
             md.append("name: ").append(cleanName).append("\n");
@@ -215,12 +218,24 @@ public class SkillStore {
             } else {
                 md.append("# ").append(cleanName).append("\n\nAdd instructions here...\n");
             }
-            Files.writeString(skillDir.resolve("SKILL.md"), md.toString(), StandardCharsets.UTF_8);
+            String document = md.toString();
+            String validationError = SkillContentPolicy.validateDocument(cleanName, description, document);
+            if (validationError != null) {
+                auditResult(result, "CREATE_REJECTED", cleanName, document, false, validationError);
+                result.put("success", false);
+                result.put("error", validationError);
+                return result;
+            }
+            Files.createDirectories(skillDir);
+            Files.writeString(skillDir.resolve("SKILL.md"), document, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
             refreshCache();
             result.put("success", true);
             result.put("name", cleanName);
             result.put("path", skillDir.toString());
+            auditResult(result, "CREATE", cleanName, document, true, null);
         } catch (IOException e) {
+            auditResult(result, "CREATE_FAILED", cleanName, content, false, e.getMessage());
             result.put("success", false);
             result.put("error", "create failed: " + e.getMessage());
         }
@@ -229,6 +244,13 @@ public class SkillStore {
 
     public Map<String, Object> editSkill(String name, String newContent) {
         Map<String, Object> result = new LinkedHashMap<>();
+        if (newContent == null || newContent.isBlank()) {
+            String error = "content 不能为空";
+            auditResult(result, "EDIT_REJECTED", name, newContent, false, error);
+            result.put("success", false);
+            result.put("error", error);
+            return result;
+        }
         Path skillMd = findSkillMd(name);
         if (Objects.isNull(skillMd)) {
             result.put("success", false);
@@ -240,10 +262,19 @@ public class SkillStore {
             int endOfFrontmatter = existing.indexOf("---", 3);
             String frontmatter = endOfFrontmatter > 0 ? existing.substring(0, endOfFrontmatter + 3) : "---\nname: " + name + "\n---";
             String updated = frontmatter + "\n\n" + newContent;
+            String validationError = SkillContentPolicy.validateDocument(name, null, updated);
+            if (validationError != null) {
+                auditResult(result, "EDIT_REJECTED", name, updated, false, validationError);
+                result.put("success", false);
+                result.put("error", validationError);
+                return result;
+            }
             Files.writeString(skillMd, updated, StandardCharsets.UTF_8);
             refreshCache();
             result.put("success", true);
+            auditResult(result, "EDIT", name, updated, true, null);
         } catch (IOException e) {
+            auditResult(result, "EDIT_FAILED", name, newContent, false, e.getMessage());
             result.put("success", false);
             result.put("error", "edit failed: " + e.getMessage());
         }
@@ -258,6 +289,14 @@ public class SkillStore {
             result.put("error", "skill not found: " + name);
             return result;
         }
+        String patchError = SkillContentPolicy.validatePatchText(oldText, "old_text");
+        if (patchError == null) patchError = SkillContentPolicy.validatePatchText(newText, "new_text");
+        if (patchError != null) {
+            auditResult(result, "PATCH_REJECTED", name, newText, false, patchError);
+            result.put("success", false);
+            result.put("error", patchError);
+            return result;
+        }
         try {
             String content = Files.readString(skillMd, StandardCharsets.UTF_8);
             if (!content.contains(oldText)) {
@@ -266,9 +305,19 @@ public class SkillStore {
                 return result;
             }
             String updated = content.replace(oldText, newText);
+            String validationError = SkillContentPolicy.validateDocument(name, null, updated);
+            if (validationError != null) {
+                auditResult(result, "PATCH_REJECTED", name, updated, false, validationError);
+                result.put("success", false);
+                result.put("error", validationError);
+                return result;
+            }
             Files.writeString(skillMd, updated, StandardCharsets.UTF_8);
+            refreshCache();
+            auditResult(result, "PATCH", name, updated, true, null);
             result.put("success", true);
         } catch (IOException e) {
+            auditResult(result, "PATCH_FAILED", name, newText, false, e.getMessage());
             result.put("success", false);
             result.put("error", "patch failed: " + e.getMessage());
         }
@@ -287,7 +336,9 @@ public class SkillStore {
             deleteRecursively(skillDir);
             refreshCache();
             result.put("success", true);
+            auditResult(result, "DELETE", name, "", true, null);
         } catch (IOException e) {
+            auditResult(result, "DELETE_FAILED", name, "", false, e.getMessage());
             result.put("success", false);
             result.put("error", "delete failed: " + e.getMessage());
         }
@@ -419,5 +470,52 @@ public class SkillStore {
             }
         }
         Files.deleteIfExists(dir);
+    }
+
+    /**
+     * Append a compact, secret-free mutation record. The skill body is never
+     * written to the audit stream; only its byte count and SHA-256 are kept so
+     * an operator can correlate a change with a trace without exposing prompt
+     * contents or credentials.
+     */
+    private void auditResult(Map<String, Object> result, String action, String name,
+                             String content, boolean success, String reason) {
+        String eventId = UUID.randomUUID().toString();
+        String value = content == null ? "" : content;
+        long bytes = value.getBytes(StandardCharsets.UTF_8).length;
+        String line = "{\"eventId\":\"" + eventId + "\",\"at\":\"" + Instant.now()
+                + "\",\"actor\":\"agent\",\"action\":\"" + jsonEscape(action)
+                + "\",\"name\":\"" + jsonEscape(name) + "\",\"success\":" + success
+                + ",\"bytes\":" + bytes + ",\"sha256\":\""
+                + SkillContentPolicy.sha256(value) + "\""
+                + (reason == null ? "" : ",\"reason\":\"" + jsonEscape(reason) + "\"") + "}\n";
+        boolean persisted = true;
+        try {
+            synchronized (auditLock) {
+                Path audit = skillsDir.resolve(".skill-audit.jsonl");
+                if (Files.exists(audit) && Files.size(audit) > MAX_AUDIT_BYTES) {
+                    Path rotated = skillsDir.resolve(".skill-audit.jsonl.1");
+                    Files.move(audit, rotated, StandardCopyOption.REPLACE_EXISTING);
+                }
+                Files.writeString(audit, line, StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
+            }
+        } catch (IOException | RuntimeException e) {
+            persisted = false;
+            log.error("Unable to persist skill audit event {} action={} name={}", eventId, action, name, e);
+        }
+        Map<String, Object> auditView = new LinkedHashMap<>();
+        auditView.put("event_id", eventId);
+        auditView.put("action", action);
+        auditView.put("bytes", bytes);
+        auditView.put("sha256", SkillContentPolicy.sha256(value));
+        auditView.put("persisted", persisted);
+        result.put("audit", auditView);
+    }
+
+    private static String jsonEscape(String value) {
+        if (value == null) return "";
+        return value.replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\r", "\\r").replace("\n", "\\n");
     }
 }

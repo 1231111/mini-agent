@@ -17,8 +17,11 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -1762,9 +1765,8 @@ public class TaskTodoStore {
     }
 
     private void writeItems(Path file, List<TodoItem> items) throws Exception {
-        Files.writeString(file,
-                MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(MAPPER.readTree(itemsToJson(items))),
-                StandardCharsets.UTF_8);
+        writeAtomically(file,
+                MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(MAPPER.readTree(itemsToJson(items))));
     }
 
     /**
@@ -1794,14 +1796,35 @@ public class TaskTodoStore {
             } else {
                 Files.createDirectories(persistDir);
                 Path file = persistFile(sessionId);
-                Files.writeString(file,
-                        MAPPER.writerWithDefaultPrettyPrinter()
-                                .writeValueAsString(MAPPER.readTree(payload)),
-                        StandardCharsets.UTF_8);
+                writeAtomically(file, MAPPER.writerWithDefaultPrettyPrinter()
+                        .writeValueAsString(MAPPER.readTree(payload)));
                 fileMtimes.put(sessionId, fileMtime(file));
             }
         } catch (Exception e) {
             log.warn("持久化 todo 失败 {}: {}", sessionId, e.getMessage());
+        }
+    }
+
+    /** Write a checkpoint without ever exposing truncated JSON to a recovering worker. */
+    private static void writeAtomically(Path target, String payload) throws Exception {
+        Path parent = target.toAbsolutePath().normalize().getParent();
+        Files.createDirectories(parent);
+        Path temporary = Files.createTempFile(parent, target.getFileName().toString(), ".tmp");
+        try {
+            try (FileChannel channel = FileChannel.open(temporary,
+                    StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                var buffer = StandardCharsets.UTF_8.encode(payload == null ? "" : payload);
+                while (buffer.hasRemaining()) channel.write(buffer);
+                channel.force(true);
+            }
+            try {
+                Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (java.nio.file.AtomicMoveNotSupportedException unsupported) {
+                Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } finally {
+            Files.deleteIfExists(temporary);
         }
     }
 

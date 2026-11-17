@@ -92,6 +92,18 @@ public class PlanValidator {
             return new PlanValidationReport(errors, warnings);
         }
 
+        // A canonical waiting receipt defers business acceptance; it does not
+        // certify the requested outputs or permit an executable graph.
+        if (intent != null && intent.needsClarification()) {
+            if (goal == null || !goal.isClarify() || !GoalCompiler.isClarificationWait(g, intent)) {
+                errors.add(new PlanValidationReport.ValidationError(
+                        PlanValidationReport.ValidationError.Type.GENERAL, null,
+                        "待澄清任务缺少与具体问题一致的等待节点",
+                        "仅保留问题对应的 AWAITING_CONFIRM 计划节点；澄清完成后重新编译并验收执行图"));
+            }
+            return new PlanValidationReport(errors, warnings);
+        }
+
         // 2. 检查循环依赖
         if (g.hasCycle()) {
             errors.add(new PlanValidationReport.ValidationError(

@@ -7,6 +7,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.channels.FileChannel;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -128,14 +131,40 @@ public class FilePlannerStatePersistence implements PlannerStatePersistence {
     }
 
     private void write(String sessionId, StateSnapshot snapshot, List<DomainEvent> events) {
+        Path target = file(sessionId);
+        Path temporary = null;
         try {
             var node = PlannerStateJson.MAPPER.createObjectNode();
             node.set("snapshot", PlannerStateJson.MAPPER.valueToTree(snapshot));
             node.set("events", PlannerStateJson.MAPPER.valueToTree(events == null ? List.of() : events));
-            Files.writeString(file(sessionId),
-                    PlannerStateJson.MAPPER.writeValueAsString(node), StandardCharsets.UTF_8);
+            String payload = PlannerStateJson.MAPPER.writeValueAsString(node);
+            // A worker can be terminated while persisting a checkpoint.  Writing
+            // directly to the live file leaves truncated JSON and makes the next
+            // process lose the whole workflow.  Stage and fsync in the same
+            // directory, then atomically replace the checkpoint.
+            Files.createDirectories(target.getParent());
+            temporary = Files.createTempFile(target.getParent(), target.getFileName().toString(), ".tmp");
+            try (FileChannel channel = FileChannel.open(temporary,
+                    StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                var buffer = StandardCharsets.UTF_8.encode(payload);
+                while (buffer.hasRemaining()) channel.write(buffer);
+                channel.force(true);
+            }
+            try {
+                Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (java.nio.file.AtomicMoveNotSupportedException unsupported) {
+                // Some filesystems (and test filesystems) do not advertise atomic
+                // rename.  REPLACE_EXISTING still avoids exposing a partial payload.
+                Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+            temporary = null;
         } catch (Exception e) {
             throw new IllegalStateException("写 planner 文件失败: " + e.getMessage(), e);
+        } finally {
+            if (temporary != null) {
+                try { Files.deleteIfExists(temporary); } catch (Exception ignored) { }
+            }
         }
     }
 

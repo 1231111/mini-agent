@@ -255,13 +255,18 @@ public class RecoveryEngine {
                 "recovery_" + dx.failureClass().name().toLowerCase())
                 .withExecution(exec).withRecoveryInc();
         try {
-            StateSnapshot committed = stateStore.commit(sessionId, cur.version(), patched);
-            stateStore.appendEvent(sessionId, committed, new DomainEvent(
+            // The graph transition and its recovery audit are one durable workflow
+            // transition.  Appending after commit used to leave a successful state
+            // without RECOVERY_APPLIED when the worker crashed between the two DB
+            // writes; replay then had no audit/diagnostic boundary to resume from.
+            DomainEvent recoveryEvent = new DomainEvent(
                     "ev_" + UUID.randomUUID().toString().substring(0, 8),
                     DomainEventType.RECOVERY_APPLIED, null, dx.taskId(),
                     Map.of("class", dx.failureClass().name(), "kind", dx.kind().name(),
                             "tool", dx.tool(), "classCount", used + 1),
-                    null));
+                    null);
+            StateSnapshot committed = stateStore.commit(sessionId, cur.version(), patched,
+                    List.of(recoveryEvent));
             traceRecovery(sessionId, dx);
             if (traceRecorder != null) {
                 traceRecorder.recordNode(sessionId, 0, AgentStepNode.STATE_COMMIT.name(),

@@ -63,7 +63,7 @@ public class MemoryServiceClient {
             throw new CallFailed(null, 401, "Account-issued memory access token is required", null);
         }
         ApiResponse<T> response;
-        int status;
+        int status = 0;
         try {
             RestClient.RequestBodySpec spec = http.method(method).uri(uri)
                     .header(ServiceToken.HEADER, ServiceToken.BEARER + accessToken)
@@ -77,7 +77,17 @@ public class MemoryServiceClient {
             byte[] raw = entity.getBody();
             response = raw == null || raw.length == 0 ? null : json.readValue(raw, envelope);
         } catch (IOException | RuntimeException e) {
-            throw new CallFailed(null, 0, method + " " + uri + " 调用失败: " + e.getMessage(), e);
+            // A proxy may return HTML for an authentication challenge. Preserve
+            // the status so the caller can renew credentials even if JSON parsing
+            // fails. Parser messages may echo response data; do not log them here.
+            throw new CallFailed(null, status, method + " " + uri
+                    + " 调用失败或响应格式无效 HTTP " + status, e);
+        }
+        // Both HTTP status and the business envelope must indicate success.
+        // A gateway failure carrying a success envelope cannot certify a write.
+        if (status >= 300 || !(status >= 200)) {
+            throw new CallFailed(response == null ? null : response.getCode(), status,
+                    method + " " + uri + " 返回失败 HTTP " + status, null);
         }
         if (response == null) {
             throw new CallFailed(null, status, method + " " + uri + " 返回空响应 HTTP " + status,

@@ -10,6 +10,9 @@ import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.List;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeUnit;
@@ -23,6 +26,8 @@ import static org.mockito.Mockito.*;
 class WebSearchServiceDeepSeekFallbackTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String PAGE = "https://example.com/article";
+    private static final ZoneId ZONE = ZoneId.of("Asia/Shanghai");
+    private static final Instant AS_OF = Instant.parse("2026-11-16T02:00:00Z");
 
     private WebSearchService service(String baseUrl, NetworkGuard guard, GuardedHttpClient http) {
         WebSearchService service = spy(new WebSearchService());
@@ -60,12 +65,15 @@ class WebSearchServiceDeepSeekFallbackTest {
             WebSearchService service = service(base(server), mock(NetworkGuard.class), mock(GuardedHttpClient.class));
             doReturn(new WebSearchService.SearchProviderResult(List.of(), List.of()))
                     .when(service).searchConfiguredBackend(anyString(), anyString(), anyInt(), any(), anyBoolean(), any());
-            String result = service.search("今日 AI 新闻", 5);
-            var root = JSON.readTree(result);
-            assertTrue(root.path("success").asBoolean());
-            assertEquals("deepseek_search", root.path("search_backend").asText());
-            assertEquals("bing", root.path("fallback_from").asText());
-            assertEquals("2026-11-16", root.at("/data/web/0/publication_date").asText());
+            try (var ignored = SearchDateContext.bind(new SearchDateContext.Window(
+                    LocalDate.of(2026, 11, 16), LocalDate.of(2026, 11, 16), ZONE, AS_OF))) {
+                String result = service.search("今日 AI 新闻", 5);
+                var root = JSON.readTree(result);
+                assertTrue(root.path("success").asBoolean());
+                assertEquals("deepseek_search", root.path("search_backend").asText());
+                assertEquals("bing", root.path("fallback_from").asText());
+                assertEquals("2026-11-16", root.at("/data/web/0/publication_date").asText());
+            }
             assertEquals(1, calls.get());
             assertEquals("今日 AI 新闻", JSON.readTree(requestBody.get()).path("ori_question").asText());
             assertEquals(15, JSON.readTree(requestBody.get()).path("count").asInt());

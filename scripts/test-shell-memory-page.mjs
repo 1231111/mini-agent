@@ -48,7 +48,10 @@ await test('the real page loader displays full persisted preferences in API orde
     assert.ok(html.indexOf('人物介绍模板') < html.indexOf('更早偏好'));
     assert.equal(h.text('memPreferenceCount'), '已载入 3 条 · 最新优先');
     assert.doesNotMatch(html, /unrelated learned content/);
-    assert.match(h.html('memStats'), /记忆条目/);
+    assert.match(h.html('memStats'), /总记忆数/);
+    assert.match(h.html('memStats'), /沉淀知识/);
+    assert.match(h.html('memStats'), /可复用流程/);
+    assert.deepEqual([...h.html('memStats').matchAll(/class="stat-num">([^<]*)<\/div>/g)].map(match => match[1]), ['4', '1', '0']);
 });
 
 await test('preference HTML stays escaped and malformed or unconfirmed records stay hidden', () => {

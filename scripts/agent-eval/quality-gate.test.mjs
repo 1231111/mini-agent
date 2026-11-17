@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { assessRun, createRun, digest, modelIdentityFingerprint, selectCases, validateManifest } from './quality-gate.mjs';
+import { assessCase, assessRun, createRun, digest, modelIdentityFingerprint, selectCases, validateManifest } from './quality-gate.mjs';
 import { parseArguments } from './run-eval.mjs';
 import { verifyReport, attestationPayload } from './verify-report.mjs';
 import { makeFixtures } from './fixtures.mjs';
@@ -23,12 +23,81 @@ const failed = (report, code) => {
     assert.ok(report.errors.includes(code) || report.results.some(r => r.checks.some(c => c.code === code)), code);
 };
 
+function standaloneCase(f, definition, delivery, observation) {
+    const capture = { runId: f.context.runId, caseId: definition.id, status: 'DONE', terminal: true,
+        elapsedMs: 1, delivery, observation: { caseId: definition.id, nonce: 'nonce-' + definition.id, ...observation } };
+    const context = { ...f.context, nonces: { [definition.id]: 'nonce-' + definition.id },
+        artifactDir: path.join(f.context.artifactRoot, definition.id), nonce: 'nonce-' + definition.id };
+    fs.mkdirSync(context.artifactDir, { recursive: true });
+    return assessCase(definition, capture, context);
+}
+
+function desktopPng(width = 320, height = 240) {
+    const png = Buffer.alloc(33);
+    Buffer.from('89504e470d0a1a0a', 'hex').copy(png);
+    png.writeUInt32BE(13, 8); png.write('IHDR', 12); png.writeUInt32BE(width, 16); png.writeUInt32BE(height, 20);
+    return png;
+}
+
 test('synthetic fixtures verify all business validators without claiming live acceptance', t => {
     const report = score(fixture(t));
     assert.equal(report.pass, true);
     assert.equal(report.releaseEligible, false);
     assert.equal(verifyReport(report), true);
     assert.equal(verifyReport(report, { requireLive: true }), false);
+});
+
+test('search validator binds every cited result to collector-owned HTTP evidence', t => {
+    const f = fixture(t);
+    const definition = { id: 'web-search', sloMs: 1000, checks: [{ type: 'search', minItems: 2, minSources: 2,
+        allowedHosts: ['one.example', 'two.example'] }] };
+    const sources = [
+        { id: 's1', url: 'https://one.example/a', title: '结果一', httpStatus: 200,
+            bodySha256: digest('body-one'), evidence: 'search-collector', retrievedAt: '2026-11-17T00:00:00Z' },
+        { id: 's2', url: 'https://two.example/b', title: '结果二', httpStatus: 200,
+            bodySha256: digest('body-two'), evidence: 'search-collector', retrievedAt: '2026-11-17T00:01:00Z' }
+    ];
+    const result = standaloneCase(f, definition, { search: sources.map(source => ({ sourceId: source.id,
+        title: source.title, url: source.url, summary: '已由抓取器核验的摘要。' })) }, { searchSources: sources });
+    assert.equal(result.pass, true);
+    const bad = structuredClone(sources); bad[0].httpStatus = 500;
+    const failedResult = standaloneCase(f, definition, { search: [{ sourceId: 's1', title: '结果一',
+        url: 'https://one.example/a', summary: '摘要' }, { sourceId: 's2', title: '结果二',
+        url: 'https://two.example/b', summary: '摘要' }] }, { searchSources: bad });
+    assert.equal(failedResult.pass, false);
+    const malformed = structuredClone(sources); malformed[0].url = 'not-a-url';
+    const malformedResult = standaloneCase(f, definition, { search: [] }, { searchSources: malformed });
+    assert.equal(malformedResult.checks.find(check => check.type === 'search').code, 'SEARCH_SOURCE_URL_INVALID');
+});
+
+test('browser action validator requires observer snapshots and reply state binding', t => {
+    const f = fixture(t);
+    const definition = { id: 'browser-action', sloMs: 1000, checks: [{ type: 'browser-action',
+        requiredActions: [{ id: 'submit', expectedState: 'receipt-visible' }] }] };
+    const event = { id: 'submit', source: 'browser-observer', verified: true,
+        observedState: 'receipt-visible', snapshotSha256: digest('browser-snapshot') };
+    const good = standaloneCase(f, definition, { browserActions: [{ id: 'submit', observedState: 'receipt-visible' }] },
+        { browserActions: [event] });
+    assert.equal(good.pass, true);
+    const bad = standaloneCase(f, definition, { browserActions: [{ id: 'submit', observedState: 'receipt-visible' }] },
+        { browserActions: [{ ...event, verified: false }] });
+    assert.equal(bad.pass, false);
+});
+
+test('desktop action validator requires observer-confirmed state and a case-bound screenshot', t => {
+    const f = fixture(t);
+    const definition = { id: 'desktop-action', sloMs: 1000, checks: [{ type: 'desktop-action',
+        requiredActions: [{ id: 'save', expectedState: 'saved' }] }] };
+    const root = path.join(f.context.artifactRoot, definition.id); fs.mkdirSync(root, { recursive: true });
+    const file = path.join(root, 'save.png'); fs.writeFileSync(file, desktopPng());
+    const screenshot = { path: 'save.png', sha256: digest(fs.readFileSync(file)) };
+    const event = { id: 'save', source: 'desktop-observer', verified: true, observedState: 'saved', screenshot };
+    const good = standaloneCase(f, definition, { desktopActions: [{ id: 'save', observedState: 'saved' }] },
+        { desktopActions: [event] });
+    assert.equal(good.pass, true);
+    const bad = standaloneCase(f, definition, { desktopActions: [{ id: 'save', observedState: 'saved' }] },
+        { desktopActions: [{ ...event, screenshot: { path: 'missing.png', sha256: screenshot.sha256 } }] });
+    assert.equal(bad.pass, false);
 });
 
 test('SLO is part of pass even when every business outcome is correct', t => {
