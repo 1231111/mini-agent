@@ -4,6 +4,9 @@ import com.miniagent.agent.execution.*;
 import com.miniagent.agent.hook.ToolHookChain;
 import com.miniagent.agent.permission.*;
 import com.miniagent.agent.tool.*;
+import com.miniagent.agent.trace.TraceRecorder;
+import com.miniagent.config.entity.AgentTraceStep;
+import com.miniagent.config.repository.AgentTraceStepRepository;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
@@ -14,8 +17,12 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.function.BooleanSupplier;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /** Exercises actual AgentLoop -> permission -> locks -> registered handler execution. */
 class AgentLoopToolTimeoutTest {
@@ -44,6 +51,49 @@ class AgentLoopToolTimeoutTest {
         assertTrue(elapsedMillis(started) < 2_100, "handler must not receive the approval TTL as extra budget");
         assertTrue(interrupted.await(1, TimeUnit.SECONDS));
         await(() -> fixture.journal.latestStatus("read_file") == ActionExecutionStatus.TIMEOUT);
+    }
+
+    @Test
+    void traceRecordsMeasuredPipelineDurationForSingleTool() throws Exception {
+        Fixture fixture = new Fixture();
+        List<AgentTraceStep> traces = attachTraceRecorder(fixture);
+        fixture.registry.register("read_file", "read", READ_SCHEMA, args -> {
+            sleep(120);
+            return "{\"success\":true}";
+        });
+
+        assertTrue(fixture.start(List.of(call("read_file", "{}")), false)
+                .get(3, TimeUnit.SECONDS).getFirst().isSuccess());
+
+        AgentTraceStep trace = traces.stream()
+                .filter(step -> "read_file".equals(step.getToolName()))
+                .findFirst().orElseThrow();
+        assertTrue(trace.getDurationMs() >= 100,
+                "trace latency must include the handler time instead of recording a constant zero");
+    }
+
+    @Test
+    void parallelTraceUsesWorkerCompletionInsteadOfOrderedCollectionDelay() throws Exception {
+        Fixture fixture = new Fixture();
+        List<AgentTraceStep> traces = attachTraceRecorder(fixture);
+        fixture.registry.register("exec_command", "exec", COMMAND_SCHEMA, args -> "{\"success\":true}");
+        fixture.registry.register("read_file", "read", READ_SCHEMA, args -> {
+            sleep(60);
+            return "{\"success\":true}";
+        });
+
+        Future<List<ToolResult>> running = fixture.start(List.of(
+                call("exec_command", COMMAND), call("read_file", "{}")), true);
+        fixture.awaitApproval();
+        sleep(400);
+        fixture.approve();
+        assertTrue(running.get(3, TimeUnit.SECONDS).stream().allMatch(ToolResult::isSuccess));
+
+        AgentTraceStep readTrace = traces.stream()
+                .filter(step -> "read_file".equals(step.getToolName()))
+                .findFirst().orElseThrow();
+        assertTrue(readTrace.getDurationMs() < 300,
+                "the second trace must not inherit the first tool's approval wait");
     }
 
     @Test
@@ -295,6 +345,20 @@ class AgentLoopToolTimeoutTest {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
         while (!condition.getAsBoolean() && System.nanoTime() < deadline) Thread.sleep(10);
         assertTrue(condition.getAsBoolean(), "condition was not met");
+    }
+
+    private static List<AgentTraceStep> attachTraceRecorder(Fixture fixture) {
+        List<AgentTraceStep> traces = new CopyOnWriteArrayList<>();
+        AgentTraceStepRepository repository = mock(AgentTraceStepRepository.class);
+        when(repository.save(any())).thenAnswer(invocation -> {
+            AgentTraceStep step = invocation.getArgument(0);
+            traces.add(step);
+            return step;
+        });
+        TraceRecorder recorder = new TraceRecorder();
+        ReflectionTestUtils.setField(recorder, "repo", repository);
+        fixture.loop.setTraceRecorder(recorder);
+        return traces;
     }
 
     private static ToolExecutionRequest call(String name, String arguments) {

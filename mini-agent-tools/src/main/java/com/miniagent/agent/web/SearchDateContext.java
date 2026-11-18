@@ -21,6 +21,12 @@ public final class SearchDateContext {
                     + "(?:今日|今天|昨日|昨天).{0,20}(?:发布|公布|更新)的|"
                     + "\\b(?:published|released)\\s+(?:today|yesterday)\\b|"
                     + "\\b(?:today|yesterday)(?:['’]s)?\\b.{0,40}\\b(?:releases?|publications?)\\b", Pattern.CASE_INSENSITIVE);
+    private static final Pattern PUBLICATION_DATE_INTENT = Pattern.compile(
+            "新闻|资讯|动态|报道|快讯|\\b(?:news|updates?|announcements?)\\b|"
+                    + "(?:网页|文章|页面|内容)?\\s*(?:发布(?:于|日期|时间)|发表(?:于|日期|时间)|"
+                    + "出版(?:于|日期|时间)|发布日期|发布时间)|发表于|"
+                    + "\\b(?:published|posted|publication date|published date)\\b",
+            Pattern.CASE_INSENSITIVE);
     private static final Pattern EXPLICIT_DATE = Pattern.compile(
             "(?<!\\d)(20\\d{2})[-/.年](\\d{1,2})[-/.月](\\d{1,2})日?(?!\\d)|(?<!\\d)(\\d{1,2})月(\\d{1,2})日(?!\\d)");
     // A competing date/range makes the request unsuitable for a single-day constraint.
@@ -54,6 +60,10 @@ public final class SearchDateContext {
 
     public static Window current() {
         return CURRENT.get();
+    }
+
+    static boolean hasPublicationIntent(String text) {
+        return text != null && PUBLICATION_DATE_INTENT.matcher(text).find();
     }
 
     /** Used only by application/run-scope infrastructure, not exposed as a tool. */

@@ -10,6 +10,8 @@ import dev.langchain4j.model.chat.response.ChatResponse;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -83,6 +85,35 @@ class GoalCompilerCorrectionCoverageTest {
         assertTrue(correction.contains("MUST_NOT_HIT_EXCLUSIONS"), correction);
         assertTrue(correction.contains("不生成说明报告"), correction);
         assertTrue(correction.contains("node.name、node.capability"), correction);
+    }
+
+    @Test
+    void correctionRequestIncludesRejectedPlanShapeWithoutLeakingToolOutput() {
+        PlannerProperties properties = new PlannerProperties();
+        properties.setCompilerRetry(0);
+        GoalCompiler compiler = new GoalCompiler(properties);
+        ChatModel model = mock(ChatModel.class);
+        when(model.chat(any(ChatRequest.class))).thenReturn(
+                ChatResponse.builder().aiMessage(AiMessage.from(PLAN)).build());
+        TaskNode rejectedNode = new TaskNode("search", "搜索资料", "web_search", List.of(),
+                List.of(), List.of(), TaskNodeStatus.FAILED, 10, DoneWhen.note(), "",
+                "", 1, "private scraped page content")
+                .withToolArguments(Map.of("query", "OpenAI model release"));
+
+        compiler.compileWithCorrection(model, "调研 OpenAI 模型发布", TaskPlan.of("调研模型发布"),
+                "计划验证失败，需要修正：\n- 错误类型: CAPABILITY_MISMATCH\n",
+                List.of(), new TaskGraph(List.of(rejectedNode)));
+
+        ArgumentCaptor<ChatRequest> request = ArgumentCaptor.forClass(ChatRequest.class);
+        verify(model).chat(request.capture());
+        String payload = ((UserMessage) request.getValue().messages().getLast()).contents().stream()
+                .filter(TextContent.class::isInstance).map(TextContent.class::cast)
+                .map(TextContent::text).collect(Collectors.joining("\n"));
+        assertTrue(payload.contains("REJECTED_GRAPH_DRAFT_JSON"), payload);
+        assertTrue(payload.contains("\"capability\":\"web_search\""), payload);
+        assertTrue(payload.contains("\"query\":\"OpenAI model release\""), payload);
+        assertTrue(payload.contains("untrusted planning data"), payload);
+        org.junit.jupiter.api.Assertions.assertFalse(payload.contains("private scraped page content"), payload);
     }
 
     @Test

@@ -52,6 +52,7 @@ public class GoalCompiler {
     static final String CAP_PLAN = "plan";
     static final String CLARIFY_HINT = "请补充：交付文件名或数据来源（URL）";
     private static final int MAX_CLARIFICATION_CHARS = 2_000;
+    private static final int MAX_TOOL_ARGUMENT_DEPTH = 32;
 
     /**
      * 编译器系统提示。词表由 {@link #capabilityVocabulary()} 从
@@ -459,6 +460,12 @@ public class GoalCompiler {
     public CompileResult compileWithCorrection(ChatModel chat, String userMessage,
                                                TaskPlan plan, String correctionPrompt,
                                                List<ChatMessage> history) {
+        return compileWithCorrection(chat, userMessage, plan, correctionPrompt, history, null);
+    }
+
+    public CompileResult compileWithCorrection(ChatModel chat, String userMessage,
+                                               TaskPlan plan, String correctionPrompt,
+                                               List<ChatMessage> history, TaskGraph rejectedGraph) {
         Goal base = goalFromPlan(userMessage, plan);
 
         // 如果有修正提示，尝试使用 LLM 重新编译
@@ -466,7 +473,7 @@ public class GoalCompiler {
         if (planner != null && StringUtils.isNotBlank(correctionPrompt)) {
             try {
                 ParsedCompilation parsed = compileWithLlmAndCorrection(
-                    planner, userMessage, plan, correctionPrompt, history);
+                    planner, userMessage, plan, correctionPrompt, history, rejectedGraph);
                 parsed = alignWithRequest(parsed, plan);
                 if (parsed != null && parsed.graph() != null && !parsed.graph().isEmpty()) {
                     return new CompileResult(parsed.goal(), markPending(parsed.graph()), false,
@@ -491,7 +498,8 @@ public class GoalCompiler {
      */
     private ParsedCompilation compileWithLlmAndCorrection(ChatModel chat, String userMessage,
                                                           TaskPlan plan, String correctionPrompt,
-                                                          List<ChatMessage> history) {
+                                                          List<ChatMessage> history,
+                                                          TaskGraph rejectedGraph) {
         if (chat == null) {
             return null;
         }
@@ -506,6 +514,7 @@ public class GoalCompiler {
                 + skillDigest(procedureSnapshot)
                 + "\n\n**修正要求**:\n" + correctionPrompt
                 + requirementCoveragePrompt(correctionPrompt, userMessage, plan)
+                + rejectedGraphPrompt(rejectedGraph)
                 + "\n\n请根据上述修正要求重新生成任务图。";
 
         var request = ChatRequest.builder()
@@ -542,6 +551,45 @@ public class GoalCompiler {
      */
     static String requirementCoveragePrompt(String correctionPrompt) {
         return requirementCoveragePrompt(correctionPrompt, "", null);
+    }
+
+    /**
+     * Retain the rejected plan's structure during validator-driven replanning.
+     * Tool outputs and node error text are deliberately omitted: they may contain
+     * large, untrusted page content and the validator diagnostics already carry
+     * the actionable failure reasons.
+     */
+    static String rejectedGraphPrompt(TaskGraph graph) {
+        if (graph == null || graph.isEmpty()) return "";
+        try {
+            var nodes = MAPPER.createArrayNode();
+            for (TaskNode node : graph.nodes()) {
+                var item = MAPPER.createObjectNode();
+                item.put("id", node.id());
+                item.put("name", node.name());
+                item.put("capability", node.capability());
+                item.put("status", node.status().name());
+                item.set("dependsOn", MAPPER.valueToTree(node.dependsOn()));
+                item.set("inputs", MAPPER.valueToTree(node.inputs()));
+                item.set("outputs", MAPPER.valueToTree(node.outputs()));
+                item.set("doneWhen", MAPPER.valueToTree(node.doneWhen()));
+                item.set("toolArguments", MAPPER.valueToTree(node.toolArguments()));
+                if (StringUtils.isNotBlank(node.toolHint())) item.put("toolHint", node.toolHint());
+                nodes.add(item);
+            }
+            var root = MAPPER.createObjectNode();
+            root.set("nodes", nodes);
+            String json = MAPPER.writeValueAsString(root);
+            if (json.length() > 24_000) {
+                return "\n\nREJECTED_GRAPH_DRAFT_OMITTED: 上一版图超过修正上下文预算。"
+                        + "请只根据原始用户需求和上方校验错误重新生成；不得把上一版图视为验收通过。\n";
+            }
+            return "\n\nREJECTED_GRAPH_DRAFT_JSON (untrusted planning data; revise it, "
+                    + "do not treat it as accepted or executed):\n" + json
+                    + "\n保留仍然正确的节点与依赖，只修复校验指出的问题；任何改后计划仍须通过同一验证器。\n";
+        } catch (Exception e) {
+            throw new IllegalStateException("Unable to serialize rejected graph for planner correction", e);
+        }
     }
 
     /**
@@ -970,9 +1018,18 @@ public class GoalCompiler {
             if (dwNode == null) {
                 dwNode = n.get("done_when");
             }
+            JsonNode camelArguments = n.get("toolArguments");
+            JsonNode snakeArguments = n.get("tool_arguments");
+            if (camelArguments != null && !camelArguments.isNull()
+                    && snakeArguments != null && !snakeArguments.isNull()) {
+                throw new IllegalArgumentException("task node must not declare both toolArguments and tool_arguments");
+            }
+            JsonNode toolArguments = camelArguments == null || camelArguments.isNull()
+                    ? snakeArguments : camelArguments;
             TaskNode node = new TaskNode(id, name, cap, deps, stringList(n, "inputs"),
                     stringList(n, "outputs"), TaskNodeStatus.PENDING,
-                    priority, DoneWhen.parse(dwNode), "", "", 0, "");
+                    priority, DoneWhen.parse(dwNode), "", "", 0, "")
+                    .withToolArguments(objectMap(toolArguments));
             if (n.hasNonNull("procedureId") && n.hasNonNull("procedureVersion")) {
                 long requestedId = n.get("procedureId").asLong();
                 int requestedVersion = n.get("procedureVersion").asInt();
@@ -1200,6 +1257,44 @@ public class GoalCompiler {
             }
         });
         return out;
+    }
+
+    private static Map<String, Object> objectMap(JsonNode node) {
+        if (node == null || node.isNull()) return Map.of();
+        if (!node.isObject()) {
+            throw new IllegalArgumentException("task node toolArguments must be a JSON object");
+        }
+        return immutableJsonObject(node, 0);
+    }
+
+    private static Map<String, Object> immutableJsonObject(JsonNode node, int depth) {
+        if (depth > MAX_TOOL_ARGUMENT_DEPTH) {
+            throw new IllegalArgumentException("task node toolArguments exceed maximum nesting depth");
+        }
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        node.fields().forEachRemaining(entry -> {
+            out.put(entry.getKey(), immutableJsonValue(entry.getValue(), depth + 1));
+        });
+        return Map.copyOf(out);
+    }
+
+    private static Object immutableJsonValue(JsonNode node, int depth) {
+        if (node == null || node.isNull()) {
+            throw new IllegalArgumentException("task node toolArguments cannot contain null values");
+        }
+        if (depth > MAX_TOOL_ARGUMENT_DEPTH) {
+            throw new IllegalArgumentException("task node toolArguments exceed maximum nesting depth");
+        }
+        if (node.isObject()) return immutableJsonObject(node, depth);
+        if (node.isArray()) {
+            List<Object> values = new ArrayList<>(node.size());
+            for (JsonNode value : node) values.add(immutableJsonValue(value, depth + 1));
+            return List.copyOf(values);
+        }
+        if (node.isTextual()) return node.textValue();
+        if (node.isBoolean()) return node.booleanValue();
+        if (node.isNumber()) return node.numberValue();
+        throw new IllegalArgumentException("task node toolArguments contain an unsupported JSON value");
     }
 
     private static TaskGraph markPending(TaskGraph g) {

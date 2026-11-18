@@ -51,7 +51,11 @@ public class AgentTraceStep {
     /** 状态：RUNNING / SUCCESS / FAILURE / TIMEOUT 等 */
     @Column(length = 50)
     private String status;
-    /** 耗时毫秒（仅 TOOL_RESULT） */
+    /**
+     * ToolPipeline invocation wall time in milliseconds (dispatch through terminal result).
+     * A zero can mean a sub-millisecond invocation or that no pipeline was run (for example,
+     * a cache hit or guard rejection); callers must not treat zero alone as missing telemetry.
+     */
     @Column(name = "duration_ms")
     private long durationMs;
     @Column(name = "token_input")

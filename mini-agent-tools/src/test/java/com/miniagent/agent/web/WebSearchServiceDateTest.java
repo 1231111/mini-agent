@@ -20,6 +20,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
@@ -48,6 +49,30 @@ class WebSearchServiceDateTest {
                 WebSearchService.resolveDateWindow("AI 技术新闻", "2026-11-11", "2026-11-12", TODAY, null));
         assertEquals(new WebSearchService.DateWindow(TODAY, TODAY),
                 WebSearchService.resolveDateWindow("AI 新闻 2026-11-12", null, null, TODAY));
+    }
+
+    @Test
+    void eventDatesDoNotBecomeWebpagePublicationFilters() {
+        String flightQuery = "上海到北京航班 2026-11-17";
+        assertNull(WebSearchService.resolveDateWindow(flightQuery, null, null, TODAY));
+        assertThrows(IllegalArgumentException.class, () -> WebSearchService.resolveDateWindow(
+                flightQuery, "2026-11-15", "2026-11-17", TODAY));
+    }
+
+    @Test
+    void explicitPublicationLanguageAllowsDateFilteringWithoutNewsKeyword() {
+        assertEquals(new WebSearchService.DateWindow(TODAY, TODAY),
+                WebSearchService.resolveDateWindow("AI page published on 2026-11-12",
+                        "2026-11-12", "2026-11-12", TODAY));
+    }
+
+    @Test
+    void mismatchedEventDateFilterReturnsActionableContractError() throws Exception {
+        JsonNode response = new ObjectMapper().readTree(new WebSearchService().search(
+                "上海到北京航班 2026-11-17", 5, "2026-11-15", "2026-11-17"));
+        assertEquals(false, response.path("success").asBoolean());
+        assertEquals("DATE_FILTER_NOT_APPLICABLE", response.path("error_code").asText());
+        assertTrue(response.path("error").asText().contains("航班"));
     }
 
     @Test

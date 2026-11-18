@@ -1816,9 +1816,8 @@ public class PlanningLoop {
         TaskPlan recoveryPlan = taskPlan.withTaskGoal(snap.goal().objective());
         GoalCompiler.CompileResult compiled;
         try {
-            compiled = history == null || history.isEmpty()
-                    ? goalCompiler.compileWithCorrection(chat, userMessage, recoveryPlan, correction)
-                    : goalCompiler.compileWithCorrection(chat, userMessage, recoveryPlan, correction, history);
+            compiled = goalCompiler.compileWithCorrection(chat, userMessage, recoveryPlan, correction,
+                    history == null ? List.of() : history, snap.graph());
         } catch (Exception e) {
             com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(e);
             log.warn("运行时 LLM replan 失败: {}", e.getMessage());
@@ -2099,6 +2098,7 @@ public class PlanningLoop {
         String initialValidation = report.summary();
         log.info("PlanValidator 拒绝，进入 replan 闭环，错误数={}", report.errors().size());
         log.debug("验证报告: {}", initialValidation);
+        TaskGraph rejectedGraph = compiled.graph();
 
         // 尝试 replan，最多重试 maxReplanRetries 次
         int maxReplanRetries = Math.max(0, properties.getMaxReplanRetries());
@@ -2106,12 +2106,12 @@ public class PlanningLoop {
             log.info("Replan 尝试 {}/{}", attempt, maxReplanRetries);
 
             // 生成修正提示
-            String correctionPrompt = report.toCorrectionPrompt();
+            String correctionPrompt = report.toCorrectionPrompt()
+                    + GoalCompiler.rejectedGraphPrompt(rejectedGraph);
 
             // 重新编译，注入修正提示
-            GoalCompiler.CompileResult replanned = hasHistory
-                    ? goalCompiler.compileWithCorrection(chat, userMessage, taskPlan, correctionPrompt, history)
-                    : goalCompiler.compileWithCorrection(chat, userMessage, taskPlan, correctionPrompt);
+            GoalCompiler.CompileResult replanned = goalCompiler.compileWithCorrection(chat, userMessage,
+                    taskPlan, correctionPrompt, hasHistory ? history : List.of(), rejectedGraph);
             replanned = mergeCompletedCompilation(replanned, completed, generation);
 
             // 验证重新编译的结果
@@ -2124,6 +2124,9 @@ public class PlanningLoop {
             }
 
             log.warn("Replan 尝试 {} 仍然失败，错误数={}", attempt, report.errors().size());
+            if (replanned.graph() != null && !replanned.graph().isEmpty()) {
+                rejectedGraph = replanned.graph();
+            }
         }
 
         // 所有 replan 尝试失败。不再构造规则猜测图：

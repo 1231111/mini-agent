@@ -37,7 +37,7 @@ Run the independent structural contract tests in an isolated Python test environ
 
 The Schema tests invoke jsonschema.Draft202012Validator with FormatChecker and validate both Schema definitions plus positive/negative documents. Missing validator dependencies fail the test import instead of silently skipping validation. This separate test command does not integrate a Schema engine into verify-release.mjs or a production pipeline.
 
-The Ubuntu/Windows client-quality jobs in .github/workflows/ci.yml and .github/workflows/desktop-release.yml are configured to install schema-test-requirements.txt and explicitly run schema-contract-test.py before the unified Node regressions. Desktop packaging depends on both client-quality and browser-contracts. These are contract fixture checks; they do not execute production scanners, platform signing or database restoration. Their configuration does not establish that a remote workflow has run successfully.
+The Ubuntu/Windows client-quality jobs in .github/workflows/ci.yml and .github/workflows/desktop-release.yml install schema-test-requirements.txt, run schema-contract-test.py, exercise this verifier with node --test scripts/release/release-gate.test.mjs, and then run the unified Node regressions. Desktop packaging depends on both client-quality and browser-contracts. These are contract fixture checks; they do not execute production scanners, platform signing or database restoration. Their configuration does not establish that a remote workflow has run successfully.
 
 The backup smoke can be run separately:
 

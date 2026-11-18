@@ -73,6 +73,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
@@ -2317,6 +2318,7 @@ public class AgentLoop {
         // 于是"报超时但工具还在跑、还在写盘"，模型重试就产生重复副作用。
         List<Future<ToolInvocation>> futures = new ArrayList<>();
         List<ToolRequest> requests = new ArrayList<>();
+        List<ToolExecutionTiming> timings = new ArrayList<>();
 
         RunScope scope = RunScope.capture();
         final int turn = state.currentTurn;
@@ -2336,6 +2338,7 @@ public class AgentLoop {
                         state.toolResultCache.get(cacheKey));
                 futures.add(CompletableFuture.completedFuture(null));
                 requests.add(null);
+                timings.add(null);
                 continue;
             }
 
@@ -2346,12 +2349,16 @@ public class AgentLoop {
                     name, args, turn, denyProbes, state, scope)
                     .withActionBinding(bindings.get(toolIdOf(tc)))
                     .withExecutionBudget(timeout);
+            ToolExecutionTiming timing = new ToolExecutionTiming();
             futures.add(VIRTUAL_EXECUTOR.submit(() -> {
                 try (var ignored = scope.bind()) {
                     return toolPipeline.invoke(request);
+                } finally {
+                    timing.markFinished();
                 }
             }));
             requests.add(request);
+            timings.add(timing);
         }
 
         // Each handler's independent watchdog starts inside the resource lock.
@@ -2418,7 +2425,8 @@ public class AgentLoop {
 
             log.info("  [并行] {}: {}", name, truncate(redactSensitive(result), 200));
             recordToolOutcome(state, name, argumentsOf(tc), result,
-                    bindings.get(toolIdOf(tc)), structuredResult);
+                    bindings.get(toolIdOf(tc)), structuredResult,
+                    timings.get(index) == null ? 0L : timings.get(index).elapsedMillis());
             state.pendingObservations.add(new ToolObservationProjector.Observation(name, toolIdOf(tc), structuredResult));
             messages.add(ToolExecutionResultMessage.from(
                     toolIdOf(tc), name, resultForContext));
@@ -2447,6 +2455,7 @@ public class AgentLoop {
 
         String result;
         ToolResult structuredResult = null;
+        ToolExecutionTiming timing = null;
         if (isCacheableTool(name) && state.toolResultCache.containsKey(cacheKey)) {
             result = state.toolResultCache.get(cacheKey);
             structuredResult = ToolResult.success(result);
@@ -2463,6 +2472,8 @@ public class AgentLoop {
                     fName, fArgs, turn, denyProbes, state, scope)
                     .withActionBinding(binding)
                     .withExecutionBudget(timeout);
+            timing = new ToolExecutionTiming();
+            ToolExecutionTiming invocationTiming = timing;
             // submit 而非 supplyAsync：只有 ExecutorService 的 Future 才支持
             // "cancel(true) 真正中断工作线程"。CompletableFuture 的 cancel 只改状态，
             // 于是超时后工具还在跑（还在写盘），模型重试就产生重复副作用。
@@ -2470,6 +2481,8 @@ public class AgentLoop {
                     () -> {
                         try (var ignored = scope.bind()) {
                             return toolPipeline.invoke(request);
+                        } finally {
+                            invocationTiming.markFinished();
                         }
                     });
             try {
@@ -2526,7 +2539,8 @@ public class AgentLoop {
         }
 
         log.info("  {}: {}", name, truncate(redactSensitive(result), 300));
-        recordToolOutcome(state, name, args, result, binding, structuredResult);
+        recordToolOutcome(state, name, args, result, binding, structuredResult,
+                timing == null ? 0L : timing.elapsedMillis());
         state.pendingObservations.add(new ToolObservationProjector.Observation(name, toolIdOf(tc), structuredResult));
         messages.add(ToolExecutionResultMessage.from(
                 toolIdOf(tc), name, resultForContext));
@@ -2674,13 +2688,43 @@ public class AgentLoop {
 
     private void recordToolOutcome(LoopState state, String name, String args, String result,
                                    ExecutionTurnContext.ActionBinding binding, ToolResult structuredResult) {
+        recordToolOutcome(state, name, args, result, binding, structuredResult, 0L);
+    }
+
+    private void recordToolOutcome(LoopState state, String name, String args, String result,
+                                   ExecutionTurnContext.ActionBinding binding, ToolResult structuredResult,
+                                   long durationMs) {
         ToolResult actual = structuredResult == null ? ToolResult.fromLegacy(result) : structuredResult;
         state.noteToolFinished(name, args, actual,
                 toolRegistry == null ? Set.of() : toolRegistry.getToolNames());
         if (Objects.nonNull(traceRecorder))
             traceRecorder.recordToolResult(
-                    currentSessionId.get(), state.currentTurn, name, actual, 0);
+                    currentSessionId.get(), state.currentTurn, name, actual, Math.max(0L, durationMs));
         notifyToolExecution(state, name, result, binding, actual);
+    }
+
+    /**
+     * Measures wall-clock time spent in one submitted ToolPipeline invocation.
+     * Capturing completion in the worker prevents ordered result collection in a
+     * parallel batch from inflating later tools' durations. If cancellation wins
+     * before the worker returns, the caller's outcome time is used instead.
+     */
+    private static final class ToolExecutionTiming {
+        private static final long NOT_FINISHED = Long.MIN_VALUE;
+        private final long startedAtNanos = System.nanoTime();
+        private final AtomicLong finishedAtNanos = new AtomicLong(NOT_FINISHED);
+
+        void markFinished() {
+            finishedAtNanos.compareAndSet(NOT_FINISHED, System.nanoTime());
+        }
+
+        long elapsedMillis() {
+            long finished = finishedAtNanos.get();
+            if (finished == NOT_FINISHED) {
+                finished = System.nanoTime();
+            }
+            return TimeUnit.NANOSECONDS.toMillis(Math.max(0L, finished - startedAtNanos));
+        }
     }
 
     /**

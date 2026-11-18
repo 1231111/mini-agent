@@ -1208,3 +1208,19 @@ return hasSuspendedTodo ? CONTINUE : ACTION;   // CONTINUE: suspend=false, resum
 - **自动化验证通过**：`./mvnw.cmd -B -ntp verify` 结果为 `BUILD SUCCESS`；7 个模块合计 2,304 tests，0 failures、0 errors、94 skipped。release-gate Node 测试 57/57 通过，迁移版本连续性检查通过，`git diff --check` 通过。静态核对确认 agent V1–V36、account V1–V4、memory-service V1–V13 连续。本机没有可用 Bash，因此没有执行 `bash -n` 或 shell 脚本。
 
 仍需目标环境验收的内容属于部署和运行条件：真实 MySQL 8.4 多服务链路、Redis/Milvus/ClamAV 真实服务、多副本并发和崩溃/断网故障注入、TLS 代理与 systemd 资源限额在目标主机上的验证、真实支付渠道验签，以及 Canary 受信 runner、流量观测和回滚演练。代码测试通过不替代这些验收；生产 profile 的 fail-closed 校验必须保持开启。
+
+### 2026-11-18 追加整改：规划参数、搜索日期与发布门禁
+
+- `GoalCompiler.parseGraph()` 现在保留节点 `toolArguments` / `tool_arguments`，并拒绝类型错误、重复别名、null 值和超过 32 层的参数对象；JSON 参数会递归复制为不可变 Map/List，防止执行期间外部修改已校验计划。新增调度参数透传和异常输入测试。
+- 验证失败重规划现在把被拒绝图的结构作为明确标记的非可信规划数据重新提供给规划模型。提示只包含节点结构、验收条件和工具参数，不包含工具输出或错误正文；序列化超过 24,000 字符时省略草案并继续依赖原始需求与验证器。初次验收重规划和运行时恢复均接入此契约。
+- `web_search` 的网页发布日期过滤现在要求 query 表达新闻/发布时间意图。航班、上映等事件日期不会自动变成网页发布日期条件；模型仍传入不适用的 `dateFrom/dateTo` 时，工具返回 `DATE_FILTER_NOT_APPLICABLE` 和可执行的修正说明。可信 `SearchDateContext` 仍优先于模型重写后的 query。
+- CI 与桌面发布的跨平台 `client-quality` job 都运行 `release-gate.test.mjs`，在打包前验证签名、报告绑定和篡改拒绝逻辑。
+- **本次自动化验证**：全量 Maven `verify` 为 `BUILD SUCCESS`；7 个代码模块汇总 2,329 tests，0 failures、0 errors、93 skipped。定向规划/搜索测试 28/28、离线客户端与验收合约 213/213、发布门禁 57/57、发布 Schema 合约 20/20 通过；`git diff --check` 通过。本机的 Bash 命令转发到未安装 `/bin/bash` 的 WSL 环境，故未能本地执行迁移 Shell 校验；CI 已配置迁移连续性验证。
+
+这些修复解决了已复现的规划数据丢失和事件日期误筛问题，但本轮没有执行付费实时模型验收，也没有目标环境访问权。真实用户任务的成功率、P95/成本、多副本故障恢复、MySQL/Redis/Milvus/ClamAV 集成、真实备份恢复、支付渠道验签与受信 Canary runner/router 仍须部署验收；在这些证据生成前，不应把发布状态标为 GA/生产验收完成。
+
+### 2026-11-18 追加整改：工具延迟数据与 MySQL 迁移实测入口
+
+- 工具 trace 的 `duration_ms` 不再固定写 0。改用单调时钟测量每次提交给 `ToolPipeline` 的墙钟耗时；并行调用在各自 worker 返回时记录完成时间，避免有序收集结果时把前一个工具的审批等待计入后一个工具。该时长包括 executor 排队、权限/控制等待、工具调用和终态落盘，不等于纯 handler CPU 时间。缓存命中、参数截断等未提交执行的路径仍记 0；小于 1 ms 也可能记 0。
+- 新增 MySQL 集成验收：`ProductionMySqlMigrationChainTest` 在 agent 主 schema 执行 V1–V37；`ProductionMySqlAccountMigrationTest` 在同一 schema 用账号服务独立 history table 执行账号链；`ProductionMySqlMemoryMigrationTest` 在单独 schema 执行 memory-service V1–V13。三者都调用 Flyway `migrate` 与 `validate` 并检查完整版本链。CI/桌面发布 job 用一次性 MySQL 8.4 容器和隔离 schema；root 只用于创建 memory-service 测试库并把该库授权给 `miniagent`，实际迁移由受限应用用户执行。Agent 主 schema 还验证 MySQL 可写入 `WAITING` 状态。
+- 工具 trace 定向测试 13/13 通过，覆盖单工具真实耗时和并行审批等待不污染后续工具耗时。全量本地 Maven `verify` 通过；因本机没有启用隔离 MySQL，三项 MySQL 集成测试均按设计跳过，MySQL 8.4 通过证据必须来自启用了 `MINIAGENT_SCHEMA_TEST` 的 CI job。测试覆盖迁移 SQL 不等于 App/account/memory-service 的独立进程启动、真实数据升级和崩溃/断网故障注入验收。

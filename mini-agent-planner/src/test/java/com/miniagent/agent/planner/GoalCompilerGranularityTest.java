@@ -48,6 +48,53 @@ class GoalCompilerGranularityTest {
     }
 
     @Test
+    void parseGraphPreservesToolArgumentsForScheduledCalls() throws Exception {
+        TaskGraph graph = compiler.parseGraph("""
+                {"nodes":[
+                  {"id":"camel","name":"查网页","capability":"web_search",
+                   "toolArguments":{"query":"mini-agent","limit":4,"includeImages":false}},
+                  {"id":"snake","name":"打开网页","capability":"browser_navigate",
+                   "tool_arguments":{"url":"https://example.test/","waitUntil":"domcontentloaded"}}
+                ]}
+                """);
+
+        TaskNode search = graph.byId("camel");
+        assertEquals(Map.of("query", "mini-agent", "limit", 4, "includeImages", false),
+                search.toolArguments());
+        assertEquals(search.toolArguments(), ActionBinder.bind(search, graph).arguments());
+
+        TaskNode browser = graph.byId("snake");
+        assertEquals(Map.of("url", "https://example.test/", "waitUntil", "domcontentloaded"),
+                browser.toolArguments());
+        assertEquals(browser.toolArguments(), ActionBinder.bind(browser, graph).arguments());
+    }
+
+    @Test
+    void parseGraphRejectsMalformedToolArguments() {
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, () ->
+                compiler.parseGraph("""
+                        {"nodes":[{"id":"n1","name":"查网页","capability":"web_search",
+                         "toolArguments":["not","an","object"]}]}
+                        """));
+    }
+
+    @Test
+    void correctionPromptKeepsRejectedStructureButDropsExecutionEvidence() {
+        TaskNode node = new TaskNode("n1", "查航班", "web_search", List.of(),
+                List.of(), List.of("flight_results"), TaskNodeStatus.FAILED, 10,
+                DoneWhen.judge("比较航班"), "use web_search", "ignored", 1, "private page body");
+        node = node.withToolArguments(Map.of("query", "上海 北京 2026-11-17"));
+
+        String correction = GoalCompiler.rejectedGraphPrompt(new TaskGraph(List.of(node)));
+
+        assertTrue(correction.contains("REJECTED_GRAPH_DRAFT_JSON"));
+        assertTrue(correction.contains("\"capability\":\"web_search\""));
+        assertTrue(correction.contains("\"query\":\"上海 北京 2026-11-17\""));
+        assertTrue(correction.contains("untrusted planning data"));
+        assertFalse(correction.contains("private page body"));
+    }
+
+    @Test
     void modelFailureIsExplicitlyMarkedWithoutTemplateSemantics() {
         PlannerProperties props = new PlannerProperties();
         props.setCompilerRetry(0);

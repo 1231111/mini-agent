@@ -148,6 +148,8 @@ public class WebSearchService {
             dateWindow = resolveDateWindow(query, dateFrom, dateTo, today, requestedWindow);
         } catch (DateWindowConflictException e) {
             return buildErrorResponse("DATE_WINDOW_CONFLICT", e.getMessage());
+        } catch (DateFilterIntentMismatchException e) {
+            return buildErrorResponse("DATE_FILTER_NOT_APPLICABLE", e.getMessage());
         } catch (IllegalArgumentException e) {
             return buildErrorResponse(e.getMessage());
         }
@@ -853,6 +855,12 @@ public class WebSearchService {
     /** The trusted user-request window survives query rewrites and cannot be broadened by model arguments. */
     static DateWindow resolveDateWindow(String query, String dateFrom, String dateTo, LocalDate today,
                                         SearchDateContext.Window requestedWindow) {
+        String text = Objects.toString(query, "");
+        if (requestedWindow != null && !SearchDateContext.hasPublicationIntent(text)) {
+            // The user-scoped publication window is authoritative even when a
+            // model rewrites the search query and drops the news wording.
+            return new DateWindow(requestedWindow.start(), requestedWindow.end());
+        }
         DateWindow modelWindow = resolveDateWindow(query, dateFrom, dateTo, today);
         if (requestedWindow == null) return modelWindow;
         if (modelWindow == null) return new DateWindow(requestedWindow.start(), requestedWindow.end());
@@ -870,16 +878,24 @@ public class WebSearchService {
     }
 
     static DateWindow resolveDateWindow(String query, String dateFrom, String dateTo, LocalDate today) {
+        String text = Objects.toString(query, "");
+        boolean publicationIntent = SearchDateContext.hasPublicationIntent(text);
         LocalDate start = parseWindowDate(dateFrom, "dateFrom");
         LocalDate end = parseWindowDate(dateTo, "dateTo");
         if (start != null || end != null) {
+            if (!publicationIntent) {
+                throw new DateFilterIntentMismatchException(
+                        "dateFrom/dateTo 只筛选网页发布日期；当前 query 未表达新闻或发布时间意图。"
+                                + "航班、演出、上映等事件日期应放在 query 中，不要作为网页发布日期过滤。"
+                );
+            }
             if (start == null) start = end;
             if (end == null) end = start;
             if (start.isAfter(end)) throw new IllegalArgumentException("web_search 的 dateFrom 不能晚于 dateTo");
             return new DateWindow(start, end);
         }
 
-        String text = Objects.toString(query, "");
+        if (!publicationIntent) return null;
         Matcher dates = ISO_DATE_IN_QUERY.matcher(text);
         List<LocalDate> explicitDates = new ArrayList<>();
         while (dates.find()) {
@@ -898,6 +914,12 @@ public class WebSearchService {
             return new DateWindow(today, today);
         }
         return null;
+    }
+
+    private static final class DateFilterIntentMismatchException extends IllegalArgumentException {
+        private DateFilterIntentMismatchException(String message) {
+            super(message);
+        }
     }
 
     static String normalizePublicationDate(String value) {
