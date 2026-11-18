@@ -9,18 +9,21 @@ import com.miniagent.config.cloud.CloudMembershipClient.OrderView;
 import com.miniagent.config.cloud.CloudMembershipClient.PlanView;
 import com.miniagent.config.repository.UserRepository;
 import com.miniagent.config.security.CurrentUser;
+import com.miniagent.config.service.UserTokenQuotaService;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseBody;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * 会员中心的数据端点：本服务只做鉴权与转发，业务与数据都在账号服务。
@@ -58,8 +61,14 @@ public class MembershipController {
     @Autowired
     private UserRepository users;
 
+    @Autowired(required = false)
+    private UserTokenQuotaService tokenQuota;
+
     @Value("${agent.auth.cloud.shared-database:false}")
     private boolean sharedDatabase;
+
+    @Value("${agent.auth.cloud.membership.simulated-payment-enabled:false}")
+    private boolean simulatedPaymentEnabled;
 
     /** 下单请求。只有套餐代码 —— 见类注释，userId 不在契约里。 */
     public record CreateOrderRequest(String planCode) {
@@ -79,7 +88,18 @@ public class MembershipController {
     @GetMapping(value = "/current", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<MembershipView> current() {
-        return ApiResponse.ok(membership.current(cloudUserId()));
+        MembershipView current = membership.current(cloudUserId());
+        if (tokenQuota != null) {
+            tokenQuota.synchronizeMembership(currentUser.userId(), current.dailyTokenLimit(),
+                    current.maxConcurrentTasks(), current.expireAt());
+        }
+        return ApiResponse.ok(current);
+    }
+
+    @GetMapping(value = "/payment-options", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<Map<String, Boolean>> paymentOptions() {
+        return ApiResponse.ok(Map.of("simulatedPaymentEnabled", simulatedPaymentEnabled));
     }
 
     /**
@@ -100,6 +120,37 @@ public class MembershipController {
             return ApiResponse.fail(ErrorCode.MEMBER_PLAN_NOT_FOUND, "缺少 planCode");
         }
         return ApiResponse.ok(membership.createOrder(cloudUserId(), planCode));
+    }
+
+    /** List only the current user's pending orders; identity is derived from the session token. */
+    @GetMapping(value = "/orders", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<List<OrderView>> pendingOrders() {
+        return ApiResponse.ok(membership.pendingOrders(cloudUserId()));
+    }
+
+    /** Mock payment is opt-in on both agent and account services and always binds to this session's account. */
+    @PostMapping(value = "/orders/{orderNo}/simulate-payment", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<?> simulatePayment(@PathVariable String orderNo) {
+        if (!simulatedPaymentEnabled) {
+            throw new BusinessException(ErrorCode.MEMBER_PAYMENT_CALLBACK_DISABLED,
+                    "模拟支付未启用，请在 agent 与 account 服务显式开启演示配置");
+        }
+        Long cloudUserId = cloudUserId();
+        OrderView order = membership.simulatePayment(cloudUserId, orderNo);
+        MembershipView active = membership.current(cloudUserId);
+        if (tokenQuota != null) {
+            tokenQuota.synchronizeMembership(currentUser.userId(), active.dailyTokenLimit(),
+                    active.maxConcurrentTasks(), active.expireAt());
+        }
+        return ApiResponse.ok(Map.of("order", order, "membership", active));
+    }
+
+    @PostMapping(value = "/orders/{orderNo}/cancel", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<OrderView> cancelOrder(@PathVariable String orderNo) {
+        return ApiResponse.ok(membership.cancelOrder(cloudUserId(), orderNo));
     }
 
     /** Local and cloud primary keys are different identity spaces outside shared-database mode. */

@@ -9,6 +9,7 @@ import com.miniagent.config.entity.UserRole;
 import com.miniagent.config.repository.UserRepository;
 import com.miniagent.config.security.AuthenticatedUser;
 import com.miniagent.config.security.CurrentUser;
+import com.miniagent.config.service.UserTokenQuotaService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -19,6 +20,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.time.LocalDateTime;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -31,6 +33,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.when;
 
 class MembershipControllerCloudIdentityTest {
@@ -60,16 +63,23 @@ class MembershipControllerCloudIdentityTest {
         when(users.findExternalIdById(7L)).thenReturn(Optional.of(" 42001 "));
         MembershipView view = new MembershipView("PRO", "专业版", 1000L, 2, null, null);
         OrderView order = new OrderView(13L, "test-order", 42001L, "PRO", 200L,
-                "CNY", "PENDING", null, null, null);
+                "CNY", "PENDING", null, null, null, null);
+        List<OrderView> pending = List.of(order);
         when(membership.current(42001L)).thenReturn(view);
         when(membership.createOrder(42001L, "PRO")).thenReturn(order);
+        when(membership.pendingOrders(42001L)).thenReturn(pending);
+        when(membership.cancelOrder(42001L, "test-order")).thenReturn(order);
 
         assertSame(view, controller.current().getData());
         assertSame(order, controller.createOrder(new MembershipController.CreateOrderRequest(" PRO ")).getData());
+        assertSame(pending, controller.pendingOrders().getData());
+        assertSame(order, controller.cancelOrder("test-order").getData());
 
-        verify(users, times(2)).findExternalIdById(7L);
+        verify(users, times(4)).findExternalIdById(7L);
         verify(membership).current(42001L);
         verify(membership).createOrder(42001L, "PRO");
+        verify(membership).pendingOrders(42001L);
+        verify(membership).cancelOrder(42001L, "test-order");
         verifyNoMoreInteractions(users, membership);
     }
 
@@ -119,6 +129,40 @@ class MembershipControllerCloudIdentityTest {
         verify(membership).createOrder(7L, "PRO");
         verifyNoMoreInteractions(membership);
         verifyNoInteractions(users);
+    }
+
+    @Test
+    void simulatedPaymentUsesMappedCloudIdentityAndSynchronizesThePurchasedAllowance() {
+        UserTokenQuotaService quota = mock(UserTokenQuotaService.class);
+        ReflectionTestUtils.setField(controller, "tokenQuota", quota);
+        ReflectionTestUtils.setField(controller, "simulatedPaymentEnabled", true);
+        ReflectionTestUtils.setField(controller, "sharedDatabase", false);
+        when(users.findExternalIdById(7L)).thenReturn(Optional.of("42001"));
+        OrderView order = new OrderView(13L, "test-order", 42001L, "PRO", 200L,
+                "CNY", "PAID", "SIMULATED", "SIMULATED-test-order", LocalDateTime.now(), null);
+        MembershipView view = new MembershipView("PRO", "专业版", 25_000L, 2,
+                LocalDateTime.now().plusDays(30), "test-order");
+        when(membership.simulatePayment(42001L, "test-order")).thenReturn(order);
+        when(membership.current(42001L)).thenReturn(view);
+
+        var response = controller.simulatePayment("test-order");
+
+        assertTrue(response.isSuccess());
+        verify(membership).simulatePayment(42001L, "test-order");
+        verify(membership).current(42001L);
+        verify(quota).synchronizeMembership(7L, 25_000L, 2, view.expireAt());
+        verify(users).findExternalIdById(7L);
+        verifyNoMoreInteractions(membership);
+    }
+
+    @Test
+    void simulatedPaymentCannotBeUsedUntilExplicitlyEnabled() {
+        when(users.findExternalIdById(7L)).thenReturn(Optional.of("42001"));
+
+        assertThrows(BusinessException.class, () -> controller.simulatePayment("test-order"));
+
+        verify(users, never()).findExternalIdById(7L);
+        verifyNoInteractions(membership);
     }
 
     @Test

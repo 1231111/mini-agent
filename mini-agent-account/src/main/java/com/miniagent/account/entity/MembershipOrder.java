@@ -20,7 +20,7 @@ import java.time.LocalDateTime;
  * 必须能从这一行读出来，而不是从当前价目表推。
  *
  * <p>{@code status} 的流转是单向的，不允许回退：{@code PENDING → PAID} 或
- * {@code PENDING → FAILED/CANCELED}，{@code PAID → REFUNDED}。
+ * {@code PENDING → FAILED/CANCELED/EXPIRED}，{@code PAID → REFUNDED}。
  * 支付回调可能重复投递，所以 {@code PAID → PAID} 必须被当作幂等成功而不是异常 ——
  * 见 {@link com.miniagent.account.service.MembershipService#markPaid}。
  */
@@ -34,6 +34,7 @@ public class MembershipOrder extends BaseEntity {
         PAID,
         FAILED,
         CANCELED,
+        EXPIRED,
         REFUNDED
     }
 
@@ -71,4 +72,8 @@ public class MembershipOrder extends BaseEntity {
 
     @Column(name = "paid_at")
     private LocalDateTime paidAt;
+
+    /** Fixed payment deadline assigned when the order is created. */
+    @Column(name = "expires_at")
+    private LocalDateTime expiresAt;
 }

@@ -36,6 +36,8 @@ public class TaskRunService implements SessionLock {
     private RedisTaskConcurrency taskConcurrency;
     @Autowired(required = false)
     private TaskAdmissionGuard admissionGuard;
+    @Autowired(required = false)
+    private UserTokenQuotaService userTokenQuota;
     @Value("${agent.concurrency.max-tasks-per-user:2}")
     private int maxPerUserConfig;
     private int maxPerUser = 2;
@@ -101,6 +103,8 @@ public class TaskRunService implements SessionLock {
         if (sessionId != null && isRunning(sessionId)) {
             return StartResult.rejected("该会话已有任务在运行");
         }
+        int maxPerUser = userTokenQuota == null ? this.maxPerUser
+                : Math.max(1, userTokenQuota.effectiveConcurrentLimit(userId, this.maxPerUser));
         String fencingToken = UUID.randomUUID().toString().replace("-", "");
 
         if (taskConcurrency != null) {

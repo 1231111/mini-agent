@@ -2,6 +2,7 @@ package com.miniagent.config.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.config.entity.Tenant;
+import com.miniagent.config.entity.User;
 import com.miniagent.config.repository.AdminAuditLogRepository;
 import com.miniagent.config.repository.AuthSessionRepository;
 import com.miniagent.config.repository.TenantRepository;
@@ -14,6 +15,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
@@ -70,5 +72,25 @@ class SystemAdminTenantQuotaTest {
 
         assertEquals(40_000L, tenant.getDailyUserTokenLimit());
         assertEquals(40_000L, view.get("dailyUserTokenLimit"));
+    }
+
+    @Test
+    void administratorCanSetAndClearAnIndividualUserOverrideWithAudit() {
+        User user = new User();
+        user.setId(41L);
+        user.setUsername("member-1");
+        user.setTenantId(9L);
+        user.setDailyTokenLimitOverride(25_000L);
+        user.setMembershipDailyTokenLimit(50_000L);
+        when(users.findByIdForUpdate(41L)).thenReturn(Optional.of(user));
+        when(users.save(user)).thenReturn(user);
+
+        var updated = service.updateUserQuota(7L, 41L, 10_000L);
+        var inherited = service.updateUserQuota(7L, 41L, null);
+
+        assertEquals(10_000L, updated.get("dailyTokenLimitOverride"));
+        assertEquals(50_000L, updated.get("membershipDailyTokenLimit"));
+        assertNull(inherited.get("dailyTokenLimitOverride"));
+        verify(auditLogs, times(2)).save(any());
     }
 }

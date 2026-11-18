@@ -1072,10 +1072,25 @@ public class AgentLoop {
             log.info("LLM 调用结束，耗时 {}ms，response={}",
                     System.currentTimeMillis() - llmStartMs, Objects.isNull(response) ? "null" : "ok");
             long llmEndMs = System.currentTimeMillis();
-            long estimatedTokens = response != null && response.tokenUsage() != null
-                    ? response.tokenUsage().inputTokenCount() + response.tokenUsage().outputTokenCount()
-                    : Math.max(1, messages.size() * 32L);
-            ExecutionControl.StopReason modelStop = executionControl.afterModelTokens(sessionId, estimatedTokens);
+            long reportedInputTokens = response != null && response.tokenUsage() != null
+                    && response.tokenUsage().inputTokenCount() != null
+                    ? Math.max(0, response.tokenUsage().inputTokenCount()) : 0;
+            long reportedOutputTokens = response != null && response.tokenUsage() != null
+                    && response.tokenUsage().outputTokenCount() != null
+                    ? Math.max(0, response.tokenUsage().outputTokenCount()) : 0;
+            long estimatedTokens = reportedInputTokens + reportedOutputTokens;
+            if (estimatedTokens <= 0) {
+                estimatedTokens = Math.max(1, messages.size() * 32L);
+                // Keep the quota debit, session usage and account usage report on the same basis
+                // when a provider omits token metadata. The fallback is explicitly approximate.
+                reportedInputTokens = estimatedTokens;
+                reportedOutputTokens = 0;
+            }
+            String usageEventId = java.util.UUID.randomUUID().toString();
+            ExecutionControl.StopReason modelStop = executionControl.afterModelTokens(sessionId, estimatedTokens,
+                    usageEventId, reportedInputTokens, reportedOutputTokens);
+            TokenUsageTracker.add(sessionId, usageEventId, executionControl.userId(sessionId),
+                    reportedInputTokens, reportedOutputTokens, 0);
             // 记录真实 input 快照：压缩判据要用它校准本地估算（见 ContextCompressor#maybeCompress）。
             if (response != null && response.tokenUsage() != null) {
                 executionControl.recordInputTokens(sessionId, response.tokenUsage().inputTokenCount());
@@ -1783,18 +1798,6 @@ public class AgentLoop {
                 }
                 if (Objects.nonNull(response)) {
                     if (state != null) state.partialStreamAnswer = "";
-                    String sid = currentSessionId.get();
-                    int inputTokens = 0;
-                    int outputTokens = 0;
-                    if (Objects.nonNull(response.tokenUsage())) {
-                        Integer in = response.tokenUsage().inputTokenCount();
-                        Integer out = response.tokenUsage().outputTokenCount();
-                        inputTokens = in == null ? 0 : in;
-                        outputTokens = out == null ? 0 : out;
-                    }
-                    if (Objects.nonNull(sid)) {
-                        TokenUsageTracker.add(sid, inputTokens, outputTokens, 0);
-                    }
                     if (Objects.nonNull(response.tokenUsage()) && Objects.nonNull(streamSink)) {
                         try {
                             // 前端显示"上下文已用 X%"，分母必须是**本轮真实窗口**（模型窗口或配置上限），

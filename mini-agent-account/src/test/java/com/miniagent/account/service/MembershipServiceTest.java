@@ -10,6 +10,7 @@ import com.miniagent.account.repository.MembershipOrderRepository;
 import com.miniagent.account.repository.MembershipPlanRepository;
 import com.miniagent.account.repository.MembershipSubscriptionRepository;
 import com.miniagent.account.repository.TenantRepository;
+import com.miniagent.account.repository.UserRepository;
 import com.miniagent.common.ErrorCode;
 import com.miniagent.common.exception.BusinessException;
 import org.junit.jupiter.api.BeforeEach;
@@ -20,6 +21,8 @@ import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.test.context.TestPropertySource;
 
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -28,12 +31,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * 会员的等级翻译与付费幂等。
  *
- * <p>这个类守的是两条不变量：
+ * <p>这个类守的是几条不变量：
  * <ol>
- *   <li><b>会员等级 → {@code tenants.daily_token_limit} 的写入必须发生。</b>
- *       这是账号服务与 agent 之间唯一的耦合点，agent 侧的
- *       {@code DbTenantTokenQuota} 只读这一列。写漏了不会有任何报错，
- *       表现只是"买了会员但额度没变"。</li>
+ *   <li><b>个人会员变更不能覆盖租户共享额度。</b> 套餐额度通过会员视图呈现，
+ *       运行时个人限额由 agent 侧用户配额配置执行。</li>
+ *   <li><b>到期订阅在 current 查询中转成 EXPIRED，续购会保留当前剩余有效期。</b></li>
  *   <li><b>支付回调必须幂等。</b>渠道会重复投递（失败重试 / 多实例广播 / 人工补投）。
  *       不幂等的后果是同一笔钱开两次会员，或者更糟：第二次把第一次的订阅置成
  *       SUPERSEDED 又建一条新的，账面上多出一个周期。</li>
@@ -67,6 +69,8 @@ class MembershipServiceTest {
     private MembershipOrderRepository orders;
     @Autowired
     private TenantRepository tenants;
+    @Autowired
+    private UserRepository users;
 
     @BeforeEach
     void seedPlans() {
@@ -120,8 +124,10 @@ class MembershipServiceTest {
         assertThat(order.getStatus()).isEqualTo(MembershipOrder.Status.PENDING);
         assertThat(order.getAmountCents()).isEqualTo(PRO_PRICE_CENTS);
         assertThat(order.getOrderNo()).startsWith("MA");
+        assertThat(order.getExpiresAt()).isAfter(LocalDateTime.now(ZoneId.of("Asia/Shanghai")))
+                .isBefore(LocalDateTime.now(ZoneId.of("Asia/Shanghai")).plusMinutes(16));
         // 下单不碰配额 —— 配额只由支付回调触发
-        assertThat(tenantQuotaOf(user)).isEqualTo(FREE_TOKENS);
+        assertThat(tenantQuotaOf(user)).isZero();
     }
 
     @Test
@@ -142,13 +148,41 @@ class MembershipServiceTest {
                 .isEqualTo(ErrorCode.MEMBER_PLAN_DISABLED);
     }
 
+    @Test
+    @DisplayName("刷新结账：用户可恢复自己的待支付订单，取消后不再出现在待处理列表")
+    void pendingOrdersCanBeRecoveredAndCanceled() {
+        User user = newUser("order-recovery");
+        MembershipOrder order = membership.createOrder(user.getId(), "pro");
+
+        assertThat(membership.pendingOrdersOf(user.getId()))
+                .extracting(MembershipOrder::getOrderNo)
+                .containsExactly(order.getOrderNo());
+
+        membership.cancelOrder(user.getId(), order.getOrderNo());
+
+        assertThat(membership.pendingOrdersOf(user.getId())).isEmpty();
+    }
+
+    @Test
+    @DisplayName("刷新结账：到期订单立即转为 EXPIRED，不再显示为待支付")
+    void pendingOrderExpiryIsVisibleWithoutWaitingForTheBackgroundSweep() {
+        User user = newUser("expired-order-recovery");
+        MembershipOrder order = membership.createOrder(user.getId(), "pro");
+        order.setExpiresAt(LocalDateTime.now(ZoneId.of("Asia/Shanghai")).minusSeconds(1));
+        orders.saveAndFlush(order);
+
+        assertThat(membership.pendingOrdersOf(user.getId())).isEmpty();
+        assertThat(orders.findByOrderNo(order.getOrderNo()).orElseThrow().getStatus())
+                .isEqualTo(MembershipOrder.Status.EXPIRED);
+    }
+
     // ==================== 支付回调 ====================
 
     @Test
-    @DisplayName("支付成功：租户配额被改成 pro 的额度，且旧订阅变成 SUPERSEDED")
-    void markPaidWritesQuotaAndSupersedesOldSubscription() {
+    @DisplayName("支付成功：激活 pro 会员并收起旧订阅，不改共享租户额度")
+    void markPaidActivatesPlanAndSupersedesOldSubscription() {
         User user = newUser("alice");
-        assertThat(tenantQuotaOf(user)).isEqualTo(FREE_TOKENS);
+        long originalTenantQuota = tenantQuotaOf(user);
 
         MembershipOrder order = membership.createOrder(user.getId(), "pro");
         membership.markPaid(order.getOrderNo(), "alipay", "TXN-1");
@@ -157,14 +191,22 @@ class MembershipServiceTest {
         // agent 侧的 DbTenantTokenQuota 只读 tenants.daily_token_limit，
         // 它不知道会员、订单、套餐的存在。这一列没写到，agent 侧毫无察觉。
         assertThat(tenantQuotaOf(user))
-                .as("会员等级必须被翻译进 tenants.daily_token_limit")
-                .isEqualTo(PRO_TOKENS);
+                .as("个人会员变更不能覆盖租户共享额度")
+                .isEqualTo(originalTenantQuota);
 
         List<MembershipSubscription> active = subscriptions
                 .findByUserIdAndStatus(user.getId(), MembershipSubscription.Status.ACTIVE);
         assertThat(active).hasSize(1);
         assertThat(active.get(0).getPlanCode()).isEqualTo("pro");
         assertThat(active.get(0).getExpireAt()).isNotNull();   // pro 有期限
+        assertThat(membership.current(user.getId()).orElseThrow().dailyTokenLimit())
+                .isEqualTo(PRO_TOKENS);
+        User entitled = users.findById(user.getId()).orElseThrow();
+        assertThat(entitled.getMembershipDailyTokenLimit()).isEqualTo(PRO_TOKENS);
+        assertThat(entitled.getMembershipMaxConcurrentTasks()).isEqualTo(5);
+        assertThat(Math.abs(java.time.Duration.between(active.get(0).getExpireAt(),
+                entitled.getMembershipExpiresAt()).toNanos()))
+                .isLessThanOrEqualTo(1_000L); // H2/MySQL DATETIME(6) rounds to microseconds.
         assertThat(active.get(0).getSourceOrderNo()).isEqualTo(order.getOrderNo());
 
         // 旧订阅是"收起"不是"删除"：升级与续费的历史是账单的依据，
@@ -200,13 +242,119 @@ class MembershipServiceTest {
                 .as("重复回调不得把第一次的订阅收起后重开")
                 .hasSize(1);
 
-        // 3. 配额仍是 pro 的值
-        assertThat(tenantQuotaOf(user)).isEqualTo(PRO_TOKENS);
+        // 3. 重复回调不会写共享租户额度
+        assertThat(tenantQuotaOf(user)).isZero();
 
         // 4. 流水号保持第一次的值：它是与渠道对账的凭据，被后者覆盖就再也对不上了
         MembershipOrder reloaded = orders.findByOrderNo(order.getOrderNo()).orElseThrow();
         assertThat(reloaded.getStatus()).isEqualTo(MembershipOrder.Status.PAID);
         assertThat(reloaded.getChannelTxnId()).isEqualTo("TXN-1");
+    }
+
+    @Test
+    @DisplayName("模拟支付只允许本人确认待支付订单，并且重试仍然幂等")
+    void simulatedPaymentChecksOwnerAndActivatesOnce() {
+        User owner = newUser("alice");
+        User other = newUser("bob");
+        MembershipOrder order = membership.createOrder(owner.getId(), "pro");
+
+        assertThatThrownBy(() -> membership.simulatePayment(other.getId(), order.getOrderNo()))
+                .isInstanceOf(BusinessException.class)
+                .extracting(e -> ((BusinessException) e).getErrorCode())
+                .isEqualTo(ErrorCode.MEMBER_ORDER_NOT_FOUND);
+        assertThat(orders.findByOrderNo(order.getOrderNo()).orElseThrow().getStatus())
+                .isEqualTo(MembershipOrder.Status.PENDING);
+
+        membership.simulatePayment(owner.getId(), order.getOrderNo());
+        membership.simulatePayment(owner.getId(), order.getOrderNo());
+
+        MembershipOrder paid = orders.findByOrderNo(order.getOrderNo()).orElseThrow();
+        assertThat(paid.getStatus()).isEqualTo(MembershipOrder.Status.PAID);
+        assertThat(paid.getChannel()).isEqualTo("SIMULATED");
+        assertThat(paid.getChannelTxnId()).isEqualTo("SIMULATED-" + order.getOrderNo());
+        assertThat(subscriptions.findByUserIdAndStatus(
+                owner.getId(), MembershipSubscription.Status.ACTIVE)).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("模拟支付不能确认过期订单，并且把订单收敛为 EXPIRED")
+    void simulatedPaymentRejectsExpiredOrder() {
+        User owner = newUser("expired-order");
+        MembershipOrder order = membership.createOrder(owner.getId(), "pro");
+        order.setExpiresAt(LocalDateTime.now(ZoneId.of("Asia/Shanghai")).minusSeconds(1));
+        orders.saveAndFlush(order);
+
+        assertThatThrownBy(() -> membership.simulatePayment(owner.getId(), order.getOrderNo()))
+                .isInstanceOf(BusinessException.class)
+                .extracting(e -> ((BusinessException) e).getErrorCode())
+                .isEqualTo(ErrorCode.MEMBER_ORDER_STATE_INVALID);
+        assertThat(orders.findByOrderNo(order.getOrderNo()).orElseThrow().getStatus())
+                .isEqualTo(MembershipOrder.Status.EXPIRED);
+        assertThat(subscriptions.findByUserIdAndStatus(owner.getId(), MembershipSubscription.Status.ACTIVE))
+                .hasSize(1); // The original free subscription only.
+    }
+
+    @Test
+    @DisplayName("用户只能取消本人待支付订单")
+    void cancelOrderChecksOwnerAndPendingState() {
+        User owner = newUser("cancel-owner");
+        User other = newUser("cancel-other");
+        MembershipOrder order = membership.createOrder(owner.getId(), "pro");
+
+        assertThatThrownBy(() -> membership.cancelOrder(other.getId(), order.getOrderNo()))
+                .isInstanceOf(BusinessException.class)
+                .extracting(e -> ((BusinessException) e).getErrorCode())
+                .isEqualTo(ErrorCode.MEMBER_ORDER_NOT_FOUND);
+        assertThat(membership.cancelOrder(owner.getId(), order.getOrderNo()).getStatus())
+                .isEqualTo(MembershipOrder.Status.CANCELED);
+    }
+
+    @Test
+    @DisplayName("后台扫描把支付截止时间已过的 PENDING 订单改为 EXPIRED")
+    void scheduledSweepExpiresPendingOrders() {
+        User owner = newUser("sweep-expired");
+        MembershipOrder order = membership.createOrder(owner.getId(), "pro");
+        order.setExpiresAt(LocalDateTime.now(ZoneId.of("Asia/Shanghai")).minusSeconds(1));
+        orders.saveAndFlush(order);
+
+        assertThat(membership.expirePendingOrders()).isEqualTo(1);
+        assertThat(orders.findByOrderNo(order.getOrderNo()).orElseThrow().getStatus())
+                .isEqualTo(MembershipOrder.Status.EXPIRED);
+    }
+
+    @Test
+    @DisplayName("续购从当前有效期末日堆叠，不损失剩余时长")
+    void renewalStacksOnCurrentExpiry() {
+        User user = newUser("renewal");
+        MembershipOrder firstOrder = membership.createOrder(user.getId(), "pro");
+        membership.markPaid(firstOrder.getOrderNo(), "alipay", "TXN-1");
+        LocalDateTime firstExpiry = membership.current(user.getId()).orElseThrow().expireAt();
+
+        MembershipOrder renewal = membership.createOrder(user.getId(), "pro");
+        membership.markPaid(renewal.getOrderNo(), "alipay", "TXN-2");
+
+        MembershipSubscription current = subscriptions.findFirstByUserIdAndStatusOrderByIdDesc(
+                user.getId(), MembershipSubscription.Status.ACTIVE).orElseThrow();
+        assertThat(current.getExpireAt()).isEqualTo(firstExpiry.plusDays(30));
+        assertThat(current.getSourceOrderNo()).isEqualTo(renewal.getOrderNo());
+        assertThat(subscriptions.findByUserIdAndStatus(user.getId(), MembershipSubscription.Status.SUPERSEDED))
+                .hasSize(2);
+    }
+
+    @Test
+    @DisplayName("current 查询到期会员时返回空并持久化 EXPIRED")
+    void currentExpiresSubscriptionAtExpiryBoundary() {
+        User user = newUser("expired");
+        MembershipOrder order = membership.createOrder(user.getId(), "pro");
+        membership.markPaid(order.getOrderNo(), "alipay", "TXN-1");
+        MembershipSubscription subscription = subscriptions.findFirstByUserIdAndStatusOrderByIdDesc(
+                user.getId(), MembershipSubscription.Status.ACTIVE).orElseThrow();
+        subscription.setExpireAt(LocalDateTime.now(ZoneId.of("Asia/Shanghai")).minusSeconds(1));
+        subscriptions.saveAndFlush(subscription);
+
+        assertThat(membership.current(user.getId())).isEmpty();
+        assertThat(subscriptions.findById(subscription.getId()).orElseThrow().getStatus())
+                .isEqualTo(MembershipSubscription.Status.EXPIRED);
     }
 
     @Test

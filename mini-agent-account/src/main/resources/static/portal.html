@@ -86,14 +86,15 @@
         </div>
         <div class="card">
             <h2 style="margin:0 0 8px;font-size:16px;">充值</h2>
-            <p class="muted">还没有接入支付渠道。确认后按订单金额直接开通。</p>
+            <p class="muted">无真实支付渠道。开发演示模式下的模拟支付不会扣款，只会开通套餐。</p>
+            <p class="muted" id="paymentNotice">正在读取支付方式…</p>
             <div id="plans"></div>
         </div>
         <div class="card">
             <h2 style="margin:0 0 8px;font-size:16px;">订单</h2>
             <table>
                 <thead>
-                <tr><th>单号</th><th>套餐</th><th>金额</th><th>状态</th><th></th></tr>
+                <tr><th>单号</th><th>套餐</th><th>金额</th><th>状态</th><th>支付截止</th><th></th></tr>
                 </thead>
                 <tbody id="orders"></tbody>
             </table>
@@ -235,6 +236,12 @@ async function loadDesk() {
             usageBody.appendChild(tr);
         });
     }
+    const mode = await call('/api/portal/payment-mode');
+    const simulatedPaymentEnabled = !!(mode.success && mode.data
+        && mode.data.simulatedPaymentEnabled);
+    document.getElementById('paymentNotice').textContent = simulatedPaymentEnabled
+        ? '模拟支付已启用：不会产生真实扣款，确认后会立即开通所选套餐。'
+        : '真实支付渠道尚未接入，当前不能购买套餐。';
     const plans = await call('/api/portal/plans');
     const box = document.getElementById('plans');
     box.replaceChildren();
@@ -242,9 +249,13 @@ async function loadDesk() {
         if (item.priceCents <= 0) {
             return;
         }
+        if (!simulatedPaymentEnabled) {
+            return;
+        }
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.textContent = item.name + ' · ' + yuan(item.priceCents);
+        btn.appendChild(document.createTextNode('（模拟支付）'));
         btn.onclick = function () { buy(item.code); };
         box.appendChild(btn);
     });
@@ -254,7 +265,8 @@ async function loadDesk() {
     (orders.data || []).forEach(function (order) {
         const tr = document.createElement('tr');
         const cells = [
-            order.orderNo, order.planCode, yuan(order.amountCents), order.status
+            order.orderNo, order.planCode, yuan(order.amountCents), order.status,
+            order.expiresAt ? new Date(order.expiresAt).toLocaleString() : '—'
         ];
         cells.forEach(function (text) {
             const td = document.createElement('td');
@@ -263,11 +275,19 @@ async function loadDesk() {
         });
         const action = document.createElement('td');
         if (order.status === 'PENDING') {
-            const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.textContent = '确认支付';
-            btn.onclick = function () { confirmPay(order.orderNo); };
-            action.appendChild(btn);
+            if (simulatedPaymentEnabled) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.setAttribute('aria-label', '模拟支付，不会扣款');
+                btn.textContent = '模拟支付（不扣款）';
+                btn.onclick = function () { confirmPay(order.orderNo); };
+                action.appendChild(btn);
+            }
+            const cancel = document.createElement('button');
+            cancel.type = 'button';
+            cancel.textContent = '取消订单';
+            cancel.onclick = function () { cancelOrder(order.orderNo); };
+            action.appendChild(cancel);
         }
         tr.appendChild(action);
         tbody.appendChild(tr);
@@ -291,11 +311,28 @@ async function buy(planCode) {
 async function confirmPay(orderNo) {
     const err = document.getElementById('deskErr');
     err.textContent = '';
+    if (!window.confirm('这是模拟支付，不会扣款。确认后会立即开通套餐，继续吗？')) {
+        return;
+    }
     const body = await call('/api/portal/orders/' + encodeURIComponent(orderNo) + '/confirm', {
         method: 'POST'
     });
     if (!body.success) {
         err.textContent = body.message || '确认失败';
+        return;
+    }
+    await loadDesk();
+}
+
+async function cancelOrder(orderNo) {
+    if (!window.confirm('确认取消这笔待支付订单吗？')) {
+        return;
+    }
+    const body = await call('/api/portal/orders/' + encodeURIComponent(orderNo) + '/cancel', {
+        method: 'POST'
+    });
+    if (!body.success) {
+        document.getElementById('deskErr').textContent = body.message || '取消失败';
         return;
     }
     await loadDesk();

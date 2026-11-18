@@ -180,6 +180,9 @@ agent:
       retry-backoff-ms: 400
       # 退避 + 重试的总时间上限。登录在启动路径上阻塞，不能无限等。
       total-budget-ms: 20000
+      membership:
+        # False by default. Use only with the account service's matching demo flag enabled.
+        simulated-payment-enabled: ${ACCOUNT_SIMULATED_PAYMENT_ENABLED:false}
   memory:
     # db=多副本真相源（agent_user_memory）；file=仅本地目录
     storage: db

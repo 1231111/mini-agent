@@ -23,6 +23,21 @@ public class User extends BaseEntity {
     @Column(name = "tenant_id", nullable = false)
     private Long tenantId;
 
+    /** Explicit administrator override for this user's daily token limit; null inherits membership/default. */
+    @Column(name = "daily_token_limit_override")
+    private Long dailyTokenLimitOverride;
+
+    /** Per-user daily allowance synchronized from the account membership service. */
+    @Column(name = "membership_daily_token_limit")
+    private Long membershipDailyTokenLimit;
+
+    @Column(name = "membership_max_concurrent_tasks")
+    private Integer membershipMaxConcurrentTasks;
+
+    /** Membership expiry; null means the membership allowance is perpetual. */
+    @Column(name = "membership_expires_at")
+    private java.time.LocalDateTime membershipExpiresAt;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 32)
     private UserRole role = UserRole.USER;

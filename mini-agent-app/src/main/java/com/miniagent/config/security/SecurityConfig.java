@@ -96,6 +96,8 @@ public class SecurityConfig {
             // 页面里的 /api/membership/** 一条都不在放行名单里，仍逐个要 Bearer，
             // 而真正的 userId 是从那个 Bearer 里解出来的（见 MembershipController）。
             "/membership",
+            // 管理页面只返回静态骨架；用户和额度数据仍由 /api/admin/** 的 SYSTEM_ADMIN 授权保护。
+            "/admin/quota",
             "/error",
             "/api/tokens",
             "/api/tokens/current",

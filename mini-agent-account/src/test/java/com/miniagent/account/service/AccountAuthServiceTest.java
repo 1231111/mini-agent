@@ -84,7 +84,7 @@ class AccountAuthServiceTest {
     // ==================== 注册 ====================
 
     @Test
-    @DisplayName("注册成功：建专属租户，并把 free 套餐的额度写进该租户")
+    @DisplayName("注册成功：建专属租户，free 额度保存在会员订阅中")
     void registerCreatesPersonalTenantAndFreeSubscription() {
         AccountAuthService.RegisterResult result = auth.register("alice", PASSWORD, null);
 
@@ -96,8 +96,8 @@ class AccountAuthServiceTest {
         // "谁用得多别人就没得用"。这条断言就是那个缺陷的回归防线。
         assertThat(tenant.getSlug()).isEqualTo("u-alice");
         assertThat(tenant.getDailyTokenLimit())
-                .as("free 套餐的额度应当已经写进租户")
-                .isEqualTo(FREE_DAILY_TOKENS);
+                .as("个人 free 会员不能写入租户共享额度")
+                .isZero();
 
         var current = membership.current(user.getId());
         assertThat(current).isPresent();

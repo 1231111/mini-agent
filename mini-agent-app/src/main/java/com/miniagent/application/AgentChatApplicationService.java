@@ -746,6 +746,7 @@ public class AgentChatApplicationService {
         };
 
         AgentLoop.setCurrentSession(sessionId);
+        com.miniagent.agent.core.TokenUsageTracker.setCurrentUserId(userId);
         // 连窗口一起绑定：循环按"配置上限 vs 模型厂商窗口"的较小值决定何时压缩。
         // 不带窗口时，128k 的模型也会按 512k 估算，压缩永远不触发 → 上游 400 → 误报成网络故障。
         com.miniagent.common.model.EffectiveModelContext.set(
@@ -881,6 +882,7 @@ public class AgentChatApplicationService {
             // 权限上下文在这里提前绑定过，任何在进入内层 try 之前抛出的异常都要清掉，
             // 否则线程复用时会带着上一个会话的模式去找下一个会话要授权。
             PermissionContext.clear();
+            com.miniagent.agent.core.TokenUsageTracker.clearCurrentUserId();
             if (Objects.nonNull(traceRecorder) && traceRecorder.isActive()) {
                 traceRecorder.endExecution(runStatus.name());
             }

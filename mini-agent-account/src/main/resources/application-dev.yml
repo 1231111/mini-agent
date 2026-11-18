@@ -6,3 +6,9 @@ spring:
   datasource:
     url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
     password: ${DB_PASSWORD:}
+
+agent:
+  account:
+    membership:
+      # Development-only demo: activates the selected plan without charging money.
+      simulated-payment-enabled: ${ACCOUNT_SIMULATED_PAYMENT_ENABLED:true}

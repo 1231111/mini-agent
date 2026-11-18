@@ -61,6 +61,9 @@ public class ContextCompressor {
     @Autowired(required = false)
     private ModelCallControl modelCallControl;
 
+    @Autowired(required = false)
+    private ExecutionControl executionControl;
+
     // ─── 阈值配置 ───
     /** 工程压缩阈值：下一次请求前达到该比例时压缩，默认与 WorkBuddy preMessage 对齐。 */
     @Value("${agent.context.pre-message-threshold:0.5}")
@@ -417,6 +420,7 @@ public class ContextCompressor {
             var request = ChatRequest.builder().messages(req).build();
             ChatResponse resp = modelCallControl == null ? model.chat(request)
                     : modelCallControl.call(() -> model.chat(request));
+            accountSummaryUsage(AgentLoop.getCurrentSession(), req, resp);
             String summary = resp.aiMessage().text();
             if (Objects.isNull(summary)) {
                 return null;
@@ -429,6 +433,22 @@ public class ContextCompressor {
             log.error("摘要生成失败: {}", e.getMessage());
             return null;
         }
+    }
+
+    private void accountSummaryUsage(String sessionId, List<ChatMessage> request, ChatResponse response) {
+        if (executionControl == null || StringUtils.isBlank(sessionId) || response == null) return;
+        long input = response.tokenUsage() != null && response.tokenUsage().inputTokenCount() != null
+                ? Math.max(0, response.tokenUsage().inputTokenCount())
+                : tokenEstimator.estimateMessages(request);
+        long output = response.tokenUsage() != null && response.tokenUsage().outputTokenCount() != null
+                ? Math.max(0, response.tokenUsage().outputTokenCount())
+                : tokenEstimator.estimate(response.aiMessage() == null ? "" : response.aiMessage().text());
+        if (input + output <= 0) input = 1;
+        String eventId = UUID.randomUUID().toString();
+        ExecutionControl.StopReason stop = executionControl.afterModelTokens(
+                sessionId, input + output, eventId, input, output);
+        TokenUsageTracker.add(sessionId, eventId, executionControl.userId(sessionId), input, output, 0);
+        if (stop != ExecutionControl.StopReason.NONE) throw new ModelCallControl.StoppedException(stop);
     }
 
     // ─── 阶段 5: 清理孤立配对 ───

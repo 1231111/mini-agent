@@ -3,10 +3,12 @@ package com.miniagent.account.repository;
 import com.miniagent.account.entity.MembershipOrder;
 import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 
@@ -24,4 +26,23 @@ public interface MembershipOrderRepository extends JpaRepository<MembershipOrder
     Optional<MembershipOrder> findByOrderNoForUpdate(@Param("orderNo") String orderNo);
 
     List<MembershipOrder> findByUserIdOrderByIdDesc(Long userId);
+
+    List<MembershipOrder> findTop20ByUserIdAndStatusOrderByIdDesc(
+            Long userId, MembershipOrder.Status status);
+
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query("update MembershipOrder o set o.status = :expired "
+            + "where o.userId = :userId and o.status = :pending "
+            + "and (o.expiresAt is null or o.expiresAt <= :now)")
+    int expirePendingOrdersForUser(@Param("userId") Long userId,
+                                   @Param("now") LocalDateTime now,
+                                   @Param("pending") MembershipOrder.Status pending,
+                                   @Param("expired") MembershipOrder.Status expired);
+
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query("update MembershipOrder o set o.status = :expired "
+            + "where o.status = :pending and o.expiresAt is not null and o.expiresAt <= :now")
+    int expirePendingOrders(@Param("now") LocalDateTime now,
+                            @Param("pending") MembershipOrder.Status pending,
+                            @Param("expired") MembershipOrder.Status expired);
 }

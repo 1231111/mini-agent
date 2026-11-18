@@ -47,6 +47,10 @@ public class ProductionReadinessValidator {
         validateEncryptionKey(encryptionKey, errors);
         validateJwtSecret(errors);
         requireProductionSecret("agent.account.cloud.internal-key", "ACCOUNT_INTERNAL_KEY", 32, errors);
+        if (environment.getProperty(
+                "agent.auth.cloud.membership.simulated-payment-enabled", Boolean.class, false)) {
+            errors.add("simulated membership payment must remain disabled in production");
+        }
         validateIndependentJudge(errors);
         boolean antivirusRequired = environment.getProperty(
                 "file.upload.antivirus.required", Boolean.class, false);

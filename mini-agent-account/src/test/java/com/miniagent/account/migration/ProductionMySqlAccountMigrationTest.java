@@ -19,7 +19,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Exercises the account service's separate history table on the shared agent database. */
 class ProductionMySqlAccountMigrationTest {
-    private static final int LATEST_MIGRATION = 4;
+    private static final int LATEST_MIGRATION = 7;
 
     @Test
     void accountMigrationsApplyToTheSharedMySqlSchema() throws Exception {
@@ -92,6 +92,24 @@ class ProductionMySqlAccountMigrationTest {
                     "SELECT COUNT(*) FROM membership_plans WHERE code = 'free'")) {
                 rows.next();
                 assertEquals(1, rows.getInt(1), "The shared-schema migration must retain the default free plan");
+            }
+            try (ResultSet rows = statement.executeQuery(
+                    "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() "
+                            + "AND table_name = 'membership_orders' AND column_name = 'expires_at'")) {
+                rows.next();
+                assertEquals(1, rows.getInt(1), "V6 must add the fixed membership order deadline");
+            }
+            try (ResultSet rows = statement.executeQuery(
+                    "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() "
+                            + "AND table_name = 'users' AND column_name = 'membership_daily_token_limit'")) {
+                rows.next();
+                assertEquals(1, rows.getInt(1), "V7 must persist membership token entitlements for the agent");
+            }
+            try (ResultSet rows = statement.executeQuery(
+                    "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() "
+                            + "AND table_name = 'users' AND column_name = 'membership_max_concurrent_tasks'")) {
+                rows.next();
+                assertEquals(1, rows.getInt(1), "V7 must persist membership concurrency entitlements");
             }
         }
     }

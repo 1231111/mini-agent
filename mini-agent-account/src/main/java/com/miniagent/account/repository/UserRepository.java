@@ -2,6 +2,10 @@ package com.miniagent.account.repository;
 
 import com.miniagent.account.entity.User;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import jakarta.persistence.LockModeType;
 
 import java.util.Optional;
 
@@ -13,6 +17,10 @@ import java.util.Optional;
  * 少即是好：接口上没有的方法，就不会有人误用。
  */
 public interface UserRepository extends JpaRepository<User, Long> {
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select u from User u where u.id = :id")
+    Optional<User> findByIdForUpdate(@Param("id") Long id);
 
     Optional<User> findByUsername(String username);
 

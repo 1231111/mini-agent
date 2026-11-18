@@ -118,9 +118,38 @@ public class CloudMembershipClient {
         });
     }
 
+    /** Retrieve the authenticated user's pending checkouts so a page refresh can resume them. */
+    public List<OrderView> pendingOrders(Long userId) {
+        return call("GET", "/api/membership/orders?userId=" + userId, null,
+                new TypeReference<Envelope<List<OrderView>>>() {});
+    }
+
+    public OrderView cancelOrder(Long userId, String orderNo) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("userId", userId);
+        body.put("orderNo", orderNo);
+        return call("POST", "/api/membership/orders/cancel", body,
+                new TypeReference<Envelope<OrderView>>() {});
+    }
+
+    /** Explicit mock checkout only; account service independently gates this endpoint by configuration. */
+    public OrderView simulatePayment(Long userId, String orderNo) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("userId", userId);
+        body.put("orderNo", orderNo);
+        return call("POST", "/api/membership/simulate-payment", body,
+                new TypeReference<Envelope<OrderView>>() {});
+    }
+
     /** 上报一次 LLM 调用。账号服务按云端用户、按天累加。 */
     public void reportUsage(long userId, long inputTokens, long outputTokens, int llmCalls) {
+        reportUsage(null, userId, inputTokens, outputTokens, llmCalls);
+    }
+
+    /** Report one idempotent model-call usage event from the durable outbox. */
+    public void reportUsage(String eventId, long userId, long inputTokens, long outputTokens, int llmCalls) {
         Map<String, Object> body = new LinkedHashMap<>();
+        if (eventId != null && !eventId.isBlank()) body.put("eventId", eventId);
         body.put("userId", userId);
         body.put("inputTokens", inputTokens);
         body.put("outputTokens", outputTokens);
@@ -223,6 +252,7 @@ public class CloudMembershipClient {
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record OrderView(Long orderId, String orderNo, Long userId, String planCode,
                             long amountCents, String currency, String status,
-                            String channel, String channelTxnId, LocalDateTime paidAt) {
+                            String channel, String channelTxnId, LocalDateTime paidAt,
+                            LocalDateTime expiresAt) {
     }
 }

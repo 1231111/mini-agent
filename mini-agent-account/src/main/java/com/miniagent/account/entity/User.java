@@ -8,6 +8,7 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import java.time.LocalDateTime;
 import lombok.Data;
 
 /**
@@ -20,8 +21,8 @@ import lombok.Data;
  *       "本地这一行对应云端哪个人"。在账号服务里 {@code id} 本身就是云端身份，
  *       没有"映射到别处"这回事。字段不映射不影响表结构：{@code ddl-auto: validate}
  *       只校验"实体的字段在表里存在"，不要求表里没有多余的列。</li>
- *   <li><b>不映射任何会话 / 配额字段。</b>本服务不签 token（没有会话），
- *       配额上限存在 {@link Tenant#getDailyTokenLimit()} 上而不是用户上。</li>
+ *   <li><b>只映射会员权益快照，不映射本地会话或管理员覆盖。</b>账号服务不签 agent token；
+ *       但共享库中的会员 token 与并发权益要在充值事务中写给 agent 执行侧读取。</li>
  * </ol>
  *
  * <p>{@code users.tenant_id} 是 {@code NOT NULL} 且有外键指向 tenants，
@@ -57,5 +58,14 @@ public class User extends BaseEntity {
 
     @Column(name = "memory_refresh_token_hash", length = 64, unique = true)
     private String memoryRefreshTokenHash;
+
+    @Column(name = "membership_daily_token_limit")
+    private Long membershipDailyTokenLimit;
+
+    @Column(name = "membership_max_concurrent_tasks")
+    private Integer membershipMaxConcurrentTasks;
+
+    @Column(name = "membership_expires_at")
+    private LocalDateTime membershipExpiresAt;
 
 }

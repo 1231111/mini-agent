@@ -2,7 +2,11 @@ package com.miniagent.account.repository;
 
 import com.miniagent.account.entity.MembershipSubscription;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 
@@ -23,4 +27,14 @@ public interface MembershipSubscriptionRepository extends JpaRepository<Membersh
 
     /** 生效新订阅前把旧的置为 SUPERSEDED。 */
     List<MembershipSubscription> findByUserIdAndStatus(Long userId, MembershipSubscription.Status status);
+
+    /** Mark finite active subscriptions expired at the inclusive expiry boundary. */
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query("update MembershipSubscription s set s.status = :expired "
+            + "where s.userId = :userId and s.status = :active "
+            + "and s.expireAt is not null and s.expireAt <= :now")
+    int expireActiveSubscriptions(@Param("userId") Long userId,
+                                  @Param("active") MembershipSubscription.Status active,
+                                  @Param("expired") MembershipSubscription.Status expired,
+                                  @Param("now") LocalDateTime now);
 }

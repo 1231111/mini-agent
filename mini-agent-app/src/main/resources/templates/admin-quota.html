@@ -1,0 +1,27 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Mini Agent &#31649;&#29702;&#21592;&#39069;&#24230;</title>
+  <style>
+    body{font-family:system-ui,sans-serif;background:#212121;color:#eee;margin:0;padding:32px}.wrap{max-width:1200px;margin:auto}
+    table{width:100%;border-collapse:collapse;background:#2f2f2f}th,td{padding:12px;border-bottom:1px solid #444;text-align:left}
+    input{width:130px;padding:7px;background:#212121;color:#eee;border:1px solid #666;border-radius:5px}
+    button{padding:7px 12px;background:#10a37f;color:#fff;border:0;border-radius:5px;cursor:pointer}.muted{color:#aaa}#msg{margin:12px 0}
+  </style>
+</head>
+<body><div class="wrap">
+  <h1>&#29992;&#25143; Token &#39069;&#24230;</h1>
+  <p class="muted">Only SYSTEM_ADMIN can change quotas. Leave the field blank to inherit the membership allowance or tenant default. 0 means no per-user limit; the tenant-wide cap still applies.</p>
+  <div id="msg" role="status"></div>
+  <table><thead><tr><th>ID</th><th>Username</th><th>Role</th><th>Tenant</th><th>Membership allowance</th><th>Admin override</th><th>New daily limit</th><th></th></tr></thead>
+    <tbody id="rows"><tr><td colspan="8">Loading…</td></tr></tbody></table>
+</div>
+<script src="/js/security.js"></script><script>
+(function(){'use strict';var rows=document.getElementById('rows'),msg=document.getElementById('msg');
+function show(t){msg.textContent=t;}
+function textCell(tr,value){var td=document.createElement('td');td.textContent=value;tr.appendChild(td);}
+function load(){fetch('/api/admin/users').then(function(r){return r.json()}).then(function(d){if(!d.success){show(d.message||'Could not load users. Check that you are signed in as SYSTEM_ADMIN.');return}rows.replaceChildren();(d.data||[]).forEach(function(u){var tr=document.createElement('tr');textCell(tr,u.id);textCell(tr,u.username);textCell(tr,u.role);textCell(tr,u.tenantId);var member=u.membershipDailyTokenLimit==null?'none':String(u.membershipDailyTokenLimit)+' tokens/day'+(u.membershipExpiresAt?' · until '+String(u.membershipExpiresAt).replace('T',' ').slice(0,16):'');textCell(tr,member);textCell(tr,u.dailyTokenLimitOverride==null?'inherit':String(u.dailyTokenLimitOverride));var input=document.createElement('input');input.type='number';input.min='0';input.step='1';input.placeholder='inherit';if(u.dailyTokenLimitOverride!=null)input.value=u.dailyTokenLimitOverride;var td=document.createElement('td');td.appendChild(input);tr.appendChild(td);var button=document.createElement('button');button.textContent='Save';button.onclick=function(){saveQuota(u.id,input.value)};td=document.createElement('td');td.appendChild(button);tr.appendChild(td);rows.appendChild(tr)})})}
+function saveQuota(id,value){var body={dailyTokenLimitOverride:value===''?null:Number(value)};fetch('/api/admin/users/'+id+'/quota',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){return r.json()}).then(function(d){show(d.success?'Quota saved for user '+id:(d.message||'Save failed'));if(d.success)load()})}
+load();})();
+</script></body></html>

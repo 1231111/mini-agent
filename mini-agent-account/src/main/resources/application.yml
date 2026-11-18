@@ -72,6 +72,9 @@ agent:
     registration-enabled: true
     password-min-length: 12
     bcrypt-strength: 12
+    membership:
+      # No real payment provider is connected. Enable only for controlled demos.
+      simulated-payment-enabled: ${ACCOUNT_SIMULATED_PAYMENT_ENABLED:false}
     login-rate-limit:
       attempts-per-minute: ${ACCOUNT_LOGIN_ATTEMPTS_PER_MINUTE:10}
       attempts-per-ip-per-minute: ${ACCOUNT_LOGIN_ATTEMPTS_PER_IP_PER_MINUTE:30}

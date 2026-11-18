@@ -211,6 +211,24 @@ public class SystemAdminService {
         return userView(saved);
     }
 
+    /** Set an individual user's daily limit; null restores membership/tenant inheritance. */
+    @Transactional
+    public Map<String, Object> updateUserQuota(Long actorId, Long userId, Long dailyTokenLimitOverride) {
+        if (dailyTokenLimitOverride != null && dailyTokenLimitOverride < 0) {
+            throw new IllegalArgumentException("dailyTokenLimitOverride must be >= 0");
+        }
+        User user = users.findByIdForUpdate(userId)
+                .orElseThrow(() -> new IllegalArgumentException("user not found"));
+        Long oldLimit = user.getDailyTokenLimitOverride();
+        user.setDailyTokenLimitOverride(dailyTokenLimitOverride);
+        User saved = users.save(user);
+        audit(actorId, "USER_QUOTA_UPDATE", "USER", saved.getId(), saved.getTenantId(),
+                details("oldDailyTokenLimitOverride", oldLimit,
+                        "dailyTokenLimitOverride", dailyTokenLimitOverride,
+                        "membershipDailyTokenLimit", saved.getMembershipDailyTokenLimit()));
+        return userView(saved);
+    }
+
     @Transactional
     public Map<String, Object> resetPassword(Long actorId, Long userId, String password) {
         requirePassword(password);
@@ -354,6 +372,9 @@ public class SystemAdminService {
         out.put("tenantId", user.getTenantId());
         out.put("role", user.getRole());
         out.put("enabled", user.isEnabled());
+        out.put("dailyTokenLimitOverride", user.getDailyTokenLimitOverride());
+        out.put("membershipDailyTokenLimit", user.getMembershipDailyTokenLimit());
+        out.put("membershipExpiresAt", user.getMembershipExpiresAt());
         return out;
     }
 

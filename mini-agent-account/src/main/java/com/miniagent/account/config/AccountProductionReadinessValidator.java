@@ -34,6 +34,9 @@ public class AccountProductionReadinessValidator {
         }
         requireSecret("spring.datasource.password", "DB_PASSWORD", 32, errors);
         requireSecret("agent.account.internal-key", "ACCOUNT_INTERNAL_KEY", 32, errors);
+        if (environment.getProperty("agent.account.membership.simulated-payment-enabled", Boolean.class, false)) {
+            errors.add("simulated membership payment must remain disabled in production");
+        }
         validateMemoryTokenKey(errors);
         if (!errors.isEmpty()) {
             throw new IllegalStateException("Account production readiness validation failed: "

@@ -10,4 +10,10 @@ public interface TenantTokenQuota {
     Decision check(Long tenantId, Long userId);
 
     Decision consume(Long tenantId, Long userId, long tokens);
+
+    /** Consume exact provider usage and optionally persist its delivery identity atomically. */
+    default Decision consume(Long tenantId, Long userId, long tokens, String eventId,
+                             long inputTokens, long outputTokens) {
+        return consume(tenantId, userId, tokens);
+    }
 }

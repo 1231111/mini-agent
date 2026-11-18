@@ -169,8 +169,10 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
                     ? resp.tokenUsage().outputTokenCount()
                     : (resp == null || resp.aiMessage() == null || resp.aiMessage().text() == null ? 0
                     : resp.aiMessage().text().getBytes(StandardCharsets.UTF_8).length);
-            TokenUsageTracker.add(session, input, output, 0);
-            checkBudget(session, input + output);
+            String usageEventId = java.util.UUID.randomUUID().toString();
+            checkBudget(session, input + output, usageEventId, input, output);
+            TokenUsageTracker.add(session, usageEventId,
+                    executionControl == null ? null : executionControl.userId(session), input, output, 0);
             String text = Objects.isNull(resp) || Objects.isNull(resp.aiMessage()) || Objects.isNull(resp.aiMessage().text())
                     ? "" : resp.aiMessage().text().trim();
             log.info("llm_judge 原始回复: {}", text.length() > 200 ? text.substring(0, 200) + "…" : text);
@@ -195,6 +197,13 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
     private void checkBudget(String session, long tokens) {
         if (executionControl == null || session == null || session.isBlank()) return;
         ExecutionControl.StopReason stop = executionControl.afterModelTokens(session, tokens);
+        if (stop != ExecutionControl.StopReason.NONE) throw new ModelCallControl.StoppedException(stop);
+    }
+
+    private void checkBudget(String session, long tokens, String eventId, long input, long output) {
+        if (executionControl == null || session == null || session.isBlank()) return;
+        ExecutionControl.StopReason stop = executionControl.afterModelTokens(
+                session, tokens, eventId, input, output);
         if (stop != ExecutionControl.StopReason.NONE) throw new ModelCallControl.StoppedException(stop);
     }
 

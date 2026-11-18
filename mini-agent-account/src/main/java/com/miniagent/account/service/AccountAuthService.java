@@ -177,10 +177,9 @@ public class AccountAuthService {
      * 于是所有用户共享一个日 token 池：谁用得多，别人就没得用。
      * 而且"按人分档"这件事在那种结构下根本无法表达。
      *
-     * <p>额度不在这里定。新租户的 {@code daily_token_limit} 先留 0，
-     * 紧接着由 {@link MembershipService#startFreeSubscription} 按 free 套餐写实。
-     * <b>刻意不给一个"看起来合理"的默认数字</b>：那样默认值会变成一条没人记得的隐性承诺，
-     * 改套餐时也不会有人想到去改它。缺 free 套餐就直接抛，让配置问题当场暴露。
+     * <p>新租户的共享 {@code daily_token_limit} 留 0；个人 free 额度由
+     * {@link MembershipService#startFreeSubscription} 保存在订阅/套餐数据中。
+     * 缺 free 套餐就直接抛，让配置问题当场暴露。
      */
     private Tenant createPersonalTenant(String username) {
         Tenant tenant = new Tenant();

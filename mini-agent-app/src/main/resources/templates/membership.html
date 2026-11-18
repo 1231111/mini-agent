@@ -134,14 +134,26 @@
             <h1>会员中心</h1>
             <div class="sub" id="whoami"></div>
         </div>
-        <a href="/">← 返回对话</a>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+            <a href="/admin/quota">管理员额度设置</a>
+            <a href="/">← 返回对话</a>
+        </div>
     </div>
 
     <div class="notice" id="notice"></div>
-
     <div class="card">
         <h2>我的会员</h2>
         <div id="currentBox"><div class="muted">加载中…</div></div>
+    </div>
+
+    <div class="card">
+        <h2>今日实际额度</h2>
+        <div id="quotaBox"><div class="muted">加载中…</div></div>
+    </div>
+
+    <div class="card">
+        <h2>待处理订单</h2>
+        <div id="ordersBox"><div class="muted">加载中…</div></div>
     </div>
 
     <div class="card">
@@ -156,6 +168,7 @@
     'use strict';
 
     var $ = function (id) { return document.getElementById(id); };
+    var simulatedPaymentEnabled = false;
 
     // ---------- 展示格式化 ----------
     // 三个都是"把后端的物理量翻译成人看的字"，不改变数值本身。
@@ -199,6 +212,27 @@
         $('notice').className = 'notice';
     }
 
+    function simulatePayment(orderNo, btn) {
+        if (!window.confirm('模拟支付不会产生真实扣款。确认开通此订单套餐吗？')) { return; }
+        btn.disabled = true;
+        fetch('/api/membership/orders/' + encodeURIComponent(orderNo) + '/simulate-payment', {
+            method: 'POST'
+        }).then(function (r) { return r.json(); }).then(function (data) {
+            if (!data.success) {
+                notice('err', data.message || '模拟支付失败');
+                btn.disabled = false;
+                return;
+            }
+            notice('info', '模拟支付完成，会员已开通；不会产生真实扣款。');
+            return loadCurrent().then(function (code) {
+                return Promise.all([loadQuota(), loadPlans(code), loadPendingOrders()]);
+            });
+        }).catch(function (e) {
+            notice('err', '模拟支付失败：' + (e && e.message ? e.message : e));
+            btn.disabled = false;
+        });
+    }
+
     // 全部用 textContent 而不是 innerHTML：下面所有值都来自账号服务的响应，
     // 一旦哪天后端把套餐名做成可运营配置的字段，innerHTML 就是一个注入点，
     // 而那时的改动看起来只是"支持自定义套餐名"。
@@ -235,6 +269,34 @@
         wrap.appendChild(el('div', 'k', k));
         wrap.appendChild(el('div', 'v', v));
         return wrap;
+    }
+
+    function renderQuota(q) {
+        var box = $('quotaBox');
+        box.textContent = '';
+        var limit = q.userUnlimited ? '不限量' : fmtTokens(q.userDailyLimit);
+        var remaining = q.availableTokens === null ? '不限量' : fmtTokens(q.availableTokens);
+        var metrics = el('div', 'metrics');
+        metrics.appendChild(metric('今日已用', fmtTokens(q.userUsedTokens)));
+        metrics.appendChild(metric('每日额度', limit));
+        metrics.appendChild(metric('当前可用', remaining));
+        metrics.appendChild(metric('用户剩余', q.userUnlimited ? '不限量' : fmtTokens(q.userRemainingTokens)));
+        metrics.appendChild(metric('租户共享剩余', q.tenantUnlimited ? '不限量' : fmtTokens(q.tenantRemainingTokens)));
+        metrics.appendChild(metric('额度来源', q.quotaSource === 'ADMIN_OVERRIDE' ? '管理员设置' :
+            (q.quotaSource === 'MEMBERSHIP' ? '会员套餐' : '租户默认')));
+        box.appendChild(metrics);
+        box.appendChild(el('div', 'muted', '统计日期 ' + q.usageDate + ' · 时区 ' + q.timeZone));
+    }
+
+    function loadQuota() {
+        return fetch('/api/me/token-quota').then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.success && data.data) {
+                    renderQuota(data.data);
+                } else {
+                    $('quotaBox').textContent = data.message || '额度读取失败';
+                }
+            });
     }
 
     // ---------- 套餐表 ----------
@@ -303,7 +365,9 @@
             if (data.success && data.data) {
                 notice('info', '订单已创建：' + data.data.orderNo +
                     '，金额 ' + fmtPrice(data.data.amountCents, data.data.currency) +
-                    '。当前状态为待支付 —— 接入支付渠道前它会一直停在这里。');
+                    (simulatedPaymentEnabled ? '。这是模拟支付，不会扣款。' :
+                        '。支付渠道尚未接入，当前为待支付状态。'));
+                loadPendingOrders();
             } else {
                 notice('err', (data.message || '下单失败') +
                     (data.code ? '（' + data.code + '）' : ''));
@@ -353,6 +417,72 @@
             });
     }
 
+    function renderPendingOrders(list) {
+        var box = $('ordersBox');
+        box.textContent = '';
+        if (!list || !list.length) {
+            box.appendChild(el('div', 'muted', '没有待处理订单。'));
+            return;
+        }
+        list.forEach(function (order) {
+            var item = el('div', 'plan');
+            item.appendChild(el('div', 'title', order.planCode + ' · ' + order.orderNo));
+            item.appendChild(el('div', 'muted', '金额 ' + fmtPrice(order.amountCents, order.currency)
+                + ' · 支付截止 ' + (order.expiresAt
+                    ? String(order.expiresAt).replace('T', ' ').slice(0, 16) : '—')));
+            if (simulatedPaymentEnabled) {
+                var pay = el('button', null, '模拟支付（不扣款）');
+                pay.addEventListener('click', function () { simulatePayment(order.orderNo, pay); });
+                item.appendChild(pay);
+            } else {
+                item.appendChild(el('div', 'muted', '支付渠道尚未接入；此订单不会自动开通会员。'));
+            }
+            var cancel = el('button', null, '取消订单');
+            cancel.style.marginTop = '8px';
+            cancel.addEventListener('click', function () { cancelPendingOrder(order.orderNo, cancel); });
+            item.appendChild(cancel);
+            box.appendChild(item);
+        });
+    }
+
+    function loadPendingOrders() {
+        return fetch('/api/membership/orders').then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.success) {
+                    renderPendingOrders(data.data);
+                } else {
+                    $('ordersBox').textContent = data.message || '订单读取失败';
+                }
+            });
+    }
+
+    function cancelPendingOrder(orderNo, btn) {
+        btn.disabled = true;
+        fetch('/api/membership/orders/' + encodeURIComponent(orderNo) + '/cancel', { method: 'POST' })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (!data.success) {
+                    notice('err', data.message || '取消订单失败');
+                    btn.disabled = false;
+                    return;
+                }
+                notice('info', '订单已取消。');
+                return loadPendingOrders();
+            })
+            .catch(function (e) {
+                notice('err', '取消订单失败：' + (e && e.message ? e.message : e));
+                btn.disabled = false;
+            });
+    }
+
+    function loadPaymentOptions() {
+        return fetch('/api/membership/payment-options').then(function (r) { return r.json(); })
+            .then(function (data) {
+                simulatedPaymentEnabled = !!(data.success && data.data
+                    && data.data.simulatedPaymentEnabled);
+            });
+    }
+
     /**
      * 套餐读不出来时，别只丢一句"读取失败"。
      *
@@ -384,8 +514,11 @@
         }
         $('whoami').textContent = 'token 已就绪 · 数据由账号服务提供';
 
-        loadCurrent()
-            .then(function (code) { return loadPlans(code); })
+        loadPaymentOptions()
+            .then(function () { return loadCurrent(); })
+            .then(function (code) { return Promise.all([
+                loadQuota(), loadPlans(code), loadPendingOrders()
+            ]); })
             .catch(function (e) {
                 notice('err', '页面初始化失败：' + (e && e.message ? e.message : e));
             });

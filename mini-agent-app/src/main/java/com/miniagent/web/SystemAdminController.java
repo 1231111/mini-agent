@@ -74,6 +74,12 @@ public class SystemAdminController {
                 body.displayName()));
     }
 
+    @PatchMapping(value = "/users/{id}/quota", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public ApiResponse<?> updateUserQuota(@PathVariable Long id,
+                                          @Valid @RequestBody UserQuotaUpdateRequest body) {
+        return ApiResponse.ok(service.updateUserQuota(actor(), id, body.dailyTokenLimitOverride()));
+    }
+
     @PostMapping(value = "/users/{id}/reset-password", consumes = MediaType.APPLICATION_JSON_VALUE)
     public ApiResponse<?> resetPassword(@PathVariable Long id,
                                         @Valid @RequestBody PasswordResetRequest body) {
@@ -138,6 +144,9 @@ public class SystemAdminController {
             Boolean enabled,
             @Pattern(regexp = "(?i)(USER|TENANT_ADMIN|SYSTEM_ADMIN)") String role,
             @Size(max = 100) String displayName) {}
+
+    /** null inherits from membership then tenant default; zero means this user is unlimited. */
+    public record UserQuotaUpdateRequest(@PositiveOrZero Long dailyTokenLimitOverride) {}
 
     public record PasswordResetRequest(
             @NotBlank @Size(min = 12, max = 200) String password) {}

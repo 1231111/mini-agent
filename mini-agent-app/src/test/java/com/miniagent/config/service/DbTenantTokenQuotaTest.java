@@ -6,6 +6,8 @@ import com.miniagent.config.repository.TenantDailyUsageRepository;
 import com.miniagent.config.repository.TenantRepository;
 import com.miniagent.config.repository.UserDailyUsageRepository;
 import com.miniagent.config.repository.UserRepository;
+import com.miniagent.config.repository.MembershipUsageOutboxRepository;
+import com.miniagent.config.entity.MembershipUsageOutbox;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -27,6 +29,7 @@ class DbTenantTokenQuotaTest {
     private final TenantDailyUsageRepository tenantUsage = mock(TenantDailyUsageRepository.class);
     private final UserDailyUsageRepository userUsage = mock(UserDailyUsageRepository.class);
     private final UserRepository users = mock(UserRepository.class);
+    private final MembershipUsageOutboxRepository usageOutbox = mock(MembershipUsageOutboxRepository.class);
     private final DbTenantTokenQuota quota = new DbTenantTokenQuota();
 
     @BeforeEach
@@ -35,6 +38,7 @@ class DbTenantTokenQuotaTest {
         ReflectionTestUtils.setField(quota, "usage", tenantUsage);
         ReflectionTestUtils.setField(quota, "userUsage", userUsage);
         ReflectionTestUtils.setField(quota, "users", users);
+        ReflectionTestUtils.setField(quota, "membershipUsageOutbox", usageOutbox);
         ReflectionTestUtils.setField(quota, "meters", new SimpleMeterRegistry());
         ReflectionTestUtils.setField(quota, "quotaZoneId", "UTC");
         quota.init();
@@ -79,5 +83,81 @@ class DbTenantTokenQuotaTest {
         verify(users).findByIdForUpdate(USER_ID);
         verify(tenantUsage).increment(TENANT_ID, TODAY, 20L);
         verify(userUsage).increment(USER_ID, TODAY, 20L);
+    }
+
+    @Test
+    void administratorOverrideReplacesTenantDefaultForOneUser() {
+        User user = users.findByIdForUpdate(USER_ID).orElseThrow();
+        user.setDailyTokenLimitOverride(105L);
+        when(userUsage.tokenCount(USER_ID, TODAY)).thenReturn(Optional.of(100L));
+
+        var decision = quota.consume(TENANT_ID, USER_ID, 10L);
+
+        assertFalse(decision.allowed());
+        assertEquals(110L, decision.usedTokens());
+        assertEquals(105L, decision.limitTokens());
+    }
+
+    @Test
+    void activeMembershipLimitIsUsedWhenNoAdministratorOverrideExists() {
+        User user = users.findByIdForUpdate(USER_ID).orElseThrow();
+        user.setMembershipDailyTokenLimit(120L);
+        user.setMembershipExpiresAt(java.time.LocalDateTime.now(ZoneId.of("UTC")).plusDays(1));
+        when(userUsage.tokenCount(USER_ID, TODAY)).thenReturn(Optional.of(115L));
+
+        var decision = quota.consume(TENANT_ID, USER_ID, 10L);
+
+        assertFalse(decision.allowed());
+        assertEquals(125L, decision.usedTokens());
+        assertEquals(120L, decision.limitTokens());
+    }
+
+    @Test
+    void expiredMembershipFallsBackToTenantDefaultAndTenantLimitRemainsHardCap() {
+        User user = users.findByIdForUpdate(USER_ID).orElseThrow();
+        user.setMembershipDailyTokenLimit(900L);
+        user.setMembershipExpiresAt(java.time.LocalDateTime.now(ZoneId.of("UTC")).minusSeconds(1));
+        when(userUsage.tokenCount(USER_ID, TODAY)).thenReturn(Optional.of(95L));
+
+        var decision = quota.consume(TENANT_ID, USER_ID, 10L);
+
+        assertFalse(decision.allowed());
+        assertEquals(105L, decision.usedTokens());
+        assertEquals(100L, decision.limitTokens());
+    }
+
+    @Test
+    void exactModelUsageIsQueuedWithTheQuotaDebitIdentity() {
+        User user = users.findByIdForUpdate(USER_ID).orElseThrow();
+        user.setExternalId("42001");
+
+        var decision = quota.consume(TENANT_ID, USER_ID, 5L,
+                "event-123", 3L, 2L);
+
+        assertTrue(decision.allowed());
+        var captor = org.mockito.ArgumentCaptor.forClass(MembershipUsageOutbox.class);
+        verify(usageOutbox).save(captor.capture());
+        assertEquals("event-123", captor.getValue().getEventId());
+        assertEquals(42001L, captor.getValue().getCloudUserId());
+        assertEquals(3L, captor.getValue().getInputTokens());
+        assertEquals(2L, captor.getValue().getOutputTokens());
+        assertEquals(MembershipUsageOutbox.Status.PENDING, captor.getValue().getStatus());
+    }
+
+    @Test
+    void outboxDueTimeUsesUtcEvenWhenQuotaDayUsesShanghai() {
+        ReflectionTestUtils.setField(quota, "quotaZoneId", "Asia/Shanghai");
+        quota.init();
+        User user = users.findByIdForUpdate(USER_ID).orElseThrow();
+        user.setExternalId("42001");
+        var before = java.time.LocalDateTime.now(ZoneId.of("UTC")).minusSeconds(2);
+
+        quota.consume(TENANT_ID, USER_ID, 5L, "utc-event", 3L, 2L);
+
+        var captor = org.mockito.ArgumentCaptor.forClass(MembershipUsageOutbox.class);
+        verify(usageOutbox).save(captor.capture());
+        assertTrue(captor.getValue().getNextAttemptAt().isAfter(before));
+        assertTrue(captor.getValue().getNextAttemptAt()
+                .isBefore(java.time.LocalDateTime.now(ZoneId.of("UTC")).plusSeconds(2)));
     }
 }

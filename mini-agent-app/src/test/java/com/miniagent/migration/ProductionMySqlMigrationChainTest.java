@@ -18,7 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Runs the complete production migration chain against the disposable CI MySQL schema. */
 class ProductionMySqlMigrationChainTest {
-    private static final int LATEST_MIGRATION = 37;
+    private static final int LATEST_MIGRATION = 39;
 
     @Test
     void productionMigrationChainAppliesAndValidatesOnMySql() throws Exception {
@@ -67,6 +67,25 @@ class ProductionMySqlMigrationChainTest {
 
         try (Connection connection = DriverManager.getConnection(url, username, password);
              Statement statement = connection.createStatement()) {
+            Set<String> userColumns = new java.util.HashSet<>();
+            try (ResultSet columns = connection.getMetaData().getColumns(
+                    connection.getCatalog(), null, "users", "%")) {
+                while (columns.next()) {
+                    userColumns.add(columns.getString("COLUMN_NAME").toLowerCase(java.util.Locale.ROOT));
+                }
+            }
+            assertTrue(userColumns.containsAll(Set.of(
+                            "daily_token_limit_override",
+                            "membership_daily_token_limit",
+                            "membership_max_concurrent_tasks",
+                            "membership_expires_at")),
+                    "V38 must add the per-user override and membership entitlement columns; found: "
+                            + userColumns);
+            try (ResultSet tables = connection.getMetaData().getTables(
+                    connection.getCatalog(), null, "membership_usage_outbox", new String[]{"TABLE"})) {
+                assertTrue(tables.next(), "V39 must add the durable account usage outbox");
+            }
+
             try (ResultSet rows = statement.executeQuery(
                     "SELECT COUNT(*) FROM flyway_schema_history WHERE success = TRUE")) {
                 rows.next();

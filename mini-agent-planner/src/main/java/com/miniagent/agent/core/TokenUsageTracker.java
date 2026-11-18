@@ -46,14 +46,46 @@ public class TokenUsageTracker {
         void onLlmCall(String sessionId, long inputTokens, long outputTokens);
     }
 
+    public record LlmCallUsage(String eventId, String sessionId, Long userId,
+                               long inputTokens, long outputTokens) {}
+
+    @FunctionalInterface
+    public interface LlmCallEventListener {
+        void onLlmCall(LlmCallUsage usage);
+    }
+
     private static final Map<String, UsageStats> stats = new ConcurrentHashMap<>();
     private static volatile LlmCallListener listener;
+    private static volatile LlmCallEventListener eventListener;
+    private static final ThreadLocal<Long> currentUserId = new ThreadLocal<>();
 
     public static void setListener(LlmCallListener next) {
         listener = next;
     }
 
+    public static void setEventListener(LlmCallEventListener next) {
+        eventListener = next;
+    }
+
+    public static void setCurrentUserId(Long userId) {
+        if (userId == null) currentUserId.remove(); else currentUserId.set(userId);
+    }
+
+    public static void clearCurrentUserId() {
+        currentUserId.remove();
+    }
+
     public static void add(String sessionId, long inputTokens, long outputTokens, int toolCalls) {
+        add(sessionId, java.util.UUID.randomUUID().toString(), inputTokens, outputTokens, toolCalls);
+    }
+
+    public static void add(String sessionId, String eventId,
+                           long inputTokens, long outputTokens, int toolCalls) {
+        add(sessionId, eventId, currentUserId.get(), inputTokens, outputTokens, toolCalls);
+    }
+
+    public static void add(String sessionId, String eventId, Long userId,
+                           long inputTokens, long outputTokens, int toolCalls) {
         if (Objects.isNull(sessionId)) {
             return;
         }
@@ -68,14 +100,25 @@ public class TokenUsageTracker {
             s.addToolCall();
         }
         s.addLlmCall();
+        LlmCallUsage usage = new LlmCallUsage(eventId == null || eventId.isBlank()
+                ? java.util.UUID.randomUUID().toString() : eventId, sessionId,
+                userId,
+                Math.max(0, inputTokens), Math.max(0, outputTokens));
         LlmCallListener current = listener;
-        if (current == null) {
-            return;
+        if (current != null) {
+            try {
+                current.onLlmCall(sessionId, inputTokens, outputTokens);
+            } catch (RuntimeException ignored) {
+                // Reporting failures must not interrupt the model loop.
+            }
         }
-        try {
-            current.onLlmCall(sessionId, inputTokens, outputTokens);
-        } catch (RuntimeException ignored) {
-            // 上报失败不能打断模型循环。
+        LlmCallEventListener events = eventListener;
+        if (events != null) {
+            try {
+                events.onLlmCall(usage);
+            } catch (RuntimeException ignored) {
+                // Durable reporting listeners own retries and must not interrupt the model loop.
+            }
         }
     }
 

@@ -12,6 +12,10 @@ import java.util.List;
 public interface MembershipUsageEventRepository
         extends JpaRepository<MembershipUsageEvent, Long> {
 
+    boolean existsByUserIdAndEventId(Long userId, String eventId);
+
+    long countByUserId(Long userId);
+
     List<MembershipUsageEvent> findByUserIdAndReportedAtGreaterThanEqualOrderByIdDesc(
             Long userId, LocalDateTime from, Pageable pageable);
 

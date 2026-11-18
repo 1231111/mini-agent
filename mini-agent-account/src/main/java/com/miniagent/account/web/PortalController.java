@@ -47,6 +47,9 @@ public class PortalController {
     @Value("${server.servlet.session.cookie.secure:false}")
     private boolean secureCookie;
 
+    @Value("${agent.account.membership.simulated-payment-enabled:false}")
+    private boolean simulatedPaymentEnabled;
+
     @Autowired
     private AccountAuthService auth;
     @Autowired
@@ -194,6 +197,13 @@ public class PortalController {
         return ApiResponse.ok(views);
     }
 
+    @GetMapping(value = "/api/portal/payment-mode", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<Map<String, Boolean>> paymentMode(HttpServletRequest request) {
+        requireUser(request);
+        return ApiResponse.ok(Map.of("simulatedPaymentEnabled", simulatedPaymentEnabled));
+    }
+
     @PostMapping(value = "/api/portal/orders",
             consumes = MediaType.APPLICATION_JSON_VALUE,
             produces = MediaType.APPLICATION_JSON_VALUE)
@@ -205,6 +215,30 @@ public class PortalController {
         String planCode = body == null ? null : body.planCode();
         MembershipOrder order = membership.createOrder(userId, planCode);
         return ApiResponse.ok(MembershipController.OrderView.of(order));
+    }
+
+    @PostMapping(value = "/api/portal/orders/{orderNo}/confirm",
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<MembershipController.OrderView> simulatePayment(
+            @PathVariable String orderNo, HttpServletRequest request) {
+        User user = requireUser(request);
+        if (!simulatedPaymentEnabled) {
+            return ApiResponse.fail(ErrorCode.MEMBER_PAYMENT_CALLBACK_DISABLED,
+                    "模拟支付未启用；真实支付渠道尚未接入");
+        }
+        return ApiResponse.ok(MembershipController.OrderView.of(
+                membership.simulatePayment(user.getId(), orderNo)));
+    }
+
+    @PostMapping(value = "/api/portal/orders/{orderNo}/cancel",
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<MembershipController.OrderView> cancelOrder(
+            @PathVariable String orderNo, HttpServletRequest request) {
+        User user = requireUser(request);
+        return ApiResponse.ok(MembershipController.OrderView.of(
+                membership.cancelOrder(user.getId(), orderNo)));
     }
 
     private static void bind(HttpServletRequest request, Long userId) {

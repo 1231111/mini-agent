@@ -191,6 +191,12 @@ public class MiniAgentChatPageController {
         return "membership";
     }
 
+    /** Public page shell only; all user data is loaded through SYSTEM_ADMIN-protected APIs. */
+    @GetMapping("/admin/quota")
+    public String showAdminQuotaPage() {
+        return "admin-quota";
+    }
+
     // ========== Login / Register / Auth endpoints ==========
 
     @PostMapping(value = "/api/tokens", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)

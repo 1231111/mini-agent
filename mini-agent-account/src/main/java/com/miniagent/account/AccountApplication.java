@@ -2,6 +2,7 @@ package com.miniagent.account;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.context.annotation.Bean;
 
 import java.time.Clock;
@@ -28,6 +29,7 @@ import java.time.Clock;
  * 默认扫描根就是本类所在包，不要给它加 scanBasePackages。
  */
 @SpringBootApplication
+@EnableScheduling
 public class AccountApplication {
 
     public static void main(String[] args) {

@@ -141,6 +141,25 @@ class TaskRunServiceTest {
     }
 
     @Test
+    void redisAdmissionUsesActiveMembershipConcurrencyAllowance() {
+        AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
+        RedisTaskConcurrency concurrency = mock(RedisTaskConcurrency.class);
+        UserTokenQuotaService quota = mock(UserTokenQuotaService.class);
+        TaskRunService service = service(repository, concurrency);
+        ReflectionTestUtils.setField(service, "userTokenQuota", quota);
+        when(quota.effectiveConcurrentLimit(7L, 2)).thenReturn(5);
+        when(concurrency.tryLockSession(eq("s1"), any())).thenReturn(true);
+        when(concurrency.tryOccupyUserQuota(eq(7L), eq("s1"), any(), eq(5))).thenReturn(false);
+
+        TaskRunService.StartResult result = service.tryStart(7L, "s1");
+
+        assertFalse(result.accepted());
+        verify(quota).effectiveConcurrentLimit(7L, 2);
+        verify(concurrency).tryOccupyUserQuota(eq(7L), eq("s1"), any(), eq(5));
+        verifyNoInteractions(repository);
+    }
+
+    @Test
     void terminalTransitionUsesRunIdAndFencingToken() {
         AgentTaskRunRepository repository = mock(AgentTaskRunRepository.class);
         RedisTaskConcurrency concurrency = mock(RedisTaskConcurrency.class);

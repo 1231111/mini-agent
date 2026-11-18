@@ -13,6 +13,9 @@ spring:
 agent:
   auth:
     jwt-secret: ${JWT_SECRET:${COOKIE_SECRET:}}
+    cloud:
+      membership:
+        simulated-payment-enabled: ${ACCOUNT_SIMULATED_PAYMENT_ENABLED:true}
   account:
     cloud:
       internal-key: ${ACCOUNT_INTERNAL_KEY:}

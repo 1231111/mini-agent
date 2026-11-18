@@ -531,6 +531,15 @@ public class ExecutionControl {
     }
 
     public StopReason afterModelTokens(String sessionId, long estimated) {
+        return afterModelTokens(sessionId, estimated, null, estimated, 0);
+    }
+
+    public Long userId(String sessionId) {
+        return lease(sessionId).userId;
+    }
+
+    public StopReason afterModelTokens(String sessionId, long estimated, String eventId,
+                                       long inputTokens, long outputTokens) {
         Lease lease = lease(sessionId);
         StopReason checkpoint = checkpoint(sessionId);
         if (checkpoint != StopReason.NONE) return checkpoint;
@@ -539,7 +548,8 @@ public class ExecutionControl {
         }
         long tokens = Math.max(0, estimated);
         if (lease.tenantId != null && tenantTokenQuota.isPresent()) {
-            boolean allowed = tenantTokenQuota.get().consume(lease.tenantId, lease.userId, tokens).allowed();
+            boolean allowed = tenantTokenQuota.get().consume(lease.tenantId, lease.userId, tokens,
+                    eventId, Math.max(0, inputTokens), Math.max(0, outputTokens)).allowed();
             // Count the completed model response locally even when it crosses a cap.
             lease.estimatedTokens.addAndGet(tokens);
             if (!allowed) {

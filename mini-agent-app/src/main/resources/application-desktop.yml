@@ -53,9 +53,8 @@
 #                          那条路必然失败，还会把"安装包不完整"伪装成"首次启动比较慢"
 #    仍要注意的策略分界：exec-policy 管的是"模型发起的 exec_command"，
 #    管不到上述工具内部自己起进程 —— 这两件事要分开看，别以为设了 block 就万事大吉。
-# 5. agent_token_usage 表恒空：TokenUsageTracker 是纯静态内存 Map（重启即丢），
-#    唯一写库的 DbTokenUsagePersistence 是孤儿 bean（TokenUsagePersistence 接口
-#    全项目无注入点）。/api/token-usage 读的是内存，不是库。既有接线缺失，与内嵌库无关。
+# 5. Token 用量限制写入本地每日用户/租户计数；会员用量明细通过持久 outbox 异步同步到账号服务。
+#    桌面端账号服务不可达时，本地 quota 仍是执行上限的权威来源，待上报事件会继续重试。
 # ============================================================
 
 server:
