@@ -1,5 +1,6 @@
 package com.miniagent.agent.memory.lifecycle;
 
+import com.miniagent.application.SubjectErasureService;
 import com.miniagent.agent.memory.entity.AgentEpisodeEntity;
 import com.miniagent.agent.memory.entity.AgentEventEntity;
 import com.miniagent.agent.memory.repository.AgentEpisodeRepository;
@@ -19,6 +20,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.*;
 
@@ -77,6 +79,71 @@ class DefaultConsolidationServiceTest {
         verify(transactionManager).commit(any(TransactionStatus.class));
         verify(taskLock).unlock("tenant-a", "session-a", "7");
         verify(eventRepository, never()).findByTenantIdAndSessionIdOrderByCreatedAtAsc("tenant-b", "session-a");
+    }
+
+    @Test
+    void subjectErasureGateRunsInEpisodeTransactionBeforeWrites() {
+        SubjectErasureService erasureService = mock(SubjectErasureService.class);
+        ReflectionTestUtils.setField(service, "subjectErasureService", erasureService);
+        when(taskLock.tryLock("tenant-a", "session-a", "7")).thenReturn(true);
+        when(eventRepository.findByTenantIdAndSessionIdAndTaskIdOrderByCreatedAtAsc(
+                "tenant-a", "session-a", "7")).thenReturn(List.of(event(11L, "tenant-a", "session-a", "7")));
+        when(episodeRepository.findFirstByTenantIdAndSessionIdAndTaskIdOrderByCreatedAtAsc(
+                "tenant-a", "session-a", "7")).thenReturn(Optional.empty());
+
+        try (var ignored = OwnerContext.bind(new OwnerContext(42L, "tenant-a"))) {
+            service.consolidateTask("tenant-a", "session-a", "7");
+        }
+
+        var order = inOrder(transactionManager, erasureService, episodeRepository, eventRepository);
+        order.verify(transactionManager).getTransaction(any(TransactionDefinition.class));
+        order.verify(erasureService).assertWritable("tenant-a", 42L);
+        order.verify(episodeRepository).save(any(AgentEpisodeEntity.class));
+        order.verify(eventRepository).markProcessed(List.of(11L));
+        order.verify(transactionManager).commit(any(TransactionStatus.class));
+    }
+
+    @Test
+    void erasedSubjectCannotBeRecreatedByBackgroundConsolidation() {
+        SubjectErasureService erasureService = mock(SubjectErasureService.class);
+        ReflectionTestUtils.setField(service, "subjectErasureService", erasureService);
+        when(taskLock.tryLock("tenant-a", "session-a", "7")).thenReturn(true);
+        when(eventRepository.findByTenantIdAndSessionIdAndTaskIdOrderByCreatedAtAsc(
+                "tenant-a", "session-a", "7")).thenReturn(List.of(event(12L, "tenant-a", "session-a", "7")));
+        when(episodeRepository.findFirstByTenantIdAndSessionIdAndTaskIdOrderByCreatedAtAsc(
+                "tenant-a", "session-a", "7")).thenReturn(Optional.empty());
+        doThrow(new IllegalStateException("subject is erased"))
+                .when(erasureService).assertWritable("tenant-a", 42L);
+
+        try (var ignored = OwnerContext.bind(new OwnerContext(42L, "tenant-a"))) {
+            assertThrows(IllegalStateException.class,
+                    () -> service.consolidateTask("tenant-a", "session-a", "7"));
+        }
+
+        verify(episodeRepository, never()).save(any(AgentEpisodeEntity.class));
+        verify(eventRepository, never()).markProcessed(anyList());
+        verify(transactionManager, never()).commit(any(TransactionStatus.class));
+        verify(transactionManager).rollback(any(TransactionStatus.class));
+        verify(taskLock).unlock("tenant-a", "session-a", "7");
+    }
+
+    @Test
+    void unresolvedOwnerFailsClosedWhenErasureGateIsEnabled() {
+        SubjectErasureService erasureService = mock(SubjectErasureService.class);
+        ReflectionTestUtils.setField(service, "subjectErasureService", erasureService);
+        when(taskLock.tryLock("tenant-a", "session-a", "7")).thenReturn(true);
+        when(eventRepository.findByTenantIdAndSessionIdAndTaskIdOrderByCreatedAtAsc(
+                "tenant-a", "session-a", "7")).thenReturn(List.of(event(13L, "tenant-a", "session-a", "7")));
+        when(episodeRepository.findFirstByTenantIdAndSessionIdAndTaskIdOrderByCreatedAtAsc(
+                "tenant-a", "session-a", "7")).thenReturn(Optional.empty());
+
+        assertThrows(IllegalStateException.class,
+                () -> service.consolidateTask("tenant-a", "session-a", "7"));
+
+        verify(erasureService, never()).assertWritable(anyString(), anyLong());
+        verify(episodeRepository, never()).save(any(AgentEpisodeEntity.class));
+        verify(eventRepository, never()).markProcessed(anyList());
+        verify(transactionManager).rollback(any(TransactionStatus.class));
     }
 
     @Test

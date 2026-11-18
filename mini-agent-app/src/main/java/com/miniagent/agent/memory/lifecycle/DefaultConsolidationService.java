@@ -1,6 +1,7 @@
 package com.miniagent.agent.memory.lifecycle;
 
 import com.miniagent.common.context.OwnerContext;
+import com.miniagent.application.SubjectErasureService;
 
 import com.miniagent.common.SecurityUtils;
 import com.miniagent.common.StringUtils;
@@ -93,6 +94,9 @@ public class DefaultConsolidationService implements ConsolidationService {
     @Autowired
     private PlatformTransactionManager transactionManager;
 
+    @Autowired(required = false)
+    private SubjectErasureService subjectErasureService;
+
     @Override
     public void consolidate(String sessionId) {
         String tenantId = OwnerContext.currentTenantId();
@@ -179,6 +183,7 @@ public class DefaultConsolidationService implements ConsolidationService {
         AgentEpisodeEntity episode = episodeToSave;
         TransactionTemplate transaction = new TransactionTemplate(transactionManager);
         transaction.executeWithoutResult(status -> {
+            assertEpisodeWritable(episode);
             episodeRepository.save(episode);
             eventRepository.markProcessed(unprocessed.stream().map(AgentEventEntity::getId).toList());
         });
@@ -221,7 +226,10 @@ public class DefaultConsolidationService implements ConsolidationService {
                 try {
                     AgentEpisodeEntity carried = extractEpisode(List.of(), workingMemory);
                     if (carried != null) {
-                        episodeRepository.save(carried);
+                        new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+                            assertEpisodeWritable(carried);
+                            episodeRepository.save(carried);
+                        });
                         workingMemoryManager.touch(sessionId);
                         log.info("工作记忆结转: tenant={}, session={}, goal={}",
                                 tenantId, sessionId, carried.getTaskSummary());
@@ -240,6 +248,7 @@ public class DefaultConsolidationService implements ConsolidationService {
                 List<Long> ids = unprocessed.stream().map(AgentEventEntity::getId).collect(Collectors.toList());
                 TransactionTemplate transaction = new TransactionTemplate(transactionManager);
                 transaction.executeWithoutResult(status -> {
+                    assertEpisodeWritable(episode);
                     episodeRepository.save(episode);
                     eventRepository.markProcessed(ids);
                 });
@@ -254,6 +263,26 @@ public class DefaultConsolidationService implements ConsolidationService {
         } catch (Exception e) {
             log.error("巩固失败: session={}", sessionId, e);
         }
+    }
+
+    /** Serialize durable episode writes with subject erasure using the same owner gate. */
+    private void assertEpisodeWritable(AgentEpisodeEntity episode) {
+        if (subjectErasureService == null || episode == null) {
+            return;
+        }
+        Long userId = OwnerContext.currentUserId();
+        String episodeUserId = episode.getUserId();
+        if (episodeUserId != null && !episodeUserId.isBlank()) {
+            try {
+                userId = Long.valueOf(episodeUserId);
+            } catch (NumberFormatException invalidOwner) {
+                throw new IllegalStateException("episode owner id is invalid; refusing to persist memory", invalidOwner);
+            }
+        }
+        if (userId == null || episode.getTenantId() == null || episode.getTenantId().isBlank()) {
+            throw new IllegalStateException("episode owner could not be resolved; refusing to persist memory");
+        }
+        subjectErasureService.assertWritable(episode.getTenantId(), userId);
     }
 
     /** 读工作记忆；失败不影响主流程（Redis 不可用时退化为无工作记忆）。 */

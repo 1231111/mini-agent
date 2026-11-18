@@ -8,6 +8,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -22,10 +23,70 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class TaskTodoScopeTest {
 
+    private static final class MutablePersistence implements SessionTodoPersistence {
+        private State state = new State("[]", null);
+        private final List<Long> savedTaskPartitions = new ArrayList<>();
+
+        @Override
+        public State load(String sessionId) {
+            return state;
+        }
+
+        @Override
+        public void save(String sessionId, String activeJson, String suspendedJson) {
+            state = new State(activeJson, suspendedJson);
+        }
+
+        @Override
+        public void saveTaskPartition(
+                String sessionId, long taskId, String partitionJson, String fullSnapshotJson) {
+            savedTaskPartitions.add(taskId);
+            save(sessionId, fullSnapshotJson, null);
+        }
+
+        @Override
+        public void delete(String sessionId) {
+            state = new State("[]", null);
+        }
+    }
+
     private TaskTodoStore store(Path dir, TaskScopeRegistry registry) {
         TaskTodoStore s = new TaskTodoStore(dir.toString());
         s.setScopeRegistry(registry);
         return s;
+    }
+
+    @Test
+    void 外部删除分区后本地副本不会重新带回(@TempDir Path tmp) {
+        TaskScopeRegistry registry = new TaskScopeRegistry();
+        MutablePersistence persistence = new MutablePersistence();
+        TaskTodoStore s = store(tmp, registry);
+        s.setPersistence(persistence);
+
+        s.set("s0", item("旧任务"));
+        assertEquals(1, s.get("s0").size());
+
+        // Another replica removed all partitions from the authoritative session row.
+        persistence.save("s0", "{}", null);
+
+        assertTrue(s.get("s0").isEmpty(), "a stale in-process map must be refreshed from persistence");
+    }
+
+    @Test
+    void importingLegacyFilePersistsEveryTaskPartition(@TempDir Path tmp) throws Exception {
+        Files.writeString(tmp.resolve("s6.json"), "{\"0\":[{\"id\":1,\"content\":\"legacy-zero\",\"status\":\"pending\"}],"
+                + "\"3\":[{\"id\":2,\"content\":\"legacy-three\",\"status\":\"pending\"}]}",
+                StandardCharsets.UTF_8);
+        TaskScopeRegistry registry = new TaskScopeRegistry();
+        MutablePersistence persistence = new MutablePersistence();
+        TaskTodoStore s = store(tmp, registry);
+        s.setPersistence(persistence);
+
+        assertEquals("legacy-zero", s.get("s6").get(0).content());
+
+        assertEquals(List.of(0L, 3L), persistence.savedTaskPartitions);
+        assertTrue(persistence.state.activeJson().contains("legacy-zero"));
+        assertTrue(persistence.state.activeJson().contains("legacy-three"));
     }
 
     private static List<Map<String, Object>> item(String content) {

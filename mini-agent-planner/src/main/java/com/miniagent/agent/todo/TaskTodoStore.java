@@ -1055,7 +1055,7 @@ public class TaskTodoStore {
         if (items != null && !items.isEmpty()) {
             archived.put(key, new ArrayList<>(items));
         }
-        persistRow(sessionOf(key));
+        persistRow(sessionOf(key), key);
         log.info("todo 已作废（保留可恢复）session={} key={} items={}",
                 sessionOf(key), key, items == null ? 0 : items.size());
     }
@@ -1082,7 +1082,7 @@ public class TaskTodoStore {
             return List.of();
         }
         todos.put(key, new ArrayList<>(items));
-        persistRow(sessionOf(key));
+        persistRow(sessionOf(key), key);
         log.info("todo 已恢复作废清单 session={} key={} items={}",
                 sessionOf(key), key, items.size());
         return List.copyOf(items);
@@ -1501,12 +1501,18 @@ public class TaskTodoStore {
                     parts = parsePartitions(
                             Files.readString(persistFile(sessionId), StandardCharsets.UTF_8));
                     applyPartitions(sessionId, parts);
-                    persist(key, todos.getOrDefault(key, new ArrayList<>()));
+                    // Import every legacy task partition. The shared-store API now
+                    // merges one task at a time, so persisting only the requested key
+                    // would silently discard the other partitions from this file.
+                    for (Long taskId : parts.keySet()) {
+                        persistRow(sessionId, scopeKeyOf(sessionId, taskId));
+                    }
                     return;
                 }
                 applyPartitions(sessionId, parts);
             } catch (Exception e) {
                 log.warn("从 DB 加载 todo 失败 {}: {}", sessionId, e.getMessage());
+                throw new IllegalStateException("无法读取持久化任务清单", e);
             }
             todos.putIfAbsent(key, new ArrayList<>());
             return;
@@ -1540,6 +1546,12 @@ public class TaskTodoStore {
      * 这样所有既有读取路径（注入、UI、统计）天然看不到它，不需要逐处加判断。</p>
      */
     private void applyPartitions(String sessionId, Map<Long, Partition> parts) {
+        // Shared persistence is authoritative. Clearing absent partitions prevents a
+        // long-lived replica from resurrecting data removed or trimmed elsewhere.
+        todos.keySet().removeIf(key ->
+                com.miniagent.agent.scope.TaskScope.belongsTo(key, sessionId));
+        archived.keySet().removeIf(key ->
+                com.miniagent.agent.scope.TaskScope.belongsTo(key, sessionId));
         parts.forEach((taskId, partition) -> {
             String key = scopeKeyOf(sessionId, taskId);
             if (partition.archived()) {
@@ -1782,17 +1794,18 @@ public class TaskTodoStore {
         todos.put(key, new ArrayList<>(safe));
         // 重新写入清单 = 撤销作废标记，否则同一任务会同时出现在两个 map 里
         archived.remove(key);
-        persistRow(sessionOf(key));
+        persistRow(sessionOf(key), key);
         // UI 按 sessionId 订阅；这里不能传作用域键，否则前端收不到
         publishTodoUi(sessionOf(key), safe);
     }
 
-    /** 把整个会话行（含未作废与已作废两类分区）落盘。 */
-    private void persistRow(String sessionId) {
+    /** 持久化当前任务分区；共享 DB 会与其他副本的分区原子合并。 */
+    private void persistRow(String sessionId, String key) {
         String payload = partitionsToJson(sessionId);
         try {
             if (useDb()) {
-                persistence.save(sessionId, payload, null);
+                persistence.saveTaskPartition(
+                        sessionId, taskIdOf(key, sessionId), partitionToJson(key), payload);
             } else {
                 Files.createDirectories(persistDir);
                 Path file = persistFile(sessionId);
@@ -1802,7 +1815,26 @@ public class TaskTodoStore {
             }
         } catch (Exception e) {
             log.warn("持久化 todo 失败 {}: {}", sessionId, e.getMessage());
+            if (useDb()) {
+                throw new IllegalStateException("无法保存持久化任务清单", e);
+            }
         }
+    }
+
+    /** The active or archived representation of one task partition, or null when empty. */
+    private String partitionToJson(String key) throws Exception {
+        List<TodoItem> active = todos.get(key);
+        if (active != null && !active.isEmpty()) {
+            return itemsToJson(active);
+        }
+        List<TodoItem> inactive = archived.get(key);
+        if (inactive == null || inactive.isEmpty()) {
+            return null;
+        }
+        Map<String, Object> box = new LinkedHashMap<>();
+        box.put("archived", true);
+        box.put("items", toPersisted(inactive));
+        return MAPPER.writeValueAsString(box);
     }
 
     /** Write a checkpoint without ever exposing truncated JSON to a recovering worker. */

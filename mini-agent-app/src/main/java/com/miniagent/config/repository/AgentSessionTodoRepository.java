@@ -1,7 +1,9 @@
 package com.miniagent.config.repository;
 
 import com.miniagent.config.entity.AgentSessionTodo;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -11,6 +13,11 @@ import java.time.LocalDateTime;
 
 public interface AgentSessionTodoRepository
         extends JpaRepository<AgentSessionTodo, String> {
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select state from AgentSessionTodo state where state.sessionId = :sessionId")
+    java.util.Optional<AgentSessionTodo> findByIdForUpdate(
+            @Param("sessionId") String sessionId);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Transactional

@@ -112,6 +112,27 @@ class ExperienceClusterPersistenceTest {
     }
 
     @Test
+    void splitRollsBackSourceCasWhenTargetCasConflicts() {
+        ExperienceClusterEntity source = saveCluster("source-split-conflict");
+        ExperienceClusterEntity target = saveCluster("target-split-conflict");
+        AgentEpisodeEntity episode = saveEpisode("episode-split-conflict", 8L);
+        saveMember(source, episode);
+
+        doReturn(0).when(clusters).updateIfVersion(
+                eq(target.getId()), eq("tenant-a"), eq(9L), eq(1), eq(2), eq("target-split-conflict"));
+
+        try (var ignored = OwnerContext.bind(new OwnerContext(9L, "tenant-a"))) {
+            assertThrows(IllegalStateException.class,
+                    () -> clusterService.split(source.getId(), target.getId(), List.of(episode.getId()), 1, 1));
+        }
+
+        assertEquals(1, clusters.findById(source.getId()).orElseThrow().getVersion());
+        assertEquals(1, clusters.findById(target.getId()).orElseThrow().getVersion());
+        assertEquals(source.getId(), members.findAll().get(0).getClusterId());
+        verify(clusters).updateIfVersion(source.getId(), "tenant-a", 9L, 1, 2, "source-split-conflict");
+    }
+
+    @Test
     void splitMovesSelectedEpisodesAndRejectsNonMembersWithoutMutation() {
         ExperienceClusterEntity source = saveCluster("source-split");
         ExperienceClusterEntity target = saveCluster("target-split");

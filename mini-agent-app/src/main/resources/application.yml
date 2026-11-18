@@ -142,6 +142,9 @@ agent:
   # 统一数据根（记忆/媒体/skills/workspace）。可用环境变量 MINI_AGENT_HOME 覆盖。
   # 默认：{user.home}/.miniagent ，不再写入项目仓库旁路目录。
   data-dir: ${MINI_AGENT_HOME:${user.home}/.miniagent}
+  chat:
+    # Bound JSON bodies before Jackson allocates inline images/files and DTO lists.
+    max-json-request-bytes: ${CHAT_MAX_JSON_REQUEST_BYTES:33554432}
   auth:
     # JWT HS256 签名密钥。旧名 cookie-secret —— cookie 通路已随无状态改造整体移除，
     # 但这份值一直在给 JWT 签名，名字留着会误导（以为还有个 cookie 在用）。

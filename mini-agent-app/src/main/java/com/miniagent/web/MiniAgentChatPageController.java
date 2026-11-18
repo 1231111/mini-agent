@@ -51,6 +51,8 @@ import com.miniagent.web.dto.resp.UploadResultDTO;
 import com.miniagent.web.dto.resp.UserDTO;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ContentDisposition;
@@ -485,7 +487,7 @@ public class MiniAgentChatPageController {
     @PostMapping(value = "/api/conversations/{sessionId}/messages/stream",
             consumes = MediaType.APPLICATION_JSON_VALUE)
     public SseEmitter chatStreamMultimodal(@PathVariable("sessionId") String sessionId,
-                                           @RequestBody ChatRequest req,
+                                           @Valid @NotNull @RequestBody ChatRequest req,
                                            HttpServletRequest request) {
         if (req != null) {
             req.setSessionId(sessionId);

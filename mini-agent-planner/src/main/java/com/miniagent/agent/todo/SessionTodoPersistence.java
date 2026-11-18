@@ -16,5 +16,16 @@ public interface SessionTodoPersistence {
 
     void save(String sessionId, String activeJson, String suspendedJson);
 
+    /**
+     * Replace one task partition without overwriting partitions changed by another replica.
+     * Shared-store implementations should merge the partition atomically. The complete
+     * snapshot is provided only as a compatibility fallback for simple stores. A null
+     * partition removes that task's partition.
+     */
+    default void saveTaskPartition(
+            String sessionId, long taskId, String partitionJson, String fullSnapshotJson) {
+        save(sessionId, fullSnapshotJson, null);
+    }
+
     void delete(String sessionId);
 }

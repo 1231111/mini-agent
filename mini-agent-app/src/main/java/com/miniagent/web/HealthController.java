@@ -9,6 +9,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.actuate.health.Health;
 import org.springframework.boot.actuate.health.HealthIndicator;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -62,10 +63,11 @@ public class HealthController implements HealthIndicator {
     public ResponseEntity<Map<String, Object>> healthCheck() {
         Map<String, Object> body = new LinkedHashMap<>();
         Map<String, Object> details = buildDetails();
-        body.put("status", isHealthy(details) ? "UP" : "DOWN");
+        boolean healthy = isHealthy(details);
+        body.put("status", healthy ? "UP" : "DOWN");
         body.put("components", details);
         body.put("metrics", metrics.snapshot());
-        return ResponseEntity.ok(body);
+        return ResponseEntity.status(healthy ? HttpStatus.OK : HttpStatus.SERVICE_UNAVAILABLE).body(body);
     }
 
     /**
@@ -98,7 +100,8 @@ public class HealthController implements HealthIndicator {
                 store.put("sessionCount", stateStore.activeSessionCount());
             } catch (Exception e) {
                 store.put("available", false);
-                store.put("error", e.getMessage());
+                // Exception messages can contain SQL, hostnames, or credential fragments.
+                store.put("error", "state store unavailable");
             }
         } else {
             store.put("available", false);

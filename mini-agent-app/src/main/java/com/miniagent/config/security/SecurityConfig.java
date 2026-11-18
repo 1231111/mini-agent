@@ -262,6 +262,8 @@ public class SecurityConfig {
                 // Keep scrape endpoints behind an authenticated system-admin token.
                 .requestMatchers("/actuator/metrics", "/actuator/metrics/**", "/actuator/prometheus")
                 .hasRole("SYSTEM_ADMIN")
+                .requestMatchers("/api/planner/metrics")
+                .hasRole("SYSTEM_ADMIN")
                 .requestMatchers("/api/admin/**").hasRole("SYSTEM_ADMIN")
                 .requestMatchers(HttpMethod.POST, "/api/mcp/servers/**")
                 .hasRole("SYSTEM_ADMIN")

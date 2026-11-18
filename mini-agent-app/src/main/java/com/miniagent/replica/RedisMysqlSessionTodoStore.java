@@ -73,12 +73,23 @@ public class RedisMysqlSessionTodoStore extends RedisAsideStore<String, SessionT
 
     @Override
     public State load(String sessionId) {
-        return loadWithFallback(sessionId);
+        // Checklist state is partitioned in MySQL under a row lock. Reading a cached
+        // full-session snapshot can reintroduce data another replica has already
+        // removed, so the database remains authoritative for this relatively small row.
+        return mysql.load(sessionId);
     }
 
     @Override
     public void save(String sessionId, String activeJson, String suspendedJson) {
-        saveWithWriteThrough(sessionId, new State(activeJson, suspendedJson));
+        mysql.save(sessionId, activeJson, suspendedJson);
+        deleteFromRedis(sessionId);
+    }
+
+    @Override
+    public void saveTaskPartition(
+            String sessionId, long taskId, String partitionJson, String fullSnapshotJson) {
+        mysql.saveTaskPartition(sessionId, taskId, partitionJson, fullSnapshotJson);
+        deleteFromRedis(sessionId);
     }
 
     @Override

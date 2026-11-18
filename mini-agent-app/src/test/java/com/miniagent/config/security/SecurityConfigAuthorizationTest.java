@@ -54,6 +54,7 @@ class SecurityConfigAuthorizationTest {
     void regularUserCannotScrapeMetrics() throws Exception {
         mvc.perform(get("/actuator/prometheus")).andExpect(status().isForbidden());
         mvc.perform(get("/actuator/metrics")).andExpect(status().isForbidden());
+        mvc.perform(get("/api/planner/metrics")).andExpect(status().isForbidden());
     }
 
     @Test
@@ -63,6 +64,7 @@ class SecurityConfigAuthorizationTest {
                 org.assertj.core.api.Assertions.assertThat(result.getResponse().getStatus()).isNotEqualTo(403));
         mvc.perform(get("/actuator/metrics")).andExpect(result ->
                 org.assertj.core.api.Assertions.assertThat(result.getResponse().getStatus()).isNotEqualTo(403));
+        mvc.perform(get("/api/planner/metrics")).andExpect(status().isOk());
     }
 
     @Test
@@ -101,7 +103,7 @@ class SecurityConfigAuthorizationTest {
 
     @RestController
     static class ProbeController {
-        @GetMapping({"/api/admin/probe", "/api/mcp/servers/probe"})
+        @GetMapping({"/api/admin/probe", "/api/mcp/servers/probe", "/api/planner/metrics"})
         String read() {
             return "ok";
         }
