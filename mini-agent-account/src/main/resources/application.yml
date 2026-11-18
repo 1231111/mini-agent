@@ -28,6 +28,14 @@ spring:
     username: ${DB_USERNAME:root}
     password: ${DB_PASSWORD:}
 
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      connect-timeout: 1s
+      timeout: 1s
+
   jpa:
     hibernate:
       # validate 而不是 none：共享库场景下，本服务对 users/tenants 的理解

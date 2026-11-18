@@ -2,24 +2,43 @@ package com.miniagent.agent.security;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import org.apache.hc.client5.http.DnsResolver;
+import org.apache.hc.client5.http.classic.methods.HttpUriRequestBase;
+import org.apache.hc.client5.http.config.ConnectionConfig;
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.core5.http.ContentType;
+import org.apache.hc.core5.http.Header;
+import org.apache.hc.core5.http.HttpEntity;
+import org.apache.hc.core5.http.io.entity.ByteArrayEntity;
+import org.apache.hc.core5.util.Timeout;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.InetAddress;
 import java.net.URI;
-import java.net.http.HttpClient;
+import java.net.UnknownHostException;
 import java.net.http.HttpHeaders;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -43,6 +62,11 @@ public class GuardedHttpClient {
     );
     private static final Pattern CHARSET_PATTERN = Pattern.compile(
             "(?i)(?:^|;)\\s*charset\\s*=\\s*\"?([^;\"\\s]+)");
+    private static final ScheduledExecutorService REQUEST_DEADLINES = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread thread = new Thread(r, "guarded-http-deadlines");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     private final NetworkGuard networkGuard;
     private final int maxRedirects;
@@ -53,19 +77,13 @@ public class GuardedHttpClient {
      * Creates a client with sensible defaults.
      */
     public GuardedHttpClient() {
-        this(new NetworkGuard(), 5, new JdkTransport(HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
-                .followRedirects(HttpClient.Redirect.NEVER)
-                .build()));
+        this(new NetworkGuard(), 5, new ApacheTransport());
     }
 
     public GuardedHttpClient(
             NetworkGuard networkGuard,
             @Value("${agent.tools.max-http-redirects:5}") int maxRedirects) {
-        this(networkGuard, maxRedirects, new JdkTransport(HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
-                .followRedirects(HttpClient.Redirect.NEVER)
-                .build()));
+        this(networkGuard, maxRedirects, new ApacheTransport());
     }
 
     GuardedHttpClient(NetworkGuard networkGuard, int maxRedirects, Transport transport) {
@@ -114,11 +132,14 @@ public class GuardedHttpClient {
         }
         Map<String, String> currentHeaders = sanitizeHeaders(headers);
 
+        List<InetAddress> validatedNextHop = null;
         for (int redirects = 0; ; redirects++) {
-            requireAllowed(current);
-            HttpRequest request = buildRequest(
+            List<InetAddress> pinnedAddresses = validatedNextHop == null
+                    ? resolveAllowed(current) : validatedNextHop;
+            validatedNextHop = null;
+            OutboundRequest request = buildRequest(
                     currentMethod, current, currentBody, currentHeaders, timeout);
-            RawResponse raw = transport.send(request);
+            RawResponse raw = transport.send(request, pinnedAddresses, maxResponseBytes);
             try (InputStream responseBody = raw.body()) {
                 if (!REDIRECT_STATUSES.contains(raw.statusCode())) {
                     byte[] bytes = readBounded(
@@ -142,7 +163,7 @@ public class GuardedHttpClient {
                 } catch (RuntimeException e) {
                     throw new IOException("Invalid HTTP redirect target", e);
                 }
-                requireAllowed(next);
+                validatedNextHop = resolveAllowed(next);
                 if ("https".equalsIgnoreCase(current.getScheme())
                         && "http".equalsIgnoreCase(next.getScheme())) {
                     throw new IOException("HTTPS to HTTP redirect is not allowed");
@@ -162,24 +183,18 @@ public class GuardedHttpClient {
         }
     }
 
-    private void requireAllowed(URI uri) throws IOException {
-        String blocked = networkGuard.validateUrl(uri.toString());
-        if (blocked != null) {
-            throw new NetworkRejectedException(blocked);
+    private List<InetAddress> resolveAllowed(URI uri) throws IOException {
+        NetworkGuard.UrlValidation validation = networkGuard.validateAndResolveUrl(uri.toString());
+        if (!validation.isAllowed()) {
+            throw new NetworkRejectedException(validation.error());
         }
+        return validation.addresses();
     }
 
-    private static HttpRequest buildRequest(String method, URI uri, byte[] body,
-                                            Map<String, String> headers,
-                                            Duration timeout) {
-        HttpRequest.Builder builder = HttpRequest.newBuilder(uri).timeout(timeout);
-        headers.forEach(builder::header);
-        if ("POST".equals(method)) {
-            builder.POST(HttpRequest.BodyPublishers.ofByteArray(body));
-        } else {
-            builder.GET();
-        }
-        return builder.build();
+    private static OutboundRequest buildRequest(String method, URI uri, byte[] body,
+                                                Map<String, String> headers,
+                                                Duration timeout) {
+        return new OutboundRequest(method, uri, body, headers, timeout);
     }
 
     private static byte[] readBounded(InputStream body, HttpHeaders headers,
@@ -302,17 +317,114 @@ public class GuardedHttpClient {
         }
     }
 
-    @FunctionalInterface
-    interface Transport {
-        RawResponse send(HttpRequest request) throws IOException, InterruptedException;
+    record OutboundRequest(String method, URI uri, byte[] body,
+                           Map<String, String> headers, Duration timeout) {
+        OutboundRequest {
+            body = body == null ? new byte[0] : body.clone();
+            headers = headers == null ? Map.of() : Map.copyOf(headers);
+        }
+
+        @Override
+        public byte[] body() {
+            return body.clone();
+        }
     }
 
-    private record JdkTransport(HttpClient client) implements Transport {
+    @FunctionalInterface
+    interface Transport {
+        RawResponse send(OutboundRequest request, List<InetAddress> pinnedAddresses,
+                         int maxResponseBytes) throws IOException, InterruptedException;
+    }
+
+    /**
+     * Uses a request-scoped DNS resolver so the socket connects only to addresses
+     * already approved by NetworkGuard. The request URI keeps its original host,
+     * preserving HTTP virtual hosting, TLS SNI, and hostname certificate checks.
+     */
+    private static final class ApacheTransport implements Transport {
         @Override
-        public RawResponse send(HttpRequest request) throws IOException, InterruptedException {
-            HttpResponse<InputStream> response = client.send(
-                    request, HttpResponse.BodyHandlers.ofInputStream());
-            return new RawResponse(response.statusCode(), response.headers(), response.body());
+        public RawResponse send(OutboundRequest request, List<InetAddress> pinnedAddresses,
+                                int maxResponseBytes) throws IOException {
+            if (pinnedAddresses == null || pinnedAddresses.isEmpty()) {
+                throw new IOException("No validated destination addresses are available");
+            }
+            String requestHost = normalizeHost(request.uri().getHost());
+            InetAddress[] addresses = pinnedAddresses.toArray(InetAddress[]::new);
+            DnsResolver pinnedResolver = new DnsResolver() {
+                @Override
+                public InetAddress[] resolve(String host) throws UnknownHostException {
+                    if (!requestHost.equals(normalizeHost(host))) {
+                        throw new UnknownHostException("Unexpected host lookup: " + host);
+                    }
+                    return addresses.clone();
+                }
+
+                @Override
+                public String resolveCanonicalHostname(String host) throws UnknownHostException {
+                    if (!requestHost.equals(normalizeHost(host))) {
+                        throw new UnknownHostException("Unexpected host lookup: " + host);
+                    }
+                    return requestHost;
+                }
+            };
+            PoolingHttpClientConnectionManager manager = PoolingHttpClientConnectionManagerBuilder.create()
+                    .setDnsResolver(pinnedResolver)
+                    .setDefaultConnectionConfig(ConnectionConfig.custom()
+                            .setConnectTimeout(Timeout.ofSeconds(10))
+                            .setSocketTimeout(Timeout.of(request.timeout()))
+                            .build())
+                    .build();
+            HttpUriRequestBase outbound = new HttpUriRequestBase(request.method(), request.uri());
+            outbound.setConfig(RequestConfig.custom()
+                    .setConnectionRequestTimeout(Timeout.of(request.timeout()))
+                    .setResponseTimeout(Timeout.of(request.timeout()))
+                    .setRedirectsEnabled(false)
+                    .build());
+            if ("POST".equals(request.method())) {
+                outbound.setEntity(new ByteArrayEntity(request.body(), ContentType.APPLICATION_OCTET_STREAM));
+            }
+            request.headers().forEach(outbound::setHeader);
+            ScheduledFuture<?> deadline = REQUEST_DEADLINES.schedule(outbound::cancel,
+                    Math.max(1, request.timeout().toMillis()), TimeUnit.MILLISECONDS);
+            try (CloseableHttpClient client = HttpClients.custom()
+                    .setConnectionManager(manager)
+                    .disableRedirectHandling()
+                    .disableContentCompression()
+                    .build()) {
+                try (CloseableHttpResponse response = client.execute(outbound)) {
+                    Map<String, List<String>> headers = new LinkedHashMap<>();
+                    for (Header header : response.getHeaders()) {
+                        headers.computeIfAbsent(header.getName(), ignored -> new ArrayList<>())
+                                .add(header.getValue());
+                    }
+                    HttpEntity entity = response.getEntity();
+                    byte[] body = new byte[0];
+                    if (entity != null && entity.getContent() != null) {
+                        long declaredLength = entity.getContentLength();
+                        if (declaredLength > maxResponseBytes) {
+                            throw new IOException("HTTP response body exceeds limit");
+                        }
+                        body = entity.getContent().readNBytes(maxResponseBytes + 1);
+                    }
+                    return new RawResponse(response.getCode(),
+                            HttpHeaders.of(headers, (name, value) -> true),
+                            new ByteArrayInputStream(body));
+                }
+            } finally {
+                deadline.cancel(false);
+            }
+        }
+
+        private static String normalizeHost(String host) {
+            if (host == null) return "";
+            String normalized = host.trim().toLowerCase(Locale.ROOT);
+            if (normalized.startsWith("[") && normalized.endsWith("]")) {
+                normalized = normalized.substring(1, normalized.length() - 1);
+            }
+            while (normalized.endsWith(".")) {
+                normalized = normalized.substring(0, normalized.length() - 1);
+            }
+            return normalized;
         }
     }
 }

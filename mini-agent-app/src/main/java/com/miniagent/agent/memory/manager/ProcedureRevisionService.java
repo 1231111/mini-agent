@@ -16,6 +16,9 @@ import java.util.Map;
 
 @Service
 public class ProcedureRevisionService {
+    public record RollbackResult(boolean applied, int fromVersion, int toVersion,
+                                 int restoredRevision, String restoredContentHash) { }
+
     private final AgentProcedureRepository procedures;
     private final AgentProcedureRevisionRepository revisions;
     private final ObjectMapper mapper;
@@ -41,6 +44,11 @@ public class ProcedureRevisionService {
 
     @Transactional
     public boolean rollback(Long procedureId, Integer targetVersion) {
+        return rollbackWithReceipt(procedureId, targetVersion).applied();
+    }
+
+    @Transactional
+    public RollbackResult rollbackWithReceipt(Long procedureId, Integer targetVersion) {
         OwnerContext owner = OwnerContext.capture();
         if (owner.userId() == null || owner.tenantId() == null) throw new SecurityException("owner required");
         AgentProcedureEntity current = procedures.findById(procedureId).orElseThrow();
@@ -50,15 +58,26 @@ public class ProcedureRevisionService {
         AgentProcedureRevisionEntity target = revisions.findByTenantIdAndProcedureIdAndProcedureVersion(
                 owner.tenantId(), procedureId, targetVersion).orElseThrow();
         try {
+            if (target.getContentHash() == null || target.getContentJson() == null
+                    || !MessageDigest.isEqual(target.getContentHash().getBytes(StandardCharsets.US_ASCII),
+                    sha256(target.getContentJson()).getBytes(StandardCharsets.US_ASCII))) {
+                throw new IllegalStateException("Procedure revision integrity check failed");
+            }
             @SuppressWarnings("unchecked") Map<String, Object> value = mapper.readValue(target.getContentJson(), Map.class);
-            int expected = current.getProcedureVersion();
-            return procedures.upgradeContent(procedureId, owner.tenantId(), expected, expected + 1,
+            Integer currentVersion = current.getProcedureVersion();
+            if (currentVersion == null || currentVersion <= 0) {
+                throw new IllegalStateException("Current procedure version is invalid");
+            }
+            int expected = currentVersion;
+            boolean applied = procedures.upgradeContent(procedureId, owner.tenantId(), expected, expected + 1,
                     String.valueOf(value.get("name")), String.valueOf(value.getOrDefault("description", "")),
                     mapper.writeValueAsString(value.get("preconditions")),
                     mapper.writeValueAsString(value.get("steps")),
                     mapper.writeValueAsString(value.get("successConditions")),
                     current.getImportance() == null ? 0.5 : current.getImportance(),
                     com.miniagent.agent.memory.entity.AgentMemoryEntryEntity.Status.ACTIVE) == 1;
+            return new RollbackResult(applied, expected, applied ? expected + 1 : expected,
+                    target.getProcedureVersion(), target.getContentHash());
         } catch (Exception e) { throw new IllegalStateException("Unable to restore procedure revision", e); }
     }
 

@@ -6,7 +6,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.http.HttpHeaders;
-import java.net.http.HttpRequest;
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayDeque;
@@ -15,6 +15,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import com.sun.net.httpserver.HttpServer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -35,6 +37,60 @@ class GuardedHttpClientTest {
     }
 
     @Test
+    void pinsTheSingleDnsAnswerThatPassedPolicyInsteadOfResolvingAgainAtConnectTime() throws Exception {
+        AtomicInteger resolutions = new AtomicInteger();
+        NetworkGuard guard = new NetworkGuard(true, Set.of(80, 443), host -> {
+            if (resolutions.incrementAndGet() == 1) {
+                return new InetAddress[]{InetAddress.getByName("93.184.216.34")};
+            }
+            return new InetAddress[]{InetAddress.getByName("127.0.0.1")};
+        });
+        FakeTransport transport = new FakeTransport(raw(200, Map.of(), "ok"));
+        GuardedHttpClient client = new GuardedHttpClient(guard, 0, transport);
+
+        GuardedHttpClient.Response response = client.get(
+                "https://rebinding.example.com/resource", Map.of(), Duration.ofSeconds(1), 1024);
+
+        assertThat(response.bodyText()).isEqualTo("ok");
+        assertThat(resolutions).hasValue(1);
+        assertThat(transport.pinnedAddresses)
+                .containsExactly(List.of(InetAddress.getByName("93.184.216.34")));
+        assertThat(transport.requests.getFirst().uri().getHost()).isEqualTo("rebinding.example.com");
+    }
+
+    @Test
+    void apacheTransportConnectsUsingThePinnedAddressWhileKeepingTheOriginalHost() throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/pinned", exchange -> {
+            byte[] body = exchange.getRequestHeaders().getFirst("Host").getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            try (var output = exchange.getResponseBody()) {
+                output.write(body);
+            }
+        });
+        server.start();
+        try {
+            AtomicInteger resolutions = new AtomicInteger();
+            NetworkGuard guard = new NetworkGuard(false,
+                    Set.of(server.getAddress().getPort()), host -> {
+                resolutions.incrementAndGet();
+                return new InetAddress[]{InetAddress.getByName("127.0.0.1")};
+            });
+            GuardedHttpClient client = new GuardedHttpClient(guard, 0);
+
+            GuardedHttpClient.Response response = client.get(
+                    "http://pinned.test:" + server.getAddress().getPort() + "/pinned",
+                    Map.of(), Duration.ofSeconds(3), 1024);
+
+            assertThat(response.statusCode()).isEqualTo(200);
+            assertThat(response.bodyText()).contains("pinned.test");
+            assertThat(resolutions).hasValue(1);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void stripsCredentialsOnCrossOriginRedirects() throws Exception {
         FakeTransport transport = new FakeTransport(
                 raw(302, Map.of("Location", List.of("https://two.example.com/end")), ""),
@@ -48,12 +104,11 @@ class GuardedHttpClientTest {
 
         assertThat(response.bodyText()).isEqualTo("ok");
         assertThat(transport.requests).hasSize(2);
-        assertThat(transport.requests.get(0).headers().firstValue("Authorization"))
-                .contains("Bearer secret");
-        assertThat(transport.requests.get(1).headers().firstValue("Authorization"))
-                .isEmpty();
-        assertThat(transport.requests.get(1).headers().firstValue("User-Agent"))
-                .contains("test");
+        assertThat(transport.requests.get(0).headers().get("Authorization"))
+                .isEqualTo("Bearer secret");
+        assertThat(transport.requests.get(1).headers()).doesNotContainKey("Authorization");
+        assertThat(transport.requests.get(1).headers().get("User-Agent"))
+                .isEqualTo("test");
     }
 
     @Test
@@ -112,15 +167,19 @@ class GuardedHttpClientTest {
 
     private static final class FakeTransport implements GuardedHttpClient.Transport {
         private final Queue<GuardedHttpClient.RawResponse> responses = new ArrayDeque<>();
-        private final List<HttpRequest> requests = new ArrayList<>();
+        private final List<GuardedHttpClient.OutboundRequest> requests = new ArrayList<>();
+        private final List<List<InetAddress>> pinnedAddresses = new ArrayList<>();
 
         private FakeTransport(GuardedHttpClient.RawResponse... responses) {
             this.responses.addAll(List.of(responses));
         }
 
         @Override
-        public GuardedHttpClient.RawResponse send(HttpRequest request) throws IOException {
+        public GuardedHttpClient.RawResponse send(GuardedHttpClient.OutboundRequest request,
+                                                  List<InetAddress> pinned,
+                                                  int maxResponseBytes) throws IOException {
             requests.add(request);
+            pinnedAddresses.add(List.copyOf(pinned));
             GuardedHttpClient.RawResponse response = responses.poll();
             if (response == null) throw new IOException("unexpected request");
             return response;

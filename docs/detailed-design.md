@@ -698,7 +698,7 @@ Todo 存储键仍是 sessionId，靠挂起字段隔离，不是 `#` 键。
 **已知边界（不得当成已实现）**：以下是当前仍未完成的能力或验证，不应把已存在的实体/配置误当成闭环已经接通。第 1 步自动治理完成低成功率 SOP 归档；第 2 步将既有结构化 resolution 形成待审核候选；独立验证目前是认证验证者提交记录，不是自动执行器；无人值守自动采纳仍未实现。
 
 - `PROJECT` scope 的项目表、成员 ACL、会话绑定、解绑入口和运行时可信 `projectId` 解析已实现；Controller 与跨租户/成员运行链路仍需集成测试，尚不能以实体存在代替端到端授权验证。
-- `agent_procedure_revisions` 已保存 Procedure 内容快照，首次创建、一般升版及提案批准路径接入 capture；`ProcedureRevisionService.rollback` 是服务方法，尚未开放 REST API。H2 已验证 capture/rollback JSON 数组往返，真实 MySQL 尚未验证。
+- `agent_procedure_revisions` stores revision snapshots, captured at creation, upgrade, and proposal approval. Authenticated owners can roll back their USER procedures through `POST /v1/memory/procedures/{procedureId}/revisions/{targetVersion}:rollback`; owner and tenant checks plus CAS create a new version, verify the source SHA-256, and record an admin audit entry in the same transaction. H2 covers JSON round trips; MySQL still needs production validation.
 - 大小写变体：MySQL 默认排序规则（utf8mb4_unicode_ci）本身不区分大小写，`ux_ap_identity` 在 MySQL 上连大小写变体一起拦；H2（桌面档）唯一索引区分大小写，只能靠写入路径的身份归一拦截。写入路径两边一致，**直连库改数据时不保证**。
 - `experience_clusters` 的服务和 REST 操作已实现，但 merge/split 的唯一成员约束、事务回滚和并发 CAS 尚缺真实 H2/MySQL 持久化测试；V15 migration 当前已覆盖 H2 MySQL mode 的建表与重复执行。
 - `agent_procedure_candidate_validations` 由 V16 创建，唯一键限制每个 proposal/verifier 只有一条记录；验证结果按 proposal、tenant、候选哈希查询。自动采纳开关默认关闭，当前没有从巩固 worker 到自动采纳的执行链路。

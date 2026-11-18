@@ -6,6 +6,7 @@ import com.miniagent.agent.memory.MemoryTaskLock;
 import com.miniagent.agent.memory.config.ConditionalOnCloudMemory;
 import com.miniagent.agent.memory.entity.AgentOutcomeOutboxEntity;
 import com.miniagent.agent.memory.repository.AgentOutcomeOutboxRepository;
+import com.miniagent.application.SubjectErasureService;
 import com.miniagent.memory.contract.MemoryApi.AckStatus;
 import com.miniagent.memory.contract.MemoryApi.OutcomeAck;
 import com.miniagent.memory.contract.MemoryApi.OutcomeBatchResult;
@@ -14,6 +15,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -51,6 +53,9 @@ public class OutcomeOutboxService {
     private final PlatformTransactionManager transactions;
     private final AtomicLong lagSeconds = new AtomicLong();
 
+    @Autowired(required = false)
+    private SubjectErasureService subjectErasureService;
+
     public OutcomeOutboxService(AgentOutcomeOutboxRepository outbox, CloudMemoryClient client,
                                 ObjectMapper json, MemoryTaskLock taskLock,
                                 PlatformTransactionManager transactions, MeterRegistry metrics) {
@@ -68,6 +73,13 @@ public class OutcomeOutboxService {
         if (event == null || event.eventId() == null || event.tenantId() == null) {
             return;
         }
+        if (event.userId() <= 0) {
+            log.warn("Outcome event missing a valid owner event={}", event.eventId());
+            return;
+        }
+        if (subjectErasureService != null) {
+            subjectErasureService.assertWritable(event.tenantId(), event.userId());
+        }
         if (outbox.findByEventId(event.eventId()).isPresent()) {
             return;
         }
@@ -75,6 +87,7 @@ public class OutcomeOutboxService {
             AgentOutcomeOutboxEntity row = new AgentOutcomeOutboxEntity();
             row.setEventId(event.eventId());
             row.setTenantId(event.tenantId());
+            row.setUserId(event.userId());
             row.setPayloadJson(json.writeValueAsString(event));
             row.setStatus(AgentOutcomeOutboxEntity.Status.PENDING);
             row.setNextAttemptAt(LocalDateTime.now());

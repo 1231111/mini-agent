@@ -29,6 +29,9 @@ public class AgentOutcomeOutboxEntity extends BaseMemoryEntity {
     @Column(name = "tenant_id", nullable = false, length = 64)
     private String tenantId;
 
+    @Column(name = "user_id", nullable = false)
+    private Long userId;
+
     @Lob
     @Column(name = "payload_json", nullable = false, columnDefinition = "LONGTEXT")
     private String payloadJson;
@@ -72,6 +75,14 @@ public class AgentOutcomeOutboxEntity extends BaseMemoryEntity {
 
     public void setTenantId(String tenantId) {
         this.tenantId = tenantId;
+    }
+
+    public Long getUserId() {
+        return userId;
+    }
+
+    public void setUserId(Long userId) {
+        this.userId = userId;
     }
 
     public String getPayloadJson() {

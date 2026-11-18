@@ -10,6 +10,10 @@ server:
         same-site: lax
 
 spring:
+  data:
+    redis:
+      ssl:
+        enabled: ${REDIS_SSL_ENABLED:true}
   datasource:
     hikari:
       maximum-pool-size: ${ACCOUNT_DB_POOL_MAX_SIZE:10}

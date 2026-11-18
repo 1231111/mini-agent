@@ -27,6 +27,7 @@ public class AccountProductionReadinessValidator {
         requireConfiguredAlias("DB_URL", errors);
         validateDatabaseTls(errors);
         validatePrivateBindOrTls(errors);
+        validateSharedRedis(errors);
         String databaseUsername = requireConfiguredAlias("DB_USERNAME", errors);
         if (!isProductionDatabaseUsername(databaseUsername)) {
             errors.add("DB_USERNAME must name a dedicated database user, not root");
@@ -93,6 +94,18 @@ public class AccountProductionReadinessValidator {
             }
         } catch (IllegalArgumentException e) {
             errors.add("ACCOUNT_MEMORY_TOKEN_KEY must be valid Base64");
+        }
+    }
+
+    private void validateSharedRedis(List<String> errors) {
+        String redisHost = requireConfiguredAlias("REDIS_HOST", errors);
+        if (redisHost.equalsIgnoreCase("localhost") || redisHost.equals("127.0.0.1")
+                || redisHost.equals("::1") || redisHost.equals("0.0.0.0")) {
+            errors.add("REDIS_HOST must point to shared non-loopback Redis for cross-replica login throttling");
+        }
+        requireSecret("spring.data.redis.password", "REDIS_PASSWORD", 32, errors);
+        if (!environment.getProperty("spring.data.redis.ssl.enabled", Boolean.class, false)) {
+            errors.add("spring.data.redis.ssl.enabled must be true (env REDIS_SSL_ENABLED) in production");
         }
     }
 

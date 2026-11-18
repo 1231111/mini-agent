@@ -134,6 +134,7 @@ public class FileStorageService {
             if (data.length > maxUploadSizeBytes) {
                 throw new IllegalArgumentException("file exceeds configured size limit");
             }
+            boolean withinExtractionLimit = data.length <= maxExtractBytes;
             UploadContentInspector.Inspection inspection = UploadContentInspector.inspect(
                     originalFilename, mimeType, data);
             requireAccepted(inspection);
@@ -171,7 +172,7 @@ public class FileStorageService {
             fileUpload.setSessionId(sessionId);
 
             // 上传即提取：Office/PDF/大文本写侧车；音视频走原生多模态，跳过抽文本
-            if (!MultimodalMedia.isNativeMedia(originalFilename, mimeType)) {
+            if (!MultimodalMedia.isNativeMedia(originalFilename, mimeType) && withinExtractionLimit) {
                 try {
                     String sidecar = uploadedDocumentService.extractAndWriteSidecar(
                             userId, filePath, originalFilename, mimeType);

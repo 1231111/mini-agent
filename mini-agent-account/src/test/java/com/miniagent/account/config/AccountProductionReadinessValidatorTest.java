@@ -14,6 +14,9 @@ class AccountProductionReadinessValidatorTest {
         MockEnvironment environment = new MockEnvironment()
                 .withProperty("DB_URL", "jdbc:mysql://db.example/mini_agent?sslMode=VERIFY_IDENTITY")
                 .withProperty("DB_USERNAME", "miniagent")
+                .withProperty("REDIS_HOST", "redis.internal.example")
+                .withProperty("spring.data.redis.password", "R".repeat(32))
+                .withProperty("spring.data.redis.ssl.enabled", "true")
                 .withProperty("spring.datasource.password", "D".repeat(32))
                 .withProperty("agent.account.internal-key", "I".repeat(32))
                 .withProperty("agent.account.memory-token-key", VALID_MEMORY_KEY);
@@ -26,6 +29,9 @@ class AccountProductionReadinessValidatorTest {
         MockEnvironment environment = new MockEnvironment()
                 .withProperty("DB_URL", "jdbc:mysql://db.example/mini_agent?sslMode=VERIFY_IDENTITY")
                 .withProperty("DB_USERNAME", "miniagent")
+                .withProperty("REDIS_HOST", "redis.internal.example")
+                .withProperty("spring.data.redis.password", "R".repeat(32))
+                .withProperty("spring.data.redis.ssl.enabled", "true")
                 .withProperty("spring.datasource.password", "short-db-password")
                 .withProperty("agent.account.internal-key", "short")
                 .withProperty("agent.account.memory-token-key", "c2hvcnQ=");
@@ -39,7 +45,25 @@ class AccountProductionReadinessValidatorTest {
         MockEnvironment environment = new MockEnvironment()
                 .withProperty("DB_URL", "jdbc:mysql://db.example/mini_agent?sslMode=VERIFY_IDENTITY")
                 .withProperty("DB_USERNAME", "root")
+                .withProperty("REDIS_HOST", "redis.internal.example")
+                .withProperty("spring.data.redis.password", "R".repeat(32))
+                .withProperty("spring.data.redis.ssl.enabled", "true")
                 .withProperty("spring.datasource.password", "D".repeat(32))
+                .withProperty("agent.account.internal-key", "I".repeat(32))
+                .withProperty("agent.account.memory-token-key", VALID_MEMORY_KEY);
+
+        assertThrows(IllegalStateException.class,
+                () -> new AccountProductionReadinessValidator(environment).validate());
+    }
+
+    @Test
+    void rejectsLocalOrUnsecuredRedisForProductionLoginThrottling() {
+        MockEnvironment environment = new MockEnvironment()
+                .withProperty("DB_URL", "jdbc:mysql://db.example/mini_agent?sslMode=VERIFY_IDENTITY")
+                .withProperty("DB_USERNAME", "miniagent")
+                .withProperty("REDIS_HOST", "127.0.0.1")
+                .withProperty("spring.datasource.password", "D".repeat(32))
+                .withProperty("spring.data.redis.password", "short")
                 .withProperty("agent.account.internal-key", "I".repeat(32))
                 .withProperty("agent.account.memory-token-key", VALID_MEMORY_KEY);
 

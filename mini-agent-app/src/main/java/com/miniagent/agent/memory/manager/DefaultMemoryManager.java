@@ -115,11 +115,45 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
         }
     }
 
+    private void assertOwnerWritable(String tenantId, AgentMemoryEntryEntity.ScopeType scopeType,
+                                     String scopeId) {
+        if (subjectErasureService == null) return;
+        Long contextUser = OwnerContext.currentUserId();
+        String contextTenant = OwnerContext.effectiveTenantId();
+        if (contextUser != null && contextTenant != null) {
+            subjectErasureService.assertWritable(contextTenant, contextUser);
+        }
+        if (scopeType == AgentMemoryEntryEntity.ScopeType.USER && scopeId != null) {
+            try {
+                long scopeUser = Long.parseLong(scopeId);
+                if (contextUser == null || !contextUser.equals(scopeUser)
+                        || !Objects.equals(contextTenant, tenantId)) {
+                    subjectErasureService.assertWritable(tenantId, scopeUser);
+                }
+            } catch (NumberFormatException ignored) {
+                // A non-local user scope cannot match the local subject tombstone.
+            }
+        }
+    }
+
+    private void assertOwnerWritable(AgentMemoryEntryEntity entity) {
+        assertOwnerWritable(entity.getTenantId(), entity.getScopeType(), entity.getScopeId());
+    }
+
     // === 写入 ===
 
     @Override
+    @Transactional
     public void recordEvent(AgentEvent event) {
         assertSubjectWritable();
+        if (event.getActor() != null && event.getActor().startsWith("user:")) {
+            try {
+                subjectErasureService.assertWritable(event.getTenantId(),
+                        Long.parseLong(event.getActor().substring("user:".length())));
+            } catch (NumberFormatException ignored) {
+                // Events without a local user actor are not subject-scoped.
+            }
+        }
         // 持久化事件
         AgentEventEntity entity = new AgentEventEntity();
         entity.setTenantId(event.getTenantId());
@@ -147,7 +181,9 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
     @Override
     @Transactional
     public void writeMemory(MemoryEntry entry) {
-        assertSubjectWritable();
+        assertOwnerWritable(entry.getTenantId(),
+                AgentMemoryEntryEntity.ScopeType.valueOf(entry.getScope().scopeType().name()),
+                entry.getScope().scopeId());
         requireSafeForPrompt(entry.getContent(), entry.getSummary(), "记忆条目");
         AgentMemoryEntryEntity entity = toEntity(entry);
         entity = entryRepository.save(entity);
@@ -188,6 +224,7 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
     public void updateMemory(Long id, MemoryEntry update) {
         assertSubjectWritable();
         entryRepository.findById(id).ifPresent(entity -> {
+            assertOwnerWritable(entity);
             if (update.getContent() != null) {
                 entity.setContent(update.getContent());
             }
@@ -229,7 +266,10 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
         }
         entryRepository.findByIdAndTenantId(id, tenantId)
                 .filter(entity -> entity.getStatus() != AgentMemoryEntryEntity.Status.DELETED)
-                .ifPresent(entity -> applyUpdate(id, update, entity));
+                .ifPresent(entity -> {
+                    assertOwnerWritable(entity);
+                    applyUpdate(id, update, entity);
+                });
     }
 
     private void applyUpdate(Long id, MemoryEntry update, AgentMemoryEntryEntity entity) {
@@ -257,6 +297,7 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
     @Transactional
     public void deleteMemory(Long id) {
         entryRepository.findById(id).ifPresent(entity -> {
+            assertOwnerWritable(entity);
             entity.setStatus(AgentMemoryEntryEntity.Status.DELETED);
             entryRepository.save(entity);
             if (indexOutbox != null) {
@@ -272,6 +313,7 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
             return;
         }
         entryRepository.findByIdAndTenantId(id, tenantId).ifPresent(entity -> {
+            assertOwnerWritable(entity);
             entity.setStatus(AgentMemoryEntryEntity.Status.DELETED);
             entryRepository.save(entity);
             if (indexOutbox != null) {
@@ -408,7 +450,9 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
     }
 
     @Override
+    @Transactional
     public void updateWorkingMemory(String sessionId, WorkingMemory update) {
+        assertSubjectWritable();
         workingMemoryManager.update(sessionId, update);
     }
 
@@ -417,7 +461,9 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
     @Override
     @Transactional
     public void writeFact(SemanticFact fact) {
-        assertSubjectWritable();
+        assertOwnerWritable(fact.getTenantId(),
+                AgentMemoryEntryEntity.ScopeType.valueOf(fact.getScope().scopeType().name()),
+                fact.getScope().scopeId());
         // 事实会以"已知事实"注入提示（DefaultMemoryService 的 facts 段），同样要过闸门。
         // 巩固期由模型从工具输出/网页内容里提炼出来的"事实"尤其危险：
         // 攻击者只要让模型把一句话总结成事实，就能让它出现在之后每一次系统提示里。
@@ -462,6 +508,7 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
             return false;
         }
         AgentSemanticFactEntity fact = found.get();
+        assertOwnerWritable(fact.getTenantId(), fact.getScopeType(), fact.getScopeId());
         fact.setValidTo(LocalDateTime.now());
         factRepository.save(fact);
         return true;
@@ -485,7 +532,9 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
     @Override
     @Transactional
     public Procedure writeProcedure(Procedure procedure) {
-        assertSubjectWritable();
+        assertOwnerWritable(procedure.getTenantId(),
+                AgentMemoryEntryEntity.ScopeType.valueOf(procedure.getScope().scopeType().name()),
+                procedure.getScope().scopeId());
         // SOP 会以"可用方法"注入提示，是"持久化指令"最容易被忽视的一条路径
         requireSafeForPrompt(
                 procedure.getName() + " " + procedure.getDescription(),

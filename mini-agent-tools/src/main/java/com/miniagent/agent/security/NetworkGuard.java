@@ -8,6 +8,7 @@ import java.net.InetAddress;
 import java.net.URI;
 import java.net.UnknownHostException;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
@@ -42,71 +43,95 @@ public class NetworkGuard {
 
     /** @return null if OK, else error message */
     public String validateUrl(String url) {
-        return validate(url, Set.of("http", "https"));
+        return validate(url, Set.of("http", "https"), false).error();
+    }
+
+    /** Returns the exact DNS answers that passed validation for connection pinning. */
+    public UrlValidation validateAndResolveUrl(String url) {
+        return validate(url, Set.of("http", "https"), true);
     }
 
     /** WebSocket endpoints obey the same host, port and DNS restrictions. */
     public String validateWebSocketUrl(String url) {
-        return validate(url, Set.of("ws", "wss"));
+        return validate(url, Set.of("ws", "wss"), false).error();
     }
 
-    private String validate(String url, Set<String> allowedSchemes) {
+    private UrlValidation validate(String url, Set<String> allowedSchemes, boolean includeAddresses) {
         if (url == null || url.isBlank()) {
-            return MessageConstants.NET_URL_EMPTY;
+            return UrlValidation.rejected(MessageConstants.NET_URL_EMPTY);
         }
         URI uri;
         try {
             uri = URI.create(url.trim());
         } catch (Exception e) {
-            return String.format(MessageConstants.NET_URL_INVALID, e.getMessage());
+            return UrlValidation.rejected(String.format(MessageConstants.NET_URL_INVALID, e.getMessage()));
         }
         String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
         if (!allowedSchemes.contains(scheme)) {
-            return allowedSchemes.contains("ws")
-                    ? "仅允许 ws/wss 协议"
-                    : MessageConstants.NET_PROTOCOL_NOT_ALLOWED;
+            return UrlValidation.rejected(allowedSchemes.contains("ws")
+                    ? "Only ws/wss protocols are allowed"
+                    : MessageConstants.NET_PROTOCOL_NOT_ALLOWED);
         }
         if (uri.getRawUserInfo() != null) {
-            return "URL credentials are not allowed";
+            return UrlValidation.rejected("URL credentials are not allowed");
         }
         String rawAuthority = uri.getRawAuthority();
         if (rawAuthority != null && (rawAuthority.contains("%25") || rawAuthority.contains("%"))) {
-            return "IPv6 zone identifiers are not allowed";
+            return UrlValidation.rejected("IPv6 zone identifiers are not allowed");
         }
         String host = normalizeHost(uri.getHost());
         if (host == null || host.isBlank()) {
-            return MessageConstants.NET_HOST_MISSING;
+            return UrlValidation.rejected(MessageConstants.NET_HOST_MISSING);
         }
         int port = uri.getPort() >= 0 ? uri.getPort()
                 : (scheme.equals("https") || scheme.equals("wss") ? 443 : 80);
         if (!allowedPorts.contains(port)) {
-            return "URL port " + port + " is not allowed";
+            return UrlValidation.rejected("URL port " + port + " is not allowed");
         }
-        if (!blockPrivate) {
-            return null;
+        if (!blockPrivate && !includeAddresses) {
+            return UrlValidation.allowed(List.of());
         }
-        if (isBlockedHost(host)) {
-            return String.format(MessageConstants.NET_SSRF_BLOCKED_HOST, host);
+        if (blockPrivate && isBlockedHost(host)) {
+            return UrlValidation.rejected(String.format(MessageConstants.NET_SSRF_BLOCKED_HOST, host));
         }
+        InetAddress[] addresses;
         try {
-            InetAddress[] addrs = hostResolver.resolve(host);
-            if (addrs == null || addrs.length == 0) {
-                return String.format(MessageConstants.NET_HOST_UNRESOLVABLE, host);
+            addresses = hostResolver.resolve(host);
+            if (addresses == null || addresses.length == 0) {
+                return UrlValidation.rejected(String.format(MessageConstants.NET_HOST_UNRESOLVABLE, host));
             }
-            for (InetAddress addr : addrs) {
-                if (addr == null) {
-                    return String.format(MessageConstants.NET_HOST_UNRESOLVABLE, host);
+            for (InetAddress address : addresses) {
+                if (address == null) {
+                    return UrlValidation.rejected(String.format(MessageConstants.NET_HOST_UNRESOLVABLE, host));
                 }
-                if (isBlockedAddress(addr)) {
-                    return String.format(MessageConstants.NET_SSRF_BLOCKED_RESOLVED, addr.getHostAddress());
+                if (blockPrivate && isBlockedAddress(address)) {
+                    return UrlValidation.rejected(String.format(
+                            MessageConstants.NET_SSRF_BLOCKED_RESOLVED, address.getHostAddress()));
                 }
             }
         } catch (UnknownHostException e) {
-            return String.format(MessageConstants.NET_HOST_UNRESOLVABLE, host);
+            return UrlValidation.rejected(String.format(MessageConstants.NET_HOST_UNRESOLVABLE, host));
         }
-        return null;
+        return UrlValidation.allowed(includeAddresses ? Arrays.asList(addresses.clone()) : List.of());
     }
 
+    public record UrlValidation(String error, List<InetAddress> addresses) {
+        public UrlValidation {
+            addresses = addresses == null ? List.of() : List.copyOf(addresses);
+        }
+
+        private static UrlValidation rejected(String error) {
+            return new UrlValidation(error, List.of());
+        }
+
+        private static UrlValidation allowed(List<InetAddress> addresses) {
+            return new UrlValidation(null, addresses);
+        }
+
+        public boolean isAllowed() {
+            return error == null;
+        }
+    }
     public static boolean isBlockedHost(String host) {
         if (host == null) {
             return true;

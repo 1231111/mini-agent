@@ -4,6 +4,7 @@ import com.miniagent.agent.memory.entity.AgentMemoryEntryEntity;
 import com.miniagent.agent.memory.entity.AgentProcedureApplicationEntity;
 import com.miniagent.agent.memory.repository.AgentProcedureApplicationRepository;
 import com.miniagent.agent.memory.repository.AgentProcedureRepository;
+import com.miniagent.application.SubjectErasureService;
 import com.miniagent.memory.port.MemoryPrincipal;
 import com.miniagent.memory.port.ProcedureSettlementCommand;
 import com.miniagent.memory.port.ProcedureSettlementPort;
@@ -11,6 +12,7 @@ import com.miniagent.memory.port.ProcedureSettlementResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -50,6 +52,9 @@ public class ProcedureApplicationSettlementService implements ProcedureSettlemen
     private final ObjectProvider<ProcedureCloudSync> cloudSync;
     private final TransactionTemplate requiresNew;
 
+    @Autowired(required = false)
+    private SubjectErasureService subjectErasureService;
+
     public ProcedureApplicationSettlementService(AgentProcedureApplicationRepository applications,
                                                   AgentProcedureRepository procedures,
                                                   PlatformTransactionManager transactionManager,
@@ -71,6 +76,9 @@ public class ProcedureApplicationSettlementService implements ProcedureSettlemen
     @Transactional
     public ProcedureSettlementResult settle(ProcedureSettlementCommand command) {
         MemoryPrincipal principal = command.principal();
+        if (subjectErasureService != null) {
+            subjectErasureService.assertWritable(principal.tenantId(), principal.userId());
+        }
         if ("CANDIDATE".equals(command.procedureVariant())) {
             return ProcedureSettlementResult.staleProcedure();
         }
