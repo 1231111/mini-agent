@@ -11,6 +11,8 @@ import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -20,6 +22,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.Objects;
 import java.util.Optional;
@@ -42,6 +45,7 @@ public class McpStdioClient implements AutoCloseable {
     private final int requestTimeoutSeconds;
     private final AtomicLong nextId = new AtomicLong(1);
     private final ConcurrentHashMap<Long, CompletableFuture<JsonNode>> pending = new ConcurrentHashMap<>();
+    private final Semaphore pendingSlots = new Semaphore(MAX_PENDING_REQUESTS);
     private volatile boolean closed;
 
     public McpStdioClient(String serverId, Process process) {
@@ -63,8 +67,9 @@ public class McpStdioClient implements AutoCloseable {
         if (StringUtils.isBlank(cfg.getCommand())) {
             throw new IllegalArgumentException("MCP server " + cfg.getId() + " 缺少 command");
         }
+        Path executable = resolveAllowedExecutable(cfg.getCommand(), cfg.getAllowedExecutable());
         List<String> cmd = new ArrayList<>();
-        cmd.add(cfg.getCommand());
+        cmd.add(executable.toString());
         if (Objects.nonNull(cfg.getArgs())) {
             cmd.addAll(cfg.getArgs());
         }
@@ -72,8 +77,7 @@ public class McpStdioClient implements AutoCloseable {
         // 环境沙箱：先收敛到白名单，再合并本 server 显式声明的 env。
         // 继承整份环境意味着任意 MCP 服务（其工具由服务方定义、模型可直接调用）
         // 都能读到 agent 的模型 key 与数据库口令；需要 token 的服务请在配置的 env 里显式声明。
-        ProcessEnv.sanitize(pb);
-        ProcessEnv.putDeclared(pb, cfg.getEnv());
+        ProcessEnv.sanitizeMcp(pb, cfg.getEnv());
         pb.redirectErrorStream(false);
         Process p = pb.start();
         McpStdioClient client = new McpStdioClient(cfg.getId(), p,
@@ -85,6 +89,25 @@ public class McpStdioClient implements AutoCloseable {
             client.close();
             throw e;
         }
+    }
+
+    /** Resolve and check the configured executable against its explicit canonical allowlist path. */
+    static Path resolveAllowedExecutable(String command, String allowedExecutable) throws Exception {
+        if (StringUtils.isBlank(command) || StringUtils.isBlank(allowedExecutable)) {
+            throw new IllegalArgumentException("MCP command and allowed-executable must both be configured");
+        }
+        Path requested = Path.of(command.trim());
+        Path approved = Path.of(allowedExecutable.trim());
+        if (!requested.isAbsolute() || !approved.isAbsolute()) {
+            throw new IllegalArgumentException("MCP command and allowed-executable must be absolute paths");
+        }
+        Path realRequested = requested.toRealPath();
+        Path realApproved = approved.toRealPath();
+        if (!Files.isRegularFile(realRequested) || !Files.isRegularFile(realApproved)
+                || !realRequested.equals(realApproved)) {
+            throw new IllegalArgumentException("MCP executable is not the configured allowlisted file");
+        }
+        return realRequested;
     }
 
     private void initialize() throws Exception {
@@ -133,6 +156,10 @@ public class McpStdioClient implements AutoCloseable {
         params.set("arguments", argsNode);
         JsonNode result = await(request("tools/call", params), requestTimeoutSeconds);
         return formatCallResult(result);
+    }
+
+    public boolean isHealthy() {
+        return !closed && process.isAlive();
     }
 
     private JsonNode await(CompletableFuture<JsonNode> future, int timeoutSeconds)
@@ -188,11 +215,14 @@ public class McpStdioClient implements AutoCloseable {
         if (closed) {
             throw new IllegalStateException("MCP 连接已关闭");
         }
-        if (pending.size() >= MAX_PENDING_REQUESTS) {
+        if (!pendingSlots.tryAcquire()) {
             throw new IllegalStateException("MCP pending 请求超过上限");
         }
         long id = nextId.getAndIncrement();
         CompletableFuture<JsonNode> fut = new CompletableFuture<>();
+        // Semaphore acquisition is the atomic bound; completion releases the
+        // slot for success, error, timeout, cancellation, write failure and close.
+        fut.whenComplete((ignored, failure) -> pendingSlots.release());
         pending.put(id, fut);
         ObjectNode msg = MAPPER.createObjectNode();
         msg.put("jsonrpc", "2.0");
@@ -233,7 +263,7 @@ public class McpStdioClient implements AutoCloseable {
     private void readLoop() {
         try (InputStream raw = new BufferedInputStream(process.getInputStream())) {
             while (!closed) {
-                JsonNode msg = readOneMessage(raw);
+                JsonNode msg = readOneMessage(raw, maxFrameBytes);
                 if (Objects.isNull(msg)) {
                     break;
                 }
@@ -244,15 +274,25 @@ public class McpStdioClient implements AutoCloseable {
                 log.warn("MCP[{}] 读循环结束: {}", serverId, e.getMessage());
             }
         } finally {
+            // A malformed or oversized frame makes this protocol stream unusable.
+            // Terminate the child as well as failing waiters so a broken MCP server
+            // cannot remain orphaned after its reader has exited.
+            boolean wasClosed = closed;
+            closed = true;
+            if (!wasClosed && process.isAlive()) process.destroyForcibly();
             pending.forEach((id, fut) -> fut.completeExceptionally(new IllegalStateException("MCP 连接关闭")));
             pending.clear();
         }
     }
 
     /** Content-Length 帧；若首行是 `{` 则按 NDJSON 一行解析 */
-    private JsonNode readOneMessage(InputStream in) throws Exception {
+    static JsonNode readOneMessage(InputStream in, int maxFrameBytes) throws Exception {
+        int boundedFrameBytes = Math.max(1, Math.min(64 * 1024 * 1024, maxFrameBytes));
         ByteArrayOutputStream lineBuf = new ByteArrayOutputStream();
         int contentLength = -1;
+        int headerBytes = 0;
+        boolean jsonLine = false;
+        boolean firstNonWhitespaceSeen = false;
         while (true) {
             int b = in.read();
             if (b < 0) {
@@ -260,10 +300,11 @@ public class McpStdioClient implements AutoCloseable {
             }
             if (b == '\n') {
                 String line = lineBuf.toString(StandardCharsets.UTF_8).replace("\r", "").trim();
+                int rawLineBytes = lineBuf.size() + 1;
                 lineBuf.reset();
                 if (line.isEmpty()) {
                     if (contentLength >= 0) {
-                        if (contentLength > maxFrameBytes) {
+                        if (contentLength > boundedFrameBytes) {
                             throw new IllegalStateException("MCP frame 超过上限: " + contentLength);
                         }
                         byte[] body = in.readNBytes(contentLength);
@@ -272,34 +313,59 @@ public class McpStdioClient implements AutoCloseable {
                         }
                         return MAPPER.readTree(body);
                     }
+                    headerBytes += rawLineBytes;
+                    if (headerBytes > MAX_HEADER_BYTES) {
+                        throw new IllegalStateException("MCP header 超过上限");
+                    }
+                    jsonLine = false;
+                    firstNonWhitespaceSeen = false;
                     continue;
                 }
                 if (line.regionMatches(true, 0, "Content-Length:", 0, 15)) {
-                    if (line.length() > MAX_HEADER_BYTES) {
+                    headerBytes += rawLineBytes;
+                    if (headerBytes > MAX_HEADER_BYTES) {
                         throw new IllegalStateException("MCP header 超过上限");
+                    }
+                    if (contentLength >= 0) {
+                        throw new IllegalStateException("重复 MCP Content-Length");
                     }
                     try {
                         contentLength = Integer.parseInt(line.substring(15).trim());
                     } catch (NumberFormatException e) {
                         throw new IllegalStateException("非法 MCP Content-Length", e);
                     }
-                    if (contentLength < 0 || contentLength > maxFrameBytes) {
+                    if (contentLength < 0 || contentLength > boundedFrameBytes) {
                         throw new IllegalStateException("MCP frame 超过上限: " + contentLength);
                     }
+                    jsonLine = false;
+                    firstNonWhitespaceSeen = false;
                     continue;
                 }
                 if (line.startsWith("{")) {
-                    if (line.getBytes(StandardCharsets.UTF_8).length > maxFrameBytes) {
+                    if (line.getBytes(StandardCharsets.UTF_8).length > boundedFrameBytes) {
                         throw new IllegalStateException("MCP NDJSON frame 超过上限");
                     }
                     return MAPPER.readTree(line);
                 }
-                // 其它头忽略
-            } else {
-                if (lineBuf.size() >= maxFrameBytes + MAX_HEADER_BYTES) {
-                    throw new IllegalStateException("MCP frame/header 超过上限");
+                // Ignore other bounded headers. Cumulative accounting prevents
+                // arbitrarily many small header lines from keeping the reader busy.
+                headerBytes += rawLineBytes;
+                if (headerBytes > MAX_HEADER_BYTES) {
+                    throw new IllegalStateException("MCP header 超过上限");
                 }
+                jsonLine = false;
+                firstNonWhitespaceSeen = false;
+            } else {
                 lineBuf.write(b);
+                if (!firstNonWhitespaceSeen && !Character.isWhitespace((char) b) && b != '\r') {
+                    firstNonWhitespaceSeen = true;
+                    jsonLine = b == '{';
+                }
+                int currentLimit = jsonLine ? boundedFrameBytes : MAX_HEADER_BYTES;
+                if (lineBuf.size() > currentLimit) {
+                    throw new IllegalStateException(jsonLine
+                            ? "MCP NDJSON frame 超过上限" : "MCP header line 超过上限");
+                }
             }
         }
     }

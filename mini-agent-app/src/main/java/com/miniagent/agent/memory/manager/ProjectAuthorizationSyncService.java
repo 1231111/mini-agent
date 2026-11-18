@@ -70,16 +70,17 @@ public class ProjectAuthorizationSyncService {
         }
         try {
             TransactionTemplate tx = new TransactionTemplate(transactionManager);
-            List<AgentProjectAuthorizationOutboxEntity> processing = outbox.findByStatus(
-                    AgentProjectAuthorizationOutboxEntity.Status.PROCESSING);
-            processing.forEach(item -> {
-                item.setStatus(AgentProjectAuthorizationOutboxEntity.Status.PENDING);
-                item.setNextAttemptAt(LocalDateTime.now());
-            });
-            outbox.saveAll(processing);
+            LocalDateTime now = LocalDateTime.now();
+            int reclaimed = outbox.requeueStaleProcessing(
+                    AgentProjectAuthorizationOutboxEntity.Status.PROCESSING,
+                    AgentProjectAuthorizationOutboxEntity.Status.PENDING,
+                    now.minus(Duration.ofMinutes(10)), now);
+            if (reclaimed > 0) {
+                log.warn("Requeued {} expired project authorization outbox leases", reclaimed);
+            }
             List<AgentProjectAuthorizationOutboxEntity> batch = outbox
                     .findTop50ByStatusAndNextAttemptAtLessThanEqualOrderByIdAsc(
-                            AgentProjectAuthorizationOutboxEntity.Status.PENDING, LocalDateTime.now());
+                            AgentProjectAuthorizationOutboxEntity.Status.PENDING, now);
             for (AgentProjectAuthorizationOutboxEntity selected : batch) {
                 try {
                     tx.executeWithoutResult(status -> deliverOne(selected.getId(), port));

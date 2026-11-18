@@ -85,6 +85,23 @@ public class VectorMemoryStore implements MemoryVectorIndex {
         return stores.containsKey(uid) || Files.exists(vecPath(uid));
     }
 
+    @Override
+    public synchronized void erase(Long userId) {
+        Long uid = Optional.ofNullable(userId).orElse(DEFAULT_USER);
+        stores.remove(uid);
+        try {
+            Files.deleteIfExists(vecPath(uid));
+            Path dir = userDir(uid);
+            if (Files.isDirectory(dir)) {
+                try (var paths = Files.list(dir)) {
+                    if (!paths.findAny().isPresent()) Files.deleteIfExists(dir);
+                }
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("vector index erasure failed", e);
+        }
+    }
+
     private Path userDir(Long userId) {
         String name = DEFAULT_USER.equals(userId) ? "_default" : String.valueOf(userId);
         return memoryDir.resolve("users").resolve(name);

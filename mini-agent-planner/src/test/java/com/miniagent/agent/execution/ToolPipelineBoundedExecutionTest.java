@@ -26,6 +26,10 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.*;
 
 class ToolPipelineBoundedExecutionTest {
+    private static final Map<String, Object> WRITE_SCHEMA = Map.of(
+            "path", Map.of("type", "string"));
+    private static final Map<String, Object> COMMAND_SCHEMA = Map.of(
+            "command", Map.of("type", "string"));
     private static final String SESSION = "bounded-pipeline";
     private static final String ARGUMENTS = "{\"path\":\"same-file\"}";
 
@@ -33,7 +37,7 @@ class ToolPipelineBoundedExecutionTest {
     void ignoredInterruptReturnsUnknownAndLateSuccessCannotReplaceJournalTerminal() throws Exception {
         Fixture fixture = new Fixture(60_000);
         BlockingWrite write = new BlockingWrite();
-        fixture.registry.register("write_file", "write", Map.of(), ignored -> write.execute());
+        fixture.registry.register("write_file", "write", WRITE_SCHEMA, ignored -> write.execute());
         ToolRequest request = ToolRequest.of(SESSION, "write_file", ARGUMENTS, 0, "one")
                 .withExecutionBudget(1);
         FutureTask<ToolInvocation> running = start(() -> fixture.pipeline.invoke(request));
@@ -62,7 +66,7 @@ class ToolPipelineBoundedExecutionTest {
         Fixture fixture = new Fixture(60_000);
         BlockingWrite write = new BlockingWrite();
         CountDownLatch secondStarted = new CountDownLatch(1);
-        fixture.registry.register("write_file", "write", Map.of(), ignored -> {
+        fixture.registry.register("write_file", "write", WRITE_SCHEMA, ignored -> {
             if (write.calls.get() == 0) return write.execute();
             secondStarted.countDown();
             return "{\"success\":true}";
@@ -88,7 +92,7 @@ class ToolPipelineBoundedExecutionTest {
         Fixture fixture = new Fixture(60_000);
         fixture.control.start(SESSION);
         BlockingWrite write = new BlockingWrite();
-        fixture.registry.register("write_file", "write", Map.of(), ignored -> write.execute());
+        fixture.registry.register("write_file", "write", WRITE_SCHEMA, ignored -> write.execute());
         FutureTask<ToolInvocation> running = start(() -> fixture.pipeline.invoke(
                 ToolRequest.of(SESSION, "write_file", ARGUMENTS, 0, "one").withExecutionBudget(20)));
         try {
@@ -110,7 +114,7 @@ class ToolPipelineBoundedExecutionTest {
         Fixture fixture = new Fixture(1_000);
         fixture.control.start(SESSION);
         BlockingWrite write = new BlockingWrite();
-        fixture.registry.register("write_file", "write", Map.of(), ignored -> write.execute());
+        fixture.registry.register("write_file", "write", WRITE_SCHEMA, ignored -> write.execute());
         FutureTask<ToolInvocation> running = start(() -> fixture.pipeline.invoke(
                 ToolRequest.of(SESSION, "write_file", ARGUMENTS, 0, "one").withExecutionBudget(20)));
         try {
@@ -131,7 +135,7 @@ class ToolPipelineBoundedExecutionTest {
         Fixture fixture = new Fixture(1_000, "ask");
         fixture.control.start(SESSION);
         AtomicInteger calls = new AtomicInteger();
-        fixture.registry.register("exec_command", "exec", Map.of(), ignored -> {
+        fixture.registry.register("exec_command", "exec", COMMAND_SCHEMA, ignored -> {
             calls.incrementAndGet();
             return "{\"success\":true}";
         });
@@ -155,7 +159,7 @@ class ToolPipelineBoundedExecutionTest {
         Fixture fixture = new Fixture(60_000, "ask");
         fixture.control.start(SESSION);
         AtomicInteger calls = new AtomicInteger();
-        fixture.registry.register("exec_command", "exec", Map.of(), ignored -> {
+        fixture.registry.register("exec_command", "exec", COMMAND_SCHEMA, ignored -> {
             calls.incrementAndGet();
             return "{\"success\":true}";
         });
@@ -224,7 +228,7 @@ class ToolPipelineBoundedExecutionTest {
             }
         };
         Fixture fixture = new Fixture(60_000, "allow", List.of(optimisticHook));
-        fixture.registry.registerStructured("write_file", "write", Map.of(), ignored ->
+        fixture.registry.registerStructured("write_file", "write", WRITE_SCHEMA, ignored ->
                 ToolResult.unknown("remote write is unresolved", null));
 
         ToolInvocation result = fixture.pipeline.invoke(

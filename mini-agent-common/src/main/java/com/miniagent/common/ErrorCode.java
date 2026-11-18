@@ -45,6 +45,7 @@ public enum ErrorCode {
     MEMBER_SUBSCRIPTION_NOT_FOUND("MEMBER.02.03", "没有生效中的订阅"),
     MEMBER_INTERNAL_KEY_MISSING("MEMBER.02.02", "会员接口未启用"),
     MEMBER_PAYMENT_DECLINED("MEMBER.03.01", "支付渠道拒绝了该请求"),
+    MEMBER_PAYMENT_CALLBACK_DISABLED("MEMBER.03.02", "支付回调未启用：尚未配置渠道验签"),
 
     // ==================== CHAT 对话/会话 ====================
     CHAT_MESSAGE_EMPTY("CHAT.01.01", "请输入有效内容"),
@@ -68,6 +69,7 @@ public enum ErrorCode {
     AGENT_STREAM_ERROR("AGENT.06.01", "流式推送失败"),
     AGENT_PLANNER_LOCK_LOST("AGENT.07.01", "规划会话锁丢失，已中止以免双实例冲突"),
     AGENT_PLANNER_GRAPH_INVALID("AGENT.07.02", "任务图未通过验收，无法调度"),
+    AGENT_TENANT_QUOTA_EXCEEDED("AGENT.07.03", "租户每日模型用量已达上限"),
 
     // ==================== MEMORY 记忆管理 ====================
     MEMORY_EMPTY_CONTENT("MEMORY.01.01", "内容不能为空"),

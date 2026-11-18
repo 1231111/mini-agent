@@ -17,8 +17,8 @@ public class AskUserQuestionParams extends ToolParams {
     @ToolParamSchema(description = "要问用户的问题", required = true)
     private String question;
 
-    @ToolParamSchema(description = "选项列表（JSON数组字符串）")
-    private String options;
+    @ToolParamSchema(description = "选项列表")
+    private List<String> options;
 
     @ToolParamSchema(description = "是否允许多选", defaultValue = "false")
     private Boolean multiSelect;

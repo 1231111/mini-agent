@@ -55,6 +55,8 @@ if [ -f .env ]; then
   set +a
 fi
 
+SPRING_PROFILE="${SPRING_PROFILES_ACTIVE:-prod}"
+
 missing=0
 require() {
   local name="$1" hint="$2"
@@ -64,7 +66,9 @@ require() {
     missing=1
   fi
 }
-require MYSQL_ROOT_PASSWORD "在 .env 里设置，与宿主机 MySQL 的 root 口令一致"
+require DB_URL              "在 .env 里设置生产数据库 URL"
+require DB_USERNAME         "在 .env 里设置专用数据库用户（不能使用 root）"
+require DB_PASSWORD         "在 .env 里设置专用数据库用户的口令"
 require REDIS_PASSWORD       "在 .env 里设置，与宿主机 Redis 的 requirepass 一致"
 require MODEL_CONFIG_ENCRYPTION_KEY "32 字节 Base64（openssl rand -base64 32），用于加密用户填的模型配置"
 # 对话密钥由 Spring 从 LLM_API_KEY、MIMO_API_KEY 或
@@ -79,7 +83,7 @@ fi
 # spring.config.import 把它作为属性加载；这里只在两边都没有时提示。
 if [ -z "${JWT_SECRET:-}" ] && ! grep -q '^JWT_SECRET:' "$HOME/.miniagent/config.yml" 2>/dev/null; then
   echo "警告: 没有 JWT_SECRET（环境变量与 ~/.miniagent/config.yml 都没有）。" >&2
-  echo "      没配则沿用 application.yml 里的默认值；要换就 openssl rand -base64 48" >&2
+  echo "      prod profile requires an explicit JWT_SECRET; generate it with openssl rand -base64 48" >&2
 fi
 
 # ── 2. 组装运行期变量 ────────────────────────────────────────────
@@ -105,10 +109,6 @@ if [ ! -f "$MODELS_DIR/yuan-embedding-2.0-zh.int8.onnx" ] || [ ! -f "$MODELS_DIR
 fi
 
 
-export DB_URL="${DB_URL:-jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}"
-export DB_USERNAME="${DB_USERNAME:-root}"
-export DB_PASSWORD="${DB_PASSWORD:-$MYSQL_ROOT_PASSWORD}"
-
 # Redis 地址在 application.yml 里已是 127.0.0.1；这两个变量只用于换机器时覆盖。
 export SPRING_DATA_REDIS_HOST="${SPRING_DATA_REDIS_HOST:-127.0.0.1}"
 export SPRING_DATA_REDIS_PORT="${SPRING_DATA_REDIS_PORT:-6379}"
@@ -127,6 +127,13 @@ export AGENT_MEMORY_VECTOR_BACKEND="${AGENT_MEMORY_VECTOR_BACKEND:-local}"
 export AGENT_CODEBASE_EMBEDDING_PROVIDER="${AGENT_CODEBASE_EMBEDDING_PROVIDER:-local-onnx}"
 export MINI_AGENT_MODELS_DIR="$MODELS_DIR"
 export MINI_AGENT_HOME="${MINI_AGENT_HOME:-$HOME/.miniagent}"
+
+# Keep the host and container runtime bounded even when the service manager did
+# not inject JVM options.  Operators may override the complete option list with
+# MINI_AGENT_JAVA_OPTS after sizing the host; production service units also set
+# hard cgroup/systemd limits.
+MINI_AGENT_JAVA_OPTS="${MINI_AGENT_JAVA_OPTS:--XX:MaxRAMPercentage=75 -XX:InitialRAMPercentage=25 -XX:+UseContainerSupport -XX:+ExitOnOutOfMemoryError}"
+read -r -a JVM_OPTS <<< "$MINI_AGENT_JAVA_OPTS"
 
 # ── 3. 检查 jar 与中间件 ─────────────────────────────────────────
 if [ ! -f "$JAR" ]; then
@@ -162,10 +169,10 @@ echo "  模型目录: $MODELS_DIR"
 
 if [ "$DAEMON" -eq 1 ]; then
   mkdir -p "$MINI_AGENT_HOME/logs"
-  nohup java -jar "$JAR" --server.port="$PORT" \
+  nohup java "${JVM_OPTS[@]}" -jar "$JAR" --spring.profiles.active="$SPRING_PROFILE" --server.port="$PORT" \
     >> "$MINI_AGENT_HOME/logs/app.log" 2>&1 &
   echo "已后台启动，pid=$!，日志: $MINI_AGENT_HOME/logs/app.log"
   echo "健康检查: curl -f http://127.0.0.1:$PORT/actuator/health"
 else
-  exec java -jar "$JAR" --server.port="$PORT"
+  exec java "${JVM_OPTS[@]}" -jar "$JAR" --spring.profiles.active="$SPRING_PROFILE" --server.port="$PORT"
 fi

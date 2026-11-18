@@ -6,7 +6,9 @@ import com.miniagent.common.ApiResponse;
 import com.miniagent.common.ErrorCode;
 import com.miniagent.common.exception.BusinessException;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -38,9 +40,6 @@ public class MembershipController {
     private MembershipService membership;
 
     public record CreateOrderRequest(Long userId, String planCode) {
-    }
-
-    public record PayCallbackRequest(String orderNo, String channel, String channelTxnId) {
     }
 
     public record UsageRequest(Long userId, Long inputTokens, Long outputTokens, Integer llmCalls) {
@@ -91,18 +90,17 @@ public class MembershipController {
     }
 
     /**
-     * 支付回调。<b>必须幂等</b> —— 渠道会重复投递，见
-     * {@link MembershipService#markPaid}。重复投递返回成功，不重复开会员。
+     * Fail closed until a channel-specific adapter verifies the signature and the
+     * provider's settled order, amount and currency. The shared internal key only
+     * authenticates another service; it does not prove that a payment occurred.
      */
     @PostMapping(value = "/pay-callback", consumes = MediaType.APPLICATION_JSON_VALUE,
             produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public ApiResponse<OrderView> payCallback(@RequestBody(required = false) PayCallbackRequest req) {
-        if (req == null || req.orderNo() == null) {
-            throw new BusinessException(ErrorCode.MEMBER_ORDER_NOT_FOUND, "缺少 orderNo");
-        }
-        return ApiResponse.ok(OrderView.of(
-                membership.markPaid(req.orderNo(), req.channel(), req.channelTxnId())));
+    public ResponseEntity<ApiResponse<OrderView>> payCallback() {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .body(ApiResponse.fail(ErrorCode.MEMBER_PAYMENT_CALLBACK_DISABLED,
+                        "支付回调已禁用：部署前必须接入并配置渠道签名、金额和币种校验"));
     }
 
     /** 客户机上报一次 LLM 调用。一次调用一行。 */

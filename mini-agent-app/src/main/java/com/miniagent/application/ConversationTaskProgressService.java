@@ -77,7 +77,9 @@ public class ConversationTaskProgressService {
         if (legacy.isEmpty()) return result;
         if (graphs.isEmpty()) return result;
         Map<String, List<AgentTraceStep>> executions = new HashMap<>();
-        for (AgentTraceStep trace : traces.findBySessionIdOrderByTurnIndexAscIdAsc(sessionId)) {
+        // Legacy repair is best-effort and must not turn a message read into an
+        // unbounded trace scan. New task cards already carry their projection.
+        for (AgentTraceStep trace : traces.findTop500BySessionIdOrderByIdDesc(sessionId)) {
             if (!graphs.containsKey(trace.getExecutionId()) || trace.getCreatedAt() == null) continue;
             if (trace.getParentExecutionId() != null
                     && !trace.getParentExecutionId().equals(trace.getExecutionId())) continue;

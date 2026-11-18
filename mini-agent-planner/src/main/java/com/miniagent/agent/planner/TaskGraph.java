@@ -3,11 +3,13 @@ package com.miniagent.agent.planner;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Queue;
 import java.util.Set;
 
 /**
@@ -133,34 +135,79 @@ public record TaskGraph(List<TaskNode> nodes) {
 
     @JsonIgnore
     public boolean hasCycle() {
-        Map<String, List<String>> adj = new HashMap<>();
-        for (TaskNode n : nodes) {
-            adj.put(n.id(), n.dependsOn());
+        Topology topology = topology();
+        return topology.processedCount() != nodes.size();
+    }
+
+    /** Returns true when the longest dependency chain has more than maxDepth nodes. */
+    @JsonIgnore
+    public boolean exceedsDependencyDepth(int maxDepth) {
+        if (nodes.isEmpty()) return false;
+        if (maxDepth < 1) return true;
+
+        Topology topology = topology();
+        if (topology.processedCount() != nodes.size()) return false; // Cycle is reported separately.
+
+        int[] depth = new int[nodes.size()];
+        for (int i = 0; i < nodes.size(); i++) {
+            if (topology.initialIndegree()[i] == 0) depth[i] = 1;
         }
-        Set<String> visiting = new HashSet<>();
-        Set<String> visited = new HashSet<>();
-        for (TaskNode n : nodes)
-            if (cycleDfs(n.id(), adj, visiting, visited)) {
-                return true;
+        for (int index : topology.order()) {
+            if (depth[index] > maxDepth) return true;
+            for (int dependent : topology.dependents().get(index)) {
+                depth[dependent] = Math.max(depth[dependent], depth[index] + 1);
             }
+        }
         return false;
     }
 
-    private static boolean cycleDfs(String id, Map<String, List<String>> adj,
-                                   Set<String> visiting, Set<String> visited) {
-        if (visited.contains(id)) {
-            return false;
+    @JsonIgnore
+    public boolean exceedsDependencyCount(int maxEdges) {
+        int edgeCount = 0;
+        for (TaskNode node : nodes) {
+            edgeCount += node.dependsOn().size();
+            if (edgeCount > maxEdges) return true;
         }
-        if (visiting.contains(id)) {
-            return true;
-        }
-        visiting.add(id);
-        for (String d : adj.getOrDefault(id, List.of()))
-            if (cycleDfs(d, adj, visiting, visited)) {
-                return true;
-            }
-        visiting.remove(id);
-        visited.add(id);
         return false;
     }
+
+    private Topology topology() {
+        Map<String, Integer> indexById = new HashMap<>();
+        for (int i = 0; i < nodes.size(); i++) {
+            String id = nodes.get(i).id();
+            if (id != null) indexById.putIfAbsent(id, i);
+        }
+
+        int[] indegree = new int[nodes.size()];
+        List<List<Integer>> dependents = new ArrayList<>(nodes.size());
+        for (int i = 0; i < nodes.size(); i++) dependents.add(new ArrayList<>());
+        for (int i = 0; i < nodes.size(); i++) {
+            Set<String> uniqueDependencies = new HashSet<>();
+            for (String dependency : nodes.get(i).dependsOn()) {
+                Integer dependencyIndex = indexById.get(dependency);
+                if (dependencyIndex != null && uniqueDependencies.add(dependency)) {
+                    indegree[i]++;
+                    dependents.get(dependencyIndex).add(i);
+                }
+            }
+        }
+
+        int[] initialIndegree = indegree.clone();
+        Queue<Integer> ready = new ArrayDeque<>();
+        for (int i = 0; i < indegree.length; i++) {
+            if (indegree[i] == 0) ready.add(i);
+        }
+        List<Integer> order = new ArrayList<>(nodes.size());
+        while (!ready.isEmpty()) {
+            int current = ready.remove();
+            order.add(current);
+            for (int dependent : dependents.get(current)) {
+                if (--indegree[dependent] == 0) ready.add(dependent);
+            }
+        }
+        return new Topology(initialIndegree, dependents, order, order.size());
+    }
+
+    private record Topology(int[] initialIndegree, List<List<Integer>> dependents,
+                            List<Integer> order, int processedCount) {}
 }

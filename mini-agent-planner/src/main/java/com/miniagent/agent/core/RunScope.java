@@ -45,7 +45,8 @@ public record RunScope(
         String projectId,
         String executionRunToken,
         SearchDateContext.Window searchDateWindow,
-        String operationRootSession
+        String operationRootSession,
+        com.miniagent.agent.trace.TraceRecorder.TraceContext traceContext
 ) {
     @FunctionalInterface
     public interface Binding extends AutoCloseable {
@@ -84,7 +85,8 @@ public record RunScope(
                 AgentLoop.getCurrentStreamingModel(),
                 EffectiveModelContext.currentContextWindow(),
                 OwnerContext.currentProjectId(), TaskExecutionContext.currentRunToken(), SearchDateContext.current(),
-                WorkspaceContext.getOperationRootSession());
+                WorkspaceContext.getOperationRootSession(),
+                com.miniagent.agent.trace.TraceRecorder.captureThreadContext());
     }
 
     public RunScope withSession(String sid) {
@@ -92,7 +94,7 @@ public record RunScope(
                 sid, owner, turnPolicy, permissionMode, confirmPolicy, planApproved, permissionForced,
                 subagent, parentSessionId, role, taskName, writeTask, workspaceRoot,
                 execution, taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken, searchDateWindow,
-                subagent ? operationRootSession : sid);
+                subagent ? operationRootSession : sid, traceContext);
     }
 
     /**
@@ -119,7 +121,7 @@ public record RunScope(
                 roleId == null ? "" : roleId, taskName, "out", subWorkspace,
                 execution == null ? null : execution.forSubagent(subSessionId),
                 taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken, searchDateWindow,
-                root);
+                root, traceContext);
     }
 
     /**
@@ -139,6 +141,7 @@ public record RunScope(
     }
 
     void applyLocals() {
+        com.miniagent.agent.trace.TraceRecorder.restoreThreadContext(traceContext);
         OwnerContext.setCurrentProjectId(projectId);
         if (sessionId != null && !sessionId.isBlank()) {
             AgentLoop.setCurrentSession(sessionId);

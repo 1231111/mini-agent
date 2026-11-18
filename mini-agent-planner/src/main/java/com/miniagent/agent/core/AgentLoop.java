@@ -1,5 +1,9 @@
 package com.miniagent.agent.core;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.miniagent.common.ChatMessageTexts;
 import com.miniagent.common.ErrorCode;
 import com.miniagent.common.MessageConstants;
@@ -95,6 +99,8 @@ import org.apache.commons.lang3.StringUtils;
 @Slf4j
 @Component
 public class AgentLoop {
+
+    private static final ObjectMapper ARGUMENT_MAPPER = new ObjectMapper();
 
     @Autowired
     private ToolRegistry toolRegistry;
@@ -554,6 +560,10 @@ public class AgentLoop {
         boolean imageGenerateUnavailable = false;
         boolean fileReminderSent = false; // 是否已注入过一次性文件落盘提醒
         final Map<String, String> toolResultCache = new HashMap<>();
+        final Map<String, Integer> toolResultOffsets = new HashMap<>();
+        /** Tools explicitly activated through capability_discover in this run. */
+        final Set<String> discoveredTools = new LinkedHashSet<>();
+        String partialStreamAnswer = "";
         final Map<String, Integer> failDupCounter = new HashMap<>();
         /** 硬闸门拒绝次数，按工具名计：闸门拒的是工具本身，换参数重试永远过不去 */
         final Map<String, Integer> gateDenyCounter = new java.util.concurrent.ConcurrentHashMap<>();
@@ -576,6 +586,8 @@ public class AgentLoop {
         boolean injectAppendHintAfterTools = false; // tool_call 被长度截断：工具执行后需注入续写引导
         boolean lengthTruncatedToolCalls = false; // 当前轮 tool_call 参数可能被截断
         int incompleteTodoReminders = 0;        // 未完成 todo 却试图收尾的次数
+        int planUnapprovedNudges = 0;            // 未批准计划的收尾拦截次数
+        final Set<String> nonExecutedFailureKeys = new java.util.HashSet<>();
         boolean goalAnchorInjected = false;     // 是否已注入任务目标锚定
         volatile String permissionAskTool = null;
         volatile String userQuestionText = null;
@@ -616,12 +628,22 @@ public class AgentLoop {
             lastErrorCode = lastToolResult == null ? ToolErrorCode.NONE : lastToolResult.errorCode();
         }
 
-        void noteToolFinished(String name, String args, ToolResult result) {
-            String key = name + "|" + (args == null ? "" : args);
-            if (!result.isSuccess() && result.status() != ToolStatus.AWAITING_USER)
+        void noteToolFinished(String name, String args, ToolResult result,
+                              Set<String> registeredTools) {
+            if ("capability_discover".equals(name) && result != null && result.isSuccess()) {
+                recordDiscoveredTools(result.rawText(), registeredTools);
+            }
+            String key = failureKey(name, args);
+            boolean rejectedBeforeExecution = nonExecutedFailureKeys.remove(key);
+            if (!rejectedBeforeExecution && !result.isSuccess()
+                    && result.status() != ToolStatus.AWAITING_USER)
                 failDupCounter.merge(key, 1, Integer::sum);
-            else
+            else if (result.isSuccess())
                 failDupCounter.remove(key);
+        }
+
+        void noteNonExecuted(String name, String args) {
+            nonExecutedFailureKeys.add(failureKey(name, args));
         }
 
         void noteGateDenied(String name) {
@@ -644,7 +666,7 @@ public class AgentLoop {
                 if (gateBlocked(name)) {
                     continue;
                 }
-                String key = name + "|" + argumentsOf(tc);
+                String key = failureKey(name, argumentsOf(tc));
                 if (failDupCounter.getOrDefault(key, 0) < FAIL_REPEAT_ABORT)
                     return false;
             }
@@ -658,6 +680,61 @@ public class AgentLoop {
                     .map(Map.Entry::getKey)
                     .toList();
         }
+
+        private static String failureKey(String name, String args) {
+            return name + "|" + canonicalArguments(args);
+        }
+
+        private void recordDiscoveredTools(String raw, Set<String> registeredTools) {
+            if (raw == null || raw.isBlank()) return;
+            try {
+                JsonNode root = ARGUMENT_MAPPER.readTree(raw);
+                JsonNode tools = root == null ? null : root.get("tools");
+                if (tools == null || !tools.isArray()) return;
+                tools.forEach(node -> {
+                    String name = node.asText("").trim();
+                    // Discovery is an activation hint, never a registration API.
+                    // Keep only tools currently present in the registry; the
+                    // per-turn PermissionPolicy and ToolPipeline gates still
+                    // apply after this allow-list is expanded.
+                    if (!name.isBlank() && registeredTools != null
+                            && registeredTools.contains(name)) {
+                        discoveredTools.add(name);
+                    }
+                });
+            } catch (Exception ignored) {
+                // A malformed discovery response is simply not an activation grant.
+            }
+        }
+    }
+
+    static String canonicalArguments(String arguments) {
+        String input = arguments == null ? "" : arguments;
+        try {
+            JsonNode parsed = ARGUMENT_MAPPER.readTree(input.isBlank() ? "{}" : input);
+            return ARGUMENT_MAPPER.writeValueAsString(canonicalize(parsed));
+        } catch (Exception ignored) {
+            return input.trim();
+        }
+    }
+
+    private static JsonNode canonicalize(JsonNode node) {
+        if (node == null || node.isValueNode() || node.isNull()) {
+            return node;
+        }
+        if (node.isArray()) {
+            ArrayNode out = ARGUMENT_MAPPER.createArrayNode();
+            node.forEach(value -> out.add(canonicalize(value)));
+            return out;
+        }
+        ObjectNode out = ARGUMENT_MAPPER.createObjectNode();
+        List<String> names = new ArrayList<>();
+        node.fieldNames().forEachRemaining(names::add);
+        names.sort(String::compareTo);
+        for (String name : names) {
+            out.set(name, canonicalize(node.get(name)));
+        }
+        return out;
     }
 
     private static LoopOutcome finish(String text, LoopState state, List<ChatMessage> messages) {
@@ -684,21 +761,80 @@ public class AgentLoop {
         int headEnd = 0;
         while (headEnd < messages.size() && messages.get(headEnd) instanceof SystemMessage) headEnd++;
         int tailStart = Math.max(headEnd, messages.size() - 10);
-        Map<String, Integer> calls = new HashMap<>();
+        Map<String, List<Integer>> calls = new HashMap<>();
+        Map<String, List<Integer>> results = new HashMap<>();
         for (int i = 0; i < messages.size(); i++) {
             if (messages.get(i) instanceof AiMessage ai && ai.hasToolExecutionRequests()) {
-                for (var call : ai.toolExecutionRequests()) calls.put(call.id(), i);
+                for (var call : ai.toolExecutionRequests()) {
+                    String id = call.id();
+                    if (StringUtils.isNotBlank(id)) {
+                        calls.computeIfAbsent(id, ignored -> new ArrayList<>()).add(i);
+                    }
+                }
+            } else if (messages.get(i) instanceof ToolExecutionResultMessage result
+                    && StringUtils.isNotBlank(result.id())) {
+                results.computeIfAbsent(result.id(), ignored -> new ArrayList<>()).add(i);
             }
         }
-        for (int i = messages.size() - 1; i >= tailStart; i--) {
-            if (messages.get(i) instanceof ToolExecutionResultMessage result) {
-                Integer callIndex = calls.get(result.id());
-                if (callIndex != null) tailStart = Math.min(tailStart, callIndex);
+
+        // A batch is safe to replay only when every call has one unique, non-blank ID
+        // and exactly one result after the assistant message. Older persisted history
+        // may predate ID validation, so discard ambiguous batches and their results.
+        Map<Integer, Map<String, List<Integer>>> resultsByBatch = new HashMap<>();
+        for (var entry : results.entrySet()) {
+            List<Integer> callIndexes = calls.get(entry.getKey());
+            if (callIndexes == null) continue;
+            for (int resultIndex : entry.getValue()) {
+                Integer nearestCall = null;
+                for (int callIndex : callIndexes) {
+                    if (callIndex < resultIndex && (nearestCall == null || callIndex > nearestCall)) {
+                        nearestCall = callIndex;
+                    }
+                }
+                if (nearestCall != null) {
+                    resultsByBatch.computeIfAbsent(nearestCall, ignored -> new HashMap<>())
+                            .computeIfAbsent(entry.getKey(), ignored -> new ArrayList<>())
+                            .add(resultIndex);
+                }
             }
+        }
+        Set<Integer> validBatches = new LinkedHashSet<>();
+        Map<Integer, Integer> resultCallIndexes = new HashMap<>();
+        for (int i = 0; i < messages.size(); i++) {
+            if (!(messages.get(i) instanceof AiMessage ai) || !ai.hasToolExecutionRequests()) continue;
+            List<String> ids = ai.toolExecutionRequests().stream().map(ToolExecutionRequest::id).toList();
+            Set<String> uniqueIds = new LinkedHashSet<>();
+            boolean valid = true;
+            for (String id : ids) {
+                List<Integer> resultIndexes = resultsByBatch.getOrDefault(i, Map.of()).get(id);
+                if (StringUtils.isBlank(id) || !uniqueIds.add(id)
+                        || resultIndexes == null || resultIndexes.size() != 1
+                        || resultIndexes.getFirst() <= i) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (valid) {
+                validBatches.add(i);
+                for (String id : ids) {
+                    int resultIndex = resultsByBatch.get(i).get(id).getFirst();
+                    resultCallIndexes.put(resultIndex, i);
+                }
+            }
+        }
+
+        Set<Integer> validResults = new LinkedHashSet<>(resultCallIndexes.keySet());
+        for (int i = messages.size() - 1; i >= tailStart; i--) {
+            Integer callIndex = resultCallIndexes.get(i);
+            if (callIndex != null) tailStart = Math.min(tailStart, callIndex);
         }
         List<ChatMessage> retained = new ArrayList<>();
         for (int i = 0; i < messages.size(); i++) {
             ChatMessage message = messages.get(i);
+            if (message instanceof AiMessage ai && ai.hasToolExecutionRequests() && !validBatches.contains(i)) {
+                continue;
+            }
+            if (message instanceof ToolExecutionResultMessage && !validResults.contains(i)) continue;
             boolean userInstruction = message instanceof UserMessage && !ToolObservationProjector.isObservation(message);
             if (i < headEnd || i >= tailStart || userInstruction) retained.add(message);
         }
@@ -714,6 +850,11 @@ public class AgentLoop {
                               TaskPlan taskPlan,
                               AgentStreamSink streamSink) {
         ToolSurface.Resolved base = resolveBaseSurface(taskPlan);
+        // A direct route (no planner TaskPlan and no forced policy allow-list)
+        // may negotiate additional capabilities.  A planner/DAG route must keep
+        // its frozen allow-list even if a model emits capability_discover.
+        boolean allowDynamicDiscovery = (taskPlan == null || taskPlan.allowedTools() == null)
+                && !LoopTurnContext.current().forceToolsOnly();
         int iterations = executionProperties.capIterations(maxIterations);
 
         LoopState state = new LoopState();
@@ -819,7 +960,8 @@ public class AgentLoop {
                         state.lastSubGoalDone, state.lastSubGoalTotal);
             }
 
-            var specsForTurn = specsAndBindTurnTools(base, state, messages);
+            var specsForTurn = specsAndBindTurnTools(base, state, messages,
+                    allowDynamicDiscovery);
             boolean needsToolVision = state.latestObservation != null
                     && ToolObservationProjector.hasImages(List.of(state.latestObservation));
             if (needsToolVision && state.visionModels == null) {
@@ -920,11 +1062,11 @@ public class AgentLoop {
                 var vision = state.visionModels;
                 try (var ignored = EffectiveModelContext.bind(vision.chat(), vision.streaming(), vision.contextWindowTokens())) {
                     response = callLlm(vision.chat(), vision.streaming(), messages, specsForTurn,
-                            !specsForTurn.isEmpty(), streamSink);
+                            !specsForTurn.isEmpty(), streamSink, state);
                 }
             } else {
                 response = callLlm(chatModel, Optional.ofNullable(getCurrentStreamingModel()).orElse(streamingChatModel),
-                        messages, specsForTurn, !specsForTurn.isEmpty(), streamSink);
+                        messages, specsForTurn, !specsForTurn.isEmpty(), streamSink, state);
             }
             log.info("LLM 调用结束，耗时 {}ms，response={}",
                     System.currentTimeMillis() - llmStartMs, Objects.isNull(response) ? "null" : "ok");
@@ -993,6 +1135,7 @@ public class AgentLoop {
                         traceRecorder.recordLlmRetry(sessionId, turn, "reconnect_hint", state.llmFailureCount);
                     }
                     if (Objects.nonNull(streamSink)) {
+                        streamSink.onAnswerReset();
                         streamSink.onThinking("\n（模型响应超时，正在重试...）\n");
                     }
                     messages.add(new SystemMessage(MessageConstants.AGENT_LLM_NETWORK_RECONNECT));
@@ -1003,6 +1146,7 @@ public class AgentLoop {
                         traceRecorder.recordLlmRetry(sessionId, turn, "trim_context", state.llmFailureCount);
                     }
                     if (Objects.nonNull(streamSink)) {
+                        streamSink.onAnswerReset();
                         streamSink.onThinking("\n（第二次重试失败，正在精简上下文后做最后尝试...）\n");
                     }
                     messages = recoveryHistory(messages);
@@ -1015,13 +1159,20 @@ public class AgentLoop {
                         traceRecorder.recordError(sessionId, turn, "LLM 连续失败 " + state.llmFailureCount + " 次");
                     }
                     state.loopEndReason = RunStatus.FAILURE.name();
-                    return finish(MessageConstants.AGENT_LLM_NETWORK_FAILED, state, messages);
+                    return finish(failureWithPartialAnswer(
+                            MessageConstants.AGENT_LLM_NETWORK_FAILED, state), state, messages);
                 }
             }
             // 成功后重置失败计数
             state.llmFailureCount = 0;
 
             LlmTurn llmTurn = LlmTurn.classify(response);
+            if (llmTurn.status() == LlmTurn.Status.ERROR) {
+                return finishUnusableTurn(
+                        ErrorCode.AGENT_LLM_NO_RESPONSE,
+                        MessageConstants.AGENT_LLM_NO_RESPONSE,
+                        llmTurn, state, messages, streamSink);
+            }
             if (llmTurn.status() == LlmTurn.Status.REFUSED
                     || llmTurn.status() == LlmTurn.Status.EMPTY) {
                 if (llmTurn.status() == LlmTurn.Status.REFUSED
@@ -1049,12 +1200,19 @@ public class AgentLoop {
                             MessageConstants.AGENT_LLM_REFUSED,
                             llmTurn, state, messages, streamSink);
                 }
+                if (llmTurn.status() == LlmTurn.Status.EMPTY) {
+                    return finishUnusableTurn(
+                            ErrorCode.AGENT_LLM_NO_RESPONSE,
+                            MessageConstants.AGENT_LLM_NO_RESPONSE,
+                            llmTurn, state, messages, streamSink);
+                }
             }
 
             AiMessage aiMessage = response.aiMessage();
             if (aiMessage == null) {
                 aiMessage = AiMessage.from("");
             }
+            aiMessage = normalizeToolCallIds(aiMessage);
             messages.add(aiMessage);
 
             // 1.5) 长度截断检测：上游因输出上限把本轮内容截断（finish_reason=length）。
@@ -1216,7 +1374,7 @@ public class AgentLoop {
         return finish(buildMaxIterationFallback(state, iterations), state, messages);
         } catch (ModelCallControl.StoppedException stopped) {
             state.loopEndReason = stopped.reason().name();
-            return finish(controlMessage(stopped.reason()), state, messages);
+            return finish(failureWithPartialAnswer(controlMessage(stopped.reason()), state), state, messages);
         } catch (java.util.concurrent.CancellationException cancelled) {
             state.loopEndReason = CANCELLED;
             return finish("任务已取消", state, messages);
@@ -1314,13 +1472,18 @@ public class AgentLoop {
      * 安全过滤后的规格，并写入与规格同一份工具名单到 messages。
      */
     private List<?> specsAndBindTurnTools(ToolSurface.Resolved base, LoopState state,
-                                          List<ChatMessage> messages) {
+                                          List<ChatMessage> messages,
+                                          boolean allowDynamicDiscovery) {
         LinkedHashSet<String> names = new LinkedHashSet<>();
         if (base.unrestricted()) {
             names.addAll(toolRegistry.getToolNames());
         } else {
             names.addAll(base.names());
         }
+        // Direct-route dynamic discovery starts with a bootstrap surface.  Tools
+        // returned by capability_discover become available on the next turn, while
+        // the normal permission/spec filtering below remains authoritative.
+        names = mergeDiscoveredSurface(names, state.discoveredTools, allowDynamicDiscovery);
         // exec-enabled=false 时仍留在工具表，执行时 needsSessionGrant 弹批准（同 http_post）。
         if (state.imageGenerateUnavailable) {
             names.remove("image_generate");
@@ -1364,6 +1527,23 @@ public class AgentLoop {
         state.allowedToolsForTurn = allowed;
         bindTurnTools(messages, allowed);
         return specs;
+    }
+
+    /**
+     * Capability discovery may widen only the direct-route surface.  Planner
+     * and sub-agent surfaces are frozen by their proposal/role allow-list.
+     */
+    static LinkedHashSet<String> mergeDiscoveredSurface(Set<String> base,
+                                                        Set<String> discovered,
+                                                        boolean allow) {
+        LinkedHashSet<String> merged = new LinkedHashSet<>();
+        if (base != null) {
+            merged.addAll(base);
+        }
+        if (allow && discovered != null) {
+            merged.addAll(discovered);
+        }
+        return merged;
     }
 
     private static Set<String> specNames(List<?> specs) {
@@ -1503,7 +1683,7 @@ public class AgentLoop {
         return request;
     }
 
-    private static String applyInvocation(ToolInvocation invocation, LoopState state) {
+    private static String applyInvocation(ToolInvocation invocation, LoopState state, String arguments) {
         if (invocation == null) {
             return "";
         }
@@ -1511,16 +1691,25 @@ public class AgentLoop {
         state.noteStructuredResult(invocation.toolName(), invocation.result());
         switch (invocation.outcome()) {
             case GATE_DENIED -> state.noteGateDenied(invocation.toolName());
+            case POLICY_DENIED, PERMISSION_DENIED, FENCE_REJECTED -> {
+                if (!countsTowardRepeatedExecutionFailure(invocation.outcome())) {
+                    state.noteNonExecuted(invocation.toolName(), arguments);
+                }
+            }
             case PERMISSION_ASK -> state.permissionAskTool = invocation.toolName();
             case USER_QUESTION -> state.userQuestionText = invocation.loopSignal();
             case CONTROL_STOP -> {
                 ExecutionControl.StopReason stop = invocation.controlStopReason();
                 if (stop != ExecutionControl.StopReason.NONE) state.controlStopReason = stop;
             }
-            case EXECUTED, POLICY_DENIED, PERMISSION_DENIED, FENCE_REJECTED -> {
+            case EXECUTED -> {
             }
         }
         return invocation.text();
+    }
+
+    static boolean countsTowardRepeatedExecutionFailure(ToolInvocation.Outcome outcome) {
+        return outcome == ToolInvocation.Outcome.EXECUTED;
     }
 
     private static String controlEndReason(ExecutionControl.StopReason reason) {
@@ -1547,6 +1736,14 @@ public class AgentLoop {
     /** 调用 LLM 并记录 token 用量。streamSink 非空时走流式桥接，实时推送思考/答案增量。 */
     private ChatResponse callLlm(ChatModel chatModel, StreamingChatModel selectedStreamingModel, List<ChatMessage> messages,
                                   List<?> specsForTurn, boolean hasTools, AgentStreamSink streamSink) {
+        return callLlm(chatModel, selectedStreamingModel, messages, specsForTurn, hasTools, streamSink, null);
+    }
+
+    private ChatResponse callLlm(ChatModel chatModel, StreamingChatModel selectedStreamingModel, List<ChatMessage> messages,
+                                  List<?> specsForTurn, boolean hasTools, AgentStreamSink streamSink,
+                                  LoopState state) {
+        CapturingStreamSink capturingSink = streamSink == null ? null : new CapturingStreamSink(streamSink);
+        AgentStreamSink outputSink = capturingSink == null ? null : capturingSink;
         ChatRequest.Builder reqBuilder = ChatRequest.builder().messages(messages);
         if (hasTools && !specsForTurn.isEmpty()) {
             @SuppressWarnings("unchecked")
@@ -1558,24 +1755,24 @@ public class AgentLoop {
         int maxRetries = Math.max(0, llmMaxRetries);
         boolean attempted = false;
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
-            boolean resetBeforeCall = attempted && streamSink != null;
+            boolean resetBeforeCall = attempted && outputSink != null;
             attempted = true;
             java.util.concurrent.atomic.AtomicBoolean acceptingCallbacks = new java.util.concurrent.atomic.AtomicBoolean(true);
             try {
                 ChatResponse response = new ModelCallControl(executionControl).call(() ->
-                        Objects.isNull(streamSink) || selectedStreamingModel == null
+                        Objects.isNull(outputSink) || selectedStreamingModel == null
                         ? chatModel.chat(request)
-                        : callLlmStreaming(selectedStreamingModel, request, streamSink, resetBeforeCall, acceptingCallbacks));
+                        : callLlmStreaming(selectedStreamingModel, request, outputSink, resetBeforeCall, acceptingCallbacks));
                 acceptingCallbacks.set(false);
                 // Some configured vision endpoints expose only a synchronous client.
                 // Never send images to a different, global text streaming client.
-                if (streamSink != null && selectedStreamingModel == null && response != null
+                if (outputSink != null && selectedStreamingModel == null && response != null
                         && response.aiMessage() != null && StringUtils.isNotBlank(response.aiMessage().text())) {
                     try {
                         ChatResponse completed = response;
                         new ModelCallControl(executionControl).call(() -> {
-                            if (resetBeforeCall) streamSink.onAnswerReset();
-                            streamSink.onAnswerToken(completed.aiMessage().text());
+                            if (resetBeforeCall) outputSink.onAnswerReset();
+                            outputSink.onAnswerToken(completed.aiMessage().text());
                             return null;
                         });
                     } catch (Exception ignored) {
@@ -1584,6 +1781,7 @@ public class AgentLoop {
                     }
                 }
                 if (Objects.nonNull(response)) {
+                    if (state != null) state.partialStreamAnswer = "";
                     String sid = currentSessionId.get();
                     int inputTokens = 0;
                     int outputTokens = 0;
@@ -1614,6 +1812,9 @@ public class AgentLoop {
                 return response;
             } catch (Exception e) {
                 acceptingCallbacks.set(false);
+                if (state != null && capturingSink != null && !capturingSink.text().isBlank()) {
+                    state.partialStreamAnswer = capturingSink.text();
+                }
                 ModelCallControl.rethrowIfStopped(e);
                 if (isRetriable(e) && attempt < maxRetries) {
                     long backoff = retryBackoffMillis(attempt);
@@ -1628,6 +1829,9 @@ public class AgentLoop {
                 } else {
                     log.error("LLM 调用失败（不可重试）: {}", describe(e));
                 }
+                if (state != null && capturingSink != null && !capturingSink.text().isBlank()) {
+                    state.partialStreamAnswer = capturingSink.text();
+                }
                 return null;
             } finally {
                 acceptingCallbacks.set(false);
@@ -1636,6 +1840,47 @@ public class AgentLoop {
         return null; // 所有重试耗尽
     }
 
+    private static final class CapturingStreamSink implements AgentStreamSink {
+        private static final int MAX_CHARS = 16_000;
+        private final AgentStreamSink delegate;
+        private final StringBuilder sealed = new StringBuilder();
+        private final StringBuilder current = new StringBuilder();
+
+        private CapturingStreamSink(AgentStreamSink delegate) { this.delegate = delegate; }
+        @Override public void onThinking(String delta) { delegate.onThinking(delta); }
+        @Override public void onAnswerToken(String delta) {
+            synchronized (this) {
+                appendBounded(current, delta, Math.max(0, MAX_CHARS - sealed.length() - current.length()));
+            }
+            delegate.onAnswerToken(delta);
+        }
+        @Override public void onAnswerReset() {
+            synchronized (this) {
+                if (!current.isEmpty()) {
+                    appendBounded(sealed, "\n\n[interrupted stream attempt]\n", MAX_CHARS - sealed.length());
+                    appendBounded(sealed, current.toString(), MAX_CHARS - sealed.length());
+                    current.setLength(0);
+                }
+            }
+            delegate.onAnswerReset();
+        }
+        @Override public void onSubGoal(String text, int done, int total) {
+            delegate.onSubGoal(text, done, total);
+        }
+        @Override public void onContext(int usedTokens, int limitTokens) {
+            delegate.onContext(usedTokens, limitTokens);
+        }
+        synchronized String text() { return sealed.toString() + current; }
+        private static void appendBounded(StringBuilder target, String value, int remaining) {
+            if (value != null && remaining > 0) target.append(value, 0, Math.min(value.length(), remaining));
+        }
+    }
+
+    private static String failureWithPartialAnswer(String fallback, LoopState state) {
+        if (state == null || StringUtils.isBlank(state.partialStreamAnswer)) return fallback;
+        return fallback + "\n\nThe model stream stopped before completion. Partial answer received:\n"
+                + state.partialStreamAnswer;
+    }
     /**
      * 判断异常是否值得重试 —— 按**类型**判断，不靠错误文案里的关键词。
      *
@@ -2125,7 +2370,7 @@ public class AgentLoop {
                 try {
                     ToolInvocation invocation = awaitToolInvocation(future, request);
                     structuredResult = invocation.result();
-                    result = applyInvocation(invocation, state);
+                    result = applyInvocation(invocation, state, args);
                 } catch (java.util.concurrent.TimeoutException timeout) {
                     // The watchdog already interrupted the handler. A second
                     // interrupt here could hit terminal journal persistence.
@@ -2158,7 +2403,7 @@ public class AgentLoop {
             // {"status":"awaiting_user"}，isFailedResult 会短路，两者天然不产生反思提示。
             // 原先只给 ask_user_question 开特判、漏了授权路径，正是那个漏口把「等人」读成了「失败」。
             String parallelReflection = buildReflectionHint(name, argumentsOf(tc), result, structuredResult);
-            String resultForContext = clampForContext(result, name);
+            String resultForContext = clampForContext(result, name, cacheKey, state);
             resultForContext = applyBrowserNudge(name, result, resultForContext, messages);
             if (Objects.nonNull(parallelReflection)) {
                 state.consecutiveFailures++;
@@ -2230,7 +2475,7 @@ public class AgentLoop {
             try {
                 ToolInvocation invocation = awaitToolInvocation(future, request);
                 structuredResult = invocation.result();
-                result = applyInvocation(invocation, state);
+                result = applyInvocation(invocation, state, args);
             } catch (java.util.concurrent.TimeoutException te) {
                 log.warn("  工具 {} handler 执行超时（{}s），已中断工作线程",
                         name, timeout);
@@ -2265,7 +2510,7 @@ public class AgentLoop {
         // 不特判 ask_user_question 与授权等待：「未执行」的结果带 status=awaiting_user，
         // isFailedResult 短路，不需要按工具名逐个开白名单（那种写法漏一个就是一个 bug）。
         String reflectionHint = buildReflectionHint(name, args, result, structuredResult);
-        String resultForContext = clampForContext(result, name);
+        String resultForContext = clampForContext(result, name, cacheKey, state);
         resultForContext = applyBrowserNudge(name, result, resultForContext, messages);
         if (Objects.nonNull(reflectionHint)) {
             state.consecutiveFailures++;
@@ -2430,7 +2675,8 @@ public class AgentLoop {
     private void recordToolOutcome(LoopState state, String name, String args, String result,
                                    ExecutionTurnContext.ActionBinding binding, ToolResult structuredResult) {
         ToolResult actual = structuredResult == null ? ToolResult.fromLegacy(result) : structuredResult;
-        state.noteToolFinished(name, args, actual);
+        state.noteToolFinished(name, args, actual,
+                toolRegistry == null ? Set.of() : toolRegistry.getToolNames());
         if (Objects.nonNull(traceRecorder))
             traceRecorder.recordToolResult(
                     currentSessionId.get(), state.currentTurn, name, actual, 0);
@@ -2545,16 +2791,14 @@ public class AgentLoop {
                 && (result.contains("\"success\":true") || result.startsWith("写入成功"))) {
             state.writeFileSucceeded = true;
             // 写入成功后失效文件相关的缓存，避免后续读到过期内容
-            state.toolResultCache.entrySet().removeIf(e ->
-                    e.getKey().startsWith("read_file:") || e.getKey().startsWith("exec_command:")
-                            || e.getKey().startsWith("list_files:") || e.getKey().startsWith("read_package:"));
+            invalidateReadCache(state, key -> key.startsWith("read_file:") || key.startsWith("exec_command:")
+                    || key.startsWith("list_files:") || key.startsWith("read_package:"));
         }
         if ("exec_command".equals(toolName) && Objects.nonNull(result)
                 && !result.contains("\"error\"")) {
             // exec_command 可能修改文件系统，失效 read_file 缓存
-            state.toolResultCache.entrySet().removeIf(e ->
-                    e.getKey().startsWith("read_file:") || e.getKey().startsWith("list_files:")
-                            || e.getKey().startsWith("read_package:"));
+            invalidateReadCache(state, key -> key.startsWith("read_file:") || key.startsWith("list_files:")
+                    || key.startsWith("read_package:"));
         }
         // 使用结构化 ToolResult 判断 image_generate 是否可用
         if ("image_generate".equals(toolName)) {
@@ -2572,6 +2816,12 @@ public class AgentLoop {
             state.mediaDelivered = true;
             state.lastMediaResult = result;
         }
+    }
+
+    private static void invalidateReadCache(LoopState state,
+                                            java.util.function.Predicate<String> invalidatedKey) {
+        state.toolResultCache.keySet().removeIf(invalidatedKey);
+        state.toolResultOffsets.keySet().removeIf(invalidatedKey);
     }
 
     // ==================== 完成判断 ====================
@@ -2596,6 +2846,9 @@ public class AgentLoop {
                 return null;
             }
             if (stop.action() == StopDecision.Action.PREVENT_CONTINUATION) {
+                if ("plan_not_approved".equals(stop.reason())) {
+                    state.loopEndReason = RunStatus.FAILURE.name();
+                }
                 return Optional.ofNullable(stop.message())
                         .orElse(Optional.ofNullable(finalText).orElse(""));
             }
@@ -2703,12 +2956,15 @@ public class AgentLoop {
                 hasPlan,
                 runnable,
                 state.incompleteTodoReminders,
+                state.planUnapprovedNudges,
                 render);
     }
 
     private static void noteStopNudge(LoopState state, String reason) {
         if (ErrorCode.TODO_STOP_INCOMPLETE.getCode().equals(reason)) {
             state.incompleteTodoReminders++;
+        } else if ("plan_not_approved".equals(reason)) {
+            state.planUnapprovedNudges++;
         }
     }
 
@@ -2766,6 +3022,35 @@ public class AgentLoop {
     private static String toolIdOf(Object tc) {
         try { return (String) tc.getClass().getMethod("id").invoke(tc); }
         catch (Exception e) { return ""; }
+    }
+
+    /**
+     * Tool results are correlated by ID in both the model protocol and history.
+     * Repair malformed provider IDs at the boundary so a blank or repeated ID
+     * cannot cause one result to satisfy multiple calls.
+     */
+    static AiMessage normalizeToolCallIds(AiMessage message) {
+        if (message == null || !message.hasToolExecutionRequests()) return message;
+        Set<String> seen = new LinkedHashSet<>();
+        List<ToolExecutionRequest> normalized = new ArrayList<>(message.toolExecutionRequests().size());
+        boolean changed = false;
+        for (ToolExecutionRequest request : message.toolExecutionRequests()) {
+            String id = request.id();
+            if (StringUtils.isBlank(id) || !seen.add(id)) {
+                changed = true;
+                do {
+                    id = "agent-tool-" + java.util.UUID.randomUUID();
+                } while (!seen.add(id));
+                normalized.add(ToolExecutionRequest.builder()
+                        .id(id)
+                        .name(request.name())
+                        .arguments(request.arguments())
+                        .build());
+            } else {
+                normalized.add(request);
+            }
+        }
+        return changed ? message.toBuilder().toolExecutionRequests(normalized).build() : message;
     }
 
 
@@ -2887,19 +3172,32 @@ public class AgentLoop {
     }
 
     /** 把工具结果压到可接受长度再塞进上下文（按工具类型取不同上限）。 */
-    private String clampForContext(String result, String toolName) {
+    private String clampForContext(String result, String toolName, String cacheKey, LoopState state) {
         if (StringUtils.isBlank(result)) {
-            return "{\"success\":true,\"message\":\"工具执行完成\"}";
+            return "{\"success\":true,\"message\":\"tool completed\"}";
         }
         int limit = TOOL_RESULT_LIMITS.getOrDefault(toolName, DEFAULT_TOOL_RESULT_MAX);
         if (result.length() <= limit) {
+            state.toolResultOffsets.remove(cacheKey);
             return result;
         }
-        return result.substring(0, limit)
-                + "\n... （结果过长已截断，共 " + result.length() + " 字符）";
+        boolean resumable = state.toolResultCache.containsKey(cacheKey);
+        int offset = resumable ? state.toolResultOffsets.getOrDefault(cacheKey, 0) : 0;
+        int end = Math.min(result.length(), offset + limit);
+        String chunk = result.substring(offset, end);
+        if (resumable && end < result.length()) {
+            state.toolResultOffsets.put(cacheKey, end);
+            return "[Tool result chunk " + (offset + 1) + "-" + end + "/" + result.length()
+                    + " chars. Repeat the exact same tool call to retrieve the next cached chunk.]\n"
+                    + chunk;
+        }
+        state.toolResultOffsets.remove(cacheKey);
+        if (end < result.length()) {
+            return chunk + "\n[Showing " + end + " of " + result.length()
+                    + " chars. Use the tool's pagination parameters or a narrower query to retrieve more.]";
+        }
+        return chunk;
     }
-
-    /** 生成人可读的工具调用进度描述，推送给前端 */
     private static String formatProgressMsg(String toolName, String arguments) {
         return switch (toolName) {
             case "web_search"        -> "🔍 正在搜索：" + extractJsonField(arguments, "query");

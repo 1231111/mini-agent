@@ -2,6 +2,7 @@ package com.miniagent.agent.surface;
 
 import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.tool.ToolRegistry;
+import org.springframework.beans.factory.annotation.Value;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -48,6 +49,18 @@ public class ToolSurface {
     @Autowired
     private ToolRegistry toolRegistry;
 
+    /**
+     * Direct (non-DAG) turns start with a small, auditable bootstrap surface and
+     * ask the model to discover a capability before exposing its tools.  Keep the
+     * switch explicit so older deployments can roll back without changing the
+     * planner's capability allowlist.
+     */
+    @Value("${agent.tools.direct-route-dynamic-discovery:false}")
+    private boolean directRouteDynamicDiscovery;
+
+    private static final Set<String> DISCOVERY_BOOTSTRAP = Set.of(
+            "capability_discover", "todo", "memory", "skill_list", "skill_view");
+
     public ToolSurface() {
     }
 
@@ -65,7 +78,16 @@ public class ToolSurface {
     public Resolved resolveTurn(TaskPlan plan, List<String> policyTools, boolean forcePolicy) {
         Set<String> registered = toolRegistry == null
                 ? Set.of() : toolRegistry.getToolNames();
+        if (directRouteDynamicDiscovery && !forcePolicy
+                && (plan == null || plan.allowedTools() == null)) {
+            return intersectRegistered(DISCOVERY_BOOTSTRAP, registered);
+        }
         return resolveTurn(plan, policyTools, forcePolicy, registered);
+    }
+
+    /** Visible for tests and operational diagnostics. */
+    boolean directRouteDynamicDiscoveryEnabled() {
+        return directRouteDynamicDiscovery;
     }
 
     static Resolved resolveTurn(TaskPlan plan, List<String> policyTools,

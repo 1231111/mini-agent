@@ -32,4 +32,28 @@ public interface ActionJournal {
     void append(ActionJournalEntry entry);
     Optional<ActionJournalEntry> latest(ActionJournalKey key);
     List<ActionJournalEntry> unresolved();
+
+    /**
+     * Explicit operator reconciliation for an unresolved receipt.  Implementations
+     * must only allow a human decision to move RUNNING/UNKNOWN to a terminal
+     * non-success state; this never replays the side effect automatically.
+     */
+    default Optional<ActionJournalEntry> reconcile(String receiptId,
+                                                    ActionExecutionStatus resolution,
+                                                    String note) {
+        throw new UnsupportedOperationException("ACTION_JOURNAL_RECONCILIATION_UNSUPPORTED");
+    }
+
+    /** Bounded view for operator review; implementations should bound the query itself. */
+    default List<ActionJournalEntry> unresolved(int limit) {
+        int bounded = Math.max(1, Math.min(500, limit));
+        return unresolved().stream().limit(bounded).toList();
+    }
+
+    /** Bounded page for operator review; database implementations should page in SQL. */
+    default List<ActionJournalEntry> unresolved(int limit, int offset) {
+        int boundedLimit = Math.max(1, Math.min(500, limit));
+        int boundedOffset = Math.max(0, Math.min(1_000_000, offset));
+        return unresolved().stream().skip(boundedOffset).limit(boundedLimit).toList();
+    }
 }

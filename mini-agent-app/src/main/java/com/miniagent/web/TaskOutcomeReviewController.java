@@ -12,6 +12,7 @@ import com.miniagent.agent.tool.ToolStatus;
 import com.miniagent.application.TaskProgressSnapshot;
 import com.miniagent.application.ConversationWorkspaceService;
 import com.miniagent.application.ConversationTaskProgressService;
+import com.miniagent.application.TenantQuotaExceededException;
 import com.miniagent.agent.tool.WorkspaceContext;
 import com.miniagent.agent.browser.BrowserService;
 import com.miniagent.agent.browser.BrowserSessionIdentity;
@@ -24,6 +25,7 @@ import com.miniagent.config.security.JwtSessionService;
 import com.miniagent.config.security.SessionAuthorizationService;
 import com.miniagent.config.service.TaskRunService;
 import com.miniagent.config.service.TaskRunLeaseRenewer;
+import com.miniagent.agent.core.TenantTokenQuota;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,13 +53,15 @@ public class TaskOutcomeReviewController {
     private final ConversationTaskProgressService taskProgress;
     private final ExecutionControl executionControl;
     private final TaskRunLeaseRenewer leaseRenewer;
+    private final TenantTokenQuota tenantTokenQuota;
 
     public TaskOutcomeReviewController(SessionAuthorizationService authorization, PlannerStateStore states,
                                       UnknownOutcomeReconciler reconciler, UserModelBinder binder,
                                       TaskRunService runs, ConversationWorkspaceService workspaces,
                                       ToolExecutionGuards tools, BrowserService browser,
                                       ConversationTaskProgressService taskProgress,
-                                      ExecutionControl executionControl, TaskRunLeaseRenewer leaseRenewer) {
+                                      ExecutionControl executionControl, TaskRunLeaseRenewer leaseRenewer,
+                                      TenantTokenQuota tenantTokenQuota) {
         this.authorization = authorization;
         this.states = states;
         this.reconciler = reconciler;
@@ -69,6 +73,7 @@ public class TaskOutcomeReviewController {
         this.taskProgress = taskProgress;
         this.executionControl = executionControl;
         this.leaseRenewer = leaseRenewer;
+        this.tenantTokenQuota = tenantTokenQuota;
     }
 
     @GetMapping
@@ -91,12 +96,15 @@ public class TaskOutcomeReviewController {
         authorization.requireOwner(user.userId(), sessionId);
         if (body == null || !body.confirmed())
             return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "请先核验实际结果并明确确认。");
+        if (!tenantTokenQuota.check(user.tenantId(), user.userId()).allowed()) {
+            throw new TenantQuotaExceededException();
+        }
         TaskRunService.StartResult admission = runs.tryStart(user.userId(), sessionId);
         if (!admission.accepted()) return ApiResponse.fail("TASK_BUSY", "任务正在执行或核验中，请稍后再试。");
         boolean committed = false;
         try (var owner = binder.bindOwner(user.userId(), String.valueOf(user.tenantId()));
              var workspace = bindWorkspace(sessionId, user.userId());
-             var control = bindReviewRun(sessionId, user.tenantId(), admission.handle());
+             var control = bindReviewRun(sessionId, user.userId(), user.tenantId(), admission.handle());
              var model = body.decision() == UnknownOutcomeReconciler.Decision.CONFIRMED_APPLIED
                      ? binder.bindModel(user.userId()) : UserModelBinder.Binding.noop()) {
             requireIdle(sessionId);
@@ -171,13 +179,14 @@ public class TaskOutcomeReviewController {
     }
 
     /** Judge calls share normal cancellation, quota accounting and lease renewal. */
-    private AutoCloseableWorkspace bindReviewRun(String sessionId, Long tenantId, TaskRunService.RunHandle run) {
+    private AutoCloseableWorkspace bindReviewRun(
+            String sessionId, Long userId, Long tenantId, TaskRunService.RunHandle run) {
         String previousSession = AgentLoop.getCurrentSession();
         var task = TaskExecutionContext.bindRun(run.fencingToken());
         TaskRunLeaseRenewer.Guard lease = null;
         try {
             AgentLoop.setCurrentSession(sessionId);
-            executionControl.start(sessionId, tenantId, run.fencingToken());
+            executionControl.start(sessionId, tenantId, userId, run.fencingToken());
             lease = leaseRenewer.start(run);
         } catch (RuntimeException failure) {
             executionControl.finish(sessionId, run.fencingToken());

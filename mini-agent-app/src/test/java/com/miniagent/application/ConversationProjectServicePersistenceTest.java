@@ -41,6 +41,7 @@ class ConversationProjectServicePersistenceTest {
     @Autowired private AgentProjectRepository projects;
     @Autowired private AgentProjectMemberRepository members;
     @Autowired private ChatConversationRepository conversations;
+    @Autowired private DatabaseConversationStore conversationStore;
     @Autowired private PlatformTransactionManager transactionManager;
     @MockBean private UserRepository users;
     @MockBean private ProjectAuthorizationSyncService authorizationSync;
@@ -98,6 +99,17 @@ class ConversationProjectServicePersistenceTest {
         }
         assertNull(conversations.findById("session-cross-tenant").orElseThrow().getProjectId());
         assertNull(conversationProjects.resolveAuthorized(9L, "21", "session-cross-tenant"));
+    }
+
+    @Test
+    void conversationSummariesUseBoundedAggregateProjection() {
+        saveConversation("session-summary", 9L);
+
+        var summaries = conversationStore.list(9L);
+
+        assertEquals(1, summaries.size());
+        assertEquals("session-summary", summaries.get(0).id);
+        assertEquals(0, summaries.get(0).messageCount);
     }
 
     private void saveProject(String projectId, String tenantId, Long ownerId) {

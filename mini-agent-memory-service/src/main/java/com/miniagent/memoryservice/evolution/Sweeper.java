@@ -110,6 +110,12 @@ public class Sweeper {
     void health(Item item) {
         EvolutionProperties.Health h = props.getHealth();
         Instant now = clock.instant();
+        if (item.activeRevisionId() == null) {
+            if (!ItemStore.HEALTH_UNKNOWN.equals(item.health())) {
+                items.setHealth(item.id(), ItemStore.HEALTH_UNKNOWN);
+            }
+            return;
+        }
         Instant recentFrom = now.minus(Duration.ofDays(h.getRecentDays()));
         Counts recent = outcomes.revisionStats(item.activeRevisionId(), recentFrom, now);
         Counts before = outcomes.revisionStats(item.activeRevisionId(),
@@ -188,6 +194,9 @@ public class Sweeper {
 
     /** 闲置 idle-days 天 → 归档提案；低成功率先给一次修复机会，修复被拒或过期后仍低 → 归档提案。 */
     void lifecycle(Item item) {
+        if (item.activeRevisionId() == null) {
+            return;
+        }
         EvolutionProperties.Lifecycle l = props.getLifecycle();
         Instant now = clock.instant();
         Instant idleSince = now.minus(Duration.ofDays(l.getIdleDays()));

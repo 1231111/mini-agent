@@ -50,6 +50,22 @@ class SecurityConfigAuthorizationTest {
     }
 
     @Test
+    @WithMockUser(roles = "USER")
+    void regularUserCannotScrapeMetrics() throws Exception {
+        mvc.perform(get("/actuator/prometheus")).andExpect(status().isForbidden());
+        mvc.perform(get("/actuator/metrics")).andExpect(status().isForbidden());
+    }
+
+    @Test
+    @WithMockUser(roles = "SYSTEM_ADMIN")
+    void systemAdminCanReachProtectedScrapeRoutes() throws Exception {
+        mvc.perform(get("/actuator/prometheus")).andExpect(result ->
+                org.assertj.core.api.Assertions.assertThat(result.getResponse().getStatus()).isNotEqualTo(403));
+        mvc.perform(get("/actuator/metrics")).andExpect(result ->
+                org.assertj.core.api.Assertions.assertThat(result.getResponse().getStatus()).isNotEqualTo(403));
+    }
+
+    @Test
     @WithMockUser(roles = "SYSTEM_ADMIN")
     void systemAdminCanAccessAdminAndMcpMutation() throws Exception {
         mvc.perform(get("/api/admin/probe")).andExpect(status().isOk());

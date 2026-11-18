@@ -1,0 +1,25 @@
+# Keep the internal memory API private by default. Multi-host deployments must
+# bind to a private network interface and restrict ingress to trusted services.
+server:
+  address: ${MEMORY_SERVICE_ADDRESS:127.0.0.1}
+
+memory:
+  evolution:
+    # Automatic memory evolution is not production-ready until the isolated
+    # runner, traffic observation and rollback evidence are deployed.
+    policy:
+      default-mode: ${MEMORY_EVOLUTION_DEFAULT_MODE:OFF}
+    experiment:
+      require-live-arms: true
+
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: ${MEMORY_DB_POOL_MAX_SIZE:10}
+      minimum-idle: ${MEMORY_DB_POOL_MIN_IDLE:2}
+      connection-timeout: 30000
+      validation-timeout: 5000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      data-source-properties:
+        sslMode: VERIFY_IDENTITY

@@ -258,6 +258,10 @@ public class SecurityConfig {
     private void configureAuthorization(AuthorizeHttpRequestsConfigurer<HttpSecurity>.AuthorizationManagerRequestMatcherRegistry auth) {
         auth
                 .requestMatchers(PUBLIC_PATHS).permitAll()
+                // Metrics can disclose aggregate request volume and model usage.
+                // Keep scrape endpoints behind an authenticated system-admin token.
+                .requestMatchers("/actuator/metrics", "/actuator/metrics/**", "/actuator/prometheus")
+                .hasRole("SYSTEM_ADMIN")
                 .requestMatchers("/api/admin/**").hasRole("SYSTEM_ADMIN")
                 .requestMatchers(HttpMethod.POST, "/api/mcp/servers/**")
                 .hasRole("SYSTEM_ADMIN")

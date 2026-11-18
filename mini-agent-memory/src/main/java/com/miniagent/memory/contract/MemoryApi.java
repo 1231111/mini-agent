@@ -122,6 +122,11 @@ public final class MemoryApi {
     public record UserFactSyncResult(List<UserFactView> facts) {
     }
 
+    /** Idempotent receipt for a completed memory-service portion of subject erasure. */
+    public record SubjectErasureResult(boolean complete, int erasedItems, int erasedFacts,
+                                       Instant completedAt) {
+    }
+
     public record RevisionView(long id, int revisionNo, String origin, ProcedureContent content,
                                String contentHash, Long proposalId, String createdBy,
                                Instant createdAt) {

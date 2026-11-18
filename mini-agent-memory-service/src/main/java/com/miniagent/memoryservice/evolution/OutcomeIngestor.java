@@ -23,6 +23,7 @@ import com.miniagent.memoryservice.store.JobQueue;
 import com.miniagent.memoryservice.store.OutcomeStore;
 import com.miniagent.memoryservice.store.ProposalStore;
 import com.miniagent.memoryservice.store.ProposalStore.Proposal;
+import com.miniagent.memoryservice.store.SubjectLifecycleStore;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -62,12 +63,14 @@ public class OutcomeIngestor {
     private final ObjectMapper json;
     private final Clock clock;
     private final MeterRegistry metrics;
+    private final SubjectLifecycleStore subjects;
     private final TransactionTemplate tx;
 
     public OutcomeIngestor(ItemStore items, OutcomeStore outcomes, ProposalStore proposals,
                            JobQueue jobs, ItemService itemService, EvolutionPolicy policy,
                            EvolutionProperties props, ObjectMapper json, Clock clock,
-                           MeterRegistry metrics, PlatformTransactionManager transactions) {
+                           MeterRegistry metrics, SubjectLifecycleStore subjects,
+                           PlatformTransactionManager transactions) {
         this.items = items;
         this.outcomes = outcomes;
         this.proposals = proposals;
@@ -78,6 +81,7 @@ public class OutcomeIngestor {
         this.json = json;
         this.clock = clock;
         this.metrics = metrics;
+        this.subjects = subjects;
         this.tx = new TransactionTemplate(transactions);
     }
 
@@ -104,6 +108,7 @@ public class OutcomeIngestor {
     @Transactional
     public int feedback(Principal principal, FeedbackRequest request) {
         ItemService.requireUser(principal);
+        subjects.lockForWrite(principal.tenantId(), principal.userId());
         if (request == null || request.taskKey() == null || request.taskKey().isBlank()) {
             throw new BusinessException(ErrorCode.MEMORY_REQUEST_INVALID, "taskKey 不能为空");
         }
@@ -138,6 +143,7 @@ public class OutcomeIngestor {
 
     private OutcomeAck ingestOne(OutcomeEvent e) {
         validate(e);
+        subjects.lockForWrite(e.tenantId(), e.userId());
         Item item = items.find(e.itemId()).orElseThrow(
                 () -> new BusinessException(ErrorCode.MEMORY_NOT_FOUND));
         if (!itemService.visibleTo(item, e.tenantId(), e.userId())) {

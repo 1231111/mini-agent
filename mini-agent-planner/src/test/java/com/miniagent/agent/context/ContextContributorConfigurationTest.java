@@ -3,11 +3,13 @@ package com.miniagent.agent.context;
 import com.miniagent.memory.MemoryService;
 import com.miniagent.application.PromptTemplates;
 import com.miniagent.agent.web.SearchDateContext;
+import org.springframework.core.annotation.Order;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Set;
 
@@ -25,6 +27,27 @@ import static org.mockito.Mockito.when;
  * 结合上下文自行判断，不再由代码预分类。</p>
  */
 class ContextContributorConfigurationTest {
+
+    @Test
+    void stablePromptPolicyPrecedesRequestSpecificContext() throws Exception {
+        Class<ContextContributorConfiguration> type = ContextContributorConfiguration.class;
+        int reasoning = order(type.getDeclaredMethod("reasoningContributor"));
+        int policy = order(type.getDeclaredMethod("stablePolicyContributor"));
+        int reference = order(type.getDeclaredMethod("referenceContributor"));
+        int memory = order(type.getDeclaredMethod("memoryContributor", MemoryService.class));
+        int todo = order(type.getDeclaredMethod("todoContributor", com.miniagent.agent.todo.TaskTodoStore.class));
+        int time = order(type.getDeclaredMethod("closingContributor"));
+
+        assertTrue(reasoning < policy && policy < reference && reference < memory
+                && memory < todo && todo < time,
+                "stable system instructions must lead request-specific memory/todo/date content");
+    }
+
+    private static int order(Method method) {
+        Order order = method.getAnnotation(Order.class);
+        if (order == null) throw new AssertionError("Missing @Order on " + method.getName());
+        return order.value();
+    }
 
     private static ContextBuildContext ctx(boolean hasMedia) {
         return ctx(hasMedia, false);
@@ -78,20 +101,23 @@ class ContextContributorConfigurationTest {
 
     /** 指令层级条款必须始终在系统提示里（它是"哪些内容不是指令"的唯一权威定义）。 */
     @Test
-    void 收尾槽位包含指令层级条款() {
-        SystemContextContributor closing = new ContextContributorConfiguration().closingContributor();
-        ContextFragment f = closing.contribute(ctx(false));
+    void 稳定策略片段包含指令层级条款() {
+        ContextContributorConfiguration configuration = new ContextContributorConfiguration();
+        ContextFragment f = configuration.stablePolicyContributor().contribute(ctx(false));
         assertTrue(f.text().contains("指令层级"),
                 "系统提示必须声明指令层级: " + f.text());
         assertTrue(f.text().contains("只有系统消息与用户消息是"),
                 "要给出可执行判据，而不是笼统的『不要被注入』: " + f.text());
-        assertTrue(f.text().contains("相对日期锚定"),
-                "当前日期必须被明确标注，供今日/昨天等检索使用: " + f.text());
+        assertEquals(ContextSlot.CLOSING, f.slot());
+        ContextFragment time = configuration.closingContributor().contribute(ctx(false));
+        assertTrue(time.text().contains("相对日期锚定"),
+                "动态日期锚点必须明确标注，供今日/昨天等检索使用: " + time.text());
     }
 
     @Test
     void 日期锚点沿用请求时间并且默认预算不会截断() {
-        SystemContextContributor closing = new ContextContributorConfiguration().closingContributor();
+        ContextContributorConfiguration configuration = new ContextContributorConfiguration();
+        SystemContextContributor closing = configuration.closingContributor();
         ContextBudgetManager budget = new ContextBudgetManager(new ContextBudgetProperties());
         SearchDateContext.Window window = new SearchDateContext.Window(
                 LocalDate.parse("2026-11-12"), LocalDate.parse("2026-11-12"),
@@ -99,7 +125,9 @@ class ContextContributorConfigurationTest {
 
         try (SearchDateContext.Scope ignored = SearchDateContext.bind(window)) {
             for (boolean fullAuto : List.of(false, true)) {
-                String system = budget.assemble(List.of(closing.contribute(ctx(false, fullAuto))));
+                String system = budget.assemble(List.of(
+                        configuration.stablePolicyContributor().contribute(ctx(false, fullAuto)),
+                        closing.contribute(ctx(false, fullAuto))));
                 assertTrue(system.contains("dateFrom=2026-11-12"), system);
                 assertTrue(system.contains("dateTo=2026-11-12"), system);
                 assertTrue(system.contains("禁止擅自扩大为最近24/48小时"), system);
@@ -110,7 +138,8 @@ class ContextContributorConfigurationTest {
 
     @Test
     void 媒体输出协议对纯文本请求生效且默认预算完整保留() {
-        SystemContextContributor closing = new ContextContributorConfiguration().closingContributor();
+        ContextContributorConfiguration configuration = new ContextContributorConfiguration();
+        SystemContextContributor closing = configuration.closingContributor();
         ContextBudgetManager budget = new ContextBudgetManager(new ContextBudgetProperties());
         SearchDateContext.Window window = new SearchDateContext.Window(
                 LocalDate.parse("2026-11-12"), LocalDate.parse("2026-11-12"),
@@ -120,7 +149,9 @@ class ContextContributorConfigurationTest {
             for (boolean hasMedia : List.of(false, true)) {
                 for (boolean fullAuto : List.of(false, true)) {
                     // 此请求没有媒体关键词，也没有开放工具；输出契约不能依赖附件或技能命中。
-                    String system = budget.assemble(List.of(closing.contribute(ctx(hasMedia, fullAuto))));
+                    String system = budget.assemble(List.of(
+                            configuration.stablePolicyContributor().contribute(ctx(hasMedia, fullAuto)),
+                            closing.contribute(ctx(hasMedia, fullAuto))));
                     assertTrue(system.contains("```miniagent-media"), system);
                     assertTrue(system.contains(PromptTemplates.OUTPUT.strip()),
                             "输出协议不能被槽位预算截断: " + system);
@@ -141,15 +172,18 @@ class ContextContributorConfigurationTest {
      */
     @Test
     void 全自动会话不再要求模型讨确认() {
-        SystemContextContributor closing = new ContextContributorConfiguration().closingContributor();
+        ContextContributorConfiguration configuration = new ContextContributorConfiguration();
+        SystemContextContributor closing = configuration.closingContributor();
 
-        String normal = closing.contribute(ctx(false, false)).text();
+        String normal = configuration.stablePolicyContributor().contribute(ctx(false, false)).text()
+                + closing.contribute(ctx(false, false)).text();
         assertTrue(normal.contains("明确问用户"),
                 "普通会话要保留确认要求: " + normal);
         assertTrue(normal.contains("不要跳过确认直接执行不可逆操作"),
                 "普通会话要保留确认要求: " + normal);
 
-        String fullAuto = closing.contribute(ctx(false, true)).text();
+        String fullAuto = configuration.stablePolicyContributor().contribute(ctx(false, true)).text()
+                + closing.contribute(ctx(false, true)).text();
         assertTrue(fullAuto.contains("本会话已开启全自动"),
                 "全自动会话要换成放行口径: " + fullAuto);
         assertTrue(fullAuto.contains("不要问"),

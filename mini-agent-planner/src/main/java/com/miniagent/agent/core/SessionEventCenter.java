@@ -34,6 +34,8 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 
 /**
  * 会话事件中心：事件生产与 HTTP 连接解耦。
@@ -52,6 +54,27 @@ public class SessionEventCenter {
     private static final String PENDING_USER_MSG_RUN_PREFIX = "pending-user-msg-run:";
     private static final Duration PENDING_USER_MSG_TTL = Duration.ofHours(2);
     private static final int DELIVERY_QUEUE_LIMIT = 128;
+    private static final long CLIENT_PRESENCE_TTL_MS = 60_000L;
+    private static final org.springframework.data.redis.core.script.DefaultRedisScript<Long> REDIS_CLIENT_PRESENCE_SCRIPT =
+            new org.springframework.data.redis.core.script.DefaultRedisScript<>("""
+                    local count = tonumber(ARGV[1])
+                    if count > 0 then
+                      redis.call('HSET', KEYS[1], ARGV[2], ARGV[1])
+                      redis.call('PEXPIRE', KEYS[1], ARGV[3])
+                    else
+                      redis.call('HDEL', KEYS[1], ARGV[2])
+                      if redis.call('HLEN', KEYS[1]) == 0 then redis.call('DEL', KEYS[1]) end
+                    end
+                    return 1
+                    """, Long.class);
+    private static final org.springframework.data.redis.core.script.DefaultRedisScript<Long> REDIS_HAS_CLIENT_PRESENCE_SCRIPT =
+            new org.springframework.data.redis.core.script.DefaultRedisScript<>("""
+                    local clients = redis.call('HVALS', KEYS[1])
+                    for _, count in ipairs(clients) do
+                      if tonumber(count) and tonumber(count) > 0 then return 1 end
+                    end
+                    return 0
+                    """, Long.class);
     private static final Semaphore DELIVERY_WORKERS = new Semaphore(64);
     private static final Semaphore CLOSE_WORKERS = new Semaphore(16);
     private static final long SEND_TIMEOUT_MS = 5_000L;
@@ -93,10 +116,15 @@ public class SessionEventCenter {
      * 只按 sessionId 记账的话，退出登录后已建立的长连接不会被摘掉，仍会继续收到该会话的推送。
      */
     private final Map<SseEmitter, Long> emitterOwner = new ConcurrentHashMap<>();
+    private final Map<SseEmitter, String> emitterSession = new ConcurrentHashMap<>();
+    private final Map<String, AtomicInteger> localClientCounts = new ConcurrentHashMap<>();
     private final Map<SseEmitter, DeliveryQueue> clientDeliveries = new ConcurrentHashMap<>();
     /** Reused across executions of a session, so Redis start/event/end frames retain their order. */
     private final Map<String, DeliveryQueue> redisDeliveries = new ConcurrentHashMap<>();
     private final long sendTimeoutMillis;
+    private final long disconnectGraceMillis;
+    private final long heartbeatIntervalMillis;
+    private volatile BiConsumer<String, String> orphanedRunHandler;
     private final String instanceId = UUID.randomUUID().toString();
     private final ScheduledExecutorService cleaner =
             Executors.newSingleThreadScheduledExecutor(r -> {
@@ -112,13 +140,24 @@ public class SessionEventCenter {
     @Autowired(required = false)
     private ReplicaProperties replicaProperties;
 
-    public SessionEventCenter() { this(SEND_TIMEOUT_MS); }
+    public SessionEventCenter() { this(SEND_TIMEOUT_MS, 30_000L, 15_000L); }
 
-    SessionEventCenter(long sendTimeoutMillis) {
+    SessionEventCenter(long sendTimeoutMillis) { this(sendTimeoutMillis, 30_000L, 15_000L); }
+
+    SessionEventCenter(long sendTimeoutMillis, long disconnectGraceMillis, long heartbeatIntervalMillis) {
         this.sendTimeoutMillis = Math.max(50L, sendTimeoutMillis);
+        this.disconnectGraceMillis = Math.max(1L, disconnectGraceMillis);
+        this.heartbeatIntervalMillis = Math.max(1L, heartbeatIntervalMillis);
         cleaner.scheduleWithFixedDelay(this::removeExpiredChannels, 60, 60, TimeUnit.SECONDS);
         cleaner.scheduleWithFixedDelay(() -> redisDeliveries.values().forEach(DeliveryQueue::start),
                 250, 250, TimeUnit.MILLISECONDS);
+        cleaner.scheduleWithFixedDelay(this::sendHeartbeats,
+                this.heartbeatIntervalMillis, this.heartbeatIntervalMillis, TimeUnit.MILLISECONDS);
+    }
+
+    /** Install the run-control callback after both services are constructed. */
+    public void setOrphanedRunHandler(BiConsumer<String, String> handler) {
+        orphanedRunHandler = handler;
     }
 
     /** Stop the cleaner on context shutdown/reload so old application contexts do not retain it. */
@@ -254,6 +293,29 @@ public class SessionEventCenter {
         }, null);
     }
 
+    private void enqueueHeartbeat(SessionChannel channel, SseEmitter emitter) {
+        DeliveryQueue queue = clientDeliveries.get(emitter);
+        if (queue == null) return;
+        queue.offer(() -> {
+            try { emitter.send(SseEmitter.event().comment("heartbeat")); }
+            catch (Exception failed) { throw new IllegalStateException("SSE heartbeat failed", failed); }
+        }, null);
+    }
+
+    private void sendHeartbeats() {
+        for (SessionChannel channel : channels.values()) {
+            if (channel.status != Status.running || channel.clients.isEmpty()) continue;
+            int localCount;
+            synchronized (channel.bufferLock) {
+                if (channel.status != Status.running) continue;
+                for (SseEmitter client : channel.clients) enqueueHeartbeat(channel, client);
+                AtomicInteger localCountAtomic = localClientCounts.get(channel.sessionId);
+                localCount = localCountAtomic == null ? 0 : localCountAtomic.get();
+            }
+            if (localCount > 0) updateClientPresence(channel, localCount);
+        }
+    }
+
     private void enqueueClientTerminal(SessionChannel channel, SseEmitter emitter, String name, Object data) {
         DeliveryQueue queue = clientDeliveries.get(emitter);
         if (queue == null) return;
@@ -341,6 +403,9 @@ public class SessionEventCenter {
         boolean acceptingUserMessages = true;
         volatile String sessionId;
         volatile String runToken;
+        volatile String ownerInstanceId;
+        volatile boolean everHadClient;
+        ScheduledFuture<?> disconnectCancellation;
         volatile String userMessage = "";
         final StringBuilder think = new StringBuilder();
         final StringBuilder answer = new StringBuilder();
@@ -380,8 +445,10 @@ public class SessionEventCenter {
         SessionChannel channel = new SessionChannel();
         channel.sessionId = k;
         channel.runToken = UUID.randomUUID().toString();
+        channel.ownerInstanceId = instanceId;
         channel.userMessage = Optional.ofNullable(userMessage).orElse("");
         channels.put(k, channel);
+        if (redisMode()) scheduleDisconnectCancellation(channel);
         if (redisMode()) {
             try {
                 redis.delete(pendingQueueKey(k));
@@ -495,6 +562,7 @@ public class SessionEventCenter {
         }
         // Replay and registration share the terminal lock: no end/error can fall
         // between the status check and adding a reconnecting client.
+        int presenceCount;
         synchronized (channel.bufferLock) {
             deliveryFor(channel, emitter); // Only attachment can create a queue; detached snapshots cannot resurrect it.
             if (Objects.nonNull(userId)) emitterOwner.put(emitter, userId);
@@ -502,6 +570,12 @@ public class SessionEventCenter {
             emitter.onTimeout(() -> detachClient(channel, emitter));
             emitter.onError(e -> detachClient(channel, emitter));
             channel.clients.add(emitter);
+            channel.everHadClient = true;
+            cancelDisconnectCancellation(channel);
+            emitterSession.put(emitter, channel.sessionId);
+            presenceCount = localClientCounts.computeIfAbsent(channel.sessionId, ignored -> new AtomicInteger())
+                    .incrementAndGet();
+            updateClientPresence(channel, presenceCount); // Queue the update under the lock to preserve order.
             enqueueClient(channel, emitter, "session", Optional.ofNullable(channel.sessionId).orElse(""));
             if (Objects.nonNull(channel.userMessage) && !channel.userMessage.isEmpty()) {
                 enqueueClient(channel, emitter, "user", channel.userMessage);
@@ -538,16 +612,109 @@ public class SessionEventCenter {
             } else if (channel.status == Status.error) {
                 enqueueClientTerminal(channel, emitter, "error", Optional.ofNullable(channel.errorMsg).orElse("处理出错"));
             }
-            return true;
         }
+        return true;
     }
 
     /** 摘掉一个 emitter：从通道列表移除，同时清掉归属登记。 */
     private void detachClient(SessionChannel channel, SseEmitter emitter) {
-        channel.clients.remove(emitter);
+        boolean removed;
+        int presenceCount = 0;
+        synchronized (channel.bufferLock) {
+            removed = channel.clients.remove(emitter);
+            if (removed) {
+                String sessionId = emitterSession.remove(emitter);
+                int[] remaining = { 0 };
+                if (sessionId != null) {
+                    localClientCounts.compute(sessionId, (sid, count) -> {
+                        int left = count == null ? 0 : Math.max(0, count.decrementAndGet());
+                        remaining[0] = left;
+                        return left == 0 ? null : count;
+                    });
+                }
+                presenceCount = remaining[0];
+                updateClientPresence(channel, presenceCount); // Redis I/O runs asynchronously outside the lock.
+                if (channel.clients.isEmpty() && channel.status == Status.running && !redisMode()) {
+                    scheduleDisconnectCancellation(channel);
+                }
+            }
+        }
         emitterOwner.remove(emitter);
         DeliveryQueue queue = clientDeliveries.remove(emitter);
         if (queue != null) queue.close();
+    }
+
+    private void cancelDisconnectCancellation(SessionChannel channel) {
+        ScheduledFuture<?> pending = channel.disconnectCancellation;
+        channel.disconnectCancellation = null;
+        if (pending != null) pending.cancel(false);
+    }
+
+    private void scheduleDisconnectCancellation(SessionChannel channel) {
+        // Redis mirrors never own the run. The owner starts a sweep at run
+        // admission, so a remote-only client population is still observed.
+        if (redisMode() && !Objects.equals(channel.ownerInstanceId, instanceId)) return;
+        cancelDisconnectCancellation(channel);
+        String runToken = channel.runToken;
+        if (StringUtils.isBlank(runToken)) return;
+        channel.disconnectCancellation = cleaner.schedule(() -> {
+            boolean eligible;
+            synchronized (channel.bufferLock) {
+                if (channel.status != Status.running || !runToken.equals(channel.runToken)
+                        || !channel.clients.isEmpty()) return;
+                eligible = true;
+            }
+            // Presence queries run outside the channel lock. Redis failure is
+            // fail-safe and leaves the task to explicit control/deadline.
+            boolean hasClient = redisMode() && hasRemoteClientPresence(channel.sessionId);
+            boolean shouldCancel = false;
+            synchronized (channel.bufferLock) {
+                if (!eligible || channel.status != Status.running || !runToken.equals(channel.runToken)
+                        || !channel.clients.isEmpty()) return;
+                if (hasClient) channel.everHadClient = true;
+                if (!channel.everHadClient || hasClient) {
+                    scheduleDisconnectCancellation(channel);
+                    return;
+                }
+                channel.disconnectCancellation = null;
+                shouldCancel = true;
+            }
+            BiConsumer<String, String> handler = orphanedRunHandler;
+            if (shouldCancel && handler != null) handler.accept(channel.sessionId, runToken);
+        }, disconnectGraceMillis, TimeUnit.MILLISECONDS);
+    }
+
+    private void updateClientPresence(SessionChannel channel, int count) {
+        if (!redisMode()) return;
+        try {
+            cleaner.execute(() -> {
+                try {
+                    redis.execute(REDIS_CLIENT_PRESENCE_SCRIPT,
+                            List.of(clientPresenceKey(channel.sessionId)),
+                            String.valueOf(count), instanceId,
+                            String.valueOf(CLIENT_PRESENCE_TTL_MS));
+                } catch (RuntimeException unavailable) {
+                    log.warn("SSE 客户端 presence 更新失败，断连不触发自动取消: sessionId={}", channel.sessionId);
+                }
+            });
+        } catch (RuntimeException unavailable) {
+            log.debug("SSE presence updater is shutting down: sessionId={}", channel.sessionId);
+        }
+    }
+
+    private boolean hasRemoteClientPresence(String sessionId) {
+        try {
+            Long result = redis.execute(REDIS_HAS_CLIENT_PRESENCE_SCRIPT,
+                    List.of(clientPresenceKey(sessionId)));
+            return result == null || result != 0;
+        } catch (RuntimeException unavailable) {
+            log.warn("SSE 客户端 presence 查询失败，保留在途任务: sessionId={}", sessionId, unavailable);
+            return true;
+        }
+    }
+
+    private static String clientPresenceKey(String sessionId) {
+        return "sse:client-presence:" + sessionId;
     }
 
     /**
@@ -858,6 +1025,7 @@ public class SessionEventCenter {
                         if (runToken != null && runToken.equals(channel.runToken)) return;
                         channel.status = Status.running;
                         channel.runToken = runToken;
+                        channel.ownerInstanceId = from;
                         channel.userMessage = String.valueOf(data);
                         synchronized (channel.bufferLock) {
                             channel.think.setLength(0);

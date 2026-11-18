@@ -291,8 +291,9 @@ public class DefaultConsolidationService implements ConsolidationService {
         try {
             return episodeRepository.existsByTenantIdAndSessionId(tenantId, sessionId);
         } catch (Exception e) {
-            log.debug("查询已有 Episode 失败，保守认为已存在: tenant={}, session={}", tenantId, sessionId);
-            return true;
+            log.warn("查询已有 Episode 失败，保留工作记忆结转并等待重试: tenant={}, session={}",
+                    tenantId, sessionId, e);
+            throw new IllegalStateException("无法确认已有 Episode 状态，保留待巩固数据", e);
         }
     }
 

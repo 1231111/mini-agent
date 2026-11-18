@@ -1,0 +1,46 @@
+# Production networking assumes TLS terminates at a trusted reverse proxy. Keep
+# the application listener private by default; deployments on a separate proxy
+# host must bind to a private interface and firewall it from public ingress.
+server:
+  address: ${SERVER_ADDRESS:127.0.0.1}
+  servlet:
+    session:
+      cookie:
+        secure: true
+        http-only: true
+        same-site: lax
+
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: ${APP_DB_POOL_MAX_SIZE:20}
+      minimum-idle: ${APP_DB_POOL_MIN_IDLE:5}
+      connection-timeout: 30000
+      validation-timeout: 5000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      data-source-properties:
+        # Requires the production database certificate chain and hostname to be
+        # trusted by the JVM. Do not weaken this to useSSL=false in production.
+        sslMode: VERIFY_IDENTITY
+
+agent:
+  tools:
+    # Direct routes negotiate a capability before exposing the full tool schema.
+    # Planner-provided allowlists and ToolPipeline permissions remain authoritative.
+    direct-route-dynamic-discovery: true
+  planner:
+    require-independent-judge: true
+    judge-model-name: ${AGENT_JUDGE_MODEL_NAME:}
+    judge-base-url: ${AGENT_JUDGE_BASE_URL:}
+    judge-api-key: ${AGENT_JUDGE_API_KEY:}
+
+file:
+  upload:
+    antivirus:
+      # Do not make an unscanned upload visible in production.
+      enabled: ${FILE_UPLOAD_ANTIVIRUS_ENABLED:false}
+      required: true
+      host: ${FILE_UPLOAD_ANTIVIRUS_HOST:127.0.0.1}
+      port: ${FILE_UPLOAD_ANTIVIRUS_PORT:3310}
+      timeout-ms: ${FILE_UPLOAD_ANTIVIRUS_TIMEOUT_MS:10000}

@@ -18,7 +18,7 @@ public final class PermissionPolicy {
 
     /** Plan 未批准前允许的工具（探索 + 计划，禁止写/执行/生图） */
     public static final Set<String> PLAN_SAFE_TOOLS = Set.of(
-            "todo", "memory",
+            "todo", "memory", "capability_discover",
             "skill_list", "skill_view",
             "read_file", "list_files", "read_package",
             "search_code", "ast_search", "codebase_search",
@@ -150,6 +150,13 @@ public final class PermissionPolicy {
             // Foreground input can submit/send/delete in any app. Automatic
             // editing alone is not an approval for an arbitrary desktop action.
             // Explicit full-auto and explicit session grants retain their existing semantics.
+            return true;
+        }
+        if (toolName.startsWith("mcp__")) {
+            // MCP servers are externally supplied capabilities, not local edits.
+            // They must keep an approval gate in DEFAULT and ACCEPT_EDITS; only
+            // an explicit PLAN approval, an explicit grant, or full-auto above
+            // can authorize them without a per-invocation prompt.
             return true;
         }
         if (mode == PermissionMode.ACCEPT_EDITS) {

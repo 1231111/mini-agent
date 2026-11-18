@@ -7,12 +7,15 @@ import com.miniagent.common.MessageConstants;
 import com.miniagent.common.RunStatus;
 import com.miniagent.agent.tool.ToolResult;
 import com.miniagent.agent.tool.ToolStatus;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -23,10 +26,19 @@ import java.util.UUID;
 @Slf4j
 public class TraceRecorder {
 
+    /** Immutable trace identity copied into tool/sub-agent worker threads. */
+    public record TraceContext(TraceRecorder recorder, String sessionId, String executionId,
+                               String question, List<Long> parentStepIds,
+                               List<String> parentExecutionIds) {}
+
+    private static final ThreadLocal<TraceRecorder> ACTIVE_RECORDER = new ThreadLocal<>();
+
     @Autowired
     private AgentTraceStepRepository repo;
     @Autowired(required = false)
     private TraceSseHub traceSseHub;
+    @Autowired(required = false)
+    private MeterRegistry meterRegistry;
 
     private final ThreadLocal<String> currentSessionId = new ThreadLocal<>();
     private final ThreadLocal<String> currentExecutionId = new ThreadLocal<>();
@@ -36,6 +48,7 @@ public class TraceRecorder {
     private final ThreadLocal<Deque<String>> parentExecStack = ThreadLocal.withInitial(ArrayDeque::new);
 
     public void beginExecution(String sessionId, String executionId, String userQuestion) {
+        ACTIVE_RECORDER.set(this);
         currentSessionId.set(sessionId);
         currentExecutionId.set(executionId);
         currentQuestion.set(userQuestion);
@@ -72,6 +85,36 @@ public class TraceRecorder {
 
     public boolean isActive() {
         return StringUtils.isNotBlank(currentExecutionId.get());
+    }
+
+    /** Snapshot the active execution for explicit propagation into executor threads. */
+    public static TraceContext captureThreadContext() {
+        TraceRecorder recorder = ACTIVE_RECORDER.get();
+        if (recorder == null || !recorder.isActive()) return null;
+        return new TraceContext(recorder, recorder.currentSessionId.get(), recorder.currentExecutionId.get(),
+                recorder.currentQuestion.get(), List.copyOf(recorder.parentStepStack.get()),
+                List.copyOf(recorder.parentExecStack.get()));
+    }
+
+    /** Restore a previously captured context; passing null clears the current trace binding. */
+    public static void restoreThreadContext(TraceContext context) {
+        TraceRecorder current = ACTIVE_RECORDER.get();
+        if (current != null) current.clearTls();
+        if (context == null || context.recorder() == null) {
+            ACTIVE_RECORDER.remove();
+            return;
+        }
+        TraceRecorder recorder = context.recorder();
+        ACTIVE_RECORDER.set(recorder);
+        recorder.currentSessionId.set(context.sessionId());
+        recorder.currentExecutionId.set(context.executionId());
+        recorder.currentQuestion.set(context.question());
+        Deque<Long> stepIds = recorder.parentStepStack.get();
+        stepIds.clear();
+        for (int i = context.parentStepIds().size() - 1; i >= 0; i--) stepIds.push(context.parentStepIds().get(i));
+        Deque<String> executionIds = recorder.parentExecStack.get();
+        executionIds.clear();
+        for (int i = context.parentExecutionIds().size() - 1; i >= 0; i--) executionIds.push(context.parentExecutionIds().get(i));
     }
 
     public String currentExecutionId() { return currentExecutionId.get(); }
@@ -233,6 +276,18 @@ public class TraceRecorder {
     }
 
     public void recordLlmLatency(String sessionId, int turn, long durationMs, int inputTokens, int outputTokens) {
+        if (meterRegistry != null) {
+            Timer.builder("miniagent.llm.request.duration")
+                    .description("Duration of completed LLM requests")
+                    .register(meterRegistry)
+                    .record(Math.max(0, durationMs), java.util.concurrent.TimeUnit.MILLISECONDS);
+            if (inputTokens > 0) {
+                meterRegistry.counter("miniagent.llm.tokens", "direction", "input").increment(inputTokens);
+            }
+            if (outputTokens > 0) {
+                meterRegistry.counter("miniagent.llm.tokens", "direction", "output").increment(outputTokens);
+            }
+        }
         save(build(sessionId, turn, AgentStepNode.LLM_CALL.name(), null, null,
                 String.format("耗时 %dms, 输入 %d tokens, 输出 %d tokens", durationMs, inputTokens, outputTokens),
                 null, 0, 0, RunStatus.SUCCESS.name(), durationMs));
@@ -251,6 +306,10 @@ public class TraceRecorder {
     }
 
     public void recordCompression(String sessionId, int turn, int beforeMsgCount, int afterMsgCount, int beforeTokens, int afterTokens) {
+        if (meterRegistry != null && beforeTokens > afterTokens) {
+            meterRegistry.counter("miniagent.context.compression.tokens_saved")
+                    .increment((long) beforeTokens - afterTokens);
+        }
         String content = String.format("上下文压缩: %d→%d 条消息, %d→%d tokens (节省 %.1f%%)",
                 beforeMsgCount, afterMsgCount, beforeTokens, afterTokens,
                 beforeTokens > 0 ? (double) (beforeTokens - afterTokens) / beforeTokens * 100 : 0);
@@ -290,13 +349,13 @@ public class TraceRecorder {
         AgentTraceStep s = new AgentTraceStep();
         s.setSessionId(sessionId);
         s.setExecutionId(currentExecutionId.get());
-        s.setUserQuestion(currentQuestion.get());
+        s.setUserQuestion(TraceDataSanitizer.sanitizeText(currentQuestion.get()));
         s.setTurnIndex(turn);
         s.setStepType(stepType);
         s.setToolName(toolName);
-        s.setToolArgs(toolArgs);
-        s.setContent(content);
-        s.setSubGoalText(subGoalText);
+        s.setToolArgs(TraceDataSanitizer.sanitize(toolArgs));
+        s.setContent(TraceDataSanitizer.sanitize(content));
+        s.setSubGoalText(TraceDataSanitizer.sanitizeText(subGoalText));
         s.setSubGoalDone(subGoalDone);
         s.setSubGoalTotal(subGoalTotal);
         s.setStatus(status);
@@ -339,6 +398,7 @@ public class TraceRecorder {
         currentQuestion.remove();
         parentStepStack.remove();
         parentExecStack.remove();
+        if (ACTIVE_RECORDER.get() == this) ACTIVE_RECORDER.remove();
     }
 
     private String truncate(String s, int max) {

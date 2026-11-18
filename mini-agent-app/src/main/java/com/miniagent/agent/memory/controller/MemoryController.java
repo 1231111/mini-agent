@@ -7,6 +7,7 @@ import com.miniagent.web.dto.resp.ProcedureProposalReviewRequest;
 import com.miniagent.agent.memory.entity.ProcedureRewriteProposalEntity;
 import com.miniagent.agent.memory.manager.ProcedureRewriteProposalService;
 import com.miniagent.agent.memory.manager.ProcedureCandidateValidationService;
+import com.miniagent.application.SubjectErasureService;
 import com.miniagent.web.dto.resp.ProcedureCandidateValidationRequest;
 import com.miniagent.config.entity.UserRole;
 import com.miniagent.config.security.AuthenticatedUser;
@@ -44,6 +45,27 @@ public class MemoryController {
     @Autowired
     private com.miniagent.agent.memory.service.AgentProjectAuthorizationService projectAuthorization;
 
+    @Autowired
+    private SubjectErasureService subjectErasureService;
+
+    private void assertWritable(AuthenticatedUser user) {
+        if (subjectErasureService != null) {
+            subjectErasureService.assertWritable(user.tenantKey(), user.userId());
+        }
+    }
+
+    /**
+     * Erase the authenticated subject across local stores and, in remote mode,
+     * the memory service. No user id is accepted from the request; a remote
+     * failure returns a pending result so callers cannot mistake partial cleanup
+     * for completed erasure.
+     */
+    @PostMapping("/erase-subject")
+    public ApiResponse<SubjectErasureService.Result> eraseSubject(HttpServletRequest request) {
+        AuthenticatedUser user = requireUser(request);
+        return ApiResponse.ok(subjectErasureService.erase(user.userId(), user.tenantKey()));
+    }
+
     /**
      * 记录 Agent 事件。
      */
@@ -51,6 +73,7 @@ public class MemoryController {
     public ApiResponse<Void> recordEvent(@RequestBody AgentEvent event,
                                          HttpServletRequest request) {
         AuthenticatedUser user = requireUser(request);
+        assertWritable(user);
         bindEventToPrincipal(event, user);
         memoryManager.recordEvent(event);
         return ApiResponse.ok(null);
@@ -63,6 +86,7 @@ public class MemoryController {
     public ApiResponse<MemoryIdDTO> writeMemory(@RequestBody MemoryEntry entry,
                                                 HttpServletRequest request) {
         AuthenticatedUser user = requireUser(request);
+        assertWritable(user);
         bindMemoryToPrincipal(entry, user);
         memoryManager.writeMemory(entry);
         return ApiResponse.ok(new MemoryIdDTO(entry.getId()));
@@ -113,6 +137,7 @@ public class MemoryController {
                                           @RequestBody MemoryEntry update,
                                           HttpServletRequest request) {
         AuthenticatedUser user = requireUser(request);
+        assertWritable(user);
         MemoryEntry stored = memoryManager.getMemory(user.tenantKey(), id)
                 .orElseThrow(() -> new AccessDeniedException("Memory is not accessible"));
         requireMemoryAccess(user, stored);
@@ -130,6 +155,7 @@ public class MemoryController {
     @DeleteMapping("/memories/{id}")
     public ApiResponse<Void> deleteMemory(@PathVariable Long id, HttpServletRequest request) {
         AuthenticatedUser user = requireUser(request);
+        assertWritable(user);
         MemoryEntry stored = memoryManager.getMemory(user.tenantKey(), id)
                 .orElseThrow(() -> new AccessDeniedException("Memory is not accessible"));
         requireMemoryAccess(user, stored);
@@ -144,6 +170,7 @@ public class MemoryController {
     public ApiResponse<Void> writeFact(@RequestBody SemanticFact fact,
                                        HttpServletRequest request) {
         AuthenticatedUser user = requireUser(request);
+        assertWritable(user);
         bindScopedRecord(fact, user);
         memoryManager.writeFact(fact);
         return ApiResponse.ok(null);
@@ -173,6 +200,7 @@ public class MemoryController {
     public ApiResponse<ProcedureWriteResultDTO> writeProcedure(@RequestBody Procedure procedure,
                                                                HttpServletRequest request) {
         AuthenticatedUser user = requireUser(request);
+        assertWritable(user);
         bindScopedRecord(procedure, user);
         try (var ignored = com.miniagent.common.context.OwnerContext.bind(
                 new com.miniagent.common.context.OwnerContext(user.userId(), user.tenantKey()))) {

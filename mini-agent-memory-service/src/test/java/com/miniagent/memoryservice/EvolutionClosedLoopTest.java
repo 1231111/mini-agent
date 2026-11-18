@@ -26,6 +26,7 @@ import com.miniagent.memory.contract.MemoryApi.OutcomeResult;
 import com.miniagent.memory.contract.MemoryApi.PolicyUpdate;
 import com.miniagent.memory.contract.MemoryApi.ProposalView;
 import com.miniagent.memory.contract.MemoryApi.ScopeType;
+import com.miniagent.memory.contract.MemoryApi.SubjectErasureResult;
 import com.miniagent.memory.contract.MemoryApi.Verdict;
 import com.miniagent.memory.contract.MemoryApi.UserFactMutation;
 import com.miniagent.memory.contract.MemoryApi.UserFactSync;
@@ -55,6 +56,7 @@ import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 
@@ -93,12 +95,16 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 @SpringBootTest(properties = {
         "spring.datasource.url=jdbc:h2:mem:closed-loop;MODE=MySQL;DB_CLOSE_DELAY=-1",
         "memory.service.role=api",
+        // Base configuration is fail-closed (OFF); this suite explicitly exercises
+        // the complete evolution lifecycle and therefore opts into AUTO.
+        "memory.evolution.policy.default-mode=AUTO",
         "memory.evolution.holdout.bps=0",
         "memory.evolution.trigger.debounce-seconds=0",
         "memory.evolution.experiment.min-samples-per-arm=5",
         "memory.evolution.eval.min-success-cases=3",
         "memory.evolution.metrics.refresh-ms=3600000"
 })
+@ActiveProfiles("test")
 @AutoConfigureMockMvc(print = MockMvcPrint.NONE)
 @Import(EvolutionClosedLoopTest.Fakes.class)
 class EvolutionClosedLoopTest {
@@ -332,6 +338,180 @@ class EvolutionClosedLoopTest {
         UserFactView tiedDeleted = call(HttpMethod.POST, MemoryApi.USER_FACTS, token,
                 new UserFactSync(List.of(tiedTombstone)), UserFactSyncResult.class).facts().getFirst();
         assertTrue(tiedDeleted.deleted(), "same-time delete wins against an active value");
+    }
+
+    @Test
+    void subjectErasurePurgesUserRecordsAndBlocksLateReplayIdempotently() throws Exception {
+        Ctx owner = new Ctx("erase-tenant", 8801);
+        String token = user(owner);
+        ItemView privateItem = createItem(owner, "erase-private-sop");
+        report(owner, "erase-task", privateItem.id(), OutcomeResult.SUCCESS);
+        UserFactMutation fact = new UserFactMutation("profile", "preference", "private value",
+                false, clock.instant());
+        call(HttpMethod.POST, MemoryApi.USER_FACTS, token,
+                new UserFactSync(List.of(fact)), UserFactSyncResult.class);
+        seedErasureHistory(owner, privateItem.id());
+        long sharedProjectItem = seedProjectMemory(owner);
+
+        SubjectErasureResult receipt = call(HttpMethod.DELETE,
+                MemoryApi.SUBJECTS + "/" + owner.user(), token, null, SubjectErasureResult.class);
+        assertTrue(receipt.complete());
+        assertEquals(1, receipt.erasedItems());
+        assertEquals(1, receipt.erasedFacts());
+        assertNotNull(receipt.completedAt());
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM mem_user_fact"
+                + " WHERE tenant_id = ? AND user_id = ?", Integer.class, owner.tenant(), owner.user()));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM mem_item"
+                + " WHERE tenant_id = ? AND scope_type = 'USER' AND scope_id = ?",
+                Integer.class, owner.tenant(), String.valueOf(owner.user())));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM outcome_event"
+                + " WHERE tenant_id = ? AND user_id = ?", Integer.class, owner.tenant(), owner.user()));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM evo_proposal WHERE item_id = ?",
+                Integer.class, privateItem.id()));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM evo_job WHERE item_id = ?",
+                Integer.class, privateItem.id()));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM memory_evolution_proposals"
+                + " WHERE tenant_id = ? AND user_id = ?", Integer.class, owner.tenant(), owner.user()));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM memory_evolution_trials"
+                + " WHERE tenant_id = ?", Integer.class, owner.tenant()));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM memory_evolution_canary_observations"
+                + " WHERE tenant_id = ?", Integer.class, owner.tenant()));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM memory_evolution_validation_runs"
+                + " WHERE tenant_id = ? AND user_id = ?", Integer.class, owner.tenant(), owner.user()));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM memory_evolution_validation_locks"
+                + " WHERE tenant_id = ?", Integer.class, owner.tenant()));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM memory_evolution_canary_assignments"
+                + " WHERE tenant_id = ? AND user_id = ?", Integer.class, owner.tenant(), owner.user()));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM memory_evolution_evidence"
+                + " WHERE tenant_id = ? AND user_id = ?", Integer.class, owner.tenant(), owner.user()));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM agent_procedures"
+                + " WHERE tenant_id = ? AND scope_type = 'USER' AND scope_id = ?",
+                Integer.class, owner.tenant(), String.valueOf(owner.user())));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM agent_procedure_applications"
+                + " WHERE tenant_id = ? AND user_id = ?", Integer.class, owner.tenant(), owner.user()));
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM mem_item WHERE id = ?",
+                Integer.class, sharedProjectItem), "project-shared memory is retained");
+        assertEquals("REVOKED", jdbc.queryForObject("SELECT status FROM memory_project_authorizations"
+                + " WHERE tenant_id = ? AND project_id = ?", String.class, owner.tenant(),
+                "erase-shared-project"));
+
+        String lateReplay = mvc.perform(build(HttpMethod.POST, MemoryApi.USER_FACTS, token,
+                        new UserFactSync(List.of(new UserFactMutation("profile", "preference",
+                                "resurrected", false, clock.instant())))))
+                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+        assertFalse(json.readTree(lateReplay).path("success").asBoolean(),
+                "a late offline sync must not recreate erased facts");
+        String lateProcedure = mvc.perform(build(HttpMethod.POST, MemoryApi.ITEMS, token,
+                        new ItemWrite(ScopeType.USER, null, "late-private-sop",
+                                new ProcedureContent("description", List.of(), List.of("step"),
+                                        List.of("done")), null)))
+                .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+        assertFalse(json.readTree(lateProcedure).path("success").asBoolean(),
+                "a late USER SOP projection must not recreate erased records");
+
+        UserFactSyncResult otherTenantFact = call(HttpMethod.POST, MemoryApi.USER_FACTS,
+                user(new Ctx("different-erase-tenant", owner.user())),
+                new UserFactSync(List.of(new UserFactMutation("profile", "preference", "other",
+                        false, clock.instant()))), UserFactSyncResult.class);
+        assertEquals("other", otherTenantFact.facts().getFirst().objectValue(),
+                "the same numeric user id in another tenant is a separate subject");
+
+        SubjectErasureResult retry = call(HttpMethod.DELETE,
+                MemoryApi.SUBJECTS + "/" + owner.user(), token, null, SubjectErasureResult.class);
+        assertEquals(receipt, retry, "retries return the durable first completion receipt");
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM mem_user_fact"
+                + " WHERE tenant_id = ? AND user_id = ?", Integer.class, owner.tenant(), owner.user()));
+    }
+
+    private void seedErasureHistory(Ctx owner, long itemId) {
+        Instant now = clock.instant();
+        long revisionId = jdbc.queryForObject("SELECT active_revision_id FROM mem_item WHERE id = ?",
+                Long.class, itemId);
+        jdbc.update("INSERT INTO evo_proposal (tenant_id, item_id, trigger_type, state,"
+                        + " base_revision_id, generator_version, traffic_bps, max_traffic_bps,"
+                        + " ramp_step, tokens_used, created_at, updated_at)"
+                        + " VALUES (?, ?, 'FAILURE', 'PENDING_REVIEW', ?, 'test', 0, 10000, 1, 0, ?, ?)",
+                owner.tenant(), itemId, revisionId, java.sql.Timestamp.from(now),
+                java.sql.Timestamp.from(now));
+        long proposalId = jdbc.queryForObject("SELECT id FROM evo_proposal WHERE item_id = ?",
+                Long.class, itemId);
+        jdbc.update("INSERT INTO evo_job (job_type, open_key, tenant_id, item_id, proposal_id,"
+                        + " payload_json, status, priority, attempts, run_after, created_at, updated_at)"
+                        + " VALUES ('DETECT', ?, ?, ?, ?, '{}', 'PENDING', 1, 0, ?, ?, ?)",
+                "erase-job-" + itemId, owner.tenant(), itemId, proposalId,
+                java.sql.Timestamp.from(now), java.sql.Timestamp.from(now), java.sql.Timestamp.from(now));
+        jdbc.update("INSERT INTO evo_regression_case (item_id, proposal_id, user_message, status, created_at)"
+                        + " VALUES (?, ?, 'private prompt', 'ACTIVE', ?)",
+                itemId, proposalId, java.sql.Timestamp.from(now));
+        jdbc.update("INSERT INTO evo_review (proposal_id, reviewer, agree, note, created_at)"
+                        + " VALUES (?, 'user:8801', TRUE, 'private note', ?)",
+                proposalId, java.sql.Timestamp.from(now));
+
+        String candidate = "erase-candidate-" + itemId;
+        String hash = "a".repeat(64);
+        jdbc.update("INSERT INTO memory_evolution_proposals (tenant_id, user_id, procedure_id,"
+                        + " base_version, candidate_id, base_content_json, candidate_content_json,"
+                        + " candidate_hash, generator_version, evidence_ids_json, status)"
+                        + " VALUES (?, ?, ?, 1, ?, '{}', '{}', ?, 'test', '[]', 'PENDING')",
+                owner.tenant(), owner.user(), itemId, candidate, hash);
+        long legacyProposalId = jdbc.queryForObject("SELECT proposal_id"
+                + " FROM memory_evolution_proposals WHERE tenant_id = ? AND user_id = ?",
+                Long.class, owner.tenant(), owner.user());
+        jdbc.update("INSERT INTO memory_evolution_trials (tenant_id, proposal_id, candidate_hash,"
+                        + " suite_id, suite_version, sample_id, variant, passed, duration_ms)"
+                        + " VALUES (?, ?, ?, 'suite', '1', 'sample', 'BASELINE', TRUE, 1)",
+                owner.tenant(), legacyProposalId, hash);
+        jdbc.update("INSERT INTO memory_evolution_canary_observations (tenant_id, proposal_id,"
+                        + " candidate_hash, source_observation_id, passed) VALUES (?, ?, ?, ?, TRUE)",
+                owner.tenant(), legacyProposalId, hash, "observation-" + itemId);
+        jdbc.update("INSERT INTO memory_evolution_validation_runs (run_id, tenant_id, user_id,"
+                        + " proposal_id, candidate_hash, base_content_hash, candidate_content_hash,"
+                        + " suite_id, suite_version, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'suite', '1', 'PASSED')",
+                "run-" + itemId, owner.tenant(), owner.user(), legacyProposalId, hash, hash, hash);
+        jdbc.update("INSERT INTO memory_evolution_validation_locks (tenant_id, proposal_id,"
+                        + " candidate_hash, suite_id, suite_version) VALUES (?, ?, ?, 'suite', '1')",
+                owner.tenant(), legacyProposalId, hash);
+        jdbc.update("INSERT INTO memory_evolution_canary_assignments (tenant_id, user_id, session_id,"
+                        + " task_id, node_id, procedure_id, procedure_version, proposal_id, candidate_hash,"
+                        + " variant, target_percent, bucket, router_attestation)"
+                        + " VALUES (?, ?, ?, 1, 'node', ?, 1, ?, ?, 'BASELINE', 1, 0, 'signed')",
+                owner.tenant(), owner.user(), "session-" + itemId, itemId, legacyProposalId, hash);
+        jdbc.update("INSERT INTO memory_evolution_evidence (tenant_id, user_id, procedure_id,"
+                        + " procedure_version, session_id, task_id, node_id, task_summary, resolution_text,"
+                        + " evidence_hash, proposal_id) VALUES (?, ?, ?, 1, ?, 1, 'node', 'summary',"
+                        + " 'resolution', ?, ?)", owner.tenant(), owner.user(), itemId,
+                "session-" + itemId, hash, legacyProposalId);
+
+        long legacyProcedureId = 9_900_001L + itemId;
+        jdbc.update("INSERT INTO agent_procedures (id, tenant_id, scope_type, scope_id, name,"
+                        + " steps_json, procedure_version, created_at, updated_at)"
+                        + " VALUES (?, ?, 'USER', ?, 'private', '[]', 1, ?, ?)",
+                legacyProcedureId, owner.tenant(), String.valueOf(owner.user()),
+                java.sql.Timestamp.from(now), java.sql.Timestamp.from(now));
+        jdbc.update("INSERT INTO agent_procedure_applications (tenant_id, user_id, session_id,"
+                        + " task_id, node_id, procedure_id, procedure_version, action_id, result)"
+                        + " VALUES (?, ?, ?, 1, 'node', ?, 1, ?, 'SUCCESS')",
+                owner.tenant(), owner.user(), "session-" + itemId, legacyProcedureId,
+                "action-" + itemId);
+    }
+
+    private long seedProjectMemory(Ctx owner) {
+        Instant now = clock.instant();
+        jdbc.update("INSERT INTO mem_item (tenant_id, scope_type, scope_id, owner_user_id,"
+                        + " name, name_key, status, activation_version, evolution_locked, health,"
+                        + " created_at, updated_at) VALUES (?, 'PROJECT', ?, ?, 'shared', 'shared',"
+                        + " 'ACTIVE', 1, FALSE, 'UNKNOWN', ?, ?)", owner.tenant(),
+                "erase-shared-project", owner.user(), java.sql.Timestamp.from(now),
+                java.sql.Timestamp.from(now));
+        long itemId = jdbc.queryForObject("SELECT id FROM mem_item WHERE tenant_id = ?"
+                        + " AND scope_type = 'PROJECT' AND scope_id = ?",
+                Long.class, owner.tenant(), "erase-shared-project");
+        jdbc.update("INSERT INTO memory_project_authorizations (tenant_id, project_id, owner_user_id,"
+                        + " authorization_version, status, updated_at) VALUES (?, ?, ?, 1, 'ACTIVE', ?)",
+                owner.tenant(), "erase-shared-project", owner.user(), java.sql.Timestamp.from(now));
+        jdbc.update("INSERT INTO memory_project_members (tenant_id, project_id, user_id, authorization_version)"
+                        + " VALUES (?, ?, 99001, 1)", owner.tenant(), "erase-shared-project");
+        return itemId;
     }
 
     @Test

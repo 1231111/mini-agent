@@ -294,9 +294,7 @@ public class ItemStore {
 
     /** 用户删除级联：返回被删条目 id，供调用方清理提案与作业。 */
     public List<Long> deleteUserScope(String tenantId, long userId) {
-        List<Long> ids = jdbc.queryForList("SELECT id FROM mem_item WHERE tenant_id = ?"
-                + " AND scope_type = 'USER' AND scope_id = ?", Long.class, tenantId,
-                String.valueOf(userId));
+        List<Long> ids = userScopeIds(tenantId, userId);
         if (ids.isEmpty()) {
             return ids;
         }
@@ -305,6 +303,12 @@ public class ItemStore {
         named.update("DELETE FROM mem_revision WHERE item_id IN (:ids)", p);
         named.update("DELETE FROM mem_item WHERE id IN (:ids)", p);
         return ids;
+    }
+
+    public List<Long> userScopeIds(String tenantId, long userId) {
+        return jdbc.queryForList("SELECT id FROM mem_item WHERE tenant_id = ?"
+                        + " AND scope_type = 'USER' AND scope_id = ? AND owner_user_id = ?",
+                Long.class, tenantId, String.valueOf(userId), userId);
     }
 
     private void history(long itemId, Long fromRevisionId, long toRevisionId, Reason reason,

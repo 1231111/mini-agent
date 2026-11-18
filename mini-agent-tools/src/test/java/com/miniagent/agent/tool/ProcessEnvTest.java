@@ -62,6 +62,32 @@ class ProcessEnvTest {
     }
 
     @Test
+    void mcpEnvironmentKeepsOnlyMinimalOsKeysAndExplicitServerVariables() {
+        ProcessEnv.allowKeys("MINIAGENT_TEST_MCP_PASSTHROUGH");
+        ProcessBuilder pb = new ProcessBuilder("noop");
+        pb.environment().put("PATH", "C:\\tools");
+        pb.environment().put("SystemRoot", "C:\\Windows");
+        pb.environment().put("TEMP", "C:\\Temp");
+        pb.environment().put("HOME", "C:\\Users\\agent");
+        pb.environment().put("LLM_API_KEY", "model-secret");
+        pb.environment().put("JAVA_HOME", "C:\\Java");
+        pb.environment().put("MINIAGENT_TEST_MCP_PASSTHROUGH", "global-passthrough");
+
+        int dropped = ProcessEnv.sanitizeMcp(pb, Map.of("MCP_ACCESS_TOKEN", "server-token"));
+
+        assertTrue(dropped >= 3);
+        assertEquals("C:\\tools", pb.environment().get("PATH"));
+        assertEquals("C:\\Windows", pb.environment().get("SystemRoot"));
+        assertEquals("C:\\Temp", pb.environment().get("TEMP"));
+        assertEquals("C:\\Users\\agent", pb.environment().get("HOME"));
+        assertEquals("server-token", pb.environment().get("MCP_ACCESS_TOKEN"));
+        assertFalse(pb.environment().containsKey("LLM_API_KEY"));
+        assertFalse(pb.environment().containsKey("JAVA_HOME"));
+        assertFalse(pb.environment().containsKey("MINIAGENT_TEST_MCP_PASSTHROUGH"),
+                "the broad CLI passthrough list must not be inherited by MCP");
+    }
+
+    @Test
     void putDeclaredMergesAfterSanitize() {
         ProcessBuilder pb = new ProcessBuilder("noop");
         pb.environment().put("MINIAGENT_TEST_SECRET", "should-be-dropped");

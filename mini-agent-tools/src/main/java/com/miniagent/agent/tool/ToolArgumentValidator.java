@@ -28,7 +28,16 @@ public final class ToolArgumentValidator {
             return ValidationResult.failure("工具参数不是合法 JSON: " + e.getMessage());
         }
         if (schema == null || schema.isEmpty()) {
-            return ValidationResult.success(args);
+            return args.isEmpty()
+                    ? ValidationResult.success(args)
+                    : ValidationResult.failure("工具不接受参数: " + args.fieldNames().next());
+        }
+        var fieldNames = args.fieldNames();
+        while (fieldNames.hasNext()) {
+            String fieldName = fieldNames.next();
+            if (!schema.containsKey(fieldName)) {
+                return ValidationResult.failure("未知参数: " + fieldName);
+            }
         }
         for (Map.Entry<String, Object> entry : schema.entrySet()) {
             if (!(entry.getValue() instanceof Map<?, ?> def)) {

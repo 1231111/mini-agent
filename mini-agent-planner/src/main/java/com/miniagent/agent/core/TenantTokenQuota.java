@@ -7,7 +7,7 @@ public interface TenantTokenQuota {
         public static Decision unlimited(long used) { return new Decision(true, used, 0); }
     }
 
-    Decision check(Long tenantId);
+    Decision check(Long tenantId, Long userId);
 
-    Decision consume(Long tenantId, long tokens);
+    Decision consume(Long tenantId, Long userId, long tokens);
 }

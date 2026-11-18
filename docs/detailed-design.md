@@ -1058,7 +1058,7 @@ V7 已删意图规则表，不要再建。
 | 扩展 | 做法 |
 |------|------|
 | 新工具 | `ToolRegistry.register`，经 `ToolPipeline` |
-| 新 MCP 服务器 | yml `agent.mcp.servers`，再把 `enabled` 打开 |
+| 新 MCP 服务器 | yml `agent.mcp.servers` 配置绝对路径 `command`、完全相同的 `allowed-executable`、env 与精确 `allowed-tools`，再把 `enabled` 打开；任一白名单为空或不匹配时不会注册工具。子进程故障后只按 `max-reconnect-attempts` / `reconnect-window-seconds` 有界重启，预算耗尽需管理员 refresh 或等窗口到期 |
 | 新技能 | `{data-dir}/skills/<name>/SKILL.md` |
 | 新模型预设 | `agent.models.presets` |
 | 新能力识别 | 别加词表。缺什么能力就加工具（`ToolRegistry.register`），让模型自己选 |

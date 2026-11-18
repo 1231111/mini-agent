@@ -210,24 +210,6 @@ class MembershipServiceTest {
     }
 
     @Test
-    @DisplayName("网页确认到账不能支付别人的订单，原订单保持 PENDING")
-    void confirmPortalPaymentRejectsAnotherUser() {
-        User alice = newUser("alice");
-        User bob = newUser("bob");
-        MembershipOrder order = membership.createOrder(alice.getId(), "pro");
-
-        assertThatThrownBy(() ->
-                membership.confirmPortalPayment(bob.getId(), order.getOrderNo()))
-                .isInstanceOf(BusinessException.class)
-                .extracting(e -> ((BusinessException) e).getErrorCode())
-                .isEqualTo(ErrorCode.AUTH_FORBIDDEN);
-
-        MembershipOrder reloaded = orders.findByOrderNo(order.getOrderNo()).orElseThrow();
-        assertThat(reloaded.getStatus()).isEqualTo(MembershipOrder.Status.PENDING);
-        assertThat(tenantQuotaOf(alice)).isEqualTo(FREE_TOKENS);
-    }
-
-    @Test
     @DisplayName("订单不存在时报 MEMBER.01.03")
     void markPaidRejectsUnknownOrder() {
         assertThatThrownBy(() -> membership.markPaid("MA-nope", "alipay", "TXN"))

@@ -19,7 +19,8 @@ class EventDrivenConsolidationWorkerTest {
         DefaultConsolidationService consolidation = mock(DefaultConsolidationService.class);
         MemoryTaskLock lock = mock(MemoryTaskLock.class);
         when(lock.tryLock(eq("consolidation-worker"), any())).thenReturn(true);
-        when(events.findByProcessedFalseOrderByCreatedAtAsc()).thenReturn(List.of(
+        when(events.findTop50ByProcessedFalseAndSessionIdIsNotNullAndTenantIdIsNotNullOrderByCreatedAtAsc())
+                .thenReturn(List.of(
                 event("tenant-a", "session-a", null),
                 event("tenant-b", "session-a", null),
                 event("tenant-a", "session-a", "")));
@@ -35,7 +36,30 @@ class EventDrivenConsolidationWorkerTest {
         verify(consolidation).consolidate("tenant-a", "session-a");
         verify(consolidation).consolidate("tenant-b", "session-a");
         verify(consolidation, times(2)).consolidate(any(String.class), any(String.class));
+        verify(events).markUnconsolidatableProcessed();
         verify(lock).unlock("consolidation-worker");
+    }
+
+    @Test
+    void quarantinesMissingSessionEventsSoTheyCannotStarveEligibleWork() {
+        AgentEventRepository events = mock(AgentEventRepository.class);
+        DefaultConsolidationService consolidation = mock(DefaultConsolidationService.class);
+        MemoryTaskLock lock = mock(MemoryTaskLock.class);
+        when(lock.tryLock(eq("consolidation-worker"), any())).thenReturn(true);
+        when(events.markUnconsolidatableProcessed()).thenReturn(3);
+        when(events.findTop50ByProcessedFalseAndSessionIdIsNotNullAndTenantIdIsNotNullOrderByCreatedAtAsc())
+                .thenReturn(List.of(event("tenant-ok", "session-ok", null)));
+
+        EventDrivenConsolidationWorker worker = new EventDrivenConsolidationWorker();
+        ReflectionTestUtils.setField(worker, "eventRepository", events);
+        ReflectionTestUtils.setField(worker, "consolidationService", consolidation);
+        ReflectionTestUtils.setField(worker, "taskLock", lock);
+        ReflectionTestUtils.setField(worker, "batchSize", 50);
+
+        worker.processPendingEvents();
+
+        verify(consolidation).consolidate("tenant-ok", "session-ok");
+        verify(events).findTop50ByProcessedFalseAndSessionIdIsNotNullAndTenantIdIsNotNullOrderByCreatedAtAsc();
     }
 
     private static AgentEventEntity event(String tenantId, String sessionId, String taskId) {

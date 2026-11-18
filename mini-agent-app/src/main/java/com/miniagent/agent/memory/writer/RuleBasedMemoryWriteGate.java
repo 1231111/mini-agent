@@ -5,9 +5,14 @@ import com.miniagent.memory.model.AgentEvent;
 import com.miniagent.memory.model.GateDecision;
 import com.miniagent.memory.model.MemoryEntry;
 import com.miniagent.memory.writer.MemoryWriteGate;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
@@ -48,6 +53,20 @@ public class RuleBasedMemoryWriteGate implements MemoryWriteGate {
     @Value("${agent.memory.gate.enabled:true}")
     private boolean enabled;
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private MeterRegistry meterRegistry;
+
+    /**
+     * Durable audit for gate decisions.  The in-process counters remain useful
+     * for fast metrics, but they disappear on restart; persisting the decision
+     * gives operators a restart-safe quality signal and a bounded audit trail.
+     */
+    @Autowired(required = false)
+    private JdbcTemplate jdbc;
+
+    @Value("${agent.memory.gate.retention-days:90}")
+    private int denialRetentionDays;
+
     /** 各规则拒绝计数，供运维观测误拒率（不做持久化，进程内统计）。 */
     private final Map<GateDecision.Rule, AtomicLong> denyCounters = new ConcurrentHashMap<>();
 
@@ -62,16 +81,16 @@ public class RuleBasedMemoryWriteGate implements MemoryWriteGate {
         // 结构层 G-02：信息量不足
         if (meaningfulLength(content) < MIN_CONTENT_CHARS) {
             return deny(GateDecision.Rule.NO_CONTENT,
-                "有效内容不足 " + MIN_CONTENT_CHARS + " 字");
+                "有效内容不足 " + MIN_CONTENT_CHARS + " 字", event);
         }
 
         // 结构层 G-03：纯状态迁移
         if (isRitual(event)) {
-            return deny(GateDecision.Rule.RITUAL, "状态迁移事件，无实质载荷");
+            return deny(GateDecision.Rule.RITUAL, "状态迁移事件，无实质载荷", event);
         }
 
         // 安全层 G-01：复用既有安全扫描
-        GateDecision security = scanSecurity(content, candidate.getSummary());
+        GateDecision security = scanSecurity(content, candidate.getSummary(), event);
         if (security != null) {
             return security;
         }
@@ -83,7 +102,7 @@ public class RuleBasedMemoryWriteGate implements MemoryWriteGate {
      * 调用既有安全扫描器。命中时返回拒绝裁决，安全时返回 null。
      * 正文与摘要都要扫：摘要同样会进入系统提示。
      */
-    private GateDecision scanSecurity(String content, String summary) {
+    private GateDecision scanSecurity(String content, String summary, AgentEvent event) {
         String reason = SecurityScanner.scan(content);
         if (reason == null && summary != null && !summary.isBlank()) {
             reason = SecurityScanner.scan(summary);
@@ -91,15 +110,55 @@ public class RuleBasedMemoryWriteGate implements MemoryWriteGate {
         if (reason == null) {
             return null;
         }
-        return deny(GateDecision.Rule.SECURITY, reason);
+        return deny(GateDecision.Rule.SECURITY, reason, event);
     }
 
-    private GateDecision deny(GateDecision.Rule rule, String reason) {
+    private GateDecision deny(GateDecision.Rule rule, String reason, AgentEvent event) {
         denyCounters.computeIfAbsent(rule, k -> new AtomicLong()).incrementAndGet();
+        if (meterRegistry != null) {
+            Counter.builder("miniagent.memory.write_gate.denied")
+                    .tag("rule", rule.code())
+                    .register(meterRegistry)
+                    .increment();
+        }
+        persistDenial(rule, reason, event);
         if (log.isDebugEnabled()) {
             log.debug("写入闸门拒绝 [{}] {}", rule.code(), reason);
         }
         return GateDecision.deny(rule, reason);
+    }
+
+    private void persistDenial(GateDecision.Rule rule, String reason, AgentEvent event) {
+        if (jdbc == null) {
+            return;
+        }
+        String tenant = event == null || event.getTenantId() == null
+                || event.getTenantId().isBlank() ? "unknown" : event.getTenantId();
+        String clipped = reason == null ? "" : reason.substring(0, Math.min(500, reason.length()));
+        try {
+            jdbc.update("INSERT INTO agent_memory_write_gate_denials "
+                            + "(tenant_id, rule_code, reason, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP(6))",
+                    tenant, rule.code(), clipped);
+        } catch (Exception e) {
+            // Gate decisions must never make a memory write path fail closed a
+            // second time merely because its optional audit store is unavailable.
+            log.warn("写入闸门拒绝审计落库失败: tenant={}, rule={}", tenant, rule.code());
+        }
+    }
+
+    /** Keep the durable audit bounded; aggregate metrics remain in the registry. */
+    @Scheduled(cron = "${agent.memory.gate.purge-cron:0 25 3 * * *}")
+    void purgeOldDenials() {
+        if (jdbc == null) {
+            return;
+        }
+        try {
+            jdbc.update("DELETE FROM agent_memory_write_gate_denials "
+                            + "WHERE created_at < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL ? DAY)",
+                    Math.max(1, denialRetentionDays));
+        } catch (Exception e) {
+            log.warn("写入闸门拒绝审计清理失败", e);
+        }
     }
 
     /** 去掉结构化标签后的有效字符数。 */

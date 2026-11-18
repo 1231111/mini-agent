@@ -5,9 +5,14 @@ import com.miniagent.common.ErrorCode;
 import com.miniagent.common.MessageConstants;
 import com.miniagent.common.exception.BusinessException;
 import com.miniagent.common.exception.SystemException;
+import com.miniagent.application.TenantQuotaExceededException;
 import com.miniagent.config.cloud.CloudAccountException;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.RecoverableDataAccessException;
+import org.springframework.dao.TransientDataAccessException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.AccessDeniedException;
@@ -46,7 +51,44 @@ public class GlobalExceptionHandler {
         return ResponseEntity.badRequest().body(ApiResponse.fail(e.getErrorCode(), e.getMessage()));
     }
 
+    @ExceptionHandler(TenantQuotaExceededException.class)
+    public ResponseEntity<ApiResponse<Void>> handleTenantQuotaExceeded(TenantQuotaExceededException e) {
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", "86400")
+                .body(ApiResponse.fail(ErrorCode.AGENT_TENANT_QUOTA_EXCEEDED, e.getMessage()));
+    }
+
     // ==================== 系统异常 ====================
+
+    /** Only recognized temporary store outages are retryable infrastructure failures. */
+    @ExceptionHandler(DataAccessException.class)
+    public ResponseEntity<ApiResponse<Void>> handleDataAccessUnavailable(DataAccessException e) {
+        if (isTemporaryDataAccessFailure(e)) {
+            log.warn("Data store temporarily unavailable [{}]", e.getClass().getSimpleName());
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .header("Retry-After", "5")
+                    .body(ApiResponse.fail(ErrorCode.SYSTEM_INTERNAL_ERROR,
+                            "服务暂不可用，请稍后重试"));
+        }
+        // Constraint, SQL, and mapping errors are not made retryable by this handler.
+        log.error("Non-retryable data access failure [{}]", e.getClass().getSimpleName(), e);
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ApiResponse.fail(ErrorCode.SYSTEM_INTERNAL_ERROR, "系统内部错误，请稍后重试"));
+    }
+
+    private static boolean isTemporaryDataAccessFailure(Throwable failure) {
+        for (Throwable current = failure; current != null && current.getCause() != current;
+             current = current.getCause()) {
+            if (current instanceof TransientDataAccessException
+                    || current instanceof RecoverableDataAccessException
+                    || current instanceof DataAccessResourceFailureException
+                    || current instanceof java.sql.SQLTransientException
+                    || current instanceof java.sql.SQLRecoverableException) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     @ExceptionHandler(SystemException.class)
     public ResponseEntity<ApiResponse<Void>> handleSystem(SystemException e) {

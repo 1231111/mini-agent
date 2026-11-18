@@ -1,6 +1,7 @@
 package com.miniagent.config.security;
 
 import com.miniagent.common.permission.ExecPolicy;
+import com.miniagent.common.security.RepositoryCredentialDefaults;
 import jakarta.annotation.PostConstruct;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -26,19 +27,34 @@ public class ProductionReadinessValidator {
     void validate() {
         List<String> errors = new ArrayList<>();
         require("DB_URL", errors);
-        require("DB_USERNAME", errors);
-        requireSecret("DB_PASSWORD", errors);
-        requireSecret("REDIS_PASSWORD", errors);
+        validateDatabaseTls(errors);
+        validatePrivateBindOrTls(errors);
+        String databaseUsername = require("DB_USERNAME", errors);
+        if (databaseUsername != null && !isProductionDatabaseUsername(databaseUsername)) {
+            errors.add("DB_USERNAME must name a dedicated database user, not root");
+        }
+        requireProductionSecret("spring.datasource.password", "DB_PASSWORD", 32, errors);
+        requireProductionSecret("spring.data.redis.password", "REDIS_PASSWORD", 32, errors);
         // The desktop profile intentionally stores the MiMo credential as
         // MIMO_API_KEY in ~/.miniagent/config.yml.  application.yml resolves
         // that value into the effective LangChain4j property, so requiring
         // the environment variable name here incorrectly rejects a valid
         // MiMo-only configuration in prod.
         requireConfiguredLlmKey(errors);
+        validateLlmEndpoints(errors);
         require("ALLOWED_ORIGINS", errors);
         String encryptionKey = requireSecret("MODEL_CONFIG_ENCRYPTION_KEY", errors);
         validateEncryptionKey(encryptionKey, errors);
         validateJwtSecret(errors);
+        requireProductionSecret("agent.account.cloud.internal-key", "ACCOUNT_INTERNAL_KEY", 32, errors);
+        validateIndependentJudge(errors);
+        boolean antivirusRequired = environment.getProperty(
+                "file.upload.antivirus.required", Boolean.class, false);
+        boolean antivirusEnabled = environment.getProperty(
+                "file.upload.antivirus.enabled", Boolean.class, false);
+        if (antivirusRequired && !antivirusEnabled) {
+            errors.add("file.upload.antivirus.enabled must be true when upload antivirus is required");
+        }
         String bootstrapUsername = environment.getProperty("BOOTSTRAP_ADMIN_USERNAME", "").trim();
         String bootstrapPassword = environment.getProperty("BOOTSTRAP_ADMIN_PASSWORD", "");
         if (!bootstrapUsername.isEmpty() || !bootstrapPassword.isBlank()) {
@@ -105,10 +121,11 @@ public class ProductionReadinessValidator {
                         + "' (expected true / false; prefer agent.tools.exec-policy)");
             }
         }
-        if (execPolicy == ExecPolicy.ALLOW) {
-            errors.add("exec tool must not be globally allowed in production "
-                    + "(agent.tools.exec-policy must be ask or block)");
+        if (!isProductionExecPolicy(execPolicyRaw)) {
+            errors.add("exec tool must be blocked in production until command isolation is available "
+                    + "(agent.tools.exec-policy must be block)");
         }
+        validateProcessEnvironmentPassthrough(errors);
         if (environment.getProperty("agent.tools.allow-absolute-write", Boolean.class, false)) {
             errors.add("absolute file writes must be disabled in production");
         }
@@ -160,6 +177,36 @@ public class ProductionReadinessValidator {
         return value;
     }
 
+    private String requireProductionSecret(String property, String envAlias, int minimumBytes,
+                                           List<String> errors) {
+        String value = environment.getProperty(property);
+        if (value == null || value.isBlank()) {
+            value = environment.getProperty(envAlias, "");
+        }
+        if (value == null || value.isBlank()) {
+            errors.add(property + " is required (env " + envAlias + ")");
+            return value;
+        }
+        if (RepositoryCredentialDefaults.isKnownDefault(value)) {
+            errors.add(property + " must not use a repository development credential");
+        }
+        String normalized = value.trim().toLowerCase(java.util.Locale.ROOT);
+        if (normalized.contains("replace-") || normalized.contains("changeme")) {
+            errors.add(property + " still contains a placeholder value");
+        }
+        if (value.trim().getBytes(java.nio.charset.StandardCharsets.UTF_8).length < minimumBytes) {
+            errors.add(property + " must be at least " + minimumBytes + " bytes");
+        }
+        return value;
+    }
+
+    private void validateProcessEnvironmentPassthrough(List<String> errors) {
+        String passthrough = environment.getProperty("agent.tools.env-passthrough", "");
+        if (hasProductionEnvironmentPassthrough(passthrough)) {
+            errors.add("agent.tools.env-passthrough must be empty in production; shell commands run without isolation");
+        }
+    }
+
     /**
      * Validate the credential actually consumed by the chat client.  Keep
      * environment-variable compatibility while accepting the supported MiMo
@@ -184,6 +231,61 @@ public class ProductionReadinessValidator {
         return value;
     }
 
+    private void validateLlmEndpoints(List<String> errors) {
+        requireHttpsEndpoint("langchain4j.open-ai.chat-model.base-url", "LLM_BASE_URL", errors);
+        requireHttpsEndpoint("langchain4j.open-ai.streaming-chat-model.base-url",
+                "LLM_BASE_URL", errors);
+    }
+
+    /**
+     * Production enables the independent semantic judge so that the executor
+     * cannot grade its own output.  Treat a missing judge configuration as a
+     * startup error instead of allowing the runtime to silently fall back to
+     * the execution model.
+     */
+    private void validateIndependentJudge(List<String> errors) {
+        if (!environment.getProperty("agent.planner.require-independent-judge", Boolean.class, false)) {
+            return;
+        }
+        requireNonBlank("agent.planner.judge-model-name", "AGENT_JUDGE_MODEL_NAME", errors);
+        requireHttpsEndpoint("agent.planner.judge-base-url", "AGENT_JUDGE_BASE_URL", errors);
+        requireProductionSecret("agent.planner.judge-api-key", "AGENT_JUDGE_API_KEY", 16, errors);
+    }
+
+    private String requireHttpsEndpoint(String property, String envAlias, List<String> errors) {
+        String value = environment.getProperty(property);
+        if (value == null || value.isBlank()) {
+            value = environment.getProperty(envAlias, "");
+        }
+        if (value == null || value.isBlank()) {
+            errors.add(property + " is required and must use HTTPS (env " + envAlias + ")");
+            return "";
+        }
+        try {
+            URI uri = URI.create(value.trim());
+            if (!"https".equalsIgnoreCase(uri.getScheme()) || uri.getHost() == null
+                    || uri.getUserInfo() != null || uri.getQuery() != null
+                    || uri.getFragment() != null || uri.getPort() == 0 || uri.getPort() > 65535) {
+                errors.add(property + " must be an absolute HTTPS URL without credentials, query or fragment");
+            }
+        } catch (IllegalArgumentException e) {
+            errors.add(property + " must be a valid absolute HTTPS URL");
+        }
+        return value.trim();
+    }
+
+    private String requireNonBlank(String property, String envAlias, List<String> errors) {
+        String value = environment.getProperty(property);
+        if (value == null || value.isBlank()) {
+            value = environment.getProperty(envAlias, "");
+        }
+        if (value == null || value.isBlank()) {
+            errors.add(property + " is required when independent judge is enabled (env " + envAlias + ")");
+            return "";
+        }
+        return value.trim();
+    }
+
     /**
      * JWT 签名密钥（{@code agent.auth.jwt-secret}，env {@code JWT_SECRET}，旧名 {@code COOKIE_SECRET}）。
      *
@@ -200,13 +302,26 @@ public class ProductionReadinessValidator {
             return;
         }
         String normalized = secret.trim().toLowerCase(java.util.Locale.ROOT);
-        if (normalized.contains("not-for-production") || normalized.contains("replace-")
+        if (RepositoryCredentialDefaults.isKnownDefault(secret)
+                || normalized.contains("not-for-production") || normalized.contains("replace-")
                 || normalized.contains("changeme")) {
             errors.add("agent.auth.jwt-secret must not be a placeholder or local development default");
         }
         if (secret.getBytes(java.nio.charset.StandardCharsets.UTF_8).length * 8 < 256) {
             errors.add("agent.auth.jwt-secret must be at least 256 bits for HS256");
         }
+    }
+
+    static boolean isProductionExecPolicy(String value) {
+        return ExecPolicy.parse(value) == ExecPolicy.BLOCK;
+    }
+
+    static boolean hasProductionEnvironmentPassthrough(String value) {
+        return value != null && !value.isBlank();
+    }
+
+    static boolean isProductionDatabaseUsername(String value) {
+        return value != null && !value.isBlank() && !"root".equalsIgnoreCase(value.trim());
     }
 
     private static void validateEncryptionKey(String encoded, List<String> errors) {        if (encoded == null || encoded.isBlank()) {
@@ -243,5 +358,27 @@ public class ProductionReadinessValidator {
             }
         }
         return ports.equals(java.util.Set.of("80", "443"));
+    }
+
+    private void validateDatabaseTls(List<String> errors) {
+        String url = environment.getProperty("spring.datasource.url",
+                environment.getProperty("DB_URL", ""));
+        String normalized = url.toLowerCase(java.util.Locale.ROOT);
+        // A production URL must negotiate and verify the MySQL server
+        // certificate.  Do not accept the legacy useSSL=false form or an
+        // explicit disabled sslMode even when DB_URL is supplied by env.
+        if (normalized.contains("usessl=false") || normalized.contains("sslmode=disabled")
+                || (!normalized.contains("sslmode=verify_identity")
+                    && !normalized.contains("sslmode=verify_ca"))) {
+            errors.add("spring.datasource.url must enable MySQL TLS with sslMode=VERIFY_IDENTITY (or VERIFY_CA)");
+        }
+    }
+
+    private void validatePrivateBindOrTls(List<String> errors) {
+        boolean tls = environment.getProperty("server.ssl.enabled", Boolean.class, false);
+        String address = environment.getProperty("server.address", "127.0.0.1").trim();
+        if (!tls && (address.isEmpty() || "0.0.0.0".equals(address) || "::".equals(address))) {
+            errors.add("production server must bind privately when TLS is terminated by a reverse proxy");
+        }
     }
 }

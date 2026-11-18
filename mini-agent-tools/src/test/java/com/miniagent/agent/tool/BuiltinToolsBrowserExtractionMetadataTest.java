@@ -73,7 +73,8 @@ class BuiltinToolsBrowserExtractionMetadataTest {
 
         ToolResult result = tools.executeResult("browser_extract_text", "{}");
         assertEquals(ToolStatus.FAILED, result.status());
-        assertEquals(failure, result.legacyText());
+        assertTrue(result.legacyText().contains("\"errorCode\":\"EMPTY_RESULT\""));
+        assertTrue(result.legacyText().contains("\"retriable\":false"));
         assertFalse(Files.exists(workspace.resolve("_source.md")));
         assertFalse(Files.exists(workspace.resolve("notes.md")));
     }

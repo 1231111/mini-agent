@@ -2,6 +2,10 @@ package com.miniagent.agent.memory.repository;
 
 import com.miniagent.agent.memory.entity.AgentMemoryIndexOutboxEntity;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -41,4 +45,23 @@ public interface AgentMemoryIndexOutboxRepository
             AgentMemoryIndexOutboxEntity.Status status, LocalDateTime nextAttemptAt);
 
     List<AgentMemoryIndexOutboxEntity> findByStatus(AgentMemoryIndexOutboxEntity.Status status);
+
+    List<AgentMemoryIndexOutboxEntity> findTop500ByStatusAndUpdatedAtBeforeOrderByIdAsc(
+            AgentMemoryIndexOutboxEntity.Status status, LocalDateTime updatedAt);
+
+    /** Requeue only work whose processing lease has actually expired. */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Transactional
+    @Query("UPDATE AgentMemoryIndexOutboxEntity item "
+            + "SET item.status = :pending, item.nextAttemptAt = :now, item.updatedAt = :now "
+            + "WHERE item.status = :processing AND item.updatedAt < :staleBefore")
+    int requeueStaleProcessing(@Param("processing") AgentMemoryIndexOutboxEntity.Status processing,
+                               @Param("pending") AgentMemoryIndexOutboxEntity.Status pending,
+                               @Param("staleBefore") LocalDateTime staleBefore,
+                               @Param("now") LocalDateTime now);
+
+    @Modifying
+    @Transactional
+    @Query("DELETE FROM AgentMemoryIndexOutboxEntity item WHERE item.id IN :ids")
+    int deleteByIds(@Param("ids") List<Long> ids);
 }

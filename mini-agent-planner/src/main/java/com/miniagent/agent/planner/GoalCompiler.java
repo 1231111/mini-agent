@@ -928,6 +928,22 @@ public class GoalCompiler {
         if (nodes == null || !nodes.isArray()) {
             return new TaskGraph(List.of());
         }
+        if (nodes.size() > properties.getMaxGraphNodes()) {
+            throw new IllegalArgumentException("Task graph exceeds configured node limit of "
+                    + properties.getMaxGraphNodes());
+        }
+        int dependencyCount = 0;
+        for (JsonNode node : nodes) {
+            JsonNode dependencies = node.get("dependsOn");
+            if (dependencies == null) dependencies = node.get("depends_on");
+            if (dependencies != null && dependencies.isArray()) {
+                dependencyCount += dependencies.size();
+                if (dependencyCount > properties.getMaxGraphEdges()) {
+                    throw new IllegalArgumentException("Task graph exceeds configured dependency edge limit of "
+                            + properties.getMaxGraphEdges());
+                }
+            }
+        }
         List<TaskNode> list = new ArrayList<>();
         for (JsonNode n : nodes) {
             String id = textOr(n, "id", "n" + (list.size() + 1));

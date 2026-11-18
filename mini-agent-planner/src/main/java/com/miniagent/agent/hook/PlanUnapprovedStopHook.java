@@ -11,6 +11,8 @@ import java.util.Objects;
 @Component
 public class PlanUnapprovedStopHook implements StopHook {
 
+    static final int MAX_NUDGES = 2;
+
     private static final java.util.Set<String> EXEC_HINTS = java.util.Set.of(
             "write_file", "edit_file", "exec_command", "delegate_task",
             "image_generate"
@@ -35,6 +37,12 @@ public class PlanUnapprovedStopHook implements StopHook {
                 && context.toolsInvoked().stream().anyMatch(EXEC_HINTS::contains);
         if (!claimedExec && !context.writeFileSucceeded() && !context.mediaDelivered()) {
             return StopDecision.proceed();
+        }
+        if (context.planUnapprovedNudges() >= MAX_NUDGES) {
+            return StopDecision.preventWithAnswer(
+                    "计划尚未获批准，且本轮出现了写入或执行工具调用。为避免误报完成，已停止；"
+                            + "请批准计划后继续，并核验已发生的操作。",
+                    "plan_not_approved");
         }
         return StopDecision.blockRetry(
                 "【Plan 模式·StopHook】计划尚未获用户批准，禁止声称已交付。"

@@ -75,6 +75,8 @@ public class BuiltinTools {
     private  LyriaMusicService lyriaMusicService;
     @Autowired
     private  NetworkGuard networkGuard;
+    @Autowired
+    private  CapabilityRegistry capabilityRegistry;
 
     /**
      * 出网统一走这个客户端：它手动处理重定向，**每一跳**都重新过 {@link NetworkGuard}，
@@ -261,6 +263,7 @@ public class BuiltinTools {
 
     @PostConstruct
     public void register() {
+        registerCapabilityDiscovery();
         registerFileTools();
         registerSearchAndEditTools();
         registerHttpTools();
@@ -272,6 +275,51 @@ public class BuiltinTools {
         registerSongGenerateTool();
         registerMiniMaxMusicTool();
         registerLyriaMusicTool();
+    }
+
+    /** Read-only capability negotiation used by direct routes. */
+    private void registerCapabilityDiscovery() {
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("capability", Map.of("type", "string", "description",
+                "Capability pack such as file_read, file_write, web, browser, desktop, code, shell, image, research"));
+        schema.put("query", Map.of("type", "string", "description",
+                "Optional free-text capability query; use capability when known"));
+        registry.register("capability_discover",
+                "Discover the minimal registered tool set for a capability before using tools outside the current surface.",
+                schema, this::discoverCapabilities);
+    }
+
+    private String discoverCapabilities(String argumentsJson) {
+        String capability = "";
+        String query = "";
+        try {
+            ObjectNode node = RESULT_JSON.readValue(argumentsJson == null ? "{}" : argumentsJson,
+                    ObjectNode.class);
+            capability = node.path("capability").asText("").trim().toLowerCase(Locale.ROOT);
+            query = node.path("query").asText("").trim().toLowerCase(Locale.ROOT);
+        } catch (Exception ignored) {
+            return errorJson(ToolErrorCode.INVALID_ARGUMENT, "capability discovery arguments must be JSON");
+        }
+        if ((capability.isBlank() || !CapabilityRegistry.knownCapability(capability)) && !query.isBlank()) {
+            for (String candidate : CapabilityRegistry.checkedCapabilities()) {
+                String normalized = candidate.toLowerCase(Locale.ROOT);
+                if (normalized.contains(query) || query.contains(normalized)) {
+                    capability = normalized;
+                    break;
+                }
+            }
+        }
+        if (!CapabilityRegistry.knownCapability(capability)) {
+            capability = CapabilityRegistry.GENERAL;
+        }
+        List<String> tools = capabilityRegistry == null
+                ? List.of("todo") : capabilityRegistry.toolsFor(capability);
+        ObjectNode result = RESULT_JSON.createObjectNode();
+        result.put("success", true);
+        result.put("capability", capability);
+        result.set("tools", RESULT_JSON.valueToTree(tools));
+        result.put("message", "Tools are activated for the next turn and remain subject to permission gates.");
+        return result.toString();
     }
 
 

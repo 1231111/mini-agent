@@ -23,6 +23,7 @@ import com.miniagent.memory.contract.MemoryApi.ProposalView;
 import com.miniagent.memory.contract.MemoryApi.RevertRequest;
 import com.miniagent.memory.contract.MemoryApi.ReviewRequest;
 import com.miniagent.memory.contract.MemoryApi.RevisionView;
+import com.miniagent.memory.contract.MemoryApi.SubjectErasureResult;
 import com.miniagent.memory.contract.ServiceToken.Principal;
 import com.miniagent.memory.port.ProjectAuthorizationCommand;
 import com.miniagent.memory.port.ProjectAuthorizationResult;
@@ -30,6 +31,7 @@ import com.miniagent.memoryservice.evolution.ContextAssembler;
 import com.miniagent.memoryservice.evolution.ExperimentService;
 import com.miniagent.memoryservice.evolution.ItemService;
 import com.miniagent.memoryservice.evolution.OutcomeIngestor;
+import com.miniagent.memoryservice.evolution.SubjectErasureService;
 import com.miniagent.memoryservice.evolution.UserFactSyncService;
 import com.miniagent.memoryservice.store.ProjectAccess;
 import com.miniagent.memoryservice.store.ProposalState;
@@ -64,11 +66,12 @@ public class MemoryController {
     private final ProposalStore proposals;
     private final ProjectAccess projects;
     private final UserFactSyncService userFacts;
+    private final SubjectErasureService subjectErasure;
 
     public MemoryController(ContextAssembler assembler, OutcomeIngestor ingestor,
                             ItemService itemService, ExperimentService experiments,
                             ProposalStore proposals, ProjectAccess projects,
-                            UserFactSyncService userFacts) {
+                            UserFactSyncService userFacts, SubjectErasureService subjectErasure) {
         this.assembler = assembler;
         this.ingestor = ingestor;
         this.itemService = itemService;
@@ -76,6 +79,7 @@ public class MemoryController {
         this.proposals = proposals;
         this.projects = projects;
         this.userFacts = userFacts;
+        this.subjectErasure = subjectErasure;
     }
 
     @PostMapping(MemoryApi.ASSEMBLE)
@@ -261,12 +265,12 @@ public class MemoryController {
 
     /** 用户注销级联删除只能清理当前令牌主体的数据。 */
     @DeleteMapping(MemoryApi.SUBJECTS + "/{userId:\\d+}")
-    public ApiResponse<Integer> erase(@RequestAttribute(PRINCIPAL_ATTR) Principal principal,
-                                      @PathVariable long userId) {
+    public ApiResponse<SubjectErasureResult> erase(
+            @RequestAttribute(PRINCIPAL_ATTR) Principal principal, @PathVariable long userId) {
         if (!principal.hasUser() || !Objects.equals(principal.userId(), userId)) {
             throw new BusinessException(ErrorCode.AUTH_FORBIDDEN, "只能清理令牌所属用户的数据");
         }
-        return ApiResponse.ok(itemService.eraseUser(principal.tenantId(), userId));
+        return ApiResponse.ok(subjectErasure.erase(principal.tenantId(), userId));
     }
 
     private ProposalStore.Proposal visibleProposal(Principal principal, long id) {

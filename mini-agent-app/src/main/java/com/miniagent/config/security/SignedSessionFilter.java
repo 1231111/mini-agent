@@ -14,6 +14,7 @@ import org.springframework.security.authentication.UsernamePasswordAuthenticatio
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContext;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.dao.DataAccessException;
 import org.springframework.stereotype.Component;
 import org.springframework.util.AntPathMatcher;
 import org.springframework.web.filter.OncePerRequestFilter;
@@ -77,7 +78,19 @@ public class SignedSessionFilter extends OncePerRequestFilter {
             return;
         }
 
-        Long userId = jwtSessionService.resolveUserIdAndRefresh(request);
+        final Long userId;
+        try {
+            userId = jwtSessionService.resolveUserIdAndRefresh(request);
+        } catch (DataAccessException unavailable) {
+            // In replica mode Redis is the authentication/revocation authority.
+            // Never translate an outage into a bad-password response or permit a
+            // per-process fallback; return an explicit retryable availability error.
+            response.setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+            response.setContentType("application/json;charset=UTF-8");
+            response.setHeader("Retry-After", "5");
+            response.getWriter().write("{\"error\":\"session store unavailable\"}");
+            return;
+        }
         AuthenticatedUser principal = resolvePrincipal(userId);
         if (Objects.nonNull(principal)) {
             request.setAttribute(JwtSessionService.ATTR_USER_ID, principal.userId());

@@ -18,6 +18,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.*;
 
 class ToolPipelineActionClaimTest {
+    private static final Map<String, Object> WRITE_SCHEMA = Map.of(
+            "path", Map.of("type", "string"));
     private static final ExecutionTurnContext.ActionBinding BINDING = new ExecutionTurnContext.ActionBinding(
             "action", "node", "write_file", "fixed-binding");
 
@@ -104,7 +106,7 @@ class ToolPipelineActionClaimTest {
 
     private static ToolPipeline pipeline(ActionJournal journal, AtomicInteger calls) {
         ToolRegistry registry = new ToolRegistry();
-        registry.register("write_file", "fixture", Map.of(), arguments -> {
+        registry.register("write_file", "fixture", WRITE_SCHEMA, arguments -> {
             calls.incrementAndGet(); return "{\"success\":true}";
         });
         SessionPermissionStore permissions = new SessionPermissionStore();

@@ -3,9 +3,14 @@ package com.miniagent.agent.memory;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.*;
 
 /**
  * 锁定 {@link MemoryTaskLock} 的互斥语义。
@@ -57,5 +62,30 @@ class MemoryTaskLockTest {
         // 不允许抛异常：finally 块在异常路径上也会无条件调用 unlock
         lock.unlock("never-acquired");
         assertTrue(lock.tryLock("never-acquired", TTL));
+    }
+
+    @Test
+    void configuredRedisFailureDoesNotFallBackToPerProcessLock() {
+        MemoryTaskLock lock = new MemoryTaskLock();
+        StringRedisTemplate redis = mock(StringRedisTemplate.class);
+        @SuppressWarnings("unchecked") ValueOperations<String, String> values = mock(ValueOperations.class);
+        when(redis.opsForValue()).thenReturn(values);
+        when(values.setIfAbsent(anyString(), anyString(), any(Duration.class)))
+                .thenThrow(new IllegalStateException("redis unavailable"));
+        ReflectionTestUtils.setField(lock, "redis", redis);
+
+        assertThrows(IllegalStateException.class, () -> lock.tryLock("worker", TTL));
+        assertThrows(IllegalStateException.class, () -> lock.tryLock("worker", TTL));
+    }
+
+    @Test
+    void redisReplicaModeWithoutRedisBeanFailsClosed() {
+        MemoryTaskLock lock = new MemoryTaskLock();
+        ReflectionTestUtils.setField(lock, "replicaMode", "redis");
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> lock.tryLock("worker", TTL));
+
+        org.junit.jupiter.api.Assertions.assertTrue(failure.getMessage().contains("requires Redis"));
     }
 }

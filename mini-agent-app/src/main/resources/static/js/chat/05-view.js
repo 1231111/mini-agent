@@ -348,7 +348,9 @@ async function saveModelConfig() {
             return;
         }
         applyModelConfigView(data);
-        setModelHint('已保存', false);
+        // The fresh server response already rendered the effective model and endpoint.
+        // Keep that useful confirmation while clearing any prior error styling.
+        setModelHint(document.getElementById('modelMenuHint').textContent, false);
     } catch (e) {
         setModelHint('保存失败: ' + e.message, true);
     } finally {

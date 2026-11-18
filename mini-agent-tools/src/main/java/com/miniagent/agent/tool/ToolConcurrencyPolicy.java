@@ -43,7 +43,7 @@ public final class ToolConcurrencyPolicy {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private static final Set<String> READ_ONLY = Set.of(
-            "skill_list", "skill_view", "read_file", "list_files", "read_package",
+            "capability_discover", "skill_list", "skill_view", "read_file", "list_files", "read_package",
             "search_code", "ast_search", "codebase_search", "web_search", "web_extract",
             "http_get", "browser_snapshot", "browser_form_inspect", "browser_form_verify", "ask_user_question");
 
@@ -117,6 +117,16 @@ public final class ToolConcurrencyPolicy {
     private static final ToolExecutionProfile WRITE_GLOBAL_IDEMPOTENT = new ToolExecutionProfile(
             90, 0, 10, ToolConcurrencyScope.GLOBAL, "", "",
             ToolTimeoutRecovery.RETRY, "，可安全重试", 0);
+
+    /**
+     * MCP is an external side-effect boundary. Until a server/tool-specific
+     * contract is reviewed, serialize calls, never auto-retry and abort on an
+     * uncertain timeout so operators can reconcile the remote state.
+     */
+    private static final ToolExecutionProfile MCP_EXTERNAL_WRITE = new ToolExecutionProfile(
+            60, 15, 10, ToolConcurrencyScope.GLOBAL, "", "",
+            ToolTimeoutRecovery.ABORT,
+            "，MCP 远端状态未知；先到服务端核验操作结果，禁止直接重试", 0);
 
     /** 给用户发消息：会话内互斥，超时先查会话记录确认发没发出去。 */
     private static final ToolExecutionProfile NOTIFY_USER = new ToolExecutionProfile(
@@ -256,6 +266,9 @@ public final class ToolConcurrencyPolicy {
     public static ToolExecutionProfile profileOf(String name) {
         if (name == null) {
             return ToolExecutionProfile.DEFAULT;
+        }
+        if (name.startsWith("mcp__")) {
+            return MCP_EXTERNAL_WRITE;
         }
         return switch (name) {
             // ── 只读 ──

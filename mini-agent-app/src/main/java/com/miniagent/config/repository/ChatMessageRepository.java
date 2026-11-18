@@ -8,7 +8,9 @@ import java.util.List;
 
 public interface ChatMessageRepository extends JpaRepository<ChatMessage, Long> {
     List<ChatMessage> findByConversationIdOrderByTimestampAsc(String conversationId);
+    Page<ChatMessage> findByConversationIdOrderByTimestampAsc(String conversationId, Pageable pageable);
     void deleteByConversationId(String conversationId);
     long countByConversationId(String conversationId);
     Page<ChatMessage> findByConversationIdOrderByTimestampDesc(String conversationId, Pageable pageable);
+    Page<ChatMessage> findByConversationIdOrderByTimestampDescIdDesc(String conversationId, Pageable pageable);
 }

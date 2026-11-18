@@ -32,6 +32,7 @@ import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.agent.trace.TraceRecorder;
 import com.miniagent.common.MessageConstants;
 import com.miniagent.common.RunStatus;
+import com.miniagent.common.context.OwnerContext;
 import com.miniagent.common.permission.ExecPolicy;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -201,6 +202,15 @@ public class ToolPipeline {
         }
         PermissionMode mode = run.permissionMode();
         boolean planOk = run.planApproved();
+        if (mode == PermissionMode.PLAN && planOk && fence == null
+                && !PermissionPolicy.isPlanSafe(name)) {
+            recordNode(sid, turn, AgentStepNode.PERM_DENY,
+                    "{\"tool\":\"" + name + "\",\"mode\":\"PLAN\",\"reason\":\"planner_binding_required\"}",
+                    RunStatus.FAILURE.name());
+            return ToolInvocation.policyDenied(name, ToolResult.failure(
+                    ToolErrorCode.PERMISSION_DENIED,
+                    "PLAN 模式的写入工具必须由已批准的规划节点绑定执行: " + name, false));
+        }
         if (mode == PermissionMode.PLAN && !planOk && !PermissionPolicy.isPlanSafe(name)) {
             recordNode(sid, turn, AgentStepNode.PERM_DENY,
                     "{\"tool\":\"" + name + "\",\"mode\":\"PLAN\"}",
@@ -237,6 +247,7 @@ public class ToolPipeline {
         // request must never become a standing approval for the tool name.
         boolean granted = sid != null
                 && permissionStore.isAskGranted(sid, name, effective);
+        boolean grantAuditRecorded = false;
 
         // exec_command 的生效策略：会话覆盖 ?? 全局默认，再计入会话模式（ACCEPT_EDITS 相当于"别问我"）。
         ExecPolicy effectiveExec = execPolicyService.effective(sid, mode);
@@ -260,8 +271,7 @@ public class ToolPipeline {
         if (!needsGrant && !granted && PermissionPolicy.isFullAuto(mode, run.confirmPolicy())
                 && PermissionPolicy.isAskDangerous(name)) {
             recordNode(sid, turn, AgentStepNode.PERM_AUTO,
-                    "{\"tool\":\"" + name + "\",\"mode\":\"accept_edits\","
-                            + "\"confirmPolicy\":\"auto\"}",
+                    permissionAuditJson(name, effective, "auto", ""),
                     RunStatus.SUCCESS.name());
         }
         if (needsGrant && !granted) {
@@ -284,8 +294,7 @@ public class ToolPipeline {
             emitPermissionAsk(sid, name, effective, grant == null ? null : grant.token(),
                     grant == null ? 0L : grant.expiresAtEpochMillis());
             recordNode(sid, turn, AgentStepNode.WAITING_FOR_HUMAN,
-                    "{\"tool\":\"" + name + "\",\"mode\":\"" + mode.wireName()
-                            + "\",\"reason\":\"permission_ask\"}",
+                    permissionAuditJson(name, effective, "ask", "\"mode\":\"" + mode.wireName() + "\","),
                     RunStatus.SUCCESS.name());
             if (!attached) {
                 String pending = String.format(
@@ -298,7 +307,7 @@ public class ToolPipeline {
                 if (waitStop != ExecutionControl.StopReason.NONE) {
                     permissionStore.denyAskToken(sid, grant.token(), name);
                     recordNode(sid, turn, AgentStepNode.PERM_DENY,
-                            "{\"tool\":\"" + name + "\",\"reason\":\"control_stop\"}",
+                            permissionAuditJson(name, effective, "deny", "\"reason\":\"control_stop\","),
                             RunStatus.FAILURE.name());
                     return ToolInvocation.controlStop(name, ToolResult.failure(
                             controlErrorCode(waitStop), controlMessage(waitStop), false), waitStop);
@@ -316,7 +325,7 @@ public class ToolPipeline {
                     // 前端那句「用户未在有效期内批准」和真实原因（点了拒绝 / 超时）
                     // 在界面上长得一样，只有轨迹能区分。
                     recordNode(sid, turn, AgentStepNode.PERM_DENY,
-                            "{\"tool\":\"" + name + "\",\"reason\":\"approval_not_granted\"}",
+                            permissionAuditJson(name, effective, "deny", "\"reason\":\"approval_not_granted\","),
                             RunStatus.FAILURE.name());
                     return ToolInvocation.permissionDenied(name, ToolResult.failure(
                             ToolErrorCode.PERMISSION_DENIED, "用户未批准本次工具调用（已拒绝或已超时）", false));
@@ -327,24 +336,30 @@ public class ToolPipeline {
                         SessionPermissionStore.argumentDigest(name, effective));
                 if (!granted) {
                     recordNode(sid, turn, AgentStepNode.PERM_DENY,
-                            "{\"tool\":\"" + name + "\",\"reason\":\"argument_mismatch\"}",
+                            permissionAuditJson(name, effective, "deny", "\"reason\":\"argument_mismatch\","),
                             RunStatus.FAILURE.name());
                     return ToolInvocation.permissionDenied(name, ToolResult.failure(
                             ToolErrorCode.PERMISSION_DENIED, "批准与当前工具参数不匹配", false));
                 }
                 recordNode(sid, turn, AgentStepNode.PERM_GRANT,
-                        "{\"tool\":\"" + name + "\",\"resumed\":true}",
+                        permissionAuditJson(name, effective, "grant", "\"resumed\":true,"),
                         RunStatus.SUCCESS.name());
+                grantAuditRecorded = true;
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 recordNode(sid, turn, AgentStepNode.PERM_DENY,
-                        "{\"tool\":\"" + name + "\",\"reason\":\"interrupted\"}",
+                        permissionAuditJson(name, effective, "deny", "\"reason\":\"interrupted\","),
                         RunStatus.FAILURE.name());
                 return ToolInvocation.controlStop(name, ToolResult.failure(
                         ToolErrorCode.CANCELLED, "等待批准时任务已取消", false), ExecutionControl.StopReason.CANCELLED);
             } finally {
                 executionControl.markHumanWaitpoint(sid, false);
             }
+        }
+        if (granted && needsGrant && !grantAuditRecorded) {
+            recordNode(sid, turn, AgentStepNode.PERM_GRANT,
+                    permissionAuditJson(name, effective, "grant", "\"source\":\"exact_prior_grant\","),
+                    RunStatus.SUCCESS.name());
         }
         ToolInvocation boundaryRejection = executionBoundary(run, name, turn);
         if (boundaryRejection != null) return boundaryRejection;
@@ -914,6 +929,18 @@ public class ToolPipeline {
                 .replace("\"", "\\\"")
                 .replace("\n", " ")
                 .replace("\r", " ");
+    }
+
+    private static String permissionAuditJson(String tool, String argumentsJson,
+                                              String decision, String extraJsonFields) {
+        // Persist an immutable binding to the authorized invocation without
+        // copying command arguments, which can contain credentials or private data.
+        Long actorUserId = OwnerContext.currentUserId();
+        String actorField = actorUserId == null ? "" : "\"actorUserId\":" + actorUserId + ",";
+        return "{\"tool\":\"" + jsonEscape(tool) + "\",\"decision\":\""
+                + jsonEscape(decision) + "\"," + actorField + "\"argumentsDigest\":\""
+                + SessionPermissionStore.argumentDigest(tool, argumentsJson) + "\","
+                + (extraJsonFields == null ? "" : extraJsonFields) + "\"auditVersion\":1}";
     }
 
     private void emitUserQuestion(String sessionId, String json) {

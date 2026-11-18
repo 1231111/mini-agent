@@ -70,7 +70,9 @@ jobs:
     timeout-minutes: 30
     services:
       mysql:
-        image: mysql:8.0
+        # Keep CI on the same major release that is supported in production.
+        # MySQL 8.0 can silently accept migration SQL that 8.4 rejects.
+        image: mysql:8.4
         env:
           MYSQL_ROOT_PASSWORD: schema-test-root
           MYSQL_DATABASE: mini_agent_schema_test

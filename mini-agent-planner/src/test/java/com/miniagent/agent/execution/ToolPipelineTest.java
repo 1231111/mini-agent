@@ -17,6 +17,7 @@ import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.agent.tool.ToolResult;
 import com.miniagent.agent.tool.ToolStatus;
 import com.miniagent.agent.trace.TraceRecorder;
+import com.miniagent.common.context.OwnerContext;
 import com.miniagent.common.permission.ExecPolicy;
 import com.miniagent.config.entity.AgentTraceStep;
 import org.junit.jupiter.api.AfterEach;
@@ -38,6 +39,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ToolPipelineTest {
+    private static final Map<String, Object> COMMAND_SCHEMA = Map.of(
+            "command", Map.of("type", "string"));
 
     @AfterEach
     void tearDown() {
@@ -99,7 +102,7 @@ class ToolPipelineTest {
     void hardGateDoesNotExecuteTool() {
         ToolRegistry registry = new ToolRegistry();
         AtomicInteger calls = new AtomicInteger();
-        registry.register("exec_command", "e", Map.of(), x -> {
+        registry.register("exec_command", "e", COMMAND_SCHEMA, x -> {
             calls.incrementAndGet();
             return "{\"ok\":true}";
         });
@@ -114,7 +117,7 @@ class ToolPipelineTest {
     void toolOutsideTurnSurfaceNeverReachesRegistry() {
         ToolRegistry registry = new ToolRegistry();
         AtomicInteger calls = new AtomicInteger();
-        registry.register("exec_command", "e", Map.of(), x -> {
+        registry.register("exec_command", "e", COMMAND_SCHEMA, x -> {
             calls.incrementAndGet();
             return "{\"ok\":true}";
         });
@@ -168,7 +171,7 @@ class ToolPipelineTest {
     void hardGateFollowsCapturedScopeAfterThreadLocalCleared() {
         ToolRegistry registry = new ToolRegistry();
         AtomicInteger calls = new AtomicInteger();
-        registry.register("exec_command", "e", Map.of(), x -> {
+        registry.register("exec_command", "e", COMMAND_SCHEMA, x -> {
             calls.incrementAndGet();
             return "{\"ok\":true}";
         });
@@ -197,6 +200,48 @@ class ToolPipelineTest {
         assertEquals(ToolInvocation.Outcome.POLICY_DENIED, inv.outcome());
         assertEquals(0, calls.get());
         assertTrue(inv.text().contains("Plan"));
+    }
+
+    @Test
+    void approvedPlanStillRequiresPlannerBoundExecutionForWrites() {
+        ToolRegistry registry = new ToolRegistry();
+        AtomicInteger calls = new AtomicInteger();
+        registry.register("write_file", "w", Map.of(), x -> {
+            calls.incrementAndGet();
+            return "{\"ok\":true}";
+        });
+        PermissionContext.force("s", PermissionMode.PLAN, true);
+        RunScope scope = RunScope.capture().withSession("s");
+        PermissionContext.clear();
+
+        ToolInvocation denied = pipeline(registry).invoke(
+                ToolRequest.of(scope, "write_file", "{}", 0, "r1"));
+
+        assertEquals(ToolInvocation.Outcome.POLICY_DENIED, denied.outcome());
+        assertEquals(ToolErrorCode.PERMISSION_DENIED, denied.result().errorCode());
+        assertEquals(0, calls.get());
+        assertTrue(denied.text().contains("规划节点"));
+    }
+
+    @Test
+    void approvedPlanAllowsWriteWhenPlannerExecutionFenceIsPresent() {
+        ToolRegistry registry = new ToolRegistry();
+        AtomicInteger calls = new AtomicInteger();
+        registry.register("write_file", "w", Map.of(), x -> {
+            calls.incrementAndGet();
+            return "{\"ok\":true}";
+        });
+        PermissionContext.force("s", PermissionMode.PLAN, true);
+        ExecutionTurnContext.open("s", "approved-plan-execution", 1L, List.of(), () -> true);
+        RunScope scope = RunScope.capture().withSession("s");
+        PermissionContext.clear();
+
+        ToolInvocation invocation = pipeline(registry).invoke(
+                ToolRequest.of(scope, "write_file", "{}", 0, "r1"));
+
+        assertEquals(ToolInvocation.Outcome.EXECUTED, invocation.outcome());
+        assertTrue(invocation.result().isSuccess());
+        assertEquals(1, calls.get());
     }
 
     @Test
@@ -278,13 +323,21 @@ class ToolPipelineTest {
         Fixture fx = new Fixture("ask", execRegistry(calls));
         PermissionContext.force("s", PermissionMode.ACCEPT_EDITS, true);
 
-        ToolInvocation inv = fx.pipeline.invoke(
-                ToolRequest.of("s", "exec_command", "{}", 0, "r1"));
+        ToolInvocation inv;
+        try (OwnerContext.Scope ignored = OwnerContext.bind(new OwnerContext(42L, "tenant-1"))) {
+            inv = fx.pipeline.invoke(
+                    ToolRequest.of("s", "exec_command", "{\"command\":\"echo sentinel-secret\"}", 0, "r1"));
+        }
 
         assertEquals(ToolInvocation.Outcome.PERMISSION_ASK, inv.outcome(),
                 "自动编辑模式不得把 ask 档提升成免批执行");
         assertEquals(0, calls.get(), "未获批准的命令不能执行");
         assertTrue(fx.trace.hasNode("WAITING_FOR_HUMAN"), "ask 档必须给批准入口");
+        String digest = SessionPermissionStore.argumentDigest("exec_command",
+                "{\"command\":\"echo sentinel-secret\"}");
+        assertTrue(fx.trace.contentContains(digest), "审批轨迹必须绑定到确切参数摘要");
+        assertTrue(fx.trace.contentContains("\"actorUserId\":42"), "审批审计需要记录当前认证主体");
+        assertFalse(fx.trace.contentContains("sentinel-secret"), "审批轨迹不能落明文命令参数");
     }
 
     @Test
@@ -726,7 +779,7 @@ class ToolPipelineTest {
 
     private static ToolRegistry execRegistry(AtomicInteger calls) {
         ToolRegistry registry = new ToolRegistry();
-        registry.register("exec_command", "e", Map.of(), x -> {
+        registry.register("exec_command", "e", COMMAND_SCHEMA, x -> {
             calls.incrementAndGet();
             return "{\"ok\":true}";
         });

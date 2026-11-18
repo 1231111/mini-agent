@@ -28,6 +28,11 @@ public class PlannerProperties {
     /** 专用规划模型超时（秒）。默认 60s，比主模型短避免拖慢。 */
     private int plannerTimeoutSeconds = 60;
 
+    /** Hard bounds for model-produced task graphs. */
+    private int maxGraphNodes = 64;
+    private int maxGraphEdges = 256;
+    private int maxGraphDepth = 32;
+
     private int maxRecoveries = 3;
     /** 兼容历史配置；PlanningLoop 当前逐节点派发与验收，实际批量固定为 1。 */
     private int proposalBatchSize = 1;
@@ -67,6 +72,21 @@ public class PlannerProperties {
 
     public int getMaxRecoveries() { return maxRecoveries; }
     public void setMaxRecoveries(int maxRecoveries) { this.maxRecoveries = maxRecoveries; }
+
+    public int getMaxGraphNodes() { return maxGraphNodes; }
+    public void setMaxGraphNodes(int maxGraphNodes) {
+        this.maxGraphNodes = Math.max(1, Math.min(512, maxGraphNodes));
+    }
+
+    public int getMaxGraphEdges() { return maxGraphEdges; }
+    public void setMaxGraphEdges(int maxGraphEdges) {
+        this.maxGraphEdges = Math.max(0, Math.min(4096, maxGraphEdges));
+    }
+
+    public int getMaxGraphDepth() { return maxGraphDepth; }
+    public void setMaxGraphDepth(int maxGraphDepth) {
+        this.maxGraphDepth = Math.max(1, Math.min(128, maxGraphDepth));
+    }
 
     public int getProposalBatchSize() { return proposalBatchSize; }
     public void setProposalBatchSize(int proposalBatchSize) {

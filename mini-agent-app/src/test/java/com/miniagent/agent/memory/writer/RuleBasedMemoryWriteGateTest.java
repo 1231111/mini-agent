@@ -3,6 +3,7 @@ package com.miniagent.agent.memory.writer;
 import com.miniagent.memory.model.AgentEvent;
 import com.miniagent.memory.model.GateDecision;
 import com.miniagent.memory.model.MemoryEntry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -74,5 +75,21 @@ class RuleBasedMemoryWriteGateTest {
         GateDecision d = gate.evaluate(event, candidate);
         assertFalse(d.isAllowed());
         assertEquals(GateDecision.Rule.SECURITY, d.getRule());
+    }
+
+    @Test
+    void rejectedWritesAreExportedAsMicrometerCounters() {
+        var registry = new SimpleMeterRegistry();
+        ReflectionTestUtils.setField(gate, "meterRegistry", registry);
+        AgentEvent event = new AgentEvent();
+        event.setEventType(AgentEvent.EventType.TOOL_EXECUTION);
+        MemoryEntry candidate = new MemoryEntry();
+        candidate.setContent("ok");
+
+        GateDecision decision = gate.evaluate(event, candidate);
+
+        assertFalse(decision.isAllowed());
+        assertEquals(1.0, registry.get("miniagent.memory.write_gate.denied")
+                .tag("rule", GateDecision.Rule.NO_CONTENT.code()).counter().count());
     }
 }

@@ -1,0 +1,29 @@
+[Unit]
+Description=MiniAgent application
+After=network-online.target mysql.service redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=miniagent
+Group=miniagent
+WorkingDirectory=/opt/miniagent
+EnvironmentFile=/etc/miniagent/app.env
+ExecStart=/usr/bin/java -XX:MaxRAMPercentage=75 -XX:InitialRAMPercentage=25 -XX:+UseContainerSupport -XX:+ExitOnOutOfMemoryError -jar /opt/miniagent/mini-agent-app/target/mini-agent-app-0.0.1-SNAPSHOT.jar --spring.profiles.active=prod --server.port=8080
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=2100s
+KillSignal=SIGTERM
+SuccessExitStatus=143
+MemoryMax=2G
+CPUQuota=200%
+TasksMax=512
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/miniagent /var/log/miniagent
+
+[Install]
+WantedBy=multi-user.target

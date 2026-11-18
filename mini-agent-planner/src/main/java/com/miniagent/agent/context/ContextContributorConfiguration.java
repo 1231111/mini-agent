@@ -48,7 +48,7 @@ public class ContextContributorConfiguration {
     }
 
     @Bean
-    @Order(30)
+    @Order(50)
     SystemContextContributor referenceContributor() {
         return ctx -> {
             ContextReferenceDecision ref = ctx.reference();
@@ -62,7 +62,7 @@ public class ContextContributorConfiguration {
     }
 
     @Bean
-    @Order(40)
+    @Order(60)
     SystemContextContributor memoryContributor(MemoryService memoryService) {
         return ctx -> {
             String text = memoryService.retrieveForPrompt(
@@ -86,7 +86,7 @@ public class ContextContributorConfiguration {
     static final String MEMORY_UNTRUSTED_FOOTER = "</memory-data>";
 
     @Bean
-    @Order(50)
+    @Order(70)
     SystemContextContributor skillsContributor(SkillStore skillStore) {
         return ctx -> {
             if (!ctx.policy().injectSkills()) {
@@ -97,20 +97,20 @@ public class ContextContributorConfiguration {
     }
 
     @Bean
-    @Order(60)
+    @Order(30)
     SystemContextContributor reasoningContributor() {
         return ctx -> ContextFragment.of(ContextSlot.REASONING,
                 PromptTemplates.REASONING + "\n\n" + PromptTemplates.COMPLETION);
     }
 
     @Bean
-    @Order(70)
+    @Order(80)
     SystemContextContributor toolsContributor() {
         return ctx -> ContextFragment.of(ContextSlot.TOOLS, "");
     }
 
     @Bean
-    @Order(80)
+    @Order(90)
     SystemContextContributor todoContributor(TaskTodoStore taskTodoStore) {
         return ctx -> {
             if (!ctx.policy().injectTodo() || StringUtils.isBlank(ctx.sessionId())) {
@@ -126,16 +126,23 @@ public class ContextContributorConfiguration {
     }
 
     @Bean
-    @Order(90)
+    @Order(40)
+    SystemContextContributor stablePolicyContributor() {
+        return ctx -> ContextFragment.of(ContextSlot.CLOSING,
+                PromptTemplates.UNTRUSTED_DATA_RULES + "\n\n"
+                        + (ctx.fullAuto() ? PromptTemplates.FULL_AUTO_CONFIRMATION
+                                          : PromptTemplates.CONFIRMATION) + "\n\n"
+                        + PromptTemplates.OUTPUT);
+    }
+
+    /** Request-specific date facts are kept after the stable prompt prefix. */
+    @Bean
+    @Order(100)
     SystemContextContributor closingContributor() {
         return ctx -> {
             ZonedDateTime now = RelativeDateGuidance.resolveNow(configuredTimeZone);
-            return ContextFragment.of(ContextSlot.CLOSING,
-                    PromptTemplates.UNTRUSTED_DATA_RULES + "\n\n"
-                            + (ctx.fullAuto() ? PromptTemplates.FULL_AUTO_CONFIRMATION
-                                              : PromptTemplates.CONFIRMATION) + "\n\n"
-                            + PromptTemplates.OUTPUT + "\n\n"
-                            + RelativeDateGuidance.render(now) + "\n当前时间："
+            return ContextFragment.of(ContextSlot.TIME,
+                    RelativeDateGuidance.render(now) + "\n当前时间："
                             + now.format(CLOCK) + "（" + now.getZone().getId() + "）");
         };
     }

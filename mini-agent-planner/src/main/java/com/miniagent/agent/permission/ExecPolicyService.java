@@ -77,8 +77,20 @@ public class ExecPolicyService {
         return globalDefault;
     }
 
+    /**
+     * A global BLOCK is a security ceiling: session state must never be able
+     * to raise it to ASK or ALLOW. This also protects persisted overrides
+     * written before the ceiling was enforced.
+     */
+    public boolean isBlockLocked() {
+        return globalDefault == ExecPolicy.BLOCK;
+    }
+
     /** 不含会话模式提升的生效策略：会话覆盖优先，否则全局默认。 */
     public ExecPolicy effective(String sessionId) {
+        if (isBlockLocked()) {
+            return ExecPolicy.BLOCK;
+        }
         ExecPolicy override = store.getExecPolicyOverride(sessionId);
         return override != null ? override : globalDefault;
     }

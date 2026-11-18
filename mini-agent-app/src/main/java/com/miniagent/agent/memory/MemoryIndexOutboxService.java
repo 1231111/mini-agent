@@ -35,6 +35,8 @@ public class MemoryIndexOutboxService {
      * 同时在实例崩溃后自动过期，不会把队列永久堵死。
      */
     private static final Duration LOCK_TTL = Duration.ofMinutes(5);
+    private static final Duration PROCESSING_LEASE = Duration.ofMinutes(10);
+    private static final Duration COMPLETED_RETENTION = Duration.ofDays(14);
 
     @Autowired
     private AgentMemoryIndexOutboxRepository outboxRepository;
@@ -61,16 +63,6 @@ public class MemoryIndexOutboxService {
     void init() {
         this.txTemplate = new TransactionTemplate(transactionManager);
         this.milvus = milvusProvider.getIfAvailable();
-        // recover interrupted items
-        List<AgentMemoryIndexOutboxEntity> interrupted = outboxRepository.findByStatus(
-                AgentMemoryIndexOutboxEntity.Status.PROCESSING);
-        for (AgentMemoryIndexOutboxEntity item : interrupted) {
-            item.setStatus(AgentMemoryIndexOutboxEntity.Status.PENDING);
-            item.setNextAttemptAt(LocalDateTime.now());
-        }
-        if (!interrupted.isEmpty()) {
-            outboxRepository.saveAll(interrupted);
-        }
     }
 
     @Transactional
@@ -124,6 +116,15 @@ public class MemoryIndexOutboxService {
             return;
         }
         try {
+            LocalDateTime now = LocalDateTime.now();
+            int reclaimed = outboxRepository.requeueStaleProcessing(
+                    AgentMemoryIndexOutboxEntity.Status.PROCESSING,
+                    AgentMemoryIndexOutboxEntity.Status.PENDING,
+                    now.minus(PROCESSING_LEASE), now);
+            if (reclaimed > 0) {
+                log.warn("Requeued {} expired memory index outbox leases", reclaimed);
+            }
+            purgeCompletedBatch(now);
             List<AgentMemoryIndexOutboxEntity> batch = outboxRepository
                     .findTop50ByStatusAndNextAttemptAtLessThanEqualOrderByIdAsc(
                             AgentMemoryIndexOutboxEntity.Status.PENDING, LocalDateTime.now());
@@ -137,6 +138,20 @@ public class MemoryIndexOutboxService {
             }
         } finally {
             taskLock.unlock(LOCK_NAME);
+        }
+    }
+
+    private void purgeCompletedBatch(LocalDateTime now) {
+        List<AgentMemoryIndexOutboxEntity> completed = outboxRepository
+                .findTop500ByStatusAndUpdatedAtBeforeOrderByIdAsc(
+                        AgentMemoryIndexOutboxEntity.Status.DONE, now.minus(COMPLETED_RETENTION));
+        if (completed.isEmpty()) {
+            return;
+        }
+        int deleted = outboxRepository.deleteByIds(completed.stream()
+                .map(AgentMemoryIndexOutboxEntity::getId).toList());
+        if (deleted > 0) {
+            log.info("Purged {} completed memory index outbox rows", deleted);
         }
     }
 

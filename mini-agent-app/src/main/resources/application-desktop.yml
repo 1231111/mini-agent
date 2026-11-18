@@ -125,6 +125,8 @@ spring:
         dialect: org.hibernate.dialect.H2Dialect
 
   flyway:
+    clean-disabled: true
+    out-of-order: false
     # 桌面档自 1.0.1 起具备版本化升级能力。迁移链的起点与 prod 不同：
     #
     #   db/migration 下 V1~V8 是 MySQL 方言脚本（V5 的 SET @var := / PREPARE
@@ -207,16 +209,6 @@ agent:
       read-timeout-ms: 8000
       # max-attempts / retry-backoff-ms / total-budget-ms 走 application.yml 的
       # 共用值：重试策略与部署形态无关，不必按档复制一份。
-      #
-      # 本机 H2 与云端账号库是**两个库**，必须显式关掉共享库模式。
-      # 基类那份 shared-database: true 是给云端 agent 写的（它与账号服务同一个
-      # MySQL，账号行就是本机行）；桌面档继承过来，ShadowUserService 就会拿云端
-      # 返回的 userId 去本机空库里查主键 —— 客户机首次登录必然失败：
-      #   AUTH.03.03 共享库模式下找不到 users.id=N
-      # 这个 bug 在开发机上会自我掩盖：本机库早就有同 id 的行（本地注册过），
-      # 只有干净安装的客户机才暴露。置 false 后走影子用户，才是上面注释写的
-      # 「本地只留一个影子用户（users.external_id 指向云端身份）」。
-      shared-database: false
       # 云端角色（SYSTEM_ADMIN 等）是否同步到本地影子用户。默认 false：
       # 云端的权限域和本机不是一回事，自动等同等于把云端提权放大到设备上。
       adopt-role: false

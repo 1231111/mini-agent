@@ -1,5 +1,7 @@
 # mini-agent 生产级差距审计报告
 
+> **状态说明（2026-11-18）**：本文件前半部分是按各自日期记录的历史审计快照，原始缺陷描述和当时的未完成项不代表当前状态。当前代码与本轮自动化验证结果以文末“P0–P2 最终复核”为准。本地代码验证通过不等于生产上线验收通过；尚未完成的真实服务、部署和故障演练要求单独列出。
+
 ### 2026-10-30 补充（五）：规划授权快照在提示与解析间保持一致
 
 - `GoalCompiler.compileWithLlm()` 与 `compileWithLlmAndCorrection()` 各自在单次模型调用前读取一次 `ProcedurePromptInput` 快照；该快照同时用于模型提示构造和 `parseCompilation(..., snapshot)` 的模型引用授权，不再在解析阶段重新查询当前 allowlist。
@@ -159,8 +161,8 @@
 | **P0-4** | ✅ 已修 | **写入侧收口到唯一闸门**：`DefaultMemoryManager` 的 `writeMemory`/`updateMemory`/`writeFact`/`writeProcedure` 全部过 `SecurityScanner`（命中即抛 `MEMORY_CONTENT_REJECTED`），覆盖 REST 三条路径与巩固期提炼；Episode 的派生文本用 `redactIfUnsafe` 清洗（摘掉污染段而不丢整条记录，避免毒消息轮回）；**扫描器补强**（原规则漏掉最常见的 "Ignore all previous instructions"，且完全不含中文）；**注入侧建边界**：记忆槽用 `<memory-data trust="untrusted">` 包裹 + 系统提示新增「指令层级」条款，明确"只有系统消息与用户消息是指令" | `agent/memory/manager/DefaultMemoryManager.java`、`lifecycle/DefaultConsolidationService.java`、`memory/SecurityScanner.java`、`application/PromptTemplates.java`、`agent/context/ContextContributorConfiguration.java`、`common/ErrorCode.java` |
 | **P0-5** | ✅ 已修 | **(a) 幂等键加入参数摘要**（按 key 排序后 SHA-256），"改正参数后的重试"不再被去重静默跳过，且参数不变时键不变（崩溃恢复的去重语义保留）；**(b) 结局贯通**：新增 `PlanningLoop.Outcome{COMPLETED,UNFINISHED,BLOCKED_ON_HUMAN,FAILED}` 与 `runWithOutcome`，死锁/恢复耗尽/轮次用尽/图无法验收全部返回 `UNFINISHED` 并附未完成节点清单，应用层据此 `markFailed` 而不再 `markCompleted`（`run(String)` 保留为兼容入口） | `agent/planner/GraphScheduler.java`、`PlanningLoop.java`、`application/AgentChatApplicationService.java` |
 | P0-6 | ✅ 已修 | 子代理权限**只降不升**（`SubagentScope` 取更严模式）；`RunScope.asSubagent` 不再硬编码 `planApproved=true`，改为继承父的批准状态 | `agent/delegate/SubagentScope.java`、`agent/core/RunScope.java` |
-| P0-7 | ✅ 已修 | 自助支付确认端点默认关闭（`agent.account.portal-confirm-enabled=false`），开启时才可用；服务层注释改为陈述事实 | `account/web/PortalController.java`、`config/service/MembershipService.java`、`application.yml` |
-| P0-8 | ✅ 已修 | compose 去掉全部默认口令（`${VAR:?}` 强制显式提供）、MySQL/Redis/Milvus/MinIO/embedding 端口只绑回环；`.env.example` 补 MinIO 必填项 | `docker-compose.yml`、`.env.example` |
+| P0-7 | ✅ 已修 | 删除无凭证的浏览器自助支付确认端点、配置开关和 `confirmPortalPayment` 服务方法；支付回调在渠道验签实现接入前始终 fail-closed 返回 503 | `account/web/PortalController.java`、`account/service/MembershipService.java`、`MembershipController.java` |
+| P0-8 | ✅ 已修（部署形态变更） | 已移除 Docker/Compose 生产部署形态，改为宿主机 JAR 与 systemd 单元；启动脚本要求专用 `DB_USERNAME`/`DB_PASSWORD`，生产 JDBC 使用 `VERIFY_IDENTITY`。部署者仍须按运维文档配置私网中间件与 TLS 反向代理。 | `scripts/run-app.sh`、`scripts/run-app.ps1`、`scripts/systemd/*.service`、`.env.example` |
 | P1-6(SSRF) | ✅ 已修 | `web_extract` 改调 `NetworkGuard` 并走 `GuardedHttpClient`（逐跳校验、有界响应体）；删除字符串黑名单 `isPrivateHost`；`http_get`/`http_post` 同步切到 `GuardedHttpClient`；删掉裸 `HttpClient + Redirect.NORMAL` 静态客户端 | `web/WebSearchService.java`、`agent/tool/BuiltinTools.java` |
 | P1-7(env) | ✅ 已修 | 子进程环境沙箱：默认只继承启动所需白名单（PATH/SystemRoot/TEMP/JAVA_HOME…），其余丢弃；MCP 在收敛后再合并**显式声明**的 env；新增 `agent.tools.env-passthrough` 放行清单 | `agent/tool/ProcessEnv.java`、`ProcessEnvProperties.java`、`BuiltinTools.java`、`HostCommand.java`、`mcp/McpStdioClient.java` |
 | P1-13(测试) | ✅ 已修 | `git checkout HEAD -- mini-agent-tools/src/test` 恢复 13 个被删的安全/契约测试（1191 行，实测全部通过，模块测试数 1 → 119） | `mini-agent-tools/src/test/**` |
@@ -191,8 +193,8 @@
 1. **文件工具不再能访问任意路径**。默认只允许 workspace、数据根（媒体/附件/记忆/技能）、项目根。确实需要别的目录时用 `agent.tools.allowed-read-roots`（逗号分隔）显式放行 —— 拒绝消息里会带上这句话和当前允许的根。
 2. **"自动编辑"模式不再免批执行命令**。要免批请显式把 `agent.tools.exec-policy` 设为 `allow`（prod 档仍禁止 allow）。
 3. **子进程环境被收敛**。某些 CLI 依赖的自有变量需要加进 `agent.tools.env-passthrough`，否则它会看不到。
-4. **compose 必须先提供口令**：`MYSQL_ROOT_PASSWORD`、`REDIS_PASSWORD`、`DB_USERNAME`、`MINIO_ACCESS_KEY`、`MINIO_SECRET_KEY`，缺失时 `docker compose up` 直接报错退出（不再用仓库已知默认值静默起来）。
-5. **账号服务的"确认支付"默认关闭**：本地联调需设 `agent.account.portal-confirm-enabled=true`。
+4. **宿主机启动脚本不回退到数据库 root 凭据**：部署 `.env` 必须设置 `DB_URL`、专用 `DB_USERNAME` 和 `DB_PASSWORD`；生产数据库连接必须启用证书身份校验。按目标部署形态配置 Redis 与其他外部服务凭据。
+5. **账号服务没有浏览器自助确认支付入口**：渠道回调适配和签名验证接入前，订单保持待支付状态。
 6. **记忆写入会拒**：命中注入/凭据扫描的内容不会写入，REST 返回 `MEMORY.CONTENT_REJECTED`（`MEMORY.01.05`）；Episode 的派生文本命中时替换为占位符、记录保留。
 7. **任务状态更严格**：规划器未达成目标的运行会记为 FAILED（原因码形如 `GRAPH_DEADLOCK`/`OUTER_ROUNDS_EXHAUSTED`），答复里附带未完成节点清单 —— 依赖"任何结束都算成功"的看板/告警需要按新口径调整。
 
@@ -334,7 +336,7 @@
 
 **影响**：注册 → 下 `pro` 订单（3900 分）→ confirm → 直接获得 500 万 token/日额度，可无限重复。**所有付费档位免费**。
 
-**修复**：删除或默认关闭该端点（`portal-confirm-enabled=false`），仅允许签名校验过的渠道回调把订单置为 `PAID`（并保留 operator-only 的人工补偿入口）。
+**修复**：已删除浏览器自助确认端点和无凭证的 `confirmPortalPayment` 方法。渠道验签回调尚未接入，当前 `/api/membership/pay-callback` 保持 fail-closed；人工补偿入口也尚未实现。
 
 ---
 
@@ -502,9 +504,9 @@ docker-compose.yml:64-65,84-85   MINIO_ACCESS_KEY/SECRET: minioadmin / minioadmi
 |---|---|---|---|
 | A-1 | P2 | 审批无审计流水：只写进 Set + 一条聊天消息，trace 的 `WAITING_FOR_HUMAN` 不含被批准的命令原文 | `ToolPipeline.java:185-188`、`SessionPermissionStore.java:264-285` |
 | A-2 | P2 | `ActionJournal.unresolved()` 无生产调用者，"需人工核验"队列无人可读；崩溃留下的 `RUNNING→UNKNOWN` 使该幂等键永久不可执行 | `FileActionJournal.java:44-49`、`ToolPipeline.java:230-247` |
-| A-3 | P2 | 动作日志无界增长、`latest` 全量驻内存、`writeString` 无 fsync，且初始化失败会阻断整个应用启动 | `FileActionJournal.java:25,31-43,56-71` |
-| A-4 | P2 | MCP：`Content-Length` 不校验（`readNBytes` 可申请 ~2GB，`OutOfMemoryError` 逃过 `catch(Exception)`）、头部行无上限、超时泄漏 `pending`、坏客户端不重连 | `McpStdioClient.java:200-224,146-158,189-196` |
-| A-5 | P2 | MCP server 无命令白名单/信任边界/执行契约声明，落到默认档（60s、全局串行、超时 ABORT） | `McpStdioClient.java:47-61`、`McpToolBridge.java:145-150` |
+| A-3 | P2 | ✅ 已修（保留期） | 动作回执改为数据库分页读取；新增默认 10 年终态保留和定时清理，仅清理 `SUCCEEDED/FAILED/TIMEOUT/CANCELLED`，永不清理 `RUNNING/UNKNOWN` 安全屏障；清理失败不改变执行权威。 | `DbActionJournal.java`、`application.yml` |
+| A-4 | P2 | ✅ 已修 | MCP 帧/头部/待处理请求/超时清理已有边界；新增断连后的有界自动恢复，每 server 默认 15 分钟最多 3 次，耗尽后保持断开并要求管理员 refresh 或等待窗口。 | `McpStdioClient.java`、`McpToolBridge.java`、`McpReconnectBudget.java` |
+| A-5 | P2 | ✅ 已修（stdio） | MCP server 必须配置绝对 `command` 与同一真实路径的 `allowed-executable`，并保留精确 `allowed-tools`；缺失/不一致时拒绝启动或注册。HTTP transport 仍未实现。 | `McpProperties.java`、`McpStdioClient.java`、`McpToolBridge.java` |
 | B-1 | P2 | `PlanUnapprovedStopHook` 无 nudge 上限（todo 钩子上限 2），一旦 `toolsInvoked` 含被拒的写类调用就永久 `blockRetry`，只能耗到 90 轮 | `PlanUnapprovedStopHook.java:30-42` vs `TodoPlanStopHook.java:14,34-48`、`AgentLoop.java:1861` |
 | B-2 | P2 | 放弃路径报 SUCCESS：提醒 2 次后附带未完成清单放行并置 SUCCESS；`RunStatus` 无 PARTIAL；`PREVENT_CONTINUATION` 退出连 endReason 都不设（留 "DONE"） | `AgentLoop.java:1943-1958,947,1921-1924` |
 | B-3 | P2 | 重复失败检测按**原始参数串**做键，JSON 键序/空格不同即视为新调用；且要求整批全部重复才中止 | `AgentLoop.java:516-522,534-549` |
@@ -529,7 +531,7 @@ docker-compose.yml:64-65,84-85   MINIO_ACCESS_KEY/SECRET: minioadmin / minioadmi
 | E-1 | P2 | 限流器 map 永不淘汰（1 万个 key 之后新客户端永久 429）、按 `getRemoteAddr()` 取 IP（反代后所有人共用一个桶）、`RedisRateLimiter` 无调用者（多副本限额翻倍）、无 `Retry-After` | `RateLimitFilter.java:36-37,63-68,85-92`、`RedisRateLimiter.java:11-27` |
 | E-2 | P2 | Agent 运行跑在 ForkJoinPool.commonPool（并行度=核数-1、无界队列），排在队列里的请求在返回 200 + 开流之后才开始跑 ⇒ 表现为"卡住"，最长 30 分钟 | `AgentChatApplicationService.java:268,523` vs `ToolExecutorConfig.java:41-49` |
 | E-3 | P2 | 无优雅停机（`server.shutdown` 未设 ⇒ immediate）：每次发布/缩容都会掐断在途运行与 SSE；`recoverOrphanedRuns` 只在下次启动把行标为 INTERRUPTED | `TaskRunService.java:65-86` |
-| E-4 | P2 | 无资源限制/无 restart 策略/无 `-XX:MaxRAMPercentage`/`ExitOnOutOfMemoryError`，基础镜像只用 tag 未用 digest 固定 | `docker-compose.yml`（grep `deploy.resources|restart:` = 0）、`Dockerfile:11,36,61-62` |
+| E-4 | P2 | ✅ 已修（部署形态变更）宿主机直跑 JAR，不再有仓库内 Docker/Compose 生产形态；新增 systemd 单元和启动脚本 JVM 默认参数，覆盖 `MemoryMax`/`CPUQuota`/`TasksMax`/`LimitNOFILE`、`Restart=on-failure`、`MaxRAMPercentage` 与 `ExitOnOutOfMemoryError`。桌面发布模型归档由受保护的 SHA-256 secret 校验；部署时仍需验证 systemd 限额在目标主机生效。 | `scripts/systemd/*.service`、`scripts/run-app.sh`、`scripts/run-app.ps1`、`scripts/start-account.sh`、`scripts/start-memory-service.sh`、`.github/workflows/desktop-release.yml` |
 | E-5 | P2 | 无 TLS：应用端口明文、所有 JDBC `useSSL=false`、账号服务 HTTP、账号模块会话 Cookie 未设 `Secure`/`SameSite` | `application.yml:21,56-57`、`application-prod.yml:14,57` |
 | E-6 | P2 | 账号模块**完全没有 Spring Security**（只有 crypto）：cookie 鉴权 + 状态变更 POST 无 CSRF 防护、无登录限流/锁定 | `mini-agent-account/pom.xml`、`PortalController.java:140-180` |
 | E-7 | P2 | 上传：700MB 上限 + 30 分钟连接超时 + `max-swallow-size: -1`；base64 **先解码后查大小**；无内容嗅探/AV；共享会话媒体根目录的归属校验弱于文档路径 | `application.yml:12-13,59-63`、`FileStorageService.java:58-65`、`MultimodalMessageBuilder.java:137-140`、`UploadedDocumentService.java:139-146` |
@@ -726,6 +728,8 @@ docker-compose.yml:64-65,84-85   MINIO_ACCESS_KEY/SECRET: minioadmin / minioadmi
 - CI 里的 `docker compose --env-file .env.example config --quiet` 校验步骤同步删除。
 - 与 P0-8 相关的一条约束**仍然成立**：`MYSQL_ROOT_PASSWORD` 这类口令不允许有仓库默认值，
   只是现在约束点在部署机 `.env` / 环境变量，而不是 compose 的 `${VAR:?}`。
+
+**后续修订（2026-11-18）**：上文“密钥只存在于 application.yml / 不再有 `.env` 载体”已过时。当前 `.env.example` 是宿主机 JAR 部署模板，启动脚本会读取本机 `.env`；App 启动要求 `DB_URL`、专用 `DB_USERNAME`、`DB_PASSWORD` 和 `REDIS_PASSWORD`，不会回退到 MySQL root 密码。不要把本地 `.env` 提交到仓库。
 
 ## 客户端到云端：`AUTH.03.01` 的实测根因与重试策略（2026-11-09）
 
@@ -1171,3 +1175,36 @@ return hasSuspendedTodo ? CONTINUE : ACTION;   // CONTINUE: suspend=false, resum
   `background=rgba(16,163,127,0.08)`
 
 探针页验证后删除，未入库。
+
+### 2026-11-18 历史复核（当前状态以文末整改复核为准）：P1-9 当时仅 memory-service 擦除闭环
+
+- `DELETE /internal/v2/memory/subjects/{userId}` 仍要求令牌主体和路径 userId 一致；现在在单个数据库事务中删除该用户的 `mem_user_fact`、USER 域 SOP/修订/激活记录、结果事件、进化提案/评审/回归案例/作业，以及遗留的 v1 proposal、trial、canary、validation、evidence、procedure/application 数据。同步删除绑定的用户审计内容，撤销其拥有的项目授权并移除其项目成员关系；共享 PROJECT SOP 内容保留。
+- 新增 memory-service V13 `mem_subject_erasure` 墓碑。墓碑仅保存 tenant 和主体 SHA-256 指纹，不保存原始 userId；同一主体生命周期行 `FOR UPDATE` 串行化写入与擦除。已擦除主体的迟到 USER facts、SOP 导入/写入和 outcome 回放均 fail-closed，防止 App 离线 outbox 把删除内容重新导入。
+- 擦除接口返回 `SubjectErasureResult { complete, erasedItems, erasedFacts, completedAt }`。首次删除与墓碑、数据清理在同一事务提交；若响应丢失，同一路径重试会返回已持久化的相同完成回执和计数。memory-service 定向端到端测试覆盖当前/遗留表清理、跨租户同数值用户隔离、迟到写拒绝、重复回执、共享 PROJECT 记忆保留和 owner 授权撤销；`EvolutionClosedLoopTest` 7/7 通过。
+- **当时状态（已过期）**：App 侧擦除编排尚未实现。文末最新复核记录了随后增加的 App 本地清理、远端重试和 `PENDING_REMOTE`/`COMPLETE` 状态；本段保留作历史，不应用来描述当前代码。
+- App `DELETE /v1/memory/memories/{id}` 仍是单条记忆软删除并异步清理向量索引；`POST /v1/memory/forget` 仍只应用保留策略，不是主体擦除 API。
+- 安全边界复核：Milvus 向量与关键词结果按租户及完整 scope 后置过滤；授权过滤不等于物理删除，必须与可验证的本地/远端清理回执分开验收。
+
+### 2026-11-18 历史复核（当前状态以文末整改复核为准）：P1-5 当时尚无工具按需发现
+
+- 已将稳定的 reasoning、指令层级/确认/输出策略移到动态上下文之前；reference、记忆、技能、todo 与相对日期/当前时间留在后段。请求时间锚点拆入独立 `TIME` 槽，默认预算 400 tokens。这样在支持自动 prompt caching 的 provider 上，跨请求的长静态前缀可以复用；provider 未提供统一缓存开关，本仓库没有声明缓存必然命中。
+- 新增上下文贡献者顺序回归测试，锁定静态片段先于动态 reference、memory、todo、time；媒体输出契约、全自动确认口径和日期锚点定向测试仍通过。
+- **当时状态（已过期）**：direct route 仍发送全部注册工具 schema。文末最新复核记录了后来加入的 `capability_discover` 及固定 Planner/DAG/子代理工具面约束；本段保留作历史，不应用来描述当前代码。
+
+### 2026-11-18 复核：P2 E-7 上传内容边界已收紧，生产需配置扫描器
+
+- 上传在写入前按魔数和有限文本启发式做内容嗅探；客户端 MIME/文件名不再单独决定安全性。无法确认的二进制内容、压缩内容与不支持扩展名组合、声明 MIME 与实际内容冲突时直接拒绝。
+- 新增有界 ClamAV `INSTREAM` 适配器。`prod` profile 将 `file.upload.antivirus.required` 设为 `true`，`ProductionReadinessValidator` 要求同时显式开启 `file.upload.antivirus.enabled`；扫描器缺失、超时、协议异常或报告感染时 fail-closed。开发档可保持关闭以便本地联调。
+- 尚未内置杀毒引擎；上线前必须部署并隔离 ClamAV（或实现同一 `UploadMalwareScanner` 契约的受信扫描器），并以目标环境演练 100 MiB 上限、超时和感染样本处理。故“上传安全”代码边界已修，但生产验收仍依赖扫描器部署与演练。
+
+### 2026-11-18 P0–P2 最终复核（代码与本轮验证）
+
+本节以当前工作区代码和测试为准，覆盖前文历史审计条目中尚未回写的状态：
+
+- P0 八项已修复；P1 的独立验收、上下文窗口、流式重试、超时取消、SSRF、环境变量隔离、主体擦除、密钥加密、配额、可观测性、SSE 断连、历史工具调用、Redis fail-closed 和无界查询已接入代码并有回归测试。
+- P1-9 主体擦除由 App 编排：`POST /v1/memory/erase-subject` 清理本地 SQL/blob、Redis、向量、上传文件、会话、trace/event 和缓存，再调用 memory-service；远端失败返回 `PENDING_REMOTE`，本地与远端回执都确认后才返回 `COMPLETE`。墓碑会拒绝迟到写入。
+- P1-5 direct route 已增加 `capability_discover`。启用动态发现时首轮只暴露发现、todo、memory 和 skill bootstrap 工具；发现结果仅注册允许的工具，后续调用仍同时经过 `PermissionPolicy` 与 `ToolPipeline`，并有 schema、过滤、畸形参数和只读策略测试。生产配置默认开启该能力。
+- P2 A–E 已覆盖：动作回执保留与管理员分页/reconcile、审批审计、MCP 帧和请求边界及有界重连、计划 nudge/任务结局、参数规范化和 schema 严格校验、危险 skill 门禁、统一错误契约、结果分片、事件/outbox 清理与租约恢复、写闸门拒绝审计、限流淘汰/可信代理/Retry-After、独立 executor、优雅停机、账号 CSRF/登录限流、安全 Cookie、生产 TLS/Flyway readiness、迁移预检和上传内容检查/ClamAV fail-closed。
+- **自动化验证通过**：`./mvnw.cmd -B -ntp verify` 结果为 `BUILD SUCCESS`；7 个模块合计 2,304 tests，0 failures、0 errors、94 skipped。release-gate Node 测试 57/57 通过，迁移版本连续性检查通过，`git diff --check` 通过。静态核对确认 agent V1–V36、account V1–V4、memory-service V1–V13 连续。本机没有可用 Bash，因此没有执行 `bash -n` 或 shell 脚本。
+
+仍需目标环境验收的内容属于部署和运行条件：真实 MySQL 8.4 多服务链路、Redis/Milvus/ClamAV 真实服务、多副本并发和崩溃/断网故障注入、TLS 代理与 systemd 资源限额在目标主机上的验证、真实支付渠道验签，以及 Canary 受信 runner、流量观测和回滚演练。代码测试通过不替代这些验收；生产 profile 的 fail-closed 校验必须保持开启。

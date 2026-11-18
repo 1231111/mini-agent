@@ -140,6 +140,22 @@ class PermissionPolicyTest {
     }
 
     @Test
+    void externalMcpToolsRequireApprovalUnlessTheUserExplicitlyEnablesFullAuto() {
+        String tool = "mcp__external__write";
+        assertTrue(PermissionPolicy.isAskDangerous(tool));
+        assertTrue(PermissionPolicy.needsSessionGrant(
+                PermissionMode.DEFAULT, tool, ExecPolicy.ALLOW, ConfirmPolicy.DANGEROUS));
+        assertTrue(PermissionPolicy.needsSessionGrant(
+                PermissionMode.ACCEPT_EDITS, tool, ExecPolicy.ASK, ConfirmPolicy.DANGEROUS),
+                "automatic editing alone must not authorize external MCP tools");
+        assertFalse(PermissionPolicy.needsSessionGrant(
+                PermissionMode.ACCEPT_EDITS, tool, ExecPolicy.ASK, ConfirmPolicy.AUTO),
+                "explicit full-auto retains its documented behavior");
+        assertTrue(PermissionPolicy.needsSessionGrant(
+                PermissionMode.READ_ONLY, tool, ExecPolicy.ALLOW, ConfirmPolicy.AUTO));
+    }
+
+    @Test
     void otherDangerousToolsUnaffectedByExecPolicy() {
         // exec 策略不该波及别的工具：ALLOW 也不能让 write_file 在 ASK 模式下免批
         assertTrue(PermissionPolicy.needsSessionGrant(

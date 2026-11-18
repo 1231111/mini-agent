@@ -84,6 +84,9 @@ public record PlanValidationReport(List<ValidationError> errors, List<Validation
      */
     public record ValidationError(Type type, String nodeId, String message, String suggestion) {
         public enum Type {
+            GRAPH_TOO_LARGE("Graph exceeds configured node limit", true),
+            GRAPH_TOO_MANY_EDGES("Graph exceeds configured dependency edge limit", true),
+            GRAPH_TOO_DEEP("Graph exceeds configured dependency depth", true),
             EMPTY_GRAPH("图为空", true),
             HAS_CYCLE("图包含循环", true),
             DUPLICATE_IDS("节点ID重复", true),

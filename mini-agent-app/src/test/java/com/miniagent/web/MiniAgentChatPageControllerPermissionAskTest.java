@@ -5,6 +5,7 @@ import com.miniagent.agent.permission.ExecPolicyService;
 import com.miniagent.agent.permission.SessionPermissionStore;
 import com.miniagent.common.ApiResponse;
 import com.miniagent.common.ErrorCode;
+import com.miniagent.common.permission.ExecPolicy;
 import com.miniagent.config.security.JwtSessionService;
 import com.miniagent.config.security.SessionAuthorizationService;
 import org.junit.jupiter.api.Test;
@@ -16,6 +17,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -155,11 +157,59 @@ class MiniAgentChatPageControllerPermissionAskTest {
                 "等待点必须仍然可以正常批准");
     }
 
+    @Test
+    void globalBlockRejectsSessionAskAndAllowOverrides() {
+        SessionPermissionStore store = new SessionPermissionStore();
+        MiniAgentChatPageController controller = controller(
+                store, new ExecPolicyService("block", "", store));
+
+        for (String requestedPolicy : new String[]{"ask", "allow"}) {
+            Map<String, Object> body = new HashMap<>();
+            body.put("execPolicy", requestedPolicy);
+            ApiResponse<Object> response = controller.putPermissionMode(
+                    SESSION, body, request(7L));
+
+            assertFalse(response.isSuccess(), "global block must reject " + requestedPolicy);
+            assertEquals(ErrorCode.AUTH_FORBIDDEN.getCode(), response.getCode());
+            assertNull(store.getExecPolicyOverride(SESSION));
+        }
+    }
+
+    @Test
+    void globalBlockAllowsBlockOverrideAndClearingOverride() {
+        SessionPermissionStore store = new SessionPermissionStore();
+        MiniAgentChatPageController controller = controller(
+                store, new ExecPolicyService("block", "", store));
+
+        Map<String, Object> block = new HashMap<>();
+        block.put("execPolicy", "block");
+        ApiResponse<Object> blocked = controller.putPermissionMode(
+                SESSION, block, request(7L));
+        assertTrue(blocked.isSuccess(), blocked.getMessage());
+        assertEquals(ExecPolicy.BLOCK, store.getExecPolicyOverride(SESSION));
+
+        Map<String, Object> inherit = new HashMap<>();
+        inherit.put("execPolicy", "default");
+        ApiResponse<Object> cleared = controller.putPermissionMode(
+                SESSION, inherit, request(7L));
+        assertTrue(cleared.isSuccess(), cleared.getMessage());
+        assertNull(store.getExecPolicyOverride(SESSION));
+        assertTrue(cleared.getData() instanceof Map);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> view = (Map<String, Object>) cleared.getData();
+        assertEquals("block", view.get("execPolicyEffective"));
+        assertEquals(Boolean.TRUE, view.get("execPolicyLocked"));
+    }
+
     private static MiniAgentChatPageController controller(SessionPermissionStore store) {
+        return controller(store, new ExecPolicyService("ask", "", store));
+    }
+
+    private static MiniAgentChatPageController controller(
+            SessionPermissionStore store, ExecPolicyService execPolicyService) {
         MiniAgentChatPageController controller = new MiniAgentChatPageController();
         ReflectionTestUtils.setField(controller, "permissionStore", store);
-        ReflectionTestUtils.setField(controller, "execPolicyService",
-                new ExecPolicyService("ask", "", store));
+        ReflectionTestUtils.setField(controller, "execPolicyService", execPolicyService);
         ReflectionTestUtils.setField(controller, "sessionAuthorization",
                 mock(SessionAuthorizationService.class));
         ReflectionTestUtils.setField(controller, "eventCenter",

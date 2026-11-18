@@ -219,27 +219,6 @@ public class MembershipService {
     }
 
     /**
-     * 网页门户确认到账。只允许订单本人操作。
-     *
-     * <p><b>没有任何支付凭证校验</b> —— 因此它只能在运维显式打开
-     * {@code agent.account.portal-confirm-enabled=true} 时被调用（默认关闭），
-     * 用于本地联调。真实上线的到账入口必须是签名校验过的渠道回调；
-     * 在它接入之前，把 {@code MarkPaid} 暴露给浏览器等于所有付费档免费。</p>
-     */
-    @Transactional
-    public MembershipOrder confirmPortalPayment(Long userId, String orderNo) {
-        MembershipOrder order = orders.findByOrderNo(orderNo)
-                .orElseThrow(() -> new BusinessException(
-                        ErrorCode.MEMBER_ORDER_NOT_FOUND,
-                        "订单「" + orderNo + "」不存在"));
-        if (userId == null || !userId.equals(order.getUserId())) {
-            throw new BusinessException(
-                    ErrorCode.AUTH_FORBIDDEN, "不能支付他人的订单");
-        }
-        return markPaid(orderNo, "portal", orderNo);
-    }
-
-    /**
      * 下单。只落一条 PENDING 订单，不碰配额 —— 配额由支付回调触发。
      *
      * <p>金额在<b>下单时从套餐表抄一份</b>存进订单，之后不再跟套餐表联动。

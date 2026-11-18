@@ -77,6 +77,39 @@ public class MemoryStore {
         return Objects.nonNull(blobStore);
     }
 
+    /**
+     * Erase all local user memory and runtime cache. This operation is deliberately
+     * owner-keyed and idempotent; callers must establish the authenticated owner
+     * before invoking it. Durable blob/vector adapters are erased before the
+     * in-process map is dropped so a crash cannot resurrect the old snapshot.
+     */
+    public void eraseUser(long userId) {
+        if (userId <= 0) {
+            throw new IllegalArgumentException("userId required");
+        }
+        UserMemory removed = users.remove(userId);
+        if (blobStore != null) {
+            blobStore.erase(userId);
+        }
+        if (vectorStore != null) {
+            vectorStore.erase(userId);
+        }
+        Path dir = userDir(userId);
+        deleteTree(dir);
+    }
+
+    private static void deleteTree(Path root) {
+        if (!Files.exists(root)) return;
+        try (var paths = Files.walk(root)) {
+            paths.sorted(Comparator.reverseOrder()).forEach(path -> {
+                try { Files.deleteIfExists(path); }
+                catch (IOException e) { throw new UncheckedIOException("Failed to erase memory", e); }
+            });
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to enumerate memory for erasure", e);
+        }
+    }
+
     /** 触发当前用户长期记忆（MEMORY + USER 全部条目）的向量索引重建。 */
     private void reindexVector(Long userId, UserMemory um) {
         if (Objects.isNull(vectorStore) || !vectorStore.isEnabled()) {

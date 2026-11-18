@@ -63,20 +63,16 @@ class ToolResultTest {
         assertTrue(result.retriable());
     }
 
-    /**
-     * 失败结果必须**原样保留**调用方给的文本。
-     *
-     * <p>此前这一层只取 {@code error} 字段再重建一份 JSON，于是服务层附带的 {@code hint}
-     * 整段消失 —— 而 {@code hint} 里装的正是「HTTP &lt;码&gt;：&lt;响应体前 300 字&gt;」，
-     * 是模型唯一的服务端原话来源（2026-10-15 实测）。</p>
-     */
+    /** Legacy errors gain the shared machine contract without losing diagnostics. */
     @Test
-    void 失败结果保留原文与hint() {
+    void legacyFailureIsNormalizedAndKeepsHint() {
         String raw = "{\"error\":\"歌词生成请求失败\",\"hint\":\"HTTP 500：{\\\"code\\\":\\\"internal\\\"}\"}";
         ToolResult r = ToolResult.fromLegacy(raw);
 
         assertEquals(ToolStatus.FAILED, r.status());
-        assertEquals(raw, r.legacyText(), "rawText 应当就是调用方给的原文，不是重建的");
+        assertTrue(r.legacyText().contains("\"errorCode\":\"DEPENDENCY_UNAVAILABLE\""));
+        assertTrue(r.legacyText().contains("\"retriable\":true"));
+        assertTrue(r.legacyText().contains("\"hint\""));
         assertTrue(r.message().contains("HTTP 500"),
                 "message 要带出 hint，否则模型只看到「歌词生成请求失败」这种笼统文案");
     }

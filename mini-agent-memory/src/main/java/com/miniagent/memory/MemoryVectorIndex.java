@@ -13,5 +13,9 @@ public interface MemoryVectorIndex {
 
     void reindex(Long userId, List<String> entries);
 
+    /** Remove every vector owned by a user. Idempotent. */
+    default void erase(Long userId) {
+    }
+
     List<String> recall(Long userId, String query);
 }

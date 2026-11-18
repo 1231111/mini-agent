@@ -58,6 +58,9 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
     private String judgeApiKey;
     @Value("${agent.planner.judge-timeout-seconds:60}")
     private int judgeTimeoutSeconds;
+    /** Production must never let the executor grade itself when its separate judge is unavailable. */
+    @Value("${agent.planner.require-independent-judge:false}")
+    private boolean requireIndependentJudge;
 
     private volatile ChatModel dedicatedJudge;
     private record ModelIdentity(WeakReference<ChatModel> model, String identity) { }
@@ -125,6 +128,9 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
         // that bounded payload itself is exceeded; the following context
         // budget check remains the authoritative per-model guard.
         if (payload.length() > 48000) return "llm_judge 完整 evidence 超出校验范围，尚未验证；请拆分材料";
+        if (requireIndependentJudge && dedicatedJudge == null) {
+            return "llm_judge 未配置独立评判模型，尚未验证；请配置专用 judge 后重试";
+        }
 
         String instructions = """
                 你是严格的任务验收裁判。根据「评判标准」判断「待验收内容」是否达标。

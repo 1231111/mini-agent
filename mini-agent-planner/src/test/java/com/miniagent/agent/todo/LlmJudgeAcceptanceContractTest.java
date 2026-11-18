@@ -36,6 +36,15 @@ class LlmJudgeAcceptanceContractTest {
         assertNull(judge.validate(item(), "实际统计结果"));
     }
 
+    @Test void productionPolicyNeverFallsBackToTheExecutorForAcceptance() {
+        ChatModel executor = mock(ChatModel.class);
+        LlmJudgeTodoValidator judge = judge(executor);
+        ReflectionTestUtils.setField(judge, "requireIndependentJudge", true);
+
+        assertTrue(judge.validate(item(), "实际统计结果").contains("未配置独立评判模型"));
+        verifyNoInteractions(executor);
+    }
+
     @Test void criteriaAndEvidenceStayInAnIndependentUntrustedDataMessage() {
         ChatModel model = mock(ChatModel.class);
         when(model.chat(org.mockito.ArgumentMatchers.<ChatMessage>anyList())).thenReturn(response("FAIL\n证据不足"));

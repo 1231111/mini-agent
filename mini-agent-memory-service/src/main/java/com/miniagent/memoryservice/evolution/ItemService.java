@@ -25,6 +25,7 @@ import com.miniagent.memoryservice.store.ProjectAccess;
 import com.miniagent.memoryservice.store.ProposalState;
 import com.miniagent.memoryservice.store.ProposalStore;
 import com.miniagent.memoryservice.store.ProposalStore.Proposal;
+import com.miniagent.memoryservice.store.SubjectLifecycleStore;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -57,10 +58,12 @@ public class ItemService {
     private final EvolutionPolicy policy;
     private final EvolutionProperties props;
     private final Clock clock;
+    private final SubjectLifecycleStore subjects;
 
     public ItemService(ItemStore items, ProposalStore proposals, JobQueue jobs,
                        OutcomeStore outcomes, ProjectAccess projects, AuditStore audit,
-                       EvolutionPolicy policy, EvolutionProperties props, Clock clock) {
+                       EvolutionPolicy policy, EvolutionProperties props, Clock clock,
+                       SubjectLifecycleStore subjects) {
         this.items = items;
         this.proposals = proposals;
         this.jobs = jobs;
@@ -70,6 +73,7 @@ public class ItemService {
         this.policy = policy;
         this.props = props;
         this.clock = clock;
+        this.subjects = subjects;
     }
 
     /** 同名即同一条目：内容变了就追加人工修订并激活，内容没变原样返回。 */
@@ -215,22 +219,6 @@ public class ItemService {
                 baseline.tasks(), baseline.successes(), item.health());
     }
 
-    /** 用户注销：删其 USER 域条目、相关提案 / 回归案例 / 作业与其全部结果事件。 */
-    @Transactional
-    public int eraseUser(String tenantId, long userId) {
-        List<Long> erased = items.deleteUserScope(tenantId, userId);
-        Instant now = clock.instant();
-        for (Long itemId : erased) {
-            proposals.openForItem(itemId).ifPresent(p -> jobs.cancelForProposal(p.id(), now));
-        }
-        proposals.deleteForItems(erased);
-        audit.deleteRegressionForItems(erased);
-        outcomes.deleteUser(tenantId, userId);
-        audit.audit(tenantId, "subject-erasure", "SUBJECT_ERASED", "USER", userId,
-                Map.of("items", erased.size()), now);
-        return erased.size();
-    }
-
     /** 当前用户能否看到该条目（USER 域本人，PROJECT 域有授权）。 */
     public Item requireVisible(Principal principal, long id) {
         requireUser(principal);
@@ -279,6 +267,9 @@ public class ItemService {
 
     private ItemView write(String tenantId, long ownerUserId, ScopeType scopeType, String scopeId,
                            ItemWrite write, Origin origin, String actor) {
+        if (scopeType == ScopeType.USER) {
+            subjects.lockForWrite(tenantId, ownerUserId);
+        }
         validate(write, scopeId);
         if (SecurityScanner.scan(write.name() + "\n" + write.content().text()) != null) {
             throw new BusinessException(ErrorCode.MEMORY_CONTENT_REJECTED);

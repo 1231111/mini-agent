@@ -1,6 +1,9 @@
 package com.miniagent.web;
 
 import com.miniagent.common.ApiResponse;
+import com.miniagent.agent.execution.ActionJournal;
+import com.miniagent.agent.execution.ActionJournalEntry;
+import com.miniagent.agent.execution.ActionExecutionStatus;
 import com.miniagent.web.dto.resp.RevokedSessionsDTO;
 import com.miniagent.config.security.CurrentUser;
 import com.miniagent.config.service.SystemAdminService;
@@ -31,6 +34,9 @@ public class SystemAdminController {
     @Autowired
     private CurrentUser currentUser;
 
+    @Autowired
+    private ActionJournal actionJournal;
+
 
     @GetMapping("/tenants")
     public ApiResponse<?> tenants() {
@@ -40,14 +46,14 @@ public class SystemAdminController {
     @PostMapping(value = "/tenants", consumes = MediaType.APPLICATION_JSON_VALUE)
     public ApiResponse<?> createTenant(@Valid @RequestBody TenantCreateRequest body) {
         return ApiResponse.ok(service.createTenant(actor(), body.slug(), body.name(),
-                body.dailyTokenLimit()));
+                body.dailyTokenLimit(), body.dailyUserTokenLimit()));
     }
 
     @PatchMapping(value = "/tenants/{id}", consumes = MediaType.APPLICATION_JSON_VALUE)
     public ApiResponse<?> updateTenant(@PathVariable Long id,
                                        @Valid @RequestBody TenantUpdateRequest body) {
         return ApiResponse.ok(service.updateTenant(actor(), id, body.enabled(),
-                body.dailyTokenLimit()));
+                body.dailyTokenLimit(), body.dailyUserTokenLimit()));
     }
 
     @GetMapping("/users")
@@ -85,6 +91,28 @@ public class SystemAdminController {
         return ApiResponse.ok(service.listAudit(page, size));
     }
 
+    /** Unknown external side effects require a human reconciliation; never replay them automatically. */
+    @GetMapping("/action-journal/unresolved")
+    public ApiResponse<?> unresolvedActions(@RequestParam(defaultValue = "100") int limit,
+                                            @RequestParam(defaultValue = "0") int offset) {
+        int bounded = Math.max(1, Math.min(200, limit));
+        int boundedOffset = Math.max(0, Math.min(1_000_000, offset));
+        return ApiResponse.ok(actionJournal.unresolved(bounded, boundedOffset).stream()
+                .map(UnresolvedActionView::of).toList());
+    }
+
+    /** Explicitly reconcile a durable UNKNOWN/RUNNING receipt; never executes it. */
+    @PostMapping(value = "/action-journal/unresolved/{receiptId}:reconcile",
+            consumes = MediaType.APPLICATION_JSON_VALUE)
+    public ApiResponse<?> reconcileAction(@PathVariable String receiptId,
+                                          @Valid @RequestBody ReconcileActionRequest body) {
+        ActionExecutionStatus resolution = ActionExecutionStatus.valueOf(body.resolution().toUpperCase());
+        ActionJournalEntry entry = actionJournal.reconcile(receiptId, resolution, body.note())
+                .orElseThrow(() -> new IllegalArgumentException("action receipt is no longer unresolved"));
+        service.auditActionJournalReview(actor(), receiptId, resolution.name(), body.note());
+        return ApiResponse.ok(UnresolvedActionView.of(entry));
+    }
+
     private Long actor() {
         return currentUser.userId();
     }
@@ -92,10 +120,12 @@ public class SystemAdminController {
     public record TenantCreateRequest(
             @NotBlank @Pattern(regexp = "[a-z0-9][a-z0-9-]{2,63}") String slug,
             @NotBlank @Size(max = 120) String name,
-            @PositiveOrZero Long dailyTokenLimit) {}
+            @PositiveOrZero Long dailyTokenLimit,
+            @PositiveOrZero Long dailyUserTokenLimit) {}
 
     public record TenantUpdateRequest(Boolean enabled,
-                                      @PositiveOrZero Long dailyTokenLimit) {}
+                                      @PositiveOrZero Long dailyTokenLimit,
+                                      @PositiveOrZero Long dailyUserTokenLimit) {}
 
     public record UserCreateRequest(
             @NotNull Long tenantId,
@@ -111,4 +141,34 @@ public class SystemAdminController {
 
     public record PasswordResetRequest(
             @NotBlank @Size(min = 12, max = 200) String password) {}
+
+    public record ReconcileActionRequest(
+            @NotBlank @Pattern(regexp = "(?i)FAILED|CANCELLED") String resolution,
+            @Size(max = 1000) String note) {}
+
+    public record UnresolvedActionView(String receiptId, String sessionIdHash, String toolName, String argumentsHash,
+                                       String status, int attempt, long timestampEpochMillis,
+                                       String errorCode) {
+        static UnresolvedActionView of(ActionJournalEntry entry) {
+            String receiptId = entry.receiptId().isBlank() ? digestKey(entry.key()) : entry.receiptId();
+            String sessionIdHash = entry.sessionIdHash().isBlank() ? null : entry.sessionIdHash();
+            return new UnresolvedActionView(receiptId, sessionIdHash,
+                    entry.toolName(), entry.argumentsHash(), entry.status().name(), entry.attempt(),
+                    entry.timestampEpochMillis(), entry.errorCode());
+        }
+
+        private static String digestKey(com.miniagent.agent.execution.ActionJournalKey key) {
+            try {
+                java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+                for (String value : java.util.List.of(key.sessionId(), key.planVersion(), key.nodeId(), key.idempotencyKey())) {
+                    byte[] bytes = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    digest.update(java.nio.ByteBuffer.allocate(4).putInt(bytes.length).array());
+                    digest.update(bytes);
+                }
+                return java.util.HexFormat.of().formatHex(digest.digest());
+            } catch (java.security.NoSuchAlgorithmException impossible) {
+                throw new IllegalStateException("SHA-256 unavailable", impossible);
+            }
+        }
+    }
 }

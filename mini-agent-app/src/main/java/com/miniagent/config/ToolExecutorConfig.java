@@ -20,6 +20,8 @@ public class ToolExecutorConfig {
     private static final int MAX_POOL_SIZE = 8;
     private static final long KEEP_ALIVE_SECONDS = 60L;
     private static final int QUEUE_CAPACITY = 64;
+    private static final int AGENT_RUN_CORE_POOL_SIZE = 4;
+    private static final int AGENT_RUN_MAX_POOL_SIZE = 8;
 
     /**
      * 工具执行专用线程池。
@@ -47,5 +49,29 @@ public class ToolExecutorConfig {
                 threadFactory,
                 new ThreadPoolExecutor.CallerRunsPolicy()
         );
+    }
+
+    /**
+     * Long-lived Agent runs must not compete with unrelated common-pool work.
+     * Do not queue accepted runs: their HTTP/SSE timeout could expire before the
+     * worker starts. AbortPolicy lets the request path terminalize and notify an
+     * overloaded run immediately.
+     */
+    @Bean(name = "agentRunExecutor", destroyMethod = "shutdown")
+    public ExecutorService agentRunExecutor() {
+        AtomicInteger threadNum = new AtomicInteger(0);
+        ThreadFactory threadFactory = task -> {
+            Thread thread = new Thread(task, "agent-run-worker-" + threadNum.incrementAndGet());
+            thread.setDaemon(false);
+            return thread;
+        };
+        return new ThreadPoolExecutor(
+                AGENT_RUN_CORE_POOL_SIZE,
+                AGENT_RUN_MAX_POOL_SIZE,
+                60L,
+                TimeUnit.SECONDS,
+                new SynchronousQueue<>(),
+                threadFactory,
+                new ThreadPoolExecutor.AbortPolicy());
     }
 }

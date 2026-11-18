@@ -40,14 +40,14 @@ if (Test-Path $envFile) {
 }
 
 $missing = @()
-foreach ($name in @('MYSQL_ROOT_PASSWORD', 'REDIS_PASSWORD', 'MODEL_CONFIG_ENCRYPTION_KEY')) {
+foreach ($name in @('DB_URL', 'DB_USERNAME', 'DB_PASSWORD', 'REDIS_PASSWORD', 'MODEL_CONFIG_ENCRYPTION_KEY')) {
     if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name, 'Process'))) {
         $missing += $name
     }
 }
 if ($missing.Count -gt 0) {
     Write-Host ("Missing " + ($missing -join ', ')) -ForegroundColor Red
-    Write-Host "MYSQL_ROOT_PASSWORD / REDIS_PASSWORD must match the local MySQL and Redis." -ForegroundColor Red
+    Write-Host "DB_PASSWORD / REDIS_PASSWORD must match the dedicated MySQL user and Redis." -ForegroundColor Red
     Write-Host "MODEL_CONFIG_ENCRYPTION_KEY: 32-byte Base64 (openssl rand -base64 32)." -ForegroundColor Red
     Write-Host "Chat model key: set LLM_API_KEY or MIMO_API_KEY, or configure it in %USERPROFILE%\\.miniagent\\config.yml." -ForegroundColor Red
     exit 1
@@ -72,10 +72,6 @@ if (-not (Test-Path $onnx) -or -not (Test-Path $tok)) {
 }
 
 $env:SPRING_PROFILES_ACTIVE = 'prod'
-$env:DB_URL = if ($env:DB_URL) { $env:DB_URL } else { 'jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8' }
-$env:DB_USERNAME = if ($env:DB_USERNAME) { $env:DB_USERNAME } else { 'root' }
-$env:DB_PASSWORD = if ($env:DB_PASSWORD) { $env:DB_PASSWORD } else { $env:MYSQL_ROOT_PASSWORD }
-
 # application-prod.yml uses host "redis" (the compose service name). The jar runs
 # on the host, so that name does not resolve - override it explicitly.
 $env:SPRING_DATA_REDIS_HOST = if ($env:SPRING_DATA_REDIS_HOST) { $env:SPRING_DATA_REDIS_HOST } else { '127.0.0.1' }
@@ -92,6 +88,12 @@ $env:AGENT_MEMORY_VECTOR_BACKEND = if ($env:AGENT_MEMORY_VECTOR_BACKEND) { $env:
 $env:AGENT_CODEBASE_EMBEDDING_PROVIDER = if ($env:AGENT_CODEBASE_EMBEDDING_PROVIDER) { $env:AGENT_CODEBASE_EMBEDDING_PROVIDER } else { 'local-onnx' }
 $env:MINI_AGENT_MODELS_DIR = $modelsDir
 if (-not $env:MINI_AGENT_HOME) { $env:MINI_AGENT_HOME = Join-Path $HOME '.miniagent' }
+$javaRuntimeOpts = if ($env:MINI_AGENT_JAVA_OPTS) {
+    $env:MINI_AGENT_JAVA_OPTS
+} else {
+    '-XX:MaxRAMPercentage=75 -XX:InitialRAMPercentage=25 -XX:+UseContainerSupport -XX:+ExitOnOutOfMemoryError'
+}
+$jvmOptions = $javaRuntimeOpts -split '\s+' | Where-Object { $_ -ne '' }
 
 # ---- 3. verify jar and middleware -----------------------------------------
 $jarPath = Join-Path $repoRoot $Jar
@@ -123,5 +125,5 @@ Write-Host "Starting MiniAgent: profile=prod port=$Port" -ForegroundColor Cyan
 Write-Host "  data dir : $env:MINI_AGENT_HOME"
 Write-Host "  models   : $modelsDir"
 
-& java -jar $jarPath --server.port=$Port
+& java @jvmOptions -jar $jarPath --server.port=$Port
 exit $LASTEXITCODE

@@ -36,6 +36,10 @@ public class SystemAdminBootstrap implements ApplicationRunner {
     private String displayName;
     @Value("${agent.auth.bootstrap-admin.required:false}")
     private boolean required;
+    @Value("${agent.quota.self-hosted-default-daily-token-limit:1000000}")
+    private long selfHostedDefaultDailyTokenLimit;
+    @Value("${agent.quota.self-hosted-default-daily-user-token-limit:100000}")
+    private long selfHostedDefaultDailyUserTokenLimit;
 
     @Override
     @Transactional
@@ -77,6 +81,8 @@ public class SystemAdminBootstrap implements ApplicationRunner {
                         value.setSlug("system");
                         value.setName("System");
                         value.setEnabled(true);
+                        value.setDailyTokenLimit(Math.max(1L, selfHostedDefaultDailyTokenLimit));
+                        value.setDailyUserTokenLimit(Math.max(1L, selfHostedDefaultDailyUserTokenLimit));
                         return tenants.save(value);
                     });
         }

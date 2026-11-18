@@ -4,6 +4,7 @@ import com.miniagent.account.service.MemoryAccessTokenService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.ActiveProfiles;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
@@ -33,6 +34,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
         "agent.account.memory-token-key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         "agent.account.internal-key=context-loads-internal-key"
 })
+@ActiveProfiles("test")
 class AccountContextLoadsTest {
 
     @Autowired

@@ -126,6 +126,25 @@ class DefaultConsolidationServiceTest {
     }
 
     @Test
+    void episodeLookupFailurePropagatesSoWorkingMemoryCanBeRetried() {
+        when(eventRepository.findByTenantIdAndSessionIdOrderByCreatedAtAsc("tenant-a", "session-a"))
+                .thenReturn(List.of());
+        WorkingMemory workingMemory = new WorkingMemory();
+        workingMemory.setTenantId("tenant-a");
+        workingMemory.setSessionId("session-a");
+        workingMemory.setGoal("finish migration");
+        WorkingMemoryManager workingMemoryManager = mock(WorkingMemoryManager.class);
+        when(workingMemoryManager.get("session-a")).thenReturn(workingMemory);
+        when(episodeRepository.existsByTenantIdAndSessionId("tenant-a", "session-a"))
+                .thenThrow(new IllegalStateException("database read failed"));
+        ReflectionTestUtils.setField(service, "workingMemoryManager", workingMemoryManager);
+
+        assertThrows(IllegalStateException.class, () -> service.consolidate("tenant-a", "session-a"));
+        verify(episodeRepository, never()).save(any(AgentEpisodeEntity.class));
+        verify(workingMemoryManager, never()).touch("session-a");
+    }
+
+    @Test
     void legacyConsolidationWithoutBoundTenantIsRejected() {
         service.consolidate("session-a");
 

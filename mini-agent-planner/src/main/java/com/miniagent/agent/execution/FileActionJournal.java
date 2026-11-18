@@ -139,6 +139,21 @@ public class FileActionJournal implements ActionJournal, AutoCloseable {
                 .sorted(Comparator.comparingLong(ActionJournalEntry::timestampEpochMillis)).toList();
     }
 
+    @Override public List<ActionJournalEntry> unresolved(int limit) {
+        int bounded = Math.max(1, Math.min(500, limit));
+        return latest.values().stream().filter(e -> e.status() == ActionExecutionStatus.UNKNOWN)
+                .sorted(Comparator.comparingLong(ActionJournalEntry::timestampEpochMillis))
+                .limit(bounded).toList();
+    }
+
+    @Override public List<ActionJournalEntry> unresolved(int limit, int offset) {
+        int boundedLimit = Math.max(1, Math.min(500, limit));
+        int boundedOffset = Math.max(0, Math.min(1_000_000, offset));
+        return latest.values().stream().filter(e -> e.status() == ActionExecutionStatus.UNKNOWN)
+                .sorted(Comparator.comparingLong(ActionJournalEntry::timestampEpochMillis))
+                .skip(boundedOffset).limit(boundedLimit).toList();
+    }
+
     private void requireOpen() {
         if (processLock == null || !processLock.isValid()) throw new IllegalStateException("ACTION_JOURNAL_NOT_OPEN");
     }

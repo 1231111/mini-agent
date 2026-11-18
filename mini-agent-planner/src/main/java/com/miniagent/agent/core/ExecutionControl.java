@@ -47,6 +47,7 @@ public class ExecutionControl {
         /** 累计 token 的告警线，不是终止线。 */
         private final long tokenSoftLimit;
         private final Long tenantId;
+        private final Long userId;
         private final String signalId;
         private final String runToken;
         private boolean started;
@@ -70,16 +71,17 @@ public class ExecutionControl {
         private final AtomicLong heartbeatEpochMillis = new AtomicLong(System.currentTimeMillis());
 
         private Lease(long deadlineEpochMillis, int maxToolCalls, long tokenSoftLimit,
-                      Long tenantId) {
-            this(deadlineEpochMillis, maxToolCalls, tokenSoftLimit, tenantId, null, null, null);
+                      Long tenantId, Long userId) {
+            this(deadlineEpochMillis, maxToolCalls, tokenSoftLimit, tenantId, userId, null, null, null);
         }
 
         private Lease(long deadlineEpochMillis, int maxToolCalls, long tokenSoftLimit,
-                      Long tenantId, String signalId, String runToken, Lease pending) {
+                      Long tenantId, Long userId, String signalId, String runToken, Lease pending) {
             this.deadlineEpochMillis = deadlineEpochMillis;
             this.maxToolCalls = maxToolCalls;
             this.tokenSoftLimit = tokenSoftLimit;
             this.tenantId = tenantId;
+            this.userId = userId;
             this.signalId = signalId;
             this.runToken = runToken;
             this.cancelled = pending == null ? new AtomicBoolean() : pending.cancelled;
@@ -144,11 +146,40 @@ public class ExecutionControl {
     }
 
     public Lease start(String sessionId, Long tenantId) {
+        return start(sessionId, tenantId, null, null);
+    }
+
+    public Lease start(String sessionId, Long tenantId, String runToken) {
+        return start(sessionId, tenantId, null, runToken);
+    }
+
+    public Lease start(String sessionId, Long tenantId, Long userId, String runToken) {
         String key = key(sessionId);
+        String scoped = runToken == null ? null : scopedKey(key, runToken);
         long deadline = System.currentTimeMillis() + deadlineMillis;
-        Lease lease = new Lease(deadline, maxToolCalls, tokenSoftLimit, tenantId);
+        Lease lease;
+        if (scoped == null) {
+            lease = new Lease(deadline, maxToolCalls, tokenSoftLimit, tenantId, userId);
+        } else {
+            prunePendingRuns();
+            lease = runLeases.compute(scoped, (ignored, pending) -> {
+                if (pending != null && pending.started) return pending;
+                Lease active = new Lease(deadline, maxToolCalls, tokenSoftLimit,
+                        tenantId, userId, scoped, runToken, pending);
+                if (tenantId != null && tenantTokenQuota.isPresent()
+                        && !tenantTokenQuota.get().check(tenantId, userId).allowed()) {
+                    active.tenantQuotaDenied.set(true);
+                }
+                signalStore.ifPresent(store -> store.startPreservingControls(
+                        scoped, active.deadlineEpochMillis, signalTtlMillis()));
+                active.started = true;
+                leases.put(key, active);
+                return active;
+            });
+            return lease;
+        }
         if (tenantId != null && tenantTokenQuota.isPresent()
-                && !tenantTokenQuota.get().check(tenantId).allowed()) {
+                && !tenantTokenQuota.get().check(tenantId, userId).allowed()) {
             lease.tenantQuotaDenied.set(true);
         }
         leases.put(key, lease);
@@ -158,28 +189,6 @@ public class ExecutionControl {
             leases.remove(key, lease);
             throw e;
         }
-        return lease;
-    }
-
-    public Lease start(String sessionId, Long tenantId, String runToken) {
-        String sid = key(sessionId);
-        String scoped = scopedKey(sid, runToken);
-        prunePendingRuns();
-        Lease lease = runLeases.compute(scoped, (ignored, pending) -> {
-            if (pending != null && pending.started) return pending;
-            Lease active = new Lease(System.currentTimeMillis() + deadlineMillis,
-                    maxToolCalls, tokenSoftLimit, tenantId, scoped, runToken, pending);
-            if (tenantId != null && tenantTokenQuota.isPresent()
-                    && !tenantTokenQuota.get().check(tenantId).allowed()) {
-                active.tenantQuotaDenied.set(true);
-            }
-            // Same scoped key is serialized with pre-start cancel/pause/resume.
-            signalStore.ifPresent(store -> store.startPreservingControls(
-                    scoped, active.deadlineEpochMillis, signalTtlMillis()));
-            active.started = true;
-            leases.put(sid, active);
-            return active;
-        });
         return lease;
     }
 
@@ -314,7 +323,7 @@ public class ExecutionControl {
         AtomicReference<RuntimeException> failure = new AtomicReference<>();
         runLeases.compute(scoped, (ignored, previous) -> {
             Lease lease = previous == null ? new Lease(System.currentTimeMillis() + deadlineMillis,
-                    maxToolCalls, tokenSoftLimit, null, scoped, runToken, null) : previous;
+                    maxToolCalls, tokenSoftLimit, null, null, scoped, runToken, null) : previous;
             // Install the local control first. A remote signal-store failure must
             // not discard a pre-start cancel/pause/resume when compute returns.
             try {
@@ -529,14 +538,19 @@ public class ExecutionControl {
             return StopReason.TENANT_QUOTA_EXCEEDED;
         }
         long tokens = Math.max(0, estimated);
-        if (lease.tenantId != null && tenantTokenQuota.isPresent()
-                && !tenantTokenQuota.get().consume(lease.tenantId, tokens).allowed()) {
-            lease.tenantQuotaDenied.set(true);
-            return StopReason.TENANT_QUOTA_EXCEEDED;
+        if (lease.tenantId != null && tenantTokenQuota.isPresent()) {
+            boolean allowed = tenantTokenQuota.get().consume(lease.tenantId, lease.userId, tokens).allowed();
+            // Count the completed model response locally even when it crosses a cap.
+            lease.estimatedTokens.addAndGet(tokens);
+            if (!allowed) {
+                lease.tenantQuotaDenied.set(true);
+                return StopReason.TENANT_QUOTA_EXCEEDED;
+            }
+        } else {
+            lease.estimatedTokens.addAndGet(tokens);
         }
         // 累计 token 只统计、不判定。越过 tokenSoftLimit 时由调用方记一条告警并继续，
         // 不在这里返回停止原因 —— 详见 StopReason 的类注释。
-        lease.estimatedTokens.addAndGet(tokens);
         return StopReason.NONE;
     }
 
@@ -549,7 +563,7 @@ public class ExecutionControl {
             if (scoped != null && (current == null || token.equals(current.runToken))) return scoped;
             // A finished worker must never adopt the next run's budget or controls.
             Lease stale = new Lease(System.currentTimeMillis() + deadlineMillis,
-                    maxToolCalls, tokenSoftLimit, null, scopedKey(resolved, token), token, null);
+                    maxToolCalls, tokenSoftLimit, null, null, scopedKey(resolved, token), token, null);
             stale.cancelled.set(true);
             return stale;
         }
@@ -575,7 +589,7 @@ public class ExecutionControl {
     }
     private Lease fallbackLease() {
         return new Lease(System.currentTimeMillis() + deadlineMillis,
-                maxToolCalls, tokenSoftLimit, null);
+                maxToolCalls, tokenSoftLimit, null, null);
     }
     private long signalTtlMillis() { return Math.max(deadlineMillis + 60_000L, 120_000L); }
     private static String key(String sessionId) { return sessionId == null || sessionId.isBlank() ? "anonymous" : sessionId; }

@@ -217,6 +217,59 @@ class PlanValidatorTest {
                 PlanValidationReport.ValidationError.Type.UNDER_DECOMPOSED));
     }
 
+    @Test
+    void rejectsGraphAboveConfiguredNodeLimitBeforeBusinessChecks() {
+        PlannerProperties properties = new PlannerProperties();
+        properties.setMaxGraphNodes(1);
+        PlanValidator boundedValidator = new PlanValidator(properties);
+        TaskGraph graph = new TaskGraph(List.of(
+                node("n1", "Inspect source", "research"),
+                node("n2", "Summarize source", "research", List.of("n1"))));
+
+        PlanValidationReport report = boundedValidator.validate(graph, TaskPlan.of("Summarize source"));
+
+        assertFalse(report.valid());
+        assertEquals(1, report.errors().size());
+        assertEquals(1, report.countByType(
+                PlanValidationReport.ValidationError.Type.GRAPH_TOO_LARGE));
+    }
+
+    @Test
+    void rejectsGraphAboveConfiguredDependencyEdgeLimit() {
+        PlannerProperties properties = new PlannerProperties();
+        properties.setMaxGraphEdges(0);
+        PlanValidator boundedValidator = new PlanValidator(properties);
+        TaskGraph graph = new TaskGraph(List.of(
+                node("n1", "Inspect source", "research"),
+                node("n2", "Summarize source", "research", List.of("n1"))));
+
+        PlanValidationReport report = boundedValidator.validate(graph, TaskPlan.of("Summarize source"));
+
+        assertFalse(report.valid());
+        assertEquals(1, report.errors().size());
+        assertEquals(1, report.countByType(
+                PlanValidationReport.ValidationError.Type.GRAPH_TOO_MANY_EDGES));
+    }
+
+    @Test
+    void rejectsGraphAboveConfiguredDependencyDepth() {
+        PlannerProperties properties = new PlannerProperties();
+        properties.setMaxGraphDepth(2);
+        PlanValidator boundedValidator = new PlanValidator(properties);
+        TaskGraph graph = new TaskGraph(List.of(
+                node("n1", "Inspect source", "research"),
+                node("n2", "Extract findings", "research", List.of("n1")),
+                node("n3", "Summarize findings", "research", List.of("n2"))));
+
+        PlanValidationReport report = boundedValidator.validate(graph, TaskPlan.of("Summarize source"));
+
+        assertFalse(report.valid());
+        assertEquals(1, report.countByType(
+                PlanValidationReport.ValidationError.Type.GRAPH_TOO_DEEP));
+        assertTrue(graph.exceedsDependencyDepth(2));
+        assertFalse(graph.exceedsDependencyDepth(3));
+    }
+
     private static TaskPlan structured(String goal) {
         return TaskPlan.of(goal);
     }

@@ -1,0 +1,22 @@
+# Production portal sessions must only travel over HTTPS. The service binds to
+# loopback by default and should sit behind a TLS-terminating reverse proxy.
+server:
+  address: ${ACCOUNT_SERVER_ADDRESS:127.0.0.1}
+  servlet:
+    session:
+      cookie:
+        secure: true
+        http-only: true
+        same-site: lax
+
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: ${ACCOUNT_DB_POOL_MAX_SIZE:10}
+      minimum-idle: ${ACCOUNT_DB_POOL_MIN_IDLE:2}
+      connection-timeout: 30000
+      validation-timeout: 5000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      data-source-properties:
+        sslMode: VERIFY_IDENTITY

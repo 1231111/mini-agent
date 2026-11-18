@@ -7,6 +7,7 @@ import com.miniagent.agent.execution.ActionJournalEntry;
 import com.miniagent.agent.execution.ActionJournalKey;
 import com.miniagent.common.io.AgentDataPaths;
 import com.miniagent.migration.V28__DurableActionClaims;
+import com.miniagent.migration.V31__ActionReceiptSessionScopeHash;
 import org.flywaydb.core.api.migration.Context;
 import org.h2.jdbcx.JdbcDataSource;
 import org.junit.jupiter.api.Test;
@@ -203,8 +204,10 @@ class DbActionJournalTest {
         assertEquals(ActionExecutionStatus.UNKNOWN, journal.latest(other).orElseThrow().status());
         assertFalse(journal.claim(other, "send", HASH, true).acquired());
         assertEquals(1, journal.unresolved().size());
+        assertEquals(sha256(other.sessionId()), journal.unresolved().getFirst().sessionIdHash());
         String persisted = new JdbcTemplate(database).queryForList("SELECT * FROM agent_action_receipt").toString();
         assertFalse(persisted.contains("fixture-session"));
+        assertFalse(persisted.contains("other-session"));
         assertFalse(persisted.contains("secret-idempotency-marker"));
     }
 
@@ -317,6 +320,71 @@ class DbActionJournalTest {
         assertEquals(0, new JdbcTemplate(database).queryForObject("SELECT COUNT(*) FROM agent_action_receipt", Integer.class));
     }
 
+    @Test void retentionPrunesOnlyExpiredConfirmedReceiptsAndNeverUnknownOrRunningBarriers() throws Exception {
+        JdbcDataSource database = database();
+        DbActionJournal journal = journal(database);
+        ActionJournalKey succeededKey = new ActionJournalKey("s1", "e1", "node", "success");
+        ActionJournalKey failedKey = new ActionJournalKey("s2", "e2", "node", "failed");
+        ActionJournalKey unknownKey = new ActionJournalKey("s3", "e3", "node", "unknown");
+        ActionJournalKey runningKey = new ActionJournalKey("s4", "e4", "node", "running");
+        seedOldTerminal(journal, database, succeededKey, ActionExecutionStatus.SUCCEEDED);
+        seedOldTerminal(journal, database, failedKey, ActionExecutionStatus.FAILED);
+        seedOldTerminal(journal, database, unknownKey, ActionExecutionStatus.UNKNOWN);
+        journal.claim(runningKey, "send", HASH, false);
+        new JdbcTemplate(database).update("UPDATE agent_action_receipt SET timestamp_ms=1000");
+
+        assertEquals(2, journal.purgeTerminalReceiptsBefore(2_000L));
+        assertEquals(0, new JdbcTemplate(database).queryForObject("SELECT COUNT(*) FROM agent_action_receipt"
+                + " WHERE execution_status IN ('SUCCEEDED','FAILED','TIMEOUT','CANCELLED')", Integer.class));
+        assertEquals(ActionExecutionStatus.UNKNOWN, journal.latest(unknownKey).orElseThrow().status());
+        assertEquals(ActionExecutionStatus.RUNNING, journal.latest(runningKey).orElseThrow().status());
+    }
+
+    private static void seedOldTerminal(DbActionJournal journal, DataSource database,
+                                        ActionJournalKey key, ActionExecutionStatus status) {
+        ActionJournal.Claim claim = journal.claim(key, "send", HASH, false);
+        journal.append(terminal(claim, status));
+        new JdbcTemplate(database).update("UPDATE agent_action_receipt SET timestamp_ms=1000 WHERE execution_status=?",
+                status.name());
+    }
+
+    @Test void sessionHashMigrationLeavesHistoricalReceiptsUnscopedAndIsRepeatable() throws Exception {
+        JdbcDataSource database = new JdbcDataSource();
+        database.setURL("jdbc:h2:mem:action-migration-" + UUID.randomUUID() + ";MODE=MySQL;DB_CLOSE_DELAY=-1");
+        migrateV28(database);
+        new JdbcTemplate(database).update("INSERT INTO agent_action_receipt"
+                        + " (key_digest,tool_name,arguments_hash,execution_status,attempt,timestamp_ms,error_code,diagnostic_message,result_digest)"
+                        + " VALUES (?,?,?,?,?,?,?,?,?)",
+                "c".repeat(64), "send", HASH, "UNKNOWN", 1, 123L, "OUTCOME_UNKNOWN", "", "");
+
+        migrateV31(database);
+        migrateV31(database);
+
+        assertNull(new JdbcTemplate(database).queryForObject(
+                "SELECT session_id_hash FROM agent_action_receipt WHERE key_digest=?", String.class, "c".repeat(64)),
+                "the irreversible legacy key digest cannot be used to reconstruct a session hash");
+        assertEquals(1, new JdbcTemplate(database).queryForObject("SELECT COUNT(*) FROM agent_action_receipt", Integer.class));
+    }
+
+    @Test void newReceiptsPersistOnlySessionHashAndExposeStableReceiptIdForReview() throws Exception {
+        JdbcDataSource database = database();
+        DbActionJournal journal = journal(database);
+        journal.claim(KEY, "send", HASH, false);
+
+        String expectedSessionHash = sha256(KEY.sessionId());
+        var row = new JdbcTemplate(database).queryForMap("SELECT * FROM agent_action_receipt");
+        assertEquals(expectedSessionHash, row.get("SESSION_ID_HASH"));
+        assertFalse(row.toString().contains(KEY.sessionId()));
+
+        ActionJournalEntry persisted = journal.latest(KEY).orElseThrow();
+        assertEquals(row.get("KEY_DIGEST"), persisted.receiptId());
+        assertEquals(expectedSessionHash, persisted.sessionIdHash());
+        ActionJournalEntry unresolved = journal.unresolved(10, 0).getFirst();
+        assertEquals(persisted.receiptId(), unresolved.receiptId());
+        assertEquals(expectedSessionHash, unresolved.sessionIdHash());
+        assertFalse(unresolved.key().sessionId().contains(KEY.sessionId()));
+    }
+
     @Test void rawToolDiagnosticsAndUntrustedErrorBodiesAreNeverPersisted() throws Exception {
         JdbcDataSource database = database();
         DbActionJournal journal = journal(database);
@@ -342,7 +410,29 @@ class DbActionJournalTest {
             Context context = mock(Context.class);
             when(context.getConnection()).thenReturn(connection);
             new V28__DurableActionClaims().migrate(context);
+            new V31__ActionReceiptSessionScopeHash().migrate(context);
         }
+    }
+
+    private static void migrateV28(DataSource database) throws Exception {
+        try (Connection connection = database.getConnection()) {
+            Context context = mock(Context.class);
+            when(context.getConnection()).thenReturn(connection);
+            new V28__DurableActionClaims().migrate(context);
+        }
+    }
+
+    private static void migrateV31(DataSource database) throws Exception {
+        try (Connection connection = database.getConnection()) {
+            Context context = mock(Context.class);
+            when(context.getConnection()).thenReturn(connection);
+            new V31__ActionReceiptSessionScopeHash().migrate(context);
+        }
+    }
+
+    private static String sha256(String value) throws Exception {
+        return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                .digest(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
     }
 
     private DbActionJournal journal(DataSource database) {

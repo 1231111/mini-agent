@@ -12,9 +12,11 @@ public enum ContextSlot {
     REASONING(1500),
     TOOLS(4000),
     TODO(2000),
-    // Includes the output/media contract plus the relative-date anchor; keep enough room
-    // so mandatory suffix guidance is not silently clipped from every model request.
-    CLOSING(2400);
+    // Stable closing/confirmation/output policy, placed before request-specific context.
+    CLOSING(2400),
+    // Request-specific date anchor follows stable policy text so it does not invalidate
+    // the reusable system-prompt prefix on providers with automatic prompt caching.
+    TIME(400);
 
     private final int defaultTokenBudget;
 

@@ -6,7 +6,16 @@ import java.util.Objects;
 public record ActionJournalEntry(ActionJournalKey key, String toolName, String argumentsHash,
                                  ActionExecutionStatus status, int attempt,
                                  long timestampEpochMillis, String errorCode,
-                                 String message, String resultDigest) {
+                                 String message, String resultDigest,
+                                 String receiptId, String sessionIdHash) {
+    /** Source-compatible constructor for journal entries without persisted review metadata. */
+    public ActionJournalEntry(ActionJournalKey key, String toolName, String argumentsHash,
+                              ActionExecutionStatus status, int attempt, long timestampEpochMillis,
+                              String errorCode, String message, String resultDigest) {
+        this(key, toolName, argumentsHash, status, attempt, timestampEpochMillis,
+                errorCode, message, resultDigest, "", "");
+    }
+
     public ActionJournalEntry {
         key = Objects.requireNonNull(key, "key");
         toolName = Objects.requireNonNullElse(toolName, "");
@@ -17,6 +26,8 @@ public record ActionJournalEntry(ActionJournalKey key, String toolName, String a
         errorCode = Objects.requireNonNullElse(errorCode, "");
         message = truncate(Objects.requireNonNullElse(message, ""), 1000);
         resultDigest = Objects.requireNonNullElse(resultDigest, "");
+        receiptId = Objects.requireNonNullElse(receiptId, "");
+        sessionIdHash = Objects.requireNonNullElse(sessionIdHash, "");
     }
 
     private static String truncate(String value, int max) {

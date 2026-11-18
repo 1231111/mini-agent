@@ -103,14 +103,21 @@ class UserModelConfigWindowTest {
         }
     }
 
-    @Test void legacyOverrideWithoutWindowIsConservativeAndCorruptWindowRemainsRepairable() {
+    @Test void legacyAndCorruptWindowOverridesUseConservativeBudgetAndRemainRepairable() {
         service.save(1L, "default", "https://own.example/v1", "small-model", "own-key");
         assertNull(stored.get().getCustomContextWindowTokens());
         assertEquals(8192, service.getEffective(1L).contextWindowTokens());
         stored.get().setCustomContextWindowTokens(-1);
-        assertThrows(IllegalStateException.class, () -> service.getEffective(1L));
-        assertEquals(false, current(service.getView(1L)).get("configurationValid"));
+        assertEquals(8192, service.getEffective(1L).contextWindowTokens(),
+                "a corrupt optional window must fall back to the conservative custom-model budget");
+        Map<String, Object> view = current(service.getView(1L));
+        assertEquals(true, view.get("configurationValid"));
+        assertEquals(0, view.get("customContextWindowTokens"), "the invalid persisted value must not be shown as editable input");
+        assertEquals(8192, view.get("contextWindowTokens"));
+        assertEquals("conservative", view.get("contextWindowSource"));
+        assertTrue(view.get("contextWindowWarning").toString().contains("未确认"));
         assertEquals(true, service.save(1L, "default", "https://own.example/v1", "small-model", "", 32000).get("success"));
+        assertEquals(32000, service.getEffective(1L).contextWindowTokens());
     }
 
     @SuppressWarnings("unchecked") private static Map<String, Object> current(Map<String, Object> view) {

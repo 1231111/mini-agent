@@ -18,7 +18,22 @@ public interface AgentEventRepository extends JpaRepository<AgentEventEntity, Lo
     List<AgentEventEntity> findByTenantIdAndSessionIdAndTaskIdOrderByCreatedAtAsc(
             String tenantId, String sessionId, String taskId);
 
-    List<AgentEventEntity> findByProcessedFalseOrderByCreatedAtAsc();
+    List<AgentEventEntity> findTop50ByProcessedFalseAndSessionIdIsNotNullAndTenantIdIsNotNullOrderByCreatedAtAsc();
+
+    List<AgentEventEntity> findTop500ByProcessedTrueAndCreatedAtBeforeOrderByIdAsc(
+            java.time.LocalDateTime createdAt);
+
+    @Modifying
+    @org.springframework.transaction.annotation.Transactional
+    @Query("UPDATE AgentEventEntity e SET e.processed = true "
+            + "WHERE e.processed = false AND (e.sessionId IS NULL OR e.sessionId = '' "
+            + "OR e.tenantId IS NULL OR e.tenantId = '')")
+    int markUnconsolidatableProcessed();
+
+    @Modifying
+    @org.springframework.transaction.annotation.Transactional
+    @Query("DELETE FROM AgentEventEntity e WHERE e.id IN :ids")
+    int deleteByIds(@Param("ids") List<Long> ids);
 
     @Modifying
     @Query("UPDATE AgentEventEntity e SET e.processed = true WHERE e.id IN :ids")

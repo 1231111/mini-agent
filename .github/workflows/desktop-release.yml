@@ -86,6 +86,59 @@ jobs:
       - name: Run offline client and acceptance contract regressions
         run: node scripts/agent-eval/run-offline-checks.mjs
 
+  server-quality:
+    name: Server tests and database migration validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        # Release migrations must be exercised against the production major.
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: schema-test-root
+          MYSQL_DATABASE: mini_agent_schema_test
+          MYSQL_USER: miniagent
+          MYSQL_PASSWORD: schema-test-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pschema-test-root --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      MINIAGENT_SCHEMA_TEST: 'true'
+      SCHEMA_DB_URL: jdbc:mysql://127.0.0.1:3306/mini_agent_schema_test?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      SCHEMA_DB_USERNAME: miniagent
+      SCHEMA_DB_PASSWORD: schema-test-password
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Compile and test all server modules
+        run: |
+          chmod +x mvnw
+          ./mvnw -B -ntp verify
+      - name: Validate Flyway migration sequence
+        run: bash scripts/verify-migrations.sh
+      - name: Require verified pre-deployment backup and migration policy
+        env:
+          MIGRATION_BACKUP_VERIFIED: ${{ secrets.MIGRATION_BACKUP_VERIFIED }}
+          MIGRATION_BACKUP_ID: ${{ secrets.MIGRATION_BACKUP_ID }}
+        run: bash scripts/preflight-migrations.sh
+      - name: Save Surefire reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-server-test-reports
+          path: '**/target/surefire-reports/'
+          if-no-files-found: ignore
+          retention-days: 7
+
   browser-contracts:
     name: Release Chromium execution and client recovery (Windows)
     runs-on: windows-latest
@@ -119,8 +172,12 @@ jobs:
 
   desktop:
     name: ${{ matrix.label }}
-    needs: [browser-contracts, client-quality]
+    needs: [browser-contracts, client-quality, server-quality]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     # 单平台约 15 分钟（fat jar 3 + jlink 1 + Chromium 1 + electron-builder 5 + 上传 3），
     # 留 3 倍余量给冷缓存和网络抖动。
     timeout-minutes: 60
@@ -207,10 +264,19 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The checksum shipped beside the archive is fetched from the same
+          # mutable release.  A separately protected digest is required so an
+          # attacker cannot replace both files and still pass verification.
+          EXPECTED_MODELS_SHA256: ${{ secrets.MODELS_ARCHIVE_SHA256 }}
         run: |
           set -euo pipefail
           WORK=".verify/_models"
           rm -rf "$WORK" && mkdir -p "$WORK"
+
+          if [[ ! "$EXPECTED_MODELS_SHA256" =~ ^[a-f0-9]{64}$ ]]; then
+            echo "::error::MODELS_ARCHIVE_SHA256 must be a protected lowercase SHA-256 digest" >&2
+            exit 1
+          fi
 
           echo "从 release ${MODELS_RELEASE_TAG} 取 ${MODELS_ARCHIVE}"
           if ! gh release download "$MODELS_RELEASE_TAG" \
@@ -235,7 +301,8 @@ jobs:
           # 校验 sha256 而不是直接解开。下载被中断或被代理改写时，拿到的可能是一个
           # HTML 错误页 —— 它有文件名、有字节数，会被一路放行到建会话那一步才失败。
           node scripts/verify-models-archive.mjs \
-            "$WORK/${MODELS_ARCHIVE}" "$WORK/${MODELS_ARCHIVE}.sha256" --list
+            "$WORK/${MODELS_ARCHIVE}" "$WORK/${MODELS_ARCHIVE}.sha256" \
+            --expected-sha256 "$EXPECTED_MODELS_SHA256" --list
 
           rm -rf .verify/onnx && mkdir -p .verify/onnx
           # `< /dev/null` 不是多余的心眼：msys2 版 GNU tar 在 stdin 是**匿名管道**时
@@ -257,6 +324,15 @@ jobs:
         # --expect-arch 让脚本校验「runner 实际架构 == 矩阵声明的架构」，
         # 不符会在第一步就失败，不会打出一份名实不符的包。
         run: node scripts/build-desktop.mjs --target=${{ matrix.target }} --expect-arch=${{ matrix.arch }}
+
+      - name: Attest packaged installers
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            mini-agent-desktop/dist/*.exe
+            mini-agent-desktop/dist/*.dmg
+            mini-agent-desktop/dist/*.AppImage
+            mini-agent-desktop/dist/*.deb
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

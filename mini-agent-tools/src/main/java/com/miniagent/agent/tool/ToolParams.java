@@ -6,6 +6,7 @@ import lombok.Data;
 
 import java.lang.reflect.Field;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -70,6 +71,10 @@ public abstract class ToolParams {
                 fieldDef.put("items", Map.of("type", "string"));
             }
             fieldDef.put("description", annotation.description());
+
+            if (annotation.allowedValues().length > 0) {
+                fieldDef.put("enum", List.of(annotation.allowedValues()));
+            }
 
             if (annotation.required()) {
                 fieldDef.put("required", Boolean.TRUE);

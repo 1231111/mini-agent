@@ -212,13 +212,6 @@ public class ToolRegistry {
         }
         LinkedHashSet<String> names = new LinkedHashSet<>(allowedToolNames);
         // 全工具面（含写文件+网页）时附带已注册 MCP，避免静态白名单漏掉 mcp__*
-        if (names.contains("write_file") && names.contains("web_extract")) {
-            for (String n : specCache.keySet()) {
-                if (Objects.nonNull(n) && n.startsWith("mcp__")) {
-                    names.add(n);
-                }
-            }
-        }
         List<ToolSpecification> result = new ArrayList<>();
         for (String name : names) {
             ToolSpecification spec = specCache.get(name);
@@ -291,7 +284,8 @@ public class ToolRegistry {
 
         Map<String, Object> params = tool.getParameters();
         if (Objects.nonNull(params) && !params.isEmpty()) {
-            JsonObjectSchema.Builder schema = JsonObjectSchema.builder();
+            JsonObjectSchema.Builder schema = JsonObjectSchema.builder()
+                    .additionalProperties(false);
             List<String> required = new ArrayList<>();
 
             for (Map.Entry<String, Object> entry : params.entrySet()) {
@@ -303,6 +297,8 @@ public class ToolRegistry {
                     String type = String.valueOf(def.getOrDefault("type", "string")).toLowerCase(Locale.ROOT);
                     String desc = Objects.toString(def.getOrDefault("description", ""), "");
                     boolean isRequired = Boolean.TRUE.equals(def.get("required"));
+                    List<String> allowedValues = def.get("enum") instanceof Collection<?> values
+                            ? values.stream().map(Objects::toString).toList() : List.of();
 
                     switch (type) {
                         case "array" -> schema.addProperty(paramName, JsonArraySchema.builder()
@@ -329,7 +325,9 @@ public class ToolRegistry {
                             }
                         }
                         default -> {
-                            if (StringUtils.isBlank(desc)) {
+                            if (!allowedValues.isEmpty()) {
+                                schema.addEnumProperty(paramName, allowedValues, desc);
+                            } else if (StringUtils.isBlank(desc)) {
                                 schema.addStringProperty(paramName);
                             } else {
                                 schema.addStringProperty(paramName, desc);

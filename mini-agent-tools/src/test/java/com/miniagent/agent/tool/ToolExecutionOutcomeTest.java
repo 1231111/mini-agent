@@ -49,7 +49,9 @@ class ToolExecutionOutcomeTest {
 
     @Test
     void readonlyExecUsesActualCommandRatherThanConservativeRegistrationContract() {
-        Tool exec = Tool.builder().name("exec_command").sideEffect(ToolSideEffect.EXTERNAL_WRITE)
+        Tool exec = Tool.builder().name("exec_command").parameters(Map.of("command", Map.of(
+                        "type", "string", "required", true)))
+                .sideEffect(ToolSideEffect.EXTERNAL_WRITE)
                 .handler(args -> { throw new IllegalStateException("connection reset"); }).build();
         assertEquals(ToolStatus.FAILED, exec.executeResult("{\"command\":\"git status\"}").status());
         assertUnknown(exec.executeResult("{\"command\":\"git push origin master\"}"));

@@ -20,4 +20,11 @@ public interface MemoryBlobStore {
     void saveUser(long userId, String content);
 
     void saveMidterm(long userId, String content);
+
+    /** Permanently remove all persisted user memory blobs. Must be idempotent. */
+    default void erase(long userId) {
+        // Implementations backed by a durable store must override this method.
+        // The no-op default keeps legacy file-only adapters source compatible;
+        // MemoryStore removes their files separately.
+    }
 }

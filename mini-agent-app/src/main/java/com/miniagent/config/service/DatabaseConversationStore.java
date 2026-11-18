@@ -14,6 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.data.domain.PageRequest;
 
 import java.time.Instant;
 import java.util.*;
@@ -36,6 +37,8 @@ public class DatabaseConversationStore {
     
 
     private static final int TITLE_MAX = 200;
+    private static final int SUMMARY_PAGE_SIZE = 100;
+    private static final int API_MESSAGE_HISTORY_LIMIT = 100;
 
     /** Create a new conversation for a user */
     @Transactional
@@ -98,7 +101,19 @@ public class DatabaseConversationStore {
                 || MessageConstants.isSystemControlMessage(content)) {
             return;
         }
-        long realUserMsgs = messageRepo.findByConversationIdOrderByTimestampAsc(id).stream()
+        // Keep the bounded paged query on the production path.  A few integrations
+        // still provide the legacy list-only repository double; if a double returns
+        // null for the overload, fall back to that method rather than failing title
+        // generation with an NPE.  Spring Data never returns null here in production.
+        var page = messageRepo.findByConversationIdOrderByTimestampAsc(id,
+                PageRequest.of(0, API_MESSAGE_HISTORY_LIMIT));
+        List<ChatMessage> messages = page != null
+                ? page.getContent()
+                : messageRepo.findByConversationIdOrderByTimestampAsc(id);
+        if (messages == null) {
+            messages = List.of();
+        }
+        long realUserMsgs = messages.stream()
                 .filter(m -> ChatRole.USER.getValue().equals(m.getRole()))
                 .filter(m -> !MessageConstants.isSystemControlMessage(m.getContent()))
                 .count();
@@ -131,11 +146,8 @@ public class DatabaseConversationStore {
     /** List conversations for a user */
     @Transactional(readOnly = true)
     public List<ConversationSummary> list(Long userId) {
-        return conversationRepo.findByUserIdAndDeletedFalseOrderByUpdatedAtDesc(userId).stream()
-                .map(c -> new ConversationSummary(
-                        c.getId(), c.getTitle(), c.getCreatedAt(), c.getUpdatedAt(),
-                        messageRepo.countByConversationId(c.getId())))
-                .collect(Collectors.toList());
+        return conversationRepo.findUserSummaries(userId, PageRequest.of(0, SUMMARY_PAGE_SIZE))
+                .getContent().stream().map(DatabaseConversationStore::summaryFromRow).toList();
     }
 
     /** 所有去重的用户 ID（供每日分析按用户遍历）。 */
@@ -155,13 +167,16 @@ public class DatabaseConversationStore {
     /** List all conversations (no user filter, for backward compat) */
     @Transactional(readOnly = true)
     public List<ConversationSummary> listAll() {
-        return conversationRepo.findAll().stream()
-                .filter(c -> !c.isDeleted())
-                .sorted((a, b) -> Long.compare(b.getUpdatedAt(), a.getUpdatedAt()))
-                .map(c -> new ConversationSummary(
-                        c.getId(), c.getTitle(), c.getCreatedAt(), c.getUpdatedAt(),
-                        messageRepo.countByConversationId(c.getId())))
-                .collect(Collectors.toList());
+        log.warn("Unscoped conversation listing is deprecated; returning only the latest {} summaries",
+                SUMMARY_PAGE_SIZE);
+        return conversationRepo.findAllSummaries(PageRequest.of(0, SUMMARY_PAGE_SIZE))
+                .getContent().stream().map(DatabaseConversationStore::summaryFromRow).toList();
+    }
+
+    private static ConversationSummary summaryFromRow(Object[] row) {
+        return new ConversationSummary((String) row[0], (String) row[1],
+                ((Number) row[2]).longValue(), ((Number) row[3]).longValue(),
+                ((Number) row[4]).longValue());
     }
 
     /** Append a message */
@@ -181,6 +196,57 @@ public class DatabaseConversationStore {
             applyAutoTitle(conv, id, role, content);
             conversationRepo.save(conv);
         });
+    }
+
+    /** Persist the assistant answer together with completed tool exchanges from this turn. */
+    @Transactional
+    public void addAssistantMessageWithToolHistory(String id, String content,
+                                                    List<dev.langchain4j.data.message.ChatMessage> runMessages) {
+        String encodedHistory = AgentToolHistoryCodec.encodeLatestTurn(runMessages);
+        if (StringUtils.isBlank(encodedHistory)) {
+            encodedHistory = AgentToolHistoryCodec.encodeExchanges(runMessages);
+        }
+        final String history = encodedHistory;
+        if (StringUtils.isBlank(history)) {
+            addMessage(id, ChatRole.ASSISTANT.getValue(), content);
+            return;
+        }
+        conversationRepo.findById(id).filter(conv -> !conv.isDeleted()).ifPresent(conv -> {
+            ChatMessage msg = new ChatMessage();
+            msg.setConversationId(id);
+            msg.setRole(ChatRole.ASSISTANT.getValue());
+            msg.setContent(content);
+            msg.setToolHistoryJson(history);
+            msg.setTimestamp(Instant.now().toEpochMilli());
+            messageRepo.save(msg);
+
+            conv.setUpdatedAt(Instant.now().toEpochMilli());
+            conversationRepo.save(conv);
+        });
+    }
+
+    /** Bounded model-facing history, including structured tool exchanges hidden from chat APIs. */
+    @Transactional(readOnly = true)
+    public List<AgentHistoryMessage> agentHistory(String id, int maxMessages) {
+        if (StringUtils.isBlank(id)) return List.of();
+        int limit = Math.max(1, Math.min(maxMessages, API_MESSAGE_HISTORY_LIMIT));
+        var page = messageRepo.findByConversationIdOrderByTimestampDescIdDesc(id, PageRequest.of(0, limit));
+        List<ChatMessage> rows = new ArrayList<>(page.getContent());
+        Collections.reverse(rows);
+        return rows.stream().map(row -> {
+            AgentHistoryMessage message = new AgentHistoryMessage();
+            message.role = row.getRole();
+            message.content = row.getContent();
+            if (StringUtils.isNotBlank(row.getImages())) {
+                try {
+                    message.images = MAPPER.readValue(row.getImages(), new TypeReference<List<String>>() {});
+                } catch (Exception ignored) {
+                    message.images = List.of();
+                }
+            }
+            message.toolHistoryJson = row.getToolHistoryJson();
+            return message;
+        }).toList();
     }
 
     /** Append a message with images */
@@ -292,6 +358,17 @@ public class DatabaseConversationStore {
                 .orElse(null);
     }
 
+    /** Bounded projection for the legacy conversation read endpoint. */
+    @Transactional(readOnly = true)
+    public Conversation getForUserBounded(Long userId, String id) {
+        if (Objects.isNull(userId) || Objects.isNull(id)) {
+            return null;
+        }
+        return conversationRepo.findByIdAndUserIdAndDeletedFalse(id, userId)
+                .map(entity -> toModel(entity, API_MESSAGE_HISTORY_LIMIT))
+                .orElse(null);
+    }
+
     public boolean ownedBy(Long userId, String id) {
         return Objects.nonNull(userId) && Objects.nonNull(id)
                 && conversationRepo.existsByIdAndUserIdAndDeletedFalse(id, userId);
@@ -317,6 +394,10 @@ public class DatabaseConversationStore {
 
     /** Convert entity to model */
     private Conversation toModel(ChatConversation entity) {
+        return toModel(entity, Integer.MAX_VALUE);
+    }
+
+    private Conversation toModel(ChatConversation entity, int maxMessages) {
         Conversation conv = new Conversation();
         conv.id = entity.getId();
         conv.title = entity.getTitle();
@@ -324,7 +405,16 @@ public class DatabaseConversationStore {
         conv.updatedAt = entity.getUpdatedAt();
         conv.workspaceRoot = entity.getWorkspaceRoot();
         conv.projectId = entity.getProjectId();
-        conv.messages = messageRepo.findByConversationIdOrderByTimestampAsc(entity.getId())
+        List<ChatMessage> messages;
+        if (maxMessages == Integer.MAX_VALUE) {
+            messages = messageRepo.findByConversationIdOrderByTimestampAsc(entity.getId());
+        } else {
+            var page = messageRepo.findByConversationIdOrderByTimestampDescIdDesc(entity.getId(),
+                    PageRequest.of(0, Math.max(1, Math.min(maxMessages, API_MESSAGE_HISTORY_LIMIT))));
+            messages = new ArrayList<>(page.getContent());
+            Collections.reverse(messages);
+        }
+        conv.messages = messages
                 .stream().map(m -> {
             Message msg = new Message();
             msg.role = m.getRole();
@@ -362,6 +452,13 @@ public class DatabaseConversationStore {
         public String content;
         public long timestamp;
         public List<String> images;
+    }
+
+    public static class AgentHistoryMessage {
+        public String role;
+        public String content;
+        public List<String> images = List.of();
+        public String toolHistoryJson;
     }
 
     public static class ConversationSummary {

@@ -30,6 +30,10 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @Timeout(8)
 class ToolPipelineEffectGuardTest {
+    private static final Map<String, Object> BROWSER_CLICK_SCHEMA = Map.of(
+            "target", Map.of("type", "object"),
+            "buttons", Map.of("type", "array", "items", Map.of("type", "string")),
+            "keys", Map.of("type", "array", "items", Map.of("type", "integer")));
     private static final String SESSION = "effect-fixture";
     private static final ExecutionTurnContext.ActionBinding ACTION = new ExecutionTurnContext.ActionBinding(
             "random-proposal-action", "browser-node", "browser_click", "stable-browser-action");
@@ -231,7 +235,7 @@ class ToolPipelineEffectGuardTest {
     }
     private static Fixture fixture(ActionJournal journal, String tool, Function<String, String> handler) {
         ToolRegistry registry = new ToolRegistry();
-        registry.register(tool, "fixture", Map.of(), handler);
+        registry.register(tool, "fixture", "browser_click".equals(tool) ? BROWSER_CLICK_SCHEMA : Map.of(), handler);
         SessionPermissionStore permissions = new SessionPermissionStore();
         return new Fixture(new ToolPipeline(new ExecutionControl(60000, 50, 10000), new ToolHookChain(List.of()), permissions,
                 journal, new ToolExecutionGuards(registry, new AgentToolsProperties(4)), registry,

@@ -21,6 +21,9 @@ public class ChatMessage {
     @Column(columnDefinition = "TEXT")
     private String images;
 
+    @Column(name = "tool_history_json", columnDefinition = "LONGTEXT")
+    private String toolHistoryJson;
+
     @Column(nullable = false)
     private Long timestamp;
 
@@ -34,6 +37,8 @@ public class ChatMessage {
     public void setContent(String content) { this.content = content; }
     public String getImages() { return images; }
     public void setImages(String images) { this.images = images; }
+    public String getToolHistoryJson() { return toolHistoryJson; }
+    public void setToolHistoryJson(String toolHistoryJson) { this.toolHistoryJson = toolHistoryJson; }
     public Long getTimestamp() { return timestamp; }
     public void setTimestamp(Long timestamp) { this.timestamp = timestamp; }
 }

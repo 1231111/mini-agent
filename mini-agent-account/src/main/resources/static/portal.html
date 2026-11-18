@@ -107,16 +107,32 @@ const auth = document.getElementById('auth');
 const desk = document.getElementById('desk');
 const loginForm = document.getElementById('loginForm');
 const registerForm = document.getElementById('registerForm');
+let csrfToken = '';
+const csrfReady = (async function () {
+    const response = await fetch('/api/portal/csrf', { credentials: 'same-origin' });
+    const body = await response.json();
+    if (!response.ok || !body.success || !body.data || !body.data.token) {
+        throw new Error('无法初始化安全请求令牌');
+    }
+    csrfToken = body.data.token;
+})();
 
 function yuan(cents) {
     return (Number(cents) / 100).toFixed(2) + ' 元';
 }
 
 async function call(path, options) {
-    const res = await fetch(path, Object.assign({
+    const requestOptions = Object.assign({
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' }
-    }, options || {}));
+    }, options || {});
+    requestOptions.headers = Object.assign(
+        { 'Content-Type': 'application/json' }, (options && options.headers) || {});
+    if (String(requestOptions.method || 'GET').toUpperCase() === 'POST') {
+        await csrfReady;
+        requestOptions.headers['X-CSRF-TOKEN'] = csrfToken;
+    }
+    const res = await fetch(path, requestOptions);
     return res.json();
 }
 

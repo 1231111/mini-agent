@@ -15,6 +15,7 @@ import com.miniagent.agent.planner.ProcedurePromptInput;
 import com.miniagent.agent.planner.ProcedurePromptPort;
 import com.miniagent.common.ErrorCode;
 import com.miniagent.common.exception.BusinessException;
+import com.miniagent.application.SubjectErasureService;
 import org.apache.commons.lang3.StringUtils;
 import com.miniagent.memory.MemoryManager;
 import com.miniagent.memory.SecurityScanner;
@@ -98,16 +99,27 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
     @Autowired(required = false)
     private ProcedureCloudSync cloudSync;
 
+    @Autowired
+    private SubjectErasureService subjectErasureService;
+
     @Value("${agent.memory.context.max-tokens:4000}")
     private int contextMaxTokens;
 
     @Value("${agent.memory.context.max-episodes:5}")
     private int maxEpisodes;
 
+    private void assertSubjectWritable() {
+        Long userId = OwnerContext.currentUserId();
+        if (userId != null && subjectErasureService != null) {
+            subjectErasureService.assertWritable(OwnerContext.effectiveTenantId(), userId);
+        }
+    }
+
     // === 写入 ===
 
     @Override
     public void recordEvent(AgentEvent event) {
+        assertSubjectWritable();
         // 持久化事件
         AgentEventEntity entity = new AgentEventEntity();
         entity.setTenantId(event.getTenantId());
@@ -135,6 +147,7 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
     @Override
     @Transactional
     public void writeMemory(MemoryEntry entry) {
+        assertSubjectWritable();
         requireSafeForPrompt(entry.getContent(), entry.getSummary(), "记忆条目");
         AgentMemoryEntryEntity entity = toEntity(entry);
         entity = entryRepository.save(entity);
@@ -173,6 +186,7 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
     @Override
     @Transactional
     public void updateMemory(Long id, MemoryEntry update) {
+        assertSubjectWritable();
         entryRepository.findById(id).ifPresent(entity -> {
             if (update.getContent() != null) {
                 entity.setContent(update.getContent());
@@ -209,6 +223,7 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
     @Override
     @Transactional
     public void updateMemory(String tenantId, Long id, MemoryEntry update) {
+        assertSubjectWritable();
         if (tenantId == null || tenantId.isBlank() || id == null || update == null) {
             return;
         }
@@ -402,6 +417,7 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
     @Override
     @Transactional
     public void writeFact(SemanticFact fact) {
+        assertSubjectWritable();
         // 事实会以"已知事实"注入提示（DefaultMemoryService 的 facts 段），同样要过闸门。
         // 巩固期由模型从工具输出/网页内容里提炼出来的"事实"尤其危险：
         // 攻击者只要让模型把一句话总结成事实，就能让它出现在之后每一次系统提示里。
@@ -469,6 +485,7 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
     @Override
     @Transactional
     public Procedure writeProcedure(Procedure procedure) {
+        assertSubjectWritable();
         // SOP 会以"可用方法"注入提示，是"持久化指令"最容易被忽视的一条路径
         requireSafeForPrompt(
                 procedure.getName() + " " + procedure.getDescription(),

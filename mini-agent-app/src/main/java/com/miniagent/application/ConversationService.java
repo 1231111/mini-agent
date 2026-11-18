@@ -58,7 +58,7 @@ public class ConversationService {
     }
 
     public Conversation getConversationForUser(Long userId, String sessionId) {
-        return conversationStore.getForUser(userId, sessionId);
+        return conversationStore.getForUserBounded(userId, sessionId);
     }
 
     public boolean deleteConversation(String sessionId) {

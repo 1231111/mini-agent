@@ -47,6 +47,12 @@ public class DbMemoryBlobStore implements MemoryBlobStore {
         repo.save(row);
     }
 
+    @Override
+    @Transactional
+    public void erase(long userId) {
+        repo.deleteById(userId);
+    }
+
     private AgentUserMemory getOrCreate(long userId) {
         return repo.findById(userId).orElseGet(() -> {
             AgentUserMemory n = new AgentUserMemory();

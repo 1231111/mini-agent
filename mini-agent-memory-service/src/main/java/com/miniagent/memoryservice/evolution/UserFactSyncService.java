@@ -8,6 +8,7 @@ import com.miniagent.memory.contract.MemoryApi.UserFactSyncResult;
 import com.miniagent.memory.contract.MemoryApi.UserFactView;
 import com.miniagent.memory.contract.ServiceToken.Principal;
 import com.miniagent.memoryservice.store.UserFactStore;
+import com.miniagent.memoryservice.store.SubjectLifecycleStore;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -27,10 +28,12 @@ public class UserFactSyncService {
     private static final int MAX_VALUE_LENGTH = 8192;
 
     private final UserFactStore facts;
+    private final SubjectLifecycleStore subjects;
     private final Clock clock;
 
-    public UserFactSyncService(UserFactStore facts, Clock clock) {
+    public UserFactSyncService(UserFactStore facts, SubjectLifecycleStore subjects, Clock clock) {
         this.facts = facts;
+        this.subjects = subjects;
         this.clock = clock;
     }
 
@@ -42,6 +45,7 @@ public class UserFactSyncService {
     @Transactional
     public UserFactSyncResult synchronize(Principal principal, UserFactSync request) {
         requireUser(principal);
+        subjects.lockForWrite(principal.tenantId(), principal.userId());
         if (request == null || request.facts() == null
                 || request.facts().size() > MAX_BATCH_SIZE) {
             throw invalid("user fact batch must contain at most " + MAX_BATCH_SIZE + " entries");

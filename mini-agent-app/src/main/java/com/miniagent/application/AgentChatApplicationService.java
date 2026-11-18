@@ -36,6 +36,7 @@ import dev.langchain4j.memory.ChatMemory;
 import dev.langchain4j.model.chat.ChatModel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -62,6 +63,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import com.miniagent.common.ChatMessageTexts;
 import com.miniagent.common.ChatRole;
 import com.miniagent.common.ErrorCode;
@@ -90,6 +92,9 @@ public class AgentChatApplicationService {
 
     @Autowired
     private AgentLoop agentLoop;
+    @Autowired
+    @Qualifier("agentRunExecutor")
+    private Executor agentRunExecutor;
     @Autowired
     private ExecutionProperties executionProperties;
     @Autowired
@@ -123,6 +128,8 @@ public class AgentChatApplicationService {
     private ChatTaskRepository chatTaskRepository;
     @Autowired
     private UserRepository userRepository;
+    @Autowired(required = false)
+    private com.miniagent.agent.core.TenantTokenQuota tenantTokenQuota;
     @Autowired
     private SessionEventCenter eventCenter;
     @Autowired
@@ -171,6 +178,16 @@ public class AgentChatApplicationService {
         agentLoop.setEventCenter(eventCenter);
         agentLoop.setToolExecutionSink(toolExecutionSink);
         planningLoop.setTraceRecorder(traceRecorder);
+        streamingService.getEventCenter().setOrphanedRunHandler((sessionId, runToken) -> {
+            try {
+                // The EventCenter invokes this only on the run-owning replica,
+                // after its reconnect grace and distributed client-presence check.
+                executionControl.cancel(sessionId, runToken);
+                log.info("SSE clients disconnected; requested bounded cancellation: sessionId={}", sessionId);
+            } catch (RuntimeException unavailable) {
+                log.warn("SSE disconnect cancellation could not reach run control: sessionId={}", sessionId, unavailable);
+            }
+        });
     }
 
     // =========================================================================
@@ -195,7 +212,7 @@ public class AgentChatApplicationService {
      * 会话不存在时先创建（首次提问即建会话）。失败不影响主流程。
      */
     private void persistTurn(Long userId, String sessionId, String userMessage, String answer,
-                             List<String> userImagePaths) {
+                             List<String> userImagePaths, List<ChatMessage> agentMessages) {
         try {
             if (!conversationStore.exists(sessionId)) {
                 conversationStore.create(userId, sessionId, userMessage);
@@ -205,7 +222,7 @@ public class AgentChatApplicationService {
             } else {
                 conversationStore.addMessage(sessionId, ChatRole.USER.getValue(), userMessage);
             }
-            conversationStore.addMessage(sessionId, ChatRole.ASSISTANT.getValue(), answer);
+            conversationStore.addAssistantMessageWithToolHistory(sessionId, answer, agentMessages);
             if (sessionHistoryVectorStore != null && sessionHistoryVectorStore.isEnabled()) {
                 sessionHistoryVectorStore.upsertTurn(sessionId, userMessage, answer);
             }
@@ -242,6 +259,9 @@ public class AgentChatApplicationService {
                 .filter(com.miniagent.config.entity.User::isEnabled)
                 .map(com.miniagent.config.entity.User::getTenantId)
                 .orElseThrow(() -> new BusinessException(ErrorCode.AUTH_SESSION_INVALID));
+        if (tenantTokenQuota != null && !tenantTokenQuota.check(tenantId, userId).allowed()) {
+            throw new TenantQuotaExceededException();
+        }
         String projectId = conversationProjectService.resolveAuthorized(
                 userId, String.valueOf(tenantId), sessionId);
         TaskRunService.StartResult start = taskRunService.tryStart(userId, sessionId);
@@ -286,7 +306,7 @@ public class AgentChatApplicationService {
             if (!taskRunService.renewSessionLock(sessionId, run.fencingToken())) {
                 throw new IllegalStateException("Task run lease is no longer owned");
             }
-            executionControl.start(sessionId, tenantId, run.fencingToken());
+            executionControl.start(sessionId, tenantId, userId, run.fencingToken());
             executionStarted = true;
             if (executionControl.isCancelled(sessionId, run.fencingToken())) {
                 terminalStatus = RunStatus.CANCELED;
@@ -731,6 +751,7 @@ public class AgentChatApplicationService {
         com.miniagent.common.model.EffectiveModelContext.set(
                 effectiveChat, models.streaming(), models.settings().contextWindowTokens());
         String answer;
+        List<ChatMessage> agentMessages = List.of();
         String endReason = "SUCCESS";
         boolean planApprovalRequired = false;
         boolean dagInvoked = false;
@@ -747,6 +768,7 @@ public class AgentChatApplicationService {
                         history, taskPlan, sessionId, run.fencingToken(), executionId,
                         streamSink, planningRoute);
                 answer = outcome.answer();
+                agentMessages = outcome.agentMessages();
                 endReason = outcome.reason();
                 planApprovalRequired = "PLAN_APPROVAL_REQUIRED".equals(outcome.reason());
                 if (planApprovalRequired && progressEmitter != null) {
@@ -761,6 +783,7 @@ public class AgentChatApplicationService {
                         : agentLoop.runOutcome(effectiveChat, systemPrompt, userMessage, history,
                                 maxIterations(), taskPlan, streamSink);
                 answer = outcome == null ? "" : outcome.text();
+                agentMessages = outcome == null ? List.of() : outcome.messages();
                 endReason = outcome == null ? "MISSING_LOOP_OUTCOME"
                         : StringUtils.defaultIfBlank(outcome.endReason(), "UNKNOWN_LOOP_OUTCOME");
                 runStatus = loopStatus(outcome);
@@ -843,7 +866,8 @@ public class AgentChatApplicationService {
         persistTurn(userId, sessionId,
                 StringUtils.isNotBlank(userMessage) ? userMessage : displayQuestion,
                 answer,
-                memoryMediaPaths.isEmpty() ? null : memoryMediaPaths);
+                memoryMediaPaths.isEmpty() ? null : memoryMediaPaths,
+                agentMessages);
         return new AgentResult(answer, runStatus, endReason, loaded.taskId(),
                 Objects.requireNonNullElse(progressExecutionId, ""));
         }
@@ -929,6 +953,11 @@ public class AgentChatApplicationService {
         try {
             prepared = prepareRun(userId, finalSid);
         } catch (Exception e) {
+            if (e instanceof TenantQuotaExceededException quotaExceeded) {
+                // This decision happens before an emitter is opened; let MVC map it
+                // to HTTP 429 + Retry-After instead of returning a successful SSE 200.
+                throw quotaExceeded;
+            }
             return streamingService.createErrorEmitter("error", exceptionDetail(e));
         }
         final ChatStreamingService.StreamStart stream;
@@ -977,12 +1006,20 @@ public class AgentChatApplicationService {
                     RoleContext.clear();
                 }
             }
-        });
+        }, agentRunExecutor);
         } catch (RuntimeException e) {
             try {
                 taskRunService.markFailed(prepared.handle(), exceptionDetail(e));
+            } catch (RuntimeException terminalError) {
+                e.addSuppressed(terminalError);
+                log.error("Agent worker was rejected and run terminalization failed: session={}", finalSid, terminalError);
+            }
+            try {
                 streamingService.markCompleting(finalSid);
                 streamingService.getEventCenter().error(finalSid, exceptionDetail(e), stream.runToken());
+            } catch (RuntimeException notificationError) {
+                e.addSuppressed(notificationError);
+                log.error("Agent worker rejection could not be sent to SSE client: session={}", finalSid, notificationError);
             } finally {
                 try {
                     executionControl.finish(finalSid, prepared.handle().fencingToken());

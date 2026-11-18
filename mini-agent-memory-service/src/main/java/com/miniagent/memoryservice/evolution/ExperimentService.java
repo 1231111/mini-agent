@@ -88,6 +88,9 @@ public class ExperimentService {
      * 能拿到 min-samples-per-arm 个任务。
      */
     public boolean trafficSufficient(Item item) {
+        if (item == null || item.activeRevisionId() == null) {
+            return false;
+        }
         EvolutionProperties.Experiment e = props.getExperiment();
         Instant since = clock.instant().minus(Duration.ofDays(e.getTrafficWindowDays()));
         double perDay = (double) outcomes.distinctTasks(item.id(), since) / e.getTrafficWindowDays();

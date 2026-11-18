@@ -12,7 +12,11 @@ import org.junit.jupiter.api.Timeout;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
+import java.util.LinkedHashSet;
+import java.util.Set;
+import java.lang.reflect.Constructor;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -22,6 +26,17 @@ import static org.mockito.Mockito.*;
 @Timeout(8)
 class AgentLoopModelControlTest {
     private static final String SESSION = "agent-model-control";
+
+    @Test
+    void plannerSurfaceCannotBeWidenedByCapabilityDiscovery() {
+        Set<String> base = Set.of("capability_discover", "todo");
+        Set<String> discovered = Set.of("write_file", "exec_command");
+
+        assertEquals(new LinkedHashSet<>(base),
+                AgentLoop.mergeDiscoveredSurface(base, discovered, false));
+        assertEquals(new LinkedHashSet<>(Set.of("capability_discover", "todo", "write_file", "exec_command")),
+                AgentLoop.mergeDiscoveredSurface(base, discovered, true));
+    }
 
     @AfterEach void clear() {
         AgentLoop.clearCurrentSession();
@@ -178,6 +193,64 @@ class AgentLoopModelControlTest {
                 releaseSink.countDown();
             }
         }
+    }
+
+    @Test void retriablePartialStreamIsSealedBeforeTheNextAttempt() throws Exception {
+        AgentLoop loop = loop(new ExecutionControl(60_000, 10, 10_000));
+        ReflectionTestUtils.setField(loop, "llmMaxRetries", 1);
+        StreamingChatModel streaming = mock(StreamingChatModel.class);
+        AgentStreamSink sink = mock(AgentStreamSink.class);
+        List<String> events = new CopyOnWriteArrayList<>();
+        AtomicInteger attempts = new AtomicInteger();
+        doAnswer(invocation -> {
+            StreamingChatResponseHandler handler = invocation.getArgument(1);
+            if (attempts.getAndIncrement() == 0) {
+                handler.onPartialResponse("partial");
+                handler.onError(new dev.langchain4j.exception.RetriableException("connection reset"));
+            } else {
+                handler.onPartialResponse("complete answer");
+                handler.onCompleteResponse(ChatResponse.builder()
+                        .aiMessage(dev.langchain4j.data.message.AiMessage.from("complete answer")).build());
+            }
+            return null;
+        }).when(streaming).chat(any(ChatRequest.class), any(StreamingChatResponseHandler.class));
+        doAnswer(invocation -> { events.add("token:" + invocation.getArgument(0)); return null; })
+                .when(sink).onAnswerToken(any());
+        doAnswer(invocation -> { events.add("reset"); return null; }).when(sink).onAnswerReset();
+
+        ChatResponse response = invoke(loop, mock(ChatModel.class), streaming, sink);
+
+        assertEquals("complete answer", response.aiMessage().text());
+        assertEquals(List.of("token:partial", "reset", "token:complete answer"), events);
+    }
+
+    @Test void terminalStreamFailureReturnsCapturedPartialAnswerForPersistence() throws Exception {
+        AgentLoop loop = loop(new ExecutionControl(60_000, 10, 10_000));
+        ReflectionTestUtils.setField(loop, "llmMaxRetries", 0);
+        StreamingChatModel streaming = mock(StreamingChatModel.class);
+        AgentStreamSink sink = mock(AgentStreamSink.class);
+        doAnswer(invocation -> {
+            StreamingChatResponseHandler handler = invocation.getArgument(1);
+            handler.onPartialResponse("received before disconnect");
+            handler.onError(new IllegalStateException("provider stream failed"));
+            return null;
+        }).when(streaming).chat(any(ChatRequest.class), any(StreamingChatResponseHandler.class));
+        Object state = newLoopState();
+        ChatResponse response = ReflectionTestUtils.invokeMethod(loop, "callLlm", mock(ChatModel.class),
+                streaming, List.of(UserMessage.from("test")), List.of(), false, sink, state);
+        String partial = (String) ReflectionTestUtils.getField(state, "partialStreamAnswer");
+        String finalText = ReflectionTestUtils.invokeMethod(loop, "failureWithPartialAnswer", "failed", state);
+
+        assertNull(response);
+        assertTrue(partial.contains("received before disconnect"));
+        assertTrue(finalText.contains("received before disconnect"));
+    }
+
+    private static Object newLoopState() throws Exception {
+        Class<?> stateType = Class.forName("com.miniagent.agent.core.AgentLoop$LoopState");
+        Constructor<?> constructor = stateType.getDeclaredConstructor();
+        constructor.setAccessible(true);
+        return constructor.newInstance();
     }
 
     private static AgentLoop loop(ExecutionControl control) {

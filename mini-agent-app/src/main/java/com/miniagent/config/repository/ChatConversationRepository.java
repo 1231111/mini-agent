@@ -3,10 +3,25 @@ package com.miniagent.config.repository;
 import com.miniagent.config.entity.ChatConversation;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.repository.query.Param;
 import java.util.List;
 
 public interface ChatConversationRepository extends JpaRepository<ChatConversation, String> {
     List<ChatConversation> findByUserIdAndDeletedFalseOrderByUpdatedAtDesc(Long userId);
+    @Query(value = "select c.id, c.title, c.createdAt, c.updatedAt, count(m.id) "
+            + "from ChatConversation c left join ChatMessage m on m.conversationId = c.id "
+            + "where c.userId = :userId and c.deleted = false "
+            + "group by c.id, c.title, c.createdAt, c.updatedAt order by c.updatedAt desc",
+            countQuery = "select count(c) from ChatConversation c where c.userId = :userId and c.deleted = false")
+    Page<Object[]> findUserSummaries(@Param("userId") Long userId, Pageable pageable);
+    @Query(value = "select c.id, c.title, c.createdAt, c.updatedAt, count(m.id) "
+            + "from ChatConversation c left join ChatMessage m on m.conversationId = c.id "
+            + "where c.deleted = false "
+            + "group by c.id, c.title, c.createdAt, c.updatedAt order by c.updatedAt desc",
+            countQuery = "select count(c) from ChatConversation c where c.deleted = false")
+    Page<Object[]> findAllSummaries(Pageable pageable);
     long countByUserId(Long userId);
 
     java.util.Optional<ChatConversation> findByIdAndUserId(String id, Long userId);

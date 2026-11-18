@@ -1,6 +1,7 @@
 package com.miniagent.agent.tool;
 
 import org.junit.jupiter.api.Test;
+import com.miniagent.agent.tool.impl.AskUserQuestionParams;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -36,5 +37,18 @@ class AskUserQuestionToolTest {
                 ToolConcurrencyPolicy.sideEffectOf("ask_user_question"));
         assertEquals(ToolConcurrencyScope.SESSION,
                 ToolConcurrencyPolicy.concurrencyScopeOf("ask_user_question"));
+    }
+
+    @Test
+    void naturalArrayOptionsAreTypedAndVisibleInTheToolSchema() {
+        AskUserQuestionParams params = ToolParams.fromJson(
+                "{\"question\":\"风格？\",\"options\":[\"民谣\",\"摇滚\"]}",
+                AskUserQuestionParams.class);
+
+        assertEquals(java.util.List.of("民谣", "摇滚"), params.getOptions());
+        var schema = ToolParams.generateSchema(AskUserQuestionParams.class);
+        assertEquals("array", ((java.util.Map<?, ?>) schema.get("options")).get("type"));
+        assertTrue(ToolArgumentValidator.validate(schema,
+                "{\"question\":\"风格？\",\"options\":[\"民谣\",\"摇滚\"]}").valid());
     }
 }

@@ -22,8 +22,21 @@ public record StopContext(
         boolean hasTodoPlan,
         boolean runnableIncomplete,
         int incompleteNudges,
+        int planUnapprovedNudges,
         String todoRender
 ) {
+    public StopContext(String sessionId, String finalText, int turn, int maxIterations,
+                       Set<String> toolsInvoked, boolean writeFileSucceeded,
+                       boolean mediaDelivered, boolean subagent,
+                       PermissionMode permissionMode, boolean planApproved,
+                       boolean plannerOwned, boolean hasTodoPlan,
+                       boolean runnableIncomplete, int incompleteNudges,
+                       String todoRender) {
+        this(sessionId, finalText, turn, maxIterations, toolsInvoked, writeFileSucceeded,
+                mediaDelivered, subagent, permissionMode, planApproved, plannerOwned,
+                hasTodoPlan, runnableIncomplete, incompleteNudges, 0, todoRender);
+    }
+
     public StopContext {
         toolsInvoked = toolsInvoked == null ? Set.of() : Set.copyOf(toolsInvoked);
         finalText = finalText == null ? "" : finalText;

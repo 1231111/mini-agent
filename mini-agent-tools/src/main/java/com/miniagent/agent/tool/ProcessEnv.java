@@ -45,6 +45,12 @@ public final class ProcessEnv {
             "git_exec_path", "ssl_cert_file", "ssl_cert_dir", "curl_ca_bundle"
     );
 
+    /** Small launch-time environment for MCP servers. */
+    private static final Set<String> MCP_OS_KEYS = Set.of(
+            "path", "pathext", "systemroot", "windir", "systemdrive", "comspec",
+            "temp", "tmp", "tmpdir", "home"
+    );
+
     /** 由配置额外放行的变量名（小写）。 */
     private static final Set<String> EXTRA_ALLOWED_KEYS = ConcurrentHashMap.newKeySet();
 
@@ -86,6 +92,29 @@ public final class ProcessEnv {
         int before = env.size();
         env.keySet().removeIf(k -> k == null || !allowed.contains(k.toLowerCase(Locale.ROOT)));
         return before - env.size();
+    }
+
+    /**
+     * Replaces the inherited environment with only the small OS launch set
+     * needed by MCP processes, then adds variables explicitly configured for
+     * that server. This deliberately ignores the broader CLI passthrough list.
+     *
+     * @return number of inherited variables removed
+     */
+    public static int sanitizeMcp(ProcessBuilder pb, Map<String, String> declared) {
+        Map<String, String> env = pb.environment();
+        Map<String, String> minimal = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : env.entrySet()) {
+            String key = entry.getKey();
+            if (key != null && MCP_OS_KEYS.contains(key.toLowerCase(Locale.ROOT))) {
+                minimal.put(key, entry.getValue());
+            }
+        }
+        int dropped = env.size() - minimal.size();
+        env.clear();
+        env.putAll(minimal);
+        putDeclared(pb, declared);
+        return dropped;
     }
 
     /** 白名单收敛之后，再合并调用方显式声明的变量（如 MCP server 配置里的 env）。 */

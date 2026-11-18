@@ -11,6 +11,7 @@ import com.miniagent.agent.core.ExecutionSignalStore;
 import com.miniagent.agent.core.ModelCallControl;
 import com.miniagent.agent.core.SessionEventCenter;
 import com.miniagent.agent.core.TaskExecutionContext;
+import com.miniagent.agent.core.TenantTokenQuota;
 import com.miniagent.agent.delegate.ClientMultiAgent;
 import com.miniagent.agent.desktop.DesktopInteractionService;
 import com.miniagent.agent.memory.ChatMemoryConfig;
@@ -56,6 +57,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.nio.file.Path;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -78,10 +80,13 @@ class AgentChatApplicationServiceLifecycleTest {
     private ChatStreamingService streams;
     private SessionEventCenter events;
     private DesktopInteractionService desktop;
+    private ExecutorService agentRunExecutor;
 
     @BeforeEach
     void setUp() {
         app = new AgentChatApplicationService();
+        agentRunExecutor = Executors.newSingleThreadExecutor();
+        put(app, "agentRunExecutor", agentRunExecutor);
         loop = mock(AgentLoop.class);
         planner = mock(PlanningLoop.class);
         when(planner.selectRoute(any(), any(), anyString(), anyString(), any(), anyList()))
@@ -153,6 +158,7 @@ class AgentChatApplicationServiceLifecycleTest {
 
     @AfterEach
     void shutdownEventCenter() {
+        agentRunExecutor.shutdownNow();
         ReflectionTestUtils.invokeMethod(events, "shutdown");
     }
 
@@ -166,6 +172,18 @@ class AgentChatApplicationServiceLifecycleTest {
         verify(runs).markFailed(eq(run), contains(reason));
         verify(runs, never()).markCompleted(any());
         verify(trace).endExecution("FAILURE");
+    }
+
+    @Test
+    void exhaustedTenantQuotaIsRejectedBeforeRunAdmission() {
+        TenantTokenQuota quota = mock(TenantTokenQuota.class);
+        when(quota.check(1L, 7L)).thenReturn(new TenantTokenQuota.Decision(false, 100, 100));
+        put(app, "tenantTokenQuota", quota);
+
+        assertThrows(TenantQuotaExceededException.class, () -> app.chatStreamMultimodal(
+                7L, "s1", "goal", "goal", List.of(), List.of(), List.of(), List.of(), null));
+
+        verify(runs, never()).tryStart(anyLong(), anyString());
     }
 
     @Test
@@ -943,6 +961,20 @@ class AgentChatApplicationServiceLifecycleTest {
         verify(events, never()).error(anyString(), anyString());
         verify(events, never()).complete(anyString(), anyString());
         verify(streams, never()).markIdle(anyString());
+    }
+
+    @Test
+    void rejectedAgentWorkerMarksAcceptedRunFailedAndNotifiesStream() {
+        put(app, "agentRunExecutor", (java.util.concurrent.Executor) command -> {
+            throw new java.util.concurrent.RejectedExecutionException("agent capacity reached");
+        });
+
+        startStream(List.of());
+
+        verify(runs).markFailed(eq(run), contains("agent capacity reached"));
+        verify(events).error(eq("s1"), contains("agent capacity reached"), anyString());
+        verify(streams).markIdle("s1");
+        verifyNoInteractions(loop, planner, workers);
     }
 
     @Test

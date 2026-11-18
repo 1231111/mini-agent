@@ -32,6 +32,8 @@ import java.util.regex.Pattern;
 /** System-level tenant, user and session governance with safety invariants and audit. */
 @Service
 public class SystemAdminService {
+    @Value("${agent.quota.self-hosted-default-daily-user-token-limit:100000}")
+    private long selfHostedDefaultDailyUserTokenLimit;
     private static final Pattern USERNAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9_.-]{2,49}");
     private static final Pattern TENANT_SLUG = Pattern.compile("[a-z0-9][a-z0-9-]{2,63}");
 
@@ -69,7 +71,7 @@ public class SystemAdminService {
 
     @Transactional
     public Map<String, Object> createTenant(Long actorId, String slug, String name,
-                                            Long dailyTokenLimit) {
+                                            Long dailyTokenLimit, Long dailyUserTokenLimit) {
         String normalizedSlug = StringUtils.trimToEmpty(slug).toLowerCase(Locale.ROOT);
         String normalizedName = StringUtils.trimToEmpty(name);
         if (!TENANT_SLUG.matcher(normalizedSlug).matches()) {
@@ -82,6 +84,12 @@ public class SystemAdminService {
         if (limit < 0) {
             throw new IllegalArgumentException("dailyTokenLimit must be >= 0");
         }
+        long userLimit = dailyUserTokenLimit == null
+                ? ("system".equals(normalizedSlug) ? Math.max(1L, selfHostedDefaultDailyUserTokenLimit) : 0L)
+                : dailyUserTokenLimit;
+        if (userLimit < 0) {
+            throw new IllegalArgumentException("dailyUserTokenLimit must be >= 0");
+        }
         if (tenants.findBySlug(normalizedSlug).isPresent()) {
             throw new IllegalStateException("tenant slug already exists");
         }
@@ -91,19 +99,21 @@ public class SystemAdminService {
         tenant.setName(normalizedName);
         tenant.setEnabled(true);
         tenant.setDailyTokenLimit(limit);
+        tenant.setDailyUserTokenLimit(userLimit);
         try {
             tenant = tenants.saveAndFlush(tenant);
         } catch (DataIntegrityViolationException e) {
             throw new IllegalStateException("tenant slug already exists", e);
         }
         audit(actorId, "TENANT_CREATE", "TENANT", tenant.getId(), tenant.getId(),
-                details("slug", tenant.getSlug(), "dailyTokenLimit", limit));
+                details("slug", tenant.getSlug(), "dailyTokenLimit", limit,
+                        "dailyUserTokenLimit", userLimit));
         return tenantView(tenant);
     }
 
     @Transactional
     public Map<String, Object> updateTenant(Long actorId, Long tenantId, Boolean enabled,
-                                            Long dailyTokenLimit) {
+                                            Long dailyTokenLimit, Long dailyUserTokenLimit) {
         // Lock administrator rows first so concurrent governance changes preserve the invariant.
         List<User> admins = users.findByRoleForUpdate(UserRole.SYSTEM_ADMIN);
         Tenant tenant = tenants.findByIdForUpdate(tenantId)
@@ -115,6 +125,9 @@ public class SystemAdminService {
         if (dailyTokenLimit != null && dailyTokenLimit < 0) {
             throw new IllegalArgumentException("dailyTokenLimit must be >= 0");
         }
+        if (dailyUserTokenLimit != null && dailyUserTokenLimit < 0) {
+            throw new IllegalArgumentException("dailyUserTokenLimit must be >= 0");
+        }
 
         boolean disabling = Boolean.FALSE.equals(enabled) && tenant.isEnabled();
         if (enabled != null) {
@@ -123,10 +136,14 @@ public class SystemAdminService {
         if (dailyTokenLimit != null) {
             tenant.setDailyTokenLimit(dailyTokenLimit);
         }
+        if (dailyUserTokenLimit != null) {
+            tenant.setDailyUserTokenLimit(dailyUserTokenLimit);
+        }
         Tenant saved = tenants.save(tenant);
         int revoked = disabling ? sessions.revokeAllForTenant(tenantId) : 0;
         audit(actorId, "TENANT_UPDATE", "TENANT", tenantId, tenantId,
                 details("enabled", saved.isEnabled(), "dailyTokenLimit", saved.getDailyTokenLimit(),
+                        "dailyUserTokenLimit", saved.getDailyUserTokenLimit(),
                         "sessionsRevoked", revoked));
         return tenantView(saved);
     }
@@ -305,6 +322,18 @@ public class SystemAdminService {
         auditLogs.save(entry);
     }
 
+    /** Append-only audit record for human reconciliation of an external side effect. */
+    public void auditActionJournalReview(Long actorId, String receiptId,
+                                         String resolution, String note) {
+        if (StringUtils.isBlank(receiptId) || StringUtils.isBlank(resolution)) {
+            throw new IllegalArgumentException("receiptId and resolution are required");
+        }
+        audit(actorId, "ACTION_JOURNAL_RECONCILE", "ACTION_RECEIPT", receiptId, null,
+                details("resolution", resolution,
+                        "note", StringUtils.abbreviate(StringUtils.defaultString(note), 1000),
+                        "source", "system-admin-api"));
+    }
+
     private Map<String, Object> tenantView(Tenant tenant) {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("id", tenant.getId());
@@ -312,6 +341,7 @@ public class SystemAdminService {
         out.put("name", tenant.getName());
         out.put("enabled", tenant.isEnabled());
         out.put("dailyTokenLimit", tenant.getDailyTokenLimit());
+        out.put("dailyUserTokenLimit", tenant.getDailyUserTokenLimit());
         out.put("userCount", users.countByTenantId(tenant.getId()));
         return out;
     }

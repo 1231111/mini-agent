@@ -95,6 +95,18 @@ class TaskGraphUnknownOutcomeTest {
                 restored.graph().normalizeForScheduling().byId("n1").status());
     }
 
+    @Test
+    void cycleDetectionHandlesDeepGraphsWithoutRecursiveStackGrowth() {
+        int size = 5_000;
+        java.util.ArrayList<TaskNode> nodes = new java.util.ArrayList<>(size);
+        for (int i = size - 1; i >= 0; i--) {
+            List<String> dependencies = i == 0 ? List.of() : List.of("n" + (i - 1));
+            nodes.add(node("n" + i, dependencies, TaskNodeStatus.PENDING));
+        }
+
+        assertFalse(new TaskGraph(nodes).hasCycle());
+    }
+
     private static TaskNode node(String id, List<String> dependencies, TaskNodeStatus status) {
         return new TaskNode(id, "执行 " + id, "web", dependencies, List.of(), List.of(),
                 status, 10, DoneWhen.note(), "", "", 0, "");

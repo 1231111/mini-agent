@@ -7,6 +7,8 @@ import com.miniagent.config.entity.AgentTraceStep;
 import com.miniagent.config.entity.ChatTask;
 import com.miniagent.config.entity.FileUpload;
 import com.miniagent.config.repository.AgentTraceStepRepository;
+import com.miniagent.config.repository.ChatTaskRepository;
+import com.miniagent.config.service.FileStorageService;
 import com.miniagent.config.security.JwtSessionService;
 import com.miniagent.config.security.SessionAuthorizationService;
 import com.miniagent.config.security.AuthenticatedUser;
@@ -17,6 +19,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -161,7 +165,7 @@ class MiniAgentChatPageControllerTaskApiTest {
         ApiResponse<?> unauthenticatedResponse = controller.inspectorSnapshot("session-1", unauthenticated);
         assertEquals(false, unauthenticatedResponse.isSuccess());
         verify(store, never()).get("session-1");
-        verify(traces, never()).findBySessionIdOrderByTurnIndexAscIdAsc("session-1");
+        verify(traces, never()).findTop500BySessionIdOrderByIdDesc("session-1");
 
         MockHttpServletRequest authenticated = new MockHttpServletRequest();
         authenticated.setAttribute(JwtSessionService.ATTR_USER_ID, 7L);
@@ -171,7 +175,7 @@ class MiniAgentChatPageControllerTaskApiTest {
         assertEquals(List.of(), ((InspectorSnapshotDTO) forbiddenResponse.getData()).todos());
         verify(authorization).owns(7L, "session-1");
         verify(store, never()).get("session-1");
-        verify(traces, never()).findBySessionIdOrderByTurnIndexAscIdAsc("session-1");
+        verify(traces, never()).findTop500BySessionIdOrderByIdDesc("session-1");
     }
 
     @Test
@@ -193,10 +197,10 @@ class MiniAgentChatPageControllerTaskApiTest {
         when(authorization.owns(7L, "session-1")).thenReturn(true);
         when(store.get("session-1")).thenReturn(todos);
         when(streaming.isTaskRunning("session-1")).thenReturn(true);
-        when(traces.findBySessionIdOrderByTurnIndexAscIdAsc("session-1")).thenReturn(List.of(
-                trace(1L, "execution-old", 0, "AGENT_LOOP_START", "RUNNING", "old question"),
+        when(traces.findTop500BySessionIdOrderByIdDesc("session-1")).thenReturn(List.of(
+                trace(3L, "execution-new", 1, "ANSWER", "SUCCESS", "新闻摘要"),
                 trace(2L, "execution-new", 0, "AGENT_LOOP_START", "RUNNING", "今日 AI 新闻"),
-                trace(3L, "execution-new", 1, "ANSWER", "SUCCESS", "新闻摘要")));
+                trace(1L, "execution-old", 0, "AGENT_LOOP_START", "RUNNING", "old question")));
 
         MockHttpServletRequest request = new MockHttpServletRequest();
         request.setAttribute(JwtSessionService.ATTR_USER_ID, 7L);
@@ -212,7 +216,54 @@ class MiniAgentChatPageControllerTaskApiTest {
         assertEquals(List.of(2L, 3L), response.getData().steps().stream().map(AgentTraceStep::getId).toList());
         verify(store).get("session-1");
         verify(streaming).isTaskRunning("session-1");
-        verify(traces).findBySessionIdOrderByTurnIndexAscIdAsc("session-1");
+        verify(traces).findTop500BySessionIdOrderByIdDesc("session-1");
+    }
+
+    @Test
+    void queryPagingAlwaysClampsClientSuppliedBounds() {
+        assertEquals(0, MiniAgentChatPageController.boundedPageRequest(-5, 100_000, 100).getPageNumber());
+        assertEquals(100, MiniAgentChatPageController.boundedPageRequest(0, 100_000, 100).getPageSize());
+        assertEquals(1, MiniAgentChatPageController.boundedPageRequest(0, 0, 100).getPageSize());
+        assertEquals(10_000, MiniAgentChatPageController.boundedPageRequest(
+                Integer.MAX_VALUE, 1, 500).getPageNumber());
+    }
+
+    @Test
+    void conversationIndexUsesBoundedDatabasePage() {
+        MiniAgentChatPageController controller = new MiniAgentChatPageController();
+        ChatTaskRepository tasks = mock(ChatTaskRepository.class);
+        ReflectionTestUtils.setField(controller, "chatTaskRepository", tasks);
+        when(tasks.findLatestTaskPerSession(org.mockito.ArgumentMatchers.eq(7L),
+                org.mockito.ArgumentMatchers.any())).thenReturn(new PageImpl<>(List.of()));
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.setAttribute(JwtSessionService.ATTR_USER_ID, 7L);
+        var response = controller.listConversations(request, -100, Integer.MAX_VALUE);
+
+        assertEquals(true, response.isSuccess());
+        assertEquals(List.of(), response.getData());
+        verify(tasks).findLatestTaskPerSession(7L, PageRequest.of(0, 100));
+    }
+
+    @Test
+    void messageHistoryUsesBoundedDatabasePage() {
+        MiniAgentChatPageController controller = new MiniAgentChatPageController();
+        ChatTaskRepository tasks = mock(ChatTaskRepository.class);
+        FileStorageService files = mock(FileStorageService.class);
+        ReflectionTestUtils.setField(controller, "chatTaskRepository", tasks);
+        ReflectionTestUtils.setField(controller, "fileStorageService", files);
+        when(tasks.findByUserIdAndSessionIdAndDeletedFalseOrderByCreatedAtDesc(
+                org.mockito.ArgumentMatchers.eq(7L), org.mockito.ArgumentMatchers.eq("session-1"),
+                org.mockito.ArgumentMatchers.any())).thenReturn(new PageImpl<>(List.of()));
+        when(files.getUserSessionFiles(7L, "session-1")).thenReturn(List.of());
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.setAttribute(JwtSessionService.ATTR_USER_ID, 7L);
+        var response = controller.getConversationMessages(request, "session-1", Integer.MAX_VALUE, Integer.MAX_VALUE);
+
+        assertEquals(true, response.isSuccess());
+        verify(tasks).findByUserIdAndSessionIdAndDeletedFalseOrderByCreatedAtDesc(
+                7L, "session-1", PageRequest.of(10_000, 100));
     }
 
     @Test

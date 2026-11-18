@@ -12,6 +12,7 @@ import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -87,6 +88,44 @@ class McpStdioClientCancellationTest {
             assertFalse(call.thread().isAlive());
             assertNull(call.result().get());
             assertInstanceOf(IllegalStateException.class, call.error().get());
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void concurrentPendingRequestsAreAtomicallyBounded() throws Exception {
+        SilentProcess server = new SilentProcess();
+        try (McpStdioClient client = new McpStdioClient("test", server)) {
+            List<Call> calls = new java.util.ArrayList<>();
+            for (int i = 0; i < 260; i++) calls.add(startCall(client));
+
+            List<Long> accepted = new java.util.ArrayList<>();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+            while (accepted.size() < 256 && System.nanoTime() < deadline) {
+                Long id = server.requests.poll(20, TimeUnit.MILLISECONDS);
+                if (id != null) accepted.add(id);
+            }
+            assertEquals(256, accepted.size(), "the request semaphore must cap in-flight calls atomically");
+
+            int rejected = 0;
+            deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (rejected < 4 && System.nanoTime() < deadline) {
+                rejected = (int) calls.stream().filter(call ->
+                        !call.thread().isAlive() && call.error().get() instanceof IllegalStateException).count();
+                Thread.sleep(1);
+            }
+            assertEquals(4, rejected);
+
+            calls.forEach(call -> call.thread().interrupt());
+            for (Call call : calls) call.thread().join(1_000);
+            assertTrue(calls.stream().noneMatch(call -> call.thread().isAlive()));
+
+            Call afterRelease = startCall(client);
+            Long id = server.requests.poll(1, TimeUnit.SECONDS);
+            assertNotNull(id, "cancellation releases its request slot");
+            server.reply(id, "released");
+            afterRelease.thread().join(1_000);
+            assertEquals("released", afterRelease.result().get());
         }
     }
 

@@ -3,6 +3,7 @@ package com.miniagent.agent.planner;
 import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.tool.CapabilityRegistry;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -18,6 +19,17 @@ import java.util.regex.Pattern;
  */
 @Component
 public class PlanValidator {
+
+    private final PlannerProperties properties;
+
+    public PlanValidator() {
+        this(new PlannerProperties());
+    }
+
+    @Autowired
+    public PlanValidator(PlannerProperties properties) {
+        this.properties = properties == null ? new PlannerProperties() : properties;
+    }
 
     /** 用户明确提出文件交付时才允许规划器落盘。 */
     private static final Pattern FILE_OUTPUT_ACTION = Pattern.compile(
@@ -92,6 +104,37 @@ public class PlanValidator {
             return new PlanValidationReport(errors, warnings);
         }
 
+        if (g.nodes().size() > properties.getMaxGraphNodes()) {
+            errors.add(new PlanValidationReport.ValidationError(
+                    PlanValidationReport.ValidationError.Type.GRAPH_TOO_LARGE, null,
+                    "Task graph has " + g.nodes().size() + " nodes; configured maximum is "
+                            + properties.getMaxGraphNodes() + ".",
+                    "Reduce the plan to a smaller set of independently verifiable steps."));
+            return new PlanValidationReport(errors, warnings);
+        }
+        if (g.exceedsDependencyCount(properties.getMaxGraphEdges())) {
+            errors.add(new PlanValidationReport.ValidationError(
+                    PlanValidationReport.ValidationError.Type.GRAPH_TOO_MANY_EDGES, null,
+                    "Task graph exceeds the configured dependency edge limit of "
+                            + properties.getMaxGraphEdges() + ".",
+                    "Remove redundant dependency links and retain only required ordering."));
+            return new PlanValidationReport(errors, warnings);
+        }
+
+        boolean hasCycle = g.hasCycle();
+        if (hasCycle) {
+            errors.add(new PlanValidationReport.ValidationError(
+                    PlanValidationReport.ValidationError.Type.HAS_CYCLE, null,
+                    "Task graph contains a dependency cycle.",
+                    "Remove cyclic dependencies before scheduling."));
+        } else if (g.exceedsDependencyDepth(properties.getMaxGraphDepth())) {
+            errors.add(new PlanValidationReport.ValidationError(
+                    PlanValidationReport.ValidationError.Type.GRAPH_TOO_DEEP, null,
+                    "Task graph exceeds the configured dependency depth of "
+                            + properties.getMaxGraphDepth() + ".",
+                    "Shorten the dependency chain while preserving required ordering."));
+        }
+
         // A canonical waiting receipt defers business acceptance; it does not
         // certify the requested outputs or permit an executable graph.
         if (intent != null && intent.needsClarification()) {
@@ -102,16 +145,6 @@ public class PlanValidator {
                         "仅保留问题对应的 AWAITING_CONFIRM 计划节点；澄清完成后重新编译并验收执行图"));
             }
             return new PlanValidationReport(errors, warnings);
-        }
-
-        // 2. 检查循环依赖
-        if (g.hasCycle()) {
-            errors.add(new PlanValidationReport.ValidationError(
-                PlanValidationReport.ValidationError.Type.HAS_CYCLE,
-                null,
-                "任务图包含循环依赖",
-                "检查节点依赖关系，确保无环"
-            ));
         }
 
         // 3. 检查节点属性。调用本校验器即表示该图将交给调度器，必须严格检查。

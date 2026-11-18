@@ -5,6 +5,7 @@ import com.miniagent.agent.web.MultimodalMedia;
 import com.miniagent.common.ChatRole;
 import com.miniagent.common.event.SessionEvictedEvent;
 import com.miniagent.config.service.DatabaseConversationStore;
+import com.miniagent.config.service.AgentToolHistoryCodec;
 import com.miniagent.config.storage.MediaStorage;
 import com.miniagent.common.io.AgentDataPaths;
 import com.miniagent.memory.MemoryBlobStore;
@@ -104,10 +105,10 @@ public class ChatMemoryConfig {
     public ChatMemoryProvider chatMemoryProvider(DatabaseConversationStore conversationStore,
                                                  MediaStorage mediaStorage) {
         return sid -> {
-            MessageWindowChatMemory memory = MessageWindowChatMemory.withMaxMessages(maxMessages);
-            DatabaseConversationStore.Conversation conv = conversationStore.get(sid);
-            if (Objects.nonNull(conv) && Objects.nonNull(conv.messages) && !conv.messages.isEmpty()) {
-                List<DatabaseConversationStore.Message> all = conv.messages;
+            int windowSize = Math.max(1, maxMessages);
+            MessageWindowChatMemory memory = MessageWindowChatMemory.withMaxMessages(windowSize);
+            List<DatabaseConversationStore.AgentHistoryMessage> all = conversationStore.agentHistory(sid, maxMessages);
+            if (all != null && !all.isEmpty()) {
                 int from = Math.max(0, all.size() - maxMessages);
                 while (from < all.size() && !ChatRole.USER.getValue().equals(all.get(from).role)) {
                     from++;
@@ -115,28 +116,70 @@ public class ChatMemoryConfig {
                 if (from >= all.size()) {
                     from = Math.max(0, all.size() - maxMessages);
                 }
+                List<List<ChatMessage>> turns = new ArrayList<>();
+                List<ChatMessage> currentTurn = null;
                 for (int i = from; i < all.size(); i++) {
-                    DatabaseConversationStore.Message msg = all.get(i);
+                    DatabaseConversationStore.AgentHistoryMessage msg = all.get(i);
                     if (Objects.isNull(msg) || Objects.isNull(msg.content)) {
                         continue;
                     }
                     if (ChatRole.USER.getValue().equals(msg.role)) {
+                        if (currentTurn != null && !currentTurn.isEmpty()) turns.add(currentTurn);
+                        currentTurn = new ArrayList<>();
                         if (Objects.nonNull(msg.images) && !msg.images.isEmpty()) {
-                            memory.add(rebuildMultimodalMessage(msg.content, msg.images, mediaStorage));
+                            currentTurn.add(rebuildMultimodalMessage(msg.content, msg.images, mediaStorage));
                         } else {
-                            memory.add(UserMessage.from(msg.content));
+                            currentTurn.add(UserMessage.from(msg.content));
                         }
                     } else if (ChatRole.ASSISTANT.getValue().equals(msg.role)) {
-                        memory.add(AiMessage.from(msg.content));
+                        if (currentTurn == null) currentTurn = new ArrayList<>();
+                        for (ChatMessage toolMessage : AgentToolHistoryCodec.decode(msg.toolHistoryJson)) {
+                            currentTurn.add(toolMessage);
+                        }
+                        currentTurn.add(AiMessage.from(msg.content));
+                        turns.add(currentTurn);
+                        currentTurn = null;
                     } else if (ChatRole.SYSTEM.getValue().equals(msg.role)) {
-                        memory.add(SystemMessage.from(msg.content));
+                        if (currentTurn == null) currentTurn = new ArrayList<>();
+                        currentTurn.add(SystemMessage.from(msg.content));
                     }
                 }
+                if (currentTurn != null && !currentTurn.isEmpty()) turns.add(currentTurn);
+                for (ChatMessage restored : boundedWholeTurns(turns, windowSize)) memory.add(restored);
             }
             memories.put(sid, memory);
             lastAccess.put(sid, System.currentTimeMillis());
             return memory;
         };
+    }
+
+    /** Keep only complete turns so the sliding window cannot strand a tool result without its call. */
+    static List<ChatMessage> boundedWholeTurns(List<List<ChatMessage>> turns, int maxMessages) {
+        if (turns == null || turns.isEmpty() || maxMessages <= 0) return List.of();
+        int budget = maxMessages;
+        List<List<ChatMessage>> retained = new ArrayList<>();
+        for (int i = turns.size() - 1; i >= 0; i--) {
+            List<ChatMessage> turn = turns.get(i) == null ? List.of() : turns.get(i);
+            if (turn.isEmpty()) continue;
+            if (turn.size() <= budget) {
+                retained.add(0, turn);
+                budget -= turn.size();
+                continue;
+            }
+            if (retained.isEmpty()) retained.add(compactOversizedTurn(turn, maxMessages));
+            break;
+        }
+        List<ChatMessage> out = new ArrayList<>();
+        retained.forEach(out::addAll);
+        return List.copyOf(out);
+    }
+
+    private static List<ChatMessage> compactOversizedTurn(List<ChatMessage> turn, int maxMessages) {
+        if (maxMessages == 1) return List.of(turn.getLast());
+        ChatMessage firstUser = turn.stream().filter(UserMessage.class::isInstance).findFirst().orElse(null);
+        ChatMessage finalAnswer = turn.getLast();
+        if (firstUser == null || firstUser == finalAnswer) return List.of(finalAnswer);
+        return List.of(firstUser, finalAnswer);
     }
 
     private UserMessage rebuildMultimodalMessage(String textContent, List<String> imagePaths,

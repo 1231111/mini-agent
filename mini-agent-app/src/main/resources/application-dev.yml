@@ -1,19 +1,20 @@
-# 开发环境配置示例
-# 复制此文件为 application-local.yml 并填入真实值
-# 或通过环境变量设置以下变量
+# Local development values are read from the gitignored .env file or IDE environment.
+spring:
+  config:
+    activate:
+      on-profile: dev
+  datasource:
+    url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
+    password: ${DB_PASSWORD:}
+  data:
+    redis:
+      password: ${REDIS_PASSWORD:}
 
-# MySQL
-# MYSQL_PASSWORD=your_mysql_password
-
-# MiMo API (对话 + 图像生成)
-# MIMO_API_KEY=your_mimo_api_key
-
-# JWT 签名密钥 (至少 32 字符)
-# JWT_SECRET=your_jwt_secret_at_least_32_chars
-# 旧名 COOKIE_SECRET 仍可回退使用
-
-# 第三方 API (可选)
-# CHATANYWHERE_API_KEY=your_chatanywhere_key
-# TAVILY_API_KEY=your_tavily_key
-# BING_API_KEY=your_bing_key
-# SILICONFLOW_API_KEY=your_siliconflow_key
+agent:
+  auth:
+    jwt-secret: ${JWT_SECRET:${COOKIE_SECRET:}}
+  account:
+    cloud:
+      internal-key: ${ACCOUNT_INTERNAL_KEY:}
+  tools:
+    exec-policy: ask

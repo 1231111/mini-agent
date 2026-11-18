@@ -59,7 +59,7 @@ class McpToolBridgeOutcomeTest {
         when(fixture.client.callTool(eq("submit"), anyString())).thenReturn(failure, success);
         ToolResult rejected = fixture.registry.executeResult("mcp__server__submit", "{}");
         assertEquals(ToolStatus.FAILED, rejected.status());
-        assertEquals(failure, rejected.legacyText());
+        assertTrue(rejected.legacyText().contains("\"errorCode\":\"EXECUTION_FAILED\""));
         assertTrue(fixture.registry.executeResult("mcp__server__submit", "{}").isSuccess());
     }
 
@@ -72,6 +72,12 @@ class McpToolBridgeOutcomeTest {
         @SuppressWarnings("unchecked")
         Fixture() throws Exception {
             ReflectionTestUtils.setField(bridge, "toolRegistry", registry);
+            McpProperties properties = new McpProperties();
+            McpProperties.Server server = new McpProperties.Server();
+            server.setId("server");
+            server.setAllowedTools(List.of("submit"));
+            properties.setServers(List.of(server));
+            ReflectionTestUtils.setField(bridge, "properties", properties);
             clients = (ConcurrentHashMap<String, McpStdioClient>) ReflectionTestUtils.getField(bridge, "clients");
             clients.put("server", client);
             when(client.listTools()).thenReturn(List.of(new McpStdioClient.McpToolDef("submit", "submit", Map.of())));

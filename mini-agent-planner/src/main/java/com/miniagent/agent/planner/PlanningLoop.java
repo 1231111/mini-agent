@@ -20,9 +20,11 @@ import com.miniagent.common.ErrorCode;
 import com.miniagent.common.MessageConstants;
 import com.miniagent.common.RunStatus;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.model.chat.ChatModel;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -74,6 +76,7 @@ public class PlanningLoop {
     private final SessionLock sessionLock;
     private final ToolSuccessStats toolSuccessStats;
     private TraceRecorder traceRecorder;
+    private final ThreadLocal<List<ChatMessage>> currentTurnAgentMessages = new ThreadLocal<>();
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private NodeTerminalCommitPort nodeTerminalCommitPort;
 
@@ -238,18 +241,28 @@ public class PlanningLoop {
     }
 
     /** {@code run} 的结构化返回：答复文本 + 结局 + 机器可读的原因码 + 是否模板降级。 */
-    public record RunOutcome(String answer, Outcome outcome, String reason, boolean degraded) {
+    public record RunOutcome(String answer, Outcome outcome, String reason, boolean degraded,
+                             List<ChatMessage> agentMessages) {
         public RunOutcome {
             answer = answer == null ? "" : answer;
             reason = reason == null ? "" : reason;
+            agentMessages = agentMessages == null ? List.of() : List.copyOf(agentMessages);
+        }
+
+        public RunOutcome(String answer, Outcome outcome, String reason, boolean degraded) {
+            this(answer, outcome, reason, degraded, List.of());
         }
 
         public RunOutcome(String answer, Outcome outcome, String reason) {
-            this(answer, outcome, reason, false);
+            this(answer, outcome, reason, false, List.of());
         }
 
         public boolean goalSatisfied() {
             return outcome == Outcome.COMPLETED;
+        }
+
+        public RunOutcome withAgentMessages(List<ChatMessage> messages) {
+            return new RunOutcome(answer, outcome, reason, degraded, messages);
         }
 
         static RunOutcome satisfied(String answer) {
@@ -269,18 +282,20 @@ public class PlanningLoop {
             if (AgentLoop.OUTCOME_UNKNOWN.equals(reason)
                     || (result.lastToolResult() != null
                     && result.lastToolResult().status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN)) {
-                return failed(result.text(), AgentLoop.OUTCOME_UNKNOWN);
+                return new RunOutcome(result.text(), Outcome.FAILED, AgentLoop.OUTCOME_UNKNOWN,
+                        false, result.messages());
             }
             if (result.awaitingHuman()) {
-                return blockedOnHuman(result.text(), reason);
+                return new RunOutcome(result.text(), Outcome.BLOCKED_ON_HUMAN, reason,
+                        false, result.messages());
             }
             if (result.successful()) {
-                return new RunOutcome(result.text(), Outcome.COMPLETED, reason);
+                return new RunOutcome(result.text(), Outcome.COMPLETED, reason, false, result.messages());
             }
             if (RunStatus.SUCCESS.name().equals(reason)) {
                 reason = StringUtils.isBlank(result.text()) ? "EMPTY_FINAL_ANSWER" : "TOOL_EXECUTION_FAILED";
             }
-            return failed(result.text(), reason);
+            return new RunOutcome(result.text(), Outcome.FAILED, reason, false, result.messages());
         }
 
         static RunOutcome unfinished(String answer, String reason) {
@@ -333,6 +348,25 @@ public class PlanningLoop {
 
     /** Executes a previously resolved per-turn strategy without a second model routing call. */
     public RunOutcome runWithOutcome(ChatModel chat, String systemPrompt, String userMessage,
+                      UserMessage multimodalUser, List<ChatMessage> history, TaskPlan taskPlan,
+                      String sessionId, String fencingToken, String executionId,
+                      AgentStreamSink streamSink, PlanningRoute route) {
+        currentTurnAgentMessages.set(new ArrayList<>());
+        try {
+            RunOutcome outcome = runWithOutcomeInternal(chat, systemPrompt, userMessage, multimodalUser,
+                    history, taskPlan, sessionId, fencingToken, executionId, streamSink, route);
+            if (outcome == null) return null;
+            List<ChatMessage> captured = currentTurnAgentMessages.get();
+            if (captured == null || captured.isEmpty()) return outcome;
+            List<ChatMessage> combined = new ArrayList<>(outcome.agentMessages());
+            combined.addAll(captured);
+            return outcome.withAgentMessages(combined);
+        } finally {
+            currentTurnAgentMessages.remove();
+        }
+    }
+
+    private RunOutcome runWithOutcomeInternal(ChatModel chat, String systemPrompt, String userMessage,
                       UserMessage multimodalUser, List<ChatMessage> history, TaskPlan taskPlan,
                       String sessionId, String fencingToken, String executionId,
                       AgentStreamSink streamSink, PlanningRoute route) {
@@ -713,6 +747,7 @@ public class PlanningLoop {
             StepExec step = executeProposal(chat, systemPrompt, stepUser,
                     multimodalUser, history, taskPlan, proposal, snap.graph(),
                     snap.version(), sessionId, streamSink);
+            captureAgentTranscript(step.messages());
             boolean drifted = step.drifted();
             boolean quotaAbort = isResourceQuotaAbort(step.endReason())
                     || AgentLoop.LOOP_MAX_ITERATIONS.equals(step.endReason());
@@ -1459,8 +1494,40 @@ public class PlanningLoop {
         // stops and approval waits can be resumed without claiming unconfirmed side effects.
         boolean attempted = invocation == null || invocation.outcome() == ToolInvocation.Outcome.EXECUTED
                 || result.status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN;
+        List<ChatMessage> toolMessages = new ArrayList<>();
+        if (invocation != null && invocation.outcome() == ToolInvocation.Outcome.EXECUTED
+                && result.status() != com.miniagent.agent.tool.ToolStatus.UNKNOWN) {
+            toolMessages.add(AiMessage.from(ToolExecutionRequest.builder()
+                    .id(action.actionId()).name(action.tool()).arguments(json).build()));
+        }
+        toolMessages.add(msg);
         return new StepExec(ok ? AgentLoop.STEP_SEGMENT_DONE : text, end, false,
-                action.tool(), code, List.of(msg), result, attempted);
+                action.tool(), code, List.copyOf(toolMessages), result, attempted);
+    }
+
+    private void captureAgentTranscript(List<ChatMessage> messages) {
+        List<ChatMessage> target = currentTurnAgentMessages.get();
+        if (target == null || messages == null || messages.isEmpty()) return;
+        target.addAll(toolTranscriptSinceLatestUser(messages));
+    }
+
+    static List<ChatMessage> toolTranscriptSinceLatestUser(List<ChatMessage> messages) {
+        if (messages == null || messages.isEmpty()) return List.of();
+        int start = -1;
+        for (int i = 0; i < messages.size(); i++) {
+            if (messages.get(i) instanceof UserMessage) start = i + 1;
+        }
+        int from = Math.max(0, start);
+        List<ChatMessage> transcript = new ArrayList<>();
+        for (int i = from; i < messages.size(); i++) {
+            ChatMessage message = messages.get(i);
+            if (message instanceof AiMessage ai && ai.hasToolExecutionRequests()) {
+                transcript.add(message);
+            } else if (message instanceof ToolExecutionResultMessage) {
+                transcript.add(message);
+            }
+        }
+        return List.copyOf(transcript);
     }
 
     private boolean dispatchFenceValid(String sessionId, ActionProposal proposal) {

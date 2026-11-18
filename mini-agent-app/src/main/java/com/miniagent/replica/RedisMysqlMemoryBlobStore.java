@@ -85,6 +85,18 @@ public class RedisMysqlMemoryBlobStore implements MemoryBlobStore {
         }
     }
 
+    @Override
+    public void erase(long userId) {
+        // Delete the cache first so a stale snapshot cannot be served after the
+        // durable row is removed. A cache failure is surfaced: erasure cannot be
+        // reported complete while an old copy may remain readable.
+        if (!redis.delete(redisKey(userId))) {
+            // Redis returns false for an already absent key; that is idempotent.
+            // A transport failure throws and prevents the completion receipt.
+        }
+        mysql.erase(userId);
+    }
+
     private void writeToRedis(long userId, Blob blob) {
         try {
             Map<String, String> map = new HashMap<>();

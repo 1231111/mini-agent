@@ -44,7 +44,7 @@ class ConversationTaskProgressServiceTest {
         ChatTask first = task(1, 1), second = task(2, 3);
         when(planners.findBySessionIdOrSessionIdStartingWith("session", "session#"))
                 .thenReturn(List.of(graph("session", "exec-1", "第一轮节点"), graph("session#1", "exec-2", "第二轮节点")));
-        when(traces.findBySessionIdOrderByTurnIndexAscIdAsc("session"))
+        when(traces.findTop500BySessionIdOrderByIdDesc("session"))
                 .thenReturn(List.of(trace("exec-1", 0), trace("exec-2", 2)));
         when(tasks.findFirstByUserIdAndSessionIdAndDeletedFalseAndIdLessThanOrderByIdDesc(7L, "session", 1L))
                 .thenReturn(Optional.empty());
@@ -62,7 +62,7 @@ class ConversationTaskProgressServiceTest {
         ChatTask task = task(1, 5);
         when(planners.findBySessionIdOrSessionIdStartingWith("session", "session#"))
                 .thenReturn(List.of(graph("session", "exec-1", "节点一"), graph("session#1", "exec-2", "节点二")));
-        when(traces.findBySessionIdOrderByTurnIndexAscIdAsc("session"))
+        when(traces.findTop500BySessionIdOrderByIdDesc("session"))
                 .thenReturn(List.of(trace("exec-1", 0), trace("exec-2", 2)));
         assertTrue(service.forMessages(7L, "session", List.of(task)).isEmpty());
     }
@@ -73,7 +73,7 @@ class ConversationTaskProgressServiceTest {
         var newer = graph("session", "exec-1", "后来完成的节点");
         newer.setUpdatedAt(start.plusMinutes(4));
         when(planners.findBySessionIdOrSessionIdStartingWith("session", "session#")).thenReturn(List.of(newer));
-        when(traces.findBySessionIdOrderByTurnIndexAscIdAsc("session")).thenReturn(List.of(trace("exec-1", 0)));
+        when(traces.findTop500BySessionIdOrderByIdDesc("session")).thenReturn(List.of(trace("exec-1", 0)));
 
         assertTrue(service.forMessages(7L, "session", List.of(first)).isEmpty());
     }

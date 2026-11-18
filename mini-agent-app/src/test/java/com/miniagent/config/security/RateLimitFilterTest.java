@@ -126,6 +126,64 @@ class RateLimitFilterTest {
         assertThat(response.getStatus()).isEqualTo(429);
     }
 
+    @Test
+    void ignoresForwardedAddressFromAnUntrustedPeer() throws Exception {
+        MockHttpServletRequest request = request("198.51.100.9");
+        request.addHeader("X-Forwarded-For", "203.0.113.10");
+
+        filter.doFilterInternal(request, new MockHttpServletResponse(), chain);
+
+        @SuppressWarnings("unchecked")
+        Map<String, java.util.Deque<Long>> windows =
+                (Map<String, java.util.Deque<Long>>) ReflectionTestUtils.getField(filter, "windows");
+        assertThat(windows).containsKey("request:ip:198.51.100.9");
+        assertThat(windows).doesNotContainKey("request:ip:203.0.113.10");
+    }
+
+    @Test
+    void resolvesClientAddressThroughOnlyConfiguredProxyHops() throws Exception {
+        ReflectionTestUtils.setField(filter, "trustedProxyCidrsConfig", "10.0.0.0/8");
+        ReflectionTestUtils.invokeMethod(filter, "initRate");
+        MockHttpServletRequest request = request("10.0.0.2");
+        request.addHeader("X-Forwarded-For", "198.51.100.44, 10.0.0.1");
+
+        filter.doFilterInternal(request, new MockHttpServletResponse(), chain);
+
+        @SuppressWarnings("unchecked")
+        Map<String, java.util.Deque<Long>> windows =
+                (Map<String, java.util.Deque<Long>>) ReflectionTestUtils.getField(filter, "windows");
+        assertThat(windows).containsKey("request:ip:198.51.100.44");
+    }
+
+    @Test
+    void sharedLimiterEnforcesTheSameLimitAcrossReplicas() throws Exception {
+        ReflectionTestUtils.setField(filter, "perMinute", 1);
+        RedisRateLimiter shared = mock(RedisRateLimiter.class);
+        when(shared.increment("mini-agent:rate-limit:request:ip:198.51.100.9", 60))
+                .thenReturn(2L);
+        ReflectionTestUtils.setField(filter, "redisRateLimiter", shared);
+
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        filter.doFilterInternal(request("198.51.100.9"), response, chain);
+
+        assertThat(response.getStatus()).isEqualTo(429);
+        assertThat(response.getHeader("Retry-After")).isEqualTo("60");
+    }
+
+    @Test
+    void sharedLimiterFailureDoesNotSilentlyFallBackToPerProcessBuckets() throws Exception {
+        RedisRateLimiter shared = mock(RedisRateLimiter.class);
+        when(shared.increment(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyLong()))
+                .thenThrow(new IllegalStateException("redis unavailable"));
+        ReflectionTestUtils.setField(filter, "redisRateLimiter", shared);
+
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        filter.doFilterInternal(request("198.51.100.9"), response, chain);
+
+        assertThat(response.getStatus()).isEqualTo(503);
+        assertThat(response.getHeader("Retry-After")).isEqualTo("5");
+    }
+
     private static MockHttpServletRequest request(String ip) {
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/probe");
         request.setRemoteAddr(ip);

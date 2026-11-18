@@ -3,17 +3,21 @@ server:
   port: ${MEMORY_SERVICE_PORT:8091}
 
 spring:
+  profiles:
+    # Production is the safe implicit mode; development must be explicit.
+    default: prod
   application:
     name: mini-agent-memory-service
   datasource:
-    # 默认连本机 MySQL 的 mini_agent_memory 库（由 Flyway 建表）。
-    # 早先默认是 H2 文件库，那是"本机单跑"的形态；改为 MySQL 后与 account 用同一套
-    # 口令和地址，部署时不再需要额外注入 DB_*。
-    url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/mini_agent_memory?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
+    # 默认连本机 MySQL 的 mini_agent_memory 库（由 Flyway 建表）；密码通过 DB_PASSWORD 注入。
+    # 固定的本地开发值只在 application-dev.yml，prod profile 会校验有效口令。
+    url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/mini_agent_memory?sslMode=VERIFY_IDENTITY&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
     username: ${DB_USERNAME:root}
-    password: ${DB_PASSWORD:KGEnrzNNVB4bwaJPC7x6LcoZ8NbZ}
+    password: ${DB_PASSWORD:}
   flyway:
     enabled: true
+    clean-disabled: true
+    out-of-order: false
     # 与 App 的 db/migration 路径隔离：两条链各自从 V1 编号，指向两个库（见 db/migration-memory/README.md）
     locations: classpath:db/migration-memory
   jackson:
@@ -35,10 +39,10 @@ memory:
     # api：只提供 HTTP（测试默认，避免抢评估作业）。worker / all：升级并进程内回放。compose 设 all。
     role: ${MEMORY_SERVICE_ROLE:api}
     account-base-url: ${ACCOUNT_BASE_URL:}
-    account-internal-key: ${ACCOUNT_INTERNAL_KEY:gMPzIKw7wTtIZOhGibpoAGkdzzXYbsEEfhUVDg0Tb1w=}
+    account-internal-key: ${ACCOUNT_INTERNAL_KEY:}
     # 必须与 mini-agent-account 的 agent.account.memory-token-key 完全一致：
     # Account 用它加密 ma1. 令牌，这里用它解密（Account 不可达时的离线校验路径）。
-    memory-token-key: ${ACCOUNT_MEMORY_TOKEN_KEY:mMdxSRXpWYc8ApX3ejLKFsxzUN0ZBMW5GkE7Rjv5QmI=}
+    memory-token-key: ${ACCOUNT_MEMORY_TOKEN_KEY:}
     account-connect-timeout-ms: ${ACCOUNT_CONNECT_TIMEOUT_MS:1500}
     account-read-timeout-ms: ${ACCOUNT_READ_TIMEOUT_MS:2500}
     issuers:
@@ -47,7 +51,9 @@ memory:
         roles: eval
   evolution:
     policy:
-      default-mode: ${MEMORY_EVOLUTION_DEFAULT_MODE:AUTO}
+      # Evolution is opt-in. The dev profile may enable it explicitly; the
+      # base configuration and production profile remain fail-closed.
+      default-mode: ${MEMORY_EVOLUTION_DEFAULT_MODE:OFF}
     experiment:
       # 客户端只使用本库当前修订，不跑对照臂。离线通过后直接升级，再同步回客户端。
       require-live-arms: ${MEMORY_EVOLUTION_REQUIRE_LIVE_ARMS:false}

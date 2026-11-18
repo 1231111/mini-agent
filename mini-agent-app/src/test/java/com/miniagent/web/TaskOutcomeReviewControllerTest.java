@@ -7,6 +7,7 @@ import com.miniagent.agent.execution.ToolExecutionGuards;
 import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.core.TaskExecutionContext;
+import com.miniagent.agent.core.TenantTokenQuota;
 import com.miniagent.common.context.OwnerContext;
 import com.miniagent.application.ConversationWorkspaceService;
 import com.miniagent.application.ConversationTaskProgressService;
@@ -37,7 +38,11 @@ class TaskOutcomeReviewControllerTest {
     final ConversationTaskProgressService progress = mock(ConversationTaskProgressService.class);
     final ExecutionControl executionControl = new ExecutionControl(60000, 20, 10000);
     final TaskRunLeaseRenewer leaseRenewer = mock(TaskRunLeaseRenewer.class);
-    final TaskOutcomeReviewController controller = new TaskOutcomeReviewController(auth, states, reconciler, binder, runs, workspaces, tools, browser, progress, executionControl, leaseRenewer);
+    final TenantTokenQuota quota = new TenantTokenQuota() {
+        @Override public Decision check(Long tenantId, Long userId) { return Decision.unlimited(0); }
+        @Override public Decision consume(Long tenantId, Long userId, long tokens) { return Decision.unlimited(tokens); }
+    };
+    final TaskOutcomeReviewController controller = new TaskOutcomeReviewController(auth, states, reconciler, binder, runs, workspaces, tools, browser, progress, executionControl, leaseRenewer, quota);
     final TaskRunService.RunHandle handle = new TaskRunService.RunHandle(1L, 7L, "s", "fence");
 
     MockHttpServletRequest authenticated() {

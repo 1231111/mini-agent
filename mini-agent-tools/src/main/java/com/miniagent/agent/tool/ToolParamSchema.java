@@ -19,6 +19,9 @@ public @interface ToolParamSchema {
      */
     boolean required() default false;
 
+    /** Allowed string values, exposed to both model providers and runtime validation. */
+    String[] allowedValues() default {};
+
     /**
      * 默认值（字符串形式，空表示无默认值）
      */

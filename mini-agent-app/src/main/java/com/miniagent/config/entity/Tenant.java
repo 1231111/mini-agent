@@ -26,6 +26,10 @@ public class Tenant extends BaseEntity {
     @Column(name = "daily_token_limit", nullable = false)
     private long dailyTokenLimit;
 
+    /** Per-member daily ceiling; zero means the tenant has no individual cap. */
+    @Column(name = "daily_user_token_limit", nullable = false)
+    private long dailyUserTokenLimit;
+
     public Long getId() { return id; }
     public void setId(Long id) { this.id = id; }
     public String getSlug() { return slug; }
@@ -36,4 +40,6 @@ public class Tenant extends BaseEntity {
     public void setEnabled(boolean enabled) { this.enabled = enabled; }
     public long getDailyTokenLimit() { return dailyTokenLimit; }
     public void setDailyTokenLimit(long dailyTokenLimit) { this.dailyTokenLimit = dailyTokenLimit; }
+    public long getDailyUserTokenLimit() { return dailyUserTokenLimit; }
+    public void setDailyUserTokenLimit(long dailyUserTokenLimit) { this.dailyUserTokenLimit = dailyUserTokenLimit; }
 }

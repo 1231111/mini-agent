@@ -1,4 +1,9 @@
 spring:
+  profiles:
+    # Production is the safe implicit mode. Local development must opt into
+    # `dev` explicitly; otherwise a forgotten profile would bypass readiness
+    # validation and silently start with development defaults.
+    default: prod
   # 机器相关配置与密钥放在仓库外，优先级高于本文件。
   # optional: 前缀 —— 文件不存在时不阻止启动，但依赖密钥的功能（联网搜索/生图等）会失败。
   # 模板见仓库根目录 config.example.yml；实际文件在 ${MINI_AGENT_HOME}/config.yml。
@@ -9,38 +14,41 @@ spring:
     cache: true    # 生产形态：模板缓存常开，改模板需重启；开发用 dev 档关闭
   servlet:
     multipart:
-      max-file-size: 1000MB
-      max-request-size: 1000MB
+      max-file-size: 100MB
+      # Leave room for encoding/metadata around a 100MB decoded upload.
+      max-request-size: 140MB
       enabled: true
   application:
     name: mini-agent-springboot
   lifecycle:
-    # 先停止接收新请求，再给在途 agent run / SSE 一个确定的排空窗口。
-    timeout-per-shutdown-phase: 30s
+    # Agent/SSE hard deadline is 30 minutes; allow five extra minutes for final
+    # persistence and stream completion after admission has stopped.
+    timeout-per-shutdown-phase: ${SERVER_SHUTDOWN_TIMEOUT:35m}
   mvc:
     async:
       request-timeout: 1800000
   datasource:
-    url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/mini_agent?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
+    # The secure default is intentional. Local development overrides this in
+    # application-dev.yml; production still requires an explicit DB_URL and a
+    # trusted server certificate through the readiness validator.
+    url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/mini_agent?sslMode=VERIFY_IDENTITY&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8}
     username: ${DB_USERNAME:root}
-    # 本地开发兜底默认值；需要覆盖时用环境变量 DB_PASSWORD。
-    # 原来兜底是空字符串，于是"没配"和"配成空"无法区分，报错落在 MySQL 握手的
-    # "using password: NO"（看着像权限问题），而不是"缺配置"。
-    # 需要覆盖时照旧用环境变量；prod 档是裸的 ${DB_PASSWORD}，生产不走这个默认值。
-    password: ${DB_PASSWORD:KGEnrzNNVB4bwaJPC7x6LcoZ8NbZ}
+    # 密码只从环境变量或外部 config.yml 注入；固定的本地开发值仅在 application-dev.yml。
+    # prod profile 校验实际解析后的口令，拒绝缺失、短值和曾提交的开发口令。
+    password: ${DB_PASSWORD:}
     driver-class-name: com.mysql.cj.jdbc.Driver
   data:
     redis:
       host: 127.0.0.1
       port: 6379
-      # 同上。本机 Redis 的 requirepass 必须与此同值，
-      # 所以这里兜底必须是同一个值：留空的话 Redis 会回 "NOAUTH Authentication required."，
-      # 而 /actuator/health 只会显示 redis DOWN，看不出是密码没给。
-      password: ${REDIS_PASSWORD:DbNNvoUSY7F1v9o4dhd0WjoEyE11}
+      # Redis 密码从环境变量或外部 config.yml 注入；固定的本地开发值仅在 application-dev.yml。
+      password: ${REDIS_PASSWORD:}
       timeout: 3s
   flyway:
     enabled: true
     baseline-on-migrate: true
+    clean-disabled: true
+    out-of-order: false
     # 两处来源：SQL 迁移（db/migration，V1~V8，MySQL 方言）与 Java 迁移
     # （com.miniagent.migration，V9 起，H2/MySQL 通用）。Java 迁移必须把包路径
     # 加进 locations —— Flyway 是拿 location 当包名扫描的，默认的
@@ -62,16 +70,16 @@ server:
   shutdown: graceful
   tomcat:
     connection-timeout: 1800000
-    max-http-form-post-size: 710MB
+    max-http-form-post-size: 140MB
     max-http-request-header-size: 64KB
-    # -1：拒绝超限请求时也把 body 读完再关连接。100MB 会在 700MB 上传途中把连接掐掉。
-    max-swallow-size: -1
+    # 限制拒绝请求时最多 drain 的 body，避免 -1 对超大恶意请求无界读取。
+    max-swallow-size: 140MB
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health,info,metrics,prometheus
   endpoint:
     health:
       show-details: never
@@ -137,8 +145,8 @@ agent:
   auth:
     # JWT HS256 签名密钥。旧名 cookie-secret —— cookie 通路已随无状态改造整体移除，
     # 但这份值一直在给 JWT 签名，名字留着会误导（以为还有个 cookie 在用）。
-    # 仍接受 COOKIE_SECRET 回退，已部署环境不用改环境变量也能起来。
-    jwt-secret: ${JWT_SECRET:F4M4Z99WfVgHf9CTKYO3NXCF2shQglNdKNHTcLuxv1LwJfigPi6yQRNneRcXyzmO}
+    # prod profile 要显式配置强密钥；仍接受旧变量 COOKIE_SECRET 作为兼容别名。
+    jwt-secret: ${JWT_SECRET:${COOKIE_SECRET:}}
     # JWT 方案：exp 仅为硬性上限；真实滑动超时由 Redis TTL 控制
     jwt-exp-seconds: 604800      # JWT 有效期上限（7 天），兜底用
     jwt-ttl-seconds: 1800       # Redis 滑动会话窗口（30 分钟），每次鉴权刷新
@@ -158,7 +166,7 @@ agent:
       # 且会员配额写在账号的租户上、agent 读影子行的租户，表现是"买了会员额度不变"。
       shared-database: true
       # 服务间密钥。账号服务侧读的是同一个环境变量名，两处必须完全一致。
-      internal-key: ${ACCOUNT_INTERNAL_KEY:gMPzIKw7wTtIZOhGibpoAGkdzzXYbsEEfhUVDg0Tb1w=}
+      internal-key: ${ACCOUNT_INTERNAL_KEY:}
       connect-timeout-ms: 4000
       read-timeout-ms: 8000
       # 公网到云端是间歇性劣化的：同一个地址可能上一秒 40 ms、下一秒 SYN 丢包。
@@ -172,6 +180,11 @@ agent:
   memory:
     # db=多副本真相源（agent_user_memory）；file=仅本地目录
     storage: db
+    events:
+      # processed event rows back durable Episodes; retain a bounded 90-day operational history.
+      retention-days: ${MEMORY_EVENT_RETENTION_DAYS:90}
+      purge-batches-per-run: ${MEMORY_EVENT_PURGE_BATCHES_PER_RUN:20}
+      purge-cron: ${MEMORY_EVENT_PURGE_CRON:0 15 3 * * *}
     service:
       # 本地记忆保持可用；配置 memory-service 地址后，云端访问使用 Account 签发的用户凭证。
       mode: ${MEMORY_SERVICE_MODE:local}
@@ -331,12 +344,18 @@ agent:
   permissions:
     # Ask approvals are exact tool+argument grants and expire automatically.
     ask-grant-ttl-seconds: 300
+  action-journal:
+    # Confirmed receipts remain available to prevent stale task replay; unresolved
+    # RUNNING/UNKNOWN barriers are never purged regardless of this retention period.
+    terminal-retention-days: 3650
+    purge-cron: "0 20 3 * * *"
   tools:
     # 默认执行策略，三档：block=禁止 / ask=需会话批准 / allow=免批。
-    # 安全基线是 ask：配置缺失或 profile 漏激活时，exec_command 仍需用户批准。
+    # 基础 profile 默认 block；dev 与 desktop profile 显式改为 ask。
+    # prod profile 校验会要求 block，直到命令隔离 worker 完成并验收。
     # 会话内可用 PUT /api/conversations/{sid}/permission 的 execPolicy 字段覆盖（default 表示跟随这里）。
     # 命令级安全过滤（黑名单 / 危险模式 / 注入检测 / 常驻服务器拦截）不受本档位影响，永远生效。
-    exec-policy: ask
+    exec-policy: block
     allow-absolute-write: false
     # 出站只允许标准端口，且跳转次数受限，避免被用来做端口扫描/绕过 SSRF 拦截。
     allowed-http-ports: 80,443
@@ -367,10 +386,14 @@ agent:
     per-minute: 30
     # UI 的任务状态/检查器刷新单独计数，避免历史会话轮询耗尽交互请求额度。
     background-read-per-minute: 180
+    # 只有部署在反向代理后且已明确配置代理 CIDR 时，才信任 X-Forwarded-For。
+    trusted-proxies: ${RATE_LIMIT_TRUSTED_PROXIES:}
   concurrency:
     max-tasks-per-user: 2
   quota:
     zone-id: ${AGENT_QUOTA_ZONE_ID:Asia/Shanghai}
+    self-hosted-default-daily-token-limit: ${AGENT_SELF_HOSTED_DAILY_TOKEN_LIMIT:1000000}
+    self-hosted-default-daily-user-token-limit: ${AGENT_SELF_HOSTED_DAILY_USER_TOKEN_LIMIT:100000}
   security:
     model-config-encryption-key: ${MODEL_CONFIG_ENCRYPTION_KEY:}
   multimodal:
@@ -412,17 +435,28 @@ agent:
   # 会话累计 token 软预算（0=关闭）；超限后注入一次提醒，不硬杀
   token-budget:
     max-total: 0
-  # MCP：启用后启动时连接 servers 并把 tools 注册为 mcp__{id}__{tool}
+  # MCP：启用后启动时连接 servers 并把 tools 注册为 mcp__{id}__{tool}。
+  # 每个 server 必须显式列出 allowed-tools 中的远端工具名；缺失或与 tools/list 不一致时整台服务器拒绝注册。
   # POST /api/mcp/servers 或 /api/mcp/servers/{serverId} 可热更新 tools/list
   mcp:
     enabled: false
+    auto-reconnect-enabled: true
+    max-reconnect-attempts: 3
+    reconnect-window-seconds: 900
+    health-check-interval-ms: 30000
     servers: []
     # 示例：
     # servers:
     #   - id: filesystem
     #     transport: stdio
-    #     command: npx
+    #     command: C:/Program Files/nodejs/npx.cmd
+    #     # 与 command 必须指向同一个允许启动的绝对可执行文件；缺失时子进程不会启动。
+    #     allowed-executable: C:/Program Files/nodejs/npx.cmd
     #     args: ["-y", "@modelcontextprotocol/server-filesystem", "./workspace"]
+    #     # 精确的远端 MCP 工具名白名单；空列表会在启动子进程前禁用该 server。
+    #     allowed-tools: ["read_file", "list_directory"]
+    #     # 凭据只通过此 server 的 env 显式传入，不继承 agent 主进程密钥。
+    #     env: {}
     #     # MCP 进程是不可信边界：单帧与等待中的请求都有限额。
     #     max-frame-bytes: 8388608
     #     request-timeout-seconds: 120
@@ -495,7 +529,15 @@ file:
   upload:
     # 已弃用：实际上传到 agent.data-dir/media/uploads（MediaStorage）
     base-dir: unused
-    max-size: 734003200          # 700MB，与 spring.servlet.multipart.max-file-size 对齐
+    max-size: 104857600          # 100MB，与 spring.servlet.multipart.max-file-size 对齐
+    antivirus:
+      # Production profile overrides required=true and enables a configured scanner.
+      enabled: ${FILE_UPLOAD_ANTIVIRUS_ENABLED:false}
+      required: ${FILE_UPLOAD_ANTIVIRUS_REQUIRED:false}
+      host: ${FILE_UPLOAD_ANTIVIRUS_HOST:127.0.0.1}
+      port: ${FILE_UPLOAD_ANTIVIRUS_PORT:3310}
+      timeout-ms: ${FILE_UPLOAD_ANTIVIRUS_TIMEOUT_MS:10000}
+      chunk-bytes: ${FILE_UPLOAD_ANTIVIRUS_CHUNK_BYTES:1048576}
   extract:
     max-bytes: 52428800          # 单文件原始大小上限 50MB
     max-inline-chars: 80000      # 单文件提取后内联截断

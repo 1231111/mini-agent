@@ -73,16 +73,35 @@ function readExpectedDigest(shaFile) {
 }
 
 async function main() {
-  const argv = process.argv.slice(2).filter((a) => a !== '--list');
-  const list = process.argv.includes('--list');
+  const positional = [];
+  let list = false;
+  let pinnedDigest = null;
+  const rawArgs = process.argv.slice(2);
+  for (let i = 0; i < rawArgs.length; i += 1) {
+    const arg = rawArgs[i];
+    if (arg === '--list') {
+      if (list) fail('duplicate --list');
+      list = true;
+    } else if (arg === '--expected-sha256') {
+      if (pinnedDigest !== null || i + 1 >= rawArgs.length) {
+        fail('--expected-sha256 requires exactly one value');
+      }
+      pinnedDigest = rawArgs[++i];
+      if (!/^[0-9a-f]{64}$/.test(pinnedDigest)) {
+        fail('--expected-sha256 must be a 64-character lowercase SHA-256 digest');
+      }
+    } else {
+      positional.push(arg);
+    }
+  }
 
-  if (argv.length !== 2) {
+  if (positional.length !== 2) {
     fail(
       '用法：node scripts/verify-models-archive.mjs <archive> <archive.sha256> [--list]\n' +
-      `  收到 ${argv.length} 个位置参数：${argv.join(' ') || '(无)'}`
+      `  收到 ${positional.length} 个位置参数：${positional.join(' ') || '(无)'}`
     );
   }
-  const [archive, shaFile] = argv.map((p) => path.resolve(p));
+  const [archive, shaFile] = positional.map((p) => path.resolve(p));
 
   if (!fs.existsSync(archive)) fail(`归档不存在：${archive}`);
   if (!fs.existsSync(shaFile)) fail(`sha256 文件不存在：${shaFile}`);
@@ -90,6 +109,14 @@ async function main() {
   const bytes = fs.statSync(archive).size;
   const expected = readExpectedDigest(shaFile);
   const actual = await sha256File(archive);
+
+  if (pinnedDigest !== null && actual !== pinnedDigest) {
+    fail(
+      `${path.basename(archive)} does not match the independently pinned SHA-256\n` +
+      `  pinned ${pinnedDigest}\n` +
+      `  actual ${actual}`
+    );
+  }
 
   if (actual !== expected) {
     fail(

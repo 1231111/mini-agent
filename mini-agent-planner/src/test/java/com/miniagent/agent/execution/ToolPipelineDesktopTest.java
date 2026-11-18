@@ -34,6 +34,11 @@ import static org.mockito.Mockito.*;
 
 /** Pipeline-only regression tests: no native input or real desktop is touched. */
 class ToolPipelineDesktopTest {
+    private static final Map<String, Object> DESKTOP_ACTION_SCHEMA = Map.of(
+            "observationId", Map.of("type", "string"),
+            "action", Map.of("type", "string"),
+            "x", Map.of("type", "integer"),
+            "y", Map.of("type", "integer"));
     private static final String SESSION = "desktop-pipeline";
     private static final String CLICK = "{\"observationId\":\"screen-1\",\"action\":\"click\",\"x\":20,\"y\":40}";
 
@@ -137,7 +142,7 @@ class ToolPipelineDesktopTest {
         CountDownLatch actionStarted = new CountDownLatch(1);
         AtomicInteger calls = new AtomicInteger();
         AtomicReference<String> received = new AtomicReference<>();
-        fixture.registry.register("desktop_act", "act", Map.of(), arguments -> {
+        fixture.registry.register("desktop_act", "act", DESKTOP_ACTION_SCHEMA, arguments -> {
             calls.incrementAndGet();
             received.set(arguments);
             actionStarted.countDown();
@@ -215,7 +220,7 @@ class ToolPipelineDesktopTest {
     void pausedTaskDoesNotDispatchInputUntilResumed() throws Exception {
         Fixture fixture = new Fixture();
         CountDownLatch actionStarted = new CountDownLatch(1);
-        fixture.registry.register("desktop_act", "act", Map.of(), ignored -> {
+        fixture.registry.register("desktop_act", "act", DESKTOP_ACTION_SCHEMA, ignored -> {
             actionStarted.countDown();
             return "{\"success\":true}";
         });
@@ -239,7 +244,7 @@ class ToolPipelineDesktopTest {
     void timedOutActionIsUnknownAndCannotBeReplayedEvenAfterALateSuccess() throws Exception {
         Fixture fixture = new Fixture();
         BlockingAction action = new BlockingAction();
-        fixture.registry.register("desktop_act", "act", Map.of(), ignored -> action.execute());
+        fixture.registry.register("desktop_act", "act", DESKTOP_ACTION_SCHEMA, ignored -> action.execute());
         ToolRequest request = fullAutoRequest(SESSION, "desktop_act", CLICK, "one").withExecutionBudget(1);
         FutureTask<ToolInvocation> running = start(() -> fixture.pipeline.invoke(request));
         try {
@@ -265,7 +270,7 @@ class ToolPipelineDesktopTest {
         Fixture fixture = new Fixture();
         BlockingAction action = new BlockingAction();
         CountDownLatch observationStarted = new CountDownLatch(1);
-        fixture.registry.register("desktop_act", "act", Map.of(), ignored -> action.execute());
+        fixture.registry.register("desktop_act", "act", DESKTOP_ACTION_SCHEMA, ignored -> action.execute());
         fixture.registry.register("desktop_observe", "observe", Map.of(), ignored -> {
             observationStarted.countDown();
             return "{\"success\":true}";
@@ -295,7 +300,7 @@ class ToolPipelineDesktopTest {
         Fixture fixture = new Fixture();
         fixture.control.start(SESSION);
         BlockingAction action = new BlockingAction();
-        fixture.registry.register("desktop_act", "act", Map.of(), ignored -> action.execute());
+        fixture.registry.register("desktop_act", "act", DESKTOP_ACTION_SCHEMA, ignored -> action.execute());
         ToolRequest request = fullAutoRequest(SESSION, "desktop_act", CLICK, "one").withExecutionBudget(20);
         FutureTask<ToolInvocation> running = start(() -> fixture.pipeline.invoke(request));
         try {
@@ -375,7 +380,7 @@ class ToolPipelineDesktopTest {
         }
 
         void registerAction(AtomicInteger calls) {
-            registry.register("desktop_act", "act", Map.of(), ignored -> {
+            registry.register("desktop_act", "act", DESKTOP_ACTION_SCHEMA, ignored -> {
                 calls.incrementAndGet();
                 return "{\"success\":true}";
             });

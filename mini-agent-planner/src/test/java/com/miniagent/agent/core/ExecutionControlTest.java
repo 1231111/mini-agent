@@ -22,20 +22,20 @@ class ExecutionControlTest {
         AtomicLong used = new AtomicLong();
         TenantTokenQuota quota = new TenantTokenQuota() {
             @Override
-            public Decision check(Long tenantId) {
+            public Decision check(Long tenantId, Long userId) {
                 long value = used.get();
                 return new Decision(value < 5, value, 5);
             }
 
             @Override
-            public Decision consume(Long tenantId, long tokens) {
+            public Decision consume(Long tenantId, Long userId, long tokens) {
                 long value = used.addAndGet(tokens);
                 return new Decision(value <= 5, value, 5);
             }
         };
         ExecutionControl control = new ExecutionControl(
                 60_000, 10, 10_000, Optional.empty(), Optional.of(quota));
-        control.start("quota-session", 42L);
+        control.start("quota-session", 42L, 7L, "quota-run");
 
         assertEquals(ExecutionControl.StopReason.NONE,
                 control.afterModelTokens("quota-session", 3));

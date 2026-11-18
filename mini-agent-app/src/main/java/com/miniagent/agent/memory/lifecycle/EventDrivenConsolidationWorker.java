@@ -39,6 +39,12 @@ public class EventDrivenConsolidationWorker {
     @Value("${agent.memory.consolidation.batch-size:50}")
     private int batchSize;
 
+    @Value("${agent.memory.events.retention-days:90}")
+    private int eventRetentionDays;
+
+    @Value("${agent.memory.events.purge-batches-per-run:20}")
+    private int purgeBatchesPerRun;
+
     /**
      * 每 10 分钟检查一次未处理的事件。
      *
@@ -52,7 +58,12 @@ public class EventDrivenConsolidationWorker {
             return;
         }
         try {
-            List<AgentEventEntity> unprocessed = eventRepository.findByProcessedFalseOrderByCreatedAtAsc();
+            int quarantined = eventRepository.markUnconsolidatableProcessed();
+            if (quarantined > 0) {
+                log.warn("Marked {} legacy memory events without a tenant/session as non-consolidatable", quarantined);
+            }
+            List<AgentEventEntity> unprocessed = eventRepository
+                    .findTop50ByProcessedFalseAndSessionIdIsNotNullAndTenantIdIsNotNullOrderByCreatedAtAsc();
             if (unprocessed.isEmpty()) {
                 return;
             }
@@ -86,6 +97,45 @@ public class EventDrivenConsolidationWorker {
                     log.warn("旧版会话经历巩固失败: tenant={}, session={}",
                             first.getTenantId(), first.getSessionId(), e);
                 }
+            }
+        } finally {
+            taskLock.unlock(LOCK_NAME);
+        }
+    }
+
+    /**
+     * Processed events already have a durable Episode (or were explicitly
+     * quarantined because they lack an owner/session). Keep a bounded 90-day
+     * operational history and delete in small batches to avoid a single table
+     * lock or large persistence-context load.
+     */
+    @Scheduled(cron = "${agent.memory.events.purge-cron:0 15 3 * * *}")
+    public void purgeOldProcessedEvents() {
+        if (!taskLock.tryLock(LOCK_NAME, Duration.ofMinutes(9))) {
+            log.debug("另有实例正在执行记忆事件处理，跳过保留期清理");
+            return;
+        }
+        try {
+            int batches = 0;
+            int total = 0;
+            var cutoff = java.time.LocalDateTime.now().minusDays(Math.max(1, eventRetentionDays));
+            while (batches < Math.max(1, purgeBatchesPerRun)) {
+                List<AgentEventEntity> old = eventRepository
+                        .findTop500ByProcessedTrueAndCreatedAtBeforeOrderByIdAsc(cutoff);
+                if (old.isEmpty()) {
+                    break;
+                }
+                int deleted = eventRepository.deleteByIds(
+                        old.stream().map(AgentEventEntity::getId).toList());
+                if (deleted == 0) {
+                    break;
+                }
+                total += deleted;
+                batches++;
+            }
+            if (total > 0) {
+                log.info("Purged {} processed memory events older than {} days", total,
+                        Math.max(1, eventRetentionDays));
             }
         } finally {
             taskLock.unlock(LOCK_NAME);

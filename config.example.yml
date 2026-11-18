@@ -56,12 +56,15 @@ MINIMAX_API_KEY: ''
 # https://aistudio.google.com/apikey
 GEMINI_API_KEY: ''
 
+# MCP 外部服务示例（在 application.yml 的 agent.mcp.servers 配置）。
+# MCP 默认关闭；每台服务器必须设置非空 allowed-tools 精确列出需要开放的远端工具，
+# 且必须与服务 tools/list 完全一致。缺失白名单时不会启动子进程。
+# server 的凭据请放在该项自己的 env 映射里，工具权限仍由会话审批策略控制。
+
 # JWT 签名密钥：HS256 要求 >= 32 字节。生成：
 #   python -c "import secrets,base64;print(base64.b64encode(secrets.token_bytes(48)).decode())"
 #
-# 这一行故意保持注释状态。不要留成 JWT_SECRET: ''
-# 原因：Spring 的 ${JWT_SECRET:默认值} 在「键存在但值为空串」时取的是空串，
-# 不是默认值。留一个空的 JWT_SECRET 会把 application.yml 里开发档的默认密钥
-# 覆盖掉，JwtSessionService.init() 随即拒绝启动。
-# 要用就取消注释并填值；不用就保持注释 —— 键不存在才会回退到默认值。
+# 这一行故意保持注释状态。prod profile 要求显式提供强密钥；开发默认值只在 dev profile 使用。
+# 不要留成 JWT_SECRET: ''，空值会覆盖配置并导致启动失败。
+# 要用就取消注释并填入随机值；生成方式见上方命令。
 # JWT_SECRET: ''

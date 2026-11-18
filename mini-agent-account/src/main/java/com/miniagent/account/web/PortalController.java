@@ -12,8 +12,10 @@ import com.miniagent.common.ErrorCode;
 import com.miniagent.common.exception.BusinessException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpSession;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ResponseCookie;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -23,6 +25,10 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.ResponseBody;
 
 import java.util.List;
+import java.util.Base64;
+import java.security.SecureRandom;
+import java.time.Duration;
+import java.util.Map;
 
 /**
  * 浏览器上的账号与充值页。
@@ -34,6 +40,12 @@ import java.util.List;
 public class PortalController {
 
     static final String SESSION_USER_ID = "portalUserId";
+    static final String CSRF_COOKIE = "PORTAL-XSRF";
+    static final String SECURE_CSRF_COOKIE = "__Host-PORTAL-XSRF";
+    private static final SecureRandom CSRF_RANDOM = new SecureRandom();
+
+    @Value("${server.servlet.session.cookie.secure:false}")
+    private boolean secureCookie;
 
     @Autowired
     private AccountAuthService auth;
@@ -59,6 +71,26 @@ public class PortalController {
     @GetMapping({"/", "/login", "/register", "/account"})
     public String page() {
         return "forward:/portal.html";
+    }
+
+    /** Issue a short-lived double-submit token for same-origin portal POSTs. */
+    @GetMapping(value = "/api/portal/csrf", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<Map<String, String>> csrf(HttpServletResponse response) {
+        byte[] bytes = new byte[32];
+        CSRF_RANDOM.nextBytes(bytes);
+        String token = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+        String cookieName = secureCookie ? SECURE_CSRF_COOKIE : CSRF_COOKIE;
+        ResponseCookie cookie = ResponseCookie.from(cookieName, token)
+                .httpOnly(false)
+                .secure(secureCookie)
+                .path("/")
+                .sameSite("Strict")
+                .maxAge(Duration.ofHours(8))
+                .build();
+        response.addHeader("Set-Cookie", cookie.toString());
+        response.setHeader("Cache-Control", "no-store");
+        return ApiResponse.ok(Map.of("token", token));
     }
 
     @PostMapping(value = "/api/portal/session",
@@ -172,32 +204,6 @@ public class PortalController {
         Long userId = requireUser(request).getId();
         String planCode = body == null ? null : body.planCode();
         MembershipOrder order = membership.createOrder(userId, planCode);
-        return ApiResponse.ok(MembershipController.OrderView.of(order));
-    }
-
-    /**
-     * 浏览器把订单标记为已支付。
-     *
-     * <p><b>默认关闭，且默认关闭是安全边界而不是临时开关。</b>这个端点没有任何支付凭证校验，
-     * 任何登录用户都能把自己的订单（含 pro 档）直接置为 PAID 并立刻拿到对应额度 ——
-     * 等于所有付费档免费。订单状态只能由**签名校验过的渠道回调**流转；
-     * 在真实回调接入前，这里仅在运维显式打开开关（{@code agent.account.portal-confirm-enabled=true}）
-     * 时才可用，用于本地联调。</p>
-     */
-    @Value("${agent.account.portal-confirm-enabled:false}")
-    private boolean portalConfirmEnabled;
-
-    @PostMapping(value = "/api/portal/orders/{orderNo}/confirm",
-            produces = MediaType.APPLICATION_JSON_VALUE)
-    @ResponseBody
-    public ApiResponse<MembershipController.OrderView> confirm(
-            @PathVariable String orderNo, HttpServletRequest request) {
-        Long userId = requireUser(request).getId();
-        if (!portalConfirmEnabled) {
-            throw new BusinessException(ErrorCode.AUTH_FORBIDDEN,
-                    "该入口已关闭：订单状态只能由支付渠道回调确认，浏览器不能自行标记已支付");
-        }
-        MembershipOrder order = membership.confirmPortalPayment(userId, orderNo);
         return ApiResponse.ok(MembershipController.OrderView.of(order));
     }
 

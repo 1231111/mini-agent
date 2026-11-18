@@ -31,6 +31,7 @@ import com.miniagent.memory.contract.MemoryApi.ReviewRequest;
 import com.miniagent.memory.contract.MemoryApi.UserFactSync;
 import com.miniagent.memory.contract.MemoryApi.UserFactSyncResult;
 import com.miniagent.memory.contract.MemoryApi.UserFactView;
+import com.miniagent.memory.contract.MemoryApi.SubjectErasureResult;
 import com.miniagent.memory.contract.MemoryServiceClient;
 import com.miniagent.memory.contract.MemoryServiceClient.CallFailed;
 import com.miniagent.memory.port.ProjectAuthorizationCommand;
@@ -139,6 +140,18 @@ public class CloudMemoryClient implements ProjectAuthorizationPort {
         if (localUserId == null) throw new BusinessException(ErrorCode.AUTH_NOT_AUTHENTICATED);
         return callWithRefresh(localUserId, HttpMethod.GET, MemoryApi.USER_FACTS, null,
                 json.getTypeFactory().constructCollectionType(List.class, UserFactView.class));
+    }
+
+    /** Erase the authenticated cloud subject; the server binds the path to the token owner. */
+    public SubjectErasureResult eraseSubject() {
+        Long localUserId = OwnerContext.currentUserId();
+        if (localUserId == null) throw new BusinessException(ErrorCode.AUTH_NOT_AUTHENTICATED);
+        String external = users.findExternalIdById(localUserId)
+                .filter(value -> !value.isBlank())
+                .orElseThrow(() -> new BusinessException(ErrorCode.AUTH_NOT_AUTHENTICATED));
+        long cloudUserId = parseCloudUserId(external);
+        return callWithRefresh(localUserId, HttpMethod.DELETE,
+                MemoryApi.SUBJECTS + "/" + cloudUserId, null, SubjectErasureResult.class);
     }
 
     public ItemView get(long id) { return write(HttpMethod.GET, MemoryApi.ITEMS + "/" + id, null, ItemView.class); }

@@ -2,9 +2,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -r "$SCRIPT_DIR/../.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/../.env"
+  set +a
+fi
+if [[ -n "${MEMORY_SERVICE_DB_URL:-}" ]]; then
+  export DB_URL="$MEMORY_SERVICE_DB_URL"
+fi
 JAR="${MEMORY_SERVICE_JAR:-$SCRIPT_DIR/mini-agent-memory-service.jar}"
 PORT="${MEMORY_SERVICE_PORT:-8091}"
-ADDRESS="${MEMORY_SERVICE_ADDRESS:-0.0.0.0}"
+ADDRESS="${MEMORY_SERVICE_ADDRESS:-127.0.0.1}"
+SPRING_PROFILE="${SPRING_PROFILES_ACTIVE:-prod}"
 
 : "${DB_URL:?Set DB_URL to the memory-service MySQL database URL}"
 : "${DB_USERNAME:?Set DB_USERNAME}"
@@ -18,8 +28,12 @@ if [[ ! -r "$JAR" ]]; then
   exit 1
 fi
 
+MINI_AGENT_JAVA_OPTS="${MINI_AGENT_JAVA_OPTS:--XX:MaxRAMPercentage=60 -XX:InitialRAMPercentage=20 -XX:+UseContainerSupport -XX:+ExitOnOutOfMemoryError}"
+read -r -a JVM_OPTS <<< "$MINI_AGENT_JAVA_OPTS"
+
 if [[ "${1:-}" == "--foreground" ]]; then
-  exec java -jar "$JAR" --server.address="$ADDRESS" --server.port="$PORT" \
+  exec java "${JVM_OPTS[@]}" -jar "$JAR" --server.address="$ADDRESS" --server.port="$PORT" \
+    --spring.profiles.active="$SPRING_PROFILE" \
     --memory.service.role="${MEMORY_SERVICE_ROLE:-all}"
 fi
 
@@ -29,7 +43,8 @@ if [[ -s "$PID_FILE" ]] && kill -0 "$(<"$PID_FILE")" 2>/dev/null; then
   echo "Memory-service is already running (PID $(<"$PID_FILE"))." >&2
   exit 1
 fi
-nohup java -jar "$JAR" --server.address="$ADDRESS" --server.port="$PORT" \
+nohup java "${JVM_OPTS[@]}" -jar "$JAR" --server.address="$ADDRESS" --server.port="$PORT" \
+  --spring.profiles.active="$SPRING_PROFILE" \
   --memory.service.role="${MEMORY_SERVICE_ROLE:-all}" \
   >>"$LOG_FILE" 2>&1 </dev/null &
 echo "$!" > "$PID_FILE"

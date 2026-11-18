@@ -57,6 +57,7 @@ import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.core.io.UrlResource;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -88,6 +89,10 @@ import org.apache.commons.lang3.StringUtils;
 @Controller
 @Slf4j
 public class MiniAgentChatPageController {
+
+    private static final int MAX_PAGE_INDEX = 10_000;
+    private static final int MAX_MESSAGE_PAGE_SIZE = 100;
+    private static final int MAX_TRACE_PAGE_SIZE = 500;
 
     private static final String MCP_REFRESH_AUDIT_ACTION = "MCP_REFRESH";
     private static final String MCP_SERVER_AUDIT_TARGET = "MCP_SERVER";
@@ -1111,12 +1116,16 @@ public class MiniAgentChatPageController {
 
     @GetMapping(value = "/api/conversations", produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
-    public ApiResponse<List<ConversationSummaryDTO>> listConversations(HttpServletRequest request) {
+    public ApiResponse<List<ConversationSummaryDTO>> listConversations(
+            HttpServletRequest request,
+            @RequestParam(value = "page", defaultValue = "0") int page,
+            @RequestParam(value = "size", defaultValue = "50") int size) {
         Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
-        var tasks = chatTaskRepository.findLatestTaskPerSession(userId);
+        var tasks = chatTaskRepository.findLatestTaskPerSession(userId,
+                boundedPageRequest(page, size, MAX_MESSAGE_PAGE_SIZE));
         return ApiResponse.ok(tasks.stream().map(t -> new ConversationSummaryDTO(
                 t.getSessionId(),
                 t.getQuestion().length() > 40
@@ -1153,7 +1162,7 @@ public class MiniAgentChatPageController {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
         var tasks = chatTaskRepository.findByUserIdAndSessionIdAndDeletedFalseOrderByCreatedAtDesc(
-                userId, sessionId, org.springframework.data.domain.PageRequest.of(page, size));
+                userId, sessionId, boundedPageRequest(page, size, MAX_MESSAGE_PAGE_SIZE));
         var list = new ArrayList<>(tasks.getContent());
         Collections.reverse(list);
         Map<Long, List<String>> legacyUploadsByTask = legacyUploadsByTask(list,
@@ -1385,22 +1394,28 @@ public class MiniAgentChatPageController {
             produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<Object> listSessionSteps(@PathVariable("sessionId") String sessionId,
-                                                HttpServletRequest request) {
-        return listSteps(request, sessionId, null);
+                                                HttpServletRequest request,
+                                                @RequestParam(value = "page", defaultValue = "0") int page,
+                                                @RequestParam(value = "size", defaultValue = "200") int size) {
+        return listSteps(request, sessionId, null, page, size);
     }
 
     @GetMapping(value = "/api/executions/{executionId}/steps",
             produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<Object> listExecutionSteps(@PathVariable("executionId") String executionId,
-                                                  HttpServletRequest request) {
-        return listSteps(request, null, executionId);
+                                                  HttpServletRequest request,
+                                                  @RequestParam(value = "page", defaultValue = "0") int page,
+                                                  @RequestParam(value = "size", defaultValue = "200") int size) {
+        return listSteps(request, null, executionId, page, size);
     }
 
     private ApiResponse<Object> listSteps(
             HttpServletRequest request,
             String sessionId,
-            String executionId) {
+            String executionId,
+            int page,
+            int size) {
         Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
@@ -1409,18 +1424,19 @@ public class MiniAgentChatPageController {
             return ApiResponse.ok(List.of());
         }
         if (Objects.nonNull(executionId) && !executionId.isEmpty()) {
-            List<AgentTraceStep> traces =
-                    agentTraceStepRepository.findByExecutionIdOrderByTurnIndexAscIdAsc(executionId);
-            if (!ownsTraceSessions(userId, traces)) {
+            if (!ownsExecution(userId, executionId)) {
                 return ApiResponse.ok(List.of());
             }
-            if (StringUtils.isNotBlank(sessionId)
-                    && traces.stream().anyMatch(step -> !sessionId.equals(step.getSessionId()))) {
+            if (StringUtils.isNotBlank(sessionId) && !ownsSession(userId, sessionId)) {
                 return ApiResponse.ok(List.of());
             }
-            return ApiResponse.ok(traces);
+            return ApiResponse.ok(agentTraceStepRepository
+                    .findByExecutionIdOrderByTurnIndexAscIdAsc(executionId,
+                            boundedPageRequest(page, size, MAX_TRACE_PAGE_SIZE)).getContent());
         }
-        return ApiResponse.ok(agentTraceStepRepository.findBySessionIdOrderByTurnIndexAscIdAsc(sessionId));
+        return ApiResponse.ok(agentTraceStepRepository
+                .findBySessionIdOrderByTurnIndexAscIdAsc(sessionId,
+                        boundedPageRequest(page, size, MAX_TRACE_PAGE_SIZE)).getContent());
     }
 
     /**
@@ -1431,21 +1447,22 @@ public class MiniAgentChatPageController {
     @ResponseBody
     public ApiResponse<Object> getPlannerDecisions(
             HttpServletRequest request,
-            @PathVariable("executionId") String executionId) {
+            @PathVariable("executionId") String executionId,
+            @RequestParam(value = "page", defaultValue = "0") int page,
+            @RequestParam(value = "size", defaultValue = "200") int size) {
         Long userId = resolveUserId(request);
         if (Objects.isNull(userId)) {
             return ApiResponse.fail(ErrorCode.AUTH_NOT_AUTHENTICATED);
         }
         if (StringUtils.isBlank(executionId))
             return ApiResponse.fail(ErrorCode.CHAT_MESSAGE_EMPTY);
-        List<AgentTraceStep> all =
-                agentTraceStepRepository.findByExecutionIdOrderByTurnIndexAscIdAsc(executionId);
+        if (!ownsExecution(userId, executionId)) return ApiResponse.ok(List.of());
+        List<AgentTraceStep> all = agentTraceStepRepository
+                .findByExecutionIdOrderByTurnIndexAscIdAsc(executionId,
+                        boundedPageRequest(page, size, MAX_TRACE_PAGE_SIZE)).getContent();
         if (all.isEmpty()) {
             return ApiResponse.ok(List.of());
         }
-        String sessionId = all.get(0).getSessionId();
-        if (StringUtils.isNotBlank(sessionId) && !ownsSession(userId, sessionId))
-            return ApiResponse.ok(List.of());
         return ApiResponse.ok(com.miniagent.agent.planner.PlannerDecisionNodes.filter(
                 all, AgentTraceStep::getStepType));
     }
@@ -1467,8 +1484,9 @@ public class MiniAgentChatPageController {
 
         List<TaskTodoStore.TodoItem> todos = todoStore.get(sessionId);
         boolean running = streamingService.isTaskRunning(sessionId);
-        List<AgentTraceStep> sessionSteps = agentTraceStepRepository
-                .findBySessionIdOrderByTurnIndexAscIdAsc(sessionId);
+        List<AgentTraceStep> sessionSteps = new ArrayList<>(agentTraceStepRepository
+                .findTop500BySessionIdOrderByIdDesc(sessionId));
+        Collections.reverse(sessionSteps);
         Map<String, List<AgentTraceStep>> grouped = new LinkedHashMap<>();
         for (AgentTraceStep step : sessionSteps) {
             if (StringUtils.isBlank(step.getExecutionId())) continue;
@@ -1511,7 +1529,9 @@ public class MiniAgentChatPageController {
         if (Objects.isNull(userId) || !ownsSession(userId, sessionId)) {
             return ApiResponse.ok(List.of());
         }
-        List<AgentTraceStep> all = agentTraceStepRepository.findBySessionIdOrderByTurnIndexAscIdAsc(sessionId);
+        List<AgentTraceStep> all = new ArrayList<>(agentTraceStepRepository
+                .findTop500BySessionIdOrderByIdDesc(sessionId));
+        Collections.reverse(all);
         // 按 executionId 分组，返回每个执行的摘要
         Map<String, List<AgentTraceStep>> grouped = new LinkedHashMap<>();
         for (AgentTraceStep s : all) {
@@ -1577,20 +1597,18 @@ public class MiniAgentChatPageController {
         List<Object[]> slowestSteps = List.of();
 
         if (Objects.nonNull(executionId) && !executionId.isEmpty()) {
-            List<AgentTraceStep> traces =
-                    agentTraceStepRepository.findByExecutionIdOrderByTurnIndexAscIdAsc(executionId);
-            if (!ownsTraceSessions(userId, traces)) {
+            if (!ownsExecution(userId, executionId)) {
                 return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN);
             }
-            if (StringUtils.isNotBlank(sessionId)
-                    && traces.stream().anyMatch(step -> !sessionId.equals(step.getSessionId()))) {
+            if (StringUtils.isNotBlank(sessionId) && !ownsSession(userId, sessionId)) {
                 return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN);
             }
             totalSteps = agentTraceStepRepository.countByExecutionId(executionId);
             totalTurns = agentTraceStepRepository.countDistinctTurnsByExecutionId(executionId);
             totalDuration = agentTraceStepRepository.sumDurationByExecutionId(executionId);
             toolStats = agentTraceStepRepository.toolStatsByExecutionId(executionId);
-            slowestSteps = agentTraceStepRepository.slowestStepsByExecutionId(executionId);
+            slowestSteps = agentTraceStepRepository.slowestStepsPageByExecutionId(executionId,
+                    PageRequest.of(0, 5));
         } else {
             totalSteps = agentTraceStepRepository.countBySessionId(sessionId);
             totalTurns = agentTraceStepRepository.countDistinctTurnsBySessionId(sessionId);
@@ -1623,16 +1641,20 @@ public class MiniAgentChatPageController {
                 slowest));
     }
 
-    private boolean ownsTraceSessions(Long userId, List<AgentTraceStep> traces) {
-        if (traces == null || traces.isEmpty()) {
-            return true;
-        }
-        return traces.stream()
-                .map(AgentTraceStep::getSessionId)
-                .filter(StringUtils::isNotBlank)
-                .distinct()
-                .allMatch(id -> sessionAuthorization.owns(userId, id))
-                && traces.stream().allMatch(step -> StringUtils.isNotBlank(step.getSessionId()));
+    private boolean ownsExecution(Long userId, String executionId) {
+        var sessions = agentTraceStepRepository.findDistinctSessionIdsByExecutionId(
+                executionId, PageRequest.of(0, 10));
+        // Execution IDs should have one owner. Treat corrupt or unexpectedly
+        // shared IDs as inaccessible instead of reading an unbounded owner set.
+        return sessions.getTotalElements() <= 10 && !sessions.isEmpty()
+                && sessions.getContent().stream().allMatch(id -> StringUtils.isNotBlank(id)
+                && sessionAuthorization.owns(userId, id));
+    }
+
+    static PageRequest boundedPageRequest(int page, int size, int maxSize) {
+        int boundedPage = Math.max(0, Math.min(page, MAX_PAGE_INDEX));
+        int boundedSize = Math.max(1, Math.min(size, maxSize));
+        return PageRequest.of(boundedPage, boundedSize);
     }
 
     // ========== 会话工作目录 ==========
@@ -1828,6 +1850,10 @@ public class MiniAgentChatPageController {
                             "execPolicy 取值无法识别: " + raw
                                     + "（可选 block / ask / allow，或 default 表示跟随全局）");
                 }
+                if (execPolicyService.isBlockLocked() && parsed != ExecPolicy.BLOCK) {
+                    return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN,
+                            "全局 execPolicy 为 block，生产安全策略禁止会话将其提升为 ask 或 allow");
+                }
                 permissionStore.setExecPolicyOverride(sessionId, parsed);
             }
             touched = true;
@@ -1896,6 +1922,7 @@ public class MiniAgentChatPageController {
         view.put("execPolicyGlobalLabel", global.labelZh());
         view.put("execPolicyEffective", effective.wireName());
         view.put("execPolicyEffectiveLabel", effective.labelZh());
+        view.put("execPolicyLocked", execPolicyService.isBlockLocked());
         view.put("execPolicyFollowsGlobal", Objects.isNull(permissionStore.getExecPolicyOverride(sessionId)));
         view.put("execPolicyOptions", java.util.Arrays.stream(ExecPolicy.values())
                 .map(p -> Map.of("value", p.wireName(), "label", p.labelZh()))

@@ -121,9 +121,22 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
                     ToolErrorCode code = node.has("errorCode")
                             ? parseErrorCode(node.path("errorCode").asText(""))
                             : classifyLegacyFailure(message);
-                    // 传原文而不是重建：重建会丢掉这一层不认识的任何字段，
-                    // 服务层以后再加 detail / retryAfter / upstreamTraceId 也一样会没。
-                    return failure(code, message, isRetriable(code), rawText);
+                    if (code == null || code == ToolErrorCode.NONE) code = ToolErrorCode.EXECUTION_FAILED;
+                    boolean retriable = isRetriable(code);
+                    // Normalize legacy failures centrally while preserving unknown
+                    // diagnostic fields. Tool consumers always get one contract.
+                    com.fasterxml.jackson.databind.node.ObjectNode normalized = node.isObject()
+                            ? (com.fasterxml.jackson.databind.node.ObjectNode) node.deepCopy()
+                            : JSON.createObjectNode();
+                    normalized.put("success", false);
+                    normalized.put("status", status.isBlank() ? "failed" : status);
+                    normalized.put("errorCode", code.name());
+                    normalized.put("error", message);
+                    normalized.put("retriable", retriable);
+                    String canonical;
+                    try { canonical = JSON.writeValueAsString(normalized); }
+                    catch (Exception ignored) { canonical = rawText; }
+                    return failure(code, message, retriable, canonical);
                 }
                 return success(rawText);
             }
@@ -192,7 +205,7 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
                 || lower.contains("rate limit") || lower.contains("限流")) {
             return ToolErrorCode.RATE_LIMITED;
         }
-        if (lower.contains("503") || lower.contains("502") || lower.contains("504")
+        if (lower.contains("500") || lower.contains("503") || lower.contains("502") || lower.contains("504")
                 || lower.contains("unavailable") || lower.contains("bad gateway")
                 || lower.contains("gateway timeout")) {
             return ToolErrorCode.DEPENDENCY_UNAVAILABLE;

@@ -3,6 +3,7 @@ package com.miniagent.agent.memory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
@@ -23,8 +24,9 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li>同一批 PENDING outbox 记录被两个实例同时取走 → 重复写向量库</li>
  * </ul>
  *
- * <p><b>降级策略</b>：存在 Redis 时用 {@code SET NX EX} + Lua 释放（只有持有者能释放）；
- * 无 Redis（单机部署）时退化为进程内锁——单机不存在跨实例问题，够用。
+ * <p><b>锁策略</b>：{@code agent.replica.mode=redis} 时必须使用 Redis {@code SET NX EX} + Lua 释放
+ * （只有持有者能释放）；Redis 缺失或故障时拒绝运行后台任务，绝不改用进程内锁。
+ * 只有显式单机模式（{@code agent.replica.mode=local}，桌面/开发）才使用进程内锁。
  * 这样不必依赖 {@code RedisTaskConcurrency}（它是 {@code @ConditionalOnProperty}
  * 条件启用的，单机模式下根本不存在）。
  */
@@ -47,10 +49,17 @@ public class MemoryTaskLock {
     @Autowired(required = false)
     private StringRedisTemplate redis;
 
-    /** name → 本 JVM 持有的 token。降级模式下也用它做互斥。 */
+    @Value("${agent.replica.mode:local}")
+    private String replicaMode = "local";
+
+    /** name → 本 JVM 持有的 token。仅用于显式单机模式或记录当前 Redis 锁 token。 */
     private final ConcurrentHashMap<String, String> heldTokens = new ConcurrentHashMap<>();
 
     public boolean tryLock(String name, Duration ttl) {
+        if (isRedisMode() && redis == null) {
+            throw new IllegalStateException(
+                    "MEMORY_DISTRIBUTED_LOCK_UNAVAILABLE: replica mode requires Redis lock storage");
+        }
         String token = UUID.randomUUID().toString().replace("-", "");
         if (redis != null) {
             try {
@@ -61,10 +70,18 @@ public class MemoryTaskLock {
                 }
                 return false;
             } catch (Exception e) {
-                log.warn("Redis 加锁失败，退化为本地锁: name={}, {}", name, e.getMessage());
+                // A configured Redis instance is the cross-replica lock authority.
+                // Falling back to JVM-local locking here would let every replica
+                // process the same outbox batch concurrently.
+                log.warn("Redis 加锁失败，本次后台任务拒绝运行: name={}", name, e);
+                throw new IllegalStateException("MEMORY_DISTRIBUTED_LOCK_UNAVAILABLE", e);
             }
         }
         return heldTokens.putIfAbsent(name, token) == null;
+    }
+
+    private boolean isRedisMode() {
+        return "redis".equalsIgnoreCase(replicaMode);
     }
 
     public void unlock(String name) {
@@ -77,7 +94,8 @@ public class MemoryTaskLock {
                 redis.execute(UNLOCK_IF_OWNER, List.of(KEY_PREFIX + name), token);
                 return;
             } catch (Exception e) {
-                log.debug("Redis 解锁失败: name={}, {}", name, e.getMessage());
+                log.warn("Redis 解锁失败；等待锁 TTL 回收: name={}", name, e);
+                throw new IllegalStateException("MEMORY_DISTRIBUTED_UNLOCK_UNAVAILABLE", e);
             }
         }
     }

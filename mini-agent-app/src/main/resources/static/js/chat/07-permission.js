@@ -503,6 +503,7 @@ async function selectConfirmPolicy(policy) {
 const EXEC_LABELS = { block: '禁止', ask: '需批准', allow: '放行' };
 let execPolicyOverride = '';   // '' = 跟随全局
 let execPolicyEffective = '';
+let execPolicyLocked = false;
 
 function toggleExecMenu() {
     const menu = document.getElementById('execMenu');
@@ -525,6 +526,7 @@ function applyExecPolicyView(v) {
     if (!v) return;
     execPolicyOverride = v.execPolicyOverride || '';
     execPolicyEffective = v.execPolicyEffective || '';
+    execPolicyLocked = v.execPolicyLocked === true;
     const label = document.getElementById('execPolicyLabel');
     if (label) {
         const eff = EXEC_LABELS[execPolicyEffective] || execPolicyEffective || '执行';
@@ -535,8 +537,11 @@ function applyExecPolicyView(v) {
     // 只有"禁止"才高亮：放行/需批准都算正常态，不必让按钮一直亮着
     if (btn) btn.classList.toggle('active', execPolicyEffective === 'block');
     const hint = document.getElementById('execGlobalHint');
-    if (hint) hint.textContent = '全局默认：' + (EXEC_LABELS[v.execPolicyGlobal] || v.execPolicyGlobal || '-');
+    if (hint) hint.textContent = '全局默认：' + (EXEC_LABELS[v.execPolicyGlobal] || v.execPolicyGlobal || '-')
+        + (execPolicyLocked ? '（生产策略锁定，不能提升）' : '');
     document.querySelectorAll('#execMenu .perm-item').forEach(el => {
+        const raisesBlock = el.dataset.exec === 'ask' || el.dataset.exec === 'allow';
+        el.hidden = execPolicyLocked && raisesBlock;
         el.classList.toggle('active', el.dataset.exec === (execPolicyOverride || 'default'));
     });
 }
@@ -584,12 +589,14 @@ async function selectExecPolicy(value) {
 function resetExecPolicyView() {
     execPolicyOverride = '';
     execPolicyEffective = '';
+    execPolicyLocked = false;
     const label = document.getElementById('execPolicyLabel');
     if (label) label.textContent = '执行';
     document.getElementById('execPolicyBtn')?.classList.remove('active');
     const hint = document.getElementById('execGlobalHint');
     if (hint) hint.textContent = '';
     document.querySelectorAll('#execMenu .perm-item').forEach(el => {
+        el.hidden = false;
         el.classList.toggle('active', el.dataset.exec === 'default');
     });
 }

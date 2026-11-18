@@ -14,6 +14,7 @@ const view = (overrides = {}) => ({ success: true, customBaseUrlAllowed: true, d
 function harness() {
     const nodes = new Map(), requests = [];
     const element = () => ({ value: '', textContent: '', placeholder: '', checked: false, disabled: false, dataset: {},
+        style: { color: '', fontWeight: '' },
         classList: { toggle() {} }, appendChild() {}, querySelector() { return element(); } });
     const get = id => { if (!nodes.has(id)) nodes.set(id, element()); return nodes.get(id); };
     const ctx = vm.createContext({ console: { warn() {} },
@@ -33,6 +34,8 @@ function harness() {
     await h.ctx.saveModelConfig();
     assert.equal(h.get('modelBaseUrl').value, 'https://own.test/v1');
     assert.equal(h.get('modelMenuHint').textContent, '请重新输入对应 Key');
+    assert.equal(h.get('modelMenuHint').style.color, '#A32D2D');
+    assert.equal(h.get('modelMenuHint').style.fontWeight, '500');
     console.log('PASS: disabled endpoint is not submitted and failure preserves the repair form');
 }
 {

@@ -23,6 +23,12 @@ public interface ChatTaskRepository extends JpaRepository<ChatTask, Long> {
             + "AND t.id IN (SELECT MAX(t2.id) FROM ChatTask t2 WHERE t2.userId = :userId "
             + "AND t2.deleted = false GROUP BY t2.sessionId) ORDER BY t.createdAt DESC")
     List<ChatTask> findLatestTaskPerSession(Long userId);
+    @Query(value = "SELECT t FROM ChatTask t WHERE t.userId = :userId AND t.deleted = false "
+            + "AND t.id IN (SELECT MAX(t2.id) FROM ChatTask t2 WHERE t2.userId = :userId "
+            + "AND t2.deleted = false GROUP BY t2.sessionId) ORDER BY t.createdAt DESC",
+            countQuery = "SELECT COUNT(DISTINCT t.sessionId) FROM ChatTask t "
+                    + "WHERE t.userId = :userId AND t.deleted = false")
+    Page<ChatTask> findLatestTaskPerSession(@Param("userId") Long userId, Pageable pageable);
     void deleteBySessionId(String sessionId);
 
     @Transactional

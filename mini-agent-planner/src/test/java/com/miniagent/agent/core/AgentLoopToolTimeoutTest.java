@@ -19,6 +19,10 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /** Exercises actual AgentLoop -> permission -> locks -> registered handler execution. */
 class AgentLoopToolTimeoutTest {
+    private static final Map<String, Object> READ_SCHEMA = Map.of(
+            "path", Map.of("type", "string"));
+    private static final Map<String, Object> COMMAND_SCHEMA = Map.of(
+            "command", Map.of("type", "string"));
     private static final String SESSION = "handler-timeout";
     private static final String COMMAND = "{\"command\":\"git status\"}";
 
@@ -26,7 +30,7 @@ class AgentLoopToolTimeoutTest {
     void ordinaryReadRespectsOneSecondActionCapAndJournalsTimeout() throws Exception {
         Fixture fixture = new Fixture();
         CountDownLatch interrupted = new CountDownLatch(1);
-        fixture.registry.register("read_file", "read", Map.of(), args -> {
+        fixture.registry.register("read_file", "read", READ_SCHEMA, args -> {
             assertEquals(SESSION, AgentLoop.getCurrentSession());
             assertEquals(1, LoopTurnContext.current().actionTimeoutSeconds());
             return slowHandler(interrupted);
@@ -46,7 +50,7 @@ class AgentLoopToolTimeoutTest {
     void approvalLongerThanActionCapStillLeavesFullHandlerBudget() throws Exception {
         Fixture fixture = new Fixture();
         AtomicInteger calls = new AtomicInteger();
-        fixture.registry.register("exec_command", "exec", Map.of(), args -> {
+        fixture.registry.register("exec_command", "exec", COMMAND_SCHEMA, args -> {
             calls.incrementAndGet();
             sleep(350);
             return "{\"success\":true}";
@@ -67,7 +71,7 @@ class AgentLoopToolTimeoutTest {
     void approvedHandlerStillTimesOutOneSecondAfterApproval() throws Exception {
         Fixture fixture = new Fixture();
         CountDownLatch interrupted = new CountDownLatch(1);
-        fixture.registry.register("exec_command", "exec", Map.of(), args -> slowHandler(interrupted));
+        fixture.registry.register("exec_command", "exec", COMMAND_SCHEMA, args -> slowHandler(interrupted));
         Future<List<ToolResult>> running = fixture.start(List.of(call("exec_command", COMMAND)), false);
         fixture.awaitApproval();
         sleep(1_100);
@@ -85,8 +89,8 @@ class AgentLoopToolTimeoutTest {
     void earlierApprovalWaitCannotExtendLaterParallelHandlersDeadline() throws Exception {
         Fixture fixture = new Fixture();
         CountDownLatch readInterrupted = new CountDownLatch(1);
-        fixture.registry.register("exec_command", "exec", Map.of(), args -> "{\"success\":true}");
-        fixture.registry.register("read_file", "read", Map.of(), args -> slowHandler(readInterrupted));
+        fixture.registry.register("exec_command", "exec", COMMAND_SCHEMA, args -> "{\"success\":true}");
+        fixture.registry.register("read_file", "read", READ_SCHEMA, args -> slowHandler(readInterrupted));
         Future<List<ToolResult>> running = fixture.start(List.of(
                 call("exec_command", COMMAND), call("read_file", "{}")), true);
         fixture.awaitApproval();
@@ -105,7 +109,7 @@ class AgentLoopToolTimeoutTest {
     void pauseBeforeHandlerDoesNotConsumeItsExecutionBudget() throws Exception {
         Fixture fixture = new Fixture();
         AtomicInteger calls = new AtomicInteger();
-        fixture.registry.register("read_file", "read", Map.of(), args -> {
+        fixture.registry.register("read_file", "read", READ_SCHEMA, args -> {
             calls.incrementAndGet();
             sleep(350);
             return "{\"success\":true}";
@@ -126,7 +130,7 @@ class AgentLoopToolTimeoutTest {
     void cancellingDuringApprovalRemovesPendingGrantAndNeverRunsHandler() throws Exception {
         Fixture fixture = new Fixture();
         AtomicInteger calls = new AtomicInteger();
-        fixture.registry.register("exec_command", "exec", Map.of(), args -> {
+        fixture.registry.register("exec_command", "exec", COMMAND_SCHEMA, args -> {
             calls.incrementAndGet();
             return "{\"success\":true}";
         });
@@ -145,7 +149,7 @@ class AgentLoopToolTimeoutTest {
     void runDeadlineDuringApprovalRemovesPendingGrantAndNeverRunsHandler() throws Exception {
         Fixture fixture = new Fixture(1_000);
         AtomicInteger calls = new AtomicInteger();
-        fixture.registry.register("exec_command", "exec", Map.of(), args -> {
+        fixture.registry.register("exec_command", "exec", COMMAND_SCHEMA, args -> {
             calls.incrementAndGet();
             return "{\"success\":true}";
         });
@@ -166,7 +170,7 @@ class AgentLoopToolTimeoutTest {
         Fixture fixture = new Fixture(1_000);
         CountDownLatch started = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
-        fixture.registry.register("read_file", "read", Map.of(), args -> {
+        fixture.registry.register("read_file", "read", READ_SCHEMA, args -> {
             started.countDown();
             while (release.getCount() > 0) {
                 try { release.await(); }
@@ -221,7 +225,7 @@ class AgentLoopToolTimeoutTest {
         CountDownLatch firstInterrupted = new CountDownLatch(1);
         CountDownLatch secondStarted = new CountDownLatch(1);
         AtomicInteger calls = new AtomicInteger();
-        fixture.registry.register("read_file", "read", Map.of(), args -> {
+        fixture.registry.register("read_file", "read", READ_SCHEMA, args -> {
             if (calls.incrementAndGet() == 1) {
                 while (release.getCount() > 0) {
                     try { release.await(); }
@@ -254,7 +258,7 @@ class AgentLoopToolTimeoutTest {
     @Test
     void completedHandlerCancelsItsDeadlineAndNeverInterruptsReusedThread() throws Exception {
         Fixture fixture = new Fixture();
-        fixture.registry.register("read_file", "read", Map.of(), args -> "{\"success\":true}");
+        fixture.registry.register("read_file", "read", READ_SCHEMA, args -> "{\"success\":true}");
         ToolRequest request = ToolRequest.of(SESSION, "read_file", "{}", 0, "timer-cleanup")
                 .withExecutionBudget(1);
         FutureTask<Boolean> running = new FutureTask<>(() -> {

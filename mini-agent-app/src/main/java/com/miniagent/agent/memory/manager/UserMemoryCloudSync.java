@@ -14,6 +14,7 @@ import com.miniagent.memory.contract.MemoryApi.UserFactMutation;
 import com.miniagent.memory.contract.MemoryApi.UserFactView;
 import com.miniagent.memory.contract.MemoryApi.UserFactSync;
 import com.miniagent.memory.contract.MemoryApi.UserFactSyncResult;
+import com.miniagent.application.SubjectErasureService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -46,6 +47,9 @@ public class UserMemoryCloudSync {
     private final UserRepository users;
     private final CloudMemoryClient cloud;
     private final MemoryManager memory;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private SubjectErasureService subjectErasureService;
 
     public UserMemoryCloudSync(AgentSemanticFactRepository facts, UserRepository users,
                                    CloudMemoryClient cloud, MemoryManager memory) {
@@ -83,6 +87,9 @@ public class UserMemoryCloudSync {
     public void synchronizeUser(Long userId, String localTenantId) {
         if (userId == null || userId <= 0 || blank(localTenantId)) {
             throw new IllegalArgumentException("有效的本地用户与租户是云同步的必要条件");
+        }
+        if (subjectErasureService != null) {
+            subjectErasureService.assertWritable(localTenantId, userId);
         }
         try (OwnerContext.Scope ignored = OwnerContext.bind(new OwnerContext(userId, localTenantId))) {
             List<AgentSemanticFactEntity> history = facts.findByTenantIdAndScopeTypeAndScopeId(

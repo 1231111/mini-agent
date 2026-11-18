@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.dao.DataAccessException;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -137,6 +138,10 @@ public class JwtSessionService {
             // 返回的 userId 取自会话记录本身，而不是 token 里的 subject ——
             // 吊销/续期的真相源是这份记录，不是客户端拿着的那个字符串。
             return sessionStore.validateAndTouch(token, Duration.ofSeconds(jwtTtlSeconds));
+        } catch (DataAccessException unavailable) {
+            // Redis/database availability is distinct from an invalid credential.
+            // Preserve the failure so the authentication filter can return 503.
+            throw unavailable;
         } catch (JwtException | IllegalArgumentException e) {
             return null;
         }
