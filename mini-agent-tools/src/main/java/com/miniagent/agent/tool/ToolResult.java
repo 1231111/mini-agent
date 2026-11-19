@@ -118,8 +118,9 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
                         detail = node.path("message").asText("");
                     }
                     String message = detail.isBlank() ? err : err + "；" + detail;
-                    ToolErrorCode code = node.has("errorCode")
-                            ? parseErrorCode(node.path("errorCode").asText(""))
+                    ToolErrorCode code = node.has("errorCode") || node.has("error_code")
+                            ? parseErrorCode(node.path("errorCode").asText(
+                                    node.path("error_code").asText("")))
                             : classifyLegacyFailure(message);
                     if (code == null || code == ToolErrorCode.NONE) code = ToolErrorCode.EXECUTION_FAILED;
                     boolean retriable = isRetriable(code);
@@ -129,7 +130,9 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
                             ? (com.fasterxml.jackson.databind.node.ObjectNode) node.deepCopy()
                             : JSON.createObjectNode();
                     normalized.put("success", false);
-                    normalized.put("status", status.isBlank() ? "failed" : status);
+                    normalized.put("status", code == ToolErrorCode.TIMEOUT ? "timeout"
+                            : code == ToolErrorCode.CANCELLED ? "cancelled"
+                            : status.isBlank() ? "failed" : status);
                     normalized.put("errorCode", code.name());
                     normalized.put("error", message);
                     normalized.put("retriable", retriable);
@@ -188,8 +191,12 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
         if (raw == null || raw.isBlank()) {
             return ToolErrorCode.EXECUTION_FAILED;
         }
+        String normalized = raw.trim().toUpperCase(Locale.ROOT);
+        if (normalized.endsWith("_DEADLINE")) return ToolErrorCode.TIMEOUT;
+        if (normalized.endsWith("_CANCELLED") || normalized.endsWith("_CANCELED")
+                || normalized.endsWith("_INTERRUPTED")) return ToolErrorCode.CANCELLED;
         try {
-            return ToolErrorCode.valueOf(raw.trim().toUpperCase(Locale.ROOT));
+            return ToolErrorCode.valueOf(normalized);
         } catch (IllegalArgumentException ignored) {
             return classifyLegacyFailure(raw);
         }

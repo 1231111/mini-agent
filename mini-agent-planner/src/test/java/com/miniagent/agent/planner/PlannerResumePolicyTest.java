@@ -34,6 +34,9 @@ class PlannerResumePolicyTest {
     void 明说继续就接管() {
         assertTrue(PlannerResumePolicy.shouldResume("继续", false, true));
         assertTrue(PlannerResumePolicy.shouldResume("接着做", false, true));
+        assertTrue(PlannerResumePolicy.shouldResume("继续这个任务", false, true));
+        assertTrue(PlannerResumePolicy.shouldResume("继续上一个任务，请从失败步骤接着做", false, true));
+        assertTrue(PlannerResumePolicy.shouldResume("恢复这次被阻塞的真实编码评测", false, true));
     }
 
     @Test

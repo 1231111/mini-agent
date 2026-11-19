@@ -51,6 +51,8 @@ import java.util.stream.Collectors;
 public class PlanningLoop {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private com.miniagent.agent.core.ModelCallControl modelCallControl;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private CodeDiffReviewService codeDiffReviewService;
 
     private static final Logger log = LoggerFactory.getLogger(PlanningLoop.class);
     private static final int PRIOR_OUTPUT_CHARS = 6000;
@@ -387,6 +389,11 @@ public class PlanningLoop {
             return RunOutcome.failed("任务规划当前不可用，尚未开始操作。请重试。", "PLANNER_UNAVAILABLE");
         }
 
+        boolean codeReviewRequired = CodeValidationPolicy.isCodeChangeGoal(taskPlan.taskGoal())
+                || CodeValidationPolicy.isCodeChangeGoal(userMessage);
+        CodeDiffReviewService.Baseline codeReviewBaseline = codeReviewRequired && codeDiffReviewService != null
+                ? codeDiffReviewService.captureForSession(sessionId) : null;
+
         if (route.artifactDeliveryRequested() != null) {
             taskPlan = taskPlan.withArtifactDeliveryRequested(route.artifactDeliveryRequested());
         }
@@ -566,6 +573,8 @@ public class PlanningLoop {
 
         AcceptedNodeAnswer acceptedAnswer = null;
         int rounds = 0;
+        String acceptedCodeReviewHash = "";
+        String unfinishedDetail = "";
         // 只有"图全部通过终验"这一条路会把 completed 置真；其余出口都是"没做完"。
         String unfinishedReason = "NO_READY_NODES";
         while (rounds++ < properties.getMaxOuterRounds()) {
@@ -647,17 +656,60 @@ public class PlanningLoop {
                     todoProjector.project(sessionId, snap.graph());
                     continue;
                 }
+                if (codeReviewRequired) {
+                    CodeDiffReviewService.Review review = codeDiffReviewService == null
+                            ? new CodeDiffReviewService.Review("", false, true,
+                                    "独立代码审查服务不可用，按安全策略阻止完成")
+                            : codeDiffReviewService.review(codeReviewBaseline, chat);
+                    if (review.passed()) acceptedCodeReviewHash = review.diffHash();
+                    if (!review.passed()) {
+                        String reviewReason = review.feedback();
+                        TaskNode bad = resolveAcceptFailNode(snap.graph(), "");
+                        if (bad == null) {
+                            return RunOutcome.unfinished(
+                                    "代码修改尚未通过独立审查，任务未标记完成。\n" + reviewReason,
+                                    "CODE_REVIEW_BLOCKED");
+                        }
+                        TaskGraph reopened = snap.graph().replace(bad.withStatus(TaskNodeStatus.FAILED)
+                                .withError("独立代码审查未通过：" + reviewReason));
+                        try {
+                            snap = commitNodeOutcomes(sessionId, fencingToken, snap, snap.withGraph(reopened), List.of(
+                                    new NodeOutcome("code-review-" + bad.id() + "-" + snap.planVersion(), bad,
+                                            NodeTerminalCommitPort.Result.FAILURE,
+                                            failureDetail(null, reviewReason, userMessage))));
+                        } catch (PlannerStateStore.VersionConflictException conflict) {
+                            metrics.casConflict();
+                            continue;
+                        }
+                        FailureDiagnosis reviewDiagnosis = recoveryEngine.diagnose(
+                                bad, diagnoseTool(bad, ""), reviewReason);
+                        RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap, bad,
+                                reviewDiagnosis, "code-review-" + bad.id(), chat, userMessage, taskPlan, history);
+                        if (recovery.stop() != null) return recovery.stop();
+                        snap = recovery.snapshot();
+                        todoProjector.project(sessionId, snap.graph());
+                        continue;
+                    }
+                }
+                if (codeReviewRequired && (codeDiffReviewService == null
+                        || !codeDiffReviewService.isCurrent(codeReviewBaseline, acceptedCodeReviewHash))) {
+                    acceptedCodeReviewHash = "";
+                    continue;
+                }
                 // Acceptance can run a slow model or read external state. Fence
                 // its result with an actual CAS before returning task success.
                 try {
                     Map<String, Object> accepted = new LinkedHashMap<>(snap.execution());
                     accepted.put("graphAcceptedPlanVersion", snap.planVersion());
                     accepted.put("graphAcceptedStateVersion", snap.version());
+                    if (codeReviewRequired) accepted.put("graphAcceptedCodeReviewHash", acceptedCodeReviewHash);
                     snap = stateStore.commit(sessionId, snap.version(), snap.withExecution(accepted));
                 } catch (PlannerStateStore.VersionConflictException conflict) {
                     metrics.casConflict();
                     continue;
                 }
+                if (codeReviewRequired && codeDiffReviewService != null)
+                    codeDiffReviewService.completeSessionReview(sessionId);
                 log.info("PlanningLoop 图完成 session={} version={} metrics={}",
                         sessionId, snap.version(), metrics.snapshot());
                 metrics.graphCompleted();
@@ -678,6 +730,16 @@ public class PlanningLoop {
                     }
                     return RunOutcome.blockedOnHuman(
                             "关键步骤等待确认：请在页面点击「确认并继续」。", "AWAITING_CONFIRM");
+                }
+                DependencyBlock blocked = firstPendingBlockedByCancelledDependency(snap.graph());
+                if (blocked != null) {
+                    unfinishedReason = "DEPENDENCY_FAILED";
+                    unfinishedDetail = "后续步骤「" + blocked.node().name() + "」因前置步骤「"
+                            + blocked.dependency().name() + "」未通过验收而保留待处理。";
+                    log.warn("PlanningLoop 后续节点被取消依赖阻塞 session={} node={} dependency={} dependencyStatus={}",
+                            sessionId, blocked.node().id(), blocked.dependency().id(),
+                            blocked.dependency().status());
+                    break;
                 }
                 log.warn("PlanningLoop 无 ready 节点且未全部成功，尝试 REWRITE session={}", sessionId);
                 TaskNode stuck = firstNonSuccess(snap.graph());
@@ -727,6 +789,16 @@ public class PlanningLoop {
                 continue;
             }
 
+            boolean boundCodeWrite = proposal.actions().stream().anyMatch(PlanningLoop::isCodeFileWriteAction);
+            boolean boundShellAction = proposal.actions().stream()
+                    .anyMatch(action -> "exec_command".equals(action.tool()));
+            if ((boundCodeWrite || boundShellAction) && codeReviewBaseline == null
+                    && codeDiffReviewService != null) {
+                // Capture before any direct bound action can write files.
+                codeReviewBaseline = codeDiffReviewService.captureForSession(sessionId);
+            }
+            if (boundCodeWrite) codeReviewRequired = true;
+
             snap = markRunning(sessionId, snap, proposal);
             if (!ownsRunningProposal(snap, proposal)) {
                 metrics.casConflict();
@@ -747,6 +819,15 @@ public class PlanningLoop {
             StepExec step = executeProposal(chat, systemPrompt, stepUser,
                     multimodalUser, history, taskPlan, proposal, snap.graph(),
                     snap.version(), sessionId, streamSink);
+            if (boundShellAction && !codeReviewRequired) {
+                if (codeDiffReviewService == null
+                        || codeDiffReviewService.hasChangedCodeArtifact(codeReviewBaseline)) {
+                    codeReviewRequired = true;
+                } else {
+                    codeDiffReviewService.discardSessionBaseline(sessionId, codeReviewBaseline);
+                    codeReviewBaseline = null;
+                }
+            }
             captureAgentTranscript(step.messages());
             boolean drifted = step.drifted();
             boolean quotaAbort = isResourceQuotaAbort(step.endReason())
@@ -844,17 +925,39 @@ public class PlanningLoop {
                 } else if (!bound.complete(node)) {
                     ev = StepEvaluator.EvalResult.fail("declared outputs 未绑定");
                 } else {
-                    ev = step.structuredResult() == null
-                            ? stepEvaluator.evaluateAfterLoop(node, bound.evidence())
-                            : stepEvaluator.evaluate(node, step.structuredResult(), bound.evidence());
+                    if (node.doneWhen() != null && node.doneWhen().isCommand()) {
+                        StepEvaluator.CommandReceipt receipt = StepEvaluator.matchingCommandReceipt(
+                                step.commandReceipts(), node.doneWhen().criteria());
+                        String commandEvidence = receipt == null ? bound.evidence()
+                                : receipt.result().legacyText();
+                        ev = stepEvaluator.evaluate(node, step.structuredResult(), commandEvidence,
+                                step.commandReceipts());
+                    } else {
+                        ev = step.structuredResult() == null
+                                ? stepEvaluator.evaluateAfterLoop(node, bound.evidence())
+                                : stepEvaluator.evaluate(node, step.structuredResult(), bound.evidence());
+                    }
                 }
                 TaskNodeStatus next = statusAfterChunk(ev.ok(), quotaAbort);
                 if (next == TaskNodeStatus.SUCCESS) {
-                    g = g.replace(node.withStatus(TaskNodeStatus.SUCCESS).withError("")
+                    TaskNode completed = node.withStatus(TaskNodeStatus.SUCCESS).withError("")
                             .withToolStatus(step.structuredResult() == null
                                     ? null : step.structuredResult().status())
-                            .withOutput(clip(bound.evidence(), 12000),
-                                    clipBindings(bound.bindings())));
+                            .withOutput(clip(node.doneWhen() != null && node.doneWhen().isCommand()
+                                            ? commandEvidence(step, node) : bound.evidence(), 12000),
+                                    clipBindings(bound.bindings()));
+                    if (node.doneWhen() != null && node.doneWhen().isCommand()) {
+                        StepEvaluator.CommandReceipt receipt = StepEvaluator.matchingCommandReceipt(
+                                step.commandReceipts(), node.doneWhen().criteria());
+                        if (receipt != null) {
+                            Map<String, String> bindings = new LinkedHashMap<>(completed.outputBindings());
+                            bindings.put("__command_receipt", PlannerStateJson.MAPPER.valueToTree(
+                                    Map.of("tool", receipt.toolName(),
+                                            "command", commandFromArguments(receipt.arguments()))).toString());
+                            completed = completed.withOutput(completed.output(), bindings);
+                        }
+                    }
+                    g = g.replace(completed);
                     pendingOutcomes.add(new NodeOutcome(action.actionId(), node,
                             NodeTerminalCommitPort.Result.SUCCESS,
                             new NodeTerminalCommitPort.Detail(null, null, userMessage), ev.acceptanceProof()));
@@ -951,6 +1054,9 @@ public class PlanningLoop {
         }
 
         String unfinishedAnswer = "任务尚未完成，已保留执行进度。";
+        if (StringUtils.isNotBlank(unfinishedDetail)) {
+            unfinishedAnswer += "\n" + unfinishedDetail;
+        }
         // 走到这里说明是"没做完"退出（死锁/恢复耗尽/轮次用尽/配额中止）。
         // 绝不能把这种结果报成完成：上层会据此决定任务状态与"完成率"口径，
         // 附带未完成节点，不将失败或尚未验收的节点散文当成交付结果。
@@ -1106,9 +1212,11 @@ public class PlanningLoop {
 
     private record StepExec(String text, String endReason, boolean drifted,
                             String lastTool, ToolErrorCode lastErrorCode,
-                            List<ChatMessage> messages, ToolResult structuredResult, boolean toolAttempted) {
+                            List<ChatMessage> messages, ToolResult structuredResult, boolean toolAttempted,
+                            List<StepEvaluator.CommandReceipt> commandReceipts) {
         StepExec {
             messages = messages == null ? List.of() : List.copyOf(messages);
+            commandReceipts = commandReceipts == null ? List.of() : List.copyOf(commandReceipts);
         }
     }
 
@@ -1424,7 +1532,8 @@ public class PlanningLoop {
                 }
                 return new StepExec(out.text(), out.endReason(), policy.consumeDrift(),
                         lastInvokedTool(out), lastToolResult == null ? out.lastErrorCode()
-                        : lastToolResult.errorCode(), out.messages(), lastToolResult, toolAttempted);
+                        : lastToolResult.errorCode(), out.messages(), lastToolResult, toolAttempted,
+                        toolExecutionReceipts(out.messages()));
             } catch (RuntimeException ex) {
                 com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(ex);
                 // A ReAct turn may already have dispatched tools before the caller
@@ -1432,7 +1541,7 @@ public class PlanningLoop {
                 log.warn("节点执行异常，停止自动重试 task={}", focusTask, ex);
                 String message = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
                 return new StepExec("节点执行结果未知：" + message, AgentLoop.OUTCOME_UNKNOWN,
-                        policy.consumeDrift(), "", ToolErrorCode.OUTCOME_UNKNOWN, List.of(), null, true);
+                        policy.consumeDrift(), "", ToolErrorCode.OUTCOME_UNKNOWN, List.of(), null, true, List.of());
             }
         } finally {
             ExecutionTurnContext.clear();
@@ -1502,7 +1611,8 @@ public class PlanningLoop {
         }
         toolMessages.add(msg);
         return new StepExec(ok ? AgentLoop.STEP_SEGMENT_DONE : text, end, false,
-                action.tool(), code, List.copyOf(toolMessages), result, attempted);
+                action.tool(), code, List.copyOf(toolMessages), result, attempted,
+                toolExecutionReceipts(toolMessages));
     }
 
     private void captureAgentTranscript(List<ChatMessage> messages) {
@@ -1544,8 +1654,8 @@ public class PlanningLoop {
         });
     }
 
-    private static String focusBlock(ActionProposal proposal, TaskGraph graph,
-                                     Set<Integer> focusTodos, boolean hard) {
+    static String focusBlock(ActionProposal proposal, TaskGraph graph,
+                              Set<Integer> focusTodos, boolean hard) {
         StringBuilder sb = new StringBuilder();
         sb.append("# ActionProposal（硬闸门=").append(hard).append("）\n");
         sb.append("- proposalId: ").append(proposal.proposalId()).append('\n');
@@ -1595,6 +1705,12 @@ public class PlanningLoop {
                 sb.append(" blockedTools=").append(blocked);
             }
             sb.append(" expected=").append(a.expectedResult()).append('\n');
+            if (a.acceptance().isJudge() || a.acceptance().isValidation()) {
+                sb.append("【本轮验收取证】本节点的语义/验证结论必须由本轮实际工具回执支持。"
+                        + "验收条件涉及源文件时，请在本节点内重新读取并检查对应文件；"
+                        + "此前尝试的记录、对话摘要或 todo.submit 自述不能替代当前回执。"
+                        + "每项条件都要在证据中对应到实际观察，读不到时明确说明未验证。\n");
+            }
         }
         sb.append(MessageConstants.DAG_EVIDENCE_SUBMISSION).append('\n');
         return sb.toString();
@@ -1833,10 +1949,46 @@ public class PlanningLoop {
         if (merged == null || merged.isEmpty()) {
             return rejectRecovery(sessionId, snap, "REPLAN_IDENTITY_CONFLICT");
         }
-        if (!mergeValidationReports(
+        PlanValidationReport validation = mergeValidationReports(
                 planValidator.validate(merged, recoveryPlan, compiled.goal(), compiled.intent()),
-                intentGraphValidator.validate(compiled.intent(), merged)).valid()) {
-            log.warn("运行时 LLM replan 图验收失败（结构或意图）session={}", sessionId);
+                intentGraphValidator.validate(compiled.intent(), merged));
+        TaskGraph rejectedGraph = compiled.graph();
+        int maxReplanRetries = Math.max(0, properties.getMaxReplanRetries());
+        for (int retry = 1; !validation.valid() && retry <= maxReplanRetries; retry++) {
+            log.warn("运行时 LLM replan 图验收失败，提交校正重试 session={} retry={}/{} errors={}",
+                    sessionId, retry, maxReplanRetries, clip(validation.summary(), 1800));
+            String correctionPrompt = correction + "\n\n" + validation.toCorrectionPrompt();
+            try {
+                compiled = goalCompiler.compileWithCorrection(chat, userMessage, recoveryPlan, correctionPrompt,
+                        history == null ? List.of() : history, rejectedGraph);
+            } catch (Exception e) {
+                com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(e);
+                log.warn("运行时 LLM replan 校正编译失败 session={} retry={}/{}: {}",
+                        sessionId, retry, maxReplanRetries, e.getMessage());
+                return rejectRecovery(sessionId, snap, "REPLAN_COMPILATION_FAILED");
+            }
+            if (compiled == null || compiled.degradedCompilation()
+                    || compiled.graph() == null || compiled.graph().isEmpty()) {
+                return rejectRecovery(sessionId, snap, "REPLAN_COMPILATION_INVALID");
+            }
+            waiting = compiled.intent().needsClarification();
+            merged = waiting ? compiled.graph()
+                    : mergeKeepSuccess(snap.graph(), compiled.graph(), snap.recoveryCount() + 1);
+            if (merged == null || merged.isEmpty()) {
+                return rejectRecovery(sessionId, snap, "REPLAN_IDENTITY_CONFLICT");
+            }
+            validation = mergeValidationReports(
+                    planValidator.validate(merged, recoveryPlan, compiled.goal(), compiled.intent()),
+                    intentGraphValidator.validate(compiled.intent(), merged));
+            if (!validation.valid()) {
+                rejectedGraph = compiled.graph();
+            }
+        }
+        if (!validation.valid()) {
+            trace(sessionId, AgentStepNode.GOAL_COMPILED,
+                    recoveryValidationTrace(validation, maxReplanRetries), RunStatus.FAILURE);
+            log.warn("运行时 LLM replan 校正重试耗尽，保留原执行图 session={} retries={} errors={}",
+                    sessionId, maxReplanRetries, clip(validation.summary(), 1800));
             return rejectRecovery(sessionId, snap, "REPLAN_VALIDATION_FAILED");
         }
         Goal nextGoal = compiled.goal() != null ? compiled.goal() : snap.goal();
@@ -1878,6 +2030,34 @@ public class PlanningLoop {
             metrics.casConflict();
             return rejectRecovery(sessionId, snap, "STALE_EXECUTION");
         }
+    }
+
+    private static String recoveryValidationTrace(PlanValidationReport validation, int retries) {
+        var detail = PlannerStateJson.MAPPER.createObjectNode();
+        detail.put("accepted", false);
+        detail.put("reason", "REPLAN_VALIDATION_FAILED");
+        detail.put("correctionRetries", retries);
+        detail.put("summary", clip(validation == null ? "missing validation report" : validation.summary(), 1800));
+        if (validation != null) {
+            var errors = detail.putArray("errors");
+            validation.errors().stream().limit(6).forEach(error -> {
+                var item = errors.addObject();
+                item.put("type", error.type().name());
+                item.put("nodeId", clip(error.nodeId(), 120));
+                item.put("message", clip(error.message(), 240));
+                item.put("suggestion", clip(error.suggestion(), 200));
+            });
+            detail.put("omittedErrors", Math.max(0, validation.errors().size() - 6));
+            var warnings = detail.putArray("warnings");
+            validation.warnings().stream().limit(6).forEach(warning -> {
+                var item = warnings.addObject();
+                item.put("type", warning.type().name());
+                item.put("nodeId", clip(warning.nodeId(), 120));
+                item.put("message", clip(warning.message(), 240));
+            });
+            detail.put("omittedWarnings", Math.max(0, validation.warnings().size() - 6));
+        }
+        return detail.toString();
     }
 
     private static RecoveryContinuation recoveryContinuation(StateSnapshot waiting) {
@@ -2028,6 +2208,23 @@ public class PlanningLoop {
         for (TaskNode n : graph.nodes()) {
             if (n.status() != TaskNodeStatus.SUCCESS && n.status() != TaskNodeStatus.CANCELLED) {
                 return n;
+            }
+        }
+        return null;
+    }
+
+    private record DependencyBlock(TaskNode node, TaskNode dependency) {}
+
+    /** Do not spend recovery attempts cancelling descendants of an already-cancelled prerequisite. */
+    private static DependencyBlock firstPendingBlockedByCancelledDependency(TaskGraph graph) {
+        if (graph == null) return null;
+        for (TaskNode node : graph.nodes()) {
+            if (node.status() != TaskNodeStatus.PENDING) continue;
+            for (String dependencyId : node.dependsOn()) {
+                TaskNode dependency = graph.byId(dependencyId);
+                if (dependency != null && dependency.status() == TaskNodeStatus.CANCELLED) {
+                    return new DependencyBlock(node, dependency);
+                }
             }
         }
         return null;
@@ -2185,6 +2382,47 @@ public class PlanningLoop {
             }
         }
         return last;
+    }
+
+    private static boolean isCodeFileWriteAction(ActionSpec action) {
+        if (action == null || !("write_file".equals(action.tool()) || "edit_file".equals(action.tool())))
+            return false;
+        Object path = action.arguments().get("path");
+        return path != null && CodeValidationPolicy.isReviewableCodeArtifact(String.valueOf(path));
+    }
+
+    static List<StepEvaluator.CommandReceipt> toolExecutionReceipts(List<ChatMessage> messages) {
+        if (messages == null || messages.isEmpty()) return List.of();
+        Map<String, ToolExecutionRequest> requests = new HashMap<>();
+        List<StepEvaluator.CommandReceipt> receipts = new ArrayList<>();
+        for (ChatMessage message : messages) {
+            if (message instanceof AiMessage ai && ai.hasToolExecutionRequests()) {
+                for (ToolExecutionRequest request : ai.toolExecutionRequests()) {
+                    if (StringUtils.isNotBlank(request.id())) requests.put(request.id(), request);
+                }
+            } else if (message instanceof ToolExecutionResultMessage result) {
+                ToolExecutionRequest request = requests.get(result.id());
+                if (request != null && request.name().equals(result.toolName())) {
+                    receipts.add(new StepEvaluator.CommandReceipt(request.name(), request.arguments(),
+                            ToolResult.fromLegacy(result.text())));
+                }
+            }
+        }
+        return List.copyOf(receipts);
+    }
+
+    private static String commandEvidence(StepExec step, TaskNode node) {
+        StepEvaluator.CommandReceipt receipt = StepEvaluator.matchingCommandReceipt(
+                step.commandReceipts(), node.doneWhen().criteria());
+        return receipt == null ? "" : receipt.result().legacyText();
+    }
+
+    private static String commandFromArguments(String arguments) {
+        try {
+            return PlannerStateJson.MAPPER.readTree(arguments).path("command").asText("");
+        } catch (Exception ignored) {
+            return "";
+        }
     }
 
     static String diagnoseTool(TaskNode node, String lastTool) {

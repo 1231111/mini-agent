@@ -50,7 +50,7 @@ public class CapabilityRegistry implements SmartInitializingSingleton {
      * 纯文本落盘 + Office/HTML 交付。PowerPoint 与 HTML→Word 已收敛进 write_document。
      */
     private static final List<String> FILE_WRITE = List.of(
-            WRITE_FILE, "edit_file",
+            WRITE_FILE, "edit_file", "undo_last_file_change",
             "write_document", "edit_document",
             "write_docx", "write_xlsx",
             "render_diagram");
@@ -58,7 +58,7 @@ public class CapabilityRegistry implements SmartInitializingSingleton {
     private static final List<String> CODE_SEARCH =
             List.of("search_code", "codebase_search", "ast_search");
 
-    private static final List<String> SHELL = List.of("exec_command");
+    private static final List<String> SHELL = List.of("exec_command", "agent_environment");
 
     private static final List<String> WEB =
             List.of("web_search", "web_extract", "http_get", "http_post");

@@ -9,6 +9,9 @@ import java.lang.annotation.*;
 @Retention(RetentionPolicy.RUNTIME)
 @Documented
 public @interface ToolParamSchema {
+    /** Optional JSON property name exposed to the model; defaults to the Java field name. */
+    String name() default "";
+
     /**
      * 参数描述
      */

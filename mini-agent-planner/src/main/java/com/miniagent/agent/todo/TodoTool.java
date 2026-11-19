@@ -40,6 +40,7 @@ public class TodoTool {
                 .description("""
                         管理当前任务的执行计划（子任务列表）。
                         - 自主管理且尚无清单的复杂任务先 action=set；每步必须含 done_when；已有 DAG 投影时禁止 set。
+                        - 子任务名称会直接展示给用户；写清本步交付的结果和用途，不要只写工具动作或内部文件名。
                         - 默认后一步 depends_on 前一步；可显式设 depends_on:[1,2] 或 depends_on:[]（无依赖/可并行）。
                         - completed 会做存在性 + 可插拔语义校验；依赖未满足或上游 hash 失效会拒绝。
                         - 调度器管理的 DAG 节点完成操作后，用 action=submit 附实际 evidence；
@@ -65,9 +66,9 @@ public class TodoTool {
         ));
         params.put("items", Map.of(
                 "type", "string",
-                "description", "set：JSON 数组，项可含 id,content,done_when,depends_on。例："
-                        + "[{\"id\":1,\"content\":\"生图\",\"done_when\":\"media_delivered\"},"
-                        + "{\"id\":2,\"content\":\"写入md\",\"done_when\":\"file_exists:workspace/a.md\",\"depends_on\":[1]}]"
+                "description", "set：JSON 数组，项可含 id,content,done_when,depends_on。content 写用户能理解的交付结果及用途，不要只写工具动作或文件名。例："
+                        + "[{\"id\":1,\"content\":\"生成供活动页使用的主视觉图片\",\"done_when\":\"media_delivered\"},"
+                        + "{\"id\":2,\"content\":\"交付包含结论的调研摘要\",\"done_when\":\"file_exists:workspace/a.md\",\"depends_on\":[1]}]"
         ));
         params.put("id", Map.of(
                 "type", "integer",

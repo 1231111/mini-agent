@@ -40,7 +40,8 @@ class PlannerPropertiesCompatibilityTest {
 
         assertFalse(evaluator.evaluate(command, "命令完成了", "命令完成了").ok());
         assertFalse(evaluator.evaluate(judged, "报告完成了", "报告完成了").ok());
-        assertTrue(evaluator.evaluate(command, "exit_code=0\nverified", "exit_code=0\nverified").ok());
+        assertFalse(evaluator.evaluate(command, "exit_code=0\nverified", "exit_code=0\nverified").ok(),
+                "Text that looks like an exit code is not an execution receipt");
     }
 
     private static PlannerProperties bindStrictEval(boolean configured) {

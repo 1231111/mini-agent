@@ -3,6 +3,7 @@ package com.miniagent.account.service;
 import com.miniagent.account.entity.MembershipOrder;
 import com.miniagent.account.entity.MembershipPlan;
 import com.miniagent.account.entity.MembershipSubscription;
+import com.miniagent.account.entity.Tenant;
 import com.miniagent.account.entity.User;
 import com.miniagent.account.entity.MembershipUsageEvent;
 import com.miniagent.account.repository.MembershipOrderRepository;
@@ -20,7 +21,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -35,12 +35,11 @@ import java.util.concurrent.ThreadLocalRandom;
 /**
  * 会员等级与充值。
  *
- * <h3>会员订阅和租户共享额度是两种独立权益</h3>
+ * <h3>套餐 token 数是展示元数据，不是 Agent 的本地限额</h3>
  *
- * <p>套餐的 {@code dailyTokenLimit} 是个人会员权益。它保留在订阅/套餐视图中，
- * 不写入 {@code tenants.daily_token_limit}，因为租户额度是共享上限，写入会影响同租户其他用户。
- *
- * <p>agent 运行时的个人额度由 agent 侧的用户配额配置执行；账号服务负责会员订阅、订单和账单历史。
+ * <p>Agent 不强制执行租户或用户的 token 日限额。用户配置的模型 API key
+ * 由对应模型服务商按其账户策略限流/计费。会员套餐中的 {@code dailyTokenLimit}
+ * 与租户表中保留的旧字段仅作兼容和展示，不是用量或计费真相源。
  *
  * <h3>用量明细</h3>
  *
@@ -60,8 +59,6 @@ public class MembershipService {
 
     /** 明细表最多返回的行数。今天的合计另算，不受这个上限影响。 */
     private static final int USAGE_DETAIL_LIMIT = 100;
-
-    private static final int ORDER_PAYMENT_TTL_MINUTES = 15;
 
     @Autowired
     private MembershipPlanRepository plans;
@@ -139,11 +136,8 @@ public class MembershipService {
     }
 
     /** 当前生效的订阅。正常情况注册时就会建一条，返回空说明数据被外部改动过。 */
-    @Transactional
+    @Transactional(readOnly = true)
     public Optional<MembershipView> current(Long userId) {
-        LocalDateTime now = LocalDateTime.now(quotaZone);
-        subscriptions.expireActiveSubscriptions(userId,
-                MembershipSubscription.Status.ACTIVE, MembershipSubscription.Status.EXPIRED, now);
         return subscriptions
                 .findFirstByUserIdAndStatusOrderByIdDesc(userId, MembershipSubscription.Status.ACTIVE)
                 .map(sub -> {
@@ -165,15 +159,6 @@ public class MembershipService {
     @Transactional(readOnly = true)
     public List<MembershipOrder> ordersOf(Long userId) {
         return orders.findByUserIdOrderByIdDesc(userId);
-    }
-
-    /** Most recent pending orders for the authenticated user's checkout recovery. */
-    @Transactional
-    public List<MembershipOrder> pendingOrdersOf(Long userId) {
-        orders.expirePendingOrdersForUser(userId, LocalDateTime.now(quotaZone),
-                MembershipOrder.Status.PENDING, MembershipOrder.Status.EXPIRED);
-        return orders.findTop20ByUserIdAndStatusOrderByIdDesc(
-                userId, MembershipOrder.Status.PENDING);
     }
 
     /**
@@ -207,7 +192,7 @@ public class MembershipService {
      * 今天的合计，以及含今天在内最近 {@value #USAGE_HISTORY_DAYS} 天的每次上报。
      * 明细最多 {@value #USAGE_DETAIL_LIMIT} 条，新的在前。
      */
-    @Transactional
+    @Transactional(readOnly = true)
     public UsageView usageOf(Long userId) {
         LocalDate today = LocalDate.now(quotaZone);
         LocalDateTime start = today.atStartOfDay();
@@ -255,7 +240,6 @@ public class MembershipService {
         order.setAmountCents(plan.getPriceCents());
         order.setCurrency(plan.getCurrency());
         order.setStatus(MembershipOrder.Status.PENDING);
-        order.setExpiresAt(LocalDateTime.now(quotaZone).plusMinutes(ORDER_PAYMENT_TTL_MINUTES));
         MembershipOrder saved = orders.save(order);
         log.info("会员下单 orderNo={} userId={} plan={} amountCents={}",
                 saved.getOrderNo(), userId, plan.getCode(), plan.getPriceCents());
@@ -274,7 +258,7 @@ public class MembershipService {
      * 所以这里用 {@code findByOrderNoForUpdate} 把同一单串行化 —— 拿不到锁的那条
      * 会在前一条提交后重新读到 PAID 走幂等分支。
      */
-    @Transactional(noRollbackFor = OrderExpiredException.class)
+    @Transactional
     public MembershipOrder markPaid(String orderNo, String channel, String channelTxnId) {
         MembershipOrder order = orders.findByOrderNoForUpdate(orderNo)
                 .orElseThrow(() -> new BusinessException(ErrorCode.MEMBER_ORDER_NOT_FOUND,
@@ -289,7 +273,6 @@ public class MembershipService {
             throw new BusinessException(ErrorCode.MEMBER_ORDER_STATE_INVALID,
                     "订单「" + orderNo + "」当前状态是 " + order.getStatus() + "，不能标记为已支付");
         }
-        expireOrderIfPastDeadline(order);
 
         MembershipPlan plan = plans.findByCode(order.getPlanCode())
                 .orElseThrow(() -> new BusinessException(ErrorCode.MEMBER_PLAN_NOT_FOUND,
@@ -301,82 +284,10 @@ public class MembershipService {
         order.setStatus(MembershipOrder.Status.PAID);
         order.setChannel(channel);
         order.setChannelTxnId(channelTxnId);
-        order.setPaidAt(LocalDateTime.now(quotaZone));
+        order.setPaidAt(LocalDateTime.now());
 
         applyPlan(order.getUserId(), user.getTenantId(), plan, orderNo);
         return order;
-    }
-
-    /**
-     * Local/demo-only simulated settlement. The caller must authenticate the user first;
-     * this method then locks the order and checks its owner before activating anything.
-     * The channel and transaction reference are fixed here so callers cannot disguise a
-     * simulated payment as a real provider transaction.
-     */
-    @Transactional(noRollbackFor = OrderExpiredException.class)
-    public MembershipOrder simulatePayment(Long userId, String orderNo) {
-        if (userId == null || orderNo == null || orderNo.isBlank()) {
-            throw new BusinessException(ErrorCode.MEMBER_ORDER_NOT_FOUND, "订单不存在");
-        }
-        MembershipOrder order = orders.findByOrderNoForUpdate(orderNo.trim())
-                .orElseThrow(() -> new BusinessException(ErrorCode.MEMBER_ORDER_NOT_FOUND,
-                        "订单不存在"));
-        if (!userId.equals(order.getUserId())) {
-            // Do not disclose whether another user's order number exists.
-            throw new BusinessException(ErrorCode.MEMBER_ORDER_NOT_FOUND, "订单不存在");
-        }
-        if (order.getStatus() == MembershipOrder.Status.PAID) {
-            return order;
-        }
-        if (order.getStatus() != MembershipOrder.Status.PENDING) {
-            throw new BusinessException(ErrorCode.MEMBER_ORDER_STATE_INVALID,
-                    "只有待支付订单可以模拟支付");
-        }
-        expireOrderIfPastDeadline(order);
-        return markPaid(order.getOrderNo(), "SIMULATED", "SIMULATED-" + order.getOrderNo());
-    }
-
-    private void expireOrderIfPastDeadline(MembershipOrder order) {
-        LocalDateTime now = LocalDateTime.now(quotaZone);
-        if (order.getExpiresAt() == null || !order.getExpiresAt().isAfter(now)) {
-            order.setStatus(MembershipOrder.Status.EXPIRED);
-            orders.save(order);
-            throw new OrderExpiredException(
-                    "订单已过期，请重新下单");
-        }
-    }
-
-    private static final class OrderExpiredException extends BusinessException {
-        private OrderExpiredException(String detail) {
-            super(ErrorCode.MEMBER_ORDER_STATE_INVALID, detail);
-        }
-    }
-
-    /** Cancel one of the caller's own pending orders. */
-    @Transactional(noRollbackFor = OrderExpiredException.class)
-    public MembershipOrder cancelOrder(Long userId, String orderNo) {
-        if (userId == null || orderNo == null || orderNo.isBlank()) {
-            throw new BusinessException(ErrorCode.MEMBER_ORDER_NOT_FOUND, "订单不存在");
-        }
-        MembershipOrder order = orders.findByOrderNoForUpdate(orderNo.trim())
-                .orElseThrow(() -> new BusinessException(ErrorCode.MEMBER_ORDER_NOT_FOUND, "订单不存在"));
-        if (!userId.equals(order.getUserId())) {
-            throw new BusinessException(ErrorCode.MEMBER_ORDER_NOT_FOUND, "订单不存在");
-        }
-        if (order.getStatus() != MembershipOrder.Status.PENDING) {
-            throw new BusinessException(ErrorCode.MEMBER_ORDER_STATE_INVALID, "只有待支付订单可以取消");
-        }
-        expireOrderIfPastDeadline(order);
-        order.setStatus(MembershipOrder.Status.CANCELED);
-        return orders.save(order);
-    }
-
-    /** Periodically transition abandoned pending orders to their terminal state. */
-    @Scheduled(fixedDelayString = "${agent.account.membership.order-expiry-scan-ms:60000}")
-    @Transactional
-    public int expirePendingOrders() {
-        return orders.expirePendingOrders(LocalDateTime.now(quotaZone),
-                MembershipOrder.Status.PENDING, MembershipOrder.Status.EXPIRED);
     }
 
     /**
@@ -385,35 +296,25 @@ public class MembershipService {
      * <p>旧订阅置为 {@code SUPERSEDED} 而不是删除：升级与续费的历史是账单的依据，
      * 删掉之后"这个人上个月买过什么"就再也查不出来了，而对账恰恰是几个月后的事。
      *
-     * <p><b>调用方必须已在事务内</b>：这里先锁住 tenant 行，再完成订阅切换。
-     * 个人套餐额度不写进 tenant 共享额度列。
+     * <p><b>调用方必须已在事务内</b>：这里先锁住 tenant 行，再完成订阅切换和
+     * 兼容字段写入，避免并发订单让订阅状态出现竞争。
      */
     @Transactional
     public MembershipSubscription applyPlan(Long userId, Long tenantId, MembershipPlan plan,
                                            String sourceOrderNo) {
-        LocalDateTime now = LocalDateTime.now(quotaZone);
+        LocalDateTime now = LocalDateTime.now();
 
         /*
          * The tenant row is the serialization point for all plan changes belonging
          * to that tenant.  It must be locked before reading ACTIVE subscriptions:
          * otherwise two concurrent transactions can both observe the same old
          * subscription, both mark it SUPERSEDED, and both insert a new ACTIVE row.
-         * Keeping the lock for the whole transaction serializes the subscription transition.
+         * Keeping the lock for the whole transaction also makes the quota write and
+         * the subscription transition one atomic state change to agent callers.
          */
-        tenants.findByIdForUpdate(tenantId)
+        Tenant tenant = tenants.findByIdForUpdate(tenantId)
                 .orElseThrow(() -> new IllegalStateException(
-                        "租户 " + tenantId + " 不存在，无法写入会员订阅（用户 " + userId + "）"));
-
-        subscriptions.expireActiveSubscriptions(userId,
-                MembershipSubscription.Status.ACTIVE, MembershipSubscription.Status.EXPIRED, now);
-
-        LocalDateTime effectiveUntil = now;
-        MembershipSubscription current = subscriptions
-                .findFirstByUserIdAndStatusOrderByIdDesc(userId, MembershipSubscription.Status.ACTIVE)
-                .orElse(null);
-        if (current != null && current.getExpireAt() != null && current.getExpireAt().isAfter(now)) {
-            effectiveUntil = current.getExpireAt();
-        }
+                        "租户 " + tenantId + " 不存在，无法写入配额上限（用户 " + userId + "）"));
 
         List<MembershipSubscription> active = subscriptions
                 .findByUserIdAndStatus(userId, MembershipSubscription.Status.ACTIVE);
@@ -430,22 +331,14 @@ public class MembershipService {
         // durationDays <= 0 表示永久（free 档是这种）。用 null 而不是 now+100年：
         // 后者会在任何按时间排序或比较的地方表现成一个很像真实日期的值，
         // 以后排查"这个会员到底什么时候到期"时要先搞清楚 2126 年是什么意思。
-        sub.setExpireAt(plan.getDurationDays() <= 0 ? null : effectiveUntil.plusDays(plan.getDurationDays()));
+        sub.setExpireAt(plan.getDurationDays() <= 0 ? null : now.plusDays(plan.getDurationDays()));
         sub.setSourceOrderNo(sourceOrderNo);
         subscriptions.save(sub);
 
-        // The account and agent services share users in the hosted deployment. Persist
-        // the entitlement snapshot with the subscription transition so portal checkout
-        // immediately changes the quota and concurrency enforced by the agent.
-        User user = users.findByIdForUpdate(userId)
-                .orElseThrow(() -> new IllegalStateException(
-                        "用户 " + userId + " 不存在，无法同步会员权益"));
-        user.setMembershipDailyTokenLimit(plan.getDailyTokenLimit());
-        user.setMembershipMaxConcurrentTasks(plan.getMaxConcurrentTasks());
-        user.setMembershipExpiresAt(sub.getExpireAt());
-        users.save(user);
+        // 保留旧列值以兼容已有部署与 API 响应；Agent 配额实现不再用它拦截请求。
+        tenant.setDailyTokenLimit(plan.getDailyTokenLimit());
 
-        log.info("会员生效 userId={} tenantId={} plan={} dailyTokenLimit={} expireAt={} 替换掉的旧订阅={} 条",
+        log.info("会员生效 userId={} tenantId={} plan={} planTokenReference={} expireAt={} 替换掉的旧订阅={} 条",
                 userId, tenantId, plan.getCode(), plan.getDailyTokenLimit(), sub.getExpireAt(), active.size());
         return sub;
     }

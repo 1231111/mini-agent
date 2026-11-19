@@ -58,6 +58,13 @@ class WriteConsistencyTest {
         return readFile(path, 1, 100_000);
     }
 
+    private String readFileRange(String path, int lineOffset, int charOffset, int charLimit) throws Exception {
+        Method m = BuiltinTools.class.getDeclaredMethod("readFile", String.class, int.class, int.class,
+                boolean.class, int.class, int.class);
+        m.setAccessible(true);
+        return (String) m.invoke(tools, path, lineOffset, 1, true, charOffset, charLimit);
+    }
+
     private String writeFile(String path, String content, boolean append, boolean force) throws Exception {
         Method m = BuiltinTools.class.getDeclaredMethod(
                 "writeFile", String.class, String.class, boolean.class, boolean.class);
@@ -152,6 +159,48 @@ class WriteConsistencyTest {
         String result = writeFile("mid.txt", "整文件替换", false, false);
 
         assertConflict(result, "只读取了它的一部分");
+    }
+
+    @Test
+    void 超长单行明确标记截断并可按字符范围续读() throws Exception {
+        Path target = tempRoot.resolve("minified.html");
+        String source = "<script>" + "x".repeat(9_000) + "</script>";
+        Files.writeString(target, source, StandardCharsets.UTF_8);
+
+        String first = readFile("minified.html", 1, 200);
+        assertTrue(first.contains("partial=true"), "超长行不能被登记/呈现为完整文件：" + first.substring(0, Math.min(300, first.length())));
+        assertTrue(first.contains("line_offset=1"));
+        assertTrue(first.contains("next_char_offset=4000"));
+
+        String second = readFileRange("minified.html", 1, 4_000, 4_000);
+        assertTrue(second.contains("char_offset=4000"));
+        assertTrue(second.contains("partial=true"));
+        assertTrue(second.contains("x".repeat(100)), "续读必须返回行内后段，而非重复首段");
+        assertFalse(second.contains("x".repeat(4_001)));
+
+        String third = readFileRange("minified.html", 1, 8_000, 4_000);
+        assertTrue(third.contains("char_offset=8000"));
+        assertTrue(third.contains("</script>"), "末段应能读到被旧实现丢弃的行尾逻辑");
+
+        String overwrite = writeFile("minified.html", "replacement", false, false);
+        assertConflict(overwrite, "只读取了它的一部分");
+    }
+
+    @Test
+    void 字符偏移不会拆开Unicode补充字符() throws Exception {
+        Path target = tempRoot.resolve("unicode.txt");
+        Files.writeString(target, "A🙂B", StandardCharsets.UTF_8);
+
+        String first = readFileRange("unicode.txt", 1, 0, 1);
+        String emoji = readFileRange("unicode.txt", 1, 1, 1);
+        String last = readFileRange("unicode.txt", 1, 2, 1);
+
+        assertTrue(first.contains("1|A [read_file 行内截断"), first);
+        assertTrue(first.contains("next_char_offset=1"), first);
+        assertTrue(emoji.contains("1|🙂 [read_file 行内截断"), emoji);
+        assertTrue(emoji.contains("next_char_offset=2"), emoji);
+        assertTrue(last.contains("1|B [read_file 行内截断"), last);
+        assertTrue(last.contains("next_char_offset=3"), last);
     }
 
     @Test

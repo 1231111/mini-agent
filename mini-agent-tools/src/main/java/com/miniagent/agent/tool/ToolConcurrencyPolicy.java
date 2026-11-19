@@ -82,10 +82,19 @@ public final class ToolConcurrencyPolicy {
             30, 0, 3, ToolConcurrencyScope.ARGUMENT, "query", "",
             ToolTimeoutRecovery.RETRY, "，可安全重试", 1);
 
+    /** 搜索结果为空或主 provider 故障时，需要留出 DeepSeek 搜索回退时间。 */
+    private static final ToolExecutionProfile WEB_SEARCH = READ_BY_QUERY.withBudget(45);
+
     /** 只读、按 URL 分锁，可自动重试一次（网络抖动）。 */
     private static final ToolExecutionProfile READ_BY_URL = new ToolExecutionProfile(
             30, 0, 3, ToolConcurrencyScope.ARGUMENT, "url", "",
             ToolTimeoutRecovery.RETRY, "，可安全重试", 1);
+
+    /**
+     * 网页提取会依次尝试 Tavily、受保护的直连和 DeepSeek Fetch；90 秒覆盖各阶段的请求上限，
+     * 让前一个 provider 变慢时仍有时间完成后续回退。
+     */
+    private static final ToolExecutionProfile WEB_EXTRACT = READ_BY_URL.withBudget(90);
 
     /** 远程抓取：无本地副作用，不需要锁，超时可直接重试。 */
     private static final ToolExecutionProfile REMOTE_FETCH = new ToolExecutionProfile(
@@ -276,11 +285,13 @@ public final class ToolConcurrencyPolicy {
             case "read_file", "list_files" -> READ_BY_PATH.withBudget(10);
             case "read_package" -> READ_BY_PATH.withBudget(15);
             case "search_code", "ast_search", "codebase_search" -> READ_BY_PATH;
-            case "web_search" -> READ_BY_QUERY;
-            case "web_extract", "http_get" -> READ_BY_URL;
+            case "web_search" -> WEB_SEARCH;
+            case "web_extract" -> WEB_EXTRACT;
+            case "http_get" -> READ_BY_URL;
 
             // ── 本地写 ──
             case "write_file", "edit_file" -> WRITE_BY_PATH;
+            case "undo_last_file_change" -> WRITE_GLOBAL;
             case "todo", "memory", "skill_manage" -> WRITE_GLOBAL;
             case "delete_path", "move_file", "create_directory", "process" -> WRITE_GLOBAL;
             case "render_diagram" -> WRITE_GLOBAL.withBudget(90);
@@ -459,7 +470,7 @@ public final class ToolConcurrencyPolicy {
         if (isReadOnly(name)) {
             return ToolSideEffect.READ_ONLY;
         }
-        if (Set.of("write_file", "edit_file", "todo", "memory", "skill_manage",
+        if (Set.of("write_file", "edit_file", "undo_last_file_change", "todo", "memory", "skill_manage",
                 "browser_screenshot", "browser_clear_session").contains(name)) return ToolSideEffect.WRITE;
         return ToolSideEffect.EXTERNAL_WRITE;
     }

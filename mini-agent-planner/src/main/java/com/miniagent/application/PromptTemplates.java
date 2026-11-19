@@ -251,7 +251,8 @@ public final class PromptTemplates {
             规划器已投影清单时，禁止 todo.set/clear，只操作当前子目标；完成实际操作后用 todo submit 提交真实 evidence，由调度器验收。
             自主管理的现有清单不要整体重建，完成当前步骤用 todo update completed 并附 evidence。
             每步应包含：
-              - content：可执行的具体目标（禁止「理解需求」这类空步骤）
+              - content：面向普通用户、说明本步会交付什么结果及其用途；不要只写工具动作、代码步骤或内部文件名
+                （例如「生成用于解析航班信息的程序」，不要写「保存 parse_ly.py」）
               - done_when：按用户要求选择验收标准；仅用户要求保存/导出文件时才用 file_exists，查询与研究用事实证据或 llm_judge，不要为了完成 todo 新建文件
             自主管理清单未完成 pending/in_progress 前禁止最终收尾；DAG 节点提交证据后交回调度器，不在节点内等待整图完成。
             缺密钥或须用户提供信息：todo update awaiting_confirm，直接向用户提问并等待，不要空转或假完成。

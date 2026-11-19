@@ -327,10 +327,16 @@ const finalAnswer = '已生成虚拟仿真交互页面。\n\n[查看 HTML 文件
         steps.push({ stepType: 'TOOL_CALL', toolName: 'write_file', status: 'RUNNING', toolArgs: JSON.stringify({ path: 'ui.html', append: index > 0 }) });
         steps.push({ stepType: 'TOOL_RESULT', toolName: 'write_file', status: 'SUCCESS', content: 'OK' });
     }
-    const html = h.context.buildInspectorStepRows(steps, { status: 'SUCCESS' });
-    assert.match(html, /共调用 3 次，最近一次完成/);
-    assert.doesNotMatch(html, /重试/);
-    console.log('PASS: repeated file writes are counted as calls rather than mislabeled as retries');
+    const tools = h.context.buildInspectorToolRows(steps, {
+        taskRunning: false,
+        executionStatus: 'SUCCESS'
+    });
+    assert.match(tools, /调用 3 次/);
+    assert.doesNotMatch(tools, /重试/);
+    const taskSteps = h.context.buildInspectorStepRows(steps, { status: 'SUCCESS' }, false);
+    assert.match(taskSteps, /没有拆分出独立交付步骤/);
+    assert.doesNotMatch(taskSteps, /保存 HTML 页面/);
+    console.log('PASS: repeated tool calls stay in tool history and are not presented as task deliverables');
 }
 
 {

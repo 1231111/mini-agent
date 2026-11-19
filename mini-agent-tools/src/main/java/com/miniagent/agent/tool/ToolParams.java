@@ -84,7 +84,8 @@ public abstract class ToolParams {
                 fieldDef.put("default", annotation.defaultValue());
             }
 
-            schema.put(field.getName(), fieldDef);
+            String propertyName = annotation.name().isBlank() ? field.getName() : annotation.name();
+            schema.put(propertyName, fieldDef);
         }
 
         return schema;

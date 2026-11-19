@@ -2,7 +2,7 @@
 
 云端账号与会员服务：登录、注册、会员等级、充值。
 
-它是一个独立的 Spring Boot 应用（端口 8081），库是 MySQL `mini_agent`，与 agent 共用 `tenants`、`users` 和会员数据表；会员用量另存于 `membership_usage_events`。Agent 桌面端使用本机 H2，compose 不启动桌面客户端。
+它是一个独立的 Spring Boot 应用（端口 8081），库是 MySQL `mini_agent`，只碰五张表：`tenants`、`users`、`membership_plans`、`membership_subscriptions`、`membership_orders`。Agent 在桌面端，用本机 H2，compose 不启动它。
 
 ---
 
@@ -99,12 +99,9 @@ Agent 的 `V2__production_security_and_usage.sql` 里是裸 `CREATE TABLE tenant
 | POST | `/api/users` | 无 | 注册。每用户建独立 tenant，并落一条 `free` 订阅 |
 | GET | `/api/membership/plans` | 服务间密钥 | 可售套餐 |
 | GET | `/api/membership/current?userId=` | 服务间密钥 | 某人当前生效的会员 |
-| GET | `/api/membership/orders?userId=` | 服务间密钥 | 本人的待处理订单（最多 20 笔，用于刷新后恢复结账） |
 | POST | `/api/membership/orders` | 服务间密钥 | 下单，只落一条 `PENDING` 订单 |
-| POST | `/api/membership/orders/cancel` | 服务间密钥 | 取消本人的待支付订单 |
-| POST | `/api/membership/simulate-payment` | 服务间密钥 + 双端显式开启 | 本地演示结算，不扣款，支付后开通会员 |
 | POST | `/api/membership/pay-callback` | 服务间密钥 | 当前 fail-closed（HTTP 503）；接入真实渠道签名、支付状态、金额与币种校验前不会开通会员 |
-| POST | `/api/membership/usage` | 服务间密钥 | 幂等上报一次 LLM 调用，用 eventId 去重 |
+| POST | `/api/membership/usage` | 服务间密钥 | 上报一次 LLM 调用。一次调用一行 |
 | GET | `/`、`/login`、`/register`、`/account` | 无 | 账号网页：注册、登录、套餐、用量、订单 |
 | POST | `/api/portal/session` | 无 | 网页登录，写浏览器会话，不返回 token |
 | POST | `/api/portal/users` | 无 | 网页注册，并写浏览器会话 |
@@ -114,10 +111,8 @@ Agent 的 `V2__production_security_and_usage.sql` 里是裸 `CREATE TABLE tenant
 | GET | `/api/portal/membership` | 浏览器会话 | 当前会员 |
 | GET | `/api/portal/usage` | 浏览器会话 | 今日合计，以及最近 31 天内每次上报（最多 100 条） |
 | GET | `/api/portal/orders` | 浏览器会话 | 本人订单 |
-| GET | `/api/portal/payment-mode` | 浏览器会话 | 返回模拟支付是否启用 |
 | POST | `/api/portal/orders` | 浏览器会话 | 下单，只落 PENDING |
-| POST | `/api/portal/orders/{orderNo}/confirm` | 浏览器会话 + CSRF | 本人订单模拟支付确认；仅在模拟支付开启时可用 |
-| POST | `/api/portal/orders/{orderNo}/cancel` | 浏览器会话 + CSRF | 取消本人的待支付订单 |
+| — | — | — | 当前没有浏览器自助支付确认接口；支付渠道验签回调接入前所有订单保持待支付 |
 
 两类鉴权的分界：
 
@@ -134,17 +129,15 @@ Agent 的 `V2__production_security_and_usage.sql` 里是裸 `CREATE TABLE tenant
 
 响应里没有 token 字段，这不是缺项。token 由桌面端自己签。本服务只回答「这个用户名+密码对应哪个身份」（`data.userId` / `username` / `displayName` / `role`）。
 
-### 会员额度同步到 agent
+### token 限额由模型服务商执行
 
-`MembershipService.applyPlan` activates the subscription and persists its token allowance, concurrency cap, and expiry on the shared user row in the same transaction. The plan allowance does not overwrite the tenant-wide cap. Effective daily user quota is administrator override, active membership allowance, then tenant default. The tenant-wide daily cap remains a hard ceiling. In standalone desktop mode, the authenticated agent proxy syncs the current entitlement to its local shadow user after membership reads and simulated checkout.
-
-agent 本地有效用户额度的优先级是：系统管理员设置的单用户额度覆盖、有效会员套餐额度、租户默认单用户额度。租户每日总额度始终是硬上限。账号库的租户行不是 agent 执行时读取的配额来源；同步后的本地用户记录才是。
+Agent 不强制执行租户或用户的 token 日限额。用户配置的模型 API key 由对应服务商按其账户策略限流和计费。`membership_plans.daily_token_limit` 与 `tenants.daily_token_limit` 保留作兼容/展示元数据，不是 Agent 的执行上限，也不是计费依据。
 
 ### 用量明细
 
-`membership_usage_events` stores one idempotent event per completed model call (`event_id`, input/output tokens, and report time). The agent writes a local durable outbox in the same transaction as its user/tenant quota debit, then retries account delivery with capped backoff until accepted; account enforces the event key to prevent duplicate totals. Outbox scheduler timestamps use UTC, while the daily usage window uses `agent.quota.zone-id`. This is token-count quota accounting, not currency-based provider billing. The portal usage history can lag while its outbox is retrying; the agent quota page reads the authoritative local daily counters.
+`membership_usage_events` 每次 LLM 调用一行：`input_tokens`、`output_tokens`、`reported_at`。请求次数是行数，不按天合并。客户机每次模型调用成功后，用影子用户的 `users.external_id`（云端用户 id）异步 `POST /api/membership/usage`。本服务不读 agent 的 `tenant_daily_usage`。此数据仅用于展示；异步上报可能延迟或丢失，不能用于计费或配额判定。MiniAgent 不强制执行套餐 token 日限额，模型服务商按用户配置的 API Key 和账户策略执行其自身限制。
 
-日切时区是 `agent.quota.zone-id`，默认 `Asia/Shanghai`，和客户机配额同一天。门户 `GET /api/portal/usage` 返回今天的合计，以及含今天在内最近 31 天的每次上报，最多 100 条，新的在前。今天的合计不受这 100 条限制。
+日切时区是 `agent.quota.zone-id`，默认 `Asia/Shanghai`。门户 `GET /api/portal/usage` 返回今天的合计，以及含今天在内最近 31 天的每次上报，最多 100 条，新的在前。今天的合计不受这 100 条限制。
 
 客户机没配 `ACCOUNT_INTERNAL_KEY`（或和账号服务不一致）时，上报直接跳过，门户数字停在 0。本地注册、没有 `external_id` 的用户也不会上报。
 
@@ -160,7 +153,7 @@ users 表（同一个库）
   id=2  username=alice  external_id=1       tenant_id=<system 租户>    ← agent 建的第二条
 ```
 
-后果是同一人两条记录，而会员配额写在 **id=1 的租户**上、agent 读的是 **id=2 的租户**——症状是「买了会员但额度没变」，且日志里一切正常。
+后果是同一人两条记录，账号侧订阅与 Agent 侧身份/用量无法可靠对应；请确保云端服务指向同一个数据库，桌面客户端保持独立库映射。
 
 `application.yml` 里因此写着：
 
@@ -197,13 +190,9 @@ agent:
 
 | 脚本 | 内容 |
 | --- | --- |
-| `V1__account_baseline.sql` | `tenants` / `users` 基础结构，全部 `CREATE TABLE IF NOT EXISTS`，与 agent 侧基础列兼容；账号侧增量列由后续迁移增加 |
+| `V1__account_baseline.sql` | `tenants` / `users`，全部 `CREATE TABLE IF NOT EXISTS`，列定义是 agent 侧 V1+V2+V8 叠加后的最终形状 |
 | `V2__membership.sql` | `membership_plans` / `membership_subscriptions` / `membership_orders`，并插入 `free` / `pro` 两个种子套餐 |
-| `V3__membership_usage.sql` | 每次模型调用的 token 用量明细表 |
-| `V4__memory_refresh_credential.sql` | 用户的记忆服务刷新凭证摘要 |
-| `V5__membership_usage_event_id.sql` | 用 eventId 对调用用量做幂等去重 |
-| `V6__membership_order_expiry.sql` | 订单支付截止时间和过期索引；存量待支付订单按创建时间补 15 分钟期限 |
-| `V7__membership_entitlement_snapshot.sql` | 在共享 `users` 表保存会员 token 上限、并发上限和到期时间；迁移时回填当前有效订阅，之后每次充值在同一事务同步，供 agent 执行侧立即生效 |
+| `V3__membership_usage.sql` | `membership_usage_events`，一次 LLM 调用一行 |
 
 两点要留意：
 
@@ -214,9 +203,8 @@ agent:
 
 | # | 事项 | 为什么现在没做 |
 | --- | --- | --- |
-| 1 | 抽 `mini-agent-common` 的契约子模块 | 本服务只需要 `ApiResponse` 与 `ErrorCode`，却因此背上 onnxruntime(92MB) + tokenizers(18MB) + milvus-sdk-java。**实测：本服务的 fat jar 是 303,414,054 B（289 MB）** —— 一个只做账号的服务不该有这个体积。修法会影响 common 的包结构、波及全部 7 个模块 |
-| 2 | 接入真实支付渠道 | 当前只有明确标注、默认关闭的模拟支付流程；真实支付回调仍 fail-closed 并返回 503。接入渠道后必须校验签名、订单、金额和币种，再调用内部入账服务 |
-
-## 模拟会员支付
-
-`agent.account.membership.simulated-payment-enabled` 默认关闭，本地 `dev` 配置默认开启，可用 `ACCOUNT_SIMULATED_PAYMENT_ENABLED` 覆盖；生产启动校验会拒绝启用该开关。门户会明确标记“模拟支付，不扣款”，且只允许登录用户确认自己的订单；只有未过期的待支付订单会被开通，重复确认已支付订单保持幂等。用户刷新后可在账号门户或 agent 会员页恢复待处理订单，取消也只影响本人的待支付订单。订单使用固定的 `SIMULATED` 渠道标记。结算与会员订阅、token/并发额度快照在同一事务提交；agent 的共享库部署立即可见，本地桌面模式通过会员代理查询同步额度。真实支付回调 `/api/membership/pay-callback` 仍然 fail-closed。
+| 1 | `membership_plans.max_concurrent_tasks` **尚未接线** | 列已落库，但 agent 侧的 `agent.concurrency.max-tasks-per-user` 仍是配置里的固定值。接线要在 agent 侧读它，属于独立一轮 |
+| 2 | 客户机的会员配额下发 | 已按产品决策不再将 account 套餐 token 数同步为本地执行上限；Agent 不做 token 日额度拦截，调用限制由模型服务商按用户配置的 API Key 执行。`membership_usage_events` 仍是尽力上报的展示数据，不是账单或配额真相源。 |
+| 3 | 抽 `mini-agent-common` 的契约子模块 | 本服务只需要 `ApiResponse` 与 `ErrorCode`，却因此背上 onnxruntime(92MB) + tokenizers(18MB) + milvus-sdk-java。**实测：本服务的 fat jar 是 303,414,054 B（289 MB）** —— 一个只做账号的服务不该有这个体积。修法会影响 common 的包结构、波及全部 7 个模块 |
+| 4 | 接入真实支付渠道 | 自助确认到账端点与服务方法已删除；当前支付回调 fail-closed 并返回 503。接入渠道后必须先校验签名、订单、金额和币种，再调用内部入账服务 |
+| 5 | 单元测试 | `AccountAuthService` 的注册边界、`MembershipService` 的幂等与 `applyPlan` 不变量 |

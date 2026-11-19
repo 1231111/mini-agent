@@ -73,6 +73,7 @@
         </div>
         <div class="card">
             <h2 style="margin:0 0 8px;font-size:16px;">用量</h2>
+            <p class="muted">MiniAgent 不设置 token 日限额；请求限制由你配置的模型服务商 API Key 及其账户策略决定。下方统计为异步上报的参考数据。</p>
             <p class="muted" id="usageSummary">暂无用量</p>
             <table>
                 <thead>
@@ -212,14 +213,13 @@ async function loadDesk() {
         (me.data.displayName || me.data.username) + ' · ' + me.data.username;
     const plan = await call('/api/portal/membership');
     document.getElementById('plan').textContent = plan.success
-        ? ('当前套餐 ' + plan.data.planName + ' · 每日 '
-            + plan.data.dailyTokenLimit + ' token')
+        ? ('当前套餐 ' + plan.data.planName)
         : (plan.message || '没有生效中的订阅');
     const usage = await call('/api/portal/usage');
     if (usage.success && usage.data) {
         const d = usage.data;
         document.getElementById('usageSummary').textContent =
-            '今日 ' + d.date + ' · token ' + d.totalTokens + ' / ' + d.dailyTokenLimit
+            '今日 ' + d.date + ' · 已上报 token ' + d.totalTokens
             + ' · 输入 ' + d.inputTokens + ' · 输出 ' + d.outputTokens
             + ' · LLM 请求 ' + d.llmCalls + ' 次';
         const usageBody = document.getElementById('usageDays');

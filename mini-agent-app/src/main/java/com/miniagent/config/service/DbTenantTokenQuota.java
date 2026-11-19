@@ -7,8 +7,6 @@ import com.miniagent.config.repository.TenantDailyUsageRepository;
 import com.miniagent.config.repository.TenantRepository;
 import com.miniagent.config.repository.UserDailyUsageRepository;
 import com.miniagent.config.repository.UserRepository;
-import com.miniagent.config.repository.MembershipUsageOutboxRepository;
-import com.miniagent.config.entity.MembershipUsageOutbox;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PostConstruct;
@@ -19,9 +17,7 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDate;
-import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.time.ZoneOffset;
 import java.util.Objects;
 
 @Service
@@ -35,8 +31,6 @@ public class DbTenantTokenQuota implements TenantTokenQuota {
     private UserDailyUsageRepository userUsage;
     @Autowired
     private UserRepository users;
-    @Autowired(required = false)
-    private MembershipUsageOutboxRepository membershipUsageOutbox;
     @Autowired
     private MeterRegistry meters;
 
@@ -69,26 +63,14 @@ public class DbTenantTokenQuota implements TenantTokenQuota {
         LocalDate today = today();
         long tenantUsed = usage.tokenCount(tenantId, today).orElse(0L);
         long userUsed = userUsage.tokenCount(userId, today).orElse(0L);
-        long userLimit = effectiveUserLimit(tenant, user);
-        return decision(tenantUsed < tenant.getDailyTokenLimit() || tenant.getDailyTokenLimit() <= 0,
-                tenantUsed, tenant.getDailyTokenLimit(), userUsed, userLimit, false);
+        // The agent does not impose its own token ceiling. Usage is still recorded
+        // for observability; the configured model provider/API key owns enforcement.
+        return Decision.unlimited(Math.max(tenantUsed, userUsed));
     }
 
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public Decision consume(Long tenantId, Long userId, long tokens) {
-        return consumeWithinTransaction(tenantId, userId, tokens, null, 0, 0);
-    }
-
-    @Override
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public Decision consume(Long tenantId, Long userId, long tokens, String eventId,
-                            long inputTokens, long outputTokens) {
-        return consumeWithinTransaction(tenantId, userId, tokens, eventId, inputTokens, outputTokens);
-    }
-
-    private Decision consumeWithinTransaction(Long tenantId, Long userId, long tokens,
-                                               String eventId, long inputTokens, long outputTokens) {
         long delta = Math.max(0, tokens);
         // Every replica locks the same tenant row before reading or incrementing either
         // counter. This keeps the tenant-wide and per-user totals atomic as one decision.
@@ -100,62 +82,16 @@ public class DbTenantTokenQuota implements TenantTokenQuota {
         LocalDate today = today();
         long tenantUsed = usage.tokenCount(tenantId, today).orElse(0L);
         long userUsed = userUsage.tokenCount(userId, today).orElse(0L);
-        long tenantLimit = tenant.getDailyTokenLimit();
-        long userLimit = effectiveUserLimit(tenant, user);
-        boolean wasWithinBothLimits = (tenantLimit <= 0 || tenantUsed < tenantLimit)
-                && (userLimit <= 0 || userUsed < userLimit);
         if (delta > 0) {
             usage.increment(tenantId, today, delta);
             userUsage.increment(userId, today, delta);
-            enqueueUsageEvent(user, eventId, inputTokens, outputTokens);
             tenantConsumed.increment(delta);
             userConsumed.increment(delta);
             tenantUsed = saturatingAdd(tenantUsed, delta);
             userUsed = saturatingAdd(userUsed, delta);
         }
-        boolean allowed = delta == 0
-                ? (tenantLimit <= 0 || tenantUsed < tenantLimit)
-                        && (userLimit <= 0 || userUsed < userLimit)
-                : wasWithinBothLimits
-                        && (tenantLimit <= 0 || tenantUsed <= tenantLimit)
-                        && (userLimit <= 0 || userUsed <= userLimit);
-        return decision(allowed, tenantUsed, tenantLimit, userUsed, userLimit, delta > 0);
-    }
-
-    private void enqueueUsageEvent(User user, String eventId, long inputTokens, long outputTokens) {
-        if (membershipUsageOutbox == null || eventId == null || eventId.isBlank()
-                || user.getExternalId() == null || user.getExternalId().isBlank()) return;
-        final long cloudUserId;
-        try {
-            cloudUserId = Long.parseLong(user.getExternalId().trim());
-        } catch (NumberFormatException invalidMapping) {
-            // Quota remains authoritative even if an account identity mapping needs repair.
-            return;
-        }
-        MembershipUsageOutbox row = new MembershipUsageOutbox();
-        row.setEventId(eventId);
-        row.setCloudUserId(cloudUserId);
-        row.setInputTokens(Math.max(0, inputTokens));
-        row.setOutputTokens(Math.max(0, outputTokens));
-        row.setStatus(MembershipUsageOutbox.Status.PENDING);
-        // Outbox timestamps are UTC wall-clock values. Do not use quotaZone here:
-        // the dispatcher compares them with UTC and quotaZone may be Asia/Shanghai.
-        row.setNextAttemptAt(LocalDateTime.now(ZoneOffset.UTC));
-        membershipUsageOutbox.save(row);
-    }
-
-    private Decision decision(boolean allowed, long tenantUsed, long tenantLimit,
-                              long userUsed, long userLimit, boolean afterConsumption) {
-        boolean tenantExceeded = tenantLimit > 0
-                && (afterConsumption ? tenantUsed > tenantLimit : tenantUsed >= tenantLimit);
-        boolean userExceeded = userLimit > 0
-                && (afterConsumption ? userUsed > userLimit : userUsed >= userLimit);
-        if (tenantExceeded) tenantDenied.increment();
-        if (userExceeded) userDenied.increment();
-        if (tenantExceeded) return new Decision(false, tenantUsed, tenantLimit);
-        if (userExceeded) return new Decision(false, userUsed, userLimit);
-        if (tenantLimit > 0) return new Decision(allowed, tenantUsed, tenantLimit);
-        if (userLimit > 0) return new Decision(allowed, userUsed, userLimit);
+        // Keep daily rows and token counters for usage reporting, but never stop an
+        // Agent run because a local tenant/user token threshold was reached.
         return Decision.unlimited(Math.max(tenantUsed, userUsed));
     }
 
@@ -171,18 +107,6 @@ public class DbTenantTokenQuota implements TenantTokenQuota {
 
     private static long saturatingAdd(long value, long delta) {
         return value > Long.MAX_VALUE - delta ? Long.MAX_VALUE : value + delta;
-    }
-
-    private long effectiveUserLimit(Tenant tenant, User user) {
-        if (user.getDailyTokenLimitOverride() != null) {
-            return user.getDailyTokenLimitOverride();
-        }
-        LocalDateTime now = LocalDateTime.now(quotaZone);
-        if (user.getMembershipDailyTokenLimit() != null
-                && (user.getMembershipExpiresAt() == null || now.isBefore(user.getMembershipExpiresAt()))) {
-            return user.getMembershipDailyTokenLimit();
-        }
-        return tenant.getDailyUserTokenLimit();
     }
 
     private LocalDate today() {

@@ -163,7 +163,12 @@ public class GoalCompiler {
             command_success / validation_passed。
             file_exists 填 path，可加 criteria 做内容验收。
             llm_judge、validation_passed 可填 criteria。
-            command_success 要求 evidence 含 exit_code=0。
+            command_success 必须在 criteria 中逐字写明预期执行的完整 command；验收只接受
+            调度器记录的 exec_command 实际调用参数与结果，普通 evidence 文本中的 exit_code=0 不算回执。
+            修复、实现或重构代码时，必须增加依赖代码改动节点的独立测试节点，使用
+            command_success 并填写实际测试命令；命令须实际启动测试运行器，不能用 echo、构建但跳过测试、
+            shell 失败兜底或管道命令冒充测试；命令须遵守 exec_command 授权策略，未获授权或无法执行时
+            任务保持未完成并如实说明，不得降级成 note_required 或口头宣称通过。
             doneWhen.checks 是需要逐项验证的语义条件数组；criteria/checks 都会实际调用验收，
             不会因文件存在、工具返回 success 或文字中提及该条件而自动通过。
             intent.constraints 中的每个限制、acceptanceCriteria 中的每个非文件存在条件，
@@ -196,6 +201,15 @@ public class GoalCompiler {
             不要拆：打开/读取/解析同一 PDF 这类工具内部步骤；不要为凑节点而拆。
             拆分依据是执行依赖和原子性，不是句子长短，也不是「然后」这个词。
             一个业务目标可以对应多个执行节点。
+
+            【节点名称面向普通用户】
+            node.name 会直接显示在任务进度里。用普通用户能理解的语言，写清该节点完成后
+            用户会得到或能检查到什么结果；不要把工具动作、代码步骤或内部文件读写当成节点名。
+            禁止只写「保存文件 parse_ly.py」「读取 ly_flights.json」「运行 python 脚本」这类操作名。
+            改写成结果与用途，例如「生成用于解析航班信息的程序」「整理出可查看的航班数据」
+            或「验证航班数据是否完整」。具体路径仍写入 outputs / doneWhen.path；只有用户
+            明确要求某个文件名作为交付物时，才把文件名放入 node.name，并同时说明它的用途。
+            真正需要独立执行/验收的中间产物仍然保留为节点，但名称要说明该中间产物服务于什么。
 
             【规则】
             有独立验收的步骤必须拆开。不要为凑数拆节点。

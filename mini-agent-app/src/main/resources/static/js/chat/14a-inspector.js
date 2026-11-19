@@ -3,8 +3,8 @@
 
    四块内容全部取自真实接口，没有一处是写死的占位数字：
 
-     执行步骤   GET /api/conversations/{sid}/todos 优先展示任务拆分；没有 todo 时回退到执行轨迹
-                GET /api/conversations/{sid}/executions + /api/executions/{id}/steps
+     执行步骤   GET /api/conversations/{sid}/todos 展示语义任务拆分；无拆分时只展示等待/终止事件
+                原始工具调用留在独立的「本次工具」区域
      执行工具   同一份 steps 聚合调用状态，并补充注册表描述和参数摘要
      记忆与知识 从当前执行的 CONTEXT_LOAD 轨迹读取真实注入片段，并按类型合并展示
      系统状态   GET /api/shell/status                      → 模型 / 工具数 / 堆状态
@@ -259,7 +259,10 @@ async function renderInspectorSteps(sid) {
         $steps.innerHTML = buildInspectorCurrentTask(latestExecution) + (todos.length
             ? buildInspectorTodoRows(todos, steps)
             : buildInspectorStepRows(steps, latestExecution));
-        $tools.innerHTML = buildInspectorToolRows(steps);
+        $tools.innerHTML = buildInspectorToolRows(steps, {
+            taskRunning,
+            executionStatus: latestExecution && latestExecution.status
+        });
         $tools.querySelectorAll('.insp-tool-card').forEach(card => {
             card.open = inspOpenToolLogKeys.has(card.dataset.toolKey || '');
         });
@@ -419,48 +422,12 @@ function pickLatestExecution(execs) {
 }
 
 function buildInspectorStepRows(steps, execution) {
-    const activityTypes = new Set([
-        'WAITING_FOR_HUMAN', 'TOOL_CALL', 'TOOL_RESULT', 'TOOL_ERROR',
-        'ERROR', 'CANCELED', 'ABORTED'
-    ]);
+    // Raw tool calls are implementation details, not task deliverables. The
+    // separate tools section already exposes their names, arguments and results.
+    const activityTypes = new Set(['WAITING_FOR_HUMAN', 'ERROR', 'CANCELED', 'ABORTED']);
     const rows = [];
-    const toolGroups = new Map();
-    const consumed = new Set();
-    (steps || []).forEach((step, index) => {
-        if (!step || consumed.has(index) || !activityTypes.has(step.stepType)) return;
-        if (step.stepType === 'TOOL_RESULT' || step.stepType === 'TOOL_ERROR') return;
-        if (step.stepType === 'TOOL_CALL') {
-            const resultIndex = steps.findIndex((candidate, candidateIndex) => candidateIndex > index
-                && !consumed.has(candidateIndex)
-                && candidate && candidate.toolName === step.toolName
-                && ['TOOL_RESULT', 'TOOL_ERROR'].includes(candidate.stepType));
-            const result = resultIndex >= 0 ? steps[resultIndex] : null;
-            if (result) consumed.add(resultIndex);
-            const status = result
-                ? (result.stepType === 'TOOL_ERROR' ? 'FAILURE' : result.status)
-                : step.status;
-            const state = INSP_WAIT_STATUS.has(String(status || '').toUpperCase())
-                ? 'awaiting' : result && status === 'RUNNING' ? 'running' : stepState(status);
-            const presentation = toolPresentation(step.toolName, step.toolArgs, result && result.content);
-            const title = presentation.title;
-            const groupKey = presentation.kind + ':' + title.toLocaleLowerCase('zh-CN');
-            let group = toolGroups.get(groupKey);
-            if (!group) {
-                group = { title, attempts: [] };
-                toolGroups.set(groupKey, group);
-                rows.push(group);
-            }
-            group.attempts.push({
-                state,
-                detail: (result && result.stepType === 'TOOL_ERROR' ? toolFailureSummary(result) : '')
-                    || toolArgsSummary(step.toolArgs, step.toolName)
-                    || toolDescription(step.toolName),
-                time: (result && result.createdAt) || step.createdAt,
-                durationMs: result && result.durationMs
-            });
-            return;
-        }
-
+    (steps || []).forEach(step => {
+        if (!step || !activityTypes.has(step.stepType)) return;
         const label = inspLabels[step.stepType] || step.stepType || '步骤';
         let detail = step.subGoalText || step.content || '';
         if (step.stepType === 'PLAN') detail = step.subGoalText || String(detail).replace(/^子目标[：:]\s*/, '');
@@ -477,28 +444,12 @@ function buildInspectorStepRows(steps, execution) {
         });
     });
 
-    const normalizedRows = rows.map(row => {
-        if (!row.attempts) return row;
-        const latest = row.attempts[row.attempts.length - 1];
-        const callCount = row.attempts.length;
-        return {
-            state: latest.state,
-            title: row.title,
-            detail: latest.detail,
-            time: latest.time,
-            status: latest.state === 'failed' ? '执行失败'
-                : latest.state === 'awaiting' ? '待确认'
-                    : latest.state === 'running' ? '进行中'
-                        : callCount > 1 ? '共调用 ' + callCount + ' 次，最近一次完成' : '已完成',
-            durationMs: latest.durationMs
-        };
-    });
-    const tail = normalizedRows.slice(-INSP_MAX_STEPS);
+    const tail = rows.slice(-INSP_MAX_STEPS);
     if (!tail.length) {
         const terminal = execution && INSP_SUCCESS_STATUS.has(String(execution.status || '').toUpperCase());
         return `<div class="insp-empty">${terminal
-            ? '本次任务已直接完成，没有需要展开的执行步骤。'
-            : '当前任务还没有可展示的步骤。'}</div>`;
+            ? '任务已完成，但没有拆分出独立交付步骤。'
+            : '当前任务没有拆分出独立交付步骤。'}具体工具操作记录见下方“本次工具”。</div>`;
     }
     return tail.map(row => {
         const meta = [row.status, formatClock(row.time), row.durationMs > 0 ? formatDuration(row.durationMs) : '']
@@ -514,7 +465,20 @@ function buildInspectorStepRows(steps, execution) {
     }).join('');
 }
 
-function buildInspectorToolRows(steps) {
+function inspectorTaskEnded(taskRunning, executionStatus) {
+    const status = String(executionStatus || '').toUpperCase();
+    const terminalStatus = INSP_SUCCESS_STATUS.has(status)
+        || INSP_FAIL_STATUS.has(status)
+        || status === 'CANCELED' || status === 'CANCELLED';
+    return taskRunning !== true || terminalStatus;
+}
+
+function buildInspectorToolRows(steps, taskState) {
+    // A trace can end without a TOOL_RESULT/TOOL_ERROR (for example, if the
+    // result event was lost). Once the task itself has stopped, that missing
+    // result is unknown, not proof that the tool is still running.
+    const taskEnded = !!taskState
+        && inspectorTaskEnded(taskState.taskRunning, taskState.executionStatus);
     const calls = [];
     const consumedResults = new Set();
     (steps || []).forEach((step, index) => {
@@ -528,8 +492,9 @@ function buildInspectorToolRows(steps) {
         const resultStatus = result && String(result.status || '').toUpperCase();
         const failed = !!result && (result.stepType === 'TOOL_ERROR'
             || INSP_FAIL_STATUS.has(resultStatus));
-        const state = failed ? 'failed' : INSP_WAIT_STATUS.has(resultStatus) ? 'awaiting'
+        let state = failed ? 'failed' : INSP_WAIT_STATUS.has(resultStatus) ? 'awaiting'
             : !result || INSP_RUN_STATUS.has(resultStatus) ? 'running' : 'done';
+        if (taskEnded && state === 'running') state = 'unconfirmed';
         const presentation = toolPresentation(step.toolName, step.toolArgs, result && result.content);
         calls.push({
             name: step.toolName,
@@ -564,11 +529,12 @@ function buildInspectorToolRows(steps) {
         const stateLabel = state === 'running' ? '进行中'
             : state === 'awaiting' ? '待确认'
                 : state === 'failed' ? '失败'
+                    : state === 'unconfirmed' ? '结果未记录'
                 : t.durationMs > 0 ? formatDuration(t.durationMs) : '已完成';
         const countLabel = t.failedCount > 0
             ? (t.count > 1 ? `失败 ${t.failedCount} 次 · 共调用 ${t.count} 次` : '失败')
             : t.count > 1
-                ? (state === 'awaiting' ? '待确认 · ' : '') + '调用 ' + t.count + ' 次'
+                ? (state === 'awaiting' ? '待确认 · ' : state === 'unconfirmed' ? '最近一次结果未记录 · ' : '') + '调用 ' + t.count + ' 次'
                 : stateLabel;
         const detail = shortText(t.detail || toolDescription(t.name), 62);
         const key = t.kind + ':' + t.title.toLocaleLowerCase('zh-CN');
@@ -600,7 +566,8 @@ function buildInspectorToolLogEntry(call, index, total) {
     const state = call.state;
     const stateLabel = state === 'failed' ? '失败'
         : state === 'awaiting' ? '等待授权'
-            : state === 'running' ? '执行中' : '成功';
+            : state === 'running' ? '执行中'
+                : state === 'unconfirmed' ? '结果未记录' : '成功';
     const heading = total > 1 ? `第 ${index + 1} 次调用 · ${stateLabel}` : `执行记录 · ${stateLabel}`;
     const meta = [call.time ? formatClock(call.time) : '',
         call.durationMs > 0 ? formatDuration(call.durationMs) : ''].filter(Boolean).join(' · ');
@@ -623,15 +590,30 @@ function buildInspectorToolLogEntry(call, index, total) {
     const output = call.output ? formatInspectorToolLog(call.output)
         : state === 'running' || state === 'awaiting' ? '等待工具返回…' : '没有记录到返回内容。';
     const outputLabel = state === 'failed' ? '错误日志' : '工具返回';
+    const editDiff = state === 'done' && call.name === 'edit_file'
+        ? buildEditDiffPreview(argsValue) : '';
     return `<article class="insp-tool-log-entry ${state}">
         <div class="insp-tool-log-head"><strong>${esc(heading)}</strong>${meta ? `<span>${esc(meta)}</span>` : ''}</div>
         <div class="insp-tool-log-label">底层工具：${esc(call.name || '未知工具')}</div>
         ${call.state === 'done' && call.name === 'write_file' && call.htmlFile
                 && outputValue && outputValue.success === true
             ? '<div class="insp-tool-log-label">HTML 页面文件已保存；页面运行效果需另行验证。</div>' : ''}
+        ${editDiff}
         ${argsMarkup}
         <div class="insp-tool-log-block"><div class="insp-tool-log-label">${outputLabel}</div><pre>${esc(output)}</pre></div>
     </article>`;
+}
+
+/** edit_file logs contain the unique old/new anchors; show that exact reviewable change. */
+function buildEditDiffPreview(args) {
+    if (!args || typeof args.oldString !== 'string' || typeof args.newString !== 'string'
+        || !args.oldString.trim() || args.oldString === args.newString) return '';
+    const safe = redactInspectorLogValue({ oldString: args.oldString, newString: args.newString });
+    const removed = String(safe.oldString).split(/\r?\n/).map(line => '- ' + line).join('\n');
+    const added = String(safe.newString).split(/\r?\n/).map(line => '+ ' + line).join('\n');
+    const label = args.oldString.length > 4000 || args.newString.length > 4000
+        ? '差异预览（调用记录可能已截断）' : '代码改动预览';
+    return `<details class="insp-tool-log-block insp-tool-diff"><summary class="insp-tool-log-label">${label}</summary><pre>${esc(removed + '\n' + added)}</pre></details>`;
 }
 
 function formatInspectorToolLog(raw) {

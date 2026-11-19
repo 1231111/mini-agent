@@ -81,7 +81,9 @@ class WebSearchServiceExtractionFallbackTest {
         var fixture = prepare();
         doReturn(FAILED).when(fixture.service()).extractViaTavily(PAGE);
         when(fixture.client().get(eq(PAGE), any(), any(), anyInt())).thenThrow(new IOException("source unavailable"));
-        assertFalse(JSON.readTree(fixture.service().extract(PAGE)).path("success").asBoolean());
+        JsonNode result = JSON.readTree(fixture.service().extract(PAGE));
+        assertFalse(result.path("success").asBoolean());
+        assertTrue(result.path("error").asText().contains("DEEPSEEK_API_KEY"));
         verify(fixture.client()).get(eq(PAGE), any(), any(), anyInt());
         verifyNoMoreInteractions(fixture.client());
     }

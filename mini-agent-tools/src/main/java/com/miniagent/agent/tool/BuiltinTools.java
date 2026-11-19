@@ -77,6 +77,8 @@ public class BuiltinTools {
     private  NetworkGuard networkGuard;
     @Autowired
     private  CapabilityRegistry capabilityRegistry;
+    @Autowired(required = false)
+    private FileChangeLedger fileChangeLedger;
 
     /**
      * 出网统一走这个客户端：它手动处理重定向，**每一跳**都重新过 {@link NetworkGuard}，
@@ -327,7 +329,7 @@ public class BuiltinTools {
 
     private void registerFileTools() {
         // 使用新的实体类注册方式
-        registry.register("read_file", "读取文件内容",
+        registry.register("read_file", "读取文件内容。默认按行分页；若提示某行被截断，使用 offset 指定该行号、limit=1，并通过 char_offset/char_limit 按行内字符范围续读。返回结果会标明是否完整，不能把截断片段当作完整文件证据。",
                 ReadFileParams.class,
                 params -> {
                     // 缓存命中检查
@@ -337,9 +339,10 @@ public class BuiltinTools {
                         log.debug("read_file 缓存命中: {}", cacheKey);
                         return cached;
                     }
-                    String result = readFile(params.getPath(), 
-                                          params.getOffsetOrDefault(), 
-                                          params.getLimitOrDefault());
+                    String result = readFile(params.getPath(),
+                            params.getOffsetOrDefault(), params.getLimitOrDefault(),
+                            params.hasCharRange(), params.getCharOffsetOrDefault(),
+                            params.getCharLimitOrDefault());
                     toolResultCache.put(cacheKey, result);
                     return result;
                 });
@@ -355,7 +358,8 @@ public class BuiltinTools {
                         + "回复时请原样用 ![说明](url)，不要改写成相对路径或本地绝对路径，"
                         + "工作区没有静态资源映射，只有这个 url 能加载。\n"
                         + "【大文件必读】单轮输出有长度上限，超长文件（如完整的 3D 仿真 HTML、长代码）一次写不完会被截断。"
-                        + "正确做法：第一次用 mode=\"overwrite\"（默认）写开头部分，之后多次用 mode=\"append\" 把剩余内容续写到同一文件，直到写完。不要试图一次塞进全部内容。",
+                        + "正确做法：第一次用 mode=\"overwrite\"（默认）写开头部分，之后多次用 mode=\"append\" 把剩余内容续写到同一文件，直到写完。不要试图一次塞进全部内容。"
+                        + "【安全撤销】当前进程内 write_file/edit_file 的最近一次成功改动有会话级回滚记录；用户明确要求撤销时可用 undo_last_file_change。若文件之后被人工或其他程序改动，撤销会拒绝覆盖。",
                 WriteFileParams.class,
                 params -> {
                     if (Objects.isNull(params.getContent())) {
@@ -372,6 +376,11 @@ public class BuiltinTools {
         registry.register("read_package", "按Java包名读取包下所有源码文件。传包名如 com.miniagent.agent.task，自动解析路径并返回全部代码。分析项目架构时优先用这个，不要逐个 read_file。",
                 ReadPackageParams.class,
                 params -> readPackage(params.getPackageName(), params.getMaxCharsPerFileOrDefault()));
+
+        registry.register("undo_last_file_change",
+                "仅当用户明确要求撤销/回滚最近一次智能体文件修改时使用。按会话和用户隔离；若文件在智能体写入后被外部修改，会拒绝覆盖。仅能撤销 write_file/edit_file 最近一次成功操作。",
+                Map.of("type", "object", "properties", Map.of(), "required", List.of()),
+                args -> undoLastFileChange());
     }
 
     // ==================== HTTP 工具 ====================
@@ -425,7 +434,8 @@ public class BuiltinTools {
         // edit_file：锚点替换，改已有文件只传 diff，不重发整文件。
         registry.register("edit_file",
                 "精确编辑已有文件：把 oldString 替换为 newString。修改已存在的文件用这个，不要用 write_file 重写整个文件。" +
-                "oldString 必须与文件中的原文逐字符一致（含缩进），且默认必须唯一匹配——不唯一时请在 oldString 里多带几行上下文。删除内容时 newString 传空字符串。",
+                "oldString 必须与文件中的原文逐字符一致（含缩进），且默认必须唯一匹配——不唯一时请在 oldString 里多带几行上下文。删除内容时 newString 传空字符串。"
+                        + "当前进程内最近一次成功改动可在用户明确要求时通过 undo_last_file_change 安全撤销；后续外部修改会触发冲突保护。",
                 EditFileParams.class,
                 params -> editFile(params.getPath(), 
                                  params.getOldString(), 
@@ -579,6 +589,8 @@ public class BuiltinTools {
         if (oldStr.equals(newStr)) {
             return "{\"error\":\"old_string 与 new_string 相同，无需编辑\"}";
         }
+        FileChangeLedger.Snapshot undoSnapshot = null;
+        boolean undoRecorded = false;
         try {
             Path target = resolveSearchPath(path);
             if (!Files.exists(target)) {
@@ -599,7 +611,21 @@ public class BuiltinTools {
                     : content.substring(0, content.indexOf(oldStr)) + newStr
                       + content.substring(content.indexOf(oldStr) + oldStr.length());
 
+            undoSnapshot = fileChangeLedger == null ? null : fileChangeLedger.capture(target);
+            if (undoSnapshot != null && !undoSnapshot.accepted())
+                return errorJson(ToolErrorCode.CONFLICT, undoSnapshot.error());
+            if (updated.getBytes(StandardCharsets.UTF_8).length > 8L * 1024 * 1024)
+                return errorJson(ToolErrorCode.CONFLICT, "编辑结果超过安全回滚快照上限 8 MiB");
+            if (fileChangeLedger != null && undoSnapshot != null) {
+                String conflict = fileChangeLedger.verifyUnchanged(undoSnapshot, content.getBytes(StandardCharsets.UTF_8));
+                if (conflict != null) return errorJson(ToolErrorCode.CONFLICT, conflict);
+            }
+
             Files.writeString(target, updated, StandardCharsets.UTF_8);
+            if (fileChangeLedger != null && undoSnapshot != null) {
+                fileChangeLedger.record(undoSnapshot, updated.getBytes(StandardCharsets.UTF_8));
+                undoRecorded = true;
+            }
             invalidateReadCache(path);
             // 更新（不是清空）读观察：让 read → edit → edit 这类连续增量编辑继续放行。
             rememberWrite(target);
@@ -609,7 +635,19 @@ public class BuiltinTools {
                     + "\",\"replaced\":" + replaced + "}";
         } catch (Exception e) {
             return "{\"error\":\"编辑文件失败: " + e.getMessage() + "\"}";
+        } finally {
+            if (!undoRecorded && fileChangeLedger != null) fileChangeLedger.cancel(undoSnapshot);
         }
+    }
+
+    private String undoLastFileChange() {
+        if (fileChangeLedger == null) return "{\"error\":\"文件回滚能力当前不可用\"}";
+        String result = fileChangeLedger.undoLast();
+        if (result.contains("\"success\":true")) {
+            toolResultCache.clear();
+            readObservations.clear();
+        }
+        return result;
     }
 
     private static int countOccurrences(String haystack, String needle) {
@@ -1146,8 +1184,19 @@ public class BuiltinTools {
     }
 
     private static final int READ_LINE_CAP = 4000;
+    private static final int READ_CHAR_RANGE_CAP = 8000;
+
+    private record ReadLineSlice(String text, int startOffset, int totalChars,
+                                 boolean truncatedBefore, boolean truncatedAfter) {
+        boolean truncated() { return truncatedBefore || truncatedAfter; }
+    }
 
     private String readFile(String path, int offset, int limit) {
+        return readFile(path, offset, limit, false, 0, READ_CHAR_RANGE_CAP);
+    }
+
+    private String readFile(String path, int offset, int limit, boolean charRange,
+                            int charOffset, int charLimit) {
         try {
             Path target = resolveReadPath(path);
             if (!Files.exists(target)) {
@@ -1155,28 +1204,59 @@ public class BuiltinTools {
             }
             int from = Math.max(1, offset);
             int maxLines = Math.max(0, limit);
+            if (charRange && maxLines != 1) {
+                return errorJson(ToolErrorCode.INVALID_ARGUMENT,
+                        "char_offset/char_limit 仅支持 limit=1；请用 offset 指定目标行号");
+            }
+            int requestedCharOffset = Math.max(0, charOffset);
+            int requestedCharLimit = Math.max(1, Math.min(READ_CHAR_RANGE_CAP, charLimit));
             StringBuilder sb = new StringBuilder();
             int lineNo = 0;
             int written = 0;
             boolean hitLimit = false;
+            boolean lineTruncated = false;
+            List<String> truncatedLines = new ArrayList<>();
+            int returnedCharOffset = charRange ? requestedCharOffset : 0;
             try (var reader = Files.newBufferedReader(target, StandardCharsets.UTF_8)) {
-                String line;
-                while ((line = readLineCapped(reader, READ_LINE_CAP)) != null) {
+                while (true) {
+                    if (written >= maxLines) {
+                        reader.mark(1);
+                        if (reader.read() >= 0) hitLimit = true;
+                        reader.reset();
+                        break;
+                    }
+                    int sliceOffset = charRange && written == 0 ? requestedCharOffset : 0;
+                    int sliceLimit = charRange && written == 0 ? requestedCharLimit : READ_LINE_CAP;
+                    ReadLineSlice line = readLineSlice(reader, sliceOffset, sliceLimit);
+                    if (line == null) break;
                     lineNo++;
                     if (lineNo < from) {
                         continue;
                     }
-                    if (written >= maxLines) {
-                        // 行数上限截断：文件后面还有内容没读，这条观察不能当整文件依据。
-                        hitLimit = true;
-                        break;
+                    if (charRange && lineNo == from && requestedCharOffset > line.totalChars()) {
+                        return errorJson(ToolErrorCode.INVALID_ARGUMENT,
+                                "char_offset=" + requestedCharOffset + " 超出目标行长度 total_chars="
+                                        + line.totalChars());
                     }
-                    sb.append(lineNo).append('|').append(line).append('\n');
+                    sb.append(lineNo).append('|').append(line.text());
+                    if (line.truncated()) {
+                        lineTruncated = true;
+                        int returnedChars = line.text().codePointCount(0, line.text().length());
+                        sb.append(" [read_file 行内截断：char_offset=").append(line.startOffset())
+                                .append("，已返回=").append(returnedChars)
+                                .append("，total_chars=").append(line.totalChars())
+                                .append("，next_char_offset=")
+                                .append(line.startOffset() + returnedChars).append(']');
+                        truncatedLines.add(lineNo + ":" + line.startOffset() + ":"
+                                + line.startOffset() + returnedChars);
+                    }
+                    sb.append('\n');
                     written++;
                 }
             }
-            // 登记读观察：只有「从头读完、未被行数截断」才算整文件观察。
-            rememberRead(target, from > 1 || hitLimit);
+            boolean partial = from > 1 || hitLimit || lineTruncated;
+            // A line cap is a partial read too. Never authorize whole-file overwrite based on a slice.
+            rememberRead(target, partial);
             if (written == 0 && lineNo > 0 && from > lineNo) {
                 return "{\"error\":\"起始行 " + offset + " 超出文件末尾，该文件共 "
                         + lineNo + " 行\"}";
@@ -1184,32 +1264,58 @@ public class BuiltinTools {
             if (written == 0 && lineNo == 0) {
                 return "";
             }
-            return sb.toString();
+            String metadata = "[read_file path=" + target.toAbsolutePath().normalize()
+                    + " line_offset=" + from + " char_offset=" + returnedCharOffset
+                    + " char_limit=" + (charRange ? requestedCharLimit : READ_LINE_CAP)
+                    + " lines_returned=" + written
+                    + " partial=" + partial
+                    + (hitLimit ? " reason=line_limit" : "")
+                    + (truncatedLines.isEmpty() ? "" : " truncated_lines=" + String.join(",", truncatedLines))
+                    + "]\n";
+            return metadata + sb;
         } catch (Exception e) {
             return "{\"error\":\"读取文件失败: " + e.getMessage() + "\"}";
         }
     }
 
-    /** 单行超过上限就截断并丢弃本行剩余字符，避免无换行的大文件把整文件读进内存。 */
-    private static String readLineCapped(java.io.BufferedReader reader, int cap) throws java.io.IOException {
+    /** Reads a bounded Unicode-code-point slice of one physical line without retaining the rest. */
+    private static ReadLineSlice readLineSlice(java.io.BufferedReader reader, int charOffset, int cap)
+            throws java.io.IOException {
         int ch = reader.read();
         if (ch < 0) {
             return null;
         }
         StringBuilder sb = new StringBuilder();
-        boolean capped = false;
+        int totalChars = 0;
+        int returnedChars = 0;
+        int startOffset = Math.max(0, charOffset);
         while (ch >= 0 && ch != '\n') {
-            if (ch != '\r' && sb.length() < cap) {
-                sb.append((char) ch);
-            } else if (ch != '\r') {
-                capped = true;
+            if (ch == '\r') {
+                ch = reader.read();
+                continue;
             }
+
+            int codePoint = ch;
+            if (Character.isHighSurrogate((char) ch)) {
+                reader.mark(1);
+                int low = reader.read();
+                if (low >= 0 && Character.isLowSurrogate((char) low)) {
+                    codePoint = Character.toCodePoint((char) ch, (char) low);
+                } else {
+                    reader.reset();
+                }
+            }
+            if (totalChars >= startOffset && returnedChars < cap) {
+                sb.appendCodePoint(codePoint);
+                returnedChars++;
+            }
+            totalChars++;
             ch = reader.read();
         }
-        if (capped) {
-            sb.append('…');
-        }
-        return sb.toString();
+        boolean truncatedBefore = startOffset > 0;
+        boolean truncatedAfter = totalChars > startOffset + returnedChars;
+        return new ReadLineSlice(sb.toString(), startOffset, totalChars,
+                truncatedBefore, truncatedAfter);
     }
 
     private String readPackage(String packageName, int maxChars) {
@@ -1298,6 +1404,8 @@ public class BuiltinTools {
     }
 
     private String writeFile(String path, String content, boolean append, boolean force) {
+        FileChangeLedger.Snapshot undoSnapshot = null;
+        boolean undoRecorded = false;
         try {
             // 如果 path 只是文件名（无目录分隔符），默认写到 workspace 根；
             // 子 Agent 通过 WorkspaceContext.taskOverride 隔离。
@@ -1305,6 +1413,18 @@ public class BuiltinTools {
             Files.createDirectories(target.getParent());
             // 保留受保护的媒体 URL；不再把旧路径改写成匿名静态资源。
             String finalContent = content;
+            undoSnapshot = fileChangeLedger == null ? null : fileChangeLedger.capture(target);
+            if (undoSnapshot != null && !undoSnapshot.accepted())
+                return errorJson(ToolErrorCode.CONFLICT, undoSnapshot.error());
+            long currentBytes = Files.exists(target) ? Files.size(target) : 0L;
+            long resultingBytes = append ? currentBytes + finalContent.getBytes(StandardCharsets.UTF_8).length
+                    : finalContent.getBytes(StandardCharsets.UTF_8).length;
+            if (resultingBytes > 8L * 1024 * 1024)
+                return errorJson(ToolErrorCode.CONFLICT, "文件结果超过安全回滚快照上限 8 MiB");
+            if (fileChangeLedger != null && undoSnapshot != null) {
+                String conflict = fileChangeLedger.verifyUnchanged(undoSnapshot, null);
+                if (conflict != null) return errorJson(ToolErrorCode.CONFLICT, conflict);
+            }
 
             if (append) {
                 Files.writeString(target, finalContent, StandardCharsets.UTF_8,
@@ -1329,6 +1449,17 @@ public class BuiltinTools {
             } else {
                 Files.writeString(target, finalContent, StandardCharsets.UTF_8);
             }
+            if (fileChangeLedger != null && undoSnapshot != null) {
+                byte[] incoming = finalContent.getBytes(StandardCharsets.UTF_8);
+                byte[] expectedAfter = incoming;
+                if (append) {
+                    byte[] before = undoSnapshot.before();
+                    expectedAfter = java.util.Arrays.copyOf(before, before.length + incoming.length);
+                    System.arraycopy(incoming, 0, expectedAfter, before.length, incoming.length);
+                }
+                fileChangeLedger.record(undoSnapshot, expectedAfter);
+                undoRecorded = true;
+            }
             invalidateReadCache(path);
             rememberWrite(target);
             long totalBytes = Files.size(target);
@@ -1343,6 +1474,8 @@ public class BuiltinTools {
                     + "}";
         } catch (Exception e) {
             return "{\"error\":\"写入文件失败: " + e.getMessage() + "\"}";
+        } finally {
+            if (!undoRecorded && fileChangeLedger != null) fileChangeLedger.cancel(undoSnapshot);
         }
     }
 

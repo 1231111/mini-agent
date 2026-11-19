@@ -18,10 +18,13 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
+import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.text.Normalizer;
 import java.util.Arrays;
@@ -192,9 +195,9 @@ public final class LoginAttemptRateLimitFilter extends OncePerRequestFilter {
                 @Override public void setReadListener(ReadListener listener) { throw new UnsupportedOperationException(); }
             };
         }
-        @Override public java.io.BufferedReader getReader() {
-            return new java.io.BufferedReader(new java.io.InputStreamReader(getInputStream(), getCharacterEncoding() == null
-                    ? StandardCharsets.UTF_8 : java.nio.charset.Charset.forName(getCharacterEncoding())));
+        @Override public BufferedReader getReader() {
+            return new BufferedReader(new InputStreamReader(getInputStream(), getCharacterEncoding() == null
+                    ? StandardCharsets.UTF_8 : Charset.forName(getCharacterEncoding())));
         }
     }
 }

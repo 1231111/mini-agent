@@ -173,7 +173,7 @@
     // ---------- 展示格式化 ----------
     // 三个都是"把后端的物理量翻译成人看的字"，不改变数值本身。
 
-    /** 0 或负数表示不限量 —— 与 tenants.daily_token_limit 的语义完全一致，不做中间换算。 */
+    /** 套餐 token 数仅作参考展示；Agent 不强制执行本地 token 日限额。 */
     function fmtTokens(n) {
         if (n === null || n === undefined) { return '—'; }
         if (Number(n) <= 0) { return '不限量'; }
@@ -255,7 +255,7 @@
         box.appendChild(plan);
 
         var metrics = el('div', 'metrics');
-        metrics.appendChild(metric('每日 token 额度', fmtTokens(view.dailyTokenLimit)));
+        metrics.appendChild(metric('套餐参考 token 数（Agent 不拦截）', fmtTokens(view.dailyTokenLimit)));
         metrics.appendChild(metric('并发任务上限', view.maxConcurrentTasks > 0 ? view.maxConcurrentTasks : '不限'));
         metrics.appendChild(metric('到期时间', fmtExpire(view.expireAt)));
         if (view.sourceOrderNo) {
@@ -321,7 +321,7 @@
             card.appendChild(top);
 
             var ul = el('ul');
-            ul.appendChild(row('每日 token 额度', fmtTokens(p.dailyTokenLimit)));
+            ul.appendChild(row('套餐参考 token 数（Agent 不拦截）', fmtTokens(p.dailyTokenLimit)));
             ul.appendChild(row('并发任务上限', p.maxConcurrentTasks > 0 ? p.maxConcurrentTasks : '不限'));
             ul.appendChild(row('有效期', fmtDuration(p.durationDays)));
             card.appendChild(ul);

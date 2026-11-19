@@ -67,6 +67,20 @@ class LlmJudgeAcceptanceContractTest {
         verifyNoInteractions(model);
     }
 
+    @Test void evidenceManifestReportsActualReadFilesAndPartialRanges() {
+        String evidence = "[receipt=1 tool=read_file]\n"
+                + "[read_file path=C:\\workspace\\BENCHMARK_TASK.md line_offset=1 char_offset=0 char_limit=4000 partial=false]\n"
+                + "requirements\n"
+                + "[read_file path=C:\\workspace\\index.html line_offset=399 char_offset=8000 char_limit=4000 partial=true]\n"
+                + "source slice";
+
+        String manifest = LlmJudgeTodoValidator.evidenceManifest(evidence);
+
+        assertTrue(manifest.contains("BENCHMARK_TASK.md@line=1,char=0,partial=false"), manifest);
+        assertTrue(manifest.contains("index.html@line=399,char=8000,partial=true"), manifest);
+        assertFalse(manifest.contains("C:\\workspace"), "manifest must not log absolute paths");
+    }
+
     @Test void judgeCallsCountAgainstRunTokensAndKeepEffectiveModelRouting() {
         ChatModel fallback = mock(ChatModel.class);
         ChatModel effective = mock(ChatModel.class);
