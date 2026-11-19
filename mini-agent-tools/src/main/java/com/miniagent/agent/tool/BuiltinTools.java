@@ -329,7 +329,7 @@ public class BuiltinTools {
 
     private void registerFileTools() {
         // 使用新的实体类注册方式
-        registry.register("read_file", "读取文件内容",
+        registry.register("read_file", "读取文件内容。默认按行分页；若提示某行被截断，使用 offset 指定该行号、limit=1，并通过 char_offset/char_limit 按行内字符范围续读。返回结果会标明是否完整，不能把截断片段当作完整文件证据。",
                 ReadFileParams.class,
                 params -> {
                     // 缓存命中检查
@@ -339,9 +339,10 @@ public class BuiltinTools {
                         log.debug("read_file 缓存命中: {}", cacheKey);
                         return cached;
                     }
-                    String result = readFile(params.getPath(), 
-                                          params.getOffsetOrDefault(), 
-                                          params.getLimitOrDefault());
+                    String result = readFile(params.getPath(),
+                            params.getOffsetOrDefault(), params.getLimitOrDefault(),
+                            params.hasCharRange(), params.getCharOffsetOrDefault(),
+                            params.getCharLimitOrDefault());
                     toolResultCache.put(cacheKey, result);
                     return result;
                 });
@@ -1183,8 +1184,19 @@ public class BuiltinTools {
     }
 
     private static final int READ_LINE_CAP = 4000;
+    private static final int READ_CHAR_RANGE_CAP = 8000;
+
+    private record ReadLineSlice(String text, int startOffset, int totalChars,
+                                 boolean truncatedBefore, boolean truncatedAfter) {
+        boolean truncated() { return truncatedBefore || truncatedAfter; }
+    }
 
     private String readFile(String path, int offset, int limit) {
+        return readFile(path, offset, limit, false, 0, READ_CHAR_RANGE_CAP);
+    }
+
+    private String readFile(String path, int offset, int limit, boolean charRange,
+                            int charOffset, int charLimit) {
         try {
             Path target = resolveReadPath(path);
             if (!Files.exists(target)) {
@@ -1192,28 +1204,59 @@ public class BuiltinTools {
             }
             int from = Math.max(1, offset);
             int maxLines = Math.max(0, limit);
+            if (charRange && maxLines != 1) {
+                return errorJson(ToolErrorCode.INVALID_ARGUMENT,
+                        "char_offset/char_limit 仅支持 limit=1；请用 offset 指定目标行号");
+            }
+            int requestedCharOffset = Math.max(0, charOffset);
+            int requestedCharLimit = Math.max(1, Math.min(READ_CHAR_RANGE_CAP, charLimit));
             StringBuilder sb = new StringBuilder();
             int lineNo = 0;
             int written = 0;
             boolean hitLimit = false;
+            boolean lineTruncated = false;
+            List<String> truncatedLines = new ArrayList<>();
+            int returnedCharOffset = charRange ? requestedCharOffset : 0;
             try (var reader = Files.newBufferedReader(target, StandardCharsets.UTF_8)) {
-                String line;
-                while ((line = readLineCapped(reader, READ_LINE_CAP)) != null) {
+                while (true) {
+                    if (written >= maxLines) {
+                        reader.mark(1);
+                        if (reader.read() >= 0) hitLimit = true;
+                        reader.reset();
+                        break;
+                    }
+                    int sliceOffset = charRange && written == 0 ? requestedCharOffset : 0;
+                    int sliceLimit = charRange && written == 0 ? requestedCharLimit : READ_LINE_CAP;
+                    ReadLineSlice line = readLineSlice(reader, sliceOffset, sliceLimit);
+                    if (line == null) break;
                     lineNo++;
                     if (lineNo < from) {
                         continue;
                     }
-                    if (written >= maxLines) {
-                        // 行数上限截断：文件后面还有内容没读，这条观察不能当整文件依据。
-                        hitLimit = true;
-                        break;
+                    if (charRange && lineNo == from && requestedCharOffset > line.totalChars()) {
+                        return errorJson(ToolErrorCode.INVALID_ARGUMENT,
+                                "char_offset=" + requestedCharOffset + " 超出目标行长度 total_chars="
+                                        + line.totalChars());
                     }
-                    sb.append(lineNo).append('|').append(line).append('\n');
+                    sb.append(lineNo).append('|').append(line.text());
+                    if (line.truncated()) {
+                        lineTruncated = true;
+                        int returnedChars = line.text().codePointCount(0, line.text().length());
+                        sb.append(" [read_file 行内截断：char_offset=").append(line.startOffset())
+                                .append("，已返回=").append(returnedChars)
+                                .append("，total_chars=").append(line.totalChars())
+                                .append("，next_char_offset=")
+                                .append(line.startOffset() + returnedChars).append(']');
+                        truncatedLines.add(lineNo + ":" + line.startOffset() + ":"
+                                + line.startOffset() + returnedChars);
+                    }
+                    sb.append('\n');
                     written++;
                 }
             }
-            // 登记读观察：只有「从头读完、未被行数截断」才算整文件观察。
-            rememberRead(target, from > 1 || hitLimit);
+            boolean partial = from > 1 || hitLimit || lineTruncated;
+            // A line cap is a partial read too. Never authorize whole-file overwrite based on a slice.
+            rememberRead(target, partial);
             if (written == 0 && lineNo > 0 && from > lineNo) {
                 return "{\"error\":\"起始行 " + offset + " 超出文件末尾，该文件共 "
                         + lineNo + " 行\"}";
@@ -1221,32 +1264,58 @@ public class BuiltinTools {
             if (written == 0 && lineNo == 0) {
                 return "";
             }
-            return sb.toString();
+            String metadata = "[read_file path=" + target.toAbsolutePath().normalize()
+                    + " line_offset=" + from + " char_offset=" + returnedCharOffset
+                    + " char_limit=" + (charRange ? requestedCharLimit : READ_LINE_CAP)
+                    + " lines_returned=" + written
+                    + " partial=" + partial
+                    + (hitLimit ? " reason=line_limit" : "")
+                    + (truncatedLines.isEmpty() ? "" : " truncated_lines=" + String.join(",", truncatedLines))
+                    + "]\n";
+            return metadata + sb;
         } catch (Exception e) {
             return "{\"error\":\"读取文件失败: " + e.getMessage() + "\"}";
         }
     }
 
-    /** 单行超过上限就截断并丢弃本行剩余字符，避免无换行的大文件把整文件读进内存。 */
-    private static String readLineCapped(java.io.BufferedReader reader, int cap) throws java.io.IOException {
+    /** Reads a bounded Unicode-code-point slice of one physical line without retaining the rest. */
+    private static ReadLineSlice readLineSlice(java.io.BufferedReader reader, int charOffset, int cap)
+            throws java.io.IOException {
         int ch = reader.read();
         if (ch < 0) {
             return null;
         }
         StringBuilder sb = new StringBuilder();
-        boolean capped = false;
+        int totalChars = 0;
+        int returnedChars = 0;
+        int startOffset = Math.max(0, charOffset);
         while (ch >= 0 && ch != '\n') {
-            if (ch != '\r' && sb.length() < cap) {
-                sb.append((char) ch);
-            } else if (ch != '\r') {
-                capped = true;
+            if (ch == '\r') {
+                ch = reader.read();
+                continue;
             }
+
+            int codePoint = ch;
+            if (Character.isHighSurrogate((char) ch)) {
+                reader.mark(1);
+                int low = reader.read();
+                if (low >= 0 && Character.isLowSurrogate((char) low)) {
+                    codePoint = Character.toCodePoint((char) ch, (char) low);
+                } else {
+                    reader.reset();
+                }
+            }
+            if (totalChars >= startOffset && returnedChars < cap) {
+                sb.appendCodePoint(codePoint);
+                returnedChars++;
+            }
+            totalChars++;
             ch = reader.read();
         }
-        if (capped) {
-            sb.append('…');
-        }
-        return sb.toString();
+        boolean truncatedBefore = startOffset > 0;
+        boolean truncatedAfter = totalChars > startOffset + returnedChars;
+        return new ReadLineSlice(sb.toString(), startOffset, totalChars,
+                truncatedBefore, truncatedAfter);
     }
 
     private String readPackage(String packageName, int maxChars) {

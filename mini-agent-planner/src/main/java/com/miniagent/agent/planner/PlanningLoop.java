@@ -574,6 +574,7 @@ public class PlanningLoop {
         AcceptedNodeAnswer acceptedAnswer = null;
         int rounds = 0;
         String acceptedCodeReviewHash = "";
+        String unfinishedDetail = "";
         // 只有"图全部通过终验"这一条路会把 completed 置真；其余出口都是"没做完"。
         String unfinishedReason = "NO_READY_NODES";
         while (rounds++ < properties.getMaxOuterRounds()) {
@@ -729,6 +730,16 @@ public class PlanningLoop {
                     }
                     return RunOutcome.blockedOnHuman(
                             "关键步骤等待确认：请在页面点击「确认并继续」。", "AWAITING_CONFIRM");
+                }
+                DependencyBlock blocked = firstPendingBlockedByCancelledDependency(snap.graph());
+                if (blocked != null) {
+                    unfinishedReason = "DEPENDENCY_FAILED";
+                    unfinishedDetail = "后续步骤「" + blocked.node().name() + "」因前置步骤「"
+                            + blocked.dependency().name() + "」未通过验收而保留待处理。";
+                    log.warn("PlanningLoop 后续节点被取消依赖阻塞 session={} node={} dependency={} dependencyStatus={}",
+                            sessionId, blocked.node().id(), blocked.dependency().id(),
+                            blocked.dependency().status());
+                    break;
                 }
                 log.warn("PlanningLoop 无 ready 节点且未全部成功，尝试 REWRITE session={}", sessionId);
                 TaskNode stuck = firstNonSuccess(snap.graph());
@@ -1043,6 +1054,9 @@ public class PlanningLoop {
         }
 
         String unfinishedAnswer = "任务尚未完成，已保留执行进度。";
+        if (StringUtils.isNotBlank(unfinishedDetail)) {
+            unfinishedAnswer += "\n" + unfinishedDetail;
+        }
         // 走到这里说明是"没做完"退出（死锁/恢复耗尽/轮次用尽/配额中止）。
         // 绝不能把这种结果报成完成：上层会据此决定任务状态与"完成率"口径，
         // 附带未完成节点，不将失败或尚未验收的节点散文当成交付结果。
@@ -1640,8 +1654,8 @@ public class PlanningLoop {
         });
     }
 
-    private static String focusBlock(ActionProposal proposal, TaskGraph graph,
-                                     Set<Integer> focusTodos, boolean hard) {
+    static String focusBlock(ActionProposal proposal, TaskGraph graph,
+                              Set<Integer> focusTodos, boolean hard) {
         StringBuilder sb = new StringBuilder();
         sb.append("# ActionProposal（硬闸门=").append(hard).append("）\n");
         sb.append("- proposalId: ").append(proposal.proposalId()).append('\n');
@@ -1691,6 +1705,12 @@ public class PlanningLoop {
                 sb.append(" blockedTools=").append(blocked);
             }
             sb.append(" expected=").append(a.expectedResult()).append('\n');
+            if (a.acceptance().isJudge() || a.acceptance().isValidation()) {
+                sb.append("【本轮验收取证】本节点的语义/验证结论必须由本轮实际工具回执支持。"
+                        + "验收条件涉及源文件时，请在本节点内重新读取并检查对应文件；"
+                        + "此前尝试的记录、对话摘要或 todo.submit 自述不能替代当前回执。"
+                        + "每项条件都要在证据中对应到实际观察，读不到时明确说明未验证。\n");
+            }
         }
         sb.append(MessageConstants.DAG_EVIDENCE_SUBMISSION).append('\n');
         return sb.toString();
@@ -1929,10 +1949,46 @@ public class PlanningLoop {
         if (merged == null || merged.isEmpty()) {
             return rejectRecovery(sessionId, snap, "REPLAN_IDENTITY_CONFLICT");
         }
-        if (!mergeValidationReports(
+        PlanValidationReport validation = mergeValidationReports(
                 planValidator.validate(merged, recoveryPlan, compiled.goal(), compiled.intent()),
-                intentGraphValidator.validate(compiled.intent(), merged)).valid()) {
-            log.warn("运行时 LLM replan 图验收失败（结构或意图）session={}", sessionId);
+                intentGraphValidator.validate(compiled.intent(), merged));
+        TaskGraph rejectedGraph = compiled.graph();
+        int maxReplanRetries = Math.max(0, properties.getMaxReplanRetries());
+        for (int retry = 1; !validation.valid() && retry <= maxReplanRetries; retry++) {
+            log.warn("运行时 LLM replan 图验收失败，提交校正重试 session={} retry={}/{} errors={}",
+                    sessionId, retry, maxReplanRetries, clip(validation.summary(), 1800));
+            String correctionPrompt = correction + "\n\n" + validation.toCorrectionPrompt();
+            try {
+                compiled = goalCompiler.compileWithCorrection(chat, userMessage, recoveryPlan, correctionPrompt,
+                        history == null ? List.of() : history, rejectedGraph);
+            } catch (Exception e) {
+                com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(e);
+                log.warn("运行时 LLM replan 校正编译失败 session={} retry={}/{}: {}",
+                        sessionId, retry, maxReplanRetries, e.getMessage());
+                return rejectRecovery(sessionId, snap, "REPLAN_COMPILATION_FAILED");
+            }
+            if (compiled == null || compiled.degradedCompilation()
+                    || compiled.graph() == null || compiled.graph().isEmpty()) {
+                return rejectRecovery(sessionId, snap, "REPLAN_COMPILATION_INVALID");
+            }
+            waiting = compiled.intent().needsClarification();
+            merged = waiting ? compiled.graph()
+                    : mergeKeepSuccess(snap.graph(), compiled.graph(), snap.recoveryCount() + 1);
+            if (merged == null || merged.isEmpty()) {
+                return rejectRecovery(sessionId, snap, "REPLAN_IDENTITY_CONFLICT");
+            }
+            validation = mergeValidationReports(
+                    planValidator.validate(merged, recoveryPlan, compiled.goal(), compiled.intent()),
+                    intentGraphValidator.validate(compiled.intent(), merged));
+            if (!validation.valid()) {
+                rejectedGraph = compiled.graph();
+            }
+        }
+        if (!validation.valid()) {
+            trace(sessionId, AgentStepNode.GOAL_COMPILED,
+                    recoveryValidationTrace(validation, maxReplanRetries), RunStatus.FAILURE);
+            log.warn("运行时 LLM replan 校正重试耗尽，保留原执行图 session={} retries={} errors={}",
+                    sessionId, maxReplanRetries, clip(validation.summary(), 1800));
             return rejectRecovery(sessionId, snap, "REPLAN_VALIDATION_FAILED");
         }
         Goal nextGoal = compiled.goal() != null ? compiled.goal() : snap.goal();
@@ -1974,6 +2030,34 @@ public class PlanningLoop {
             metrics.casConflict();
             return rejectRecovery(sessionId, snap, "STALE_EXECUTION");
         }
+    }
+
+    private static String recoveryValidationTrace(PlanValidationReport validation, int retries) {
+        var detail = PlannerStateJson.MAPPER.createObjectNode();
+        detail.put("accepted", false);
+        detail.put("reason", "REPLAN_VALIDATION_FAILED");
+        detail.put("correctionRetries", retries);
+        detail.put("summary", clip(validation == null ? "missing validation report" : validation.summary(), 1800));
+        if (validation != null) {
+            var errors = detail.putArray("errors");
+            validation.errors().stream().limit(6).forEach(error -> {
+                var item = errors.addObject();
+                item.put("type", error.type().name());
+                item.put("nodeId", clip(error.nodeId(), 120));
+                item.put("message", clip(error.message(), 240));
+                item.put("suggestion", clip(error.suggestion(), 200));
+            });
+            detail.put("omittedErrors", Math.max(0, validation.errors().size() - 6));
+            var warnings = detail.putArray("warnings");
+            validation.warnings().stream().limit(6).forEach(warning -> {
+                var item = warnings.addObject();
+                item.put("type", warning.type().name());
+                item.put("nodeId", clip(warning.nodeId(), 120));
+                item.put("message", clip(warning.message(), 240));
+            });
+            detail.put("omittedWarnings", Math.max(0, validation.warnings().size() - 6));
+        }
+        return detail.toString();
     }
 
     private static RecoveryContinuation recoveryContinuation(StateSnapshot waiting) {
@@ -2124,6 +2208,23 @@ public class PlanningLoop {
         for (TaskNode n : graph.nodes()) {
             if (n.status() != TaskNodeStatus.SUCCESS && n.status() != TaskNodeStatus.CANCELLED) {
                 return n;
+            }
+        }
+        return null;
+    }
+
+    private record DependencyBlock(TaskNode node, TaskNode dependency) {}
+
+    /** Do not spend recovery attempts cancelling descendants of an already-cancelled prerequisite. */
+    private static DependencyBlock firstPendingBlockedByCancelledDependency(TaskGraph graph) {
+        if (graph == null) return null;
+        for (TaskNode node : graph.nodes()) {
+            if (node.status() != TaskNodeStatus.PENDING) continue;
+            for (String dependencyId : node.dependsOn()) {
+                TaskNode dependency = graph.byId(dependencyId);
+                if (dependency != null && dependency.status() == TaskNodeStatus.CANCELLED) {
+                    return new DependencyBlock(node, dependency);
+                }
             }
         }
         return null;

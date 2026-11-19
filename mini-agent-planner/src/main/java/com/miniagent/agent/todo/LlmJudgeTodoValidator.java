@@ -26,7 +26,10 @@ import java.util.Objects;
 import java.util.UUID;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import org.apache.commons.lang3.StringUtils;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 可选语义裁判：done_when = llm_judge:&lt;评判标准&gt;
@@ -37,6 +40,9 @@ import org.apache.commons.lang3.StringUtils;
 @Component
 @Order(200)
 public class LlmJudgeTodoValidator implements TodoStepValidator {
+
+    private static final Pattern READ_FILE_RECEIPT = Pattern.compile(
+            "(?i)\\[read_file path=(.*?) line_offset=(\\d+) char_offset=(\\d+).*?partial=(true|false)");
 
     @Autowired
     private ChatModel chatModel;
@@ -150,6 +156,8 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
         if (StringUtils.isBlank(payload)) {
             return "llm_judge 无法读取 evidence 内容";
         }
+        log.info("llm_judge evidence manifest chars={} sha256={} receipts={}",
+                payload.length(), evidenceSha256(payload), evidenceManifest(payload));
         // File acceptance reads are bounded at 48k chars.  Reject only when
         // that bounded payload itself is exceeded; the following context
         // budget check remains the authoritative per-model guard.
@@ -253,5 +261,29 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
         String hinted = filePathInEvidence(ev);
         // A declared file that cannot be read must fail; its path or receipt is not its contents.
         return hinted == null ? ev : AcceptanceEvidenceFiles.readText(hinted);
+    }
+
+    static String evidenceManifest(String payload) {
+        if (StringUtils.isBlank(payload)) return "none";
+        Matcher matcher = READ_FILE_RECEIPT.matcher(payload);
+        LinkedHashSet<String> receipts = new LinkedHashSet<>();
+        while (matcher.find()) {
+            String path = matcher.group(1).trim();
+            int slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+            String name = slash >= 0 ? path.substring(slash + 1) : path;
+            receipts.add(name + "@line=" + matcher.group(2) + ",char=" + matcher.group(3)
+                    + ",partial=" + matcher.group(4).toLowerCase(java.util.Locale.ROOT));
+        }
+        return receipts.isEmpty() ? "none" : String.join(";", receipts);
+    }
+
+    private static String evidenceSha256(String payload) {
+        try {
+            return java.util.HexFormat.of().formatHex(
+                    java.security.MessageDigest.getInstance("SHA-256")
+                            .digest(payload.getBytes(StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 unavailable", impossible);
+        }
     }
 }

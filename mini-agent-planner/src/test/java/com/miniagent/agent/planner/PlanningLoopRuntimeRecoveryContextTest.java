@@ -3,6 +3,7 @@ package com.miniagent.agent.planner;
 import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.core.NodeExecutor;
 import com.miniagent.agent.permission.PermissionContext;
+import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.tool.CapabilityRegistry;
 import com.miniagent.agent.tool.ToolErrorCode;
@@ -23,7 +24,9 @@ import org.mockito.ArgumentCaptor;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -63,6 +66,106 @@ class PlanningLoopRuntimeRecoveryContextTest {
         assertTrue(f.store.events(SESSION).stream().anyMatch(event ->
                 event.type() == DomainEventType.RECOVERY_APPLIED && Boolean.TRUE.equals(event.payload().get("llmReplan"))));
         assertEquals("NO_READY".equals(entrance) ? 1 : 2, invocations(f.executor));
+    }
+
+    @Test
+    void runtimeRecoveryRetriesInvalidGraphWithValidatorFeedbackThenAppliesValidGraph() throws Exception {
+        Fixture f = fixture(new PlannerStateStore(), "STEP_FAILURE", FailureClass.REWRITE_GRAPH, 1);
+        when(f.executor.execute(any(), anyString(), anyString(), any(), anyList(), anyInt(), any(), any()))
+                .thenReturn(failure(), success());
+        ChatModel model = mock(ChatModel.class);
+        when(model.chat(any(ChatRequest.class))).thenReturn(
+                response(lowLevelNodeJson()), response(json(false, false)));
+
+        PlanningLoop.RunOutcome result = run(f, model, "继续", HISTORY);
+
+        assertTrue(result.goalSatisfied(), result.reason() + ": " + result.answer());
+        ArgumentCaptor<ChatRequest> requests = ArgumentCaptor.forClass(ChatRequest.class);
+        verify(model, times(2)).chat(requests.capture());
+        String correction = ((UserMessage) requests.getAllValues().get(1).messages().getLast()).contents().stream()
+                .filter(TextContent.class::isInstance).map(TextContent.class::cast).map(TextContent::text)
+                .collect(java.util.stream.Collectors.joining("\n"));
+        assertTrue(correction.contains("LOW_LEVEL_NODE_NAME"), correction);
+        assertTrue(correction.contains("读取文件「notes.txt」"), correction);
+        StateSnapshot completed = f.store.get(SESSION).orElseThrow();
+        assertEquals(f.originalCompleted, completed.graph().byId("completed"));
+        assertEquals(EXECUTION, completed.executionId());
+        assertTrue(f.store.events(SESSION).stream().anyMatch(event ->
+                event.type() == DomainEventType.RECOVERY_APPLIED && Boolean.TRUE.equals(event.payload().get("llmReplan"))));
+        assertEquals(2, invocations(f.executor), "执行原失败节点一次，再执行修正图中的剩余节点");
+    }
+
+    @Test
+    void runtimeRecoveryExhaustionKeepsPreReplanSnapshotAndRecordsValidationErrors() throws Exception {
+        Fixture f = fixture(new PlannerStateStore(), "STEP_FAILURE", FailureClass.REWRITE_GRAPH, 1);
+        when(f.executor.execute(any(), anyString(), anyString(), any(), anyList(), anyInt(), any(), any()))
+                .thenReturn(failure());
+        com.miniagent.agent.trace.TraceRecorder traceRecorder = mock(com.miniagent.agent.trace.TraceRecorder.class);
+        f.loop.setTraceRecorder(traceRecorder);
+        ChatModel model = mock(ChatModel.class);
+        AtomicReference<StateSnapshot> beforeReplan = new AtomicReference<>();
+        when(model.chat(any(ChatRequest.class))).thenAnswer(call -> {
+            beforeReplan.compareAndSet(null, f.store.get(SESSION).orElseThrow());
+            return response(lowLevelNodeJson());
+        });
+
+        PlanningLoop.RunOutcome result = run(f, model, "继续", HISTORY);
+
+        assertEquals("REPLAN_VALIDATION_FAILED", result.reason());
+        verify(model, times(2)).chat(any(ChatRequest.class));
+        assertEquals(beforeReplan.get(), f.store.get(SESSION).orElseThrow(),
+                "validation retries may not mutate the stored graph until a candidate is accepted");
+        assertEquals(f.originalCompleted, beforeReplan.get().graph().byId("completed"));
+        assertEquals(1, invocations(f.executor), "a rejected recovery graph must not trigger another action");
+        assertFalse(f.store.events(SESSION).stream().anyMatch(event ->
+                event.type() == DomainEventType.RECOVERY_APPLIED && Boolean.TRUE.equals(event.payload().get("llmReplan"))));
+        ArgumentCaptor<String> traceContent = ArgumentCaptor.forClass(String.class);
+        verify(traceRecorder).recordNode(eq(SESSION), eq(0), eq(AgentStepNode.GOAL_COMPILED.name()),
+                traceContent.capture(), eq("FAILURE"), eq(0L));
+        assertTrue(traceContent.getValue().contains("LOW_LEVEL_NODE_NAME"), traceContent.getValue());
+    }
+
+    @Test
+    void canceledPrerequisiteStopsWithRootCauseAndLeavesDescendantsPending() {
+        PlannerProperties properties = new PlannerProperties();
+        properties.setMaxOuterRounds(8);
+        properties.setMaxReplanRetries(0);
+        PlannerStateStore store = new PlannerStateStore();
+        Goal goal = new Goal("goal", OBJECTIVE, "", Map.of(), List.of(), List.of());
+        TaskNode failed = node("failed-root", TaskNodeStatus.CANCELLED, List.of(), "failed-output")
+                .withError("recovery_exhausted");
+        TaskNode pending = node("blocked-child", TaskNodeStatus.PENDING, List.of("failed-root"), "child-output");
+        StateSnapshot initial = store.init(SESSION, EXECUTION, goal, new TaskGraph(List.of(failed, pending)));
+        StateSnapshot exhausted = store.commit(SESSION, initial.version(), initial.withRecoveryInc()
+                .withRecoveryInc().withRecoveryInc());
+        Fixture f = components(properties, store, null);
+
+        PlanningLoop.RunOutcome result = run(f, mock(ChatModel.class), "继续", HISTORY);
+
+        assertEquals("DEPENDENCY_FAILED", result.reason());
+        assertTrue(result.answer().contains("failed-root"), result.answer());
+        StateSnapshot retained = store.get(SESSION).orElseThrow();
+        assertEquals(TaskNodeStatus.CANCELLED, retained.graph().byId("failed-root").status());
+        assertEquals(TaskNodeStatus.PENDING, retained.graph().byId("blocked-child").status(),
+                "a descendant that never ran must remain pending");
+        assertEquals(exhausted.recoveryCount(), retained.recoveryCount());
+        verifyNoInteractions(f.executor);
+    }
+
+    @Test
+    void semanticAcceptanceFocusRequiresFreshCurrentTurnReceipts() {
+        TaskNode node = new TaskNode("inspect", "确认游戏逻辑与验收要求", "file_read",
+                List.of(), List.of(), List.of(), TaskNodeStatus.READY, 50,
+                DoneWhen.judge("检查 BENCHMARK_TASK.md 与 index.html"), "", "", 0, "");
+        ActionSpec action = new ActionSpec("inspect-action", "inspect", "read_file", Map.of(),
+                "llm_judge:检查 BENCHMARK_TASK.md 与 index.html", "");
+        ActionProposal proposal = new ActionProposal("proposal", 1, EXECUTION, List.of(action));
+
+        String focus = PlanningLoop.focusBlock(proposal, new TaskGraph(List.of(node)), Set.of(), true);
+
+        assertTrue(focus.contains("本轮实际工具回执"), focus);
+        assertTrue(focus.contains("此前尝试"), focus);
+        assertTrue(focus.contains("index.html"), focus);
     }
 
     @Test
@@ -199,10 +302,20 @@ class PlanningLoopRuntimeRecoveryContextTest {
 
     private static Fixture fixture(PlannerStateStore store, String entrance, FailureClass failureClass,
                                    String completedName) {
+        return fixture(store, entrance, failureClass, completedName, 0);
+    }
+
+    private static Fixture fixture(PlannerStateStore store, String entrance, FailureClass failureClass,
+                                   int maxReplanRetries) {
+        return fixture(store, entrance, failureClass, "completed", maxReplanRetries);
+    }
+
+    private static Fixture fixture(PlannerStateStore store, String entrance, FailureClass failureClass,
+                                   String completedName, int maxReplanRetries) {
         PlannerProperties properties = new PlannerProperties();
         properties.setMaxOuterRounds(8);
         properties.setMaxRecoveries(3);
-        properties.setMaxReplanRetries(0);
+        properties.setMaxReplanRetries(maxReplanRetries);
         properties.setCompilerRetry(0);
         TaskNode completed = new TaskNode("completed", completedName, "web", List.of(), List.of(),
                 List.of("completed-evidence"), TaskNodeStatus.SUCCESS, 50, DoneWhen.note(), "", "", 0, "")
@@ -282,6 +395,13 @@ class PlanningLoopRuntimeRecoveryContextTest {
             finish.putArray("outputs").add("verification-evidence");
             finish.putObject("doneWhen").put("type", "note_required");
         }
+        return root.toString();
+    }
+
+    private static String lowLevelNodeJson() throws Exception {
+        var root = PlannerStateJson.MAPPER.readTree(json(false, false));
+        ((com.fasterxml.jackson.databind.node.ObjectNode) root.path("nodes").get(0))
+                .put("name", "读取文件「notes.txt」");
         return root.toString();
     }
 
