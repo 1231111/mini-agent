@@ -57,27 +57,38 @@ class DbTenantTokenQuotaTest {
     }
 
     @Test
-    void preRunCheckRejectsAnExhaustedMemberEvenWhenTenantHasBudget() {
+    void preRunCheckDoesNotApplyTenantOrUserTokenCeilings() {
+        when(tenantUsage.tokenCount(TENANT_ID, TODAY)).thenReturn(Optional.of(1_000L));
         when(userUsage.tokenCount(USER_ID, TODAY)).thenReturn(Optional.of(100L));
 
         var decision = quota.check(TENANT_ID, USER_ID);
 
-        assertFalse(decision.allowed());
-        assertEquals(100L, decision.usedTokens());
-        assertEquals(100L, decision.limitTokens());
+        assertTrue(decision.allowed());
+        assertEquals(1_000L, decision.usedTokens());
+        assertEquals(0L, decision.limitTokens());
         verify(tenantUsage, never()).increment(any(), any(), anyLong());
     }
 
     @Test
-    void runtimeConsumptionAtomicallyCountsTheFullResponseAtBothLevelsBeforeDenying() {
+    void runtimeConsumptionAtomicallyCountsUsageWithoutApplyingEitherTokenCeiling() {
+        Tenant tenant = tenants.findById(TENANT_ID).orElseThrow();
+        tenant.setDailyTokenLimit(60L);
         var decision = quota.consume(TENANT_ID, USER_ID, 20L);
 
-        assertFalse(decision.allowed(), "the user has crossed their own daily limit");
+        assertTrue(decision.allowed(), "local token ceilings are not enforced");
         assertEquals(110L, decision.usedTokens());
-        assertEquals(100L, decision.limitTokens());
+        assertEquals(0L, decision.limitTokens());
         verify(tenants).findByIdForUpdate(TENANT_ID);
         verify(users).findByIdForUpdate(USER_ID);
         verify(tenantUsage).increment(TENANT_ID, TODAY, 20L);
         verify(userUsage).increment(USER_ID, TODAY, 20L);
+    }
+
+    @Test
+    void disabledUserIsStillRejectedEvenThoughTokenCeilingsAreIgnored() {
+        User user = users.findById(USER_ID).orElseThrow();
+        user.setEnabled(false);
+
+        assertFalse(quota.check(TENANT_ID, USER_ID).allowed());
     }
 }

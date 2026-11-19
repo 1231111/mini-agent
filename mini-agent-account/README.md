@@ -129,19 +129,15 @@ Agent 的 `V2__production_security_and_usage.sql` 里是裸 `CREATE TABLE tenant
 
 响应里没有 token 字段，这不是缺项。token 由桌面端自己签。本服务只回答「这个用户名+密码对应哪个身份」（`data.userId` / `username` / `displayName` / `role`）。
 
-### 会员等级 → agent 的翻译只有一行
+### token 限额由模型服务商执行
 
-`MembershipService.applyPlan` 把 `membership_plans.daily_token_limit` 写进**用户自己那个 tenant** 的 `tenants.daily_token_limit`。
-
-agent 侧的配额闸门 `DbTenantTokenQuota.check/consume(tenantId)` 只读这一列，它不知道会员、订单、套餐的存在——**agent 侧一行代码都不用改**，而本服务的表结构和业务语义可以任意演进。
-
-替代方案是让 agent 也认识「会员等级」然后自己按等级算配额。那样每加一个等级维度（并发数、可用模型）都要改 agent 的配额代码，而且配额在两侧各算一遍，迟早会出现「界面显示一个值、实际卡在另一个值」。
+Agent 不强制执行租户或用户的 token 日限额。用户配置的模型 API key 由对应服务商按其账户策略限流和计费。`membership_plans.daily_token_limit` 与 `tenants.daily_token_limit` 保留作兼容/展示元数据，不是 Agent 的执行上限，也不是计费依据。
 
 ### 用量明细
 
-`membership_usage_events` 每次 LLM 调用一行：`input_tokens`、`output_tokens`、`reported_at`。请求次数是行数，不按天合并。客户机每次模型调用成功后，用影子用户的 `users.external_id`（云端用户 id）异步 `POST /api/membership/usage`。本服务不读 agent 的 `tenant_daily_usage`。
+`membership_usage_events` 每次 LLM 调用一行：`input_tokens`、`output_tokens`、`reported_at`。请求次数是行数，不按天合并。客户机每次模型调用成功后，用影子用户的 `users.external_id`（云端用户 id）异步 `POST /api/membership/usage`。本服务不读 agent 的 `tenant_daily_usage`。此数据仅用于展示；异步上报可能延迟或丢失，不能用于计费或配额判定。MiniAgent 不强制执行套餐 token 日限额，模型服务商按用户配置的 API Key 和账户策略执行其自身限制。
 
-日切时区是 `agent.quota.zone-id`，默认 `Asia/Shanghai`，和客户机配额同一天。门户 `GET /api/portal/usage` 返回今天的合计，以及含今天在内最近 31 天的每次上报，最多 100 条，新的在前。今天的合计不受这 100 条限制。
+日切时区是 `agent.quota.zone-id`，默认 `Asia/Shanghai`。门户 `GET /api/portal/usage` 返回今天的合计，以及含今天在内最近 31 天的每次上报，最多 100 条，新的在前。今天的合计不受这 100 条限制。
 
 客户机没配 `ACCOUNT_INTERNAL_KEY`（或和账号服务不一致）时，上报直接跳过，门户数字停在 0。本地注册、没有 `external_id` 的用户也不会上报。
 
@@ -157,7 +153,7 @@ users 表（同一个库）
   id=2  username=alice  external_id=1       tenant_id=<system 租户>    ← agent 建的第二条
 ```
 
-后果是同一人两条记录，而会员配额写在 **id=1 的租户**上、agent 读的是 **id=2 的租户**——症状是「买了会员但额度没变」，且日志里一切正常。
+后果是同一人两条记录，账号侧订阅与 Agent 侧身份/用量无法可靠对应；请确保云端服务指向同一个数据库，桌面客户端保持独立库映射。
 
 `application.yml` 里因此写着：
 
@@ -208,7 +204,7 @@ agent:
 | # | 事项 | 为什么现在没做 |
 | --- | --- | --- |
 | 1 | `membership_plans.max_concurrent_tasks` **尚未接线** | 列已落库，但 agent 侧的 `agent.concurrency.max-tasks-per-user` 仍是配置里的固定值。接线要在 agent 侧读它，属于独立一轮 |
-| 2 | 客户机的会员配额下发 | 客户机的影子用户挂在**本地** `system` 租户上，而会员配额写在**云端库**的租户里——两者不在一个库，配额传不过去。要让 account 的登录响应带上 `dailyTokenLimit`，agent 侧改为「每个云端身份建一个本地租户」并写入该值。改动面涉及 `ShadowUserService` 的租户策略与既有数据 |
+| 2 | 客户机的会员配额下发 | 已按产品决策不再将 account 套餐 token 数同步为本地执行上限；Agent 不做 token 日额度拦截，调用限制由模型服务商按用户配置的 API Key 执行。`membership_usage_events` 仍是尽力上报的展示数据，不是账单或配额真相源。 |
 | 3 | 抽 `mini-agent-common` 的契约子模块 | 本服务只需要 `ApiResponse` 与 `ErrorCode`，却因此背上 onnxruntime(92MB) + tokenizers(18MB) + milvus-sdk-java。**实测：本服务的 fat jar 是 303,414,054 B（289 MB）** —— 一个只做账号的服务不该有这个体积。修法会影响 common 的包结构、波及全部 7 个模块 |
 | 4 | 接入真实支付渠道 | 自助确认到账端点与服务方法已删除；当前支付回调 fail-closed 并返回 503。接入渠道后必须先校验签名、订单、金额和币种，再调用内部入账服务 |
 | 5 | 单元测试 | `AccountAuthService` 的注册边界、`MembershipService` 的幂等与 `applyPlan` 不变量 |

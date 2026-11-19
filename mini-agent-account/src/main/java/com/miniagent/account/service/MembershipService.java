@@ -35,16 +35,11 @@ import java.util.concurrent.ThreadLocalRandom;
 /**
  * 会员等级与充值。
  *
- * <h3>这个类最关键的一个设计：会员等级被翻译成 tenants.daily_token_limit</h3>
+ * <h3>套餐 token 数是展示元数据，不是 Agent 的本地限额</h3>
  *
- * <p>云端 agent 的配额闸门是 {@code DbTenantTokenQuota.check/consume(tenantId)}，
- * 它只读 {@code tenants.daily_token_limit}，不知道"会员"是什么。
- * 所以订阅生效时本服务把这个值写进用户自己那个 tenant ——
- * <b>agent 侧一行代码都不用改</b>，而这个服务的表结构和业务语义可以任意演进。
- *
- * <p>替代方案是让 agent 也认识"会员等级"，然后它自己按等级查表算配额。
- * 那样每加一个等级维度（并发数、可用模型）都要改 agent 的配额代码，
- * 而且配额在两侧各算一遍，迟早会出现"界面显示一个值、实际卡在另一个值"。
+ * <p>Agent 不强制执行租户或用户的 token 日限额。用户配置的模型 API key
+ * 由对应模型服务商按其账户策略限流/计费。会员套餐中的 {@code dailyTokenLimit}
+ * 与租户表中保留的旧字段仅作兼容和展示，不是用量或计费真相源。
  *
  * <h3>用量明细</h3>
  *
@@ -302,8 +297,7 @@ public class MembershipService {
      * 删掉之后"这个人上个月买过什么"就再也查不出来了，而对账恰恰是几个月后的事。
      *
      * <p><b>调用方必须已在事务内</b>：这里先锁住 tenant 行，再完成订阅切换和
-     * 配额写入。拆成多个事务会出现"订阅是新档、配额还是旧档"的中间态，而那个
-     * 中间态恰好就是 agent 读配额的时刻。
+     * 兼容字段写入，避免并发订单让订阅状态出现竞争。
      */
     @Transactional
     public MembershipSubscription applyPlan(Long userId, Long tenantId, MembershipPlan plan,
@@ -341,11 +335,10 @@ public class MembershipService {
         sub.setSourceOrderNo(sourceOrderNo);
         subscriptions.save(sub);
 
-        // 这一步是"会员等级 → agent 认识的东西"的全部内容。
-        // agent 侧的 DbTenantTokenQuota 只读这一列，它不知道会员、订单、套餐的存在。
+        // 保留旧列值以兼容已有部署与 API 响应；Agent 配额实现不再用它拦截请求。
         tenant.setDailyTokenLimit(plan.getDailyTokenLimit());
 
-        log.info("会员生效 userId={} tenantId={} plan={} dailyTokenLimit={} expireAt={} 替换掉的旧订阅={} 条",
+        log.info("会员生效 userId={} tenantId={} plan={} planTokenReference={} expireAt={} 替换掉的旧订阅={} 条",
                 userId, tenantId, plan.getCode(), plan.getDailyTokenLimit(), sub.getExpireAt(), active.size());
         return sub;
     }

@@ -63,8 +63,9 @@ public class DbTenantTokenQuota implements TenantTokenQuota {
         LocalDate today = today();
         long tenantUsed = usage.tokenCount(tenantId, today).orElse(0L);
         long userUsed = userUsage.tokenCount(userId, today).orElse(0L);
-        return decision(tenantUsed < tenant.getDailyTokenLimit() || tenant.getDailyTokenLimit() <= 0,
-                tenantUsed, tenant.getDailyTokenLimit(), userUsed, tenant.getDailyUserTokenLimit(), false);
+        // The agent does not impose its own token ceiling. Usage is still recorded
+        // for observability; the configured model provider/API key owns enforcement.
+        return Decision.unlimited(Math.max(tenantUsed, userUsed));
     }
 
     @Override
@@ -81,10 +82,6 @@ public class DbTenantTokenQuota implements TenantTokenQuota {
         LocalDate today = today();
         long tenantUsed = usage.tokenCount(tenantId, today).orElse(0L);
         long userUsed = userUsage.tokenCount(userId, today).orElse(0L);
-        long tenantLimit = tenant.getDailyTokenLimit();
-        long userLimit = tenant.getDailyUserTokenLimit();
-        boolean wasWithinBothLimits = (tenantLimit <= 0 || tenantUsed < tenantLimit)
-                && (userLimit <= 0 || userUsed < userLimit);
         if (delta > 0) {
             usage.increment(tenantId, today, delta);
             userUsage.increment(userId, today, delta);
@@ -93,27 +90,8 @@ public class DbTenantTokenQuota implements TenantTokenQuota {
             tenantUsed = saturatingAdd(tenantUsed, delta);
             userUsed = saturatingAdd(userUsed, delta);
         }
-        boolean allowed = delta == 0
-                ? (tenantLimit <= 0 || tenantUsed < tenantLimit)
-                        && (userLimit <= 0 || userUsed < userLimit)
-                : wasWithinBothLimits
-                        && (tenantLimit <= 0 || tenantUsed <= tenantLimit)
-                        && (userLimit <= 0 || userUsed <= userLimit);
-        return decision(allowed, tenantUsed, tenantLimit, userUsed, userLimit, delta > 0);
-    }
-
-    private Decision decision(boolean allowed, long tenantUsed, long tenantLimit,
-                              long userUsed, long userLimit, boolean afterConsumption) {
-        boolean tenantExceeded = tenantLimit > 0
-                && (afterConsumption ? tenantUsed > tenantLimit : tenantUsed >= tenantLimit);
-        boolean userExceeded = userLimit > 0
-                && (afterConsumption ? userUsed > userLimit : userUsed >= userLimit);
-        if (tenantExceeded) tenantDenied.increment();
-        if (userExceeded) userDenied.increment();
-        if (tenantExceeded) return new Decision(false, tenantUsed, tenantLimit);
-        if (userExceeded) return new Decision(false, userUsed, userLimit);
-        if (tenantLimit > 0) return new Decision(allowed, tenantUsed, tenantLimit);
-        if (userLimit > 0) return new Decision(allowed, userUsed, userLimit);
+        // Keep daily rows and token counters for usage reporting, but never stop an
+        // Agent run because a local tenant/user token threshold was reached.
         return Decision.unlimited(Math.max(tenantUsed, userUsed));
     }
 
