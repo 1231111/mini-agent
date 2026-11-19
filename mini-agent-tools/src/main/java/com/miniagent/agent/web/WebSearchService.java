@@ -180,6 +180,9 @@ public class WebSearchService {
         if (dateWindow != null) primaryResults = filterDateWindow(primaryResults, dateWindow, requestedLimit);
         else primaryResults = primaryResults.stream().limit(requestedLimit).toList();
         List<SearchResult> usablePrimary = usableSearchResults(primaryResults);
+        if (usablePrimary.isEmpty() && StringUtils.isBlank(deepSeekApiKey)) {
+            log.warn("DeepSeek 搜索降级未执行：未配置 DEEPSEEK_API_KEY");
+        }
         if (!usablePrimary.isEmpty()) {
             try {
                 return buildSuccessResponse(usablePrimary, dateWindow, searchZone,
@@ -220,7 +223,8 @@ public class WebSearchService {
         if (primaryFailure != null) {
             log.error("Web搜索失败: backend={} error={}", backend, primaryFailure.getMessage());
             return buildErrorResponse("搜索失败: " + primaryFailure.getMessage()
-                    + "。请检查 " + backend + " API 密钥是否正确配置。");
+                    + "。请检查 " + backend + " API 密钥是否正确配置。"
+                    + searchFallbackFailureHint());
         }
         try { return buildSuccessResponse(usablePrimary, dateWindow, searchZone); }
         catch (Exception e) { return buildErrorResponse("搜索结果格式化失败: " + e.getMessage()); }
@@ -382,7 +386,7 @@ public class WebSearchService {
             if (response.statusCode() != 200) {
                 String directFailure = "HTTP " + response.statusCode() + " - 无法访问该页面";
                 String fallback = tryDeepSeekFetch(url, providerFallback ? "tavily" : "guarded_http");
-                return fallback == null ? buildErrorResponse(directFailure) : fallback;
+                return fallback == null ? buildErrorResponse(directFailure + extractionFallbackFailureHint()) : fallback;
             }
 
             String html = response.bodyText();
@@ -409,6 +413,9 @@ public class WebSearchService {
             String direct = MAPPER.writeValueAsString(result);
             String providerFallbackResult = tryDeepSeekFetchIfEmpty(url, text,
                     providerFallback ? "tavily" : "guarded_http");
+            if (StringUtils.isBlank(text) && providerFallbackResult == null) {
+                return buildErrorResponse("原页面未提取到正文" + extractionFallbackFailureHint());
+            }
             return providerFallbackResult == null ? direct : providerFallbackResult;
 
         } catch (InterruptedException e) {
@@ -423,29 +430,49 @@ public class WebSearchService {
             return buildErrorResponse("安全拦截: " + e.getMessage());
         } catch (Exception e) {
             log.error("Web抓取失败: url={} error={}", redactSensitive(url), e.getMessage());
-            String fallback = tryDeepSeekFetch(url, "guarded_http");
-            return fallback == null ? buildErrorResponse("抓取失败: " + e.getMessage()) : fallback;
+            try {
+                String fallback = tryDeepSeekFetch(url, "guarded_http");
+                return fallback == null
+                        ? buildErrorResponse("抓取失败: " + e.getMessage() + extractionFallbackFailureHint())
+                        : fallback;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return buildErrorResponse("EXTRACTION_INTERRUPTED", "网页提取已中断，未完成后续回退");
+            } catch (CancellationException cancelled) {
+                return buildErrorResponse("EXTRACTION_CANCELLED", "网页提取已取消，未完成后续回退");
+            } catch (ToolExecutionDeadline.Expired expired) {
+                return buildErrorResponse("EXTRACTION_DEADLINE", "网页提取预算已耗尽，未完成后续回退");
+            }
         }
     }
 
-    private String tryDeepSeekFetchIfEmpty(String url, String content, String previousBackend) {
+    private String searchFallbackFailureHint() {
+        return StringUtils.isBlank(deepSeekApiKey)
+                ? " DeepSeek 搜索降级未执行：未配置 DEEPSEEK_API_KEY。"
+                : " DeepSeek 搜索降级未返回可用结果。";
+    }
+
+    private String extractionFallbackFailureHint() {
+        return StringUtils.isBlank(deepSeekApiKey)
+                ? "；DeepSeek Fetch 回退未执行：未配置 DEEPSEEK_API_KEY"
+                : "；DeepSeek Fetch 回退也未返回可用正文";
+    }
+
+    private String tryDeepSeekFetchIfEmpty(String url, String content, String previousBackend)
+            throws InterruptedException {
         if (StringUtils.isNotBlank(content)) return null;
         return tryDeepSeekFetch(url, previousBackend);
     }
 
     /** Third-party fetching is opt-in and only runs after the guarded local/provider path failed. */
-    private String tryDeepSeekFetch(String url, String previousBackend) {
-        if (StringUtils.isBlank(deepSeekApiKey)) return null;
-        String fallback;
-        try {
-            ensureExtractionActive();
-            fallback = deepSeekFetch(url);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return null;
-        } catch (CancellationException | ToolExecutionDeadline.Expired e) {
+    private String tryDeepSeekFetch(String url, String previousBackend) throws InterruptedException {
+        if (StringUtils.isBlank(deepSeekApiKey)) {
+            log.warn("DeepSeek Fetch 回退未执行：未配置 DEEPSEEK_API_KEY");
             return null;
         }
+        ensureExtractionActive();
+        log.info("主抓取路径未成功，尝试 DeepSeek Fetch: url={}", redactSensitive(url));
+        String fallback = deepSeekFetch(url);
         if (!successfulExtractionResponse(fallback)) return null;
         try {
             ObjectNode result = (ObjectNode) MAPPER.readTree(fallback);

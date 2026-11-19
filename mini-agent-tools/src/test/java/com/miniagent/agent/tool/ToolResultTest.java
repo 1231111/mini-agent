@@ -106,4 +106,19 @@ class ToolResultTest {
         assertEquals(ToolErrorCode.TIMEOUT, r.errorCode());
         assertTrue(r.retriable());
     }
+
+    @Test
+    void deadlineAndCancellationErrorCodesAreNormalizedForRecovery() {
+        ToolResult timeout = ToolResult.fromLegacy(
+                "{\"success\":false,\"error_code\":\"EXTRACTION_DEADLINE\",\"error\":\"网页提取预算已耗尽\"}");
+        assertEquals(ToolErrorCode.TIMEOUT, timeout.errorCode());
+        assertTrue(timeout.retriable());
+        assertTrue(timeout.legacyText().contains("\"status\":\"timeout\""));
+
+        ToolResult cancelled = ToolResult.fromLegacy(
+                "{\"success\":false,\"error_code\":\"SEARCH_CANCELLED\",\"error\":\"网页搜索已取消\"}");
+        assertEquals(ToolErrorCode.CANCELLED, cancelled.errorCode());
+        assertFalse(cancelled.retriable());
+        assertTrue(cancelled.legacyText().contains("\"status\":\"cancelled\""));
+    }
 }

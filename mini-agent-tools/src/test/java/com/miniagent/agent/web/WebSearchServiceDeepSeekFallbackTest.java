@@ -117,6 +117,62 @@ class WebSearchServiceDeepSeekFallbackTest {
     }
 
     @Test
+    void failedTavilyAndDirectExtractStillUseDeepSeekWithinRemainingBudget() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        AtomicReference<String> requestBody = new AtomicReference<>();
+        HttpServer server = server(calls, requestBody,
+                "{\"title\":\"回退标题\",\"content\":\"DeepSeek 正文\"}");
+        NetworkGuard guard = mock(NetworkGuard.class);
+        when(guard.validateUrl(PAGE)).thenReturn(null);
+        GuardedHttpClient direct = mock(GuardedHttpClient.class);
+        when(direct.get(eq(PAGE), any(), any(), anyInt())).thenThrow(new IOException("origin timeout"));
+        try {
+            WebSearchService service = service(base(server), guard, direct);
+            ReflectionTestUtils.setField(service, "configuredBackend", "tavily");
+            doAnswer(invocation -> {
+                Thread.sleep(100);
+                return "{\"success\":false,\"error\":\"Tavily Extract timeout\"}";
+            }).when(service).extractViaTavily(PAGE);
+
+            com.fasterxml.jackson.databind.JsonNode root;
+            try (var ignored = com.miniagent.agent.tool.ToolExecutionDeadline.bind(
+                    com.miniagent.agent.tool.ToolExecutionDeadline.after(2, TimeUnit.SECONDS))) {
+                root = JSON.readTree(service.extract(PAGE));
+            }
+            assertTrue(root.path("success").asBoolean());
+            assertEquals("deepseek_fetch", root.path("extraction_backend").asText());
+            assertEquals("DeepSeek 正文", root.path("content").asText());
+            assertEquals("guarded_http", root.path("fallback_from").asText());
+            assertEquals(1, calls.get());
+            assertEquals(PAGE, JSON.readTree(requestBody.get()).path("url").asText());
+        } finally { server.stop(0); }
+    }
+
+    @Test
+    void cancelledOrExpiredDirectFetchDoesNotStartDeepSeek() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        HttpServer server = server(calls, new AtomicReference<>(),
+                "{\"title\":\"x\",\"content\":\"x\"}");
+        NetworkGuard guard = mock(NetworkGuard.class);
+        when(guard.validateUrl(PAGE)).thenReturn(null);
+        GuardedHttpClient direct = mock(GuardedHttpClient.class);
+        try {
+            WebSearchService service = service(base(server), guard, direct);
+            when(direct.get(eq(PAGE), any(), any(), anyInt())).thenThrow(new CancellationException("cancelled"));
+            var cancelled = JSON.readTree(service.extract(PAGE));
+            assertEquals("EXTRACTION_CANCELLED", cancelled.path("error_code").asText());
+            assertEquals(0, calls.get());
+
+            reset(direct);
+            when(direct.get(eq(PAGE), any(), any(), anyInt()))
+                    .thenThrow(new com.miniagent.agent.tool.ToolExecutionDeadline.Expired());
+            var expired = JSON.readTree(service.extract(PAGE));
+            assertEquals("EXTRACTION_DEADLINE", expired.path("error_code").asText());
+            assertEquals(0, calls.get());
+        } finally { server.stop(0); }
+    }
+
+    @Test
     void cancelledOrExpiredSearchNeverStartsPaidFallback() throws Exception {
         AtomicInteger calls = new AtomicInteger();
         HttpServer server = server(calls, new AtomicReference<>(), "{\"results\":[]}");

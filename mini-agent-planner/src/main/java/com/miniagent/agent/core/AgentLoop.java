@@ -2624,12 +2624,18 @@ public class AgentLoop {
      * 而外层超时在写类工具上被判成「终态未知」→ 整轮中止。</p>
      *
      * <p>{@code actionTimeoutSeconds} 只做<b>收紧</b>（0 = 不封顶）：它表达的是
-     * 「 planner 认为这一步不该超过这么久」，不能反过来放宽工具自身的预算。</p>
+     * 「 planner 认为这一步不该超过这么久」，不能反过来放宽工具自身的预算。
+     * 联网搜索和抓取除外：它们有 provider 回退链，planner 的估算超时不能提前掐断回退。</p>
      */
     private long resolveToolTimeout(String name, String argumentsJson) {
         long tool = toolExecutionGuards.timeoutSeconds(name, argumentsJson);
         int cap = LoopTurnContext.current().actionTimeoutSeconds();
-        if (cap > 0 && cap < tool) {
+        return applyActionTimeoutCap(name, tool, cap);
+    }
+
+    static long applyActionTimeoutCap(String name, long tool, int cap) {
+        boolean hasProviderFallback = "web_search".equals(name) || "web_extract".equals(name);
+        if (!hasProviderFallback && cap > 0 && cap < tool) {
             return cap;
         }
         return tool;
