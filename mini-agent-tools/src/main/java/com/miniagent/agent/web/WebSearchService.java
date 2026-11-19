@@ -90,6 +90,9 @@ public class WebSearchService {
     private NetworkGuard networkGuard;
     @Autowired
     private GuardedHttpClient guardedHttpClient;
+    /** Optional app-layer adapter for endpoint-bound, per-user credentials stored in the DB. */
+    @Autowired(required = false)
+    private DeepSeekCredentialProvider deepSeekCredentialProvider;
 
     // ========== 环境变量配置 ==========
 
@@ -180,9 +183,6 @@ public class WebSearchService {
         if (dateWindow != null) primaryResults = filterDateWindow(primaryResults, dateWindow, requestedLimit);
         else primaryResults = primaryResults.stream().limit(requestedLimit).toList();
         List<SearchResult> usablePrimary = usableSearchResults(primaryResults);
-        if (usablePrimary.isEmpty() && StringUtils.isBlank(deepSeekApiKey)) {
-            log.warn("DeepSeek 搜索降级未执行：未配置 DEEPSEEK_API_KEY");
-        }
         if (!usablePrimary.isEmpty()) {
             try {
                 return buildSuccessResponse(usablePrimary, dateWindow, searchZone,
@@ -194,10 +194,15 @@ public class WebSearchService {
 
         // DeepSeek is a paid fallback: never call it after a usable primary result.
         // Empty DuckDuckGo Instant Answer placeholders are not treated as search results.
-        if (StringUtils.isNotBlank(deepSeekApiKey)) {
+        DeepSeekCredentialProvider.Credential fallbackCredential = resolveDeepSeekCredentials();
+        if (usablePrimary.isEmpty() && fallbackCredential == null) {
+            log.warn("DeepSeek 搜索降级未执行：当前用户和平台均未配置可用的 DeepSeek 凭据");
+        }
+        if (fallbackCredential != null) {
             try {
                 ensureExtractionActive();
-                List<SearchResult> fallback = deepSeekSearch(searchQuery, fetchLimit, query, searchZone);
+                List<SearchResult> fallback = deepSeekSearch(searchQuery, fetchLimit, query, searchZone,
+                        fallbackCredential);
                 if (dateWindow != null) fallback = filterDateWindow(fallback, dateWindow, requestedLimit);
                 else fallback = fallback.stream().limit(requestedLimit).toList();
                 fallback = usableSearchResults(fallback);
@@ -213,9 +218,8 @@ public class WebSearchService {
             } catch (Exception fallbackFailure) {
                 log.warn("DeepSeek 搜索降级失败: type={}", fallbackFailure.getClass().getSimpleName());
                 if (primaryFailure == null) {
-                    // A successful-but-empty primary is a valid empty result, not an error.
-                    try { return buildSuccessResponse(List.of(), dateWindow, searchZone); }
-                    catch (Exception ignored) { return buildErrorResponse("搜索结果格式化失败"); }
+                    return buildErrorResponse("主搜索未返回可用结果，DeepSeek 搜索降级请求失败（"
+                            + fallbackFailure.getClass().getSimpleName() + "）");
                 }
             }
         }
@@ -224,7 +228,11 @@ public class WebSearchService {
             log.error("Web搜索失败: backend={} error={}", backend, primaryFailure.getMessage());
             return buildErrorResponse("搜索失败: " + primaryFailure.getMessage()
                     + "。请检查 " + backend + " API 密钥是否正确配置。"
-                    + searchFallbackFailureHint());
+                    + searchFallbackFailureHint(fallbackCredential != null));
+        }
+        if (usablePrimary.isEmpty() && fallbackCredential == null) {
+            return buildErrorResponse("主搜索未返回可用结果。"
+                    + searchFallbackFailureHint(false));
         }
         try { return buildSuccessResponse(usablePrimary, dateWindow, searchZone); }
         catch (Exception e) { return buildErrorResponse("搜索结果格式化失败: " + e.getMessage()); }
@@ -247,15 +255,16 @@ public class WebSearchService {
     }
 
     private List<SearchResult> deepSeekSearch(String query, int limit, String originalQuestion,
-                                              ZoneId zone) throws Exception {
+                                              ZoneId zone,
+                                              DeepSeekCredentialProvider.Credential credential) throws Exception {
         ObjectNode payload = MAPPER.createObjectNode();
         payload.put("query", query);
         payload.put("count", Math.max(1, Math.min(50, limit)));
         payload.put("need_content", false);
         if (StringUtils.isNotBlank(originalQuestion)) payload.put("ori_question", originalQuestion);
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(normalizeBaseUrl(deepSeekBaseUrl) + "/v1/tools/search"))
-                .header("Authorization", "Bearer " + deepSeekApiKey)
+                .uri(URI.create(normalizeBaseUrl(credential.baseUrl()) + "/v1/tools/search"))
+                .header("Authorization", "Bearer " + credential.apiKey())
                 .header("Content-Type", "application/json")
                 .timeout(searchTimeout(Duration.ofSeconds(8)))
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload)))
@@ -278,13 +287,14 @@ public class WebSearchService {
         return results;
     }
 
-    private String deepSeekFetch(String url) throws InterruptedException {
+    private String deepSeekFetch(String url, DeepSeekCredentialProvider.Credential credential)
+            throws InterruptedException {
         try {
             ObjectNode payload = MAPPER.createObjectNode();
             payload.put("url", url);
             HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(normalizeBaseUrl(deepSeekBaseUrl) + "/v1/tools/fetch"))
-                    .header("Authorization", "Bearer " + deepSeekApiKey)
+                    .uri(URI.create(normalizeBaseUrl(credential.baseUrl()) + "/v1/tools/fetch"))
+                    .header("Authorization", "Bearer " + credential.apiKey())
                     .header("Content-Type", "application/json")
                     .timeout(extractionTimeout(Duration.ofSeconds(12)))
                     .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload)))
@@ -385,8 +395,11 @@ public class WebSearchService {
 
             if (response.statusCode() != 200) {
                 String directFailure = "HTTP " + response.statusCode() + " - 无法访问该页面";
-                String fallback = tryDeepSeekFetch(url, providerFallback ? "tavily" : "guarded_http");
-                return fallback == null ? buildErrorResponse(directFailure + extractionFallbackFailureHint()) : fallback;
+                DeepSeekCredentialProvider.Credential credential = resolveDeepSeekCredentials();
+                String fallback = tryDeepSeekFetch(url, providerFallback ? "tavily" : "guarded_http", credential);
+                return fallback == null
+                        ? buildErrorResponse(directFailure + extractionFallbackFailureHint(credential != null))
+                        : fallback;
             }
 
             String html = response.bodyText();
@@ -411,10 +424,16 @@ public class WebSearchService {
             result.put("content", text);
             result.put("content_length", text.length());
             String direct = MAPPER.writeValueAsString(result);
-            String providerFallbackResult = tryDeepSeekFetchIfEmpty(url, text,
-                    providerFallback ? "tavily" : "guarded_http");
+            DeepSeekCredentialProvider.Credential credential = null;
+            String providerFallbackResult = null;
+            if (StringUtils.isBlank(text)) {
+                credential = resolveDeepSeekCredentials();
+                providerFallbackResult = tryDeepSeekFetch(url,
+                        providerFallback ? "tavily" : "guarded_http", credential);
+            }
             if (StringUtils.isBlank(text) && providerFallbackResult == null) {
-                return buildErrorResponse("原页面未提取到正文" + extractionFallbackFailureHint());
+                return buildErrorResponse("原页面未提取到正文"
+                        + extractionFallbackFailureHint(credential != null));
             }
             return providerFallbackResult == null ? direct : providerFallbackResult;
 
@@ -429,11 +448,13 @@ public class WebSearchService {
             // Do not bypass a blocked redirect by asking a third party to fetch it.
             return buildErrorResponse("安全拦截: " + e.getMessage());
         } catch (Exception e) {
-            log.error("Web抓取失败: url={} error={}", redactSensitive(url), e.getMessage());
+            log.warn("Web抓取主路径失败: url={} error={}", redactSensitive(url), e.getMessage());
             try {
-                String fallback = tryDeepSeekFetch(url, "guarded_http");
+                DeepSeekCredentialProvider.Credential credential = resolveDeepSeekCredentials();
+                String fallback = tryDeepSeekFetch(url, "guarded_http", credential);
                 return fallback == null
-                        ? buildErrorResponse("抓取失败: " + e.getMessage() + extractionFallbackFailureHint())
+                        ? buildErrorResponse("抓取失败: " + e.getMessage()
+                                + extractionFallbackFailureHint(credential != null))
                         : fallback;
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
@@ -446,33 +467,43 @@ public class WebSearchService {
         }
     }
 
-    private String searchFallbackFailureHint() {
-        return StringUtils.isBlank(deepSeekApiKey)
-                ? " DeepSeek 搜索降级未执行：未配置 DEEPSEEK_API_KEY。"
+    private String searchFallbackFailureHint(boolean fallbackConfigured) {
+        return !fallbackConfigured
+                ? " DeepSeek 搜索降级未执行：当前用户没有可用于 DeepSeek 官方服务的模型凭据，且未配置平台级 DEEPSEEK_API_KEY。"
                 : " DeepSeek 搜索降级未返回可用结果。";
     }
 
-    private String extractionFallbackFailureHint() {
-        return StringUtils.isBlank(deepSeekApiKey)
-                ? "；DeepSeek Fetch 回退未执行：未配置 DEEPSEEK_API_KEY"
+    private String extractionFallbackFailureHint(boolean fallbackConfigured) {
+        return !fallbackConfigured
+                ? "；DeepSeek Fetch 回退未执行：当前用户没有可用于 DeepSeek 官方服务的模型凭据，且未配置平台级 DEEPSEEK_API_KEY"
                 : "；DeepSeek Fetch 回退也未返回可用正文";
     }
 
-    private String tryDeepSeekFetchIfEmpty(String url, String content, String previousBackend)
-            throws InterruptedException {
-        if (StringUtils.isNotBlank(content)) return null;
-        return tryDeepSeekFetch(url, previousBackend);
+    private DeepSeekCredentialProvider.Credential resolveDeepSeekCredentials() {
+        if (deepSeekCredentialProvider != null) {
+            try {
+                DeepSeekCredentialProvider.Credential userCredential = deepSeekCredentialProvider
+                        .currentUserCredential().orElse(null);
+                if (userCredential != null) return userCredential;
+            } catch (RuntimeException e) {
+                log.warn("当前用户 DeepSeek 凭据读取失败: type={}", e.getClass().getSimpleName());
+            }
+        }
+        if (StringUtils.isBlank(deepSeekApiKey)) return null;
+        return new DeepSeekCredentialProvider.Credential(deepSeekApiKey, normalizeBaseUrl(deepSeekBaseUrl));
     }
 
     /** Third-party fetching is opt-in and only runs after the guarded local/provider path failed. */
-    private String tryDeepSeekFetch(String url, String previousBackend) throws InterruptedException {
-        if (StringUtils.isBlank(deepSeekApiKey)) {
-            log.warn("DeepSeek Fetch 回退未执行：未配置 DEEPSEEK_API_KEY");
+    private String tryDeepSeekFetch(String url, String previousBackend,
+                                    DeepSeekCredentialProvider.Credential credential)
+            throws InterruptedException {
+        if (credential == null) {
+            log.warn("DeepSeek Fetch 回退未执行：当前用户没有可用于 DeepSeek 官方服务的模型凭据，且未配置平台级 DeepSeek 凭据");
             return null;
         }
         ensureExtractionActive();
         log.info("主抓取路径未成功，尝试 DeepSeek Fetch: url={}", redactSensitive(url));
-        String fallback = deepSeekFetch(url);
+        String fallback = deepSeekFetch(url, credential);
         if (!successfulExtractionResponse(fallback)) return null;
         try {
             ObjectNode result = (ObjectNode) MAPPER.readTree(fallback);

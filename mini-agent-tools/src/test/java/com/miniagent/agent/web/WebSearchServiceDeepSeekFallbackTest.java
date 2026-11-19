@@ -14,6 +14,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -95,6 +96,20 @@ class WebSearchServiceDeepSeekFallbackTest {
     }
 
     @Test
+    void emptySearchWithoutDatabaseOrPlatformCredentialIsReportedAsIncomplete() throws Exception {
+        WebSearchService service = spy(new WebSearchService());
+        ReflectionTestUtils.setField(service, "configuredBackend", "bing");
+        ReflectionTestUtils.setField(service, "configuredTimeZone", "Asia/Shanghai");
+        ReflectionTestUtils.setField(service, "deepSeekApiKey", null);
+        doReturn(new WebSearchService.SearchProviderResult(List.of(), List.of()))
+                .when(service).searchConfiguredBackend(anyString(), anyString(), anyInt(), any(), anyBoolean(), any());
+
+        var result = JSON.readTree(service.search("无结果搜索", 5));
+        assertFalse(result.path("success").asBoolean());
+        assertTrue(result.path("error").asText().contains("DEEPSEEK_API_KEY"));
+    }
+
+    @Test
     void failedDirectExtractUsesDeepSeekFetch() throws Exception {
         AtomicInteger calls = new AtomicInteger();
         AtomicReference<String> requestBody = new AtomicReference<>();
@@ -113,6 +128,54 @@ class WebSearchServiceDeepSeekFallbackTest {
             assertEquals("# Markdown 正文", root.path("content").asText());
             assertEquals(1, calls.get());
             assertEquals(PAGE, JSON.readTree(requestBody.get()).path("url").asText());
+        } finally { server.stop(0); }
+    }
+
+    @Test
+    void fetchFallbackUsesCurrentUsersDatabaseDeepSeekCredential() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        HttpServer server = server(calls, new AtomicReference<>(),
+                "{\"title\":\"数据库凭据\",\"content\":\"使用用户数据库 Key 获取的正文\"}", "db-user-key");
+        NetworkGuard guard = mock(NetworkGuard.class);
+        when(guard.validateUrl(PAGE)).thenReturn(null);
+        GuardedHttpClient direct = mock(GuardedHttpClient.class);
+        when(direct.get(eq(PAGE), any(), any(), anyInt())).thenThrow(new IOException("origin down"));
+        try {
+            WebSearchService service = service(base(server), guard, direct);
+            ReflectionTestUtils.setField(service, "deepSeekApiKey", null);
+            DeepSeekCredentialProvider provider = mock(DeepSeekCredentialProvider.class);
+            when(provider.currentUserCredential()).thenReturn(Optional.of(
+                    new DeepSeekCredentialProvider.Credential("db-user-key", base(server))));
+            ReflectionTestUtils.setField(service, "deepSeekCredentialProvider", provider);
+
+            var result = JSON.readTree(service.extract(PAGE));
+            assertTrue(result.path("success").asBoolean());
+            assertEquals("deepseek_fetch", result.path("extraction_backend").asText());
+            assertEquals("使用用户数据库 Key 获取的正文", result.path("content").asText());
+            assertEquals(1, calls.get());
+        } finally { server.stop(0); }
+    }
+
+    @Test
+    void searchFallbackUsesCurrentUsersDatabaseDeepSeekCredential() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        HttpServer server = server(calls, new AtomicReference<>(),
+                "{\"results\":[{\"title\":\"数据库搜索\",\"url\":\"https://news.example/item\",\"snippet\":\"用户凭据搜索结果\"}]}",
+                "db-user-key");
+        try {
+            WebSearchService service = service(base(server), mock(NetworkGuard.class), mock(GuardedHttpClient.class));
+            ReflectionTestUtils.setField(service, "deepSeekApiKey", null);
+            DeepSeekCredentialProvider provider = mock(DeepSeekCredentialProvider.class);
+            when(provider.currentUserCredential()).thenReturn(Optional.of(
+                    new DeepSeekCredentialProvider.Credential("db-user-key", base(server))));
+            ReflectionTestUtils.setField(service, "deepSeekCredentialProvider", provider);
+            doReturn(new WebSearchService.SearchProviderResult(List.of(), List.of()))
+                    .when(service).searchConfiguredBackend(anyString(), anyString(), anyInt(), any(), anyBoolean(), any());
+
+            var result = JSON.readTree(service.search("数据库凭据搜索", 5));
+            assertTrue(result.path("success").asBoolean());
+            assertEquals("deepseek_search", result.path("search_backend").asText());
+            assertEquals(1, calls.get());
         } finally { server.stop(0); }
     }
 
@@ -226,18 +289,23 @@ class WebSearchServiceDeepSeekFallbackTest {
 
     private static HttpServer server(AtomicInteger calls, AtomicReference<String> requestBody,
                                      String body) throws IOException {
+        return server(calls, requestBody, body, "test-key");
+    }
+
+    private static HttpServer server(AtomicInteger calls, AtomicReference<String> requestBody,
+                                     String body, String expectedApiKey) throws IOException {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        server.createContext("/v1/tools/search", exchange -> respond(exchange, calls, requestBody, body));
-        server.createContext("/v1/tools/fetch", exchange -> respond(exchange, calls, requestBody, body));
+        server.createContext("/v1/tools/search", exchange -> respond(exchange, calls, requestBody, body, expectedApiKey));
+        server.createContext("/v1/tools/fetch", exchange -> respond(exchange, calls, requestBody, body, expectedApiKey));
         server.start();
         return server;
     }
 
     private static void respond(com.sun.net.httpserver.HttpExchange exchange,
                                 AtomicInteger calls, AtomicReference<String> requestBody,
-                                String body) throws IOException {
+                                String body, String expectedApiKey) throws IOException {
         calls.incrementAndGet();
-        assertEquals("Bearer test-key", exchange.getRequestHeaders().getFirst("Authorization"));
+        assertEquals("Bearer " + expectedApiKey, exchange.getRequestHeaders().getFirst("Authorization"));
         requestBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().add("Content-Type", "application/json");
