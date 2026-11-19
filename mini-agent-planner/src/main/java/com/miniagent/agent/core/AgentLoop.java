@@ -22,6 +22,7 @@ import com.miniagent.agent.hook.StopContext;
 import com.miniagent.agent.hook.StopDecision;
 import com.miniagent.agent.hook.StopHookChain;
 import com.miniagent.agent.task.TaskPlan;
+import com.miniagent.agent.planner.CodeValidationPolicy;
 import com.miniagent.agent.surface.ToolSurface;
 import com.miniagent.agent.context.ContextContributorConfiguration;
 import com.miniagent.agent.permission.PermissionContext;
@@ -587,6 +588,7 @@ public class AgentLoop {
         boolean injectAppendHintAfterTools = false; // tool_call 被长度截断：工具执行后需注入续写引导
         boolean lengthTruncatedToolCalls = false; // 当前轮 tool_call 参数可能被截断
         int incompleteTodoReminders = 0;        // 未完成 todo 却试图收尾的次数
+        int codeValidationReminders = 0;
         int planUnapprovedNudges = 0;            // 未批准计划的收尾拦截次数
         final Set<String> nonExecutedFailureKeys = new java.util.HashSet<>();
         boolean goalAnchorInjected = false;     // 是否已注入任务目标锚定
@@ -596,6 +598,8 @@ public class AgentLoop {
         volatile boolean unknownOutcome = false;
         volatile String unknownOutcomeMessage = "";
         volatile Set<String> allowedToolsForTurn = Set.of();
+        String sessionId;
+        boolean codeChangeTask;
 
         void noteStructuredResult(String toolName, ToolResult result) {
             if ("desktop_observe".equals(toolName) || "desktop_act".equals(toolName) || "desktop_release".equals(toolName)) {
@@ -872,6 +876,14 @@ public class AgentLoop {
                 Objects.nonNull(taskPlan) ? taskPlan.taskGoal() : userTextForFilePattern);
 
         String sessionId = currentSessionId.get();
+        state.sessionId = sessionId;
+        String rawTaskGoal = taskPlan == null ? userTextForFilePattern : taskPlan.taskGoal();
+        state.codeChangeTask = !LoopTurnContext.current().hardGate()
+                && CodeValidationPolicy.isCodeChangeGoal(rawTaskGoal);
+        if (!LoopTurnContext.current().hardGate() && sessionId != null
+                && (state.codeChangeTask || taskTodoStore.hasIncompleteCodeTask(sessionId))) {
+            taskTodoStore.ensureCodeValidationRequired(sessionId);
+        }
         executionControl.heartbeat(sessionId);
 
         // sub-goal 栈播种：用 TaskPlan 里已有的 steps 预填 todo（仅当该 session 还没有计划时）
@@ -1359,6 +1371,13 @@ public class AgentLoop {
                                 sessionId, seal.messages().size());
                         continue;
                     }
+                }
+                if (!plannerOwnsTodos(sessionId) && taskTodoStore.hasPendingCodeValidation(sessionId)) {
+                    state.loopEndReason = "CODE_VALIDATION_REQUIRED";
+                    return finish(result, state, messages);
+                }
+                if (!plannerOwnsTodos(sessionId)) {
+                    taskTodoStore.clearSatisfiedCodeValidationIfNoIncompleteCodeTask(sessionId);
                 }
                 if (Objects.nonNull(traceRecorder)) {
                     traceRecorder.recordAnswer(sessionId, turn, result);
@@ -2403,7 +2422,7 @@ public class AgentLoop {
             if (isCacheableTool(name) && structuredResult.isSuccess() && !result.isEmpty()) {
                 state.toolResultCache.put(cacheKey, result);
             }
-            trackResult(name, result, state, structuredResult);
+            trackResult(name, args, result, state, structuredResult);
 
             // 反思机制（并行）：失败时把反思提示并入工具结果，不伪装成用户消息。
             // 这里不再为 ask_user_question 单开特判 —— 它和「等用户批准」现在都返回
@@ -2443,7 +2462,7 @@ public class AgentLoop {
         if (state.lengthTruncatedToolCalls && !"write_file".equals(name) && !"read_file".equals(name)) {
             String truncErr = "{\"error\":\"本次工具调用的参数因模型输出长度上限被截断，无法执行。请用更短的参数重试。\"}";
             log.warn("  [截断保护] 跳过执行 {}，参数可能不完整", name);
-            trackResult(name, truncErr, state, ToolResult.fromLegacy(truncErr));
+            trackResult(name, args, truncErr, state, ToolResult.fromLegacy(truncErr));
             recordToolOutcome(state, name, args, truncErr, null);
             messages.add(ToolExecutionResultMessage.from(toolIdOf(tc), name, truncErr));
             return;
@@ -2517,7 +2536,7 @@ public class AgentLoop {
             }
         }
 
-        trackResult(name, result, state, structuredResult == null ? ToolResult.fromLegacy(result) : structuredResult);
+        trackResult(name, args, result, state, structuredResult == null ? ToolResult.fromLegacy(result) : structuredResult);
 
         // 反思机制：工具失败时把反思提示并入工具结果，不伪装成用户消息。
         // 不特判 ask_user_question 与授权等待：「未执行」的结果带 status=awaiting_user，
@@ -2825,7 +2844,8 @@ public class AgentLoop {
     }
 
     /** 更新循环状态 */
-    private void trackResult(String toolName, String result, LoopState state, ToolResult structuredResult) {
+    private void trackResult(String toolName, String arguments, String result, LoopState state,
+                             ToolResult structuredResult) {
         state.toolsInvoked.add(toolName);
         state.noteStructuredResult(toolName, structuredResult);
         if ("read_file".equals(toolName) || "list_files".equals(toolName)
@@ -2843,6 +2863,34 @@ public class AgentLoop {
             // 写入成功后失效文件相关的缓存，避免后续读到过期内容
             invalidateReadCache(state, key -> key.startsWith("read_file:") || key.startsWith("exec_command:")
                     || key.startsWith("list_files:") || key.startsWith("read_package:"));
+        }
+        if (state.sessionId != null) {
+            boolean codeWorkActive = state.codeChangeTask
+                    || taskTodoStore.hasPendingCodeValidation(state.sessionId)
+                    || taskTodoStore.hasIncompleteCodeTask(state.sessionId);
+            String path = argumentText(arguments, "path");
+            boolean codeFileWrite = ("write_file".equals(toolName) || "edit_file".equals(toolName))
+                    && (CodeValidationPolicy.isCodeArtifact(path)
+                    || (codeWorkActive && CodeValidationPolicy.isCodeConfigArtifact(path)));
+            if (codeFileWrite && structuredResult.status() != ToolStatus.AWAITING_USER) {
+                // Failed/unknown write outcomes may still have changed part of a file.
+                taskTodoStore.recordCodeChange(state.sessionId, path);
+            } else if ("exec_command".equals(toolName) && codeWorkActive) {
+                String command = argumentText(arguments, "command");
+                boolean testCommand = CodeValidationPolicy.isTestCommand(command);
+                if (testCommand) {
+                    if (structuredResult.isSuccess()) {
+                        taskTodoStore.recordTrustedCodeValidation(state.sessionId, command, structuredResult);
+                    } else if (structuredResult.status() != ToolStatus.AWAITING_USER) {
+                        taskTodoStore.recordCodeValidationFailure(state.sessionId);
+                    }
+                } else if (structuredResult.status() != ToolStatus.AWAITING_USER
+                        && isMutatingCommand(toolName, arguments)) {
+                    // A failed, timed-out, or unconfirmed shell write/test can still alter source or
+                    // invalidate the previous test state. Require a fresh successful test afterward.
+                    taskTodoStore.recordCodeChange(state.sessionId);
+                }
+            }
         }
         if ("exec_command".equals(toolName) && Objects.nonNull(result)
                 && !result.contains("\"error\"")) {
@@ -2868,6 +2916,24 @@ public class AgentLoop {
         }
     }
 
+    private static String argumentText(String arguments, String field) {
+        if (arguments == null || arguments.isBlank()) return "";
+        try {
+            return ARGUMENT_MAPPER.readTree(arguments).path(field).asText("");
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private boolean isMutatingCommand(String toolName, String arguments) {
+        try {
+            return toolExecutionGuards.descriptor(toolName, arguments).sideEffect() != ToolSideEffect.READ_ONLY;
+        } catch (Exception ignored) {
+            // Unknown commands are treated conservatively for an active code task.
+            return true;
+        }
+    }
+
     private static void invalidateReadCache(LoopState state,
                                             java.util.function.Predicate<String> invalidatedKey) {
         state.toolResultCache.keySet().removeIf(invalidatedKey);
@@ -2884,6 +2950,19 @@ public class AgentLoop {
                                        int turn, int iterations, String sessionId) {
         String finalText = sanitizeFinalAnswer(aiMessage.text());
         log.info("Agent收尾 {}/{}: 生成最终回复", turn + 1, iterations);
+
+        if (!plannerOwnsTodos(sessionId) && taskTodoStore.hasPendingCodeValidation(sessionId)) {
+            state.codeValidationReminders++;
+            if (state.codeValidationReminders >= 3) {
+                return "代码修改已执行，但没有改动之后真实成功的测试回执，因此任务尚未验收完成。"
+                        + "请运行与改动相关的测试；测试通过后再完成任务。";
+            }
+            messages.add(new SystemMessage(
+                    "【代码验证门禁】本任务的代码尚无改动之后真实成功的测试回执，不能结束或宣称完成。"
+                            + "请用 exec_command 实际运行与改动相关的测试；失败时先读取错误、修复后再运行。"
+                            + "只有真实 exec_command 回执且退出码为 0 才能通过，不得用 evidence 文本代替。"));
+            return null;
+        }
 
         LoopTurnPolicy turnPolicy = LoopTurnContext.current();
         StopDecision stop = stopHookChain.evaluate(buildStopContext(

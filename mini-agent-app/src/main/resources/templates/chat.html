@@ -522,8 +522,8 @@
 
 <!-- ===================== INSPECTOR — 右侧检查器 =====================
      数据全部来自真实接口（14a-inspector.js）：
-       · 执行步骤      /api/conversations/{sid}/todos（优先）+ 真实轨迹回退
-       · 执行工具      同一份 steps 聚合去重
+       · 任务步骤      优先展示 /api/conversations/{sid}/todos 的语义拆分；无计划时不把工具调用冒充任务节点
+       · 执行工具      同一份 steps 聚合去重，保留原始工具调用细节
        · 记忆与知识    /api/shell/memory-insights
        · 系统状态      /api/shell/status
      时间戳只在轨迹有真实记录时显示；拿不到数据就显示明确的空状态。 -->

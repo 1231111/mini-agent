@@ -47,6 +47,21 @@ public class PlanValidator {
     private static final Pattern UNAMBIGUOUS_SAVE_ACTION = Pattern.compile(
             "(?i)(保存|导出|写入|写出|写到|写成|输出到|输出为|落盘|落地|另存|"
                     + "save|export)");
+    private static final Pattern OPERATION_ONLY_NODE_NAME = Pattern.compile(
+            "(?i)^(?:保存(?:文件)?|读取(?:文件)?|读入(?:文件)?|打开(?:文件)?|查看(?:文件)?|"
+                    + "运行(?:python(?:脚本)?)?|执行(?:脚本|命令)?|编辑(?:文件)?|修改(?:文件)?|生成|创建|新建)"
+                    + "\\s*[「『\\\"']?\\s*(?:[\\w.-]+\\s+)?[\\w./\\\\-]+"
+                    + "\\.(?:py|json|java|js|jsx|ts|tsx|go|rs|sh|ps1|html|css|xml|yaml|yml|md|txt)"
+                    + "[」』\\\"']?\\s*$");
+    private static final Pattern EXECUTION_ONLY_NODE_NAME = Pattern.compile(
+            "(?i)^(?:运行|执行|调用|启动|编译|测试)\\s*[\\p{IsHan}A-Za-z0-9_.-]+$");
+    private static final Pattern TOOL_ACTION_ONLY_NODE_NAME = Pattern.compile(
+            "(?i)^(?:保存|读取|读入|打开|查看|运行|执行|调用|启动|编译|测试|编辑|修改)"
+                    + "\\s+(?:python(?:脚本)?|java(?:程序)?|脚本|程序|文件|命令)"
+                    + "(?:\\s+[\\p{IsHan}A-Za-z0-9_.-]+)?$");
+    private static final Pattern SOURCE_ARTIFACT = Pattern.compile(
+            "(?i)(\\.(?:java|py|js|jsx|ts|tsx|go|rs|cs|cpp|c|h|sql|sh|ps1)\\b|"
+                    + "源代码|源文件|代码|程序|脚本|模块|函数|类)");
 
     /**
      * 用户目标里的错误诊断语义。
@@ -168,6 +183,13 @@ public class PlanValidator {
                     "节点名称为空: " + n.id(),
                     "为节点提供有意义的名称"
                 ));
+            } else if (isOperationOnlyNodeName(n.name())) {
+                errors.add(new PlanValidationReport.ValidationError(
+                        PlanValidationReport.ValidationError.Type.LOW_LEVEL_NODE_NAME,
+                        n.id(),
+                        "节点名称只描述了内部文件操作: " + n.name(),
+                        "改成普通用户能理解的交付结果和用途；例如「生成用于解析航班信息的程序」，"
+                                + "并把具体文件路径保留在 outputs 或 doneWhen.path 中"));
             }
 
             // 检查ID唯一性
@@ -186,7 +208,9 @@ public class PlanValidator {
                     PlanValidationReport.ValidationError.Type.INVALID_DONE_WHEN,
                     n.id(),
                     "节点完成条件无效: " + n.id(),
-                    "检查 doneWhen 配置"
+                        n.doneWhen().isCommand()
+                                ? "command_success 的 criteria 必须写明需要实际执行并验收的完整命令"
+                                : "检查 doneWhen 配置"
                 ));
             }
 
@@ -264,6 +288,7 @@ public class PlanValidator {
             }
         }
 
+        addCodeValidationError(g, plan, errors);
         addAcquirePersistEdgeError(g, errors);
         addGoalFileErrors(g, goal, errors);
         addGoalGraphSemanticErrors(g, plan, errors);
@@ -278,6 +303,78 @@ public class PlanValidator {
         }
 
         return new PlanValidationReport(errors, warnings);
+    }
+
+    static boolean isOperationOnlyNodeName(String name) {
+        return StringUtils.isNotBlank(name) && (OPERATION_ONLY_NODE_NAME.matcher(name.trim()).matches()
+                || EXECUTION_ONLY_NODE_NAME.matcher(name.trim()).matches()
+                || TOOL_ACTION_ONLY_NODE_NAME.matcher(name.trim()).matches());
+    }
+
+    private static void addCodeValidationError(TaskGraph graph, TaskPlan plan,
+                                               List<PlanValidationReport.ValidationError> errors) {
+        if (plan == null || StringUtils.isBlank(plan.taskGoal())
+                || !CodeValidationPolicy.isCodeChangeGoal(plan.taskGoal())) return;
+        List<TaskNode> codeChanges = graph.nodes().stream()
+                .filter(node -> "code".equalsIgnoreCase(node.capability())
+                        || SOURCE_ARTIFACT.matcher(node.name()).find()
+                        || node.outputs().stream().anyMatch(output -> SOURCE_ARTIFACT.matcher(output).find())
+                        || (node.doneWhen() != null && SOURCE_ARTIFACT.matcher(node.doneWhen().path()).find()))
+                .toList();
+        if (codeChanges.isEmpty()) return;
+        List<String> changePaths = codeChanges.stream()
+                .flatMap(node -> java.util.stream.Stream.concat(
+                        java.util.stream.Stream.concat(node.outputs().stream(),
+                                java.util.stream.Stream.of(node.doneWhen() == null ? "" : node.doneWhen().path())),
+                        java.util.stream.Stream.ofNullable(firstPathArgument(node))))
+                .filter(path -> path != null && !path.isBlank())
+                .toList();
+        Set<String> changedModules = changePaths.stream()
+                .map(CodeValidationPolicy::moduleHint)
+                .filter(module -> !module.isBlank())
+                .collect(java.util.stream.Collectors.toSet());
+        boolean unknownAffectedModule = changePaths.isEmpty()
+                || changePaths.stream().anyMatch(path -> CodeValidationPolicy.moduleHint(path).isBlank());
+        boolean hasDependentVerification = graph.nodes().stream()
+                .filter(node -> node.doneWhen() != null && node.doneWhen().isCommand()
+                        && CodeValidationPolicy.isTestCommandForModules(
+                                node.doneWhen().criteria(), changedModules, unknownAffectedModule))
+                .anyMatch(verification -> codeChanges.stream().anyMatch(change ->
+                        !verification.id().equals(change.id())
+                                && dependsOnTransitively(graph, verification.id(), change.id())));
+        if (!hasDependentVerification) {
+            String nodeId = codeChanges.get(0).id();
+            errors.add(new PlanValidationReport.ValidationError(
+                    PlanValidationReport.ValidationError.Type.MISSING_CODE_VALIDATION,
+                    nodeId,
+                    "代码改动计划缺少依赖改动节点的测试步骤",
+                    "新增独立 shell 测试节点，doneWhen 使用 command_success 并写明实际测试命令；"
+                            + "只接受不会跳过测试或掩盖失败的测试运行器命令及其成功 exec_command 回执。"
+                            + "命令需授权时先等待授权，不得跳过验证"));
+        }
+    }
+
+    private static String firstPathArgument(TaskNode node) {
+        for (String key : List.of("path", "filePath", "file_path", "file")) {
+            Object value = node.toolArguments().get(key);
+            if (value instanceof String path && !path.isBlank()) return path;
+        }
+        return null;
+    }
+
+    private static boolean dependsOnTransitively(TaskGraph graph, String nodeId, String ancestorId) {
+        Set<String> visited = new HashSet<>();
+        List<String> pending = new ArrayList<>();
+        TaskNode node = graph.byId(nodeId);
+        if (node != null) pending.addAll(node.dependsOn());
+        while (!pending.isEmpty()) {
+            String current = pending.remove(pending.size() - 1);
+            if (!visited.add(current)) continue;
+            if (ancestorId.equals(current)) return true;
+            TaskNode dependency = graph.byId(current);
+            if (dependency != null) pending.addAll(dependency.dependsOn());
+        }
+        return false;
     }
 
     /**

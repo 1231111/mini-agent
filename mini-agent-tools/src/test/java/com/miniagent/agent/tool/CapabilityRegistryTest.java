@@ -14,7 +14,7 @@ class CapabilityRegistryTest {
 
     private static final Set<String> REGISTRY = Set.of(
             "web_search", "write_file", "browser_navigate", "todo",
-            "skill_list", "memory", "read_file", "exec_command");
+            "skill_list", "memory", "read_file", "exec_command", "agent_environment");
 
     /**
      * 按注册表构造真实 {@link CapabilityRegistry}，再取能力包。
@@ -130,5 +130,14 @@ class CapabilityRegistryTest {
         assertTrue(hit.contains("read_file"));
         assertTrue(hit.contains("write_file"));
         assertTrue(hit.contains("web_search"));
+    }
+
+    @Test
+    void shellCapabilityExposesEnvironmentInspectionTool() {
+        ToolRegistry registry = new ToolRegistry();
+        for (String name : REGISTRY) {
+            registry.register(name, name, Map.of("type", "object"), x -> "ok");
+        }
+        assertTrue(new CapabilityRegistry(registry).toolsFor("shell").contains("agent_environment"));
     }
 }

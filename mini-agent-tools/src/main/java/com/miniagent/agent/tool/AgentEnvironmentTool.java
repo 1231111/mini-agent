@@ -56,10 +56,6 @@ public class AgentEnvironmentTool {
             env.put("os_arch", System.getProperty("os.arch"));
             env.put("java_version", System.getProperty("java.version"));
             env.put("java_vendor", System.getProperty("java.vendor"));
-            env.put("user_dir", System.getProperty("user.dir"));
-            env.put("user_home", System.getProperty("user.home"));
-            env.put("username", System.getProperty("user.name"));
-
             // JVM信息
             RuntimeMXBean runtime = ManagementFactory.getRuntimeMXBean();
             env.put("jvm_name", runtime.getVmName());

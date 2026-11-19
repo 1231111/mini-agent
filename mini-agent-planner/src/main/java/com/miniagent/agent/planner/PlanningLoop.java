@@ -844,17 +844,39 @@ public class PlanningLoop {
                 } else if (!bound.complete(node)) {
                     ev = StepEvaluator.EvalResult.fail("declared outputs 未绑定");
                 } else {
-                    ev = step.structuredResult() == null
-                            ? stepEvaluator.evaluateAfterLoop(node, bound.evidence())
-                            : stepEvaluator.evaluate(node, step.structuredResult(), bound.evidence());
+                    if (node.doneWhen() != null && node.doneWhen().isCommand()) {
+                        StepEvaluator.CommandReceipt receipt = StepEvaluator.matchingCommandReceipt(
+                                step.commandReceipts(), node.doneWhen().criteria());
+                        String commandEvidence = receipt == null ? bound.evidence()
+                                : receipt.result().legacyText();
+                        ev = stepEvaluator.evaluate(node, step.structuredResult(), commandEvidence,
+                                step.commandReceipts());
+                    } else {
+                        ev = step.structuredResult() == null
+                                ? stepEvaluator.evaluateAfterLoop(node, bound.evidence())
+                                : stepEvaluator.evaluate(node, step.structuredResult(), bound.evidence());
+                    }
                 }
                 TaskNodeStatus next = statusAfterChunk(ev.ok(), quotaAbort);
                 if (next == TaskNodeStatus.SUCCESS) {
-                    g = g.replace(node.withStatus(TaskNodeStatus.SUCCESS).withError("")
+                    TaskNode completed = node.withStatus(TaskNodeStatus.SUCCESS).withError("")
                             .withToolStatus(step.structuredResult() == null
                                     ? null : step.structuredResult().status())
-                            .withOutput(clip(bound.evidence(), 12000),
-                                    clipBindings(bound.bindings())));
+                            .withOutput(clip(node.doneWhen() != null && node.doneWhen().isCommand()
+                                            ? commandEvidence(step, node) : bound.evidence(), 12000),
+                                    clipBindings(bound.bindings()));
+                    if (node.doneWhen() != null && node.doneWhen().isCommand()) {
+                        StepEvaluator.CommandReceipt receipt = StepEvaluator.matchingCommandReceipt(
+                                step.commandReceipts(), node.doneWhen().criteria());
+                        if (receipt != null) {
+                            Map<String, String> bindings = new LinkedHashMap<>(completed.outputBindings());
+                            bindings.put("__command_receipt", PlannerStateJson.MAPPER.valueToTree(
+                                    Map.of("tool", receipt.toolName(),
+                                            "command", commandFromArguments(receipt.arguments()))).toString());
+                            completed = completed.withOutput(completed.output(), bindings);
+                        }
+                    }
+                    g = g.replace(completed);
                     pendingOutcomes.add(new NodeOutcome(action.actionId(), node,
                             NodeTerminalCommitPort.Result.SUCCESS,
                             new NodeTerminalCommitPort.Detail(null, null, userMessage), ev.acceptanceProof()));
@@ -1106,9 +1128,11 @@ public class PlanningLoop {
 
     private record StepExec(String text, String endReason, boolean drifted,
                             String lastTool, ToolErrorCode lastErrorCode,
-                            List<ChatMessage> messages, ToolResult structuredResult, boolean toolAttempted) {
+                            List<ChatMessage> messages, ToolResult structuredResult, boolean toolAttempted,
+                            List<StepEvaluator.CommandReceipt> commandReceipts) {
         StepExec {
             messages = messages == null ? List.of() : List.copyOf(messages);
+            commandReceipts = commandReceipts == null ? List.of() : List.copyOf(commandReceipts);
         }
     }
 
@@ -1424,7 +1448,8 @@ public class PlanningLoop {
                 }
                 return new StepExec(out.text(), out.endReason(), policy.consumeDrift(),
                         lastInvokedTool(out), lastToolResult == null ? out.lastErrorCode()
-                        : lastToolResult.errorCode(), out.messages(), lastToolResult, toolAttempted);
+                        : lastToolResult.errorCode(), out.messages(), lastToolResult, toolAttempted,
+                        toolExecutionReceipts(out.messages()));
             } catch (RuntimeException ex) {
                 com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(ex);
                 // A ReAct turn may already have dispatched tools before the caller
@@ -1432,7 +1457,7 @@ public class PlanningLoop {
                 log.warn("节点执行异常，停止自动重试 task={}", focusTask, ex);
                 String message = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
                 return new StepExec("节点执行结果未知：" + message, AgentLoop.OUTCOME_UNKNOWN,
-                        policy.consumeDrift(), "", ToolErrorCode.OUTCOME_UNKNOWN, List.of(), null, true);
+                        policy.consumeDrift(), "", ToolErrorCode.OUTCOME_UNKNOWN, List.of(), null, true, List.of());
             }
         } finally {
             ExecutionTurnContext.clear();
@@ -1502,7 +1527,8 @@ public class PlanningLoop {
         }
         toolMessages.add(msg);
         return new StepExec(ok ? AgentLoop.STEP_SEGMENT_DONE : text, end, false,
-                action.tool(), code, List.copyOf(toolMessages), result, attempted);
+                action.tool(), code, List.copyOf(toolMessages), result, attempted,
+                toolExecutionReceipts(toolMessages));
     }
 
     private void captureAgentTranscript(List<ChatMessage> messages) {
@@ -2185,6 +2211,40 @@ public class PlanningLoop {
             }
         }
         return last;
+    }
+
+    static List<StepEvaluator.CommandReceipt> toolExecutionReceipts(List<ChatMessage> messages) {
+        if (messages == null || messages.isEmpty()) return List.of();
+        Map<String, ToolExecutionRequest> requests = new HashMap<>();
+        List<StepEvaluator.CommandReceipt> receipts = new ArrayList<>();
+        for (ChatMessage message : messages) {
+            if (message instanceof AiMessage ai && ai.hasToolExecutionRequests()) {
+                for (ToolExecutionRequest request : ai.toolExecutionRequests()) {
+                    if (StringUtils.isNotBlank(request.id())) requests.put(request.id(), request);
+                }
+            } else if (message instanceof ToolExecutionResultMessage result) {
+                ToolExecutionRequest request = requests.get(result.id());
+                if (request != null && request.name().equals(result.toolName())) {
+                    receipts.add(new StepEvaluator.CommandReceipt(request.name(), request.arguments(),
+                            ToolResult.fromLegacy(result.text())));
+                }
+            }
+        }
+        return List.copyOf(receipts);
+    }
+
+    private static String commandEvidence(StepExec step, TaskNode node) {
+        StepEvaluator.CommandReceipt receipt = StepEvaluator.matchingCommandReceipt(
+                step.commandReceipts(), node.doneWhen().criteria());
+        return receipt == null ? "" : receipt.result().legacyText();
+    }
+
+    private static String commandFromArguments(String arguments) {
+        try {
+            return PlannerStateJson.MAPPER.readTree(arguments).path("command").asText("");
+        } catch (Exception ignored) {
+            return "";
+        }
     }
 
     static String diagnoseTool(TaskNode node, String lastTool) {

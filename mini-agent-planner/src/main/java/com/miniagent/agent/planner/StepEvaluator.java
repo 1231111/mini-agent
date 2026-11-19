@@ -67,15 +67,30 @@ public class StepEvaluator {
 
     /** A concrete ToolResult outranks heuristics over its human-readable payload. */
     public EvalResult evaluate(TaskNode node, ToolResult structuredResult, String evidence) {
+        return evaluate(node, structuredResult, evidence, "", "");
+    }
+
+    /** Evaluate with the invocation identity captured by the scheduler, not supplied by the model. */
+    public EvalResult evaluate(TaskNode node, ToolResult structuredResult, String evidence,
+                               String toolName, String toolArguments) {
+        return evaluate(node, structuredResult, evidence, StringUtils.isBlank(toolName) ? List.of()
+                : List.of(new CommandReceipt(toolName, toolArguments, structuredResult)));
+    }
+
+    public EvalResult evaluate(TaskNode node, ToolResult structuredResult, String evidence,
+                               List<CommandReceipt> commandReceipts) {
         if (structuredResult == null) {
-            return evaluate(node, "", evidence, false);
+            return evaluate(node, "", evidence, false, null, commandReceipts);
         }
         if (!structuredResult.isSuccess()) {
             return reject("tool error: " + abbreviate(
                     StringUtils.defaultIfBlank(structuredResult.message(), structuredResult.legacyText()), 400));
         }
-        return evaluate(node, structuredResult.legacyText(), evidence, true);
+        return evaluate(node, structuredResult.legacyText(), evidence, true, null,
+                commandReceipts);
     }
+
+    record CommandReceipt(String toolName, String arguments, ToolResult result) {}
 
     private EvalResult evaluate(TaskNode node, String toolResult, String evidence,
                                 boolean structuredSuccess) {
@@ -84,6 +99,12 @@ public class StepEvaluator {
 
     private EvalResult evaluate(TaskNode node, String toolResult, String evidence,
                                 boolean structuredSuccess, StateSnapshot acceptedSnapshot) {
+        return evaluate(node, toolResult, evidence, structuredSuccess, acceptedSnapshot, List.of());
+    }
+
+    private EvalResult evaluate(TaskNode node, String toolResult, String evidence,
+                                boolean structuredSuccess, StateSnapshot acceptedSnapshot,
+                                List<CommandReceipt> commandReceipts) {
         if (node == null) {
             return reject("missing node");
         }
@@ -110,7 +131,7 @@ public class StepEvaluator {
         if (dw.isJudge()) {
             structural = StringUtils.isBlank(ev) ? reject("缺少语义验收 evidence") : EvalResult.pass();
         } else if (dw.isCommand()) {
-            structural = checkCommand(ev, structuredSuccess);
+            structural = checkCommand(commandReceipts, dw.criteria());
         } else if (dw.isValidation()) {
             structural = dw.semanticChecks().isEmpty() ? checkValidation(ev, structuredSuccess)
                     : (StringUtils.isBlank(ev) ? reject("缺少验证 evidence") : EvalResult.pass());
@@ -224,7 +245,16 @@ public class StepEvaluator {
             if (!NodeOutputBinder.ofNode(n).complete(n)) {
                 return GraphEval.fail(n.id(), "eval: outputs 未绑定");
             }
-            EvalResult ev = evaluate(n, n.output(), n.output(), n.toolStatus() == ToolStatus.SUCCESS, acceptedSnapshot);
+            EvalResult ev;
+            if (n.doneWhen() != null && n.doneWhen().isCommand()) {
+                CommandReceipt receipt = recordedCommandReceipt(n);
+                if (receipt == null) return GraphEval.fail(n.id(), "command_success 缺少持久化工具回执");
+                receipt = new CommandReceipt(receipt.toolName(), receipt.arguments(),
+                        ToolResult.success(n.output()));
+                ev = evaluate(n, n.output(), n.output(), true, acceptedSnapshot, List.of(receipt));
+            } else {
+                ev = evaluate(n, n.output(), n.output(), n.toolStatus() == ToolStatus.SUCCESS, acceptedSnapshot);
+            }
             if (!ev.ok()) {
                 return GraphEval.fail(n.id(), ev.reason());
             }
@@ -246,6 +276,22 @@ public class StepEvaluator {
             }
         }
         return GraphEval.pass();
+    }
+
+    private static CommandReceipt recordedCommandReceipt(TaskNode node) {
+        String json = node.outputBindings() == null ? null : node.outputBindings().get("__command_receipt");
+        JsonNode receipt = jsonObject(json);
+        if (receipt == null) return null;
+        String toolName = receipt.path("tool").asText("");
+        String command = receipt.path("command").asText("");
+        if (StringUtils.isBlank(toolName) || StringUtils.isBlank(command)) return null;
+        try {
+            return new CommandReceipt(toolName,
+                    PlannerStateJson.MAPPER.writeValueAsString(java.util.Map.of("command", command)),
+                    ToolResult.success(node.output()));
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     static boolean hasFileDeliverable(TaskGraph graph, String path) {
@@ -314,6 +360,36 @@ public class StepEvaluator {
 
     static EvalResult checkCommand(String evidence) {
         return checkCommand(evidence, false);
+    }
+
+    static CommandReceipt matchingCommandReceipt(List<CommandReceipt> receipts, String expectedCommand) {
+        if (receipts == null || StringUtils.isBlank(expectedCommand)) return null;
+        for (int i = receipts.size() - 1; i >= 0; i--) {
+            CommandReceipt receipt = receipts.get(i);
+            if (receipt == null || !"exec_command".equals(receipt.toolName())) continue;
+            if (!normalizeCommand(expectedCommand).equals(normalizeCommand(commandArgument(receipt.arguments())))) continue;
+            if (receipt.result() != null && receipt.result().isSuccess()
+                    && checkCommand(receipt.result().legacyText(), true).ok()) return receipt;
+        }
+        return null;
+    }
+
+    private static EvalResult checkCommand(List<CommandReceipt> receipts, String expectedCommand) {
+        CommandReceipt receipt = matchingCommandReceipt(receipts, expectedCommand);
+        return receipt == null
+                ? EvalResult.fail(StringUtils.isBlank(expectedCommand)
+                    ? "command_success 缺少预期命令 criteria"
+                    : "command_success 缺少与预期命令匹配的成功 exec_command 回执")
+                : checkCommand(receipt.result().legacyText(), true);
+    }
+
+    private static String commandArgument(String arguments) {
+        JsonNode root = jsonObject(arguments);
+        return root == null ? "" : root.path("command").asText("");
+    }
+
+    private static String normalizeCommand(String command) {
+        return command == null ? "" : command.replace("\r\n", "\n").trim();
     }
 
     private static EvalResult checkCommand(String evidence, boolean structuredSuccess) {

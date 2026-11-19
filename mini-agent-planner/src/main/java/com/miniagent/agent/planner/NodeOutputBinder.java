@@ -117,14 +117,16 @@ final class NodeOutputBinder {
             // final action. The evaluator must see the failure before world checks.
             return new Bound(tools, Map.of());
         }
-        if (dw.isJudge() || dw.isValidation()) {
+        if (dw.isJudge() || dw.isValidation() || dw.isCommand()) {
             // A verification spans observations and actions. The final receipt
             // alone (often just todo.update or a reset click) loses that proof.
             String history = verificationToolEvidence(messages);
             if (StringUtils.isNotBlank(history)) tools = history;
         }
         String predecessor = isSubmitOnlyDelivery(node) ? usable(predecessorEvidence) : "";
-        String evidence = firstNonBlank(todo, tools);
+        // Command acceptance must persist the actual command tool result for
+        // graph re-evaluation. Model-submitted todo text is never its proof.
+        String evidence = dw.isCommand() ? tools : firstNonBlank(todo, tools);
         if (StringUtils.isBlank(evidence)) {
             evidence = predecessor;
         }

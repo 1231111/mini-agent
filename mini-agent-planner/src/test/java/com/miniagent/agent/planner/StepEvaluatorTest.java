@@ -1,6 +1,8 @@
 package com.miniagent.agent.planner;
 
 import com.miniagent.agent.core.AgentLoop;
+import com.miniagent.agent.tool.ToolErrorCode;
+import com.miniagent.agent.tool.ToolResult;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -195,6 +197,50 @@ class StepEvaluatorTest {
         assertFalse(StepEvaluator.checkValidation("构建通过了").ok());
         assertTrue(StepEvaluator.checkValidation("{\"success\":true}").ok());
         assertFalse(StepEvaluator.checkValidation("exit_code=1").ok());
+    }
+
+    @Test
+    void commandSuccessRequiresMatchingExecCommandReceipt() {
+        String expected = "mvnw -pl mini-agent-tools test";
+        TaskNode node = new TaskNode("verify", "运行受影响模块测试", "shell",
+                null, null, null, TaskNodeStatus.READY, 0,
+                DoneWhen.command(expected), "", "", 0, "exit_code=0");
+        StepEvaluator evaluator = new StepEvaluator(new PlannerProperties(), new PlannerMetrics(), null);
+        ToolResult success = ToolResult.success("exit_code=0\nTests passed");
+
+        StepEvaluator.EvalResult matching = evaluator.evaluate(node, success, "exit_code=0", "exec_command",
+                "{\"command\":\"mvnw -pl mini-agent-tools test\"}");
+        assertTrue(matching.ok(), matching.reason());
+        assertFalse(evaluator.evaluate(node, success, "exit_code=0", "exec_command",
+                "{\"command\":\"mvnw -pl mini-agent-planner test\"}").ok());
+        assertFalse(evaluator.evaluate(node, success, "exit_code=0", "todo.submit",
+                "{\"evidence\":\"exit_code=0\"}").ok());
+        assertFalse(evaluator.evaluate(node,
+                ToolResult.failure(ToolErrorCode.TIMEOUT, "timed out", true),
+                "exit_code=0", "exec_command",
+                "{\"command\":\"mvnw -pl mini-agent-tools test\"}").ok());
+        assertFalse(evaluator.evaluate(node, success, "exit_code=0").ok(),
+                "A result without trusted invocation identity must not satisfy command_success");
+        assertFalse(DoneWhen.command().valid(), "A command contract must name the expected command");
+        assertEquals(expected, DoneWhen.parseWire("command_success:" + expected).criteria());
+    }
+
+    @Test
+    void graphReevaluationRequiresPersistedCommandReceipt() {
+        String command = "mvnw -pl mini-agent-tools test";
+        TaskNode base = new TaskNode("verify", "运行受影响模块测试", "shell",
+                null, null, null, TaskNodeStatus.SUCCESS, 0,
+                DoneWhen.command(command), "", "", 0, "exit_code=0\nTests passed")
+                .withToolStatus(com.miniagent.agent.tool.ToolStatus.SUCCESS);
+        StepEvaluator evaluator = new StepEvaluator(new PlannerProperties(), new PlannerMetrics(), null);
+
+        assertFalse(evaluator.evaluateGraph(null, new TaskGraph(List.of(base))).ok());
+        TaskNode recorded = base.withOutput(base.output(), Map.of("__command_receipt",
+                "{\"tool\":\"exec_command\",\"command\":\"mvnw -pl mini-agent-tools test\"}"));
+        assertTrue(evaluator.evaluateGraph(null, new TaskGraph(List.of(recorded))).ok());
+        TaskNode forged = base.withOutput("exit_code=0\nTests passed", Map.of("__command_receipt",
+                "{\"tool\":\"todo\",\"command\":\"mvnw -pl mini-agent-tools test\"}"));
+        assertFalse(evaluator.evaluateGraph(null, new TaskGraph(List.of(forged))).ok());
     }
 
     @Test

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="docx-page-size" content="A4">
+<title>MiniAgent 智能体代码开发能力评估报告</title>
+<style>
+  body { margin: 0; }
+  p, td, li { font-family: "宋体", SimSun, serif; font-size: 12pt; line-height: 1.75; color: #1a1a1a; }
+  h1 { font-family: "黑体", SimHei, sans-serif; font-size: 20pt; font-weight: bold; color: #1a1a1a; margin: 0 0 6pt 0; }
+  h2 { font-family: "黑体", SimHei, sans-serif; font-size: 14pt; font-weight: bold; color: #1a1a1a; margin: 22pt 0 8pt 0; }
+  h3 { font-family: "黑体", SimHei, sans-serif; font-size: 12pt; font-weight: bold; color: #1a1a1a; margin: 14pt 0 6pt 0; }
+  table { border-collapse: collapse; width: 100%; margin: 8pt 0 12pt 0; }
+  td, th { border: 0.5pt solid #999999; padding: 5pt 7pt; font-family: "宋体", SimSun, serif; font-size: 11pt; line-height: 1.6; vertical-align: top; color: #1a1a1a; }
+  th { background-color: #f2f2f2; font-family: "黑体", SimHei, sans-serif; font-weight: bold; text-align: left; }
+  .meta { font-family: "宋体", SimSun, serif; font-size: 10.5pt; color: #666666; line-height: 1.8; margin: 0 0 4pt 0; }
+  .lead { font-family: "宋体", SimSun, serif; font-size: 12pt; line-height: 1.8; color: #1a1a1a; margin: 10pt 0 0 0; }
+  .tag { font-family: "黑体", SimHei, sans-serif; font-size: 11pt; font-weight: bold; color: #a32d2d; }
+  .tag-ok { font-family: "黑体", SimHei, sans-serif; font-size: 11pt; font-weight: bold; color: #0f6e56; }
+  .note { font-family: "宋体", SimSun, serif; font-size: 10.5pt; color: #555555; line-height: 1.7; }
+</style>
+</head>
+<body>
+
+<h1>MiniAgent 智能体代码开发能力评估报告</h1>
+<p class="meta">评估对象：D:/AI/miniagent（mini-agent 多模块工程，9 个模块）</p>
+<p class="meta">评估时间：2026-11-19</p>
+<p class="meta">评估方式：源码逐项核对 + 构建产物与测试报告实测，不采信既有审计文档的结论，关键项回源码复核</p>
+
+<h2>一、总体结论</h2>
+<p class="lead">当前智能体<strong>能胜任"有人在旁边审查的生产代码修改"，不能胜任"无人值守交付生产代码"</strong>。工具链本身已经是生产级的，卡点全部集中在"改完怎么证明改对了"这一段。</p>
+<p>换句话说：定位、读、改、执行这几步的能力足够，验证与审查这两步是空的。前者决定它能不能干活，后者决定它干的活能不能直接合进主干。</p>
+
+<h2>二、关键事实核对</h2>
+<table>
+  <tr><th style="width:26%">核对项</th><th>实测结果</th></tr>
+  <tr><td>代码规模</td><td>1222 个 Java 文件，164,463 行，9 个模块</td></tr>
+  <tr><td>测试现状</td><td>402 个 surefire 报告，2348 项测试，0 failure / 0 error，96 项 skip；最近一次执行时间 2026-11-19 10:17</td></tr>
+  <tr><td>编码工具面</td><td>read_file、write_file、edit_file、list_files、search_code、ast_search、codebase_search、exec_command、read_package</td></tr>
+  <tr><td>代码检索</td><td>search_code 优先调用 ripgrep，失败退回 Java 正则实现，并区分退出码 0/1/2；ast_search 走 JavaParser，支持 method_def / class_def / field_def / method_call / annotated 五类查询；codebase_search 按方法/类粒度切块做 embedding，未配置 key 时降级提示改用前两者</td></tr>
+  <tr><td>改动一致性</td><td>edit_file 要求 oldString 与原文逐字符唯一匹配，匹配到多处时直接报错并要求补上下文</td></tr>
+  <tr><td>覆盖保护</td><td>readObservations 存 SHA-256 内容指纹，write_file 覆盖前校验"读过且未被第三方改过"；只读了文件一部分（partial=true）不允许作为整文件覆盖的依据</td></tr>
+  <tr><td>命令执行治理</td><td>超时后调用 proc.descendants() 杀掉整棵进程树；BoundedOutputCapture 限制输出字节数；内层超时严格小于外层</td></tr>
+  <tr><td>权限模型</td><td>PLAN_SAFE_TOOLS / ASK_DANGEROUS_TOOLS 两个白名单加 exec_command 三档策略；effectiveExecPolicy 已不允许 ACCEPT_EDITS 顺带把命令执行提权成免批</td></tr>
+</table>
+
+<h2>三、能力分项</h2>
+<table>
+  <tr><th style="width:18%">环节</th><th style="width:14%">成熟度</th><th>判定依据</th></tr>
+  <tr><td>定位代码</td><td>92%</td><td>文本检索、AST 结构化检索、语义检索三层齐备，工具选用顺序写进了提示词；缺项目结构地图</td></tr>
+  <tr><td>改动代码</td><td>96%</td><td>锚点唯一匹配 + 内容指纹覆盖保护，设计强度高于同类实现；这部分不应回退</td></tr>
+  <tr><td>验证产出</td><td>45%</td><td>只有提示词要求，没有硬门禁；完成判定不读执行证据</td></tr>
+  <tr><td>长任务承载</td><td>80%</td><td>上下文压缩、迭代上限、四类恢复诊断齐备；压缩摘要可能丢掉代码片段</td></tr>
+  <tr><td>安全可审计</td><td>82%</td><td>路径守卫、权限分档、写前日志到位；缺改动 diff 视图与一键回退</td></tr>
+</table>
+
+<h2>四、三个真实缺口</h2>
+
+<h3>缺口一：完成判定不看执行证据</h3>
+<p><strong>表现：</strong>TaskTodoStore.verifyCompletion(doneWhen, evidence) 支持 file_exists:、media_delivered、note_required、llm_judge: 四种谓词；其余情况只要 evidence 字段非空就放行。</p>
+<p><strong>机制：</strong>done_when 是一段自然语言契约，没有"跑过命令且退出码为 0"这种可判定的谓词，所以判定只能落到字符串是否为空。</p>
+<p><strong>后果：</strong>模型写下"已修复并通过验证"、evidence 填一句"已修改 Foo.java"，completed 就成立。审计文档 P1-1 记录的"自证加正则启发式"至今未闭合。</p>
+<p><strong>修法：</strong>给 done_when 增加 build_passes:&lt;command&gt; 谓词，由 exec_command 的退出码判定，ToolStatus 非成功则拒绝 completed。改动集中在 verifyCompletion 一个方法，不动 DAG 结构。</p>
+
+<h3>缺口二：界面上看不到改动 diff</h3>
+<p><strong>表现：</strong>mini-agent-app/src/main/resources/static/ 整个目录检索 diff 零命中；chat 目录下有 markdown 渲染、媒体展示、工具时间线，唯独没有改动视图。</p>
+<p><strong>机制：</strong>edit_file 只返回 {"success":true,"path":...,"replaced":1}，没有把 oldString / newString 结构化回传，前端拿不到可渲染的差异。</p>
+<p><strong>后果：</strong>用户审查 agent 的产出只能自己打开文件比对，review 成本被推回给人。这是"能不能托管给 agent 改生产代码"的前置条件。</p>
+<p><strong>修法：</strong>edit_file 与 write_file 在返回值里带 unified diff 摘要，复用已有的 FileActionJournal 写前记录；前端加折叠 diff 块与 revert 按钮。</p>
+
+<h3>缺口三：验证是提示词约束，不是机制</h3>
+<p><strong>表现：</strong>PromptTemplates.VERIFICATION_GUIDANCE 写得到位——"跑一次编译命令、有报错就读报错、定位文件、再编译直到通过"、"无法验证要明确说明原因"。</p>
+<p><strong>机制：</strong>这段内容是一个 String 常量，拼进系统提示；没有任何一处代码检查它是否被执行。</p>
+<p><strong>后果：</strong>模型自己判断"没必要编译"就会跳过；越到长会话尾部越容易漏。</p>
+<p><strong>修法：</strong>改动 .java 文件后按路径推断所属模块，自动追加一次 mvn -pl &lt;module&gt; -am test -Dtest=&lt;受影响类&gt;，把结构化结果写回 evidence。把"要求"变成"默认动作"。</p>
+
+<h2>五、其他发现</h2>
+<p><strong>1. agent_environment 是死工具。</strong>该工具在 AgentEnvironmentTool 里完成注册，但不在 CapabilityRegistry.PACKS 的任何能力包内，toolsFor() 永远取不到它。结构化规划模式下它不可达，只有 AgentLoop 直跑全量工具面时才可见。这类"注册了但派发不到"的漂移，建议由 CapabilityRegistry.selfCheck() 一并暴露。</p>
+<p><strong>2. 工作区有 6 个未提交改动。</strong>包括 GoalCompiler、PromptTemplates、14a-inspector.js 等文件。本报告结论基于工作区当前状态，不是最后一次提交的状态。</p>
+
+<h2>六、验证建议</h2>
+<p>最硬的判定不是读代码，是给它一个真实缺陷。建议投放方式：准备一个跨 3 个文件的 Java 缺陷，明确要求"改完必须让 mvn -pl mini-agent-tools test 通过"，然后观察三件事——</p>
+<p>一、它会不会主动跑测试；二、测试失败后会不会读报错再改；三、/api/conversations/{sid}/steps 里有没有留下可核对的执行证据。</p>
+<p>这三件事成立，上述缺口的实际影响就从"阻断"降为"风险"；任一条不成立，说明模型侧并没有把提示词里的要求当回事，缺口需要按代码机制补，而不是继续加提示词。</p>
+
+<h2>附：评估口径</h2>
+<p class="note">一、"成熟度"是本次评估给出的相对刻度，不是系统内的既有指标；刻度参照"该环节能否在无人干预下稳定收敛"，90% 以上视为生产级，60%-90% 视为接近，60% 以下视为需要补机制。</p>
+<p class="note">二、五维划分（定位、改动、验证、承载、安全）是本次评估的分析框架，不对应代码里的任何模块或类。</p>
+<p class="note">三、文中出现的英文标识符均为源码原名，可直接在仓库检索；括号内的中文只作说明，不是源码里的术语。</p>
+
+</body>
+</html>

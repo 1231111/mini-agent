@@ -58,7 +58,7 @@ public class CapabilityRegistry implements SmartInitializingSingleton {
     private static final List<String> CODE_SEARCH =
             List.of("search_code", "codebase_search", "ast_search");
 
-    private static final List<String> SHELL = List.of("exec_command");
+    private static final List<String> SHELL = List.of("exec_command", "agent_environment");
 
     private static final List<String> WEB =
             List.of("web_search", "web_extract", "http_get", "http_post");

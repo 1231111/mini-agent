@@ -36,7 +36,10 @@ test('HTML writes expose the saved page and original tool identity', () => {
     assert.match(tools, /已保存/);
     assert.match(tools, /kind-code/);
     assert.doesNotMatch(tools, /验证通过|浏览器验收通过/);
-    assert.match(context.buildInspectorStepRows(steps, { status: 'SUCCESS' }), /保存 HTML 页面/);
+    const taskSteps = context.buildInspectorStepRows(steps, { status: 'SUCCESS' }, false);
+    assert.match(taskSteps, /没有拆分出独立交付步骤/);
+    assert.match(taskSteps, /具体工具操作记录见下方/);
+    assert.doesNotMatch(taskSteps, /保存 HTML 页面/);
 });
 
 test('HTM edits and reads use the actual file type', () => {
@@ -65,6 +68,55 @@ test('failed and pending page writes never claim the page was saved', () => {
     const pending = context.buildInspectorToolRows(trace('write_file', { path: 'index.html' }, 'RUNNING'));
     assert.match(pending, /进行中/);
     assert.doesNotMatch(pending, /已保存|验证通过/);
+});
+
+test('successful edit_file calls show an escaped, redacted diff preview', () => {
+    const tools = context.buildInspectorToolRows(trace('edit_file', {
+        path: 'src/Parser.java',
+        oldString: 'String token = "old";',
+        newString: 'String token = "new"; // <safe>',
+        password: 'sensitive-edit-secret'
+    }, 'SUCCESS', '{"success":true,"replaced":1}'));
+    assert.match(tools, /代码改动预览/);
+    assert.match(tools, /- String token =/);
+    assert.match(tools, /\+ String token =/);
+    assert.match(tools, /&lt;safe&gt;/);
+    assert.doesNotMatch(tools, /sensitive-edit-secret|<safe>/);
+});
+
+test('failed edit_file calls do not present an applied diff', () => {
+    const tools = context.buildInspectorToolRows(trace('edit_file', {
+        path: 'src/Parser.java', oldString: 'old', newString: 'new'
+    }, 'FAILURE', '{"success":false}'));
+    assert.doesNotMatch(tools, /代码改动预览/);
+});
+
+test('unmatched tool calls after task completion show a missing result, not active execution', () => {
+    const steps = trace('browser_extract_text', { url: 'https://finance.sina.com.cn/tech/roll/2026' }, 'RUNNING');
+    const tools = context.buildInspectorToolRows(steps, {
+        taskRunning: false,
+        executionStatus: 'SUCCESS'
+    });
+    assert.match(tools, /结果未记录/);
+    assert.match(tools, /没有记录到返回内容/);
+    assert.doesNotMatch(tools, /进行中|执行中|等待工具返回/);
+    const stepsHtml = context.buildInspectorStepRows(steps, { status: 'SUCCESS' }, false);
+    assert.match(stepsHtml, /具体工具操作记录见下方/);
+    assert.doesNotMatch(stepsHtml, /提取网页内容|进行中/);
+});
+
+test('unmatched tool calls remain active while the task is running', () => {
+    const steps = trace('browser_extract_text', { url: 'https://example.com/article' }, 'RUNNING');
+    const tools = context.buildInspectorToolRows(steps, {
+        taskRunning: true,
+        executionStatus: 'RUNNING'
+    });
+    assert.match(tools, /进行中/);
+    assert.match(tools, /执行中/);
+    assert.match(tools, /等待工具返回/);
+    const stepsHtml = context.buildInspectorStepRows(steps, { status: 'RUNNING' }, true);
+    assert.match(stepsHtml, /具体工具操作记录见下方/);
+    assert.doesNotMatch(stepsHtml, /提取网页内容|进行中/);
 });
 
 test('page source is folded and stays escaped with secrets redacted', () => {

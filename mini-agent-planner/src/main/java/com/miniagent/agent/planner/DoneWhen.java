@@ -41,7 +41,9 @@ public record DoneWhen(String type, String criteria, String path, List<String> c
     /** Each declared requirement is evaluated, rather than merely mentioned in a node's description. */
     public List<String> semanticChecks() {
         LinkedHashSet<String> all = new LinkedHashSet<>();
-        if (!criteria.isBlank()) all.add(criteria);
+        // command_success.criteria binds the expected executable command; it
+        // is not a natural-language semantic criterion for an LLM judge.
+        if (!criteria.isBlank() && !isCommand()) all.add(criteria);
         all.addAll(checks);
         return List.copyOf(all);
     }
@@ -77,6 +79,11 @@ public record DoneWhen(String type, String criteria, String path, List<String> c
 
     public static DoneWhen command() {
         return new DoneWhen(COMMAND, "", "");
+    }
+
+    /** A command acceptance contract is bound to the exact command that must run. */
+    public static DoneWhen command(String expectedCommand) {
+        return new DoneWhen(COMMAND, expectedCommand, "");
     }
 
     public static DoneWhen validation(String criteria) {
@@ -119,6 +126,9 @@ public record DoneWhen(String type, String criteria, String path, List<String> c
         if (isJudge()) {
             return StringUtils.isNotBlank(criteria);
         }
+        if (isCommand()) {
+            return StringUtils.isNotBlank(criteria);
+        }
         return isNote() || isMedia() || isCommand() || isValidation();
     }
 
@@ -157,7 +167,7 @@ public record DoneWhen(String type, String criteria, String path, List<String> c
             return MEDIA;
         }
         if (isCommand()) {
-            return COMMAND;
+            return criteria.isBlank() ? COMMAND : COMMAND + ":" + criteria;
         }
         if (isValidation())
             return criteria.isBlank() ? VALIDATION : VALIDATION + ":" + criteria;
@@ -205,6 +215,8 @@ public record DoneWhen(String type, String criteria, String path, List<String> c
         if (COMMAND.equalsIgnoreCase(t)) {
             return command();
         }
+        if (t.regionMatches(true, 0, COMMAND + ":", 0, COMMAND.length() + 1))
+            return command(t.substring(COMMAND.length() + 1).trim());
         if (VALIDATION.equalsIgnoreCase(t)) {
             return validation("");
         }

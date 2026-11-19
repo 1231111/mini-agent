@@ -46,6 +46,144 @@ class PlanValidatorTest {
     }
 
     @Test
+    void rejectsInternalFileOperationsAsUserFacingNodeNames() {
+        TaskPlan plan = structured("解析航班信息");
+        TaskGraph graph = new TaskGraph(List.of(
+                node("n1", "保存文件「parse_ly.py」", "code")));
+
+        PlanValidationReport report = validator.validate(graph, plan);
+
+        assertFalse(report.valid());
+        assertEquals(1, report.countByType(
+                PlanValidationReport.ValidationError.Type.LOW_LEVEL_NODE_NAME));
+        assertTrue(report.toCorrectionPrompt().contains("交付结果和用途"));
+    }
+
+    @Test
+    void acceptsNodeNamesThatExplainTheUserFacingDeliverable() {
+        TaskPlan plan = structured("解析航班信息");
+        TaskGraph graph = new TaskGraph(List.of(
+                node("n1", "生成用于解析航班信息的程序", "code")));
+
+        assertTrue(validator.validate(graph, plan).valid());
+    }
+
+    @Test
+    void codeFixPlanRequiresDependentBuildOrTestCommand() {
+        TaskPlan plan = structured("修复 Java 航班解析 bug");
+        TaskNode change = new TaskNode("n1", "修复航班解析程序", "code",
+                List.of(), List.of(), List.of("mini-agent-planner/src/main/java/Parser.java"),
+                TaskNodeStatus.PENDING, 10, DoneWhen.note(), "", "", 0, "");
+        TaskGraph missing = new TaskGraph(List.of(change));
+
+        PlanValidationReport missingReport = validator.validate(missing, plan);
+        assertFalse(missingReport.valid());
+        assertEquals(1, missingReport.countByType(
+                PlanValidationReport.ValidationError.Type.MISSING_CODE_VALIDATION));
+
+        TaskNode verification = new TaskNode("n2", "确认航班解析测试通过", "shell",
+                List.of("n1"), List.of(), List.of(), TaskNodeStatus.PENDING, 10,
+                DoneWhen.command("mvnw -pl mini-agent-planner test"), "", "", 0, "");
+        assertTrue(validator.validate(new TaskGraph(List.of(change, verification)), plan).valid());
+    }
+
+    @Test
+    void codeFixCannotUseAnUnrelatedCommandAsItsVerificationGate() {
+        TaskPlan plan = structured("修复 Java 航班解析 bug");
+        TaskNode change = new TaskNode("n1", "修复航班解析程序", "code",
+                List.of(), List.of(), List.of("mini-agent-tools/src/main/java/Parser.java"),
+                TaskNodeStatus.PENDING, 10, DoneWhen.note(), "", "", 0, "");
+        TaskNode unrelated = new TaskNode("n2", "报告命令运行成功", "shell",
+                List.of("n1"), List.of(), List.of(), TaskNodeStatus.PENDING, 10,
+                DoneWhen.command("echo completed"), "", "", 0, "");
+
+        PlanValidationReport report = validator.validate(new TaskGraph(List.of(change, unrelated)), plan);
+        assertFalse(report.valid());
+        assertEquals(1, report.countByType(
+                PlanValidationReport.ValidationError.Type.MISSING_CODE_VALIDATION));
+    }
+
+    @Test
+    void codeFixRejectsCommandsThatDoNotActuallyRunTestsOrCanHideFailure() {
+        TaskPlan plan = structured("修复 Java 航班解析 bug");
+        TaskNode change = node("n1", "修复航班解析程序", "code");
+        for (String command : List.of(
+                "echo \"mvn test\"", "mvn test || echo pass", "mvn -DskipTests package",
+                "mvn test | tee test.log", "javac Foo.java")) {
+            TaskNode verification = new TaskNode("n2", "验证航班解析修改", "shell",
+                    List.of("n1"), List.of(), List.of(), TaskNodeStatus.PENDING, 10,
+                    DoneWhen.command(command), "", "", 0, "");
+            PlanValidationReport report = validator.validate(new TaskGraph(List.of(change, verification)), plan);
+            assertFalse(report.valid(), command);
+            assertEquals(1, report.countByType(
+                    PlanValidationReport.ValidationError.Type.MISSING_CODE_VALIDATION), command);
+        }
+    }
+
+    @Test
+    void codeFixAcceptsAnUnmaskedTestRunnerWithSafeWorkingDirectoryPrefix() {
+        TaskPlan plan = structured("修复 Java 航班解析 bug");
+        TaskNode change = new TaskNode("n1", "修复航班解析程序", "code",
+                List.of(), List.of(), List.of("mini-agent-tools/src/main/java/Parser.java"),
+                TaskNodeStatus.PENDING, 10, DoneWhen.note(), "", "", 0, "");
+        TaskNode verification = new TaskNode("n2", "验证航班解析修改", "shell",
+                List.of("n1"), List.of(), List.of(), TaskNodeStatus.PENDING, 10,
+                DoneWhen.command("cd mini-agent-tools && ../mvnw -pl mini-agent-tools test"), "", "", 0, "");
+
+        assertTrue(validator.validate(new TaskGraph(List.of(change, verification)), plan).valid());
+    }
+
+    @Test
+    void codePlanWithoutKnownChangedPathRequiresAnUnscopedTest() {
+        TaskPlan plan = structured("修复 Java 航班解析 bug");
+        TaskNode change = node("n1", "修复航班解析程序", "code");
+        TaskNode scopedTest = new TaskNode("n2", "验证航班解析修改", "shell",
+                List.of("n1"), List.of(), List.of(), TaskNodeStatus.PENDING, 10,
+                DoneWhen.command("mvn -pl mini-agent-planner test"), "", "", 0, "");
+
+        PlanValidationReport report = validator.validate(new TaskGraph(List.of(change, scopedTest)), plan);
+        assertFalse(report.valid());
+        assertEquals(1, report.countByType(
+                PlanValidationReport.ValidationError.Type.MISSING_CODE_VALIDATION));
+    }
+
+    @Test
+    void codePlanVerificationMustCoverEveryModuleNamedByChangedOutputs() {
+        TaskPlan plan = structured("修复航班解析和账户验证 bug");
+        TaskNode plannerChange = new TaskNode("planner", "修复航班解析功能", "code",
+                List.of(), List.of(), List.of("mini-agent-planner/src/main/java/Parser.java"),
+                TaskNodeStatus.PENDING, 10, DoneWhen.note(), "", "", 0, "");
+        TaskNode accountChange = new TaskNode("account", "修复账户验证功能", "code",
+                List.of(), List.of(), List.of("mini-agent-account/src/main/java/Login.java"),
+                TaskNodeStatus.PENDING, 10, DoneWhen.note(), "", "", 0, "");
+        TaskNode plannerOnlyTest = new TaskNode("verify", "验证两个功能修改", "shell",
+                List.of("planner", "account"), List.of(), List.of(), TaskNodeStatus.PENDING, 10,
+                DoneWhen.command("mvn -pl mini-agent-planner -am test"), "", "", 0, "");
+
+        PlanValidationReport incomplete = validator.validate(
+                new TaskGraph(List.of(plannerChange, accountChange, plannerOnlyTest)), plan);
+        assertFalse(incomplete.valid());
+        assertEquals(1, incomplete.countByType(
+                PlanValidationReport.ValidationError.Type.MISSING_CODE_VALIDATION));
+
+        TaskNode bothModulesTest = plannerOnlyTest.withDoneWhen(
+                DoneWhen.command("mvn -pl mini-agent-planner,mini-agent-account test"));
+        assertTrue(validator.validate(new TaskGraph(List.of(plannerChange, accountChange, bothModulesTest)), plan).valid());
+    }
+
+    @Test
+    void rejectsOpaqueInternalExecutionTitlesAndAcceptsDeliverableTitles() {
+        TaskPlan plan = structured("解析航班信息");
+        for (String name : List.of("运行航班解析程序", "生成 parse_ly.py")) {
+            PlanValidationReport report = validator.validate(new TaskGraph(List.of(node("n1", name, "code"))), plan);
+            assertFalse(report.valid(), name);
+        }
+        for (String name : List.of("整理出可查看的航班数据", "生成供活动页使用的主视觉图片")) {
+            assertTrue(validator.validate(new TaskGraph(List.of(node("n1", name, "code"))), plan).valid(), name);
+        }
+    }
+
+    @Test
     void rejectsFileWriteWithNote() {
         TaskPlan plan = structured("整理一份文档");
         TaskGraph g = new TaskGraph(List.of(

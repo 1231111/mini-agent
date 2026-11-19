@@ -10,6 +10,9 @@ import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.tool.BuiltinTools;
 import com.miniagent.agent.planner.DoneWhen;
+import com.miniagent.agent.planner.CodeValidationPolicy;
+import com.miniagent.agent.tool.ToolResult;
+import com.miniagent.agent.tool.ToolStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -92,6 +95,16 @@ public class TaskTodoStore {
     }
 
     private final Map<String, List<TodoItem>> todos = new ConcurrentHashMap<>();
+    /** Trusted in-process command receipts for legacy code tasks; never populated from model evidence. */
+    private final Map<String, CodeValidationState> codeValidation = new ConcurrentHashMap<>();
+
+    private static final class CodeValidationState {
+        long revision;
+        long validatedRevision;
+        String command = "";
+        final Set<String> changedModules = new LinkedHashSet<>();
+        boolean unknownAffectedModule;
+    }
     /**
      * 已作废但保留的清单（{@code task.clear} 的产物）。
      *
@@ -362,6 +375,20 @@ public class TaskTodoStore {
                     status = Status.in_progress;
                     note = "语义条件尚未验证，须由 DAG 验收后完成";
                 }
+                if (mergeRanks && status == Status.completed && isCodeTask(content)) {
+                    boolean alreadyCompleted = false;
+                    for (TodoItem old : prev) {
+                        if (old.id() == id && old.content().equals(content)
+                                && old.status() == Status.completed) {
+                            alreadyCompleted = true;
+                            break;
+                        }
+                    }
+                    if (!alreadyCompleted) {
+                        status = Status.in_progress;
+                        note = "代码任务必须先运行并通过真实测试，不能由 evidence 文本直接完成";
+                    }
+                }
                 items.add(new TodoItem(
                         id, content, status, note, doneWhen, evidence, hash, deps));
                 prevId = id;
@@ -372,6 +399,13 @@ public class TaskTodoStore {
             promoteReadyItems(items);
         }
         todos.put(key, items);
+        if (mergeRanks && items.stream().anyMatch(item -> isCodeTask(item.content()))) {
+            boolean newCodeTask = items.stream().filter(item -> isCodeTask(item.content()))
+                    .anyMatch(item -> prev.stream().noneMatch(old -> old.id() == item.id()
+                            && old.content().equals(item.content()) && isCodeTask(old.content())));
+            if (newCodeTask) requireCodeValidation(key);
+            else ensureCodeValidationRequired(key);
+        }
         persist(key, items);
         return new ArrayList<>(items);
     }
@@ -493,6 +527,15 @@ public class TaskTodoStore {
             }
 
             if (status == Status.completed) {
+                if (it.status() != Status.completed && isCodeTask(it.content())) {
+                    ensureCodeValidationRequired(key);
+                    if (!isCodeValidationSatisfied(key)) {
+                        if (errorOut != null && errorOut.length > 0) {
+                            errorOut[0] = "代码任务未完成：缺少代码改动之后真实执行且成功的测试命令回执；请运行测试后再提交完成";
+                        }
+                        return null;
+                    }
+                }
                 String check = verifyCompletion(it.doneWhen(), newEvidence);
                 if (check != null) {
                     if (errorOut != null && errorOut.length > 0) {
@@ -1209,8 +1252,141 @@ public class TaskTodoStore {
         }
         promoteReadyItems(items);
         todos.put(key, items);
+        if (items.stream().anyMatch(item -> isCodeTask(item.content()))) {
+            requireCodeValidation(key);
+        }
         persist(key, items);
         return true;
+    }
+
+    /** Start a code-task validation contract if one has not already been opened for this session. */
+    public synchronized void ensureCodeValidationRequired(String sessionId) {
+        String key = safeKey(sessionId);
+        CodeValidationState state = codeValidation.computeIfAbsent(key, ignored -> new CodeValidationState());
+        if (state.revision == 0) state.revision = 1;
+    }
+
+    /** A real source write invalidates every earlier test receipt for this session. */
+    public synchronized void recordCodeChange(String sessionId) {
+        recordCodeChange(sessionId, "");
+    }
+
+    public synchronized void recordCodeChange(String sessionId, String sourcePath) {
+        String key = safeKey(sessionId);
+        CodeValidationState state = codeValidation.computeIfAbsent(key, ignored -> new CodeValidationState());
+        state.revision++;
+        state.command = "";
+        String module = CodeValidationPolicy.moduleHint(sourcePath);
+        if (!module.isBlank()) {
+            state.changedModules.add(module);
+        } else {
+            // A path-less shell mutation or file outside a known module makes a narrow
+            // project test insufficient, even if earlier edits named a module.
+            state.unknownAffectedModule = true;
+        }
+        invalidateCodeTodos(key);
+    }
+
+    /** A failed test invalidates the previous success receipt without widening changed-file scope. */
+    public synchronized void recordCodeValidationFailure(String sessionId) {
+        String key = safeKey(sessionId);
+        CodeValidationState state = codeValidation.computeIfAbsent(key, ignored -> new CodeValidationState());
+        state.revision++;
+        state.command = "";
+        invalidateCodeTodos(key);
+    }
+
+    private void invalidateCodeTodos(String key) {
+        List<TodoItem> list = todos.get(key);
+        if (list == null || list.isEmpty()) return;
+        Set<Integer> invalidated = new LinkedHashSet<>();
+        for (TodoItem item : list) {
+            if (isCodeTask(item.content())) invalidated.add(item.id());
+        }
+        boolean changed;
+        do {
+            changed = false;
+            for (TodoItem item : list) {
+                if (!invalidated.contains(item.id())
+                        && item.dependsOn().stream().anyMatch(invalidated::contains)) {
+                    invalidated.add(item.id());
+                    changed = true;
+                }
+            }
+        } while (changed);
+        boolean persisted = false;
+        for (int i = 0; i < list.size(); i++) {
+            TodoItem item = list.get(i);
+            if (!invalidated.contains(item.id()) || item.status() == Status.cancelled
+                    || item.status() == Status.blocked || item.status() == Status.awaiting_confirm) continue;
+            Status next = isCodeTask(item.content()) ? Status.in_progress : Status.pending;
+            if (item.status() == next && item.evidence().isBlank() && item.validationHash().isBlank()) continue;
+            list.set(i, new TodoItem(item.id(), item.content(), next,
+                    "代码可能已变更或命令结果未确认，先前的完成状态和下游验证已作废",
+                    item.doneWhen(), "", "", item.dependsOn()));
+            persisted = true;
+        }
+        if (persisted) persist(key, list);
+    }
+
+    /** Store a successful test receipt only when it came from the actual exec_command result path. */
+    public synchronized void recordTrustedCodeValidation(String sessionId, String command, ToolResult result) {
+        if (result == null || result.status() != ToolStatus.SUCCESS
+                || !CodeValidationPolicy.isTestCommand(command) || !hasExactSuccessfulExitCode(result.legacyText())) {
+            return;
+        }
+        String key = safeKey(sessionId);
+        CodeValidationState state = codeValidation.get(key);
+        if (state == null || state.revision == 0
+                || !CodeValidationPolicy.isTestCommandForModules(
+                        command, state.changedModules, state.unknownAffectedModule)) return;
+        state.validatedRevision = state.revision;
+        state.command = command.trim();
+    }
+
+    public synchronized boolean hasPendingCodeValidation(String sessionId) {
+        CodeValidationState state = codeValidation.get(safeKey(sessionId));
+        return state != null && state.revision > state.validatedRevision;
+    }
+
+    public synchronized boolean hasIncompleteCodeTask(String sessionId) {
+        for (TodoItem item : get(sessionId)) {
+            if (isCodeTask(item.content()) && item.status() != Status.completed
+                    && item.status() != Status.cancelled && item.status() != Status.blocked) return true;
+        }
+        return false;
+    }
+
+    public synchronized boolean isCodeValidationSatisfied(String sessionId) {
+        CodeValidationState state = codeValidation.get(safeKey(sessionId));
+        return state != null && state.revision > 0 && state.revision == state.validatedRevision;
+    }
+
+    public synchronized void clearSatisfiedCodeValidationIfNoIncompleteCodeTask(String sessionId) {
+        String key = safeKey(sessionId);
+        if (isCodeValidationSatisfied(sessionId) && !hasIncompleteCodeTask(sessionId)) codeValidation.remove(key);
+    }
+
+    private static boolean isCodeTask(String content) {
+        if (content == null || content.isBlank()) return false;
+        String lower = content.toLowerCase(java.util.Locale.ROOT);
+        return CodeValidationPolicy.isCodeChangeGoal(content)
+                || CodeValidationPolicy.isCodeArtifact(content)
+                || lower.matches("(?s).*(?:bug|defect|source file|source code|code change|implement|refactor).*" );
+    }
+
+    private void requireCodeValidation(String key) {
+        CodeValidationState state = codeValidation.computeIfAbsent(key, ignored -> new CodeValidationState());
+        state.revision++;
+        state.command = "";
+        state.changedModules.clear();
+        state.unknownAffectedModule = false;
+    }
+
+    private static boolean hasExactSuccessfulExitCode(String rawResult) {
+        if (rawResult == null || rawResult.isBlank()) return false;
+        String firstLine = rawResult.lines().findFirst().orElse("").trim();
+        return "exit_code=0".equals(firstLine);
     }
 
     public synchronized String currentSubGoal(String sessionId) {

@@ -23,6 +23,16 @@ class GoalCompilerGranularityTest {
     private final GoalCompiler compiler = new GoalCompiler(new PlannerProperties());
 
     @Test
+    void compilerPromptRequiresUserFacingDeliverableNames() {
+        String prompt = GoalCompiler.compilerSystem();
+        assertTrue(prompt.contains("node.name 会直接显示在任务进度里"), prompt);
+        assertTrue(prompt.contains("写清该节点完成后"), prompt);
+        assertTrue(prompt.contains("不要把工具动作、代码步骤或内部文件读写当成节点名"), prompt);
+        assertTrue(prompt.contains("生成用于解析航班信息的程序"), prompt);
+        assertTrue(prompt.contains("必须增加依赖代码改动节点的独立测试节点"), prompt);
+    }
+
+    @Test
     void compilerDoesNotUseTemplateFallbackWhenLlmFails() {
         ChatModel chat = mock(ChatModel.class);
         when(chat.chat(any(ChatRequest.class))).thenThrow(new RuntimeException("no"));
