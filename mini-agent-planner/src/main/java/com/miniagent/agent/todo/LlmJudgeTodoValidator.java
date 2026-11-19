@@ -102,6 +102,32 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
         return dedicatedJudge != null ? dedicatedJudge : EffectiveModelContext.chatOr(chatModel);
     }
 
+    /** Dedicated model only: code review must not silently call the executor when production requires separation. */
+    public ChatModel independentJudgeModelOrNull() { return dedicatedJudge; }
+
+    public boolean requiresIndependentJudge() { return requireIndependentJudge; }
+
+    public boolean reviewPayloadFitsContext(int promptBytes) {
+        int configuredWindow = judgeContextWindow > 0 ? judgeContextWindow : 8192;
+        int effectiveWindow = dedicatedJudge == null && EffectiveModelContext.currentContextWindow() > 0
+                ? EffectiveModelContext.currentContextWindow() : configuredWindow;
+        return promptBytes + 512 <= effectiveWindow;
+    }
+
+    public void recordIndependentReviewUsage(ChatResponse response, long promptBytes) {
+        String session = AgentLoop.getCurrentSession();
+        long input = response != null && response.tokenUsage() != null
+                && response.tokenUsage().inputTokenCount() != null
+                ? response.tokenUsage().inputTokenCount() : Math.max(0L, promptBytes);
+        long output = response != null && response.tokenUsage() != null
+                && response.tokenUsage().outputTokenCount() != null
+                ? response.tokenUsage().outputTokenCount()
+                : (response == null || response.aiMessage() == null || response.aiMessage().text() == null
+                ? 0L : response.aiMessage().text().getBytes(StandardCharsets.UTF_8).length);
+        TokenUsageTracker.add(session, input, output, 0);
+        checkBudget(session, input + output);
+    }
+
     @Override
     public String name() {
         return "llm_judge";

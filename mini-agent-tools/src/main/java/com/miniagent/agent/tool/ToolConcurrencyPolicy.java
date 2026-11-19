@@ -291,6 +291,7 @@ public final class ToolConcurrencyPolicy {
 
             // ── 本地写 ──
             case "write_file", "edit_file" -> WRITE_BY_PATH;
+            case "undo_last_file_change" -> WRITE_GLOBAL;
             case "todo", "memory", "skill_manage" -> WRITE_GLOBAL;
             case "delete_path", "move_file", "create_directory", "process" -> WRITE_GLOBAL;
             case "render_diagram" -> WRITE_GLOBAL.withBudget(90);
@@ -469,7 +470,7 @@ public final class ToolConcurrencyPolicy {
         if (isReadOnly(name)) {
             return ToolSideEffect.READ_ONLY;
         }
-        if (Set.of("write_file", "edit_file", "todo", "memory", "skill_manage",
+        if (Set.of("write_file", "edit_file", "undo_last_file_change", "todo", "memory", "skill_manage",
                 "browser_screenshot", "browser_clear_session").contains(name)) return ToolSideEffect.WRITE;
         return ToolSideEffect.EXTERNAL_WRITE;
     }

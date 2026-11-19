@@ -15,7 +15,7 @@ public final class CodeValidationPolicy {
                     + "新增(?:功能|接口|特性)|开发(?:功能|接口|组件|模块|程序|脚本)|"
                     + "重构(?:代码|模块|函数)?|修改(?:源代码|代码)|"
                     + "(?:更新|修改|更改|变更|update|change|modify|edit)\\s*(?:the\\s+|a\\s+|an\\s+)?[\\w./\\\\-]+\\.(?:java|py|js|jsx|ts|tsx|mjs|cjs|go|rs|cs|cpp|c|h|hpp|sql|sh|ps1|kt|kts|swift|rb|php)\\b|"
-                    + "fix(?:\\s+[a-z]|\\s+bug)?|"
+                    + "fix(?:\\s+[a-z]|\\s+bug)?\\b|"
                     + "implement|add\\s+(?:a\\s+)?feature|refactor\\s+code)");
     private static final Pattern CODE_ARTIFACT = Pattern.compile(
             "(?i)(\\.(?:java|py|js|jsx|ts|tsx|mjs|cjs|go|rs|cs|cpp|c|h|hpp|sql|sh|ps1|"
@@ -23,6 +23,11 @@ public final class CodeValidationPolicy {
                     + "源代码|源文件|代码|程序|脚本|模块|函数|类)");
     private static final Pattern CODE_CONFIG_ARTIFACT = Pattern.compile(
             "(?i)\\.(?:json|xml|yaml|yml|toml|properties|gradle)\\b");
+    private static final Pattern REVIEWABLE_BUILD_CONFIG = Pattern.compile(
+            "(?i)(?:^|/)(?:pom\\.xml|package(?:-lock)?\\.json|tsconfig[^/]*\\.json|"
+                    + "pyproject\\.toml|cargo\\.toml|go\\.(?:mod|sum)|requirements(?:-[^/]*)?\\.txt|"
+                    + "build\\.gradle(?:\\.kts)?|settings\\.gradle(?:\\.kts)?|composer\\.json|"
+                    + "gemfile|dockerfile|makefile|cmakelists\\.txt|[^/]+\\.csproj|[^/]+\\.sln)");
     private static final Pattern MODULE_HINT = Pattern.compile("(?i)(?:^|/)(mini-agent-[a-z0-9_-]+)(?:/|$)");
     private static final Set<String> TEST_SKIP_FLAGS = Set.of(
             "-dskiptests", "-dskiptests=true", "-dmaven.test.skip", "-dmaven.test.skip=true",
@@ -40,6 +45,13 @@ public final class CodeValidationPolicy {
 
     public static boolean isCodeConfigArtifact(String text) {
         return text != null && CODE_CONFIG_ARTIFACT.matcher(text).find();
+    }
+
+    /** Code source plus well-known build/dependency manifests, excluding arbitrary JSON data. */
+    public static boolean isReviewableCodeArtifact(String path) {
+        if (path == null || path.isBlank()) return false;
+        String normalized = path.replace('\\', '/');
+        return isCodeArtifact(normalized) || REVIEWABLE_BUILD_CONFIG.matcher(normalized).find();
     }
 
     /**

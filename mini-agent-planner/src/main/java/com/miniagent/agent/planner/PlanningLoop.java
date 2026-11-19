@@ -51,6 +51,8 @@ import java.util.stream.Collectors;
 public class PlanningLoop {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private com.miniagent.agent.core.ModelCallControl modelCallControl;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private CodeDiffReviewService codeDiffReviewService;
 
     private static final Logger log = LoggerFactory.getLogger(PlanningLoop.class);
     private static final int PRIOR_OUTPUT_CHARS = 6000;
@@ -387,6 +389,11 @@ public class PlanningLoop {
             return RunOutcome.failed("任务规划当前不可用，尚未开始操作。请重试。", "PLANNER_UNAVAILABLE");
         }
 
+        boolean codeReviewRequired = CodeValidationPolicy.isCodeChangeGoal(taskPlan.taskGoal())
+                || CodeValidationPolicy.isCodeChangeGoal(userMessage);
+        CodeDiffReviewService.Baseline codeReviewBaseline = codeReviewRequired && codeDiffReviewService != null
+                ? codeDiffReviewService.captureForSession(sessionId) : null;
+
         if (route.artifactDeliveryRequested() != null) {
             taskPlan = taskPlan.withArtifactDeliveryRequested(route.artifactDeliveryRequested());
         }
@@ -566,6 +573,7 @@ public class PlanningLoop {
 
         AcceptedNodeAnswer acceptedAnswer = null;
         int rounds = 0;
+        String acceptedCodeReviewHash = "";
         // 只有"图全部通过终验"这一条路会把 completed 置真；其余出口都是"没做完"。
         String unfinishedReason = "NO_READY_NODES";
         while (rounds++ < properties.getMaxOuterRounds()) {
@@ -647,17 +655,60 @@ public class PlanningLoop {
                     todoProjector.project(sessionId, snap.graph());
                     continue;
                 }
+                if (codeReviewRequired) {
+                    CodeDiffReviewService.Review review = codeDiffReviewService == null
+                            ? new CodeDiffReviewService.Review("", false, true,
+                                    "独立代码审查服务不可用，按安全策略阻止完成")
+                            : codeDiffReviewService.review(codeReviewBaseline, chat);
+                    if (review.passed()) acceptedCodeReviewHash = review.diffHash();
+                    if (!review.passed()) {
+                        String reviewReason = review.feedback();
+                        TaskNode bad = resolveAcceptFailNode(snap.graph(), "");
+                        if (bad == null) {
+                            return RunOutcome.unfinished(
+                                    "代码修改尚未通过独立审查，任务未标记完成。\n" + reviewReason,
+                                    "CODE_REVIEW_BLOCKED");
+                        }
+                        TaskGraph reopened = snap.graph().replace(bad.withStatus(TaskNodeStatus.FAILED)
+                                .withError("独立代码审查未通过：" + reviewReason));
+                        try {
+                            snap = commitNodeOutcomes(sessionId, fencingToken, snap, snap.withGraph(reopened), List.of(
+                                    new NodeOutcome("code-review-" + bad.id() + "-" + snap.planVersion(), bad,
+                                            NodeTerminalCommitPort.Result.FAILURE,
+                                            failureDetail(null, reviewReason, userMessage))));
+                        } catch (PlannerStateStore.VersionConflictException conflict) {
+                            metrics.casConflict();
+                            continue;
+                        }
+                        FailureDiagnosis reviewDiagnosis = recoveryEngine.diagnose(
+                                bad, diagnoseTool(bad, ""), reviewReason);
+                        RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap, bad,
+                                reviewDiagnosis, "code-review-" + bad.id(), chat, userMessage, taskPlan, history);
+                        if (recovery.stop() != null) return recovery.stop();
+                        snap = recovery.snapshot();
+                        todoProjector.project(sessionId, snap.graph());
+                        continue;
+                    }
+                }
+                if (codeReviewRequired && (codeDiffReviewService == null
+                        || !codeDiffReviewService.isCurrent(codeReviewBaseline, acceptedCodeReviewHash))) {
+                    acceptedCodeReviewHash = "";
+                    continue;
+                }
                 // Acceptance can run a slow model or read external state. Fence
                 // its result with an actual CAS before returning task success.
                 try {
                     Map<String, Object> accepted = new LinkedHashMap<>(snap.execution());
                     accepted.put("graphAcceptedPlanVersion", snap.planVersion());
                     accepted.put("graphAcceptedStateVersion", snap.version());
+                    if (codeReviewRequired) accepted.put("graphAcceptedCodeReviewHash", acceptedCodeReviewHash);
                     snap = stateStore.commit(sessionId, snap.version(), snap.withExecution(accepted));
                 } catch (PlannerStateStore.VersionConflictException conflict) {
                     metrics.casConflict();
                     continue;
                 }
+                if (codeReviewRequired && codeDiffReviewService != null)
+                    codeDiffReviewService.completeSessionReview(sessionId);
                 log.info("PlanningLoop 图完成 session={} version={} metrics={}",
                         sessionId, snap.version(), metrics.snapshot());
                 metrics.graphCompleted();
@@ -727,6 +778,16 @@ public class PlanningLoop {
                 continue;
             }
 
+            boolean boundCodeWrite = proposal.actions().stream().anyMatch(PlanningLoop::isCodeFileWriteAction);
+            boolean boundShellAction = proposal.actions().stream()
+                    .anyMatch(action -> "exec_command".equals(action.tool()));
+            if ((boundCodeWrite || boundShellAction) && codeReviewBaseline == null
+                    && codeDiffReviewService != null) {
+                // Capture before any direct bound action can write files.
+                codeReviewBaseline = codeDiffReviewService.captureForSession(sessionId);
+            }
+            if (boundCodeWrite) codeReviewRequired = true;
+
             snap = markRunning(sessionId, snap, proposal);
             if (!ownsRunningProposal(snap, proposal)) {
                 metrics.casConflict();
@@ -747,6 +808,15 @@ public class PlanningLoop {
             StepExec step = executeProposal(chat, systemPrompt, stepUser,
                     multimodalUser, history, taskPlan, proposal, snap.graph(),
                     snap.version(), sessionId, streamSink);
+            if (boundShellAction && !codeReviewRequired) {
+                if (codeDiffReviewService == null
+                        || codeDiffReviewService.hasChangedCodeArtifact(codeReviewBaseline)) {
+                    codeReviewRequired = true;
+                } else {
+                    codeDiffReviewService.discardSessionBaseline(sessionId, codeReviewBaseline);
+                    codeReviewBaseline = null;
+                }
+            }
             captureAgentTranscript(step.messages());
             boolean drifted = step.drifted();
             boolean quotaAbort = isResourceQuotaAbort(step.endReason())
@@ -2211,6 +2281,13 @@ public class PlanningLoop {
             }
         }
         return last;
+    }
+
+    private static boolean isCodeFileWriteAction(ActionSpec action) {
+        if (action == null || !("write_file".equals(action.tool()) || "edit_file".equals(action.tool())))
+            return false;
+        Object path = action.arguments().get("path");
+        return path != null && CodeValidationPolicy.isReviewableCodeArtifact(String.valueOf(path));
     }
 
     static List<StepEvaluator.CommandReceipt> toolExecutionReceipts(List<ChatMessage> messages) {

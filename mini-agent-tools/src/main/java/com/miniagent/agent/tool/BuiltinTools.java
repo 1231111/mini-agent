@@ -77,6 +77,8 @@ public class BuiltinTools {
     private  NetworkGuard networkGuard;
     @Autowired
     private  CapabilityRegistry capabilityRegistry;
+    @Autowired(required = false)
+    private FileChangeLedger fileChangeLedger;
 
     /**
      * 出网统一走这个客户端：它手动处理重定向，**每一跳**都重新过 {@link NetworkGuard}，
@@ -355,7 +357,8 @@ public class BuiltinTools {
                         + "回复时请原样用 ![说明](url)，不要改写成相对路径或本地绝对路径，"
                         + "工作区没有静态资源映射，只有这个 url 能加载。\n"
                         + "【大文件必读】单轮输出有长度上限，超长文件（如完整的 3D 仿真 HTML、长代码）一次写不完会被截断。"
-                        + "正确做法：第一次用 mode=\"overwrite\"（默认）写开头部分，之后多次用 mode=\"append\" 把剩余内容续写到同一文件，直到写完。不要试图一次塞进全部内容。",
+                        + "正确做法：第一次用 mode=\"overwrite\"（默认）写开头部分，之后多次用 mode=\"append\" 把剩余内容续写到同一文件，直到写完。不要试图一次塞进全部内容。"
+                        + "【安全撤销】当前进程内 write_file/edit_file 的最近一次成功改动有会话级回滚记录；用户明确要求撤销时可用 undo_last_file_change。若文件之后被人工或其他程序改动，撤销会拒绝覆盖。",
                 WriteFileParams.class,
                 params -> {
                     if (Objects.isNull(params.getContent())) {
@@ -372,6 +375,11 @@ public class BuiltinTools {
         registry.register("read_package", "按Java包名读取包下所有源码文件。传包名如 com.miniagent.agent.task，自动解析路径并返回全部代码。分析项目架构时优先用这个，不要逐个 read_file。",
                 ReadPackageParams.class,
                 params -> readPackage(params.getPackageName(), params.getMaxCharsPerFileOrDefault()));
+
+        registry.register("undo_last_file_change",
+                "仅当用户明确要求撤销/回滚最近一次智能体文件修改时使用。按会话和用户隔离；若文件在智能体写入后被外部修改，会拒绝覆盖。仅能撤销 write_file/edit_file 最近一次成功操作。",
+                Map.of("type", "object", "properties", Map.of(), "required", List.of()),
+                args -> undoLastFileChange());
     }
 
     // ==================== HTTP 工具 ====================
@@ -425,7 +433,8 @@ public class BuiltinTools {
         // edit_file：锚点替换，改已有文件只传 diff，不重发整文件。
         registry.register("edit_file",
                 "精确编辑已有文件：把 oldString 替换为 newString。修改已存在的文件用这个，不要用 write_file 重写整个文件。" +
-                "oldString 必须与文件中的原文逐字符一致（含缩进），且默认必须唯一匹配——不唯一时请在 oldString 里多带几行上下文。删除内容时 newString 传空字符串。",
+                "oldString 必须与文件中的原文逐字符一致（含缩进），且默认必须唯一匹配——不唯一时请在 oldString 里多带几行上下文。删除内容时 newString 传空字符串。"
+                        + "当前进程内最近一次成功改动可在用户明确要求时通过 undo_last_file_change 安全撤销；后续外部修改会触发冲突保护。",
                 EditFileParams.class,
                 params -> editFile(params.getPath(), 
                                  params.getOldString(), 
@@ -579,6 +588,8 @@ public class BuiltinTools {
         if (oldStr.equals(newStr)) {
             return "{\"error\":\"old_string 与 new_string 相同，无需编辑\"}";
         }
+        FileChangeLedger.Snapshot undoSnapshot = null;
+        boolean undoRecorded = false;
         try {
             Path target = resolveSearchPath(path);
             if (!Files.exists(target)) {
@@ -599,7 +610,21 @@ public class BuiltinTools {
                     : content.substring(0, content.indexOf(oldStr)) + newStr
                       + content.substring(content.indexOf(oldStr) + oldStr.length());
 
+            undoSnapshot = fileChangeLedger == null ? null : fileChangeLedger.capture(target);
+            if (undoSnapshot != null && !undoSnapshot.accepted())
+                return errorJson(ToolErrorCode.CONFLICT, undoSnapshot.error());
+            if (updated.getBytes(StandardCharsets.UTF_8).length > 8L * 1024 * 1024)
+                return errorJson(ToolErrorCode.CONFLICT, "编辑结果超过安全回滚快照上限 8 MiB");
+            if (fileChangeLedger != null && undoSnapshot != null) {
+                String conflict = fileChangeLedger.verifyUnchanged(undoSnapshot, content.getBytes(StandardCharsets.UTF_8));
+                if (conflict != null) return errorJson(ToolErrorCode.CONFLICT, conflict);
+            }
+
             Files.writeString(target, updated, StandardCharsets.UTF_8);
+            if (fileChangeLedger != null && undoSnapshot != null) {
+                fileChangeLedger.record(undoSnapshot, updated.getBytes(StandardCharsets.UTF_8));
+                undoRecorded = true;
+            }
             invalidateReadCache(path);
             // 更新（不是清空）读观察：让 read → edit → edit 这类连续增量编辑继续放行。
             rememberWrite(target);
@@ -609,7 +634,19 @@ public class BuiltinTools {
                     + "\",\"replaced\":" + replaced + "}";
         } catch (Exception e) {
             return "{\"error\":\"编辑文件失败: " + e.getMessage() + "\"}";
+        } finally {
+            if (!undoRecorded && fileChangeLedger != null) fileChangeLedger.cancel(undoSnapshot);
         }
+    }
+
+    private String undoLastFileChange() {
+        if (fileChangeLedger == null) return "{\"error\":\"文件回滚能力当前不可用\"}";
+        String result = fileChangeLedger.undoLast();
+        if (result.contains("\"success\":true")) {
+            toolResultCache.clear();
+            readObservations.clear();
+        }
+        return result;
     }
 
     private static int countOccurrences(String haystack, String needle) {
@@ -1298,6 +1335,8 @@ public class BuiltinTools {
     }
 
     private String writeFile(String path, String content, boolean append, boolean force) {
+        FileChangeLedger.Snapshot undoSnapshot = null;
+        boolean undoRecorded = false;
         try {
             // 如果 path 只是文件名（无目录分隔符），默认写到 workspace 根；
             // 子 Agent 通过 WorkspaceContext.taskOverride 隔离。
@@ -1305,6 +1344,18 @@ public class BuiltinTools {
             Files.createDirectories(target.getParent());
             // 保留受保护的媒体 URL；不再把旧路径改写成匿名静态资源。
             String finalContent = content;
+            undoSnapshot = fileChangeLedger == null ? null : fileChangeLedger.capture(target);
+            if (undoSnapshot != null && !undoSnapshot.accepted())
+                return errorJson(ToolErrorCode.CONFLICT, undoSnapshot.error());
+            long currentBytes = Files.exists(target) ? Files.size(target) : 0L;
+            long resultingBytes = append ? currentBytes + finalContent.getBytes(StandardCharsets.UTF_8).length
+                    : finalContent.getBytes(StandardCharsets.UTF_8).length;
+            if (resultingBytes > 8L * 1024 * 1024)
+                return errorJson(ToolErrorCode.CONFLICT, "文件结果超过安全回滚快照上限 8 MiB");
+            if (fileChangeLedger != null && undoSnapshot != null) {
+                String conflict = fileChangeLedger.verifyUnchanged(undoSnapshot, null);
+                if (conflict != null) return errorJson(ToolErrorCode.CONFLICT, conflict);
+            }
 
             if (append) {
                 Files.writeString(target, finalContent, StandardCharsets.UTF_8,
@@ -1329,6 +1380,17 @@ public class BuiltinTools {
             } else {
                 Files.writeString(target, finalContent, StandardCharsets.UTF_8);
             }
+            if (fileChangeLedger != null && undoSnapshot != null) {
+                byte[] incoming = finalContent.getBytes(StandardCharsets.UTF_8);
+                byte[] expectedAfter = incoming;
+                if (append) {
+                    byte[] before = undoSnapshot.before();
+                    expectedAfter = java.util.Arrays.copyOf(before, before.length + incoming.length);
+                    System.arraycopy(incoming, 0, expectedAfter, before.length, incoming.length);
+                }
+                fileChangeLedger.record(undoSnapshot, expectedAfter);
+                undoRecorded = true;
+            }
             invalidateReadCache(path);
             rememberWrite(target);
             long totalBytes = Files.size(target);
@@ -1343,6 +1405,8 @@ public class BuiltinTools {
                     + "}";
         } catch (Exception e) {
             return "{\"error\":\"写入文件失败: " + e.getMessage() + "\"}";
+        } finally {
+            if (!undoRecorded && fileChangeLedger != null) fileChangeLedger.cancel(undoSnapshot);
         }
     }
 

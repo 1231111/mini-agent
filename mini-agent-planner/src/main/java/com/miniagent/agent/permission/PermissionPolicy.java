@@ -31,7 +31,7 @@ public final class PermissionPolicy {
     /** Ask 模式下需用户确认的危险工具 */
     public static final Set<String> ASK_DANGEROUS_TOOLS = Set.of(
             EXEC_TOOL, "http_post",
-            "write_file", "edit_file",
+            "write_file", "edit_file", "undo_last_file_change",
             "browser_click", "browser_type", "browser_press", "browser_scroll",
             "browser_select", "browser_set_checked", "browser_upload",
             "browser_evaluate", "browser_extract_text",

@@ -20,6 +20,8 @@ class CodeValidationPolicyTest {
             assertTrue(CodeValidationPolicy.isCodeChangeGoal(goal), goal);
         }
         assertFalse(CodeValidationPolicy.isCodeChangeGoal("Tell me what Parser.java does"));
+        assertFalse(CodeValidationPolicy.isCodeChangeGoal("fixture lookup"),
+                "The word fixture must not be treated as a request to fix code.");
     }
 
     @Test

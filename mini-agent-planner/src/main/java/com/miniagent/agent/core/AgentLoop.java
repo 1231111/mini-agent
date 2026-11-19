@@ -23,6 +23,7 @@ import com.miniagent.agent.hook.StopDecision;
 import com.miniagent.agent.hook.StopHookChain;
 import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.planner.CodeValidationPolicy;
+import com.miniagent.agent.planner.CodeDiffReviewService;
 import com.miniagent.agent.surface.ToolSurface;
 import com.miniagent.agent.context.ContextContributorConfiguration;
 import com.miniagent.agent.permission.PermissionContext;
@@ -126,6 +127,8 @@ public class AgentLoop {
     private StreamingChatModel streamingChatModel;
     @Autowired
     private TaskTodoStore taskTodoStore;
+    @Autowired(required = false)
+    private CodeDiffReviewService codeDiffReviewService;
     @Autowired
     private StopHookChain stopHookChain;
     /** 代码诊断收集器（可选，注入后每轮问模型前自动挂上语法检查结果） */
@@ -589,6 +592,12 @@ public class AgentLoop {
         boolean lengthTruncatedToolCalls = false; // 当前轮 tool_call 参数可能被截断
         int incompleteTodoReminders = 0;        // 未完成 todo 却试图收尾的次数
         int codeValidationReminders = 0;
+        int codeReviewBlocks = 0;
+        boolean codeReviewBlocked;
+        String lastCodeReviewHash = "";
+        CodeDiffReviewService.Baseline codeReviewBaseline;
+        ChatModel codeReviewerModel;
+        boolean shellMutationBaselineCaptured;
         int planUnapprovedNudges = 0;            // 未批准计划的收尾拦截次数
         final Set<String> nonExecutedFailureKeys = new java.util.HashSet<>();
         boolean goalAnchorInjected = false;     // 是否已注入任务目标锚定
@@ -863,6 +872,7 @@ public class AgentLoop {
         int iterations = executionProperties.capIterations(maxIterations);
 
         LoopState state = new LoopState();
+        state.codeReviewerModel = chatModel;
         if (messages.stream().anyMatch(ToolObservationProjector::isObservation)) {
             messages = new ArrayList<>(messages);
             ToolObservationProjector.stripImages(messages);
@@ -878,8 +888,14 @@ public class AgentLoop {
         String sessionId = currentSessionId.get();
         state.sessionId = sessionId;
         String rawTaskGoal = taskPlan == null ? userTextForFilePattern : taskPlan.taskGoal();
-        state.codeChangeTask = !LoopTurnContext.current().hardGate()
-                && CodeValidationPolicy.isCodeChangeGoal(rawTaskGoal);
+        boolean pendingCodeReview = codeDiffReviewService != null
+                && codeDiffReviewService.hasPendingBaseline(sessionId);
+        state.codeChangeTask = pendingCodeReview || (!LoopTurnContext.current().hardGate()
+                && CodeValidationPolicy.isCodeChangeGoal(rawTaskGoal));
+        if (state.codeChangeTask && codeDiffReviewService != null) {
+            state.codeReviewBaseline = codeDiffReviewService.captureForSession(sessionId);
+            state.codeReviewerModel = chatModel;
+        }
         if (!LoopTurnContext.current().hardGate() && sessionId != null
                 && (state.codeChangeTask || taskTodoStore.hasIncompleteCodeTask(sessionId))) {
             taskTodoStore.ensureCodeValidationRequired(sessionId);
@@ -1314,6 +1330,19 @@ public class AgentLoop {
                 }
                 if (focusTodosCompleted(sessionId)
                         && taskTodoStore.hasIncomplete(sessionId)) {
+                    if (state.codeChangeTask) {
+                        CodeDiffReviewService.Review checkpointReview = codeDiffReviewService == null
+                                ? new CodeDiffReviewService.Review("", false, true,
+                                        "独立代码审查服务不可用，按安全策略阻止完成")
+                                : codeDiffReviewService.review(state.codeReviewBaseline, state.codeReviewerModel);
+                        if (!checkpointReview.passed()) {
+                            messages.add(new SystemMessage(
+                                    "【独立代码审查门禁】当前代码差异未通过审查，不能结束本段。"
+                                            + "请处理具体问题后重新运行相关测试，再继续。\n"
+                                            + checkpointReview.feedback()));
+                            continue;
+                        }
+                    }
                     log.info("提案 focus todo 已完成，结束本段");
                     state.loopEndReason = RunStatus.SUCCESS.name();
                     return finish(STEP_SEGMENT_DONE, state, messages);
@@ -1376,6 +1405,17 @@ public class AgentLoop {
                     state.loopEndReason = "CODE_VALIDATION_REQUIRED";
                     return finish(result, state, messages);
                 }
+                if (state.codeReviewBlocked) {
+                    state.loopEndReason = "CODE_REVIEW_BLOCKED";
+                    return finish(result, state, messages);
+                }
+                if (state.codeChangeTask && codeDiffReviewService != null
+                        && !codeDiffReviewService.isCurrent(state.codeReviewBaseline, state.lastCodeReviewHash)) {
+                    messages.add(new SystemMessage(
+                            "【独立代码审查门禁】审查通过后代码差异又发生变化，旧回执已失效。"
+                                    + "请重新检查当前改动并完成必要测试后再收尾。"));
+                    continue;
+                }
                 if (!plannerOwnsTodos(sessionId)) {
                     taskTodoStore.clearSatisfiedCodeValidationIfNoIncompleteCodeTask(sessionId);
                 }
@@ -1384,6 +1424,10 @@ public class AgentLoop {
                 }
                 state.loopEndReason = hasBlockingTodos(sessionId)
                         ? "INCOMPLETE_TODO" : RunStatus.SUCCESS.name();
+                if (state.codeChangeTask && RunStatus.SUCCESS.name().equals(state.loopEndReason)
+                        && codeDiffReviewService != null) {
+                    codeDiffReviewService.completeSessionReview(sessionId);
+                }
                 return finish(result, state, messages);
             }
             // tryReturnFinalText 注入了提醒，继续循环
@@ -2222,6 +2266,12 @@ public class AgentLoop {
         }
         toolCalls = capped.allowed();
         if (toolCalls.isEmpty()) return;
+        // Arm the review before a code-file write can mutate the workspace;
+        // natural-language task classification is not a reliable signal.
+        for (Object call : toolCalls) {
+            armCodeReviewForFileWrite(toolNameOf(call), argumentsOf(call), state);
+            captureBaselineForMutatingShell(toolNameOf(call), argumentsOf(call), state);
+        }
         Map<String, ExecutionTurnContext.ActionBinding> bindings = resolveToolBindings(toolCalls);
         if (!toolCalls.isEmpty()) {
             log.info("工具调用: {}", toolCalls.stream()
@@ -2239,6 +2289,20 @@ public class AgentLoop {
                 executeToolCallSingle(tc, messages, state, bindings.get(toolIdOf(tc)));
                 if (state.unknownOutcome || state.controlStopReason != ExecutionControl.StopReason.NONE) break;
             }
+        }
+        if (state.shellMutationBaselineCaptured && !state.codeChangeTask) {
+            if (codeDiffReviewService == null || state.codeReviewBaseline == null
+                    || state.unknownOutcome || codeDiffReviewService.hasChangedCodeArtifact(state.codeReviewBaseline)) {
+                state.codeChangeTask = true;
+                if (state.sessionId != null) {
+                    taskTodoStore.ensureCodeValidationRequired(state.sessionId);
+                    taskTodoStore.recordCodeChange(state.sessionId);
+                }
+            } else {
+                codeDiffReviewService.discardSessionBaseline(state.sessionId, state.codeReviewBaseline);
+                state.codeReviewBaseline = null;
+            }
+            state.shellMutationBaselineCaptured = false;
         }
         ToolObservationProjector.Projection projection = ToolObservationProjector.projectBatch(state.pendingObservations);
         state.pendingObservations.clear();
@@ -2872,6 +2936,7 @@ public class AgentLoop {
             boolean codeFileWrite = ("write_file".equals(toolName) || "edit_file".equals(toolName))
                     && (CodeValidationPolicy.isCodeArtifact(path)
                     || (codeWorkActive && CodeValidationPolicy.isCodeConfigArtifact(path)));
+            codeFileWrite = codeFileWrite || ("undo_last_file_change".equals(toolName) && codeWorkActive);
             if (codeFileWrite && structuredResult.status() != ToolStatus.AWAITING_USER) {
                 // Failed/unknown write outcomes may still have changed part of a file.
                 taskTodoStore.recordCodeChange(state.sessionId, path);
@@ -2914,6 +2979,36 @@ public class AgentLoop {
             state.mediaDelivered = true;
             state.lastMediaResult = result;
         }
+    }
+
+    private void armCodeReviewForFileWrite(String toolName, String arguments, LoopState state) {
+        if (state == null || state.codeChangeTask) return;
+        if (!requiresCodeReviewForFileWrite(toolName, arguments)) return;
+        state.codeChangeTask = true;
+        if (state.codeReviewBaseline == null && codeDiffReviewService != null) {
+            state.codeReviewBaseline = codeDiffReviewService.captureForSession(state.sessionId);
+        }
+    }
+
+    private void captureBaselineForMutatingShell(String toolName, String arguments, LoopState state) {
+        if (state == null || state.codeChangeTask
+                || !"exec_command".equals(toolName) || !isMutatingCommand(toolName, arguments)) return;
+        if (codeDiffReviewService == null) {
+            // A missing reviewer must not turn a mutating shell call into an
+            // unreviewed success just because the task wording was ambiguous.
+            state.codeChangeTask = true;
+            return;
+        }
+        if (state.codeReviewBaseline == null)
+            state.codeReviewBaseline = codeDiffReviewService.captureForSession(state.sessionId);
+        state.shellMutationBaselineCaptured = true;
+    }
+
+    /** Package-private for regression tests: classify the actual write target, not task wording. */
+    static boolean requiresCodeReviewForFileWrite(String toolName, String arguments) {
+        if (!"write_file".equals(toolName) && !"edit_file".equals(toolName)) return false;
+        String path = argumentText(arguments, "path");
+        return CodeValidationPolicy.isReviewableCodeArtifact(path);
     }
 
     private static String argumentText(String arguments, String field) {
@@ -2962,6 +3057,47 @@ public class AgentLoop {
                             + "请用 exec_command 实际运行与改动相关的测试；失败时先读取错误、修复后再运行。"
                             + "只有真实 exec_command 回执且退出码为 0 才能通过，不得用 evidence 文本代替。"));
             return null;
+        }
+
+        if (state.codeChangeTask) {
+            if (codeDiffReviewService == null) {
+                state.codeReviewBlocks++;
+                if (state.codeReviewBlocks >= 3) {
+                    state.codeReviewBlocked = true;
+                    state.loopEndReason = "CODE_REVIEW_BLOCKED";
+                    return "代码修改尚未通过独立审查，任务未标记完成。\n"
+                            + "独立代码审查服务不可用，按安全策略阻止完成。";
+                }
+                messages.add(new SystemMessage("【独立代码审查门禁】审查服务不可用，不能结束任务。"));
+                return null;
+            }
+            CodeDiffReviewService.Review review = codeDiffReviewService.review(
+                    state.codeReviewBaseline, state.codeReviewerModel);
+            if (traceRecorder != null) {
+                traceRecorder.recordNode(sessionId, turn, "CODE_REVIEW",
+                        "{\"diffSha256\":\"" + review.diffHash() + "\",\"passed\":"
+                                + review.passed() + "}",
+                        review.passed() ? RunStatus.SUCCESS.name() : RunStatus.FAILURE.name(), 0);
+            }
+            if (!review.passed()) {
+                if (review.diffHash().equals(state.lastCodeReviewHash)) state.codeReviewBlocks++;
+                else {
+                    state.lastCodeReviewHash = review.diffHash();
+                    state.codeReviewBlocks = 1;
+                }
+                if (state.codeReviewBlocks >= 3) {
+                    state.codeReviewBlocked = true;
+                    state.loopEndReason = "CODE_REVIEW_BLOCKED";
+                    return "代码修改尚未通过独立审查，任务未标记完成。\n" + review.feedback();
+                }
+                messages.add(new SystemMessage(
+                        "【独立代码审查门禁】当前代码差异未通过审查，不能结束任务。请先处理以下具体问题；"
+                                + "修复后重新运行相关测试，再让审查器检查新差异。\n" + review.feedback()));
+                return null;
+            }
+            state.lastCodeReviewHash = review.diffHash();
+            state.codeReviewBlocks = 0;
+            state.codeReviewBlocked = false;
         }
 
         LoopTurnPolicy turnPolicy = LoopTurnContext.current();
