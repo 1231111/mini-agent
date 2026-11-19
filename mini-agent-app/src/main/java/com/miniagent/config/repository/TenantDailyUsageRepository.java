@@ -14,6 +14,7 @@ import java.util.Optional;
 
 public interface TenantDailyUsageRepository extends JpaRepository<TenantDailyUsage, Long> {
     Optional<TenantDailyUsage> findByTenantIdAndUsageDate(Long tenantId, LocalDate usageDate);
+    long countByTenantIdAndUsageDate(Long tenantId, LocalDate usageDate);
 
     /**
      * Lock the owning row before checking for the daily row. The parent exists

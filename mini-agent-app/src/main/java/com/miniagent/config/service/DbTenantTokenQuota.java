@@ -71,6 +71,23 @@ public class DbTenantTokenQuota implements TenantTokenQuota {
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public Decision consume(Long tenantId, Long userId, long tokens) {
+        return consumeInNewTransaction(tenantId, userId, tokens);
+    }
+
+    /**
+     * Override the interface default overload so Spring sees the transaction
+     * boundary before it delegates to the implementation. Calling the default
+     * method used to self-invoke the three-argument method on the target object,
+     * bypassing its transactional proxy and making the pessimistic row locks fail.
+     */
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public Decision consume(Long tenantId, Long userId, long tokens, String eventId,
+                            long inputTokens, long outputTokens) {
+        return consumeInNewTransaction(tenantId, userId, tokens);
+    }
+
+    private Decision consumeInNewTransaction(Long tenantId, Long userId, long tokens) {
         long delta = Math.max(0, tokens);
         // Every replica locks the same tenant row before reading or incrementing either
         // counter. This keeps the tenant-wide and per-user totals atomic as one decision.

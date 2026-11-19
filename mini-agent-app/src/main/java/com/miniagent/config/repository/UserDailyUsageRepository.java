@@ -13,6 +13,7 @@ import java.time.LocalDate;
 import java.util.Optional;
 
 public interface UserDailyUsageRepository extends JpaRepository<UserDailyUsage, Long> {
+    long countByUserIdAndUsageDate(Long userId, LocalDate usageDate);
     /** Lock the owning user before first-row detection to serialize daily inserts. */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select u from User u where u.id = :userId")

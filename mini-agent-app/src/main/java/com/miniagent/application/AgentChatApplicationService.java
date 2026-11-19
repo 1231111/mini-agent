@@ -372,6 +372,8 @@ public class AgentChatApplicationService {
             }
         } catch (RuntimeException e) {
             failure = e;
+            log.error("Agent run failed before completion: sessionId={}, userId={}, runId={}, taskId={}",
+                    sessionId, userId, run.runId(), taskId[0], e);
             boolean cancelled = false;
             if (executionStarted) {
                 try {
@@ -999,6 +1001,8 @@ public class AgentChatApplicationService {
                 }
             } catch (Exception e) {
                 streamingService.markCompleting(finalSid);
+                log.error("Agent SSE worker failed: sessionId={}, runId={}, runToken={}",
+                        finalSid, prepared.handle().runId(), stream.runToken(), e);
                 streamingService.getEventCenter().error(finalSid,
                         MessageConstants.CHAT_PROCESSING_ERROR + exceptionDetail(e), stream.runToken());
             } finally {

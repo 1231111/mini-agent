@@ -3,9 +3,16 @@ package com.miniagent.config.repository;
 import com.miniagent.config.entity.Tenant;
 import com.miniagent.config.entity.User;
 import com.miniagent.config.entity.UserRole;
+import com.miniagent.agent.core.TenantTokenQuota;
+import com.miniagent.config.service.DbTenantTokenQuota;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Import;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.annotation.Propagation;
@@ -29,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
         "spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.H2Dialect",
         "spring.datasource.url=jdbc:h2:mem:daily-usage;MODE=MySQL;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000"
 })
+@Import({DbTenantTokenQuota.class, DailyUsageRepositoryIntegrationTest.MetricsConfiguration.class})
 @org.springframework.transaction.annotation.Transactional(propagation = Propagation.NOT_SUPPORTED)
 class DailyUsageRepositoryIntegrationTest {
 
@@ -36,7 +44,40 @@ class DailyUsageRepositoryIntegrationTest {
     @Autowired private UserDailyUsageRepository userUsage;
     @Autowired private TenantRepository tenants;
     @Autowired private UserRepository users;
+    @Autowired private TenantTokenQuota quota;
     @Autowired private PlatformTransactionManager transactionManager;
+
+    @TestConfiguration(proxyBeanMethods = false)
+    static class MetricsConfiguration {
+        @Bean
+        MeterRegistry meterRegistry() {
+            return new SimpleMeterRegistry();
+        }
+    }
+
+    @Test
+    void quotaServiceOverloadsCreateTransactionsWithoutAmbientTransaction() {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        Tenant tenant = new Tenant();
+        tenant.setSlug("quota-proxy-" + suffix);
+        tenant.setName("Quota proxy test");
+        tenant = tenants.saveAndFlush(tenant);
+
+        User user = new User();
+        user.setUsername("quota-proxy-" + suffix);
+        user.setPasswordHash("test-hash");
+        user.setTenantId(tenant.getId());
+        user.setRole(UserRole.USER);
+        user = users.saveAndFlush(user);
+
+        assertTrue(quota.consume(tenant.getId(), user.getId(), 7L,
+                UUID.randomUUID().toString(), 5L, 2L).allowed());
+        assertTrue(quota.consume(tenant.getId(), user.getId(), 11L).allowed());
+
+        LocalDate today = LocalDate.now();
+        assertEquals(18L, tenantUsage.tokenCount(tenant.getId(), today).orElseThrow());
+        assertEquals(18L, userUsage.tokenCount(user.getId(), today).orElseThrow());
+    }
 
     @Test
     void firstInsertAndConcurrentIncrementsRemainPortableAndUnique() throws Exception {
@@ -90,7 +131,7 @@ class DailyUsageRepositoryIntegrationTest {
         long expected = (long) workers * incrementsPerWorker * 3;
         assertEquals(expected, tenantUsage.tokenCount(tenantId, usageDate).orElseThrow());
         assertEquals(expected, userUsage.tokenCount(userId, usageDate).orElseThrow());
-        assertEquals(1, tenantUsage.count());
-        assertEquals(1, userUsage.count());
+        assertEquals(1, tenantUsage.countByTenantIdAndUsageDate(tenantId, usageDate));
+        assertEquals(1, userUsage.countByUserIdAndUsageDate(userId, usageDate));
     }
 }
