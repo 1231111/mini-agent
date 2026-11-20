@@ -46,8 +46,15 @@ public class ModelClientFactory {
     public record ResolvedModels(
             ChatModel chat,
             StreamingChatModel streaming,
-            EffectiveModelSettings settings
-    ) {}
+            EffectiveModelSettings settings,
+            boolean sendThinking
+    ) {
+        /** Compatibility constructor for tests and non-reasoning callers. */
+        public ResolvedModels(ChatModel chat, StreamingChatModel streaming,
+                              EffectiveModelSettings settings) {
+            this(chat, streaming, settings, false);
+        }
+    }
 
     public synchronized ResolvedModels resolve(Long userId) {
         return build(userModelConfigService.getEffective(userId), true);
@@ -67,16 +74,17 @@ public class ModelClientFactory {
     }
 
     private ResolvedModels build(EffectiveModelSettings settings, boolean thinking) {
-        String key = settings.cacheKey() + "|think=" + thinking;
+        boolean sendThinking = shouldSendThinking(settings, thinking);
+        String key = settings.cacheKey() + "|think=" + thinking + "|sendThink=" + sendThinking;
         ResolvedModels hit = cache.get(key);
         if (Objects.nonNull(hit)) {
             // Connection parameters can share clients, but request budgets and preset
             // metadata belong to this resolution, not the first user of this cache key.
-            return new ResolvedModels(hit.chat(), hit.streaming(), settings);
+            return new ResolvedModels(hit.chat(), hit.streaming(), settings, sendThinking);
         }
 
-        log.info("构建用户模型客户端: preset={}, model={}, baseUrl={}, thinking={}",
-                settings.presetId(), settings.modelName(), settings.baseUrl(), thinking);
+        log.info("构建用户模型客户端: preset={}, model={}, baseUrl={}, thinking={}, sendThinking={}",
+                settings.presetId(), settings.modelName(), settings.baseUrl(), thinking, sendThinking);
 
         JdkHttpClientBuilder http = new JdkHttpClientBuilder()
                 .connectTimeout(Duration.ofSeconds(30))
@@ -89,7 +97,7 @@ public class ModelClientFactory {
                 .modelName(settings.modelName())
                 .timeout(timeout)
                 .returnThinking(thinking)
-                .sendThinking(false)
+                .sendThinking(sendThinking)
                 .build();
 
         JdkHttpClientBuilder httpStream = new JdkHttpClientBuilder()
@@ -103,11 +111,20 @@ public class ModelClientFactory {
                 .modelName(settings.modelName())
                 .timeout(timeout)
                 .returnThinking(thinking)
-                .sendThinking(false)
+                .sendThinking(sendThinking)
                 .build();
 
-        ResolvedModels resolved = new ResolvedModels(chat, streaming, settings);
+        ResolvedModels resolved = new ResolvedModels(chat, streaming, settings, sendThinking);
         cache.put(key, resolved);
         return resolved;
+    }
+
+    /**
+     * DeepSeek requires returned reasoning_content to be sent back on the next turn.
+     * Keep this provider-specific behavior off for vision requests and other OpenAI-compatible APIs.
+     */
+    static boolean shouldSendThinking(EffectiveModelSettings settings, boolean thinking) {
+        return thinking && settings != null
+                && DatabaseDeepSeekCredentialProvider.isOfficialDeepSeekEndpoint(settings.baseUrl());
     }
 }

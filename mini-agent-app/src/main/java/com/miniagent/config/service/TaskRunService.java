@@ -38,6 +38,8 @@ public class TaskRunService implements SessionLock {
     private TaskAdmissionGuard admissionGuard;
     @Autowired(required = false)
     private UserTokenQuotaService userTokenQuota;
+    @Autowired(required = false)
+    private TaskRunMetrics taskRunMetrics;
     @Value("${agent.concurrency.max-tasks-per-user:2}")
     private int maxPerUserConfig;
     private int maxPerUser = 2;
@@ -87,9 +89,11 @@ public class TaskRunService implements SessionLock {
                     && taskConcurrency.isSessionLocked(run.getSessionId())) {
                 continue;
             }
-            recovered += repository.finishIfRunning(run.getId(), AgentTaskRun.Status.RUNNING,
+            int updated = repository.finishIfRunning(run.getId(), AgentTaskRun.Status.RUNNING,
                     AgentTaskRun.Status.INTERRUPTED, now,
                     "Process restarted; previous run interrupted");
+            recovered += updated;
+            if (updated == 1) recordTerminalMetric(AgentTaskRun.Status.INTERRUPTED, run.getStartedAt(), now);
         }
         if (recovered > 0) {
             log.warn("Recovered {} orphaned RUNNING task(s) as INTERRUPTED", recovered);
@@ -221,7 +225,9 @@ public class TaskRunService implements SessionLock {
         run.setUserId(userId);
         run.setSessionId(sessionId);
         run.setStatus(AgentTaskRun.Status.RUNNING);
-        return repository.save(run);
+        AgentTaskRun saved = repository.save(run);
+        recordStartedMetric();
+        return saved;
     }
 
     private void interruptPreviousRun(String sessionId, String reason) {
@@ -230,8 +236,11 @@ public class TaskRunService implements SessionLock {
                 .ifPresent(run -> {
                     // Its owner may have committed completion after our query.
                     // Compare the persisted status rather than saving a stale entity.
-                    repository.finishIfRunning(run.getId(), AgentTaskRun.Status.RUNNING,
-                            AgentTaskRun.Status.INTERRUPTED, LocalDateTime.now(), reason);
+                    LocalDateTime finishedAt = LocalDateTime.now();
+                    int updated = repository.finishIfRunning(run.getId(), AgentTaskRun.Status.RUNNING,
+                            AgentTaskRun.Status.INTERRUPTED, finishedAt, reason);
+                    if (updated == 1)
+                        recordTerminalMetric(AgentTaskRun.Status.INTERRUPTED, run.getStartedAt(), finishedAt);
                 });
     }
 
@@ -260,7 +269,13 @@ public class TaskRunService implements SessionLock {
             TransactionTemplate terminalTransaction = new TransactionTemplate(
                     Objects.requireNonNull(transactionManager, "Task terminal transaction manager is required"));
             terminalTransaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
-            terminalTransaction.executeWithoutResult(ignored -> persistTerminal(run, status, error));
+            TerminalTransition transition = terminalTransaction.execute(
+                    ignored -> persistTerminal(run, status, error));
+            if (transition != null) {
+                // execute() returns after commit, so metrics never count a terminal
+                // update that was rolled back or lost to a competing CAS.
+                recordTerminalMetric(transition.status(), transition.startedAt(), transition.finishedAt());
+            }
         } finally {
             // The template includes begin, commit and rollback in this try:
             // failures at any of those stages must release the ended worker.
@@ -268,14 +283,41 @@ public class TaskRunService implements SessionLock {
         }
     }
 
-    private void persistTerminal(RunHandle run, AgentTaskRun.Status status, String error) {
+    private record TerminalTransition(AgentTaskRun.Status status,
+                                      LocalDateTime startedAt, LocalDateTime finishedAt) {}
+
+    private TerminalTransition persistTerminal(RunHandle run, AgentTaskRun.Status status, String error) {
         String detail = error == null || error.length() <= 900
                 ? error : error.substring(0, 900);
+        AgentTaskRun active = run.runId() == null ? null : repository.findById(run.runId())
+                .filter(row -> row.getStatus() == AgentTaskRun.Status.RUNNING).orElse(null);
+        LocalDateTime finishedAt = LocalDateTime.now();
         int updated = repository.finishIfRunning(
-                run.runId(), AgentTaskRun.Status.RUNNING, status, LocalDateTime.now(), detail);
+                run.runId(), AgentTaskRun.Status.RUNNING, status, finishedAt, detail);
         if (updated == 0) {
             log.warn("Ignored stale terminal transition runId={} session={} status={}",
                     run.runId(), run.sessionId(), status);
+            return null;
+        }
+        return new TerminalTransition(status, active == null ? null : active.getStartedAt(), finishedAt);
+    }
+
+    private void recordStartedMetric() {
+        if (taskRunMetrics == null) return;
+        try {
+            taskRunMetrics.started();
+        } catch (RuntimeException failure) {
+            log.warn("Could not record task-run start metric", failure);
+        }
+    }
+
+    private void recordTerminalMetric(AgentTaskRun.Status status,
+                                     LocalDateTime startedAt, LocalDateTime finishedAt) {
+        if (taskRunMetrics == null) return;
+        try {
+            taskRunMetrics.terminal(status, startedAt, finishedAt);
+        } catch (RuntimeException failure) {
+            log.warn("Could not record task-run terminal metric status={}", status, failure);
         }
     }
 

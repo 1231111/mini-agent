@@ -149,6 +149,51 @@ class AgentLoopToolVisionTest {
     }
 
     @Test
+    void requestPreflightRunsAfterCompressionAndRemovesMalformedToolRoles() {
+        Fixture f = fixture(false);
+        List<ChatMessage> sent = new ArrayList<>();
+        when(f.compressor.maybeCompress(anyList(), anyInt(), anyString(), anyInt())).thenAnswer(invocation -> {
+            List<ChatMessage> compressed = new ArrayList<>(invocation.getArgument(0));
+            compressed.add(AiMessage.from(List.of(call("partial-1", "read_file"),
+                    call("partial-2", "write_file"))));
+            compressed.add(ToolExecutionResultMessage.from("partial-1", "read_file", "old result"));
+            return ContextCompressor.CompressResult.untouched(compressed, 1);
+        });
+        when(f.text.chat(any(ChatRequest.class))).thenAnswer(invocation -> {
+            ChatRequest request = invocation.getArgument(0);
+            sent.addAll(request.messages());
+            return answer("Completed after validating the request history.");
+        });
+
+        var outcome = run(f, null);
+
+        assertTrue(outcome.successful(), outcome.text());
+        assertFalse(sent.stream().anyMatch(ToolExecutionResultMessage.class::isInstance));
+        assertTrue(sent.stream().filter(AiMessage.class::isInstance).map(AiMessage.class::cast)
+                .noneMatch(AiMessage::hasToolExecutionRequests));
+        assertTrue(sent.stream().filter(SystemMessage.class::isInstance).map(SystemMessage.class::cast)
+                .anyMatch(system -> system.text().contains("先重新读取文件或观察外部状态")));
+    }
+
+    @Test
+    void invalidProviderRequestFailsOnceWithSpecificReasonInsteadOfNetworkRecovery() {
+        Fixture f = fixture(false);
+        ReflectionTestUtils.setField(f.loop, "llmMaxRetries", 2);
+        when(f.text.chat(any(ChatRequest.class))).thenThrow(
+                new dev.langchain4j.exception.InvalidRequestException(
+                        "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"));
+
+        AgentLoop.LoopOutcome outcome = run(f, null);
+
+        assertFalse(outcome.successful());
+        assertEquals(ToolErrorCode.MODEL_TOOL_HISTORY_INVALID, outcome.lastErrorCode());
+        assertTrue(outcome.text().contains("工具调用记录不完整"), outcome.text());
+        assertFalse(outcome.text().contains("模型连接异常"), outcome.text());
+        verify(f.text, times(1)).chat(any(ChatRequest.class));
+        verify(f.compressor, times(1)).maybeCompress(anyList(), anyInt(), anyString(), anyInt());
+    }
+
+    @Test
     void unavailableVisionIsAnExplicitFailureAndNeverSendsImagesToTextModel() throws Exception {
         Fixture f = fixture(false);
         register(f.registry, "desktop_observe", screenshot(

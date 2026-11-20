@@ -14,6 +14,8 @@ import com.miniagent.memory.contract.MemoryApi.ItemView;
 import com.miniagent.memory.contract.MemoryApi.ItemWrite;
 import com.miniagent.memory.contract.MemoryApi.ScopeType;
 import com.miniagent.memory.contract.ProcedureContent;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -28,7 +30,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 本地 SOP 已存在。云端只保存同一份并自动升级；这里把升级后的当前修订写回本库。
@@ -51,7 +52,10 @@ public class ProcedureCloudSync {
     private final TransactionTemplate sameTx;
     private final TransactionTemplate newTx;
     private final long pullIntervalMs;
-    private final ConcurrentHashMap<String, Long> lastPull = new ConcurrentHashMap<>();
+    private final CloudSyncBackoff backoff;
+
+    @Autowired(required = false)
+    private MeterRegistry metrics;
 
     public ProcedureCloudSync(CloudMemoryClient cloud, AgentProcedureRepository procedures,
                               AgentProjectRepository projects, ProcedureRevisionService revisions,
@@ -64,6 +68,7 @@ public class ProcedureCloudSync {
         this.revisions = revisions;
         this.json = json;
         this.pullIntervalMs = pullIntervalMs;
+        this.backoff = new CloudSyncBackoff(pullIntervalMs);
         this.sameTx = new TransactionTemplate(transactions);
         this.newTx = new TransactionTemplate(transactions);
         this.newTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
@@ -99,30 +104,39 @@ public class ProcedureCloudSync {
             return;
         }
         String key = owner.tenantId() + "\n" + owner.userId();
-        long now = System.currentTimeMillis();
-        Long previous = lastPull.get(key);
-        if (previous != null && now - previous < pullIntervalMs) {
+        if (!backoff.tryBegin(key)) {
+            recordSyncMetric("deferred");
             return;
         }
-        lastPull.put(key, now);
         try {
             Long cursor = null;
             for (int page = 0; page < MAX_PAGES; page++) {
                 ItemPage batch = cloud.list(null, cursor, PAGE);
                 if (batch == null || batch.items() == null || batch.items().isEmpty()) {
-                    return;
+                    break;
                 }
                 for (ItemView item : batch.items()) {
                     apply(owner.tenantId(), item);
                 }
                 if (batch.nextCursor() == null) {
-                    return;
+                    break;
                 }
                 cursor = batch.nextCursor();
             }
+            backoff.recordSuccess(key, pullIntervalMs);
+            recordSyncMetric("success");
         } catch (RuntimeException e) {
-            lastPull.remove(key);
-            log.warn("从云端同步 SOP 失败: {}", e.getMessage());
+            long delay = backoff.recordFailure(key);
+            recordSyncMetric("failure");
+            log.warn("从云端同步 SOP 失败 tenant={} user={} retryAfterMs={} failureType={}",
+                    owner.tenantId(), owner.userId(), delay, e.getClass().getSimpleName());
+        }
+    }
+
+    private void recordSyncMetric(String outcome) {
+        if (metrics != null) {
+            metrics.counter("miniagent.memory.cloud.sync", "operation", "procedures",
+                    "outcome", outcome).increment();
         }
     }
 

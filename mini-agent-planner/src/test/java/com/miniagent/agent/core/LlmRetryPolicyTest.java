@@ -11,6 +11,7 @@ import java.net.SocketTimeoutException;
 import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -57,6 +58,23 @@ class LlmRetryPolicyTest {
                 "认证失败重试多少次都一样，且会白烧 token");
         assertFalse(AgentLoop.isRetriable(new InvalidRequestException("400 bad request")),
                 "参数错误不可重试");
+    }
+
+    @Test
+    void invalidRequestsAreClassifiedByTheirActionableCause() {
+        var toolHistory = AgentLoop.classifyLlmFailure(new InvalidRequestException(
+                "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"));
+        var contextLimit = AgentLoop.classifyLlmFailure(new InvalidRequestException(
+                "maximum context length exceeded: prompt is too long"));
+        var reasoning = AgentLoop.classifyLlmFailure(new InvalidRequestException(
+                "The reasoning_content in the thinking mode must be passed back to the API"));
+        var generic = AgentLoop.classifyLlmFailure(new InvalidRequestException("bad request parameter"));
+
+        assertEquals(AgentLoop.LlmFailureKind.TOOL_HISTORY, toolHistory.kind());
+        assertEquals("LLM_TOOL_HISTORY_INVALID", toolHistory.diagnosticCode());
+        assertEquals(AgentLoop.LlmFailureKind.CONTEXT_LIMIT, contextLimit.kind());
+        assertEquals(AgentLoop.LlmFailureKind.REASONING_HISTORY, reasoning.kind());
+        assertEquals(AgentLoop.LlmFailureKind.INVALID_REQUEST, generic.kind());
     }
 
     @Test

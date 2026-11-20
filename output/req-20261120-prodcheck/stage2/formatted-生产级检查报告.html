@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="docx-page-size" content="A4">
+<title>MiniAgent 生产级智能体水平检查报告</title>
+<style>
+:root {
+  --fs-h1: var(--typography-fontSize-h1, 20pt);
+  --fs-h2: var(--typography-fontSize-h2, 15pt);
+  --fs-h3: var(--typography-fontSize-h3, 13pt);
+  --fs-body: var(--typography-fontSize-body, 12pt);
+  --fs-small: var(--typography-fontSize-small, 10.5pt);
+  --fs-cover-title: 30pt;
+  --fs-cover-sub: 14pt;
+  --ff-heading: "Microsoft YaHei", "微软雅黑", "SimSun", "宋体", sans-serif;
+  --ff-body: "SimSun", "宋体", "Microsoft YaHei", serif;
+  --lh-body: 1.75;
+  --lh-heading: 1.4;
+  --fw-bold: 700;
+  --fw-normal: 400;
+  --color-primary: #1F3A5F;
+  --color-accent: #2E6DA4;
+  --color-text: #1F2328;
+  --color-muted: #5B6470;
+  --color-border: #C9D1DA;
+  --color-bg: #F4F6F9;
+  --color-callout-bg: #EDF3F9;
+  --color-th: #E8EEF5;
+  --spacing-paragraph: 0.62em;
+  --spacing-section: 1.9em;
+  --spacing-block: 1em;
+  --margin-page: 2.4cm;
+  --page-content-width: 15.6cm;
+}
+@page {
+  margin: var(--margin-page);
+  @bottom-center { content: counter(page); }
+}
+@page cover {
+  @bottom-center { content: none; }
+}
+section[role="cover"] { page: cover; }
+
+body {
+  max-width: var(--page-content-width);
+  margin-left: auto;
+  margin-right: auto;
+  font-family: var(--ff-body);
+  font-size: var(--fs-body);
+  color: var(--color-text);
+  line-height: var(--lh-body);
+}
+p {
+  font-family: var(--ff-body);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  text-indent: 2em;
+  text-align: justify;
+  margin: var(--spacing-paragraph) 0;
+}
+h1 {
+  font-family: var(--ff-heading);
+  font-size: var(--fs-h1);
+  font-weight: var(--fw-bold);
+  color: var(--color-primary);
+  line-height: var(--lh-heading);
+  margin: var(--spacing-section) 0 var(--spacing-block) 0;
+  text-align: left;
+  text-indent: 0;
+}
+h2 {
+  font-family: var(--ff-heading);
+  font-size: var(--fs-h2);
+  font-weight: var(--fw-bold);
+  color: var(--color-accent);
+  line-height: var(--lh-heading);
+  margin: 1.4em 0 0.6em 0;
+  text-align: left;
+  text-indent: 0;
+}
+h3 {
+  font-family: var(--ff-heading);
+  font-size: var(--fs-h3);
+  font-weight: var(--fw-bold);
+  color: var(--color-text);
+  line-height: var(--lh-heading);
+  margin: 1.1em 0 0.5em 0;
+  text-align: left;
+  text-indent: 0;
+}
+ul, ol {
+  margin: var(--spacing-paragraph) 0;
+  padding-left: 2.2em;
+}
+li {
+  font-family: var(--ff-body);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  text-align: justify;
+  margin: 0.28em 0;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: var(--spacing-block) 0;
+  font-family: var(--ff-body);
+  font-size: var(--fs-small);
+}
+caption {
+  font-family: var(--ff-heading);
+  font-size: var(--fs-small);
+  font-weight: var(--fw-bold);
+  color: var(--color-muted);
+  text-align: left;
+  padding-bottom: 0.4em;
+}
+th, td {
+  border: 1px solid var(--color-border);
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+  line-height: 1.55;
+}
+th {
+  background-color: var(--color-th);
+  font-family: var(--ff-heading);
+  font-weight: var(--fw-bold);
+  color: var(--color-primary);
+}
+td { text-indent: 0; }
+
+.cover-box { text-align: center; padding-top: 4.5cm; }
+.cover-title {
+  font-family: var(--ff-heading);
+  font-size: var(--fs-cover-title);
+  font-weight: var(--fw-bold);
+  color: var(--color-primary);
+  line-height: 1.35;
+  text-align: center;
+  text-indent: 0;
+  margin: 0 0 0.5em 0;
+}
+.cover-sub {
+  font-family: var(--ff-heading);
+  font-size: var(--fs-cover-sub);
+  color: var(--color-muted);
+  text-align: center;
+  text-indent: 0;
+  margin: 0 0 3.2em 0;
+}
+.cover-meta {
+  width: 11.5cm;
+  margin: 0 auto;
+  font-size: var(--fs-body);
+}
+.cover-meta td {
+  border: none;
+  border-bottom: 1px solid var(--color-border);
+  padding: 7px 4px;
+  text-indent: 0;
+}
+.cover-meta td:first-child {
+  width: 3.4cm;
+  color: var(--color-muted);
+  font-family: var(--ff-heading);
+}
+.toc-title {
+  font-family: var(--ff-heading);
+  font-size: var(--fs-h1);
+  font-weight: var(--fw-bold);
+  color: var(--color-primary);
+  text-align: left;
+  text-indent: 0;
+  margin: 0 0 1em 0;
+}
+.toc-list, .toc-list ol, .toc-list ul { list-style: none; padding-left: 0; }
+.toc-list li {
+  font-family: var(--ff-body);
+  font-size: var(--fs-body);
+  line-height: 2.0;
+  text-indent: 0;
+}
+.toc-list a { color: var(--color-text); text-decoration: none; }
+.toc-list ol { padding-left: 1.8em; }
+.toc-list ol li { font-size: var(--fs-small); line-height: 1.85; color: var(--color-muted); }
+
+.exec-summary td {
+  background-color: var(--color-callout-bg);
+  padding: 14px 16px;
+  border: 1px solid var(--color-border);
+}
+.exec-summary p {
+  text-indent: 0;
+  margin: 0 0 0.5em 0;
+}
+.exec-summary p:last-child { margin-bottom: 0; }
+.summary-label {
+  font-family: var(--ff-heading);
+  font-size: var(--fs-small);
+  font-weight: var(--fw-bold);
+  color: var(--color-primary);
+  letter-spacing: 0.08em;
+}
+.verdict {
+  color: var(--color-primary);
+  font-family: var(--ff-heading);
+  font-size: var(--fs-h2);
+  font-weight: var(--fw-bold);
+}
+.note {
+  border-left: 3px solid var(--color-accent);
+  background-color: var(--color-callout-bg);
+  padding: 9px 11px;
+  text-indent: 0;
+}
+.tag-ok { color: #1A7F37; font-family: var(--ff-heading); font-weight: var(--fw-bold); }
+.tag-part { color: #8A5A00; font-family: var(--ff-heading); font-weight: var(--fw-bold); }
+.tag-no { color: #B42318; font-family: var(--ff-heading); font-weight: var(--fw-bold); }
+.foot-note {
+  font-size: var(--fs-small);
+  color: var(--color-muted);
+  text-indent: 0;
+}
+</style>
+</head>
+<body>
+
+<section role="cover">
+  <div class="cover-box">
+    <p class="cover-title">MiniAgent<br>生产级智能体水平检查报告</p>
+    <p class="cover-sub">基于源码核对与运行日志的逐项判定</p>
+    <table class="cover-meta">
+      <tr><td>检查对象</td><td>MiniAgent（多模块 Spring Boot 智能体系统）</td></tr>
+      <tr><td>检查日期</td><td>2026 年 11 月 20 日</td></tr>
+      <tr><td>检查方式</td><td>判据先行、逐项取证、以源码与运行日志为准</td></tr>
+      <tr><td>报告结论</td><td>不完全满足生产级智能体水平</td></tr>
+    </table>
+  </div>
+</section>
+
+<section role="cover">
+<nav class="doc-toc" aria-label="文档目录">
+  <p class="toc-title">目录</p>
+  <ol class="toc-list">
+    <li><a href="#section-1">一、检查结论</a></li>
+    <li><a href="#section-2">二、检查范围与方法</a>
+      <ol>
+        <li><a href="#section-2-1">2.1 判据来源</a></li>
+        <li><a href="#section-2-2">2.2 证据来源</a></li>
+        <li><a href="#section-2-3">2.3 不在本次检查范围内</a></li>
+      </ol>
+    </li>
+    <li><a href="#section-3">三、判据定义</a></li>
+    <li><a href="#section-4">四、逐项检查结果</a>
+      <ol>
+        <li><a href="#section-4-1">4.1 功能闭环：部分满足</a></li>
+        <li><a href="#section-4-2">4.2 稳定性：不满足</a></li>
+        <li><a href="#section-4-3">4.3 安全性：满足</a></li>
+        <li><a href="#section-4-4">4.4 可观测性：部分满足</a></li>
+        <li><a href="#section-4-5">4.5 可运维性：部分满足</a></li>
+        <li><a href="#section-4-6">4.6 可验证性：部分满足</a></li>
+      </ol>
+    </li>
+    <li><a href="#section-5">五、统计汇总</a></li>
+    <li><a href="#section-6">六、补齐差距的三项工作</a>
+      <ol>
+        <li><a href="#section-6-1">6.1 修复工具消息配对缺陷</a></li>
+        <li><a href="#section-6-2">6.2 补充任务级指标</a></li>
+        <li><a href="#section-6-3">6.3 执行一次目标环境验收</a></li>
+      </ol>
+    </li>
+    <li><a href="#section-7">七、结论</a></li>
+    <li><a href="#section-8">附录、证据与复现方式</a></li>
+  </ol>
+</nav>
+</section>
+
+<section role="body" data-page-restart="1">
+
+<h1 id="section-1">一、检查结论</h1>
+
+<table class="exec-summary">
+  <tr><td>
+    <p class="summary-label">执行摘要</p>
+    <p>MiniAgent 未完全满足生产级智能体水平。按本报告采用的六条判据衡量，结果为一条满足、四条部分满足、一条不满足。</p>
+    <p>差距集中在两个层面，而不是功能设计层面：其一，运行级未验收，目标环境的真实数据库、多副本、故障注入、传输加密、支付验签等验收项一次未做；其二，稳定性存在已知缺口，一个会导致任务直接终止的消息序列缺陷，在 2026 年 11 月 19 日单日触发十三次，其中六次造成任务终止。</p>
+    <p>结论定位：<span class="verdict">MiniAgent 已达到代码级生产就绪，尚未达到运行级生产就绪。</span></p>
+  </td></tr>
+</table>
+
+<h1 id="section-2">二、检查范围与方法</h1>
+
+<h2 id="section-2-1">2.1 判据来源</h2>
+<p>判据不采用自拟标准，而由三部分组成：项目自身的生产差距审计文档所列举的阻断项与高危项；生产级智能体通用的四类要求，即可无人值守、可回退、可复核、长时间运行不退化；以及可运维性要求，即部署、限流、配额、故障恢复与可观测。</p>
+
+<h2 id="section-2-2">2.2 证据来源</h2>
+<table>
+  <caption>表 1　本次检查的证据类型与来源</caption>
+  <thead>
+    <tr><th>证据类型</th><th>具体来源</th><th>规模</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>源码</td><td>规划器、工具、应用三个模块逐类核对</td><td>关键类逐点确认</td></tr>
+    <tr><td>运行日志</td><td>后端运行日志，覆盖 11 月 9 日至 11 月 20 日</td><td>176 MB</td></tr>
+    <tr><td>动作日志</td><td>执行器动作日志</td><td>7.4 MB</td></tr>
+    <tr><td>测试记录</td><td>全仓构建与测试结果</td><td>2,395 项，0 失败、0 错误</td></tr>
+    <tr><td>项目文档</td><td>生产差距审计、详细设计、生产运维说明</td><td>三份</td></tr>
+  </tbody>
+</table>
+
+<h2 id="section-2-3">2.3 不在本次检查范围内</h2>
+<p>以下内容本次未验证，报告中亦未作为结论依据：隔离环境下的行为回归与成功率统计；真实数据库、缓存、向量库、杀毒服务的集成验收；多副本并发与崩溃、断网故障注入；真实支付渠道验签；灰度发布执行器与流量观测。</p>
+
+<h1 id="section-3">三、判据定义</h1>
+<p>一条判据不满足，即不能称为完全满足生产级。六条判据如下，后续逐项检查与汇总均以此为准。</p>
+<table>
+  <caption>表 2　生产级智能体六条判据</caption>
+  <thead>
+    <tr><th>编号</th><th>判据</th><th>含义</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>功能闭环</td><td>对外宣称的任务类型能够完成，并有可验证的验收</td></tr>
+    <tr><td>2</td><td>稳定性</td><td>已知缺陷不中断主链路，失败可恢复</td></tr>
+    <tr><td>3</td><td>安全性</td><td>注入、越权、服务端请求伪造、密钥泄露等风险已封堵</td></tr>
+    <tr><td>4</td><td>可观测性</td><td>具备链路追踪、指标采集、告警与审计</td></tr>
+    <tr><td>5</td><td>可运维性</td><td>具备部署、升级、限流、配额、备份与故障恢复能力</td></tr>
+    <tr><td>6</td><td>可验证性</td><td>具备自动化门禁、回归测试与环境验收</td></tr>
+  </tbody>
+</table>
+
+<h1 id="section-4">四、逐项检查结果</h1>
+
+<h2 id="section-4-1">4.1 功能闭环：部分满足</h2>
+<p>已验证的部分是单文件前端页面类任务存在真实完成样本。运行日志中可观察到写文件、编辑文件、执行命令三类工具的完整调用链，产物可运行。</p>
+<p>未验证的部分是任务记录中没有后端业务逻辑改动、跨模块重构、多文件一致性修改的样本。也就是说，该类任务能否完成目前没有证据，既不能判定能，也不能判定不能。</p>
+<p>已知的功能缺环集中在自动进化链路：候选生成、隔离验证执行器、自动采纳入口、真实灰度分流仍未实现，相关开关默认关闭。这部分属于明确的功能缺口，项目审计文档已逐条记录。</p>
+
+<h2 id="section-4-2">4.2 稳定性：不满足</h2>
+<p>这是六条中唯一判定为不满足的一项，依据如下。</p>
+<p>缺陷表现是模型侧返回不可重试错误，错误信息为消息角色校验失败，即工具角色消息必须回应前一条带工具调用的消息。实测频率为 2026 年 11 月 19 日单日触发十三次，其中六次导致任务终止，包括五次连续失败两次与一次连续失败三次。</p>
+<p>影响是任务直接终止，不是降级、不是重试、不是部分完成。对一个宣称可承担开发任务的智能体而言，这意味着当天有六次工作在白做。</p>
+<p>次级缺陷是事件表主题字段长度上限为 256 字符，实测出现 259 字符写入失败，近两日两次，后果是事件写入失败、链路追踪出现断点。辅助缺陷是云端记忆同步接口持续返回 503，客户端每 15 秒重试一次，近两日告警日志累计 5,325 条；该问题不影响功能，但会淹没真实错误信号。</p>
+
+<h2 id="section-4-3">4.3 安全性：满足</h2>
+<p>依据项目审计文档的修复记录与源码核对，该项判定为满足，具体包括四个方面。</p>
+<ul>
+  <li>八个阻断级问题已全部修复，覆盖对话渲染跨站脚本、工作区与主机文件系统隔离、命令审批链、提示注入防护、完成判定、子代理越权、账号服务越权支付、默认部署口令。</li>
+  <li>路径访问统一经过路径守卫，按真实路径判定，符号链接与目录联接绕过已拦截。</li>
+  <li>网络请求具备地址分类器与逐跳重定向校验。</li>
+  <li>会话凭证以不可逆摘要入库，不落明文。</li>
+</ul>
+
+<h2 id="section-4-4">4.4 可观测性：部分满足</h2>
+<p>已具备的能力包括：应用接入指标采集与 Prometheus 导出；链路记录覆盖模型请求耗时、输入输出令牌数、上下文压缩节省量；追踪支持持久化与服务端推送。</p>
+<p>缺失项有三处。第一，没有任务级指标，当前能观测单次模型调用的耗时与令牌，但无法直接读出任务成功率、平均轮次、终止率，缺少这三个数，运维无法判断系统当天是否发生退化。第二，事件写入存在长度溢出导致追踪断点，见 4.2。第三，告警以日志为主，缺少基于指标的阈值告警配置。</p>
+
+<h2 id="section-4-5">4.5 可运维性：部分满足</h2>
+<p>已具备的能力包括：部署形态为宿主机直接运行，提供 systemd 单元与启动脚本，包含内存上限、处理器配额、任务数上限、文件句柄上限、异常退出重启与内存溢出退出策略；具备租户配额、令牌限流、会话级单写者、备份与清理任务；生产配置具备启动自检，关键项缺失时拒绝启动。</p>
+<p>未验证的部分包括：真实数据库、缓存、向量库、杀毒服务的集成；多副本并发下的租约与配额正确性；崩溃、断网、磁盘满等故障注入；反向代理下的传输加密与资源限额。这些均属部署与运行条件，代码测试不能替代。</p>
+
+<h2 id="section-4-6">4.6 可验证性：部分满足</h2>
+<p>已具备的能力包括：全仓构建通过，七个模块合计 2,395 项测试，0 失败、0 错误、96 项按环境条件跳过；持续集成包含密钥扫描、迁移版本连续性校验、发布门禁测试。</p>
+<p>不足在于，自动化套件通过只证明代码在受控条件下行为符合断言，不证明运行时行为达标。项目审计文档对此有明确表述：代码测试通过不替代目标环境验收。</p>
+
+<h1 id="section-5">五、统计汇总</h1>
+<table>
+  <caption>表 3　六条判据的检查结果汇总</caption>
+  <thead>
+    <tr><th>编号</th><th>判据</th><th>判定</th><th>关键依据</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>功能闭环</td><td class="tag-part">部分满足</td><td>前端单文件有样本；后端与跨模块零样本；自进化存在功能缺环</td></tr>
+    <tr><td>2</td><td>稳定性</td><td class="tag-no">不满足</td><td>单日 13 次消息序列错误，6 次任务终止</td></tr>
+    <tr><td>3</td><td>安全性</td><td class="tag-ok">满足</td><td>八个阻断级问题已修复，路径与网络防护在位</td></tr>
+    <tr><td>4</td><td>可观测性</td><td class="tag-part">部分满足</td><td>有模型级指标，缺任务级指标；事件写入溢出</td></tr>
+    <tr><td>5</td><td>可运维性</td><td class="tag-part">部分满足</td><td>部署与管理能力齐备，目标环境未验收</td></tr>
+    <tr><td>6</td><td>可验证性</td><td class="tag-part">部分满足</td><td>2,395 项测试通过，运行验收未执行</td></tr>
+  </tbody>
+</table>
+<p>合计：满足一项，部分满足四项，不满足一项。</p>
+
+<h1 id="section-6">六、补齐差距的三项工作</h1>
+
+<h2 id="section-6-1">6.1 修复工具消息配对缺陷</h2>
+<p>这是唯一会直接终止任务的缺陷。修复目标是在组装模型请求前校验消息序列：每一条工具角色消息，其前必须存在对应的工具调用；不成对则丢弃该条并补充说明性系统消息，而不是让请求直接失败。验收标准是该错误在运行日志中归零，并补充压缩重入场景的回归用例。</p>
+
+<h2 id="section-6-2">6.2 补充任务级指标</h2>
+<p>新增三个指标：任务成功率、任务平均轮次、任务终止率，三者按会话与时间窗口聚合，接入现有指标导出。验收标准是运维可从指标端点直接读出当日任务健康度，无需翻阅日志。</p>
+
+<h2 id="section-6-3">6.3 执行一次目标环境验收</h2>
+<p>按项目审计文档列举的清单执行：真实数据库多服务链路、缓存与向量库、多副本并发、崩溃与断网故障注入、反向代理下的传输加密与资源限额、支付渠道验签。验收标准是每一项产出可复现的记录，未通过项按缺陷处理，不并入已知限制。</p>
+
+<h1 id="section-7">七、结论</h1>
+<p>MiniAgent 的设计与代码实现已达到生产级要求：安全防护完整，工程纪律严格，测试覆盖充分，关键路径有验收门禁。</p>
+<p>但生产级智能体水平的判定，不能只看设计，还要看运行证据。当前缺的正是运行证据，并且存在一个每日仍在发生的终止级缺陷。</p>
+<p class="note">本报告的结论是不完全满足。代码级生产就绪已达成，运行级生产就绪尚未达成；在 6.1 与 6.3 完成之前，不宜将系统状态表述为生产验收通过。</p>
+
+<h1 id="section-8">附录、证据与复现方式</h1>
+<p>运行日志位于用户主目录下的日志目录，不在代码仓库内，因此从仓库侧无法检索到本报告引用的运行数字。关键统计的复现方式为：消息序列错误按错误信息中的角色校验关键字检索；任务终止按连续失败与终止关键字组合检索；事件字段溢出按主题字段长度报错检索；云端记忆失败按同步接口失败标识检索。</p>
+<p>源码依据方面，完成判定、测试回执、路径守卫、指标埋点、轮次预算相关类均已逐点核对，本报告只引用结论，不复述实现细节。</p>
+<p>未纳入结论的推断：关于长任务分段续跑是否降低任务质量的判断，本次未做对照实验，故不作为结论，仅记录为待查项。</p>
+
+</section>
+
+</body>
+</html>

@@ -73,6 +73,22 @@ class DefaultMemoryManagerWriteGateTest {
     }
 
     @Test
+    void overlongFactSubjectIsRejectedBeforeAnyPersistenceAccess() {
+        SemanticFact fact = new SemanticFact();
+        fact.setTenantId("tenant-1");
+        fact.setScope(MemoryScope.ofUser("tenant-1", "user-1"));
+        fact.setSubject("x".repeat(SemanticFactFieldValidator.SUBJECT_MAX_LENGTH + 1));
+        fact.setPredicate("learned");
+        fact.setObjectValue("value");
+
+        BusinessException error = assertThrows(BusinessException.class, () -> manager.writeFact(fact));
+
+        assertEquals(ErrorCode.MEMORY_REQUEST_INVALID, error.getErrorCode());
+        assertTrue(error.getMessage().contains("subject"));
+        assertTrue(error.getMessage().contains("未写入"));
+    }
+
+    @Test
     void poisonedProcedureIsRejected() {
         Procedure p = new Procedure();
         p.setTenantId("tenant-1");

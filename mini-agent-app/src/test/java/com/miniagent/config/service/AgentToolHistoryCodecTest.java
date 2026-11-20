@@ -1,17 +1,24 @@
 package com.miniagent.config.service;
 
+import com.miniagent.common.model.EffectiveModelContext;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.data.message.UserMessage;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.AfterEach;
 
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class AgentToolHistoryCodecTest {
+
+    @AfterEach
+    void clearModelContext() {
+        EffectiveModelContext.clear();
+    }
 
     @Test
     void roundTripsOnlyCompleteToolCallAndResultPairsAfterLatestUserTurn() {
@@ -79,6 +86,42 @@ class AgentToolHistoryCodecTest {
         assertFalse(stored.contains("do-not-store"));
         assertFalse(stored.contains("sensitive"));
         assertTrue(stored.contains("***"));
+    }
+
+    @Test
+    void deepseekReasoningContentIsRedactedBoundedAndRoundTripsWithToolCalls() {
+        EffectiveModelContext.set(null, null, 64_000, true);
+        List<ChatMessage> run = List.of(
+                UserMessage.from("continue"),
+                AiMessage.builder().thinking("Reasoning with api_key=do-not-store")
+                        .toolExecutionRequests(List.of(call("deepseek-call", "read_file", "{}"))).build(),
+                ToolExecutionResultMessage.from("deepseek-call", "read_file", "result"));
+
+        String encoded = AgentToolHistoryCodec.encodeLatestTurn(run);
+        List<ChatMessage> decoded = AgentToolHistoryCodec.decode(encoded);
+
+        assertNotNull(encoded);
+        assertFalse(encoded.contains("do-not-store"));
+        AiMessage assistant = assertInstanceOf(AiMessage.class, decoded.getFirst());
+        assertTrue(assistant.thinking().contains("***"));
+        assertEquals("result", assertInstanceOf(ToolExecutionResultMessage.class, decoded.getLast()).text());
+    }
+
+    @Test
+    void doesNotPersistReasoningForProvidersThatDoNotRequireIt() {
+        EffectiveModelContext.set(null, null, 64_000, false);
+        List<ChatMessage> run = List.of(
+                UserMessage.from("continue"),
+                AiMessage.builder().thinking("provider reasoning")
+                        .toolExecutionRequests(List.of(call("ordinary-call", "read_file", "{}"))).build(),
+                ToolExecutionResultMessage.from("ordinary-call", "read_file", "result"));
+
+        String encoded = AgentToolHistoryCodec.encodeLatestTurn(run);
+        List<ChatMessage> decoded = AgentToolHistoryCodec.decode(encoded);
+
+        assertNotNull(encoded);
+        assertFalse(encoded.contains("thinking"));
+        assertNull(assertInstanceOf(AiMessage.class, decoded.getFirst()).thinking());
     }
 
     private static ToolExecutionRequest call(String id, String name, String arguments) {

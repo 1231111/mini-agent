@@ -68,14 +68,17 @@ class EffectiveModelContextTest {
 
     @Test
     void bindRestoresPreviousSnapshotOnClose() {
-        EffectiveModelContext.set(global, null);
-        try (var ignored = EffectiveModelContext.bind(userModel, userStreaming)) {
+        EffectiveModelContext.set(global, null, 64_000, true);
+        try (var ignored = EffectiveModelContext.bind(userModel, userStreaming, 128_000, false)) {
             assertSame(userModel, EffectiveModelContext.currentChat());
             assertSame(userStreaming, EffectiveModelContext.currentStreaming());
+            assertFalse(EffectiveModelContext.currentSendThinking());
         }
         // 恢复进入前的快照，而不是清空
         assertSame(global, EffectiveModelContext.currentChat());
         assertNull(EffectiveModelContext.currentStreaming());
+        assertTrue(EffectiveModelContext.currentSendThinking());
+        assertTrue(EffectiveModelContext.currentContextWindow() == 64_000);
     }
 
     @Test
@@ -98,6 +101,16 @@ class EffectiveModelContextTest {
             assertNull(EffectiveModelContext.currentChat());
         }
         assertNull(EffectiveModelContext.currentChat());
+    }
+
+    @Test
+    void sendThinkingCapabilityDefaultsOffAndClearsWhenModelIsReset() {
+        EffectiveModelContext.set(userModel, userStreaming, 32_000, true);
+        assertTrue(EffectiveModelContext.currentSendThinking());
+
+        EffectiveModelContext.set(null, null);
+
+        assertFalse(EffectiveModelContext.currentSendThinking());
     }
 
     /**

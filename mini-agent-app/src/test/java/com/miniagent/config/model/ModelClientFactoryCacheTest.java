@@ -57,6 +57,34 @@ class ModelClientFactoryCacheTest {
         assertNotSame(text.chat(), vision.chat());
         assertSame(vision.chat(), updated.chat());
         assertEquals(16_000, updated.settings().contextWindowTokens());
+        assertEquals(false, ReflectionTestUtils.getField(vision.chat(), "sendThinking"));
+        assertEquals(false, ReflectionTestUtils.getField(vision.streaming(), "sendThinking"));
+    }
+
+    @Test
+    void thinkingIsRoundTrippedOnlyForOfficialDeepSeekTextRequestsInBothClients() {
+        UserModelConfigService service = mock(UserModelConfigService.class);
+        EffectiveModelSettings deepSeek = new EffectiveModelSettings("deepseek", "DeepSeek",
+                "https://api.deepseek.com/v1", "deepseek-chat", "fixture-only", 64_000);
+        EffectiveModelSettings other = new EffectiveModelSettings("other", "Other",
+                "https://api.example.test/v1", "deepseek-chat", "fixture-only", 64_000);
+        when(service.getEffective(1L)).thenReturn(deepSeek);
+        when(service.getEffective(2L)).thenReturn(other);
+        ModelClientFactory factory = factory(service);
+
+        var deepSeekModels = factory.resolve(1L);
+        var otherModels = factory.resolve(2L);
+
+        assertEquals(true, ReflectionTestUtils.getField(deepSeekModels.chat(), "sendThinking"));
+        assertEquals(true, ReflectionTestUtils.getField(deepSeekModels.streaming(), "sendThinking"));
+        assertEquals(true, ReflectionTestUtils.getField(deepSeekModels.chat(), "returnThinking"));
+        assertEquals(true, ReflectionTestUtils.getField(deepSeekModels.streaming(), "returnThinking"));
+        assertTrue(deepSeekModels.sendThinking());
+        assertEquals(false, ReflectionTestUtils.getField(otherModels.chat(), "sendThinking"));
+        assertEquals(false, ReflectionTestUtils.getField(otherModels.streaming(), "sendThinking"));
+        assertEquals(true, ReflectionTestUtils.getField(otherModels.chat(), "returnThinking"));
+        assertEquals(true, ReflectionTestUtils.getField(otherModels.streaming(), "returnThinking"));
+        assertFalse(otherModels.sendThinking());
     }
 
     private static EffectiveModelSettings settings(String preset, int window) {

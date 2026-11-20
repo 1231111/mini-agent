@@ -26,12 +26,13 @@ public final class EffectiveModelContext {
     private static final ThreadLocal<ChatModel> CURRENT_CHAT = new ThreadLocal<>();
     private static final ThreadLocal<StreamingChatModel> CURRENT_STREAMING = new ThreadLocal<>();
     private static final ThreadLocal<Integer> CURRENT_WINDOW = new ThreadLocal<>();
+    private static final ThreadLocal<Boolean> CURRENT_SEND_THINKING = new ThreadLocal<>();
 
     private EffectiveModelContext() {}
 
     /** 安装当前模型；某一项传 null 表示清除该项（与另一项无关）。 */
     public static void set(ChatModel chat, StreamingChatModel streaming) {
-        set(chat, streaming, 0);
+        set(chat, streaming, 0, false);
     }
 
     /**
@@ -41,6 +42,12 @@ public final class EffectiveModelContext {
      * 遇到 32k/128k 的模型就会"永远不压缩 → 上游 context-length 400 → 被误报成网络故障"。</p>
      */
     public static void set(ChatModel chat, StreamingChatModel streaming, int contextWindowTokens) {
+        set(chat, streaming, contextWindowTokens, false);
+    }
+
+    /** Install model capabilities used to validate provider-specific request history. */
+    public static void set(ChatModel chat, StreamingChatModel streaming, int contextWindowTokens,
+                           boolean sendThinking) {
         if (chat == null) {
             CURRENT_CHAT.remove();
         } else {
@@ -56,18 +63,29 @@ public final class EffectiveModelContext {
         } else {
             CURRENT_WINDOW.remove();
         }
+        if (sendThinking) {
+            CURRENT_SEND_THINKING.set(Boolean.TRUE);
+        } else {
+            CURRENT_SEND_THINKING.remove();
+        }
     }
 
     public static void clear() {
         CURRENT_CHAT.remove();
         CURRENT_STREAMING.remove();
         CURRENT_WINDOW.remove();
+        CURRENT_SEND_THINKING.remove();
     }
 
     /** 当前模型的上下文窗口（token）；未声明返回 0，调用方回退到配置的工作窗口。 */
     public static int currentContextWindow() {
         Integer w = CURRENT_WINDOW.get();
         return w == null ? 0 : w;
+    }
+
+    /** Whether the bound provider requires reasoning_content on assistant tool-call history. */
+    public static boolean currentSendThinking() {
+        return Boolean.TRUE.equals(CURRENT_SEND_THINKING.get());
     }
 
     /** 当前绑定的对话模型，未绑定返回 null（需要兜底请用 {@link #chatOr}）。 */
@@ -100,15 +118,21 @@ public final class EffectiveModelContext {
      * 用于后台任务在自身线程内临时绑定某用户的模型。
      */
     public static Binding bind(ChatModel chat, StreamingChatModel streaming) {
-        return bind(chat, streaming, 0);
+        return bind(chat, streaming, 0, false);
     }
 
     /** 作用域绑定（含窗口）：进入时安装，关闭时精确恢复进入前的快照。 */
     public static Binding bind(ChatModel chat, StreamingChatModel streaming, int contextWindowTokens) {
+        return bind(chat, streaming, contextWindowTokens, false);
+    }
+
+    public static Binding bind(ChatModel chat, StreamingChatModel streaming, int contextWindowTokens,
+                               boolean sendThinking) {
         ChatModel previousChat = CURRENT_CHAT.get();
         StreamingChatModel previousStreaming = CURRENT_STREAMING.get();
         Integer previousWindow = CURRENT_WINDOW.get();
-        set(chat, streaming, contextWindowTokens);
+        Boolean previousSendThinking = CURRENT_SEND_THINKING.get();
+        set(chat, streaming, contextWindowTokens, sendThinking);
         return () -> {
             if (previousChat == null) {
                 CURRENT_CHAT.remove();
@@ -124,6 +148,11 @@ public final class EffectiveModelContext {
                 CURRENT_WINDOW.remove();
             } else {
                 CURRENT_WINDOW.set(previousWindow);
+            }
+            if (previousSendThinking == null) {
+                CURRENT_SEND_THINKING.remove();
+            } else {
+                CURRENT_SEND_THINKING.set(previousSendThinking);
             }
         };
     }

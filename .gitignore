@@ -79,6 +79,11 @@ mini-agent-desktop/.build-tmp/
 # 一次性脚本与流水线中间产物
 tmp/
 outputs/
+# 部署前备份的 fat jar（单个 500MB+，超过 GitHub 100MB 单文件上限，push 会被拒）。
+# 2026-11-20 实测踩到：output/<request>/backup/*.jar 被 `git add .` 带进提交，
+# push 被 pre-receive hook 拒收（GH001）。备份按设计只留在本机，不进版本库。
+output/**/backup/
+output/**/*.jar
 
 # 内联 embedding 的 ONNX 变体（.verify/onnx/export_onnx.py 的产出）。
 # 三档实际体积：int8 315MB / fp16 655MB / fp32 1308MB（还有 fp32 那份 1.2GB 的

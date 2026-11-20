@@ -41,7 +41,7 @@ public interface MembershipOrderRepository extends JpaRepository<MembershipOrder
 
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query("update MembershipOrder o set o.status = :expired "
-            + "where o.status = :pending and o.expiresAt is not null and o.expiresAt <= :now")
+            + "where o.status = :pending and (o.expiresAt is null or o.expiresAt <= :now)")
     int expirePendingOrders(@Param("now") LocalDateTime now,
                             @Param("pending") MembershipOrder.Status pending,
                             @Param("expired") MembershipOrder.Status expired);

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.miniagent.common.SecurityUtils;
+import com.miniagent.common.model.EffectiveModelContext;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
@@ -24,6 +25,7 @@ public final class AgentToolHistoryCodec {
     private static final int MAX_CALLS_PER_TURN = 16;
     private static final int MAX_ARGUMENT_CHARS = 4_000;
     private static final int MAX_RESULT_CHARS = 8_000;
+    private static final int MAX_THINKING_CHARS = 8_000;
     private static final int MAX_HISTORY_JSON_CHARS = 96_000;
 
     private AgentToolHistoryCodec() {}
@@ -34,21 +36,29 @@ public final class AgentToolHistoryCodec {
      * an action whose outcome was not durably observed.
      */
     public static String encodeLatestTurn(List<ChatMessage> messages) {
+        return encodeLatestTurn(messages, EffectiveModelContext.currentSendThinking());
+    }
+
+    public static String encodeLatestTurn(List<ChatMessage> messages, boolean includeThinking) {
         if (messages == null || messages.isEmpty()) return null;
         int start = -1;
         for (int i = 0; i < messages.size(); i++) {
             if (messages.get(i) instanceof dev.langchain4j.data.message.UserMessage) start = i + 1;
         }
         if (start < 0) return null;
-        return encodeFrom(messages, start);
+        return encodeFrom(messages, start, includeThinking);
     }
 
     /** Encode an already isolated list of completed exchanges, such as a DAG turn's node transcripts. */
     public static String encodeExchanges(List<ChatMessage> messages) {
-        return messages == null || messages.isEmpty() ? null : encodeFrom(messages, 0);
+        return encodeExchanges(messages, EffectiveModelContext.currentSendThinking());
     }
 
-    private static String encodeFrom(List<ChatMessage> messages, int start) {
+    public static String encodeExchanges(List<ChatMessage> messages, boolean includeThinking) {
+        return messages == null || messages.isEmpty() ? null : encodeFrom(messages, 0, includeThinking);
+    }
+
+    private static String encodeFrom(List<ChatMessage> messages, int start, boolean includeThinking) {
         ArrayNode encoded = JSON.createArrayNode();
         int callsSaved = 0;
         for (int i = start; i < messages.size() && callsSaved < MAX_CALLS_PER_TURN; i++) {
@@ -87,6 +97,12 @@ public final class AgentToolHistoryCodec {
             ObjectNode assistant = JSON.createObjectNode();
             assistant.put("type", "assistant_tool_calls");
             assistant.put("text", safe(ai.text(), 1_200));
+            // DeepSeek requires the opaque reasoning_content from an assistant tool-call
+            // message to accompany its replay. Persist it only for providers configured to
+            // require it, with the same redaction and strict size bound as other stored text.
+            if (includeThinking && !blank(ai.thinking())) {
+                assistant.put("thinking", safe(ai.thinking(), MAX_THINKING_CHARS));
+            }
             ArrayNode callArray = assistant.putArray("calls");
             for (ToolExecutionRequest call : calls) {
                 ObjectNode item = callArray.addObject();
@@ -167,6 +183,7 @@ public final class AgentToolHistoryCodec {
                 }
                 if (!valid || resultIds.size() != calls.size()) continue;
                 messages.add(AiMessage.builder().text(text(batch, "text"))
+                        .thinking(text(batch, "thinking"))
                         .toolExecutionRequests(calls).build());
                 messages.addAll(results);
                 callCount += calls.size();

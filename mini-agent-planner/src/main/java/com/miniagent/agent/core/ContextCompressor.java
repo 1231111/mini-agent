@@ -451,28 +451,14 @@ public class ContextCompressor {
         if (stop != ExecutionControl.StopReason.NONE) throw new ModelCallControl.StoppedException(stop);
     }
 
-    // ─── 阶段 5: 清理孤立配对 ───
+    // ─── 阶段 5: 执行与发送请求前相同的工具协议校验 ───
     private List<ChatMessage> sanitizeOrphanedToolPairs(List<ChatMessage> messages) {
-        Set<String> callIds = new HashSet<>();
-        for (ChatMessage m : messages) {
-            if (m instanceof AiMessage am && am.hasToolExecutionRequests()) {
-                for (var req : am.toolExecutionRequests()) {
-                    callIds.add(req.id());
-                }
-            }
+        AgentLoop.ToolHistoryPreflight result = AgentLoop.preflightToolMessages(messages);
+        if (result.changed()) {
+            log.info("压缩后工具历史校验移除无效配对: callMessages={}, resultMessages={}",
+                    result.droppedCallMessages(), result.droppedResultMessages());
         }
-        List<ChatMessage> cleaned = new ArrayList<>();
-        int removed = 0;
-        for (ChatMessage m : messages) {
-            if (m instanceof ToolExecutionResultMessage tr && !callIds.contains(tr.id())) {
-                removed++; continue;
-            }
-            cleaned.add(m);
-        }
-        if (removed > 0) {
-            log.info("清理了 {} 个孤立 tool_result", removed);
-        }
-        return cleaned;
+        return result.messages();
     }
 
     // ─── 主入口 ───

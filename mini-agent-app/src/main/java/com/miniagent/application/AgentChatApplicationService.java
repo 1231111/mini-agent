@@ -752,7 +752,7 @@ public class AgentChatApplicationService {
         // 连窗口一起绑定：循环按"配置上限 vs 模型厂商窗口"的较小值决定何时压缩。
         // 不带窗口时，128k 的模型也会按 512k 估算，压缩永远不触发 → 上游 400 → 误报成网络故障。
         com.miniagent.common.model.EffectiveModelContext.set(
-                effectiveChat, models.streaming(), models.settings().contextWindowTokens());
+                effectiveChat, models.streaming(), models.settings().contextWindowTokens(), models.sendThinking());
         String answer;
         List<ChatMessage> agentMessages = List.of();
         String endReason = "SUCCESS";

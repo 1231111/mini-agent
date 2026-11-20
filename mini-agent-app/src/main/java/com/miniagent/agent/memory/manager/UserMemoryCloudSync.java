@@ -5,6 +5,7 @@ import com.miniagent.agent.memory.entity.AgentMemoryEntryEntity;
 import com.miniagent.agent.memory.entity.AgentSemanticFactEntity;
 import com.miniagent.agent.memory.repository.AgentSemanticFactRepository;
 import com.miniagent.common.context.OwnerContext;
+import com.miniagent.common.exception.BusinessException;
 import com.miniagent.config.entity.User;
 import com.miniagent.config.repository.UserRepository;
 import com.miniagent.memory.MemoryManager;
@@ -15,8 +16,11 @@ import com.miniagent.memory.contract.MemoryApi.UserFactView;
 import com.miniagent.memory.contract.MemoryApi.UserFactSync;
 import com.miniagent.memory.contract.MemoryApi.UserFactSyncResult;
 import com.miniagent.application.SubjectErasureService;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -47,16 +51,28 @@ public class UserMemoryCloudSync {
     private final UserRepository users;
     private final CloudMemoryClient cloud;
     private final MemoryManager memory;
+    private final CloudSyncBackoff backoff;
+
+    @Autowired(required = false)
+    private MeterRegistry metrics;
 
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private SubjectErasureService subjectErasureService;
 
+    @Autowired
     public UserMemoryCloudSync(AgentSemanticFactRepository facts, UserRepository users,
-                                   CloudMemoryClient cloud, MemoryManager memory) {
+                               CloudMemoryClient cloud, MemoryManager memory,
+                               @Value("${agent.memory.service.sync-interval-ms:15000}") long syncIntervalMs) {
         this.facts = facts;
         this.users = users;
         this.cloud = cloud;
         this.memory = memory;
+        this.backoff = new CloudSyncBackoff(syncIntervalMs);
+    }
+
+    public UserMemoryCloudSync(AgentSemanticFactRepository facts, UserRepository users,
+                               CloudMemoryClient cloud, MemoryManager memory) {
+        this(facts, users, cloud, memory, 15_000L);
     }
 
     /**
@@ -72,13 +88,19 @@ public class UserMemoryCloudSync {
                     || users.findMemoryAccessTokenById(user.getId()).filter(v -> !v.isBlank()).isEmpty()) {
                 continue;
             }
+            String ownerKey = ownerKey(user.getTenantId().toString(), user.getId());
+            if (!backoff.tryBegin(ownerKey)) {
+                recordSyncMetric("deferred");
+                continue;
+            }
             try {
                 synchronizeUser(user.getId(), String.valueOf(user.getTenantId()));
             } catch (RuntimeException failure) {
                 // Isolate account failures; a revoked token or one malformed profile must not
                 // prevent other local accounts from reconciling during this scheduled run.
-                log.warn("用户偏好云同步失败 userId={} tenant={}: {}",
-                        user.getId(), user.getTenantId(), failure.getMessage());
+                log.warn("用户偏好云同步失败 userId={} retryAfterMs={} failureType={}",
+                        user.getId(), backoff.retryAfterMillis(ownerKey),
+                        failure.getClass().getSimpleName());
             }
         }
     }
@@ -88,37 +110,57 @@ public class UserMemoryCloudSync {
         if (userId == null || userId <= 0 || blank(localTenantId)) {
             throw new IllegalArgumentException("有效的本地用户与租户是云同步的必要条件");
         }
-        if (subjectErasureService != null) {
-            subjectErasureService.assertWritable(localTenantId, userId);
-        }
-        try (OwnerContext.Scope ignored = OwnerContext.bind(new OwnerContext(userId, localTenantId))) {
-            List<AgentSemanticFactEntity> history = facts.findByTenantIdAndScopeTypeAndScopeId(
-                    localTenantId, AgentMemoryEntryEntity.ScopeType.USER, String.valueOf(userId));
-            Map<FactKey, AgentSemanticFactEntity> latest = latestFacts(history);
-            List<UserFactView> snapshot = cloud.userFacts();
-            Map<FactKey, UserFactView> remote = indexRemote(snapshot);
-            List<UserFactMutation> pending = latest.entrySet().stream()
-                    .filter(entry -> needsPush(entry.getValue(), remote.get(entry.getKey())))
-                    .map(entry -> toMutation(entry.getValue()))
-                    .toList();
+        String key = ownerKey(localTenantId, userId);
+        try {
+            if (subjectErasureService != null) {
+                subjectErasureService.assertWritable(localTenantId, userId);
+            }
+            try (OwnerContext.Scope ignored = OwnerContext.bind(new OwnerContext(userId, localTenantId))) {
+                List<AgentSemanticFactEntity> history = facts.findByTenantIdAndScopeTypeAndScopeId(
+                        localTenantId, AgentMemoryEntryEntity.ScopeType.USER, String.valueOf(userId));
+                Map<FactKey, AgentSemanticFactEntity> latest = latestFacts(history);
+                List<UserFactView> snapshot = cloud.userFacts();
+                Map<FactKey, UserFactView> remote = indexRemote(snapshot);
+                List<UserFactMutation> pending = latest.entrySet().stream()
+                        .filter(entry -> needsPush(entry.getValue(), remote.get(entry.getKey())))
+                        .map(entry -> toMutation(entry.getValue()))
+                        .toList();
 
-            for (int start = 0; start < pending.size(); start += BATCH_SIZE) {
-                List<UserFactMutation> batch = pending.subList(start,
-                        Math.min(start + BATCH_SIZE, pending.size()));
-                UserFactSyncResult result = cloud.syncUserFacts(new UserFactSync(batch));
-                if (result != null && result.facts() != null) {
-                    for (UserFactView canonical : result.facts()) {
-                        reconcileOne(userId, localTenantId, latest, canonical);
+                for (int start = 0; start < pending.size(); start += BATCH_SIZE) {
+                    List<UserFactMutation> batch = pending.subList(start,
+                            Math.min(start + BATCH_SIZE, pending.size()));
+                    UserFactSyncResult result = cloud.syncUserFacts(new UserFactSync(batch));
+                    if (result != null && result.facts() != null) {
+                        for (UserFactView canonical : result.facts()) {
+                            reconcileOne(userId, localTenantId, latest, canonical);
+                        }
                     }
                 }
-            }
 
-            // Pull cloud-only facts and cloud writes newer than the local version. This also
-            // bootstraps a second device whose local database has not seen a USER fact yet.
-            for (UserFactView item : snapshot == null ? List.<UserFactView>of() : snapshot) {
-                reconcileOne(userId, localTenantId, latest, item);
+                // Pull cloud-only facts and cloud writes newer than the local version. This also
+                // bootstraps a second device whose local database has not seen a USER fact yet.
+                for (UserFactView item : snapshot == null ? List.<UserFactView>of() : snapshot) {
+                    reconcileOne(userId, localTenantId, latest, item);
+                }
             }
+            backoff.recordSuccess(key);
+            recordSyncMetric("success");
+        } catch (RuntimeException failure) {
+            backoff.recordFailure(key);
+            recordSyncMetric("failure");
+            throw failure;
         }
+    }
+
+    private void recordSyncMetric(String outcome) {
+        if (metrics != null) {
+            metrics.counter("miniagent.memory.cloud.sync", "operation", "user_facts",
+                    "outcome", outcome).increment();
+        }
+    }
+
+    private static String ownerKey(String tenantId, Long userId) {
+        return tenantId + "\n" + userId;
     }
 
     private void reconcileOne(Long userId, String localTenantId,
@@ -126,6 +168,12 @@ public class UserMemoryCloudSync {
                               UserFactView remote) {
         if (remote == null || blank(remote.subject()) || blank(remote.predicate())
                 || remote.sourceUpdatedAt() == null) {
+            return;
+        }
+        try {
+            SemanticFactFieldValidator.validate(remote.subject(), remote.predicate(), remote.objectValue());
+        } catch (BusinessException invalidFact) {
+            log.warn("跳过超出本地字段限制的云端事实: {}", invalidFact.getMessage());
             return;
         }
         FactKey key = new FactKey(remote.subject(), remote.predicate());

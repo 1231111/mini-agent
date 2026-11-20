@@ -26,7 +26,7 @@ public class AgentSemanticFactEntity extends BaseMemoryEntity {
     @Column(name = "scope_id", nullable = false, length = 128)
     private String scopeId;
 
-    @Column(name = "subject", nullable = false, length = 256)
+    @Column(name = "subject", nullable = false, length = 512)
     private String subject;
 
     @Column(name = "predicate", nullable = false, length = 256)

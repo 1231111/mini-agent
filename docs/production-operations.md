@@ -16,6 +16,26 @@ In production, the App's primary chat model and streaming chat model endpoints (
 
 The App exposes Prometheus metrics at `/actuator/prometheus`; `/actuator/metrics/**` and the scrape endpoint require an authenticated `SYSTEM_ADMIN` bearer token. Keep actuator traffic on a private monitoring path and store the scrape credential in the monitoring system's secret store. LLM duration, aggregate input/output tokens, compression savings, and quota decisions use bounded labels and do not put user, session, or prompt values into metric labels. Provider billing cost is not inferred from token counts because configured providers and model pricing differ; reconcile cost using provider billing data until explicit, versioned pricing is configured.
 
+Task lifecycle metrics are `miniagent_task_runs_started_total`,
+`miniagent_task_runs_terminal_total{status=...}`, and
+`miniagent_task_run_duration_seconds{status=...}`. They count successfully
+persisted task starts and durable terminal transitions; `WAITING` means the task
+yielded for an external continuation, not that the user goal completed. Compare
+starts and terminal outcomes over the same time window and use the status label
+to distinguish completed, failed, cancelled, interrupted, and waiting runs.
+Cloud memory synchronization reports
+`miniagent_memory_cloud_sync_total{operation=user_facts|procedures,outcome=success|failure|deferred}`.
+Failures retain their local durable facts and use bounded per-owner exponential
+retry backoff (capped at 15 minutes); no owner, session, or exception text is a
+metric label. Alert on sustained or recurring upstream failures, for example:
+
+```promql
+sum(increase(miniagent_memory_cloud_sync_total{outcome="failure"}[10m])) > 0
+```
+
+Tune the window and notification policy to the memory synchronization SLO; a
+single brief outage should page only if the service's recovery objective requires it.
+
 The repository uses host-run JARs rather than Docker/Compose. Install the
 systemd units under `scripts/systemd/` (or reproduce their limits in the chosen
 service manager) before exposing production traffic. They set bounded

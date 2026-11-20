@@ -461,6 +461,7 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
     @Override
     @Transactional
     public void writeFact(SemanticFact fact) {
+        SemanticFactFieldValidator.validate(fact);
         assertOwnerWritable(fact.getTenantId(),
                 AgentMemoryEntryEntity.ScopeType.valueOf(fact.getScope().scopeType().name()),
                 fact.getScope().scopeId());

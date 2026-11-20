@@ -163,6 +163,28 @@ class UserMemoryCloudSyncTest {
     }
 
     @Test
+    void importsSubjectAtTheLocalLimit() {
+        String subject = "x".repeat(SemanticFactFieldValidator.SUBJECT_MAX_LENGTH);
+        when(cloud.userFacts()).thenReturn(List.of(view(subject, "learned", "value", at("2026-11-15T12:34:56Z"))));
+
+        sync.synchronizeUser(USER_ID, TENANT);
+
+        verify(memory).writeFact(any(SemanticFact.class));
+        assertEquals(subject, stored.getFirst().getSubject());
+    }
+
+    @Test
+    void skipsRemoteSubjectOverTheLocalLimitWithoutFailingTheSync() {
+        String subject = "x".repeat(SemanticFactFieldValidator.SUBJECT_MAX_LENGTH + 1);
+        when(cloud.userFacts()).thenReturn(List.of(view(subject, "learned", "value", at("2026-11-15T12:34:56Z"))));
+
+        sync.synchronizeUser(USER_ID, TENANT);
+
+        verify(memory, never()).writeFact(any(SemanticFact.class));
+        assertTrue(stored.isEmpty());
+    }
+
+    @Test
     void newerCloudVersionWinsAndOlderCloudVersionDoesNotOverwriteLocalFact() {
         Instant localAt = at("2026-11-15T12:00:00Z");
         stored.add(fact(1L, "assistant style", "preference", "local newer", localAt));

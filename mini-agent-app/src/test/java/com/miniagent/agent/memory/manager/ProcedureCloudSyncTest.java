@@ -26,6 +26,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -114,6 +115,20 @@ class ProcedureCloudSyncTest {
         }
 
         verify(procedures, never()).save(any());
+    }
+
+    @Test
+    void pullBacksOffAfterCloudFailureInsteadOfRetryingOnEveryScheduledPass() {
+        when(cloud.list(null, null, 100)).thenThrow(new IllegalStateException("temporarily unavailable"));
+        ProcedureCloudSync sync = new ProcedureCloudSync(cloud, procedures,
+                mock(AgentProjectRepository.class), revisions, json, noopTransactions(), 60_000L);
+
+        try (OwnerContext.Scope ignored = OwnerContext.bind(new OwnerContext(3L, "t1"))) {
+            sync.pull();
+            sync.pull();
+        }
+
+        verify(cloud, times(1)).list(null, null, 100);
     }
 
     private ProcedureCloudSync sync() {

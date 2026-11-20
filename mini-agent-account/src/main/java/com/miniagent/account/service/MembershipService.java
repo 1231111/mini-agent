@@ -21,6 +21,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -77,6 +78,9 @@ public class MembershipService {
     @Value("${agent.quota.zone-id:Asia/Shanghai}")
     private String quotaZoneId;
 
+    @Value("${agent.account.membership.pending-order-ttl-minutes:15}")
+    private long pendingOrderTtlMinutes = 15L;
+
     private ZoneId quotaZone = ZoneId.of("Asia/Shanghai");
 
     @PostConstruct
@@ -121,6 +125,13 @@ public class MembershipService {
         }
     }
 
+    /** A durably expired order must remain expired even though the caller receives a domain error. */
+    private static final class ExpiredOrderException extends BusinessException {
+        private ExpiredOrderException(String message) {
+            super(ErrorCode.MEMBER_ORDER_STATE_INVALID, message);
+        }
+    }
+
     /** 注册时调用，把新用户放进 free 档并落一条订阅。 */
     @Transactional
     public MembershipSubscription startFreeSubscription(Long userId, Long tenantId) {
@@ -136,8 +147,10 @@ public class MembershipService {
     }
 
     /** 当前生效的订阅。正常情况注册时就会建一条，返回空说明数据被外部改动过。 */
-    @Transactional(readOnly = true)
+    @Transactional
     public Optional<MembershipView> current(Long userId) {
+        subscriptions.expireActiveSubscriptions(userId, MembershipSubscription.Status.ACTIVE,
+                MembershipSubscription.Status.EXPIRED, LocalDateTime.now(quotaZone));
         return subscriptions
                 .findFirstByUserIdAndStatusOrderByIdDesc(userId, MembershipSubscription.Status.ACTIVE)
                 .map(sub -> {
@@ -240,10 +253,77 @@ public class MembershipService {
         order.setAmountCents(plan.getPriceCents());
         order.setCurrency(plan.getCurrency());
         order.setStatus(MembershipOrder.Status.PENDING);
+        order.setExpiresAt(LocalDateTime.now(quotaZone).plusMinutes(Math.max(1L, pendingOrderTtlMinutes)));
         MembershipOrder saved = orders.save(order);
         log.info("会员下单 orderNo={} userId={} plan={} amountCents={}",
                 saved.getOrderNo(), userId, plan.getCode(), plan.getPriceCents());
         return saved;
+    }
+
+    /** Return recent pending orders after durably expiring any stale orders for this owner. */
+    @Transactional
+    public List<MembershipOrder> pendingOrdersOf(Long userId) {
+        if (userId == null || !users.existsById(userId)) {
+            throw new BusinessException(ErrorCode.MEMBER_USER_NOT_FOUND, "用户不存在");
+        }
+        LocalDateTime now = LocalDateTime.now(quotaZone);
+        orders.expirePendingOrdersForUser(userId, now,
+                MembershipOrder.Status.PENDING, MembershipOrder.Status.EXPIRED);
+        return orders.findTop20ByUserIdAndStatusOrderByIdDesc(userId, MembershipOrder.Status.PENDING);
+    }
+
+    /** Cancel an owner's pending order; ownership mismatches intentionally look like not found. */
+    @Transactional(noRollbackFor = ExpiredOrderException.class)
+    public MembershipOrder cancelOrder(Long userId, String orderNo) {
+        if (userId == null || orderNo == null || orderNo.isBlank()) {
+            throw new BusinessException(ErrorCode.MEMBER_ORDER_NOT_FOUND, "订单不存在");
+        }
+        MembershipOrder order = orders.findByOrderNoForUpdate(orderNo)
+                .filter(candidate -> userId != null && userId.equals(candidate.getUserId()))
+                .orElseThrow(() -> new BusinessException(ErrorCode.MEMBER_ORDER_NOT_FOUND, "订单不存在"));
+        LocalDateTime now = LocalDateTime.now(quotaZone);
+        if (order.getStatus() == MembershipOrder.Status.PENDING
+                && (order.getExpiresAt() == null || !order.getExpiresAt().isAfter(now))) {
+            order.setStatus(MembershipOrder.Status.EXPIRED);
+            orders.save(order);
+            throw new ExpiredOrderException("订单已过期，不能取消");
+        }
+        if (order.getStatus() != MembershipOrder.Status.PENDING) {
+            throw new BusinessException(ErrorCode.MEMBER_ORDER_STATE_INVALID,
+                    "订单当前状态是 " + order.getStatus() + "，不能取消");
+        }
+        order.setStatus(MembershipOrder.Status.CANCELED);
+        return orders.save(order);
+    }
+
+    /**
+     * Demo-only settlement. The web entry point is separately disabled by default and the
+     * production readiness validator refuses to start with it enabled.
+     */
+    @Transactional(noRollbackFor = ExpiredOrderException.class)
+    public MembershipOrder simulatePayment(Long userId, String orderNo) {
+        if (userId == null || orderNo == null || orderNo.isBlank()) {
+            throw new BusinessException(ErrorCode.MEMBER_ORDER_NOT_FOUND, "订单不存在");
+        }
+        MembershipOrder order = orders.findByOrderNoForUpdate(orderNo)
+                .filter(candidate -> userId != null && userId.equals(candidate.getUserId()))
+                .orElseThrow(() -> new BusinessException(ErrorCode.MEMBER_ORDER_NOT_FOUND, "订单不存在"));
+        LocalDateTime now = LocalDateTime.now(quotaZone);
+        if (order.getStatus() == MembershipOrder.Status.PENDING
+                && (order.getExpiresAt() == null || !order.getExpiresAt().isAfter(now))) {
+            order.setStatus(MembershipOrder.Status.EXPIRED);
+            orders.save(order);
+            throw new ExpiredOrderException("订单已过期，不能确认支付");
+        }
+        return markPaid(orderNo, "SIMULATED", "SIMULATED-" + orderNo);
+    }
+
+    /** Periodically expire timed-out checkout rows even if their owners never revisit checkout. */
+    @Scheduled(fixedDelayString = "${agent.account.membership.expire-sweep-ms:60000}")
+    @Transactional
+    public int expirePendingOrders() {
+        return orders.expirePendingOrders(LocalDateTime.now(quotaZone),
+                MembershipOrder.Status.PENDING, MembershipOrder.Status.EXPIRED);
     }
 
     /**
@@ -258,7 +338,7 @@ public class MembershipService {
      * 所以这里用 {@code findByOrderNoForUpdate} 把同一单串行化 —— 拿不到锁的那条
      * 会在前一条提交后重新读到 PAID 走幂等分支。
      */
-    @Transactional
+    @Transactional(noRollbackFor = ExpiredOrderException.class)
     public MembershipOrder markPaid(String orderNo, String channel, String channelTxnId) {
         MembershipOrder order = orders.findByOrderNoForUpdate(orderNo)
                 .orElseThrow(() -> new BusinessException(ErrorCode.MEMBER_ORDER_NOT_FOUND,
@@ -272,6 +352,12 @@ public class MembershipService {
         if (order.getStatus() != MembershipOrder.Status.PENDING) {
             throw new BusinessException(ErrorCode.MEMBER_ORDER_STATE_INVALID,
                     "订单「" + orderNo + "」当前状态是 " + order.getStatus() + "，不能标记为已支付");
+        }
+
+        if (order.getExpiresAt() == null || !order.getExpiresAt().isAfter(LocalDateTime.now(quotaZone))) {
+            order.setStatus(MembershipOrder.Status.EXPIRED);
+            orders.save(order);
+            throw new ExpiredOrderException("订单「" + orderNo + "」已过期，不能再确认支付");
         }
 
         MembershipPlan plan = plans.findByCode(order.getPlanCode())
@@ -302,7 +388,7 @@ public class MembershipService {
     @Transactional
     public MembershipSubscription applyPlan(Long userId, Long tenantId, MembershipPlan plan,
                                            String sourceOrderNo) {
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = LocalDateTime.now(quotaZone);
 
         /*
          * The tenant row is the serialization point for all plan changes belonging
@@ -316,9 +402,21 @@ public class MembershipService {
                 .orElseThrow(() -> new IllegalStateException(
                         "租户 " + tenantId + " 不存在，无法写入配额上限（用户 " + userId + "）"));
 
+        subscriptions.expireActiveSubscriptions(userId, MembershipSubscription.Status.ACTIVE,
+                MembershipSubscription.Status.EXPIRED, now);
+        MembershipSubscription current = subscriptions
+                .findFirstByUserIdAndStatusOrderByIdDesc(userId, MembershipSubscription.Status.ACTIVE)
+                .orElse(null);
         List<MembershipSubscription> active = subscriptions
                 .findByUserIdAndStatus(userId, MembershipSubscription.Status.ACTIVE);
+        LocalDateTime effectiveStart = now;
+        if (current != null && current.getExpireAt() != null && current.getExpireAt().isAfter(effectiveStart)) {
+            effectiveStart = current.getExpireAt();
+        }
         for (MembershipSubscription old : active) {
+            if (old.getExpireAt() != null && old.getExpireAt().isAfter(effectiveStart)) {
+                effectiveStart = old.getExpireAt();
+            }
             old.setStatus(MembershipSubscription.Status.SUPERSEDED);
         }
 
@@ -331,12 +429,18 @@ public class MembershipService {
         // durationDays <= 0 表示永久（free 档是这种）。用 null 而不是 now+100年：
         // 后者会在任何按时间排序或比较的地方表现成一个很像真实日期的值，
         // 以后排查"这个会员到底什么时候到期"时要先搞清楚 2126 年是什么意思。
-        sub.setExpireAt(plan.getDurationDays() <= 0 ? null : now.plusDays(plan.getDurationDays()));
+        sub.setExpireAt(plan.getDurationDays() <= 0 ? null
+                : effectiveStart.plusDays(plan.getDurationDays()));
         sub.setSourceOrderNo(sourceOrderNo);
         subscriptions.save(sub);
 
-        // 保留旧列值以兼容已有部署与 API 响应；Agent 配额实现不再用它拦截请求。
-        tenant.setDailyTokenLimit(plan.getDailyTokenLimit());
+        // Membership is a per-user entitlement. Never overwrite the tenant-wide shared quota.
+        User entitledUser = users.findByIdForUpdate(userId)
+                .orElseThrow(() -> new IllegalStateException("用户 " + userId + " 不存在，无法写入会员权益"));
+        entitledUser.setMembershipDailyTokenLimit(plan.getDailyTokenLimit());
+        entitledUser.setMembershipMaxConcurrentTasks(plan.getMaxConcurrentTasks());
+        entitledUser.setMembershipExpiresAt(sub.getExpireAt());
+        users.save(entitledUser);
 
         log.info("会员生效 userId={} tenantId={} plan={} planTokenReference={} expireAt={} 替换掉的旧订阅={} 条",
                 userId, tenantId, plan.getCode(), plan.getDailyTokenLimit(), sub.getExpireAt(), active.size());

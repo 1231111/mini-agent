@@ -770,8 +770,191 @@ public class AgentLoop {
                 state.lastToolResult);
     }
 
+    private static final String TOOL_HISTORY_VALIDATION_WARNING = "【上下文安全】本次请求前发现工具调用历史不完整或配对有歧义，"
+            + "相关调用及结果已从模型上下文移除。相关操作可能已经发生；继续前先重新读取文件或观察外部状态，"
+            + "确认后再决定是否重试，避免重复执行有副作用的操作。";
+
+    record ToolHistoryPreflight(List<ChatMessage> messages, int droppedCallMessages, int droppedResultMessages) {
+        boolean changed() {
+            return droppedCallMessages > 0 || droppedResultMessages > 0;
+        }
+    }
+
+    enum LlmFailureKind {
+        AUTHENTICATION,
+        CONTEXT_LIMIT,
+        TOOL_HISTORY,
+        REASONING_HISTORY,
+        INVALID_REQUEST,
+        PERMANENT_PROVIDER_FAILURE
+    }
+
+    record LlmFailure(LlmFailureKind kind, String diagnosticCode, String userMessage) {}
+
+    static final class LlmCallFailureException extends RuntimeException {
+        private final LlmFailure failure;
+
+        private LlmCallFailureException(LlmFailure failure, Throwable cause) {
+            super(failure == null ? "Permanent model request failure" : failure.diagnosticCode(), cause);
+            this.failure = failure;
+        }
+
+        LlmFailure failure() { return failure; }
+    }
+
+    static LlmFailure classifyLlmFailure(Throwable failure) {
+        String message = exceptionMessage(failure).toLowerCase(java.util.Locale.ROOT);
+        if (hasCause(failure, dev.langchain4j.exception.AuthenticationException.class)) {
+            return new LlmFailure(LlmFailureKind.AUTHENTICATION, "LLM_AUTHENTICATION_FAILED",
+                    "模型认证失败，请检查 API Key、服务地址和账号状态后再试。此错误不会自动重试。");
+        }
+        if (hasCause(failure, dev.langchain4j.exception.InvalidRequestException.class)) {
+            if (containsAny(message, "context_length", "context length", "context window",
+                    "maximum context", "prompt is too long", "too many tokens", "token limit")) {
+                return new LlmFailure(LlmFailureKind.CONTEXT_LIMIT, "LLM_CONTEXT_LIMIT",
+                        "模型请求超出上下文长度限制；已停止自动重试。请缩短任务或拆分后再试。");
+            }
+            if (containsAny(message, "messages with role 'tool'", "tool_calls", "tool call history")) {
+                return new LlmFailure(LlmFailureKind.TOOL_HISTORY, "LLM_TOOL_HISTORY_INVALID",
+                        "模型请求中的工具调用记录不完整；已停止自动重试。请重新检查当前文件或外部状态后继续。");
+            }
+            if (containsAny(message, "reasoning_content", "reasoning content")) {
+                return new LlmFailure(LlmFailureKind.REASONING_HISTORY, "LLM_REASONING_HISTORY_INVALID",
+                        "模型拒绝了缺少思考上下文的历史请求；已停止自动重试。请从当前状态重新观察后继续。");
+            }
+            return new LlmFailure(LlmFailureKind.INVALID_REQUEST, "LLM_INVALID_REQUEST",
+                    "模型服务拒绝了请求参数（HTTP 400）；已停止自动重试。请检查模型参数或联系管理员。");
+        }
+        String type = failure == null ? "未知错误" : failure.getClass().getSimpleName();
+        return new LlmFailure(LlmFailureKind.PERMANENT_PROVIDER_FAILURE,
+                "LLM_PERMANENT_FAILURE", "模型请求失败（" + type + "），且该错误不适合自动重试。");
+    }
+
+    private static boolean hasCause(Throwable failure, Class<? extends Throwable> type) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (type.isInstance(current)) return true;
+            if (current == current.getCause()) break;
+        }
+        return false;
+    }
+
+    private static String exceptionMessage(Throwable failure) {
+        StringBuilder text = new StringBuilder();
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (current.getMessage() != null) text.append(current.getMessage()).append('\n');
+            if (current == current.getCause()) break;
+        }
+        return text.toString();
+    }
+
+    private static boolean containsAny(String text, String... needles) {
+        for (String needle : needles) if (text.contains(needle)) return true;
+        return false;
+    }
+
+    private static ToolErrorCode toolErrorCode(LlmFailureKind kind) {
+        return switch (kind) {
+            case AUTHENTICATION -> ToolErrorCode.MODEL_AUTHENTICATION_FAILED;
+            case CONTEXT_LIMIT -> ToolErrorCode.MODEL_CONTEXT_LIMIT;
+            case TOOL_HISTORY -> ToolErrorCode.MODEL_TOOL_HISTORY_INVALID;
+            case REASONING_HISTORY -> ToolErrorCode.MODEL_REASONING_HISTORY_INVALID;
+            case INVALID_REQUEST -> ToolErrorCode.MODEL_INVALID_REQUEST;
+            case PERMANENT_PROVIDER_FAILURE -> ToolErrorCode.MODEL_PERMANENT_FAILURE;
+        };
+    }
+
+    private static String llmFailureTrace(LlmFailure failure) {
+        return failure == null ? "LLM_PERMANENT_FAILURE" : failure.diagnosticCode();
+    }
+
+    /**
+     * Validate the provider's assistant-tool-call/tool-result protocol before every request.
+     * Malformed batches and orphan result roles are removed fail-closed; a bounded system note
+     * asks the model to re-observe state before considering any potentially repeated side effect.
+     */
+    static ToolHistoryPreflight preflightToolMessages(List<ChatMessage> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return new ToolHistoryPreflight(messages == null ? List.of() : new ArrayList<>(messages), 0, 0);
+        }
+
+        Set<Integer> validCallIndexes = new LinkedHashSet<>();
+        Set<Integer> validResultIndexes = new LinkedHashSet<>();
+        for (int i = 0; i < messages.size(); i++) {
+            if (!(messages.get(i) instanceof AiMessage ai) || !ai.hasToolExecutionRequests()) continue;
+            List<ToolExecutionRequest> requests = ai.toolExecutionRequests();
+            if (requests.isEmpty()) continue;
+
+            Map<String, ToolExecutionRequest> callsById = new LinkedHashMap<>();
+            boolean requiresThinking = EffectiveModelContext.currentSendThinking();
+            boolean valid = i + requests.size() < messages.size()
+                    && (!requiresThinking || StringUtils.isNotBlank(ai.thinking()));
+            for (ToolExecutionRequest request : requests) {
+                if (!valid) break;
+                if (StringUtils.isBlank(request.id()) || StringUtils.isBlank(request.name())
+                        || callsById.putIfAbsent(request.id(), request) != null) {
+                    valid = false;
+                    break;
+                }
+            }
+            Set<String> returnedIds = new LinkedHashSet<>();
+            if (valid) {
+                for (int offset = 1; offset <= requests.size(); offset++) {
+                    ChatMessage resultMessage = messages.get(i + offset);
+                    if (!(resultMessage instanceof ToolExecutionResultMessage result)) {
+                        valid = false;
+                        break;
+                    }
+                    ToolExecutionRequest matchingCall = callsById.get(result.id());
+                    if (matchingCall == null || !returnedIds.add(result.id())
+                            || !Objects.equals(matchingCall.name(), result.toolName())) {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if (valid && returnedIds.size() == requests.size()) {
+                validCallIndexes.add(i);
+                for (int offset = 1; offset <= requests.size(); offset++) {
+                    validResultIndexes.add(i + offset);
+                }
+                i += requests.size();
+            }
+        }
+
+        int droppedCallMessages = 0;
+        int droppedResultMessages = 0;
+        List<ChatMessage> sanitized = new ArrayList<>(messages.size() + 1);
+        for (int i = 0; i < messages.size(); i++) {
+            ChatMessage message = messages.get(i);
+            if (message instanceof AiMessage ai && ai.hasToolExecutionRequests() && !validCallIndexes.contains(i)) {
+                droppedCallMessages++;
+            } else if (message instanceof ToolExecutionResultMessage && !validResultIndexes.contains(i)) {
+                droppedResultMessages++;
+            } else {
+                sanitized.add(message);
+            }
+        }
+        if (droppedCallMessages > 0 || droppedResultMessages > 0) {
+            // Counts are bounded and contain no tool names, arguments, paths, or result text.
+            log.warn("模型请求前丢弃无效工具历史: callMessages={}, resultMessages={}",
+                    droppedCallMessages, droppedResultMessages);
+        }
+        if ((droppedCallMessages > 0 || droppedResultMessages > 0)
+                && sanitized.stream().noneMatch(message -> message instanceof SystemMessage system
+                && system.text().contains(TOOL_HISTORY_VALIDATION_WARNING))) {
+            if (!sanitized.isEmpty() && sanitized.getFirst() instanceof SystemMessage system) {
+                sanitized.set(0, new SystemMessage(system.text() + "\n\n"
+                        + TOOL_HISTORY_VALIDATION_WARNING));
+            } else {
+                sanitized.addFirst(new SystemMessage(TOOL_HISTORY_VALIDATION_WARNING));
+            }
+        }
+        return new ToolHistoryPreflight(sanitized, droppedCallMessages, droppedResultMessages);
+    }
+
     /** Recovery may drop old assistant chatter, but never user intent or half a tool batch. */
     static List<ChatMessage> recoveryHistory(List<ChatMessage> messages) {
+        messages = preflightToolMessages(messages).messages();
         int headEnd = 0;
         while (headEnd < messages.size() && messages.get(headEnd) instanceof SystemMessage) headEnd++;
         int tailStart = Math.max(headEnd, messages.size() - 10);
@@ -1078,6 +1261,17 @@ public class AgentLoop {
                 }
             }
 
+            // Run the protocol guard after compression and every context mutation, immediately
+            // before constructing the provider request.
+            ToolHistoryPreflight toolHistory = preflightToolMessages(messages);
+            messages = new ArrayList<>(toolHistory.messages());
+            if (toolHistory.changed() && Objects.nonNull(traceRecorder)) {
+                traceRecorder.recordNode(sessionId, turn, "TOOL_HISTORY_PREFLIGHT",
+                        "已移除无效工具历史：callMessages=" + toolHistory.droppedCallMessages()
+                                + ", resultMessages=" + toolHistory.droppedResultMessages(),
+                        RunStatus.SUCCESS.name(), 0);
+            }
+
             // 记录 LLM 请求上下文（超长 prompt 截断，避免轨迹写入拖死线程）
             if (Objects.nonNull(traceRecorder)) {
                 String promptCtx = truncate(formatMessagesForTrace(messages), 8000);
@@ -1087,15 +1281,34 @@ public class AgentLoop {
             log.info("开始调用 LLM（流式={}，工具数={}）…", Objects.nonNull(streamSink), specsForTurn.size());
             long llmStartMs = System.currentTimeMillis();
             ChatResponse response;
-            if (needsToolVision) {
-                var vision = state.visionModels;
-                try (var ignored = EffectiveModelContext.bind(vision.chat(), vision.streaming(), vision.contextWindowTokens())) {
-                    response = callLlm(vision.chat(), vision.streaming(), messages, specsForTurn,
-                            !specsForTurn.isEmpty(), streamSink, state);
+            try {
+                if (needsToolVision) {
+                    var vision = state.visionModels;
+                    try (var ignored = EffectiveModelContext.bind(vision.chat(), vision.streaming(),
+                            vision.contextWindowTokens(), false)) {
+                        response = callLlm(vision.chat(), vision.streaming(), messages, specsForTurn,
+                                !specsForTurn.isEmpty(), streamSink, state);
+                    }
+                } else {
+                    response = callLlm(chatModel, Optional.ofNullable(getCurrentStreamingModel()).orElse(streamingChatModel),
+                            messages, specsForTurn, !specsForTurn.isEmpty(), streamSink, state);
                 }
-            } else {
-                response = callLlm(chatModel, Optional.ofNullable(getCurrentStreamingModel()).orElse(streamingChatModel),
-                        messages, specsForTurn, !specsForTurn.isEmpty(), streamSink, state);
+            } catch (LlmCallFailureException rejected) {
+                LlmFailure failure = rejected.failure();
+                state.lastErrorCode = toolErrorCode(failure == null
+                        ? LlmFailureKind.PERMANENT_PROVIDER_FAILURE : failure.kind());
+                state.loopEndReason = RunStatus.FAILURE.name();
+                log.error("LLM 请求被永久拒绝，已停止自动重试: code={}", llmFailureTrace(failure));
+                if (traceRecorder != null) {
+                    traceRecorder.recordNode(sessionId, turn, "LLM_REQUEST_REJECTED",
+                            llmFailureTrace(failure), RunStatus.FAILURE.name(),
+                            System.currentTimeMillis() - llmStartMs);
+                    traceRecorder.recordError(sessionId, turn,
+                            "LLM 请求被永久拒绝: " + llmFailureTrace(failure));
+                }
+                if (streamSink != null) streamSink.onAnswerReset();
+                return finish(failure == null
+                        ? classifyLlmFailure(rejected).userMessage() : failure.userMessage(), state, messages);
             }
             log.info("LLM 调用结束，耗时 {}ms，response={}",
                     System.currentTimeMillis() - llmStartMs, Objects.isNull(response) ? "null" : "ok");
@@ -1821,6 +2034,8 @@ public class AgentLoop {
     private ChatResponse callLlm(ChatModel chatModel, StreamingChatModel selectedStreamingModel, List<ChatMessage> messages,
                                   List<?> specsForTurn, boolean hasTools, AgentStreamSink streamSink,
                                   LoopState state) {
+        ToolHistoryPreflight protocol = preflightToolMessages(messages);
+        messages = new ArrayList<>(protocol.messages());
         CapturingStreamSink capturingSink = streamSink == null ? null : new CapturingStreamSink(streamSink);
         AgentStreamSink outputSink = capturingSink == null ? null : capturingSink;
         ChatRequest.Builder reqBuilder = ChatRequest.builder().messages(messages);
@@ -1893,13 +2108,17 @@ public class AgentLoop {
                 }
                 if (isRetriable(e)) {
                     log.error("LLM 调用重试耗尽（{} 次）: {}", maxRetries + 1, describe(e));
-                } else {
-                    log.error("LLM 调用失败（不可重试）: {}", describe(e));
+                    if (state != null && capturingSink != null && !capturingSink.text().isBlank()) {
+                        state.partialStreamAnswer = capturingSink.text();
+                    }
+                    return null;
                 }
                 if (state != null && capturingSink != null && !capturingSink.text().isBlank()) {
                     state.partialStreamAnswer = capturingSink.text();
                 }
-                return null;
+                LlmFailure classified = classifyLlmFailure(e);
+                log.error("LLM 请求不可重试，分类为 {}: {}", classified.diagnosticCode(), describe(e));
+                throw new LlmCallFailureException(classified, e);
             } finally {
                 acceptingCallbacks.set(false);
             }

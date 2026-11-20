@@ -74,6 +74,9 @@ public class RecoveryEngine {
                 case RATE_LIMITED, DEPENDENCY_UNAVAILABLE, RESOURCE_BUSY -> FailureKind.RESOURCE_EXHAUSTED;
                 case CONFLICT -> FailureKind.CONFLICT;
                 case NOT_FOUND, EXECUTION_FAILED, INTERNAL_ERROR -> FailureKind.TOOL_ERROR;
+                case MODEL_AUTHENTICATION_FAILED, MODEL_CONTEXT_LIMIT, MODEL_TOOL_HISTORY_INVALID,
+                        MODEL_REASONING_HISTORY_INVALID, MODEL_INVALID_REQUEST,
+                        MODEL_PERMANENT_FAILURE -> FailureKind.GENERIC;
                 case CANCELLED -> FailureKind.GENERIC;
                 case EMPTY_RESULT, OUTCOME_UNKNOWN -> FailureKind.EVAL_FAILED;
                 case NONE -> classifyKind(error);

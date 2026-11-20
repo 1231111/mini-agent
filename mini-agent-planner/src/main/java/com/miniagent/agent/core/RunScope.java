@@ -42,6 +42,7 @@ public record RunScope(
         ChatModel chatModel,
         StreamingChatModel streamingModel,
         int contextWindowTokens,
+        boolean sendThinking,
         String projectId,
         String executionRunToken,
         SearchDateContext.Window searchDateWindow,
@@ -84,6 +85,7 @@ public record RunScope(
                 AgentLoop.getCurrentChatModel(),
                 AgentLoop.getCurrentStreamingModel(),
                 EffectiveModelContext.currentContextWindow(),
+                EffectiveModelContext.currentSendThinking(),
                 OwnerContext.currentProjectId(), TaskExecutionContext.currentRunToken(), SearchDateContext.current(),
                 WorkspaceContext.getOperationRootSession(),
                 com.miniagent.agent.trace.TraceRecorder.captureThreadContext());
@@ -93,7 +95,8 @@ public record RunScope(
         return new RunScope(
                 sid, owner, turnPolicy, permissionMode, confirmPolicy, planApproved, permissionForced,
                 subagent, parentSessionId, role, taskName, writeTask, workspaceRoot,
-                execution, taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken, searchDateWindow,
+                execution, taskId, chatModel, streamingModel, contextWindowTokens, sendThinking,
+                projectId, executionRunToken, searchDateWindow,
                 subagent ? operationRootSession : sid, traceContext);
     }
 
@@ -120,7 +123,8 @@ public record RunScope(
                 planApproved, true, true, parent,
                 roleId == null ? "" : roleId, taskName, "out", subWorkspace,
                 execution == null ? null : execution.forSubagent(subSessionId),
-                taskId, chatModel, streamingModel, contextWindowTokens, projectId, executionRunToken, searchDateWindow,
+                taskId, chatModel, streamingModel, contextWindowTokens, sendThinking,
+                projectId, executionRunToken, searchDateWindow,
                 root, traceContext);
     }
 
@@ -188,7 +192,7 @@ public record RunScope(
         if (chatModel != null || streamingModel != null) {
             // 窗口一并恢复：并行工具/子代理线程上的辅助 LLM 调用与压缩阈值都要用它，
             // 只恢复模型会让"该不该压缩"在这条路径上退回全局常量。
-            EffectiveModelContext.set(chatModel, streamingModel, contextWindowTokens);
+            EffectiveModelContext.set(chatModel, streamingModel, contextWindowTokens, sendThinking);
         } else {
             AgentLoop.clearCurrentModels();
         }
