@@ -6,7 +6,9 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
+    "test": "node --test test/window-bounds.test.cjs test/bundled-model-key.test.cjs",
     "test:window-bounds": "node --test test/window-bounds.test.cjs",
+    "test:bundled-key": "node --test test/bundled-model-key.test.cjs",
     "build": "electron-builder",
     "build:win": "electron-builder --win",
     "build:mac": "electron-builder --mac",

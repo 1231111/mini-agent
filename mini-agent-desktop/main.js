@@ -7,6 +7,7 @@ const fs = require('fs');
 const { restoreWindowBounds, animateWindowBounds } = require('./src/window-bounds.cjs');
 const { openWebLink, installExternalLinkHandling } = require('./src/external-links.cjs');
 const { ensureDesktopModelConfigKey } = require('./src/model-config-key.cjs');
+const { ensureBundledModelConfig } = require('./src/bundled-model-key.cjs');
 
 /** 只弹出全息浮层或启动页预览，不拉后端、不占正式客户端的单实例锁。 */
 const holoPreview = process.argv.includes('--holo-preview');
@@ -283,6 +284,25 @@ function startBackend(rt, nonce) {
   backendLogStream.write(
     `\n===== backend start ${new Date().toISOString()} mode=${rt.mode} port=auto =====\n`
   );
+
+  // 全新客户机没有 ~/.miniagent/config.yml，视觉轮次 / 全局模型回落会拿到空 Key。
+  // 必须在 spawn 之前下发：Spring 只在启动时解析 spring.config.import。
+  // 用户自己已经写过 config.yml 时本函数直接跳过，绝不覆盖。
+  try {
+    const bundled = ensureBundledModelConfig({
+      dataDir: resolveDataDir(),
+      resourcesPath: process.resourcesPath,
+      packaged: app.isPackaged
+    });
+    if (bundled.status === 'written') {
+      console.log(`[boot] 已生成出厂模型凭据配置：${bundled.target}`);
+      backendLogStream.write(`[boot] 已生成出厂模型凭据配置：${bundled.target}\n`);
+    }
+  } catch (e) {
+    // 写不出来不该让客户端起不来 —— 退化为「用户自行在设置页配 Key」，但要留痕。
+    console.warn('[boot] 出厂模型凭据下发失败：' + e.message);
+    backendLogStream.write(`[boot] 出厂模型凭据下发失败：${e.message}\n`);
+  }
 
   // 保留最后若干行：后端启动失败时把真实报错带进弹窗，
   // 而不是只给一句「起不来」让用户自己去翻日志。
