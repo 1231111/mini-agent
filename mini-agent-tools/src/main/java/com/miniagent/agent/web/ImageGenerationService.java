@@ -13,6 +13,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -35,6 +36,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.apache.commons.lang3.StringUtils;
 
 /**
@@ -55,6 +58,9 @@ import org.apache.commons.lang3.StringUtils;
  *   CHATANYWHERE_API_KEY — ChatAnywhere 图片生成 API 密钥（OpenAI 兼容）
  *   SILICONFLOW_API_KEY  — SiliconFlow API 密钥（免费FLUX.1-schnell）
  *   ZHIPU_API_KEY        — 智谱AI API密钥（CogView-3）
+ *
+ * 免 Key 兜底：
+ *   pollinations         — 公共免费服务，不需要任何 Key；只能用 image.gen.pollinations-enabled 关掉
  */
 @Slf4j
 @Service
@@ -75,7 +81,9 @@ public class ImageGenerationService {
             "xiaomi", 90L,
             "fal", 120L,
             "siliconflow", 45L,
-            "zhipu", 45L
+            "zhipu", 45L,
+            // 公共免费服务，排队时明显更慢；90s 与 mimo 同档
+            "pollinations", 90L
     );
 
     /** 熔断：5 分钟内失败达到阈值则跳过该后端 */
@@ -156,6 +164,24 @@ public class ImageGenerationService {
 
     @Value("${image.gen.backend:}")
     private String configuredBackend;
+
+    /**
+     * Pollinations 免 Key 公共免费服务：没有任何生图 Key 时的兜底。
+     *
+     * <p>默认开启的理由是「新机器装完就能生图」，但它没有 SLA ——
+     * 正式交付若不允许依赖公共免费服务，把它设成 {@code false}，
+     * 后端会退回「没 Key 就报错」的老行为。</p>
+     */
+    @Value("${image.gen.pollinations-enabled:true}")
+    private boolean pollinationsEnabled;
+
+    @Value("${image.gen.pollinations-base-url:https://image.pollinations.ai}")
+    private String pollinationsBaseUrl;
+
+    // 实测 2026-11-22：GET /models 只返回 ["sana"]，传 flux/turbo 会被静默忽略并回同一张图，
+    // 所以默认写实际存在的那个；服务端换模型池时用 IMAGE_POLLINATIONS_MODEL 覆盖即可。
+    @Value("${image.gen.pollinations-model:sana}")
+    private String pollinationsModel;
 
     @Value("${image.gen.mimo-api-key:${langchain4j.open-ai.chat-model.api-key:#{null}}}")
     private String mimoKey;
@@ -394,6 +420,13 @@ public class ImageGenerationService {
             while (Objects.nonNull(root.getCause()) && root.getCause() != root) {
                 root = root.getCause();
             }
+            // 限速有确定的恢复窗口：计熔断会把「等 45 秒就能用」变成「5 分钟全废」，
+            // 而且这期间用户重试只会得到「熔断中，跳过」，看不出真实原因。
+            if (root instanceof BackendRateLimitedException rateLimited) {
+                log.warn("后端 {} 限速（{}s 后可重试），不计入熔断: {}",
+                        backend, rateLimited.retryAfterSeconds(), rateLimited.getMessage());
+                return BackendAttempt.fail(rateLimited.getMessage());
+            }
             String detail = Optional.ofNullable(root.getMessage()).orElse(e.getMessage());
             log.warn("后端 {} 异常，尝试下一个: {}", backend, detail);
             recordFailure(backend);
@@ -449,12 +482,78 @@ public class ImageGenerationService {
             case "fal" -> generateViaFal(prompt, imageSize);
             case "siliconflow" -> generateViaSiliconFlow(prompt, imageSize);
             case "zhipu" -> generateViaCogView(prompt, imageSize);
+            case "pollinations" -> generateViaPollinations(prompt, imageSize);
             default -> null;
         };
     }
 
     /** 单张生成图的字节上限：再大就不是正常出图结果，别把内存和磁盘交给对端。 */
     private static final long MAX_IMAGE_BYTES = 32L * 1024 * 1024;
+
+    /** Pollinations 把 prompt 放在 URL 路径里，超长会被网关拒；按字符截断而不是整条丢弃。 */
+    private static final int MAX_POLLINATIONS_PROMPT_CHARS = 800;
+
+    /**
+     * 后端明确告知「额度/限速，N 秒后可再试」。
+     *
+     * <p>必须和普通失败分开处理。它说明后端是活的，恢复时间也是确定的；
+     * 若按普通失败计入熔断，连续几次限速就会让该后端被跳过整整 5 分钟，
+     * 而实际几十秒后就能出图 —— 用户看到的现象是「刚才还能用，突然全废了」。
+     * 这是 2026-11-22 实测 Pollinations 每 IP 每 45 秒 1 张时暴露的问题。</p>
+     */
+    static final class BackendRateLimitedException extends RuntimeException {
+        private final long retryAfterSeconds;
+
+        BackendRateLimitedException(String message, long retryAfterSeconds) {
+            super(message);
+            this.retryAfterSeconds = retryAfterSeconds;
+        }
+
+        long retryAfterSeconds() {
+            return retryAfterSeconds;
+        }
+    }
+
+    /** 从正文里兜底提取「Retry after 33s」这类提示；响应头优先。 */
+    private static final Pattern RETRY_AFTER_TEXT =
+            Pattern.compile("(?i)retry\\s+after\\s+(\\d+)\\s*s");
+
+    /**
+     * 解析「多少秒后可重试」。
+     *
+     * <p>优先信任 {@code Retry-After} 响应头；Pollinations 的 402 正文里也带
+     * 「Retry after 33s」，头缺失时用它兜底。解析不出来返回 0，
+     * 让调用方只说「请稍后重试」，不编造一个看起来精确的秒数。</p>
+     */
+    private static long parseRetryAfterSeconds(HttpResponse<?> response, String body) {
+        Long fromHeader = parsePositiveLong(
+                response.headers().firstValue("retry-after").orElse(null));
+        if (Objects.nonNull(fromHeader)) {
+            return fromHeader;
+        }
+        if (StringUtils.isNotBlank(body)) {
+            Matcher matcher = RETRY_AFTER_TEXT.matcher(body);
+            if (matcher.find()) {
+                Long fromBody = parsePositiveLong(matcher.group(1));
+                if (Objects.nonNull(fromBody)) {
+                    return fromBody;
+                }
+            }
+        }
+        return 0L;
+    }
+
+    private static Long parsePositiveLong(String raw) {
+        if (StringUtils.isBlank(raw)) {
+            return null;
+        }
+        try {
+            long value = Long.parseLong(raw.trim());
+            return value > 0 ? value : null;
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
 
     /**
      * 后端结果 → 对话区可用的 markdown，**先把图片落到本机**。
@@ -1002,6 +1101,95 @@ public class ImageGenerationService {
         throw new RuntimeException("CogView: " + apiMsg);
     }
 
+    // ========== Pollinations 后端（免 Key 公共免费服务） ==========
+
+    /**
+     * Pollinations 文生图 —— 免 API Key 的公共免费服务。
+     *
+     * <p>它和前面几个后端形态不同：不是 {@code POST /v1/images/generations} 换 JSON，
+     * 而是 {@code GET /prompt/<urlencoded>} 直接回图片字节。所以这里自己把字节读出来，
+     * 再以 {@code data:} URI 交给 {@link #toMarkdownImage} 链路（{@link #persistImage}
+     * 本来就支持 data URI），由后者统一做魔数校验并落盘。</p>
+     *
+     * <h2>为什么不直接返回那个 GET URL 了事</h2>
+     *
+     * <p>URL 是确定可构造的，直接返回它 {@code tryBackend} 必然判「成功」，
+     * 本轮就不会再降级；万一服务端限流或回错误页，用户拿到的是裂图，
+     * 错误反倒被推迟到落盘阶段吞掉。在这里读一次字节，
+     * 失败才能走正常异常路径记下原因并降级到下一个后端。</p>
+     *
+     * <p>同一 prompt 固定 seed，重试与缓存命中时出图一致，不会「试一张、给另一张」。
+     * 公共免费服务无 SLA，失败 3 次后熔断 5 分钟，不会把每次生图都拖在它身上。</p>
+     */
+    private String generateViaPollinations(String prompt, String imageSize) throws Exception {
+        Map<String, Integer> dim = parseImageSize(imageSize);
+        String trimmed = prompt.length() > MAX_POLLINATIONS_PROMPT_CHARS
+                ? prompt.substring(0, MAX_POLLINATIONS_PROMPT_CHARS)
+                : prompt;
+
+        long seed = Math.abs((long) trimmed.hashCode() * 31L) % 1_000_000L;
+        String url = pollinationsBaseUrl.replaceAll("/+$", "")
+                + "/prompt/" + URLEncoder.encode(trimmed, StandardCharsets.UTF_8)
+                + "?width=" + dim.get("width")
+                + "&height=" + dim.get("height")
+                + "&seed=" + seed
+                + "&nologo=true"
+                + "&model=" + URLEncoder.encode(pollinationsModel, StandardCharsets.UTF_8);
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofSeconds(90))
+                .GET()
+                .build();
+        HttpResponse<java.io.InputStream> response =
+                HTTP.send(request, HttpResponse.BodyHandlers.ofInputStream());
+
+        int status = response.statusCode();
+        String contentType = response.headers().firstValue("content-type").orElse("");
+        if (status != 200) {
+            // 错误响应也要把 body 读掉再关闭，否则连接不会归还连接池，
+            // 高频限速场景下会积压成「后面所有请求都超时」的假象。
+            String errBody;
+            try (java.io.InputStream in = response.body()) {
+                errBody = new String(in.readNBytes(600), StandardCharsets.UTF_8);
+            } catch (Exception ignored) {
+                errBody = "";
+            }
+            // 402/429 是「限速」，不是「后端坏了」：抛专用异常，让上层不计熔断
+            if (status == 402 || status == 429) {
+                long retryAfter = parseRetryAfterSeconds(response, errBody);
+                throw new BackendRateLimitedException(
+                        "Pollinations HTTP " + status
+                                + "：公共免费生图限速（实测每 IP 每 45 秒 1 张）"
+                                + (retryAfter > 0
+                                        ? "，约 " + retryAfter + " 秒后可重试"
+                                        : "，请稍后重试")
+                                + "；需要连续出图请配置 SILICONFLOW_API_KEY 等有额度的后端",
+                        retryAfter);
+            }
+            throw new RuntimeException("Pollinations HTTP " + status
+                    + (StringUtils.isBlank(contentType) ? "" : " content-type=" + contentType)
+                    + " body=" + bodyPreview(errBody, 180));
+        }
+        byte[] bytes;
+        try (java.io.InputStream in = response.body()) {
+            // 多读 1 字节判超限，不把对端给的长度直接读进内存
+            bytes = in.readNBytes((int) MAX_IMAGE_BYTES + 1);
+        }
+        if (bytes.length == 0) {
+            throw new RuntimeException("Pollinations 返回空响应");
+        }
+        if (bytes.length > MAX_IMAGE_BYTES) {
+            throw new RuntimeException("Pollinations 响应超过 " + MAX_IMAGE_BYTES + " 字节上限");
+        }
+        if (imageExtension(bytes, contentType) == null) {
+            throw new RuntimeException("Pollinations 返回非图片（content-type=" + contentType
+                    + "，body=" + bodyPreview(new String(bytes, StandardCharsets.UTF_8), 180) + "）");
+        }
+        String mime = StringUtils.isBlank(contentType) ? "image/jpeg" : contentType.split(";")[0].trim();
+        return "data:" + mime + ";base64," + Base64.getEncoder().encodeToString(bytes);
+    }
+
     // ========== 后端选择 ==========
 
     private String resolveBackend() {
@@ -1023,6 +1211,10 @@ public class ImageGenerationService {
         }
         if (StringUtils.isNotBlank(zhipuKey)) {
             return "zhipu";
+        }
+        // 一个 Key 都没有时优先走免 Key 兜底，别落到必然 404 的聊天网关
+        if (pollinationsEnabled) {
+            return "pollinations";
         }
         return "mimo"; // 默认使用项目主模型网关
     }
@@ -1082,6 +1274,12 @@ public class ImageGenerationService {
                     }
                 }
             }
+        }
+
+        // 免 Key 兜底永远排最后：有 Key 的后端先上，它只在全都没成时兜一次。
+        // 放在 chain.isEmpty() 判断之前，否则「无 Key 且开启兜底」会被误判成空链。
+        if (pollinationsEnabled && !chain.contains("pollinations")) {
+            chain.add("pollinations");
         }
 
         if (chain.isEmpty()) {

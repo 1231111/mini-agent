@@ -503,6 +503,17 @@ image:
     siliconflow-api-key: ${SILICONFLOW_API_KEY:}
     fal-key: ${FAL_KEY:}
     zhipu-api-key: ${ZHIPU_API_KEY:}
+    # 免 Key 兜底后端（Pollinations 公共免费服务）。没有任何生图 Key 的机器靠它出图。
+    # 实测事实（2026-11-22）：免 Key 但**限速** —— 每 IP 每 45 秒只出 1 张，
+    # 超了返回 HTTP 402 FREE_LIMIT（带 Retry-After）。这种限速有确定恢复窗口，
+    # 代码里按"可等待恢复"处理、不计熔断；要连续出图请配 SILICONFLOW_API_KEY 等有额度的后端。
+    # 它没有 SLA，只适合兜底/演示；不允许依赖公共免费服务时设为 false，
+    # 此时无 Key 会退回「未配置 API Key」的明确报错。
+    pollinations-enabled: ${IMAGE_POLLINATIONS_ENABLED:true}
+    pollinations-base-url: ${IMAGE_POLLINATIONS_BASE_URL:https://image.pollinations.ai}
+    # GET /models 实测只返回 ["sana"]；传 flux/turbo 会被静默忽略并回同一张 sana 图，
+    # 所以默认写实际存在的那个。将来服务端换模型池，用 IMAGE_POLLINATIONS_MODEL 覆盖。
+    pollinations-model: ${IMAGE_POLLINATIONS_MODEL:sana}
 
 # 生歌（SenseAudio）。留空时回退到环境变量 SENSEAUDIO_API_KEY。
 # 密钥不要提交进仓库，生产环境请用环境变量或密钥管理注入。

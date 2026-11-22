@@ -42,6 +42,13 @@ MIMO_API_KEY: ''
 LLM_API_KEY: ''
 CHATANYWHERE_IMAGE_KEY: ''
 SILICONFLOW_API_KEY: ''
+# 免 Key 兜底生图（Pollinations 公共免费服务）：不配任何生图 key 也能出图。
+# 实测限速每 IP 每 45 秒 1 张，超了回 402（代码按"可等待恢复"处理，不计熔断）；
+# 需要连续出图请配 SILICONFLOW_API_KEY 等有额度的后端。
+# 它没有 SLA，只适合兜底/演示；正式交付要求不依赖公共免费服务时改成 false 再重启。
+# GET /models 实测只返回 sana，传 flux/turbo 会被静默忽略，故默认 sana。
+# IMAGE_POLLINATIONS_ENABLED: 'true'
+# IMAGE_POLLINATIONS_MODEL: 'sana'
 FAL_KEY: ''
 ZHIPU_API_KEY: ''
 
