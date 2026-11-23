@@ -136,7 +136,10 @@ public class ChatMemoryConfig {
                         for (ChatMessage toolMessage : AgentToolHistoryCodec.decode(msg.toolHistoryJson)) {
                             currentTurn.add(toolMessage);
                         }
-                        currentTurn.add(AiMessage.from(msg.content));
+                        String thinking = AgentToolHistoryCodec.decodeAssistantThinking(msg.toolHistoryJson);
+                        currentTurn.add(StringUtils.isBlank(thinking)
+                                ? AiMessage.from(msg.content)
+                                : AiMessage.builder().text(msg.content).thinking(thinking).build());
                         turns.add(currentTurn);
                         currentTurn = null;
                     } else if (ChatRole.SYSTEM.getValue().equals(msg.role)) {

@@ -35,7 +35,8 @@ final class ToolObservationProjector {
     static final long MAX_IMAGE_BYTES = 8L * 1024 * 1024;
     static final int MAX_IMAGES = 2;
     private static final String ATTRIBUTE = "miniagent.tool-observation";
-    private static final Set<String> OBSERVATION_TOOLS = Set.of("browser_screenshot", "desktop_observe", "desktop_act");
+    private static final Set<String> OBSERVATION_TOOLS = Set.of(
+            "browser_screenshot", "desktop_observe", "desktop_act", "image_inspect");
 
     record Observation(String toolName, String callId, ToolResult result) {}
     record Projection(UserMessage message, Set<String> observedTools, boolean allImagesRejected) {}

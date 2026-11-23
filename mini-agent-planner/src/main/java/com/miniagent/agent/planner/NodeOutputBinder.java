@@ -91,6 +91,12 @@ final class NodeOutputBinder {
     static Bound bind(TaskNode node, String todoEvidence, List<ChatMessage> messages,
                       String judgeAnswer, com.miniagent.agent.tool.ToolResult structuredResult,
                       String predecessorEvidence) {
+        return bind(node, todoEvidence, messages, judgeAnswer, structuredResult, predecessorEvidence, 0);
+    }
+
+    static Bound bind(TaskNode node, String todoEvidence, List<ChatMessage> messages,
+                      String judgeAnswer, com.miniagent.agent.tool.ToolResult structuredResult,
+                      String predecessorEvidence, int expectedTodoId) {
         if (node == null) {
             return new Bound("", Map.of());
         }
@@ -120,6 +126,16 @@ final class NodeOutputBinder {
         }
         String tools = structuredResult == null
                 ? lastUsefulToolText(messages) : usable(structuredResult.legacyText());
+        boolean requireSubmittedJudgeEvidence = dw.isJudge();
+        if (requireSubmittedJudgeEvidence) {
+            // Judge DAG nodes must be grounded in the current node's accepted todo.submit
+            // receipt. Missing todo mapping is a failed-closed condition; the final
+            // assistant answer is only a claim and is never evidence.
+            if (expectedTodoId <= 0) {
+                return new Bound("", Map.of());
+            }
+            todo = lastTodoEvidence(messages, expectedTodoId);
+        }
         if (structuredResult == null && StepEvaluator.looksLikeToolError(tools)) {
             // Do not let an old file path or earlier successful tool hide a failed
             // final action. The evaluator must see the failure before world checks.
@@ -134,7 +150,8 @@ final class NodeOutputBinder {
         String predecessor = isSubmitOnlyDelivery(node) ? usable(predecessorEvidence) : "";
         // Command acceptance must persist the actual command tool result for
         // graph re-evaluation. Model-submitted todo text is never its proof.
-        String evidence = dw.isCommand() ? tools : firstNonBlank(todo, tools);
+        String evidence = dw.isCommand() ? tools
+                : requireSubmittedJudgeEvidence ? todo : firstNonBlank(todo, tools);
         if (StringUtils.isBlank(evidence)) {
             evidence = predecessor;
         }
@@ -148,10 +165,10 @@ final class NodeOutputBinder {
         }
         if (dw.isJudge()) {
             String ans = usable(judgeAnswer);
-            if (StringUtils.isBlank(evidence)) {
+            if (StringUtils.isBlank(evidence) && !requireSubmittedJudgeEvidence) {
                 evidence = ans;
             }
-            fillMissing(bindings, node, ans);
+            fillMissing(bindings, node, requireSubmittedJudgeEvidence ? evidence : ans);
         }
         fillPredecessorBindings(bindings, node, predecessor);
         fillMissing(bindings, node, evidence);
@@ -209,6 +226,23 @@ final class NodeOutputBinder {
                     if (!evidence.isEmpty()) return evidence;
                 }
             }
+        }
+        return "";
+    }
+
+    /** Extract only the accepted evidence from a submit receipt for this exact DAG todo ID. */
+    static String lastTodoEvidence(List<ChatMessage> messages, int expectedTodoId) {
+        if (messages == null || expectedTodoId <= 0) return "";
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            ChatMessage message = messages.get(i);
+            if (!(message instanceof ToolExecutionResultMessage result)
+                    || !CapabilityRegistry.FALLBACK_TOOL.equals(result.toolName())) continue;
+            JsonNode root = parseObject(result.text());
+            if (root == null || !root.path("success").asBoolean(false)
+                    || !"submit".equalsIgnoreCase(root.path("action").asText("").trim())
+                    || root.path("id").asInt(-1) != expectedTodoId) continue;
+            String evidence = usable(root.path("evidence").asText(""));
+            if (!evidence.isEmpty()) return evidence;
         }
         return "";
     }

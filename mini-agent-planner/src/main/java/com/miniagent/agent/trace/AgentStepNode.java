@@ -64,8 +64,13 @@ public enum AgentStepNode {
     LLM_CALL("模型调用", "调用耗时", "成功调用的时延与 token", true, true),
     LLM_CALL_ERROR("模型调用", "模型调用失败", "LLM 超时/异常", true, true),
     LLM_RETRY("模型调用", "模型自动重试", "失败后框架重试/裁剪上下文", true, true),
+    LLM_REQUEST_REJECTED("模型调用", "模型请求被拒", "供应商拒绝了请求；诊断码与脱敏原因见内容", true, true),
+    TOOL_HISTORY_PREFLIGHT("模型调用", "工具历史预检", "发送请求前移除不完整或不匹配的工具调用历史", true, false),
+    REASONING_HISTORY_PREFLIGHT("模型调用", "推理历史兼容", "修整旧 assistant 历史以满足供应商 reasoning 协议", true, true),
     LLM_REQUEST("模型调用", "请求发出", "展示别名，库内=THINKING", false, true),
     LLM_RESPONSE("模型调用", "响应返回", "展示别名，库内=THINKING", false, true),
+
+    CODE_REVIEW("代码校验", "独立代码审查", "本轮差异摘要、审查状态与阻断原因", true, true),
 
     TOOL_CALL("工具调用", "调用发起", "发起工具调用", true, true),
     TOOL_RESULT("工具调用", "结果返回", "工具成功返回", true, true),

@@ -2,6 +2,7 @@ package com.miniagent.agent.core;
 
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
 import java.util.concurrent.*;
 
 /** Keeps blocking provider calls inside the current run's cancellation and deadline boundary. */
@@ -18,18 +19,35 @@ public final class ModelCallControl {
     }
 
     public <T> T call(Callable<T> operation) {
+        return call(operation, null);
+    }
+
+    /** Run a provider operation with a local wall-clock bound as well as run cancellation. */
+    public <T> T call(Callable<T> operation, Duration timeout) {
+        if (operation == null) throw new IllegalArgumentException("operation is required");
+        if (timeout != null && (timeout.isNegative() || timeout.isZero()))
+            throw new IllegalArgumentException("timeout must be positive");
         String session = AgentLoop.getCurrentSession();
-        if (session == null || executionControl == null) return invoke(operation);
-        checkpoint(session);
-        RunScope scope = RunScope.capture();
+        boolean controlled = session != null && executionControl != null;
+        if (controlled) checkpoint(session);
+        if (!controlled && timeout == null) return invoke(operation);
+        long deadlineNanos = timeout == null ? Long.MAX_VALUE : deadlineAfter(timeout);
+        RunScope scope = controlled ? RunScope.capture() : null;
         boolean acquired = false;
         Future<T> request = null;
         try {
-            while (!(acquired = CAPACITY.tryAcquire(POLL_MILLIS, TimeUnit.MILLISECONDS))) {
-                checkWaiting(session);
+            while (true) {
+                long waitNanos = Math.min(TimeUnit.MILLISECONDS.toNanos(POLL_MILLIS),
+                        remainingNanos(deadlineNanos));
+                if (waitNanos <= 0) throw new CallTimeoutException(timeout);
+                acquired = CAPACITY.tryAcquire(waitNanos, TimeUnit.NANOSECONDS);
+                if (acquired) break;
+                if (controlled) checkWaiting(session);
             }
-            checkWaiting(session);
+            if (controlled) checkWaiting(session);
+            if (remainingNanos(deadlineNanos) <= 0) throw new CallTimeoutException(timeout);
             FutureTask<T> pending = new FutureTask<>(() -> {
+                if (!controlled) return operation.call();
                 try (var ignored = scope.bind()) {
                     checkpoint(session);
                     return operation.call();
@@ -42,20 +60,24 @@ public final class ModelCallControl {
             request = pending;
             acquired = false; // The worker owns this permit, including when it ignores cancellation.
             while (true) {
-                checkWaiting(session);
+                if (controlled) checkWaiting(session);
+                long waitNanos = Math.min(TimeUnit.MILLISECONDS.toNanos(POLL_MILLIS),
+                        remainingNanos(deadlineNanos));
+                if (waitNanos <= 0) throw new CallTimeoutException(timeout);
                 try {
-                    T response = request.get(POLL_MILLIS, TimeUnit.MILLISECONDS);
-                    checkpoint(session); // Never publish a late response or advance while paused.
+                    T response = request.get(waitNanos, TimeUnit.NANOSECONDS);
+                    if (controlled) checkpoint(session); // Never publish a late response or advance while paused.
                     return response;
                 } catch (TimeoutException waiting) {
                     // Cancellation and the run deadline are independent of provider timeouts.
+                    if (remainingNanos(deadlineNanos) <= 0) throw new CallTimeoutException(timeout);
                 }
             }
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw new StoppedException(ExecutionControl.StopReason.CANCELLED);
         } catch (ExecutionException failed) {
-            checkWaiting(session);
+            if (controlled) checkWaiting(session);
             Throwable cause = failed.getCause();
             rethrowIfStopped(cause);
             if (cause instanceof RuntimeException runtime) throw runtime;
@@ -64,6 +86,26 @@ public final class ModelCallControl {
         } finally {
             if (request != null && !request.isDone()) request.cancel(true);
             if (acquired) CAPACITY.release();
+        }
+    }
+
+    private static long deadlineAfter(Duration timeout) {
+        long now = System.nanoTime();
+        long duration;
+        try { duration = timeout.toNanos(); }
+        catch (ArithmeticException tooLarge) { return Long.MAX_VALUE; }
+        // Keep the interval below half the signed range so wraparound-safe
+        // subtraction remains valid for System.nanoTime's arbitrary origin.
+        return now + Math.min(duration, Long.MAX_VALUE / 2);
+    }
+
+    private static long remainingNanos(long deadline) {
+        return deadline == Long.MAX_VALUE ? Long.MAX_VALUE : deadline - System.nanoTime();
+    }
+
+    public static final class CallTimeoutException extends RuntimeException {
+        public CallTimeoutException(Duration timeout) {
+            super("model call exceeded its " + timeout.toMillis() + " ms local timeout");
         }
     }
 

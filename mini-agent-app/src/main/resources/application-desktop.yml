@@ -124,6 +124,9 @@ spring:
         dialect: org.hibernate.dialect.H2Dialect
 
   flyway:
+    # Desktop runs Flyway from an ApplicationRunner after Hibernate has created
+    # the entity baseline; Boot's initializer would run migrations too early.
+    enabled: false
     clean-disabled: true
     out-of-order: false
     # 桌面档自 1.0.1 起具备版本化升级能力。迁移链的起点与 prod 不同：
@@ -139,16 +142,11 @@ spring:
     # 为什么不干脆让 Flyway 在空库上跑全量 V1~V10：那等于每份安装包都背着 8 个
     # MySQL 脚本的 H2 兼容性债，而它们描述的结构，实体注解本来就能生成。
     #
-    # 空库的坑（实测 Flyway 10.20.1 + H2 2.3.232）：baseline-on-migrate 只对
-    # 「非空库且无历史表」生效；空库 migrate 会从最小版本起全跑（实测跑了 V8+V9），
-    # 新装机会先去执行 V1~V8，必炸。所以 baseline 由 DesktopFlywayConfig
-    # （@Profile("desktop") 的 FlywayMigrationStrategy）显式调用：没有历史表就先
-    # baseline() 再 migrate()，新装机、老装机走同一条路。
+    # DesktopFlywayConfig 在 Hibernate 建立实体基线后显式执行 baseline/migrate。
     #
     # 已知的双写残留（后续步骤要收口）：ddl-auto: update 仍会把实体注解的变化
     # 直接应用到库里。纪律是「结构变更一律走 V9 之后的迁移，实体只负责新装机建表」，
     # 两边不一致时以迁移为准、尽快补迁移 —— 否则又会造出 V5 那种漂移。
-    enabled: true
     baseline-on-migrate: true
     baseline-version: 8
 

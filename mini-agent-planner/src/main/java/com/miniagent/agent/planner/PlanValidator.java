@@ -20,6 +20,24 @@ import java.util.regex.Pattern;
 @Component
 public class PlanValidator {
 
+    /**
+     * Planner-facing summary of the structural contract enforced below. Keep this
+     * next to the validator so the compiler prompt and implementation are reviewed
+     * together whenever a hard rule changes.
+     */
+    static String compilerHardConstraintsPrompt() {
+        return """
+                【PlanValidator 调度硬约束】
+                - 每个节点的 id、name 都必须非空；id 在整张图内唯一。name 写用户可理解的结果，不能只写内部操作。
+                - capability 必须是上方词表里的已知能力，不能为空，也不能是 general。
+                - 每个节点都必须有有效 doneWhen；只允许 note_required、file_exists、media_delivered、llm_judge、command_success、validation_passed。command_success.criteria 必须写完整预期测试/命令；file_exists 必须填写 workspace 相对 path。
+                - dependsOn 中的每个 id 必须真实存在，依赖图必须无环；节点 inputs 只能引用 intent.inputs 中声明的外部输入，或其 dependsOn 前置节点及其祖先的 outputs。外部输入必须在 intent.inputs 声明名称和来源。
+                - 若一项请求同时需要获取和落盘，获取与持久化必须拆为不同节点，并通过 dependsOn 建立数据流依赖；不能把 file_exists 挂在获取能力上。
+                - 代码改动必须有独立 shell 测试节点，该节点 command_success 且依赖代码改动节点；测试命令必须实际运行测试，不能跳过或掩盖失败。
+                - 不得通过删除用户要求、缩减 intent.constraints/acceptanceCriteria、空 outputs 或降低验收标准来消除校验错误。被拒绝后逐条修复校验报告，同时保留原始用户意图。
+                """;
+    }
+
     private final PlannerProperties properties;
 
     public PlanValidator() {

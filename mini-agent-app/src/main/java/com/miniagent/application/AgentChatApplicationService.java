@@ -885,6 +885,7 @@ public class AgentChatApplicationService {
             // 否则线程复用时会带着上一个会话的模式去找下一个会话要授权。
             PermissionContext.clear();
             com.miniagent.agent.core.TokenUsageTracker.clearCurrentUserId();
+            com.miniagent.common.model.EffectiveModelContext.clear();
             if (Objects.nonNull(traceRecorder) && traceRecorder.isActive()) {
                 traceRecorder.endExecution(runStatus.name());
             }

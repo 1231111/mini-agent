@@ -20,7 +20,7 @@ public final class PermissionPolicy {
     public static final Set<String> PLAN_SAFE_TOOLS = Set.of(
             "todo", "memory", "capability_discover",
             "skill_list", "skill_view",
-            "read_file", "list_files", "read_package",
+            "read_file", "list_files", "read_package", "image_inspect",
             "search_code", "ast_search", "codebase_search",
             "web_search", "web_extract", "http_get",
             "browser_navigate", "browser_snapshot", "browser_screenshot", "browser_close",

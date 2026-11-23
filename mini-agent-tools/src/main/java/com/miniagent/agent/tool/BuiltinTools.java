@@ -1,6 +1,7 @@
 package com.miniagent.agent.tool;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.miniagent.agent.browser.BrowserService;
 import com.miniagent.agent.browser.BrowserSessionIdentity;
@@ -23,6 +24,7 @@ import org.springframework.stereotype.Component;
 import jakarta.annotation.PostConstruct;
 
 import java.io.File;
+import java.nio.charset.CharacterCodingException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -328,24 +330,40 @@ public class BuiltinTools {
     // ==================== 文件工具 ====================
 
     private void registerFileTools() {
-        // 使用新的实体类注册方式
-        registry.register("read_file", "读取文件内容。默认按行分页；若提示某行被截断，使用 offset 指定该行号、limit=1，并通过 char_offset/char_limit 按行内字符范围续读。返回结果会标明是否完整，不能把截断片段当作完整文件证据。",
-                ReadFileParams.class,
-                params -> {
-                    // 缓存命中检查
+        registry.registerStructured("read_file",
+                "只读取 UTF-8 文本文件（源码、HTML、Markdown、JSON、YAML 等），不是二进制文件查看器。"
+                        + "PNG/JPEG 图片使用 image_inspect；浏览器当前页面使用 browser_screenshot；PDF/Office 使用相应文档解析工具。"
+                        + "若返回非 UTF-8/二进制诊断，不要重复读取或据此判断产品损坏。默认按行分页；若提示某行被截断，使用 offset 指定该行号、limit=1，并通过 char_offset/char_limit 按行内字符范围续读。"
+                        + "返回结果会标明是否完整，不能把截断片段当作完整文件证据。",
+                ToolParams.generateSchema(ReadFileParams.class),
+                arguments -> {
+                    ReadFileParams params = ToolParams.fromJson(arguments, ReadFileParams.class);
                     String cacheKey = "read_file|" + params.toJson();
                     String cached = toolResultCache.get(cacheKey);
                     if (Objects.nonNull(cached)) {
                         log.debug("read_file 缓存命中: {}", cacheKey);
-                        return cached;
+                        return ToolResult.success(cached);
                     }
                     String result = readFile(params.getPath(),
                             params.getOffsetOrDefault(), params.getLimitOrDefault(),
                             params.hasCharRange(), params.getCharOffsetOrDefault(),
                             params.getCharLimitOrDefault());
-                    toolResultCache.put(cacheKey, result);
-                    return result;
+                    // Successful reads always carry our metadata prefix (except an empty
+                    // file); do not reinterpret the user's file contents as a legacy error
+                    // just because the document itself contains JSON fields like "error".
+                    ToolResult classified = result.isEmpty() || result.startsWith("[read_file path=")
+                            ? ToolResult.success(result) : ToolResult.fromLegacy(result);
+                    if (classified.isSuccess()) toolResultCache.put(cacheKey, result);
+                    return classified;
                 });
+
+        registry.registerStructured("image_inspect",
+                "读取并视觉检查当前 workspace 内有效的 PNG/JPEG 图片。只接受普通文件，不跟随符号链接；"
+                        + "限制 8 MiB、8192 边长和 3200 万像素，校验图片完整解码后才将图片作为本轮视觉证据提供给模型。"
+                        + "它只证明这张图片的像素内容，不会自动证明网页交互或产品行为。",
+                Map.of("path", Map.of("type", "string", "description",
+                        "当前 workspace 内的 PNG/JPEG 相对路径，不要传 workspace 外文件")),
+                this::inspectWorkspaceImage);
 
         registry.register("write_file",
                 "写入文件内容。新建文件用本工具；修改已存在的文件请改用 edit_file，不要用本工具重写整个文件。\n"
@@ -749,6 +767,13 @@ public class BuiltinTools {
                         + " 秒（如 mvnw/npm 构建、跑测试、装依赖，请把 timeout 传到 300 以上）。\n"
                         + "命令返回非 0 退出码不一定是失败：grep/findstr 的 1 表示没匹配到，"
                         + "这类结果会带 [exit-note] 提示，不要重试同一条命令。\n"
+                        + "若返回 [TEST_HARNESS_ERROR]，表示 Node.js 的运行时错误栈明确落在本工作区的 test_*.js / *.test.js / *.spec.js 自检脚本中；"
+                        + "命令仍是失败，先修自检脚本并重新验证，不要仅凭它修改被测页面，也不能据此宣布验收通过。\n"
+                        + "若返回 [TEST_ASSERTION_FAILURE]，独立 [FAIL] 断言确实失败且验收被阻断；这不能判断是断言写错还是产品有缺陷，"
+                        + "要把断言和实际 DOM、原验收标准对照，并用独立证据复核。\n"
+                        + "若没有项目测试框架，Node 自检应保存为 test_*.test.js 并用 `node --test test_*.test.js` 运行；"
+                        + "直接执行 `node check.js` 不会被代码验证门禁视作可信测试回执。\n"
+                        + "子进程输出默认按平台/命令编码解码；若已确认某程序使用其他编码，可通过 outputEncoding 指定。\n"
                         + "输出过长时会落盘到 workspace/_tool-output/ 并在结果里给出路径，"
                         + "需要完整内容用 read_file 读那个文件，不要靠重跑命令看输出。\n"
                         + "危险操作（递归删除、覆盖已有文件、格式化磁盘、git 强制推送或重置）执行前必须先向用户确认。\n"
@@ -1197,8 +1222,9 @@ public class BuiltinTools {
 
     private String readFile(String path, int offset, int limit, boolean charRange,
                             int charOffset, int charLimit) {
+        Path target = null;
         try {
-            Path target = resolveReadPath(path);
+            target = resolveReadPath(path);
             if (!Files.exists(target)) {
                 return errorJson(ToolErrorCode.NOT_FOUND, "文件不存在: " + path);
             }
@@ -1273,8 +1299,45 @@ public class BuiltinTools {
                     + (truncatedLines.isEmpty() ? "" : " truncated_lines=" + String.join(",", truncatedLines))
                     + "]\n";
             return metadata + sb;
+        } catch (CharacterCodingException invalidUtf8) {
+            String diagnostic = target == null
+                    ? "read_file 只支持 UTF-8 文本；请确认路径指向文本文件。"
+                    : TextFileReadDiagnostic.forPath(target);
+            return errorJson(ToolErrorCode.INVALID_ARGUMENT, diagnostic);
+        } catch (SecurityException denied) {
+            return errorJson(ToolErrorCode.PERMISSION_DENIED, denied.getMessage());
+        } catch (java.nio.file.InvalidPathException invalidPath) {
+            return errorJson(ToolErrorCode.INVALID_ARGUMENT, "文件路径无效: " + invalidPath.getMessage());
         } catch (Exception e) {
-            return "{\"error\":\"读取文件失败: " + e.getMessage() + "\"}";
+            return errorJson(ToolErrorCode.EXECUTION_FAILED,
+                    "读取文件失败: " + Objects.requireNonNullElse(e.getMessage(), e.getClass().getSimpleName()));
+        }
+    }
+
+    private ToolResult inspectWorkspaceImage(String argumentsJson) {
+        try {
+            var arguments = RESULT_JSON.readTree(argumentsJson);
+            WorkspaceImageInspection.Descriptor image = WorkspaceImageInspection.inspect(
+                    effectiveWorkspaceRoot(), arguments == null ? "" : arguments.path("path").asText(""));
+            ObjectNode result = RESULT_JSON.createObjectNode();
+            result.put("success", true);
+            result.put("message", "图片已验证并作为本轮视觉观察提供给模型；这不替代交互验收。 ");
+            result.put("width", image.width());
+            result.put("height", image.height());
+            result.put("sizeBytes", image.sizeBytes());
+            ArrayNode images = result.putArray("tool_images");
+            ObjectNode descriptor = images.addObject();
+            descriptor.put("path", image.path().toString());
+            descriptor.put("mimeType", image.mimeType());
+            return ToolResult.success(RESULT_JSON.writeValueAsString(result));
+        } catch (Exception invalid) {
+            String detail = invalid instanceof IllegalArgumentException
+                    ? Objects.requireNonNullElse(invalid.getMessage(), "图片参数或格式无效")
+                    : "图片读取/解码失败（" + invalid.getClass().getSimpleName() + "）";
+            return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT,
+                    "image_inspect 无法检查图片：" + detail
+                            + "。请确认文件位于当前 workspace、格式为有效 PNG/JPEG，且不超过大小/尺寸上限。",
+                    false);
         }
     }
 
@@ -1831,6 +1894,12 @@ public class BuiltinTools {
 
         try {
             boolean isWindows = System.getProperty("os.name", "").toLowerCase().contains("win");
+            final java.nio.charset.Charset cs;
+            try {
+                cs = ProcessOutputEncoding.resolve(params.getOutputEncoding(), command, isWindows);
+            } catch (IllegalArgumentException unsupportedEncoding) {
+                return errorJson(ToolErrorCode.INVALID_ARGUMENT, unsupportedEncoding.getMessage());
+            }
             ProcessBuilder pb = isWindows
                     ? new ProcessBuilder("cmd.exe", "/c", command)
                     : new ProcessBuilder("bash", "-c", command);
@@ -1860,9 +1929,6 @@ public class BuiltinTools {
             // 这个预算必须【小于】外层闸门（ExecCommandParams.outerGateSeconds）：外层先触发会被
             // 判成「终态未知」并中止整轮，而这里能给出可控终态（强杀进程 + 部分输出）。
             // 改造前内外都是 30s，外层几乎总是先到，于是这套精细处理基本是死代码。
-            final java.nio.charset.Charset cs = isWindows
-                    ? java.nio.charset.Charset.forName("GBK")
-                    : java.nio.charset.StandardCharsets.UTF_8;
             // 有界捕获：旧实现把子进程输出**无上限**读进堆（截断发生在读完之后），
             // 于是 `yes` 或一个刷屏构建就能 OutOfMemoryError —— 拖垮的是整个应用进程，
             // 而不是只让这次调用失败。这里按上限截断：超过 MAX_CAPTURE 后继续读（必须继续读，
@@ -1974,6 +2040,10 @@ public class BuiltinTools {
     private String formatExecResult(String command, int exitCode, String output) {
         StringBuilder sb = new StringBuilder();
         sb.append("exit_code=").append(exitCode).append('\n');
+        if (exitCode != 0) {
+            SelfCheckScriptDiagnostic.classify(command, exitCode, output, effectiveWorkspaceRoot())
+                    .ifPresent(diagnostic -> sb.append(diagnostic.asToolNote()).append('\n'));
+        }
         if (exitCode != 0 && !CommandSemantics.isFailure(command, exitCode)) {
             sb.append(CommandSemantics.toleratedNote(command, exitCode)).append('\n');
         }

@@ -43,7 +43,7 @@ public final class ToolConcurrencyPolicy {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private static final Set<String> READ_ONLY = Set.of(
-            "capability_discover", "skill_list", "skill_view", "read_file", "list_files", "read_package",
+            "capability_discover", "skill_list", "skill_view", "read_file", "list_files", "read_package", "image_inspect",
             "search_code", "ast_search", "codebase_search", "web_search", "web_extract",
             "http_get", "browser_snapshot", "browser_form_inspect", "browser_form_verify", "ask_user_question");
 
@@ -282,7 +282,7 @@ public final class ToolConcurrencyPolicy {
         return switch (name) {
             // ── 只读 ──
             case "skill_list", "skill_view" -> READ_FREE.withBudget(60);
-            case "read_file", "list_files" -> READ_BY_PATH.withBudget(10);
+            case "read_file", "list_files", "image_inspect" -> READ_BY_PATH.withBudget(10);
             case "read_package" -> READ_BY_PATH.withBudget(15);
             case "search_code", "ast_search", "codebase_search" -> READ_BY_PATH;
             case "web_search" -> WEB_SEARCH;

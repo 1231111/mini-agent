@@ -51,6 +51,10 @@ public class ExecCommandParams extends ToolParams {
             defaultValue = "" + ExecCommandParams.DEFAULT_TIMEOUT_SECONDS)
     private Integer timeout;
 
+    @ToolParamSchema(description = "子进程输出编码。默认 auto：POSIX 和常见 UTF-8 工具按 UTF-8 解码，Windows 其他命令按当前控制台代码页解码。"
+            + "只有确认输出乱码时才指定；可选 UTF-8、GBK、GB18030、Big5、Shift-JIS、windows-1252")
+    private String outputEncoding;
+
     @ToolParamSchema(description = "这条命令在做什么（人话，5-15 字的动词短语）。"
             + "用于把审批提示和过程说明展示给用户，例如“查看工作区状态”“编译并运行测试”。"
             + "不要写“复杂”“有风险”这类评价词，只描述它做什么")

@@ -259,6 +259,7 @@ public class TodoTool {
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("success", true);
         response.put("action", requestedAction);
+        response.put("id", id);
         response.put("status", "in_progress");
         response.put("pendingValidation", true);
         response.put("completionOwner", "planner");

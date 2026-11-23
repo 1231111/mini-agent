@@ -15,6 +15,7 @@ import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.todo.HumanYield;
 import com.miniagent.agent.trace.AgentStepNode;
+import com.miniagent.agent.trace.TraceDataSanitizer;
 import com.miniagent.agent.trace.TraceRecorder;
 import com.miniagent.common.ErrorCode;
 import com.miniagent.common.MessageConstants;
@@ -916,9 +917,11 @@ public class PlanningLoop {
                 }
                 String judgeAnswer = node.doneWhen() != null && node.doneWhen().isJudge()
                         ? step.text() : "";
+                int expectedTodoId = node.doneWhen() != null && node.doneWhen().isJudge()
+                        ? todoProjector.todoIdFor(g, node.id()) : 0;
                 NodeOutputBinder.Bound bound = NodeOutputBinder.bind(
                         node, "", step.messages(), judgeAnswer, step.structuredResult(),
-                        predecessorOutputs(g, proposal));
+                        predecessorOutputs(g, proposal), expectedTodoId);
                 StepEvaluator.EvalResult ev;
                 if (RunStatus.FAILURE.name().equals(step.endReason())) {
                     ev = StepEvaluator.EvalResult.fail("tool execution failed: " + clip(step.text(), 400));
@@ -1954,7 +1957,10 @@ public class PlanningLoop {
                 intentGraphValidator.validate(compiled.intent(), merged));
         TaskGraph rejectedGraph = compiled.graph();
         int maxReplanRetries = Math.max(0, properties.getMaxReplanRetries());
+        int correctionRetries = 0;
         for (int retry = 1; !validation.valid() && retry <= maxReplanRetries; retry++) {
+            correctionRetries = retry;
+            PlanValidationReport previousValidation = validation;
             log.warn("运行时 LLM replan 图验收失败，提交校正重试 session={} retry={}/{} errors={}",
                     sessionId, retry, maxReplanRetries, clip(validation.summary(), 1800));
             String correctionPrompt = correction + "\n\n" + validation.toCorrectionPrompt();
@@ -1982,13 +1988,20 @@ public class PlanningLoop {
                     intentGraphValidator.validate(compiled.intent(), merged));
             if (!validation.valid()) {
                 rejectedGraph = compiled.graph();
+                if (!hasStrictValidationProgress(previousValidation, validation,
+                        rejectedGraph != null && !rejectedGraph.isEmpty())) {
+                    log.warn("运行时 LLM replan 无校验进展，停止继续重试 session={} previousErrors={} currentErrors={} graphUsable={}",
+                            sessionId, previousValidation.errors().size(), validation.errors().size(),
+                            rejectedGraph != null && !rejectedGraph.isEmpty());
+                    break;
+                }
             }
         }
         if (!validation.valid()) {
             trace(sessionId, AgentStepNode.GOAL_COMPILED,
-                    recoveryValidationTrace(validation, maxReplanRetries), RunStatus.FAILURE);
-            log.warn("运行时 LLM replan 校正重试耗尽，保留原执行图 session={} retries={} errors={}",
-                    sessionId, maxReplanRetries, clip(validation.summary(), 1800));
+                    recoveryValidationTrace(validation, correctionRetries), RunStatus.FAILURE);
+            log.warn("运行时 LLM replan 校正停止，保留原执行图 session={} retries={} configuredLimit={} errors={}",
+                    sessionId, correctionRetries, maxReplanRetries, clip(validation.summary(), 1800));
             return rejectRecovery(sessionId, snap, "REPLAN_VALIDATION_FAILED");
         }
         Goal nextGoal = compiled.goal() != null ? compiled.goal() : snap.goal();
@@ -2032,7 +2045,7 @@ public class PlanningLoop {
         }
     }
 
-    private static String recoveryValidationTrace(PlanValidationReport validation, int retries) {
+    static String recoveryValidationTrace(PlanValidationReport validation, int retries) {
         var detail = PlannerStateJson.MAPPER.createObjectNode();
         detail.put("accepted", false);
         detail.put("reason", "REPLAN_VALIDATION_FAILED");
@@ -2058,6 +2071,25 @@ public class PlanningLoop {
             detail.put("omittedWarnings", Math.max(0, validation.warnings().size() - 6));
         }
         return detail.toString();
+    }
+
+    /**
+     * Extra validator replans are useful only while the candidate graph is validly
+     * parsed and strictly reduces the outstanding error count. A plateau, regression,
+     * or empty graph stops early instead of spending the configured budget blindly.
+     */
+    static boolean hasStrictValidationProgress(PlanValidationReport previous,
+                                               PlanValidationReport current,
+                                               boolean candidateGraphUsable) {
+        return candidateGraphUsable && previous != null && current != null && !current.valid()
+                && current.errors().size() < previous.errors().size();
+    }
+
+    static String validationFailureReason(int retries, int retryLimit,
+                                          String initialValidation, String finalValidation) {
+        return "PLAN_VALIDATION_FAILED: retries=" + retries + "/" + retryLimit
+                + "; initial=" + clip(initialValidation, 1800)
+                + "; finalReplan=" + clip(finalValidation, 1800);
     }
 
     private static RecoveryContinuation recoveryContinuation(StateSnapshot waiting) {
@@ -2250,13 +2282,24 @@ public class PlanningLoop {
 
     /** A selected DAG cannot execute until compilation and validation succeed. */
     private RunOutcome invalidPlanOutcome(String sessionId, GoalCompiler.CompileResult compiled) {
-        trace(sessionId, AgentStepNode.GOAL_COMPILED,
-                "{\"nodes\":0,\"accepted\":false,\"source\":\"" + compiled.source().name()
-                        + "\",\"reason\":\"PLAN_VALIDATION_FAILED\"}", RunStatus.FAILURE);
+        trace(sessionId, AgentStepNode.GOAL_COMPILED, invalidPlanTrace(compiled), RunStatus.FAILURE);
         log.warn("PlanningLoop 任务图未通过校验，停止本轮执行 session={} source={} code={}",
                 sessionId, compiled.source(), ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode());
         return RunOutcome.failed("任务计划生成失败，尚未开始操作。请重试；原有任务进度已保留。",
                 "PLAN_VALIDATION_FAILED");
+    }
+
+    static String invalidPlanTrace(GoalCompiler.CompileResult compiled) {
+        var detail = PlannerStateJson.MAPPER.createObjectNode();
+        detail.put("nodes", compiled == null || compiled.graph() == null ? 0 : compiled.graph().nodes().size());
+        detail.put("accepted", false);
+        detail.put("source", compiled == null ? "UNKNOWN" : compiled.source().name());
+        detail.put("reason", "PLAN_VALIDATION_FAILED");
+        String diagnostic = compiled == null ? "missing compile result"
+                : TraceDataSanitizer.sanitizeText(
+                        com.miniagent.common.SecurityUtils.redactSensitive(compiled.fallbackReason()));
+        detail.put("validatorDiagnostic", clip(diagnostic, 6_000));
+        return detail.toString();
     }
 
     private GoalCompiler.CompileResult compileAndValidate(ChatModel chat,
@@ -2293,13 +2336,16 @@ public class PlanningLoop {
         // 保留第一次拒绝原因。后面即使 replan 失败，也必须能从
         // GOAL_COMPILED 看出「模型产图但未通过验收」，不能退化成无原因 TEMPLATE。
         String initialValidation = report.summary();
-        log.info("PlanValidator 拒绝，进入 replan 闭环，错误数={}", report.errors().size());
-        log.debug("验证报告: {}", initialValidation);
+        log.warn("PlanValidator 拒绝，进入 replan 闭环，错误数={} summary={}",
+                report.errors().size(), clip(initialValidation, 1800));
         TaskGraph rejectedGraph = compiled.graph();
 
-        // 尝试 replan，最多重试 maxReplanRetries 次
+        // 有界 replan：只有校验错误数严格下降才继续消耗下一次预算。
         int maxReplanRetries = Math.max(0, properties.getMaxReplanRetries());
+        int replanAttempts = 0;
         for (int attempt = 1; attempt <= maxReplanRetries; attempt++) {
+            replanAttempts = attempt;
+            PlanValidationReport previousReport = report;
             log.info("Replan 尝试 {}/{}", attempt, maxReplanRetries);
 
             // 生成修正提示
@@ -2320,19 +2366,28 @@ public class PlanningLoop {
                 return replanned;
             }
 
-            log.warn("Replan 尝试 {} 仍然失败，错误数={}", attempt, report.errors().size());
+            log.warn("Replan 尝试 {} 仍然失败，错误数={} summary={}",
+                    attempt, report.errors().size(), clip(report.summary(), 1800));
             if (replanned.graph() != null && !replanned.graph().isEmpty()) {
                 rejectedGraph = replanned.graph();
             }
+            if (!hasStrictValidationProgress(previousReport, report,
+                    replanned.graph() != null && !replanned.graph().isEmpty())) {
+                log.warn("Replan 无校验进展，停止继续重试 errors={} -> {} graphUsable={}",
+                        previousReport.errors().size(), report.errors().size(),
+                        replanned.graph() != null && !replanned.graph().isEmpty());
+                break;
+            }
         }
 
-        // 所有 replan 尝试失败。不再构造规则猜测图：
+        // 到达重试上限或校验进展停止。不再构造规则猜测图：
         // 不是模型对本次请求的理解，继续执行等于把「结构合法」当成「语义正确」，
         // 正是分项任务出错的主要来源。这里返回空图结果，调用方据此拒绝调度。
-        String fallbackReason = "PLAN_VALIDATION_FAILED: initial=" + clip(initialValidation, 1800)
-                + "; finalReplan=" + clip(report.summary(), 1800);
-        log.warn("Replan 全部失败，拒绝调度（不降级模板）code={} errors={}",
-                ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode(), report.errors().size());
+        String fallbackReason = validationFailureReason(
+                replanAttempts, maxReplanRetries, initialValidation, report.summary());
+        log.warn("Replan 停止，拒绝调度（不降级模板）code={} retries={}/{} errors={}",
+                ErrorCode.AGENT_PLANNER_GRAPH_INVALID.getCode(), replanAttempts, maxReplanRetries,
+                report.errors().size());
         return new GoalCompiler.CompileResult(compiled.goal(), new TaskGraph(List.of()), true,
                 GoalCompiler.CompilationSource.VALIDATION_ERROR, fallbackReason,
                 compiled.intent());

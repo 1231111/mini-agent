@@ -1,9 +1,12 @@
 package com.miniagent.config.flyway;
 
-import org.springframework.boot.autoconfigure.flyway.FlywayMigrationStrategy;
+import org.flywaydb.core.Flyway;
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.context.annotation.DependsOn;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
+import org.springframework.core.env.Environment;
 
 import javax.sql.DataSource;
 import java.sql.Connection;
@@ -21,10 +24,9 @@ import java.sql.Statement;
  * 桌面档的新装机恰好就是空库，而 V1~V8 是 MySQL 方言脚本（V5 的
  * {@code SET @var := / PREPARE} 用户变量在 H2 上直接语法报错）—— 空库直接 migrate 必炸。
  *
- * <p><b>策略</b>：没有历史表就先显式 {@code baseline()} 再 {@code migrate()}。
- * 实测空库上允许 baseline（"Successfully baselined schema with version: 8"），于是
- * 新装机（空库）与老装机（有表、无历史表）走同一条路：打 baseline=8，只跑 V9 起的增量。
- * 库结构的基线由 {@code ddl-auto: update} 从实体反推，Flyway 只管增量。
+ * <p><b>策略</b>：desktop 关闭 Boot 的 FlywayMigrationInitializer，由 Hibernate 先按实体
+ * 创建本地基线表；随后 ApplicationRunner 显式 baseline=8 并运行 V9 起的增量迁移。
+ * 这个次序既让迁移中的数据回填能看到实体表，也保留 Flyway 专属 outbox/状态表的创建。
  *
  * <p><b>为什么不给 prod 挂这个 bean</b>：prod 面对的是 MySQL，全新部署的空库必须
  * 从 V1 起跑全量建表（prod 是 {@code ddl-auto: validate}，Hibernate 不建表）。
@@ -41,15 +43,31 @@ import java.sql.Statement;
 public class DesktopFlywayConfig {
 
     @Bean
-    public FlywayMigrationStrategy desktopFlywayMigrationStrategy(DataSource dataSource) {
-        return flyway -> {
+    public Flyway desktopFlyway(DataSource dataSource, Environment environment) {
+        String[] locations = environment.getProperty("spring.flyway.locations",
+                "classpath:db/migration,classpath:com/miniagent/migration").split(",");
+        return Flyway.configure()
+                .dataSource(dataSource)
+                .locations(locations)
+                .table(environment.getProperty("spring.flyway.table", "flyway_schema_history"))
+                .baselineOnMigrate(environment.getProperty("spring.flyway.baseline-on-migrate", Boolean.class, true))
+                .baselineVersion(environment.getProperty("spring.flyway.baseline-version", "8"))
+                .outOfOrder(environment.getProperty("spring.flyway.out-of-order", Boolean.class, false))
+                .cleanDisabled(environment.getProperty("spring.flyway.clean-disabled", Boolean.class, true))
+                .load();
+    }
+
+    @DependsOn("entityManagerFactory")
+    @Bean(name = "postJpaSchemaMigrationBarrier")
+    public InitializingBean desktopFlywayPostJpaInitializer(Flyway flyway, DataSource dataSource) {
+        return () -> {
             String historyTable = flyway.getConfiguration().getTable();
             try (Connection connection = dataSource.getConnection()) {
                 clearFailedRows(connection, historyTable);
                 if (findTableName(connection, historyTable) == null) {
-                    // 新装机（空库）、老装机（有业务表、无历史表）都落在这一支。
-                    // baseline() 只写一条 "<< Flyway Baseline >>"（version=8）到历史表，
-                    // 不碰业务表；V1~V8 从此永远跳过。
+                    // Fresh desktop and legacy stores without a history table share V8 as
+                    // the entity-schema baseline; entity tables now exist because this runner
+                    // executes only after the EntityManagerFactory has initialized.
                     flyway.baseline();
                 }
             } catch (SQLException e) {

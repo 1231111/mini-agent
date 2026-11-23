@@ -11,6 +11,7 @@ import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.sql.init.dependency.DependsOnDatabaseInitialization;
+import org.springframework.context.annotation.DependsOn;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -41,6 +42,7 @@ import java.util.Optional;
  */
 @Component
 @DependsOnDatabaseInitialization
+@DependsOn("postJpaSchemaMigrationBarrier")
 public final class DbActionJournal implements ActionJournal {
     private static final Logger log = LoggerFactory.getLogger(DbActionJournal.class);
     private static final String LEGACY_REVIEW_REQUIRED = "ACTION_JOURNAL_LEGACY_REVIEW_REQUIRED";

@@ -44,7 +44,7 @@ public class CapabilityRegistry implements SmartInitializingSingleton {
             "research", "deliver", "plan", GENERAL);
 
     private static final List<String> FILE_READ =
-            List.of(READ_FILE, "list_files", "read_package");
+            List.of(READ_FILE, "list_files", "read_package", "image_inspect");
 
     /**
      * 纯文本落盘 + Office/HTML 交付。PowerPoint 与 HTML→Word 已收敛进 write_document。

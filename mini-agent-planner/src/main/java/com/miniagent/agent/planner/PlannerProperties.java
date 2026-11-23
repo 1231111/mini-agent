@@ -12,6 +12,7 @@ import org.springframework.stereotype.Component;
 @Data
 public class PlannerProperties {
     private static final Logger log = LoggerFactory.getLogger(PlannerProperties.class);
+    static final int MAX_REPLAN_RETRIES_LIMIT = 4;
 
     private boolean enabled = true;
 
@@ -49,8 +50,8 @@ public class PlannerProperties {
     private int maxReplaceTool = 2;
     private int maxRewriteGraph = 2;
     private int maxReviseGoal = 1;
-    /** 验证失败后 replan 重试次数 */
-    private int maxReplanRetries = 2;
+    /** 校验失败后的最大 replan 重试次数；仅在校验错误数持续下降时继续消耗预算。 */
+    private int maxReplanRetries = MAX_REPLAN_RETRIES_LIMIT;
     /**
      * 规划模型失败、退回规则图时，是否先让用户确认整图再执行。
      *
@@ -145,7 +146,9 @@ public class PlannerProperties {
     public void setMaxReviseGoal(int maxReviseGoal) { this.maxReviseGoal = maxReviseGoal; }
 
     public int getMaxReplanRetries() { return maxReplanRetries; }
-    public void setMaxReplanRetries(int maxReplanRetries) { this.maxReplanRetries = maxReplanRetries; }
+    public void setMaxReplanRetries(int maxReplanRetries) {
+        this.maxReplanRetries = Math.max(0, Math.min(MAX_REPLAN_RETRIES_LIMIT, maxReplanRetries));
+    }
 
     public boolean isPlanApprovalOnDegraded() { return planApprovalOnDegraded; }
     public void setPlanApprovalOnDegraded(boolean planApprovalOnDegraded) {

@@ -94,14 +94,18 @@ public final class AgentToolHistoryCodec {
             }
             if (!valid || matched.size() != calls.size()) continue;
 
+            String providerThinking = includeThinking ? providerThinking(ai.thinking()) : "";
+            // Provider reasoning is an opaque protocol field. Never truncate or redact it:
+            // if the complete bounded value is unavailable, omit this whole replayable
+            // exchange so the executor cannot send a corrupted reasoning_content value.
+            if (includeThinking && providerThinking.isEmpty()) continue;
+
             ObjectNode assistant = JSON.createObjectNode();
             assistant.put("type", "assistant_tool_calls");
             assistant.put("text", safe(ai.text(), 1_200));
-            // DeepSeek requires the opaque reasoning_content from an assistant tool-call
-            // message to accompany its replay. Persist it only for providers configured to
-            // require it, with the same redaction and strict size bound as other stored text.
-            if (includeThinking && !blank(ai.thinking())) {
-                assistant.put("thinking", safe(ai.thinking(), MAX_THINKING_CHARS));
+            // DeepSeek requires the exact opaque reasoning_content on tool-call replay.
+            if (includeThinking) {
+                assistant.put("thinking", providerThinking);
             }
             ArrayNode callArray = assistant.putArray("calls");
             for (ToolExecutionRequest call : calls) {
@@ -122,17 +126,49 @@ public final class AgentToolHistoryCodec {
             while (i + 1 < messages.size()
                     && messages.get(i + 1) instanceof ToolExecutionResultMessage) i++;
         }
-        while (!encoded.isEmpty()) {
+        String assistantThinking = includeThinking
+                ? lastAssistantThinking(messages, start) : "";
+        if (encoded.isEmpty() && blank(assistantThinking)) return null;
+        while (true) {
             try {
-                String value = JSON.writeValueAsString(encoded);
+                String value = serialize(encoded, assistantThinking);
                 if (value.length() <= MAX_HISTORY_JSON_CHARS) return value;
             } catch (Exception e) {
                 return null;
             }
             // Retain the most recent complete exchanges if a turn hit the storage cap.
-            encoded.remove(0);
+            if (!encoded.isEmpty()) encoded.remove(0);
+            else return null;
         }
-        return null;
+    }
+
+    /**
+     * Persist the final assistant reasoning separately from tool exchanges. The public
+     * conversation text remains the visible answer; this opaque field is retained only
+     * for providers (currently official DeepSeek) that require reasoning_content to be
+     * replayed with the next request in the same conversation.
+     */
+    private static String lastAssistantThinking(List<ChatMessage> messages, int start) {
+        String thinking = "";
+        for (int i = Math.max(0, start); i < messages.size(); i++) {
+            if (messages.get(i) instanceof AiMessage ai && !ai.hasToolExecutionRequests()) {
+                thinking = providerThinking(ai.thinking());
+            }
+        }
+        return thinking;
+    }
+
+    private static String providerThinking(String value) {
+        return blank(value) || value.length() > MAX_THINKING_CHARS ? "" : value;
+    }
+
+    private static String serialize(ArrayNode exchanges, String assistantThinking) throws Exception {
+        if (blank(assistantThinking)) return JSON.writeValueAsString(exchanges);
+        ObjectNode envelope = JSON.createObjectNode();
+        envelope.put("version", 2);
+        envelope.set("exchanges", exchanges);
+        envelope.put("assistantThinking", assistantThinking);
+        return JSON.writeValueAsString(envelope);
     }
 
     /** Rebuild only well-formed, fully paired tool exchanges from stored JSON. */
@@ -140,10 +176,14 @@ public final class AgentToolHistoryCodec {
         if (blank(value) || value.length() > MAX_HISTORY_JSON_CHARS) return List.of();
         try {
             JsonNode root = JSON.readTree(value);
-            if (root == null || !root.isArray()) return List.of();
+            JsonNode encodedExchanges = root == null ? null
+                    : root.isArray() ? root : root.path("exchanges");
+            if (encodedExchanges == null || !encodedExchanges.isArray()) return List.of();
+            boolean exactProviderThinking = root != null && root.isObject()
+                    && root.path("version").asInt(0) >= 2;
             List<ChatMessage> messages = new ArrayList<>();
             int callCount = 0;
-            for (JsonNode batch : root) {
+            for (JsonNode batch : encodedExchanges) {
                 if (!"assistant_tool_calls".equals(text(batch, "type"))) continue;
                 JsonNode callNodes = batch.get("calls");
                 JsonNode resultNodes = batch.get("results");
@@ -183,7 +223,7 @@ public final class AgentToolHistoryCodec {
                 }
                 if (!valid || resultIds.size() != calls.size()) continue;
                 messages.add(AiMessage.builder().text(text(batch, "text"))
-                        .thinking(text(batch, "thinking"))
+                        .thinking(exactProviderThinking ? text(batch, "thinking") : "")
                         .toolExecutionRequests(calls).build());
                 messages.addAll(results);
                 callCount += calls.size();
@@ -191,6 +231,20 @@ public final class AgentToolHistoryCodec {
             return List.copyOf(messages);
         } catch (Exception ignored) {
             return List.of();
+        }
+    }
+
+    /** Return saved provider reasoning for the visible assistant answer, if present. */
+    public static String decodeAssistantThinking(String value) {
+        if (blank(value) || value.length() > MAX_HISTORY_JSON_CHARS) return "";
+        try {
+            JsonNode root = JSON.readTree(value);
+            if (root == null || !root.isObject() || root.path("version").asInt(0) < 2) {
+                return ""; // Legacy v1 arrays contain no integrity marker for provider reasoning.
+            }
+            return providerThinking(text(root, "assistantThinking"));
+        } catch (Exception ignored) {
+            return "";
         }
     }
 

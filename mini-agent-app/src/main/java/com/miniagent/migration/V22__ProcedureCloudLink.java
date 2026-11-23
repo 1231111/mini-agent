@@ -75,11 +75,18 @@ public class V22__ProcedureCloudLink extends BaseJavaMigration {
 
     private static boolean indexExists(Connection connection) throws Exception {
         DatabaseMetaData metadata = connection.getMetaData();
-        try (ResultSet rs = metadata.getIndexInfo(connection.getCatalog(), null, TABLE, false,
-                false)) {
-            while (rs.next()) {
-                if (INDEX.equalsIgnoreCase(rs.getString("INDEX_NAME"))) {
-                    return true;
+        try (ResultSet tables = metadata.getTables(connection.getCatalog(), null, "%",
+                new String[]{"TABLE"})) {
+            while (tables.next()) {
+                String schema = tables.getString("TABLE_SCHEM");
+                String actualTable = tables.getString("TABLE_NAME");
+                if (schema != null && schema.equalsIgnoreCase("information_schema")) continue;
+                if (!TABLE.equalsIgnoreCase(actualTable)) continue;
+                try (ResultSet indexes = metadata.getIndexInfo(connection.getCatalog(), schema,
+                        actualTable, false, false)) {
+                    while (indexes.next()) {
+                        if (INDEX.equalsIgnoreCase(indexes.getString("INDEX_NAME"))) return true;
+                    }
                 }
             }
         }

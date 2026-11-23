@@ -260,7 +260,8 @@ public class GoalCompiler {
 
     /** 词表在装配期注入：PACKS 加了能力而提示词没跟上，正是这次生歌用不上的直接原因。 */
     static String compilerSystem() {
-        return COMPILER_SYSTEM_TEMPLATE.replace("{CAPS}", capabilityVocabulary());
+        return COMPILER_SYSTEM_TEMPLATE.replace("{CAPS}", capabilityVocabulary())
+                + "\n\n" + PlanValidator.compilerHardConstraintsPrompt();
     }
 
     @Value("${web.search.time-zone:Asia/Shanghai}")
@@ -268,10 +269,18 @@ public class GoalCompiler {
 
     /** Planning and correction use the same live date anchor as direct execution. */
     private String compilerSystemForCurrentTime() {
-        return compilerSystem() + "\n\n"
+        return compilerSystem() + "\n\n" + graphBudgetPrompt(properties)
+                + "\n\n"
                 + RelativeDateGuidance.render(RelativeDateGuidance.resolveNow(configuredTimeZone))
                 + "\n将用户指定的时间范围保留在 constraints 和 intent.acceptanceCriteria 中，"
                 + "所有检索节点及验收必须遵守；禁止在拆分或修正计划时扩大范围。";
+    }
+
+    static String graphBudgetPrompt(PlannerProperties properties) {
+        PlannerProperties limits = properties == null ? new PlannerProperties() : properties;
+        return "【图规模硬上限】本次最多 " + limits.getMaxGraphNodes() + " 个节点、"
+                + limits.getMaxGraphEdges() + " 条依赖边、依赖深度 " + limits.getMaxGraphDepth()
+                + "。在保留用户要求和独立验收的前提下精简冗余步骤；不能超限后等待校验器删节点。";
     }
 
     private final PlannerProperties properties;
