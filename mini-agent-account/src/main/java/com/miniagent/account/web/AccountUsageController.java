@@ -1,13 +1,18 @@
 package com.miniagent.account.web;
 
+import com.miniagent.account.service.LlmCallUsageService;
 import com.miniagent.account.service.UsageQueryService;
 import com.miniagent.account.service.UsageRecordingService;
+import com.miniagent.account.web.dto.LatencyStatsResponse;
+import com.miniagent.account.web.dto.LlmCallUsageResponse;
+import com.miniagent.account.web.dto.PageResponse;
 import com.miniagent.account.web.dto.UsageSummaryResponse;
 import com.miniagent.common.ApiResponse;
 import com.miniagent.common.ErrorCode;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.MediaType;
+import org.springframework.data.domain.Page;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -36,6 +41,8 @@ public class AccountUsageController {
     private UsageQueryService queries;
     @Autowired
     private UsageRecordingService recorder;
+    @Autowired
+    private LlmCallUsageService calls;
 
     /**
      * 汇总查询。
@@ -97,6 +104,67 @@ public class AccountUsageController {
         return accepted
                 ? ApiResponse.ok(null)
                 : ApiResponse.fail(ErrorCode.CONFIG_INVALID, "用量未被接受，请检查参数");
+    }
+
+    /**
+     * 单次调用明细（分页，时间倒序）。
+     *
+     * <p>对应上游控制台那种「一行一次调用」的表：模型、推理强度、端点、类型、计费模式、
+     * token、费用、首 token、耗时、输出 TPS、时间、USER-AGENT。</p>
+     */
+    @GetMapping(value = "/calls", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<PageResponse<LlmCallUsageResponse>> calls(
+            @RequestParam("userId") Long userId,
+            @RequestParam(value = "from", required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(value = "to", required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            @RequestParam(value = "page", required = false, defaultValue = "0") int page,
+            @RequestParam(value = "size", required = false, defaultValue = "50") int size) {
+        try {
+            Page<LlmCallUsageResponse> result = calls.detail(userId, from, to, page, size);
+            return ApiResponse.ok(PageResponse.of(result, item -> item));
+        } catch (IllegalArgumentException invalid) {
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, invalid.getMessage());
+        }
+    }
+
+    /**
+     * 区间延迟统计。
+     *
+     * <p>{@code ttftSamples} 与 {@code callCount} 差距过大时说明多数调用是非流式的，
+     * 此时平均首 token 不能代表用户的实际等待。</p>
+     */
+    @GetMapping(value = "/latency", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<LatencyStatsResponse> latency(
+            @RequestParam("userId") Long userId,
+            @RequestParam(value = "from", required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(value = "to", required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to) {
+        try {
+            return ApiResponse.ok(calls.latency(userId, from, to));
+        } catch (IllegalArgumentException invalid) {
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, invalid.getMessage());
+        }
+    }
+
+    /**
+     * 记录一次调用。按 {@code requestId} 幂等，重复上报不会产生第二行。
+     */
+    @PostMapping(value = "/calls/record", consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<Void> recordCall(
+            @RequestBody(required = false) LlmCallUsageService.RecordCommand body) {
+        if (body == null) {
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "请求体不能为空");
+        }
+        return calls.record(body)
+                ? ApiResponse.ok(null)
+                : ApiResponse.fail(ErrorCode.CONFIG_INVALID, "调用明细未被接受，请检查 userId 与 requestId");
     }
 
     private static long valueOrZero(Long value) {
