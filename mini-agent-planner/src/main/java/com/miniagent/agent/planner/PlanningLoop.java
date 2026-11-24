@@ -988,7 +988,9 @@ public class PlanningLoop {
                                 : stepEvaluator.evaluate(node, step.structuredResult(), bound.evidence());
                     }
                 }
-                TaskNodeStatus next = statusAfterChunk(ev.ok(), quotaAbort);
+                boolean noProgress = AgentLoop.NO_PROGRESS.equals(step.endReason());
+                TaskNodeStatus next = noProgress ? TaskNodeStatus.FAILED
+                        : statusAfterChunk(ev.ok(), quotaAbort);
                 if (next == TaskNodeStatus.SUCCESS) {
                     nodeProgressGuards.remove(progressGuardKey(proposal.basedOnPlanVersion(), node.id()));
                     TaskNode completed = node.withStatus(TaskNodeStatus.SUCCESS).withError("")
@@ -1017,17 +1019,19 @@ public class PlanningLoop {
                 } else {
                     acceptedAnswer = null;
                     anyFail = true;
+                    String failureReason = AgentLoop.NO_PROGRESS.equals(step.endReason())
+                            ? clip(step.text(), AWAITING_HINT_CHARS) : ev.reason();
                     g = g.replace(node.withStatus(TaskNodeStatus.FAILED)
                             .withToolStatus(step.structuredResult() == null
-                                    ? null : step.structuredResult().status()).withError(ev.reason()));
+                                    ? null : step.structuredResult().status()).withError(failureReason));
                     FailureDiagnosis dx = recoveryEngine.diagnose(
-                            node, diagnoseTool(node, step.lastTool()), ev.reason(),
+                            node, diagnoseTool(node, step.lastTool()), failureReason,
                             step.lastErrorCode());
                     StateSnapshot failedSnap = snap.withGraph(g);
                     try {
                         snap = commitNodeOutcomes(sessionId, fencingToken, snap, failedSnap, List.of(
                                 new NodeOutcome(action.actionId(), node, NodeTerminalCommitPort.Result.FAILURE,
-                                        failureDetail(step.lastErrorCode(), ev.reason(), userMessage))));
+                                        failureDetail(step.lastErrorCode(), failureReason, userMessage))));
                     } catch (PlannerStateStore.VersionConflictException e) {
                         metrics.casConflict();
                         log.warn("状态冲突，触发 replan: {}", e.getMessage());
@@ -1039,7 +1043,7 @@ public class PlanningLoop {
                         // failed node and stop this graph run; a later explicit user retry
                         // starts a fresh, inspectable attempt.
                         unfinishedReason = AgentLoop.NO_PROGRESS;
-                        unfinishedDetail = clip(step.text(), AWAITING_HINT_CHARS);
+                        unfinishedDetail = failureReason;
                         noProgressAbort = true;
                         continue;
                     }

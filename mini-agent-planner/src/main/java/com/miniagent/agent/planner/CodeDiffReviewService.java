@@ -168,16 +168,25 @@ public final class CodeDiffReviewService {
 
     /** Reuses a pending baseline across user turns so a fix cannot hide earlier unreviewed changes. */
     public Baseline captureForSession(String sessionId) {
-        return captureForSession(sessionId, null, Set.of());
+        String key = sessionKey(sessionId);
+        if (key != null) {
+            PendingBaseline pending = pendingBaselines.get(key);
+            if (pending != null && System.currentTimeMillis() - pending.capturedAt() <= PENDING_BASELINE_TTL_MILLIS
+                    && pending.baseline().available()) {
+                return pending.baseline();
+            }
+            if (pending != null) pendingBaselines.remove(key, pending);
+        }
+        return unavailable("代码任务没有声明交付文件路径；请先把产物路径写入任务意图或节点 outputs，再进行独立审查");
     }
 
     Baseline captureForSession(String sessionId, Path preferredRoot) {
-        return captureForSession(sessionId, preferredRoot, Set.of());
+        return unavailable("代码任务没有声明交付文件路径；请先把产物路径写入任务意图或节点 outputs，再进行独立审查");
     }
 
-    Baseline captureForSession(String sessionId, Set<String> workspaceScopePaths) {
+    public Baseline captureForSession(String sessionId, Set<String> workspaceScopePaths) {
         if (workspaceScopePaths == null || workspaceScopePaths.isEmpty())
-            return unavailable("DAG 代码任务没有声明交付文件路径；请先把产物路径写入任务意图或节点 outputs，再进行独立审查");
+            return unavailable("代码任务没有声明交付文件路径；请先把产物路径写入任务意图或节点 outputs，再进行独立审查");
         return captureForSession(sessionId, null, workspaceScopePaths);
     }
 

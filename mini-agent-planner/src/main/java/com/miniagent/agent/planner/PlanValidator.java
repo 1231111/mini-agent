@@ -33,6 +33,7 @@ public class PlanValidator {
                 - 每个节点都必须有有效 doneWhen；只允许 note_required、file_exists、media_delivered、llm_judge、command_success、validation_passed。command_success.criteria 必须写完整预期测试/命令；file_exists 必须填写 workspace 相对 path。
                 - dependsOn 中的每个 id 必须真实存在，依赖图必须无环；节点 inputs 只能引用 intent.inputs 中声明的外部输入，或其 dependsOn 前置节点及其祖先的 outputs。外部输入必须在 intent.inputs 声明名称和来源。
                 - 若一项请求同时需要获取和落盘，获取与持久化必须拆为不同节点，并通过 dependsOn 建立数据流依赖；不能把 file_exists 挂在获取能力上。
+                - 每个代码交付节点都必须在 outputs、file_exists 的 doneWhen.path 或 toolArguments.path 中声明 workspace 相对文件路径；不能等最终审查时再猜路径。
                 - 代码改动必须有独立 shell 测试节点，该节点 command_success 且依赖代码改动节点；测试命令必须实际运行测试，不能跳过或掩盖失败。
                 - 不得通过删除用户要求、缩减 intent.constraints/acceptanceCriteria、空 outputs 或降低验收标准来消除校验错误。被拒绝后逐条修复校验报告，同时保留原始用户意图。
                 """;
@@ -77,10 +78,6 @@ public class PlanValidator {
             "(?i)^(?:保存|读取|读入|打开|查看|运行|执行|调用|启动|编译|测试|编辑|修改)"
                     + "\\s+(?:python(?:脚本)?|java(?:程序)?|脚本|程序|文件|命令)"
                     + "(?:\\s+[\\p{IsHan}A-Za-z0-9_.-]+)?$");
-    private static final Pattern SOURCE_ARTIFACT = Pattern.compile(
-            "(?i)(\\.(?:java|py|js|jsx|ts|tsx|go|rs|cs|cpp|c|h|sql|sh|ps1)\\b|"
-                    + "源代码|源文件|代码|程序|脚本|模块|函数|类)");
-
     /**
      * 用户目标里的错误诊断语义。
      *
@@ -306,7 +303,7 @@ public class PlanValidator {
             }
         }
 
-        addCodeValidationError(g, plan, errors);
+        addCodeValidationError(g, plan, intent, errors);
         addAcquirePersistEdgeError(g, errors);
         addGoalFileErrors(g, goal, errors);
         addGoalGraphSemanticErrors(g, plan, errors);
@@ -329,24 +326,40 @@ public class PlanValidator {
                 || TOOL_ACTION_ONLY_NODE_NAME.matcher(name.trim()).matches());
     }
 
-    private static void addCodeValidationError(TaskGraph graph, TaskPlan plan,
+    private static void addCodeValidationError(TaskGraph graph, TaskPlan plan, TaskIntent intent,
                                                List<PlanValidationReport.ValidationError> errors) {
         if (plan == null || StringUtils.isBlank(plan.taskGoal())
                 || !CodeValidationPolicy.isCodeChangeGoal(plan.taskGoal())) return;
         List<TaskNode> codeChanges = graph.nodes().stream()
                 .filter(node -> "code".equalsIgnoreCase(node.capability())
-                        || SOURCE_ARTIFACT.matcher(node.name()).find()
-                        || node.outputs().stream().anyMatch(output -> SOURCE_ARTIFACT.matcher(output).find())
-                        || (node.doneWhen() != null && SOURCE_ARTIFACT.matcher(node.doneWhen().path()).find()))
+                        || hasReviewableCodePath(node))
                 .toList();
-        if (codeChanges.isEmpty()) return;
-        List<String> changePaths = codeChanges.stream()
-                .flatMap(node -> java.util.stream.Stream.concat(
-                        java.util.stream.Stream.concat(node.outputs().stream(),
-                                java.util.stream.Stream.of(node.doneWhen() == null ? "" : node.doneWhen().path())),
-                        java.util.stream.Stream.ofNullable(firstPathArgument(node))))
-                .filter(path -> path != null && !path.isBlank())
-                .toList();
+        if (codeChanges.isEmpty()) {
+            errors.add(new PlanValidationReport.ValidationError(
+                    PlanValidationReport.ValidationError.Type.GOAL_GRAPH_MISMATCH, null,
+                    "代码改动目标没有对应的代码交付节点",
+                    "增加实际修改代码的节点，并在 outputs、file_exists 的 doneWhen.path 或 toolArguments.path 声明 workspace 相对文件路径。"));
+            return;
+        }
+
+        for (TaskNode change : codeChanges) {
+            if (declaredCodePaths(change).isEmpty()) {
+                errors.add(new PlanValidationReport.ValidationError(
+                        PlanValidationReport.ValidationError.Type.GOAL_GRAPH_MISMATCH, change.id(),
+                        "代码交付节点没有声明可审查的 workspace 相对文件路径: " + change.name(),
+                        "将精确文件路径写进 outputs、file_exists 的 doneWhen.path 或 toolArguments.path；"
+                                + "路径必须是 workspace 相对路径，不能是目录、绝对路径或包含 .. 的路径。"));
+            }
+        }
+
+        Set<String> changePaths = new HashSet<>();
+        for (TaskNode change : codeChanges) changePaths.addAll(declaredCodePaths(change));
+        if (intent != null) {
+            intent.deliverables().stream().filter(TaskIntent.Deliverable::required)
+                    .map(TaskIntent.Deliverable::path)
+                    .filter(PlanValidator::isReviewableWorkspaceCodePath)
+                    .forEach(changePaths::add);
+        }
         Set<String> changedModules = changePaths.stream()
                 .map(CodeValidationPolicy::moduleHint)
                 .filter(module -> !module.isBlank())
@@ -378,6 +391,54 @@ public class PlanValidator {
             if (value instanceof String path && !path.isBlank()) return path;
         }
         return null;
+    }
+
+    private static Set<String> declaredCodePaths(TaskNode node) {
+        Set<String> paths = new HashSet<>();
+        if (node == null) return paths;
+        // outputs is a general data-flow label, not a typed path field. Accept a
+        // compact path-shaped value there, but leave paths containing spaces to
+        // the typed doneWhen.path/toolArguments.path/intent.deliverables.path fields.
+        node.outputs().stream().filter(PlanValidator::isReviewableCodeOutputPath).forEach(paths::add);
+        if (node.doneWhen() != null && node.doneWhen().isFile()
+                && isReviewableWorkspaceCodePath(node.doneWhen().path())) {
+            paths.add(node.doneWhen().path());
+        }
+        String argumentPath = firstPathArgument(node);
+        if (isReviewableWorkspaceCodePath(argumentPath)) paths.add(argumentPath);
+        return paths;
+    }
+
+    private static boolean hasReviewableCodePath(TaskNode node) {
+        return !declaredCodePaths(node).isEmpty();
+    }
+
+    private static boolean isReviewableWorkspaceCodePath(String rawPath) {
+        if (StringUtils.isBlank(rawPath)) return false;
+        String path = rawPath.trim().replace('\\', '/');
+        if (path.startsWith("./")) path = path.substring(2);
+        if (path.isBlank() || path.startsWith("/") || path.matches("(?i)^[a-z]:.*")) return false;
+        for (String segment : path.split("/")) {
+            if (segment.isBlank() || ".".equals(segment) || "..".equals(segment)) return false;
+        }
+        return looksLikeReviewableFilePath(path)
+                && CodeValidationPolicy.isReviewableCodeArtifact(path);
+    }
+
+    private static boolean isReviewableCodeOutputPath(String rawPath) {
+        return rawPath != null && rawPath.chars().noneMatch(Character::isWhitespace)
+                && isReviewableWorkspaceCodePath(rawPath);
+    }
+
+    private static boolean looksLikeReviewableFilePath(String path) {
+        String fileName = path.substring(path.lastIndexOf('/') + 1);
+        return fileName.matches("(?i).+\\.(?:java|py|js|jsx|ts|tsx|mjs|cjs|go|rs|cs|cpp|c|h|hpp|"
+                + "sql|sh|ps1|html|css|scss|sass|less|vue|svelte|kt|kts|swift|rb|php|json|xml|yaml|"
+                + "yml|toml|properties|txt)$")
+                || fileName.matches("(?i)(?:pom\\.xml|package(?:-lock)?\\.json|tsconfig[^/]*\\.json|"
+                + "pyproject\\.toml|cargo\\.toml|go\\.(?:mod|sum)|requirements(?:-[^/]*)?\\.txt|"
+                + "build\\.gradle(?:\\.kts)?|settings\\.gradle(?:\\.kts)?|composer\\.json|"
+                + "gemfile|dockerfile|makefile|cmakelists\\.txt|[^/]+\\.csproj|[^/]+\\.sln)");
     }
 
     private static boolean dependsOnTransitively(TaskGraph graph, String nodeId, String ancestorId) {

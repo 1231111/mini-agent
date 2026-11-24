@@ -1,5 +1,6 @@
 package com.miniagent.agent.planner;
 
+import com.miniagent.agent.task.TaskPlan;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -17,6 +18,7 @@ class PlannerCompilerContractTest {
                 .contains("id、name 都必须非空", "capability 必须是上方词表里的已知能力",
                         "每个节点都必须有有效 doneWhen", "dependsOn 中的每个 id 必须真实存在",
                         "节点 inputs 只能引用 intent.inputs", "获取与持久化必须拆为不同节点",
+                        "每个代码交付节点都必须在 outputs",
                         "代码改动必须有独立 shell 测试节点", "逐条修复校验报告",
                         "字段职责不可混用", "intent.constraints 只放禁止项/实现限制",
                         "不要把 intent.constraints 整段复制到 successCriteria",
@@ -30,6 +32,60 @@ class PlannerCompilerContractTest {
                 "llm_judge", "command_success", "validation_passed")) {
             assertThat(prompt).contains(doneWhenType);
         }
+    }
+
+    @Test
+    void codeChangesWithoutConcreteWorkspaceArtifactPathAreRejectedBeforeExecution() {
+        TaskGraph graph = codeGraph("node --test test_widget.test.js", "../outside/Widget.java");
+        TaskPlan plan = TaskPlan.of("重构代码并运行测试")
+                .withArtifactDeliveryRequested(true);
+
+        PlanValidationReport report = new PlanValidator().validate(graph, plan, null, null);
+
+        assertThat(report.errors()).anySatisfy(error -> {
+            assertThat(error.type()).isEqualTo(PlanValidationReport.ValidationError.Type.GOAL_GRAPH_MISMATCH);
+            assertThat(error.nodeId()).isEqualTo("implementation");
+            assertThat(error.message()).contains("没有声明可审查的 workspace 相对文件路径");
+            assertThat(error.suggestion()).contains("workspace 相对路径", "..");
+        });
+    }
+
+    @Test
+    void codeChangesWithDeclaredRelativeArtifactPathPassThePathAndTestContract() {
+        TaskGraph graph = codeGraph("mini-agent-app/src/main/Widget.java",
+                "mini-agent-app/src/main/Widget.java");
+        TaskPlan plan = TaskPlan.of("重构代码并运行测试")
+                .withArtifactDeliveryRequested(true);
+
+        PlanValidationReport report = new PlanValidator().validate(graph, plan, null, null);
+
+        assertThat(report.errors()).noneSatisfy(error -> assertThat(error.message())
+                .contains("没有声明可审查的 workspace 相对文件路径"));
+        assertThat(report.errors()).noneSatisfy(error -> assertThat(error.type())
+                .isEqualTo(PlanValidationReport.ValidationError.Type.MISSING_CODE_VALIDATION));
+    }
+
+    @Test
+    void codeChangeGoalWithoutAnyCodeDeliverableNodeIsRejected() {
+        TaskGraph graph = new TaskGraph(List.of(new TaskNode("answer", "功能实现结论", "deliver",
+                List.of(), List.of(), List.of("已完成"), TaskNodeStatus.PENDING,
+                90, DoneWhen.note(), "", "", 0, "")));
+        TaskPlan plan = TaskPlan.of("重构代码并运行测试");
+
+        PlanValidationReport report = new PlanValidator().validate(graph, plan, null, null);
+
+        assertThat(report.errors()).anySatisfy(error -> assertThat(error.message())
+                .contains("代码改动目标没有对应的代码交付节点"));
+    }
+
+    private static TaskGraph codeGraph(String outputLabel, String declaredPath) {
+        return new TaskGraph(List.of(
+                new TaskNode("implementation", "实现业务代码并交付功能", "code", List.of(), List.of(),
+                        List.of(outputLabel), TaskNodeStatus.PENDING, 90,
+                        DoneWhen.file(declaredPath), "", "", 0, ""),
+                new TaskNode("tests", "Java 功能测试结果", "shell", List.of("implementation"), List.of(),
+                        List.of("mvn -pl mini-agent-app test"), TaskNodeStatus.PENDING, 80,
+                        DoneWhen.command("mvn -pl mini-agent-app test"), "", "", 0, "")));
     }
 
     @Test

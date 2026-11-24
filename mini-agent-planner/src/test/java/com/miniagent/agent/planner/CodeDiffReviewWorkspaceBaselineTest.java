@@ -184,6 +184,19 @@ class CodeDiffReviewWorkspaceBaselineTest {
     }
 
     @Test
+    void directReviewApiWithoutDeclaredScopeAlsoFailsClosedInsteadOfScanning() throws Exception {
+        Path workspace = createWorkspace("workspace-direct-missing-scope");
+        Files.writeString(workspace.resolve("existing-page.html"), "<main>existing</main>\n");
+        CodeDiffReviewService service = new CodeDiffReviewService(null, null);
+
+        CodeDiffReviewService.Baseline baseline = service.captureForSession("direct-missing-scope");
+
+        assertThat(baseline.available()).isFalse();
+        assertThat(baseline.unavailableReason()).contains("没有声明交付文件路径")
+                .contains("节点 outputs");
+    }
+
+    @Test
     void pendingReviewBaselineExpandsAcrossContinuationWithoutLosingEarlierChanges() throws Exception {
         Path workspace = createWorkspace("workspace-pending-scopes");
         Files.writeString(workspace.resolve("first.html"), "<main>first</main>\n");
@@ -203,6 +216,26 @@ class CodeDiffReviewWorkspaceBaselineTest {
         assertThat(diff.error()).isEmpty();
         assertThat(diff.changedPaths()).containsExactlyInAnyOrder("first.html", "second.js");
         assertThat(diff.content()).contains("<main>first updated</main>", "const second = false");
+    }
+
+    @Test
+    void directResumeReusesOnlyAnExistingScopedBaselineAndNeverScansWithoutOne() throws Exception {
+        Path workspace = createWorkspace("workspace-direct-resume-scope");
+        Files.writeString(workspace.resolve("page.html"), "<main>before</main>\n");
+        Files.writeString(workspace.resolve("unrelated.js"), "x".repeat(700_000));
+        CodeDiffReviewService service = new CodeDiffReviewService(null, null);
+
+        CodeDiffReviewService.Baseline missing = service.captureForSession("direct-no-prior-scope");
+        assertThat(missing.available()).isFalse();
+
+        CodeDiffReviewService.Baseline scoped = service.captureForSession(
+                "direct-resume-scope", Set.of("page.html"));
+        CodeDiffReviewService.Baseline resumed = service.captureForSession("direct-resume-scope");
+
+        assertThat(scoped.available()).isTrue();
+        assertThat(resumed).isSameAs(scoped);
+        assertThat(resumed.workspaceScopePaths()).containsExactly("page.html");
+        assertThat(resumed.initialContents()).containsOnlyKeys("page.html");
     }
 
     @Test

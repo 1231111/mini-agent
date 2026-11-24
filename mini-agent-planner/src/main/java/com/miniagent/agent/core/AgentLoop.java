@@ -1378,9 +1378,10 @@ public class AgentLoop {
         // a node attempt unrelated workspace cleanup to satisfy the review gate.
         state.codeChangeTask = !LoopTurnContext.current().hardGate()
                 && (pendingCodeReview || CodeValidationPolicy.isCodeChangeGoal(rawTaskGoal));
-        if (state.codeChangeTask && codeDiffReviewService != null) {
-            state.codeReviewBaseline = codeDiffReviewService.captureForSession(sessionId);
+        if (state.codeChangeTask) {
             state.codeReviewerModel = chatModel;
+            if (codeDiffReviewService != null)
+                state.codeReviewBaseline = codeDiffReviewService.captureForSession(sessionId);
         }
         if (!LoopTurnContext.current().hardGate() && sessionId != null
                 && (state.codeChangeTask || taskTodoStore.hasIncompleteCodeTask(sessionId))) {
@@ -2346,8 +2347,23 @@ public class AgentLoop {
         ToolRequest request = ToolRequest.of(scope, name, args, turn, state.runId)
                 .withAllowedTools(state.allowedToolsForTurn)
                 .withApprovalWait();
+        // Direct shell commands do not carry an enforceable file-access manifest.
+        // A scoped code-review baseline is not authorization for a shell process to
+        // mutate arbitrary files, so keep direct execution read-only until an OS
+        // isolated worker is installed. DAG acceptance commands have their own
+        // declared action contract and still remain subject to the global exec policy.
+        if (!scope.turnPolicy().hardGate()
+                && "exec_command".equals(name)
+                && isMutatingCommand(name, args)) {
+            request = request.withProbeDeny(ToolResult.failure(
+                    ToolErrorCode.PERMISSION_DENIED,
+                    "Direct 路径暂不执行写入型 shell 命令，因为当前没有 OS 级文件访问隔离；"
+                            + "请用 write_file/edit_file 声明具体产物，或使用独立 DAG command_success 验收节点。",
+                    false).legacyText());
+        }
         if (denyProbes) {
-            request = request.withProbeDeny(denyCappedBrowserProbe(name));
+            String probeDeny = denyCappedBrowserProbe(name);
+            if (StringUtils.isNotBlank(probeDeny)) request = request.withProbeDeny(probeDeny);
         }
         return request;
     }
@@ -2913,8 +2929,10 @@ public class AgentLoop {
             }
         }
         if (state.shellMutationBaselineCaptured && !state.codeChangeTask) {
-            if (codeDiffReviewService == null || state.codeReviewBaseline == null
-                    || state.unknownOutcome || codeDiffReviewService.hasChangedCodeArtifact(state.codeReviewBaseline)) {
+            if (state.codeReviewBaseline != null && state.codeReviewBaseline.available()
+                    && (state.unknownOutcome
+                    || codeDiffReviewService == null
+                    || codeDiffReviewService.hasChangedCodeArtifact(state.codeReviewBaseline))) {
                 state.codeChangeTask = true;
                 if (state.sessionId != null) {
                     taskTodoStore.ensureCodeValidationRequired(state.sessionId);
@@ -3606,11 +3624,13 @@ public class AgentLoop {
     }
 
     private void armCodeReviewForFileWrite(String toolName, String arguments, LoopState state) {
-        if (state == null || state.codeChangeTask) return;
+        if (state == null) return;
         if (!requiresCodeReviewForFileWrite(toolName, arguments)) return;
         state.codeChangeTask = true;
-        if (state.codeReviewBaseline == null && codeDiffReviewService != null) {
-            state.codeReviewBaseline = codeDiffReviewService.captureForSession(state.sessionId);
+        if (codeDiffReviewService != null) {
+            String path = argumentText(arguments, "path");
+            state.codeReviewBaseline = codeDiffReviewService.captureForSession(
+                    state.sessionId, Set.of(path));
         }
     }
 
@@ -3620,12 +3640,19 @@ public class AgentLoop {
         if (codeDiffReviewService == null) {
             // A missing reviewer must not turn a mutating shell call into an
             // unreviewed success just because the task wording was ambiguous.
+            // toolRequest will deny this write because the baseline is absent.
             state.codeChangeTask = true;
             return;
         }
-        if (state.codeReviewBaseline == null)
+        if (state.codeReviewBaseline == null) {
             state.codeReviewBaseline = codeDiffReviewService.captureForSession(state.sessionId);
-        state.shellMutationBaselineCaptured = true;
+        }
+        // Direct shell has no trustworthy affected-path manifest. The scoped
+        // baseline API returns unavailable rather than falling back to a whole
+        // workspace/repository scan. A denied command must not be recorded as a
+        // code mutation during the post-batch reconciliation below.
+        state.shellMutationBaselineCaptured = state.codeReviewBaseline != null
+                && state.codeReviewBaseline.available();
     }
 
     /** Package-private for regression tests: classify the actual write target, not task wording. */
