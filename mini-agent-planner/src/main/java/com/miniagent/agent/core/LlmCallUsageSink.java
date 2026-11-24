@@ -17,12 +17,16 @@ public interface LlmCallUsageSink {
     /**
      * 一次调用的快照。
      *
+     * @param userId     由<b>采集点</b>填入（那里在同一条执行线程上，{@code OwnerContext} 一定有值）；
+     *                   投递方不要再自己去读 ThreadLocal —— 异步队列里的线程没有上下文，
+     *                   一旦依赖它，重构后就会静默变成「一条都不记」
      * @param ttftMillis 首 token 耗时；非流式或未收到 token 时为 0，与「0 毫秒」不可区分，
      *                   所以同时带 {@code streaming} 让下游能判断这个 0 是否有意义
      * @param costMicros 百万分之一元。目前恒为 0 —— agent 侧还没有价格表，
      *                   计价要等模型单价配置接入后再填
      */
     record CallUsage(
+            Long userId,
             String sessionId,
             int turn,
             String requestId,

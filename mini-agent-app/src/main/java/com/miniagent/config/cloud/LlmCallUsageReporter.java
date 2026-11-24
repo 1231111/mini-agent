@@ -1,7 +1,6 @@
 package com.miniagent.config.cloud;
 
 import com.miniagent.agent.core.LlmCallUsageSink;
-import com.miniagent.common.context.OwnerContext;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -59,7 +58,8 @@ public class LlmCallUsageReporter implements LlmCallUsageSink {
     @Override
     public void record(CallUsage usage) {
         if (usage == null) return;
-        Long userId = OwnerContext.currentUserId();
+        // userId 由采集点带来：投递发生在异步队列线程，那里没有 OwnerContext。
+        Long userId = usage.userId();
         if (userId == null) return;
         CloudMembershipClient client = clients.getIfAvailable();
         if (client == null || !client.available()) return;

@@ -1727,6 +1727,8 @@ public class AgentLoop {
                             ? metadataId
                             : sessionId + "-" + turn + "-" + llmStartMs;
                     llmCallUsageSink.record(new LlmCallUsageSink.CallUsage(
+                            // 在这里取而不是在投递线程取：此刻仍在执行线程上，OwnerContext 一定有值。
+                            com.miniagent.common.context.OwnerContext.currentUserId(),
                             sessionId,
                             turn,
                             requestId,
