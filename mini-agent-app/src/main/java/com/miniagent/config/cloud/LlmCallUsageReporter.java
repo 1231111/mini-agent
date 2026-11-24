@@ -92,6 +92,13 @@ public class LlmCallUsageReporter implements LlmCallUsageSink {
             // DiscardPolicy 不会抛，这里只是防御性兜底。
             dropped.incrementAndGet();
         }
+
+        // 每个模型调用一行，量级与「记录 LLM 响应」相当。
+        // cached 为 -1 时要能一眼看出来：那是"未采集"，不是"零命中"。
+        log.info("调用明细上报 model={} in={} cached={} out={} ttft={}ms dur={}ms",
+                usage.model(), usage.inputTokens(),
+                usage.cachedInputTokens() < 0 ? "未采集" : usage.cachedInputTokens(),
+                usage.outputTokens(), usage.ttftMillis(), usage.durationMillis());
     }
 
     private void send(CloudMembershipClient client, Map<String, Object> body) {
