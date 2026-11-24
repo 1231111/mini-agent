@@ -527,7 +527,7 @@ public class TaskTodoStore {
             }
 
             if (status == Status.completed) {
-                if (it.status() != Status.completed && isCodeTask(it.content())) {
+                if (it.status() != Status.completed && isLegacyCodeTask(it)) {
                     ensureCodeValidationRequired(key);
                     if (!isCodeValidationSatisfied(key)) {
                         if (errorOut != null && errorOut.length > 0) {
@@ -1301,7 +1301,12 @@ public class TaskTodoStore {
         if (list == null || list.isEmpty()) return;
         Set<Integer> invalidated = new LinkedHashSet<>();
         for (TodoItem item : list) {
-            if (isCodeTask(item.content())) invalidated.add(item.id());
+            // Planner-owned DAG nodes have their own dependency graph, command
+            // receipts, and final code review. The legacy per-session code
+            // validation fence must never rewrite their projected status: doing
+            // so can turn a successful producer back to in_progress and deadlock
+            // every downstream DAG node.
+            if (isLegacyCodeTask(item)) invalidated.add(item.id());
         }
         boolean changed;
         do {
@@ -1319,7 +1324,7 @@ public class TaskTodoStore {
             TodoItem item = list.get(i);
             if (!invalidated.contains(item.id()) || item.status() == Status.cancelled
                     || item.status() == Status.blocked || item.status() == Status.awaiting_confirm) continue;
-            Status next = isCodeTask(item.content()) ? Status.in_progress : Status.pending;
+            Status next = isLegacyCodeTask(item) ? Status.in_progress : Status.pending;
             if (item.status() == next && item.evidence().isBlank() && item.validationHash().isBlank()) continue;
             list.set(i, new TodoItem(item.id(), item.content(), next,
                     "代码可能已变更或命令结果未确认，先前的完成状态和下游验证已作废",
@@ -1351,7 +1356,7 @@ public class TaskTodoStore {
 
     public synchronized boolean hasIncompleteCodeTask(String sessionId) {
         for (TodoItem item : get(sessionId)) {
-            if (isCodeTask(item.content()) && item.status() != Status.completed
+            if (isLegacyCodeTask(item) && item.status() != Status.completed
                     && item.status() != Status.cancelled && item.status() != Status.blocked) return true;
         }
         return false;
@@ -1373,6 +1378,10 @@ public class TaskTodoStore {
         return CodeValidationPolicy.isCodeChangeGoal(content)
                 || CodeValidationPolicy.isCodeArtifact(content)
                 || lower.matches("(?s).*(?:bug|defect|source file|source code|code change|implement|refactor).*" );
+    }
+
+    private static boolean isLegacyCodeTask(TodoItem item) {
+        return item != null && !dagManaged(item.doneWhen()) && isCodeTask(item.content());
     }
 
     private void requireCodeValidation(String key) {

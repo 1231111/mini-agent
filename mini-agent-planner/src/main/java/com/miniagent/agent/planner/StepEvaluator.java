@@ -266,7 +266,7 @@ public class StepEvaluator {
             if (Goal.isPlaceholderCriterion(c)) {
                 continue;
             }
-            if (hasMatchingJudge(graph, c)) continue;
+            if (hasMatchingJudge(graph, c) || hasMatchingCommand(graph, c)) continue;
             String path = DataflowNormalizer.pathFromName(c);
             if (path.isBlank() || !path.equals(c.trim())) {
                 return GraphEval.fail("", "eval: successCriteria 无法验收 " + c);
@@ -327,6 +327,14 @@ public class StepEvaluator {
             }
         }
         return false;
+    }
+
+    /** An exact command success criterion is evaluated by the graph's persisted command receipt. */
+    static boolean hasMatchingCommand(TaskGraph graph, String command) {
+        if (graph == null || StringUtils.isBlank(command)) return false;
+        String expected = command.trim();
+        return graph.nodes().stream().anyMatch(node -> node.doneWhen() != null
+                && node.doneWhen().isCommand() && expected.equals(node.doneWhen().criteria().trim()));
     }
 
     private static String pathFileName(String path) {

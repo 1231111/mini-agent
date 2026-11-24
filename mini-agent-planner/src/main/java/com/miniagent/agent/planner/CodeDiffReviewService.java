@@ -95,8 +95,8 @@ public final class CodeDiffReviewService {
 
     private final ModelCallControl modelCallControl;
     private final LlmJudgeTodoValidator judgeValidator;
-    @Value("${agent.planner.code-review-timeout-seconds:120}")
-    private int codeReviewTimeoutSeconds = 120;
+    @Value("${agent.planner.code-review-timeout-seconds:300}")
+    private int codeReviewTimeoutSeconds = 300;
     private static final long PENDING_BASELINE_TTL_MILLIS = Duration.ofHours(24).toMillis();
     private final Map<String, PendingBaseline> pendingBaselines = new ConcurrentHashMap<>();
     private record PendingBaseline(Baseline baseline, long capturedAt) {}

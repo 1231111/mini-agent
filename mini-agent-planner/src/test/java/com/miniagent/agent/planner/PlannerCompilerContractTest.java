@@ -20,6 +20,7 @@ class PlannerCompilerContractTest {
                         "代码改动必须有独立 shell 测试节点", "逐条修复校验报告",
                         "字段职责不可混用", "intent.constraints 只放禁止项/实现限制",
                         "不要把 intent.constraints 整段复制到 successCriteria",
+                        "每个用户要求的文件（包括测试脚本）都必须有对应的 file_exists 产物节点",
                         "节点 name 必须说清被交付/验收的对象")
                 .doesNotContain("{CAPS}");
         for (String doneWhenType : List.of("note_required", "file_exists", "media_delivered",
@@ -89,6 +90,21 @@ class PlannerCompilerContractTest {
                 "retries=2/4");
         assertThat(trace).hasSizeLessThan(6_500);
         assertThat(PlanningLoop.invalidPlanTrace(null)).contains("missing compile result");
+    }
+
+    @Test
+    void exactCommandSuccessCriterionIsAcceptedOnlyWhenGraphHasMatchingCommandNode() {
+        String command = "node --test test_vla_final.test.js";
+        TaskGraph matching = new TaskGraph(List.of(new TaskNode("test", "VLA 测试执行结果", "shell",
+                List.of(), List.of(), List.of(), TaskNodeStatus.PENDING, 50,
+                DoneWhen.command(command), "", "", 0, "")));
+        TaskGraph different = new TaskGraph(List.of(new TaskNode("test", "VLA 测试执行结果", "shell",
+                List.of(), List.of(), List.of(), TaskNodeStatus.PENDING, 50,
+                DoneWhen.command("node --test other.test.js"), "", "", 0, "")));
+
+        assertThat(StepEvaluator.hasMatchingCommand(matching, command)).isTrue();
+        assertThat(StepEvaluator.hasMatchingCommand(different, command)).isFalse();
+        assertThat(StepEvaluator.hasMatchingCommand(matching, command + " ")).isTrue();
     }
 
     private static PlanValidationReport reportWithErrors(int count) {

@@ -147,10 +147,13 @@ public class GoalCompiler {
             - intent.acceptanceCriteria 放用户要求的可观察结果；每条原文放进负责节点的
               doneWhen.criteria 或 checks。它们不能只留在 successCriteria、节点名称或 toolArguments。
             - successCriteria 只列必需交付文件的精确相对路径，及确实由某节点 llm_judge
-              验收的完整 criteria 原文。不要把 intent.constraints 整段复制到 successCriteria。
+              验收的完整 criteria 原文；若用户明确要求实际执行某条测试命令，也可列出与
+              command_success.criteria 完全一致的命令。不要把 intent.constraints 整段复制到 successCriteria。
             - 单文件网页可用 file_exists 节点检查文件存在，并在 checks 列出五步顺序、模块数量、
               字段和无外链等逐项条件；独立 node --test 节点用 command_success，criteria 只写完整命令，
               不要把“测试通过”当作命令节点的语义 criteria。
+            - 每个用户要求的文件（包括测试脚本）都必须有对应的 file_exists 产物节点；测试命令节点
+              依赖测试脚本节点。不要用 command_success 节点代替测试文件的文件存在交付。
             - 节点 name 必须说清被交付/验收的对象（如“VLA 单页页面”“VLA 页面验收测试”），
               不能只写“执行检查/读取实际结果/验证通过”等工具操作步骤。
 

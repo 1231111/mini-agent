@@ -540,7 +540,8 @@ public class PlanValidator {
             return;
         }
         for (String c : goal.successCriteria()) {
-            if (c == null || c.isBlank() || Goal.isPlaceholderCriterion(c) || StepEvaluator.hasMatchingJudge(g, c)) {
+            if (c == null || c.isBlank() || Goal.isPlaceholderCriterion(c)
+                    || StepEvaluator.hasMatchingJudge(g, c) || StepEvaluator.hasMatchingCommand(g, c)) {
                 continue;
             }
             String path = DataflowNormalizer.pathFromName(c);
