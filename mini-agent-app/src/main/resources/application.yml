@@ -144,6 +144,21 @@ agent:
   # 统一数据根（记忆/媒体/skills/workspace）。可用环境变量 MINI_AGENT_HOME 覆盖。
   # 默认：{user.home}/.miniagent ，不再写入项目仓库旁路目录。
   data-dir: ${MINI_AGENT_HOME:${user.home}/.miniagent}
+  # 模型单价表，单位：元 / 百万 token（与主流服务商报价页一致）。
+  # 未配置时每次调用的费用记为 0，账号页面「费用」显示 ¥0.0000 —— 那是没配，不是统计坏了。
+  # 缓存命中价通常只有普通输入的十分之一，必须单独配；不配就等于按全价收。
+  usage:
+    pricing:
+      models: {}
+        # deepseek-flash:
+        #   input-per-million: 2
+        #   cached-input-per-million: 0.2
+        #   output-per-million: 8
+      # 未匹配到模型名时的兜底价；不配则该模型费用记 0。
+      # fallback:
+      #   input-per-million: 3
+      #   cached-input-per-million: 0.3
+      #   output-per-million: 12
   chat:
     # Bound JSON bodies before Jackson allocates inline images/files and DTO lists.
     max-json-request-bytes: ${CHAT_MAX_JSON_REQUEST_BYTES:33554432}

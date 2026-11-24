@@ -36,12 +36,15 @@ public class LlmCallUsageReporter implements LlmCallUsageSink {
     private static final int QUEUE_CAPACITY = 512;
 
     private final ObjectProvider<CloudMembershipClient> clients;
+    private final ConfiguredModelPricing pricing;
     private final ThreadPoolExecutor executor;
     private final AtomicLong dropped = new AtomicLong();
     private final AtomicLong failed = new AtomicLong();
 
-    public LlmCallUsageReporter(ObjectProvider<CloudMembershipClient> clients) {
+    public LlmCallUsageReporter(ObjectProvider<CloudMembershipClient> clients,
+                                ConfiguredModelPricing pricing) {
         this.clients = clients;
+        this.pricing = pricing;
         this.executor = new ThreadPoolExecutor(
                 1, 1, 30L, TimeUnit.SECONDS,
                 new ArrayBlockingQueue<>(QUEUE_CAPACITY),
@@ -75,7 +78,10 @@ public class LlmCallUsageReporter implements LlmCallUsageSink {
         body.put("cachedInputTokens", usage.cachedInputTokens());
         body.put("outputTokens", usage.outputTokens());
         body.put("totalTokens", usage.inputTokens() + usage.outputTokens());
-        body.put("costMicros", usage.costMicros());
+        // 计价放在这里而不是 planner 里：单价是业务配置，不是执行期数据；
+        // 让 planner 依赖价格表会把「怎么算钱」耦合进「怎么调用模型」。
+        body.put("costMicros", pricing.costMicros(
+                usage.model(), usage.inputTokens(), usage.cachedInputTokens(), usage.outputTokens()));
         body.put("ttftMillis", usage.ttftMillis());
         body.put("durationMillis", usage.durationMillis());
         body.put("userAgent", usage.userAgent());
