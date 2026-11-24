@@ -185,7 +185,7 @@ class PlanningLoopResumeRecoveryTest {
 
         PlanningLoop.RunOutcome outcome = loop.runWithOutcome(mock(ChatModel.class), "", "继续", null,
                 List.of(), TaskPlan.of(originalGoal.objective()), sessionId, "fence", executionId,
-                null, PlanningRoute.dag("state", "RESUME_CURRENT_GRAPH"));
+                null, PlanningRoute.resume("state", "RESUME_CURRENT_GRAPH"));
 
         assertThat(outcome.outcome()).isEqualTo(PlanningLoop.Outcome.BLOCKED_ON_HUMAN);
         assertThat(outcome.reason()).isEqualTo("INTENT_NEEDS_CLARIFICATION");

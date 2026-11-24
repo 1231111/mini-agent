@@ -124,26 +124,13 @@ public class PlanningLoop {
         return shouldHandle(plan, sessionId, null);
     }
 
-    /** Cheap forced/resume gate. New requests require {@link #selectRoute} for semantic routing. */
+    /** Indicates whether this turn should reach the planner/router rather than short-circuiting direct. */
     public boolean shouldHandle(TaskPlan plan, String sessionId, String requestText) {
         if (!properties.isEnabled() || plan == null) return false;
-        if (PermissionContext.mode() == PermissionMode.PLAN) return true;
-        return canResume(sessionId, requestText);
-    }
-
-    private boolean canResume(String sessionId, String requestText) {
-        if (StringUtils.isBlank(sessionId)) return false;
-        return stateStore.get(sessionId).map(snapshot -> {
-            TaskGraph graph = snapshot.graph();
-            boolean incomplete = graph != null && !graph.isEmpty() && !graph.allTerminalSuccess();
-            boolean pending = PlannerStateStore.PLAN_APPROVAL_PENDING.equals(
-                    snapshot.execution().get(PlannerStateStore.EXECUTION_PLAN_APPROVAL));
-            return incomplete && (PlannerResumePolicy.shouldResume(requestText,
-                    graph.hasAwaitingConfirm(), true, pending)
-                    || shouldRecompileClarify(snapshot.goal(), graph, requestText)
-                    || (pending && StringUtils.isNotBlank(requestText)
-                    && !PlannerResumePolicy.isClearlyNewTopic(requestText.trim())));
-        }).orElse(false);
+        return PermissionContext.mode() == PermissionMode.PLAN
+                || properties.isAutoPlanning()
+                || !activeTaskRoutingContext(sessionId).isBlank()
+                || !todoProjector.resumableTaskContext(sessionId).isBlank();
     }
 
     /** Resolve once per turn. The decision is passed explicitly to execution, never stored in a ThreadLocal. */
@@ -152,31 +139,31 @@ public class PlanningLoop {
         PlanningRoute route;
         if (!properties.isEnabled() || plan == null) {
             route = PlanningRoute.direct("configuration", "PLANNER_DISABLED_OR_NO_TASK");
-        } else if (shouldHandle(plan, sessionId, requestText)) {
-            route = PlanningRoute.dag("state", PermissionContext.mode() == PermissionMode.PLAN
-                    ? "EXPLICIT_PLAN_MODE" : "RESUME_CURRENT_GRAPH");
-            if (PermissionContext.mode() == PermissionMode.PLAN && !canResume(sessionId, requestText)) {
-                PlanningRoute semantic = new SemanticPlanningRouter(modelCallControl).decide(goalCompiler.resolvePlannerChat(chat),
-                        requestText == null ? plan.taskGoal() : requestText, multimodal, history,
-                        activeTaskRoutingContext(sessionId), todoProjector.resumableTaskContext(sessionId));
-                route = new PlanningRoute(true, "explicit", "EXPLICIT_PLAN_MODE; " + semantic.reason(),
-                        semantic.artifactDeliveryRequested(), semantic.taskBoundary());
-            }
-        } else if (!properties.isAutoPlanning()) {
+        } else if (!shouldHandle(plan, sessionId, requestText)) {
             route = PlanningRoute.direct("configuration", "AUTO_PLANNING_DISABLED");
         } else {
-            route = new SemanticPlanningRouter(modelCallControl).decide(goalCompiler.resolvePlannerChat(chat),
+            String activeContext = activeTaskRoutingContext(sessionId);
+            String pausedContext = todoProjector.resumableTaskContext(sessionId);
+            PlanningRoute semantic = new SemanticPlanningRouter(modelCallControl).decide(
+                    goalCompiler.resolvePlannerChat(chat),
                     requestText == null ? plan.taskGoal() : requestText, multimodal, history,
-                    activeTaskRoutingContext(sessionId), todoProjector.resumableTaskContext(sessionId));
+                    activeContext, pausedContext);
+            if (PermissionContext.mode() == PermissionMode.PLAN && semantic.resolved()) {
+                route = new PlanningRoute(true, "explicit", "EXPLICIT_PLAN_MODE; " + semantic.reason(),
+                        semantic.artifactDeliveryRequested(), semantic.taskBoundary(), semantic.dagAction());
+            } else {
+                route = semantic;
+            }
         }
         trace(sessionId, AgentStepNode.PLANNING_ROUTE,
                 "{\"route\":\"" + route.routeName()
                         + "\",\"source\":\"" + jsonEscape(route.source())
                         + "\",\"reason\":\"" + jsonEscape(route.reason())
-                        + "\",\"taskBoundary\":\"" + route.taskBoundary().name() + "\"}",
+                        + "\",\"taskBoundary\":\"" + route.taskBoundary().name()
+                        + "\",\"dagAction\":\"" + route.dagAction().name() + "\"}",
                 route.resolved() ? RunStatus.SUCCESS : RunStatus.FAILURE);
-        log.info("任务策略 session={} route={} source={} boundary={} reason={}", sessionId,
-                route.routeName(), route.source(), route.taskBoundary(), route.reason());
+        log.info("任务策略 session={} route={} source={} boundary={} dagAction={} reason={}", sessionId,
+                route.routeName(), route.source(), route.taskBoundary(), route.dagAction(), route.reason());
         return route;
     }
 
@@ -210,16 +197,9 @@ public class PlanningLoop {
         return maxRounds > 0 && rounds >= maxRounds;
     }
 
-    static boolean shouldRecompileClarify(Goal goal, TaskGraph graph, String userMessage) {
-        if (StringUtils.isBlank(userMessage)
-                || HumanYield.looksLikeBareContinue(userMessage)
-                || PlannerResumePolicy.isClearlyNewTopic(userMessage.trim())) {
-            return false;
-        }
-        if (goal != null && goal.isClarify()) {
-            return true;
-        }
-        return GoalCompiler.isClarifyGraph(graph);
+    static boolean shouldRecompileClarify(Goal goal, TaskGraph graph, PlanningRoute.DagAction action) {
+        return action == PlanningRoute.DagAction.PLAN
+                && ((goal != null && goal.isClarify()) || GoalCompiler.isClarifyGraph(graph));
     }
 
     static String mergeClarifyObjective(String previous, String reply) {
@@ -426,26 +406,23 @@ public class PlanningLoop {
         boolean incompleteGraph = existing.isPresent()
                 && !existing.get().graph().isEmpty()
                 && !existing.get().graph().allTerminalSuccess();
-        boolean awaitingGraph = existing.isPresent()
-                && existing.get().graph().hasAwaitingConfirm();
         boolean awaitingPlanApproval = existing.isPresent()
                 && PlannerStateStore.PLAN_APPROVAL_PENDING.equals(
                         existing.get().execution().get(
                                 PlannerStateStore.EXECUTION_PLAN_APPROVAL));
-        boolean resume = PlannerResumePolicy.shouldResume(
-                userMessage,
-                awaitingGraph,
-                incompleteGraph,
-                awaitingPlanApproval);
         boolean clarifyRecompile = existing.isPresent()
                 && shouldRecompileClarify(
-                        existing.get().goal(), existing.get().graph(), userMessage);
+                        existing.get().goal(), existing.get().graph(), route.dagAction());
+        // The semantic router chooses whether to reuse the accepted graph or compile a revision.
+        // The executor still enforces scope, incompleteness, unknown-outcome and approval gates.
+        boolean resume = route.dagAction() == PlanningRoute.DagAction.RESUME_EXISTING
+                && route.taskBoundary() != com.miniagent.agent.scope.TaskBoundary.NEW
+                && incompleteGraph;
         // 计划还在等批准时，非批准答复视为对计划的调整要求：
         // 必须带着原目标重编译，不能只拿这句话当新任务，否则原任务直接丢失。
         boolean planRevision = awaitingPlanApproval
                 && !isPlanApprovalReply(userMessage)
-                && !PlannerResumePolicy.isClearlyNewTopic(
-                        userMessage == null ? "" : userMessage.trim());
+                && route.taskBoundary() != com.miniagent.agent.scope.TaskBoundary.NEW;
         if ((resume || clarifyRecompile || planRevision) && taskPlan.artifactDeliveryRequested() == null) {
             Object stored = existing.get().execution().get("artifactDeliveryRequested");
             if (stored instanceof Boolean requested) taskPlan = taskPlan.withArtifactDeliveryRequested(requested);

@@ -42,6 +42,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /** Exercises Planner orchestration and task state through Java APIs, without driving the UI. */
@@ -82,7 +83,7 @@ class PlanningLoopBusinessClosureIntegrationTest {
         PlanningLoop loop = planningLoop(properties, stateStore, executor, List.of("read_file"));
         PlanningLoop.RunOutcome outcome = loop.runWithOutcome(mock(ChatModel.class), "", "继续", null,
                 List.of(), TaskPlan.of("核验业务事实"), sessionId, "fence", executionId, null,
-                PlanningRoute.dag("test", "RESUME_CURRENT_GRAPH"));
+                PlanningRoute.resume("test", "RESUME_CURRENT_GRAPH"));
 
         StateSnapshot persisted = stateStore.get(sessionId).orElseThrow();
         TaskNode failed = persisted.graph().byId("research");
@@ -123,21 +124,22 @@ class PlanningLoopBusinessClosureIntegrationTest {
         doAnswer(invocation -> simulateChunk(invocation, dispatches, executedTools))
                 .when(executor).continueNode(any(ChatModel.class), anyList(), anyString(), anyInt(),
                         any(TaskPlan.class), any());
-        PlanningLoop loop = planningLoop(properties, stateStore, executor, List.of("read_file"));
+        GoalCompiler compiler = mock(GoalCompiler.class);
+        PlanningLoop loop = planningLoop(properties, stateStore, executor, List.of("read_file"), compiler);
         ChatModel chat = mock(ChatModel.class);
         TaskPlan taskPlan = TaskPlan.of("核验页面文件");
 
         PlanningLoop.RunOutcome first = loop.runWithOutcome(chat, "", "继续", null,
                 List.of(), taskPlan, sessionId, "fence", executionId, null,
-                PlanningRoute.dag("test", "NEW_GRAPH"));
+                PlanningRoute.resume("test", "RESUME_EXISTING_GRAPH"));
         StateSnapshot afterFirst = stateStore.get(sessionId).orElseThrow();
         assertThat(first.outcome()).isEqualTo(PlanningLoop.Outcome.UNFINISHED);
         assertThat(afterFirst.graph().byId("artifact").status()).isEqualTo(TaskNodeStatus.READY);
         assertThat(executedTools).hasValue(1);
 
-        PlanningLoop.RunOutcome continued = loop.runWithOutcome(chat, "", "继续", null,
+        PlanningLoop.RunOutcome continued = loop.runWithOutcome(chat, "", "重试当前未完成任务", null,
                 List.of(), taskPlan, sessionId, "fence", executionId, null,
-                PlanningRoute.dag("test", "RESUME_CURRENT_GRAPH"));
+                PlanningRoute.resume("test", "RESUME_CURRENT_GRAPH"));
         StateSnapshot afterContinue = stateStore.get(sessionId).orElseThrow();
 
         assertThat(continued.outcome()).isEqualTo(PlanningLoop.Outcome.UNFINISHED);
@@ -147,6 +149,36 @@ class PlanningLoopBusinessClosureIntegrationTest {
         assertThat(executedTools).hasValue(1); // the second run is stopped before the handler
         assertThat(stateStore.events(sessionId)).filteredOn(event ->
                 event.type() == DomainEventType.NODE_TOOL_CALL_RESERVED).hasSize(1);
+        verifyNoInteractions(compiler);
+    }
+
+    @Test
+    void semanticResumeDoesNotReplayAnUnknownExternalOutcome() {
+        String sessionId = "s_planner_resume_unknown_outcome";
+        String executionId = "exec_planner_resume_unknown_outcome";
+        PlannerStateStore stateStore = new PlannerStateStore();
+        Goal goal = goal("继续完成联机改造");
+        TaskNode unknown = new TaskNode("server", "启动联机服务并核验房间", "shell",
+                List.of(), List.of(), List.of("server-process"), TaskNodeStatus.OUTCOME_UNKNOWN,
+                90, DoneWhen.note(), "", "unknown side effect", 0, "")
+                .withToolStatus(com.miniagent.agent.tool.ToolStatus.UNKNOWN);
+        StateSnapshot before = initState(stateStore, sessionId, executionId, goal.objective(),
+                new TaskGraph(List.of(unknown)), TaskIntent.fromGoal(goal));
+
+        GoalCompiler compiler = mock(GoalCompiler.class);
+        NodeExecutor executor = mock(NodeExecutor.class);
+        PlanningLoop loop = planningLoop(new PlannerProperties(), stateStore, executor,
+                List.of("shell"), compiler);
+
+        PlanningLoop.RunOutcome outcome = loop.runWithOutcome(mock(ChatModel.class), "",
+                "重试当前未完成任务", null, List.of(), TaskPlan.of(goal.objective()),
+                sessionId, "fence", executionId, null,
+                PlanningRoute.resume("model", "RESUME_EXISTING"));
+
+        assertThat(outcome.outcome()).isEqualTo(PlanningLoop.Outcome.FAILED);
+        assertThat(outcome.reason()).isEqualTo("OUTCOME_UNKNOWN");
+        assertThat(stateStore.get(sessionId).orElseThrow()).isEqualTo(before);
+        verifyNoInteractions(compiler, executor);
     }
 
     @Test
@@ -192,7 +224,7 @@ class PlanningLoopBusinessClosureIntegrationTest {
 
         PlanningLoop.RunOutcome outcome = loop.runWithOutcome(reviewer, "", "继续", null,
                 List.of(), TaskPlan.of(goal.objective()), sessionId, "fence", executionId, null,
-                PlanningRoute.dag("test", "RESUME_CURRENT_GRAPH"));
+                PlanningRoute.resume("test", "RESUME_CURRENT_GRAPH"));
 
         assertThat(Files.readString(workspace.resolve("deliverable.html"))).isEqualTo(html);
         assertThat(outcome.outcome()).isEqualTo(PlanningLoop.Outcome.COMPLETED);
@@ -228,6 +260,14 @@ class PlanningLoopBusinessClosureIntegrationTest {
                                              PlannerStateStore stateStore,
                                              NodeExecutor executor,
                                              List<String> allowedTools) {
+        return planningLoop(properties, stateStore, executor, allowedTools, mock(GoalCompiler.class));
+    }
+
+    private static PlanningLoop planningLoop(PlannerProperties properties,
+                                             PlannerStateStore stateStore,
+                                             NodeExecutor executor,
+                                             List<String> allowedTools,
+                                             GoalCompiler compiler) {
         ToolRouter router = mock(ToolRouter.class);
         when(router.allowedFor(any(ActionProposal.class), any(TaskGraph.class), anyBoolean()))
                 .thenReturn(allowedTools);
@@ -235,7 +275,7 @@ class PlanningLoopBusinessClosureIntegrationTest {
         when(lock.renewSessionLock(anyString(), anyString())).thenReturn(true);
         PlanValidator validator = mock(PlanValidator.class);
         RecoveryEngine recovery = mock(RecoveryEngine.class);
-        return new PlanningLoop(properties, mock(GoalCompiler.class), validator, stateStore,
+        return new PlanningLoop(properties, compiler, validator, stateStore,
                 new GraphScheduler(properties), router, new StepEvaluator(properties, new PlannerMetrics(), null),
                 recovery, mock(TodoStateProjector.class), executor, new PlannerMetrics(), lock,
                 mock(ToolSuccessStats.class));

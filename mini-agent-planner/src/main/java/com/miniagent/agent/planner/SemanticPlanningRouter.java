@@ -37,6 +37,13 @@ final class SemanticPlanningRouter {
             同时判断 taskBoundary：SAME 表示继续、补充、纠正或验收 activeTask；
             NEW 表示独立目标，不依赖 activeTask；RESUME 表示用户明确要求继续 pausedTask。
             未完成旧任务允许被新任务挂起，之后可恢复。仅当关系不确定时选 SAME。
+            另判断 dagAction，它只选择任务图，不授予工具权限：
+            RESUME_EXISTING 表示 activeTask 或 pausedTask 中有未完成的已验收任务图，
+            且本轮语义是继续、重试或重新提交同一目标与验收要求；应复用该图并保留已完成进度。
+            对已保存计划的明确批准并要求执行也属于 RESUME_EXISTING；计划审批仍由后端单独核验。
+            PLAN 表示新目标、实质变更目标/约束/验收条件，或没有可恢复的已保存任务图。
+            同一失败任务的重新提交即使换了说法也应复用原图；目标或验收要求确实变更时必须重新规划。
+            如果不能确认本轮仍是同一目标，不得静默执行旧图，应选择 PLAN。
             同一页面中的观察、输入、选择、点击和回读是节点内部动作，不逐次建 DAG。
             不添加用户未要求的报告、Markdown 文件或额外交付物。历史只用于理解当前追问。
             同时识别 artifactDelivery：用户是否要求实际产物（文件、可运行网页/软件、图片/音视频）。
@@ -47,6 +54,7 @@ final class SemanticPlanningRouter {
             不根据权限模式选择策略，不授予权限，不调用工具，不输出任务答案。
             严格只输出 JSON：{"route":"direct或dag","reason":"一句话说明执行依赖或为何无需拆分",
             "taskBoundary":"SAME、NEW或RESUME",
+            "dagAction":"PLAN或RESUME_EXISTING",
             "artifactDelivery":{"requested":false,"evidence":""}}
             """;
 
@@ -94,7 +102,7 @@ final class SemanticPlanningRouter {
                     messages.add(UserMessage.from("路由响应未通过校验：" + route.reason()
                             + "。请重新输出完整JSON。requested=true时，evidence只能复制currentRequest里一段连续原文，"
                             + "不得改写、省略或拼接；无产物要求时requested=false，evidence为空字符串。"
-                            + "taskBoundary 必须是 SAME、NEW 或 RESUME；不确定时用 SAME。"));
+                            + "taskBoundary 必须是 SAME、NEW 或 RESUME；dagAction 必须是 PLAN 或 RESUME_EXISTING。"));
                 }
             }
             return route;
@@ -115,6 +123,7 @@ final class SemanticPlanningRouter {
                 .readTree(raw);
         if (node == null || !node.isObject() || !node.path("route").isTextual()
                 || !node.path("reason").isTextual() || node.path("reason").asText().isBlank()
+                || !node.path("dagAction").isTextual()
                 || !node.path("artifactDelivery").path("requested").isBoolean()
                 || !node.path("artifactDelivery").path("evidence").isTextual())
             return PlanningRoute.unresolved("ROUTER_INVALID_RESPONSE");
@@ -131,9 +140,21 @@ final class SemanticPlanningRouter {
             default -> null;
         };
         if (boundary == null) return PlanningRoute.unresolved("ROUTER_INVALID_TASK_BOUNDARY");
+        PlanningRoute.DagAction dagAction = switch (
+                node.path("dagAction").asText().trim().toUpperCase(java.util.Locale.ROOT)) {
+            case "PLAN" -> PlanningRoute.DagAction.PLAN;
+            case "RESUME_EXISTING" -> PlanningRoute.DagAction.RESUME_EXISTING;
+            default -> null;
+        };
+        String routeName = node.path("route").asText();
+        if (dagAction == null
+                || (dagAction == PlanningRoute.DagAction.RESUME_EXISTING
+                && (boundary == com.miniagent.agent.scope.TaskBoundary.NEW || "direct".equals(routeName)))) {
+            return PlanningRoute.unresolved("ROUTER_INVALID_DAG_ACTION");
+        }
         return switch (node.path("route").asText()) {
-            case "dag" -> new PlanningRoute(true, "model", reason, artifact, boundary);
-            case "direct" -> new PlanningRoute(false, "model", reason, artifact, boundary);
+            case "dag" -> new PlanningRoute(true, "model", reason, artifact, boundary, dagAction);
+            case "direct" -> new PlanningRoute(false, "model", reason, artifact, boundary, dagAction);
             default -> PlanningRoute.unresolved("ROUTER_INVALID_RESPONSE");
         };
     }
