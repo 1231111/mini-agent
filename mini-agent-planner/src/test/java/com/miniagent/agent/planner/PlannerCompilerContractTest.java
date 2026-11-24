@@ -17,7 +17,10 @@ class PlannerCompilerContractTest {
                 .contains("id、name 都必须非空", "capability 必须是上方词表里的已知能力",
                         "每个节点都必须有有效 doneWhen", "dependsOn 中的每个 id 必须真实存在",
                         "节点 inputs 只能引用 intent.inputs", "获取与持久化必须拆为不同节点",
-                        "代码改动必须有独立 shell 测试节点", "逐条修复校验报告")
+                        "代码改动必须有独立 shell 测试节点", "逐条修复校验报告",
+                        "字段职责不可混用", "intent.constraints 只放禁止项/实现限制",
+                        "不要把 intent.constraints 整段复制到 successCriteria",
+                        "节点 name 必须说清被交付/验收的对象")
                 .doesNotContain("{CAPS}");
         for (String doneWhenType : List.of("note_required", "file_exists", "media_delivered",
                 "llm_judge", "command_success", "validation_passed")) {

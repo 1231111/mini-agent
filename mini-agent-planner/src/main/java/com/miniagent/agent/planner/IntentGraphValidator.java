@@ -188,7 +188,15 @@ public final class IntentGraphValidator {
 
     static boolean hasSemanticCheck(TaskGraph graph, String requirement) {
         for (TaskNode node : graph.nodes()) {
-            if (node.doneWhen() != null && node.doneWhen().valid() && node.doneWhen().verifies(requirement)) return true;
+            DoneWhen done = node.doneWhen();
+            if (done == null || !done.valid()) continue;
+            // command_success.criteria is an exact execution contract rather
+            // than natural-language judge text, but it still covers an intent
+            // requirement that names that exact command. The scheduler later
+            // requires the recorded exec_command receipt and exit_code=0.
+            if (done.isCommand() && requirement != null
+                    && requirement.trim().equals(done.criteria().trim())) return true;
+            if (done.verifies(requirement)) return true;
         }
         return false;
     }

@@ -141,6 +141,19 @@ public class GoalCompiler {
             successCriteria 只填可验收项：workspace 相对文件名，或与某节点
             doneWhen.criteria 完全相同的评判句。禁止「完成 objective 且可验收」。
 
+            【字段职责不可混用】
+            - intent.constraints 只放禁止项/实现限制（如“只用原生 HTML/CSS/JS”“不得引用外网”）；
+              必须把每条限制原文放进负责产物节点的 doneWhen.checks。
+            - intent.acceptanceCriteria 放用户要求的可观察结果；每条原文放进负责节点的
+              doneWhen.criteria 或 checks。它们不能只留在 successCriteria、节点名称或 toolArguments。
+            - successCriteria 只列必需交付文件的精确相对路径，及确实由某节点 llm_judge
+              验收的完整 criteria 原文。不要把 intent.constraints 整段复制到 successCriteria。
+            - 单文件网页可用 file_exists 节点检查文件存在，并在 checks 列出五步顺序、模块数量、
+              字段和无外链等逐项条件；独立 node --test 节点用 command_success，criteria 只写完整命令，
+              不要把“测试通过”当作命令节点的语义 criteria。
+            - 节点 name 必须说清被交付/验收的对象（如“VLA 单页页面”“VLA 页面验收测试”），
+              不能只写“执行检查/读取实际结果/验证通过”等工具操作步骤。
+
             capability 取值：{CAPS}。禁止 general：调度器无法从它判断
             工具面和验收，归不了类就拆成有明确能力的节点。
             读表格/已有文件用 file_read；写文档、报告落盘用 file_write；
