@@ -1,69 +1,34 @@
 package com.miniagent.config.service;
 
-import com.miniagent.config.entity.Tenant;
 import com.miniagent.config.entity.User;
-import com.miniagent.config.repository.TenantDailyUsageRepository;
-import com.miniagent.config.repository.TenantRepository;
-import com.miniagent.config.repository.UserDailyUsageRepository;
 import com.miniagent.config.repository.UserRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.util.LinkedHashMap;
-import java.util.Map;
-import java.util.Objects;
 
-/** Authoritative per-user quota view and synchronized account-plan entitlement. */
+/**
+ * 会员套餐落地到本地用户表的两件事：额度快照与并发上限。
+ *
+ * <p>token 额度本身不再由本地累计判定 —— 明细与已用量都在账号服务，
+ * 任务能否发起由 {@code TokenQuotaFilter} 在 HTTP 入口按云端结果拦截。
+ * 这里保留的是「本地必须知道的部分」：并发上限决定能不能同时跑多个任务，
+ * 这个判断每次都要用，不能走网络。</p>
+ *
+ * <p>租户级 token 额度已移除：额度只按会员套餐计算，不再按租户分摊。</p>
+ */
 @Service
 public class UserTokenQuotaService {
+
     @Autowired private UserRepository users;
-    @Autowired private TenantRepository tenants;
-    @Autowired private UserDailyUsageRepository userUsage;
-    @Autowired private TenantDailyUsageRepository tenantUsage;
 
     @Value("${agent.quota.zone-id:Asia/Shanghai}")
     private String quotaZoneId;
 
-    @Transactional(readOnly = true)
-    public Map<String, Object> current(Long userId, Long tenantId) {
-        User user = users.findById(userId).orElseThrow(() -> new IllegalArgumentException("user not found"));
-        Tenant tenant = tenants.findById(tenantId).orElseThrow(() -> new IllegalArgumentException("tenant not found"));
-        if (!Objects.equals(user.getTenantId(), tenantId)) {
-            throw new IllegalArgumentException("user does not belong to the current tenant");
-        }
-
-        ZoneId zone = ZoneId.of(quotaZoneId);
-        LocalDate today = LocalDate.now(zone);
-        long userUsed = userUsage.tokenCount(userId, today).orElse(0L);
-        long tenantUsed = tenantUsage.tokenCount(tenantId, today).orElse(0L);
-        EffectiveLimit effective = effectiveLimit(user, tenant, LocalDateTime.now(zone));
-        Long userRemaining = remaining(effective.limit(), userUsed);
-        Long tenantRemaining = remaining(tenant.getDailyTokenLimit(), tenantUsed);
-
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("usageDate", today);
-        out.put("timeZone", zone.getId());
-        out.put("userUsedTokens", userUsed);
-        out.put("userDailyLimit", effective.limit());
-        out.put("userRemainingTokens", userRemaining);
-        out.put("availableTokens", minimumRemaining(userRemaining, tenantRemaining));
-        out.put("userUnlimited", effective.limit() <= 0);
-        out.put("quotaSource", effective.source());
-        out.put("adminDailyTokenLimitOverride", user.getDailyTokenLimitOverride());
-        out.put("membershipDailyTokenLimit", activeMembershipLimit(user, LocalDateTime.now(zone)));
-        out.put("tenantDefaultDailyUserTokenLimit", tenant.getDailyUserTokenLimit());
-        out.put("tenantUsedTokens", tenantUsed);
-        out.put("tenantDailyLimit", tenant.getDailyTokenLimit());
-        out.put("tenantRemainingTokens", tenantRemaining);
-        out.put("tenantUnlimited", tenant.getDailyTokenLimit() <= 0);
-        return out;
-    }
-
+    /** 会员开通/续期时把套餐额度写进用户快照，供管理端展示与并发判定使用。 */
     @Transactional
     public void synchronizeMembership(Long userId, long dailyLimit, int maxConcurrentTasks,
                                       LocalDateTime expiresAt) {
@@ -90,35 +55,4 @@ public class UserTokenQuotaService {
         int cap = user.getMembershipMaxConcurrentTasks();
         return cap <= 0 ? Integer.MAX_VALUE : cap;
     }
-
-    private EffectiveLimit effectiveLimit(User user, Tenant tenant, LocalDateTime now) {
-        if (user.getDailyTokenLimitOverride() != null) {
-            return new EffectiveLimit(user.getDailyTokenLimitOverride(), "ADMIN_OVERRIDE");
-        }
-        Long membershipLimit = activeMembershipLimit(user, now);
-        if (membershipLimit != null) {
-            return new EffectiveLimit(membershipLimit, "MEMBERSHIP");
-        }
-        return new EffectiveLimit(tenant.getDailyUserTokenLimit(), "TENANT_DEFAULT");
-    }
-
-    private static Long activeMembershipLimit(User user, LocalDateTime now) {
-        if (user.getMembershipDailyTokenLimit() == null) {
-            return null;
-        }
-        return user.getMembershipExpiresAt() == null || now.isBefore(user.getMembershipExpiresAt())
-                ? user.getMembershipDailyTokenLimit() : null;
-    }
-
-    private static Long remaining(long limit, long used) {
-        return limit <= 0 ? null : Math.max(0L, limit - used);
-    }
-
-    private static Long minimumRemaining(Long first, Long second) {
-        if (first == null) return second;
-        if (second == null) return first;
-        return Math.min(first, second);
-    }
-
-    private record EffectiveLimit(long limit, String source) {}
 }

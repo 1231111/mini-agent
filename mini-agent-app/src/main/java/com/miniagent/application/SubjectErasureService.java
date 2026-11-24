@@ -279,7 +279,6 @@ public class SubjectErasureService {
         deleteIn("agent_memory_embeddings", "memory_id", episodeIds);
         deleteIn("agent_memory_entries", "id", entryIds);
         jdbc.update("DELETE FROM agent_project_members WHERE tenant_id=? AND user_id=?", tenantId, userId);
-        jdbc.update("DELETE FROM user_daily_usage WHERE user_id=?", userId);
 
         List<String> sessions = jdbc.queryForList("SELECT id FROM chat_conversations WHERE user_id=?", String.class, userId);
         for (String session : sessions) {

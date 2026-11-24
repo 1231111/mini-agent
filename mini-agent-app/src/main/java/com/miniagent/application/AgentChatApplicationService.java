@@ -129,7 +129,11 @@ public class AgentChatApplicationService {
     @Autowired
     private UserRepository userRepository;
     @Autowired(required = false)
-    private com.miniagent.agent.core.TenantTokenQuota tenantTokenQuota;
+    /**
+     * 额度来源改为云端用户级判定。租户级 token 额度已移除：额度只按会员套餐计算，
+     * 由账号服务给出「今天还能不能用」，本地不再自己累计。
+     */
+    private com.miniagent.config.cloud.TokenEntitlementGate entitlementGate;
     @Autowired
     private SessionEventCenter eventCenter;
     @Autowired
@@ -259,7 +263,7 @@ public class AgentChatApplicationService {
                 .filter(com.miniagent.config.entity.User::isEnabled)
                 .map(com.miniagent.config.entity.User::getTenantId)
                 .orElseThrow(() -> new BusinessException(ErrorCode.AUTH_SESSION_INVALID));
-        if (tenantTokenQuota != null && !tenantTokenQuota.check(tenantId, userId).allowed()) {
+        if (entitlementGate != null && entitlementGate.rejectionReason(userId) != null) {
             throw new TenantQuotaExceededException();
         }
         String projectId = conversationProjectService.resolveAuthorized(

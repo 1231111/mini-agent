@@ -25,7 +25,6 @@ import com.miniagent.config.security.JwtSessionService;
 import com.miniagent.config.security.SessionAuthorizationService;
 import com.miniagent.config.service.TaskRunService;
 import com.miniagent.config.service.TaskRunLeaseRenewer;
-import com.miniagent.agent.core.TenantTokenQuota;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -53,7 +52,7 @@ public class TaskOutcomeReviewController {
     private final ConversationTaskProgressService taskProgress;
     private final ExecutionControl executionControl;
     private final TaskRunLeaseRenewer leaseRenewer;
-    private final TenantTokenQuota tenantTokenQuota;
+    private final com.miniagent.config.cloud.TokenEntitlementGate entitlementGate;
 
     public TaskOutcomeReviewController(SessionAuthorizationService authorization, PlannerStateStore states,
                                       UnknownOutcomeReconciler reconciler, UserModelBinder binder,
@@ -61,7 +60,7 @@ public class TaskOutcomeReviewController {
                                       ToolExecutionGuards tools, BrowserService browser,
                                       ConversationTaskProgressService taskProgress,
                                       ExecutionControl executionControl, TaskRunLeaseRenewer leaseRenewer,
-                                      TenantTokenQuota tenantTokenQuota) {
+                                      com.miniagent.config.cloud.TokenEntitlementGate entitlementGate) {
         this.authorization = authorization;
         this.states = states;
         this.reconciler = reconciler;
@@ -73,7 +72,7 @@ public class TaskOutcomeReviewController {
         this.taskProgress = taskProgress;
         this.executionControl = executionControl;
         this.leaseRenewer = leaseRenewer;
-        this.tenantTokenQuota = tenantTokenQuota;
+        this.entitlementGate = entitlementGate;
     }
 
     @GetMapping
@@ -96,7 +95,7 @@ public class TaskOutcomeReviewController {
         authorization.requireOwner(user.userId(), sessionId);
         if (body == null || !body.confirmed())
             return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "请先核验实际结果并明确确认。");
-        if (!tenantTokenQuota.check(user.tenantId(), user.userId()).allowed()) {
+        if (entitlementGate.rejectionReason(user.userId()) != null) {
             throw new TenantQuotaExceededException();
         }
         TaskRunService.StartResult admission = runs.tryStart(user.userId(), sessionId);

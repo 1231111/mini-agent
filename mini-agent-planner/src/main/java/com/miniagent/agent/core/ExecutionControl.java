@@ -55,7 +55,6 @@ public class ExecutionControl {
         private final AtomicBoolean pauseRequested;
         private final AtomicBoolean pausedAtCheckpoint = new AtomicBoolean();
         private final AtomicBoolean humanWaitpoint = new AtomicBoolean();
-        private final AtomicBoolean tenantQuotaDenied = new AtomicBoolean();
         private final AtomicInteger toolCalls = new AtomicInteger();
         private final AtomicLong estimatedTokens = new AtomicLong();
         /**
@@ -98,31 +97,27 @@ public class ExecutionControl {
     private final int maxToolCalls;
     private final long tokenSoftLimit;
     private final Optional<ExecutionSignalStore> signalStore;
-    private final Optional<TenantTokenQuota> tenantTokenQuota;
 
     public ExecutionControl(long deadlineMillis, int maxToolCalls, long tokenSoftLimit) {
         this(new ExecutionProperties(deadlineMillis, maxToolCalls, tokenSoftLimit),
-                Optional.empty(), Optional.empty());
+                Optional.empty());
     }
 
     public ExecutionControl(long deadlineMillis, int maxToolCalls, long tokenSoftLimit,
-                            Optional<ExecutionSignalStore> signalStore,
-                            Optional<TenantTokenQuota> tenantTokenQuota) {
+                            Optional<ExecutionSignalStore> signalStore) {
         this(new ExecutionProperties(deadlineMillis, maxToolCalls, tokenSoftLimit),
-                signalStore, tenantTokenQuota);
+                signalStore);
     }
 
     @Autowired
     public ExecutionControl(ExecutionProperties properties,
-                            Optional<ExecutionSignalStore> signalStore,
-                            Optional<TenantTokenQuota> tenantTokenQuota) {
+                            Optional<ExecutionSignalStore> signalStore) {
         ExecutionProperties props = properties == null
                 ? new ExecutionProperties() : properties;
         this.deadlineMillis = Math.max(1_000L, props.getDeadlineMs());
         this.maxToolCalls = Math.max(1, props.getMaxToolCalls());
         this.tokenSoftLimit = Math.max(1_000L, props.getTokenSoftLimit());
         this.signalStore = Objects.requireNonNullElse(signalStore, Optional.empty());
-        this.tenantTokenQuota = Objects.requireNonNullElse(tenantTokenQuota, Optional.empty());
     }
 
     /** 子 agent 与父会话共用取消、墙钟、工具次数和累计 token 计数。 */
@@ -166,10 +161,6 @@ public class ExecutionControl {
                 if (pending != null && pending.started) return pending;
                 Lease active = new Lease(deadline, maxToolCalls, tokenSoftLimit,
                         tenantId, userId, scoped, runToken, pending);
-                if (tenantId != null && tenantTokenQuota.isPresent()
-                        && !tenantTokenQuota.get().check(tenantId, userId).allowed()) {
-                    active.tenantQuotaDenied.set(true);
-                }
                 signalStore.ifPresent(store -> store.startPreservingControls(
                         scoped, active.deadlineEpochMillis, signalTtlMillis()));
                 active.started = true;
@@ -177,10 +168,6 @@ public class ExecutionControl {
                 return active;
             });
             return lease;
-        }
-        if (tenantId != null && tenantTokenQuota.isPresent()
-                && !tenantTokenQuota.get().check(tenantId, userId).allowed()) {
-            lease.tenantQuotaDenied.set(true);
         }
         leases.put(key, lease);
         try {
@@ -543,22 +530,10 @@ public class ExecutionControl {
         Lease lease = lease(sessionId);
         StopReason checkpoint = checkpoint(sessionId);
         if (checkpoint != StopReason.NONE) return checkpoint;
-        if (lease.tenantQuotaDenied.get()) {
-            return StopReason.TENANT_QUOTA_EXCEEDED;
-        }
         long tokens = Math.max(0, estimated);
-        if (lease.tenantId != null && tenantTokenQuota.isPresent()) {
-            boolean allowed = tenantTokenQuota.get().consume(lease.tenantId, lease.userId, tokens,
-                    eventId, Math.max(0, inputTokens), Math.max(0, outputTokens)).allowed();
-            // Count the completed model response locally even when it crosses a cap.
-            lease.estimatedTokens.addAndGet(tokens);
-            if (!allowed) {
-                lease.tenantQuotaDenied.set(true);
-                return StopReason.TENANT_QUOTA_EXCEEDED;
-            }
-        } else {
-            lease.estimatedTokens.addAndGet(tokens);
-        }
+        // 累计 token 只统计、不判定。租户级额度已移除，会员额度在 HTTP 入口由
+        // TokenQuotaFilter 按任务拦截，这里不再做逐次调用检查。
+        lease.estimatedTokens.addAndGet(tokens);
         // 累计 token 只统计、不判定。越过 tokenSoftLimit 时由调用方记一条告警并继续，
         // 不在这里返回停止原因 —— 详见 StopReason 的类注释。
         return StopReason.NONE;
