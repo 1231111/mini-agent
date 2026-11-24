@@ -55,6 +55,7 @@ import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
+import dev.langchain4j.model.output.TokenUsage;
 import dev.langchain4j.model.chat.response.PartialThinking;
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import com.miniagent.agent.trace.AgentStepNode;
@@ -1028,6 +1029,27 @@ public class AgentLoop {
     }
 
     /**
+     * 从 usage 里读缓存命中的输入 token 数。
+     *
+     * <p>langchain4j 的 OpenAI 客户端把 {@code prompt_tokens_details.cached_tokens} 解析进了
+     * {@code OpenAiTokenUsage}，但 {@code response.tokenUsage()} 的静态类型是父类
+     * {@code TokenUsage}，直接取不到，只能强转。</p>
+     *
+     * <p>返回值语义：<b>-1 = 未采集</b>（上游没返回 details，或用的不是 OpenAI 兼容客户端），
+     * <b>0 = 确认零命中</b>，正数是命中数。两者不能合并 —— 把"不知道"当 0 记账会让缓存部分
+     * 按全价计费，偏高 2~3 倍且完全静默。</p>
+     */
+    static long cachedInputTokens(TokenUsage usage) {
+        if (usage instanceof dev.langchain4j.model.openai.OpenAiTokenUsage openAiUsage) {
+            var inputDetails = openAiUsage.inputTokensDetails();
+            if (inputDetails != null && inputDetails.cachedTokens() != null) {
+                return inputDetails.cachedTokens();
+            }
+        }
+        return -1;
+    }
+
+    /**
      * Validate the provider's assistant-tool-call/tool-result protocol before every request.
      * Malformed batches and orphan result roles are removed fail-closed; a bounded system note
      * asks the model to re-observe state before considering any potentially repeated side effect.
@@ -1698,16 +1720,7 @@ public class AgentLoop {
                 try {
                     var metadata = response.metadata();
                     var usage = response.tokenUsage();
-                    // langchain4j 的 OpenAI 客户端已经把 prompt_tokens_details.cached_tokens
-                    // 解析进 OpenAiTokenUsage，只是被父接口 TokenUsage 挡住了。
-                    // -1 表示上游没返回（未采集），0 才是确认零命中 —— 两者计费口径不同。
-                    long cachedInput = -1;
-                    if (usage instanceof dev.langchain4j.model.openai.OpenAiTokenUsage openAiUsage) {
-                        var inputDetails = openAiUsage.inputTokensDetails();
-                        if (inputDetails != null && inputDetails.cachedTokens() != null) {
-                            cachedInput = inputDetails.cachedTokens();
-                        }
-                    }
+                    long cachedInput = cachedInputTokens(usage);
                     String metadataId = metadata == null ? null : metadata.id();
                     String requestId = StringUtils.isNotBlank(metadataId)
                             ? metadataId
