@@ -158,6 +158,20 @@ public class CloudMembershipClient {
         });
     }
 
+    /**
+     * 上报一次调用的明细（模型、首 token、耗时等）。
+     *
+     * <p>与 {@link #reportUsage} 的区别：那个是按天的汇总事件，只有输入/输出两个数；
+     * 这个一行对应一次调用，账号服务按 {@code requestId} 幂等，重复上报不会重复计数。</p>
+     *
+     * <p>账号服务是独立部署的，这个方法在网络不可达时会抛 {@code CloudAccountException}；
+     * 调用方必须自己决定是否吞掉 —— 记账失败不该让对话失败。</p>
+     */
+    public void reportCallUsage(Map<String, Object> body) {
+        call("POST", "/api/membership/usage/calls/record", body, new TypeReference<Envelope<Void>>() {
+        });
+    }
+
     // ==================== 传输与解包 ====================
 
     private <T> T call(String method, String path, Object body, TypeReference<Envelope<T>> type) {
