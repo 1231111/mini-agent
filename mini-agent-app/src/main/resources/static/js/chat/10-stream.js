@@ -14,7 +14,7 @@ function insertAt(parent, node, ref) {
     else parent.appendChild(node);
 }
 
-/** One renderer for SSE and persisted turns. Only real DAG/todo items enter here. */
+/** One renderer for SSE and persisted turns. Only task snapshots enter here. */
 function compactTaskFailure(detail) {
     const text = String(detail || '');
     if (/stack=['"]|\n\s*at\s|Error\s*\{[\r\n]|playwright-java-|ElementHandleDispatcher\./.test(text)) {
@@ -30,37 +30,46 @@ function renderTaskProgress(botBody, items, options = {}) {
     if (!card) {
         card = document.createElement('section');
         card.className = 'todo-panel';
-        card.setAttribute('aria-label', '任务节点进度');
+        card.setAttribute('aria-label', '任务概述和当前步骤');
+        const summaryLabel = document.createElement('div');
+        summaryLabel.className = 'todo-summary-label';
+        summaryLabel.textContent = '任务概述';
+        const summary = document.createElement('div');
+        summary.className = 'todo-task-summary';
+        const state = document.createElement('div');
+        state.className = 'todo-progress-title';
+        const current = document.createElement('section');
+        current.className = 'todo-current-node';
+        const currentLabel = document.createElement('div');
+        currentLabel.className = 'todo-current-label';
+        currentLabel.textContent = '当前步骤';
+        const currentTitle = document.createElement('div');
+        currentTitle.className = 'todo-current-title';
+        const detail = document.createElement('div');
+        detail.className = 'todo-current-detail';
         const progress = document.createElement('div');
-        progress.className = 'todo-progress-card';
-        const top = document.createElement('div');
-        top.className = 'todo-progress-top';
-        for (const name of ['todo-progress-title', 'todo-progress-meta']) {
-            const el = document.createElement(name.endsWith('meta') ? 'span' : 'div');
-            el.className = name; top.appendChild(el);
-        }
+        progress.className = 'todo-current-progress';
         const track = document.createElement('div');
         track.className = 'todo-progress-track';
         track.setAttribute('role', 'progressbar');
-        track.setAttribute('aria-label', '已完成的任务节点');
+        track.setAttribute('aria-label', '当前步骤已报告的工作进度');
         track.setAttribute('aria-valuemin', '0');
         track.setAttribute('aria-valuemax', '100');
         const fill = document.createElement('div');
         fill.className = 'todo-progress-fill';
-        track.appendChild(fill); progress.append(top, track);
-        const list = document.createElement('ol'); list.className = 'todo-list';
-        card.append(progress, list);
+        track.appendChild(fill);
+        progress.appendChild(track);
+        current.append(currentLabel, currentTitle, detail, progress);
+        card.append(summaryLabel, summary, state, current);
     }
     // Move even an existing card: token/todo arrival order must never change layout.
     insertAt(botBody, card, botBody.querySelector('.answer-stream, .user-question-card, .permission-request-card, .think-panel'));
-    const scheduled = items.filter(item => item.status !== 'cancelled');
-    const completed = scheduled.filter(item => item.status === 'completed').length;
-    const total = scheduled.length;
-    const percent = total ? Math.round(completed * 100 / total) : 0;
     const live = options.live === true;
-    const current = items.find(i => i.status === 'awaiting_confirm')
+    const explicitNodeId = options.currentNodeId == null ? '' : String(options.currentNodeId);
+    const current = items.find(item => explicitNodeId && String(item.id) === explicitNodeId)
+        || items.find(i => i.status === 'awaiting_confirm')
         || items.find(i => i.status === 'in_progress') || items.find(i => i.status === 'blocked')
-        || items.find(i => i.status === 'pending');
+        || items.find(i => i.status === 'failed') || items.find(i => i.status === 'pending');
     let heading, state;
     const needsReview = options.reason === 'OUTCOME_UNKNOWN';
     if (needsReview) {
@@ -73,9 +82,10 @@ function renderTaskProgress(botBody, items, options = {}) {
         heading = '任务执行失败'; state = 'blocked';
     } else if (options.status === 'CANCELED' || options.status === 'CANCELLED') {
         heading = '任务已取消'; state = 'idle';
-    } else if (!total) {
+    } else if (!items.some(item => item.status !== 'cancelled')) {
         heading = '任务步骤已取消'; state = 'idle';
-    } else if (completed === total) {
+    } else if (items.filter(item => item.status !== 'cancelled')
+            .every(item => item.status === 'completed')) {
         heading = '所有任务节点已完成'; state = 'done';
     } else if (current && current.status === 'awaiting_confirm') {
         heading = '等待确认：' + current.content; state = 'waiting';
@@ -90,33 +100,57 @@ function renderTaskProgress(botBody, items, options = {}) {
     }
     card.dataset.state = state;
     card.querySelector('.todo-progress-title').textContent = heading;
-    card.querySelector('.todo-progress-meta').textContent = completed + '/' + total + ' 已完成';
-    const fill = card.querySelector('.todo-progress-fill');
-    fill.style.width = percent + '%';
-    fill.parentElement.setAttribute('aria-valuenow', String(percent));
-    const list = card.querySelector('.todo-list'); list.innerHTML = '';
-    const labels = { completed: '已完成', in_progress: live ? '进行中' : '待继续', pending: '待执行',
-        awaiting_confirm: '待确认', blocked: '受阻', cancelled: '已取消' };
-    for (const item of items) {
-        const status = item.status || 'pending';
-        const li = document.createElement('li');
-        li.className = 'todo-item ' + status + (!live && status === 'in_progress' ? ' idle' : '');
-        li.dataset.nodeId = String(item.id);
-        const mark = document.createElement('span'); mark.className = 'todo-mark';
-        mark.setAttribute('aria-hidden', 'true');
-        const text = document.createElement('span'); text.className = 'todo-text'; text.textContent = item.content || '';
-        const label = document.createElement('span'); label.className = 'todo-node-state';
-        label.textContent = needsReview && ['blocked', 'in_progress'].includes(status) ? '待核验'
-            : !live && (options.failed || options.status === 'FAILURE') && status === 'in_progress' ? '已中断'
-            : labels[status] || '待执行';
-        li.append(mark, text, label);
-        if (status === 'awaiting_confirm' && options.allowConfirm) {
-            const button = document.createElement('button'); button.type = 'button';
-            button.className = 'todo-confirm-btn'; button.textContent = '确认并继续'; button.disabled = live;
-            button.onclick = function (event) { event.preventDefault(); event.stopPropagation(); confirmTodoAndContinue(item.id); };
-            li.appendChild(button);
+    const summary = String(options.summary || '').trim();
+    const summaryElement = card.querySelector('.todo-task-summary');
+    const summaryLabel = card.querySelector('.todo-summary-label');
+    summaryElement.textContent = summary || (live ? '正在按已确认的任务目标处理。' : '本轮任务执行状态');
+    summaryLabel.hidden = !summary;
+
+    const currentSection = card.querySelector('.todo-current-node');
+    const currentTitle = card.querySelector('.todo-current-title');
+    const currentLabel = card.querySelector('.todo-current-label');
+    const detail = card.querySelector('.todo-current-detail');
+    const progressBox = card.querySelector('.todo-current-progress');
+    const progress = normalizeTrustedTaskProgress(options.currentProgress, current, options.executionId);
+    if (current && !['completed', 'cancelled'].includes(String(current.status || ''))) {
+        currentSection.hidden = false;
+        currentSection.dataset.state = String(current.status || 'pending');
+        currentLabel.textContent = current.status === 'awaiting_confirm' ? '等待你的操作'
+            : current.status === 'blocked' || current.status === 'failed' ? '受阻步骤' : '当前步骤';
+        currentTitle.textContent = String(current.content || '');
+        const detailParts = [];
+        if (progress && progress.message) detailParts.push(progress.message);
+        if (current.note && (current.status === 'blocked' || current.status === 'failed'))
+            detailParts.push(compactTaskFailure(current.note));
+        detail.textContent = detailParts.join(' · ');
+        detail.hidden = !detail.textContent;
+        progressBox.hidden = !progress;
+        if (progress) {
+            const fill = progressBox.querySelector('.todo-progress-fill');
+            const percent = Math.round(progress.completed * 100 / progress.total);
+            fill.style.width = percent + '%';
+            fill.parentElement.setAttribute('aria-valuenow', String(percent));
+            fill.parentElement.setAttribute('aria-valuetext',
+                progress.completed + ' / ' + progress.total + (progress.unit ? ' ' + progress.unit : ''));
+            progressBox.dataset.stage = progress.stage || '';
+            progressBox.setAttribute('aria-label', progress.stage || '当前步骤进度');
         }
-        list.appendChild(li);
+        if (current.status === 'awaiting_confirm' && options.allowConfirm) {
+            let button = currentSection.querySelector('.todo-confirm-btn');
+            if (!button) {
+                button = document.createElement('button'); button.type = 'button';
+                button.className = 'todo-confirm-btn'; button.textContent = '确认并继续';
+                button.onclick = function (event) {
+                    event.preventDefault(); event.stopPropagation(); confirmTodoAndContinue(current.id);
+                };
+                currentSection.appendChild(button);
+            }
+            button.disabled = live;
+        } else {
+            currentSection.querySelector('.todo-confirm-btn')?.remove();
+        }
+    } else {
+        currentSection.hidden = true;
     }
     let reviewButton = card.querySelector('.outcome-review-open');
     if (needsReview && !live) {
@@ -139,7 +173,27 @@ function restoreTaskProgress(botBody, task) {
     botBody.dataset.taskStatus = snapshot.status || '';
     botBody.dataset.executionId = snapshot.executionId || '';
     botBody.dataset.taskReason = snapshot.reason || '';
-    renderTaskProgress(botBody, snapshot.items, { status: snapshot.status, reason: snapshot.reason, live: false, allowConfirm: false });
+    renderTaskProgress(botBody, snapshot.items, {
+        status: snapshot.status, reason: snapshot.reason, live: false, allowConfirm: false,
+        summary: snapshot.summary, currentNodeId: snapshot.currentNodeId,
+        currentProgress: snapshot.currentProgress, executionId: snapshot.executionId
+    });
+}
+
+/** Accept measurable progress only from the typed executor event contract. */
+function normalizeTrustedTaskProgress(value, currentNode, executionId) {
+    if (!value || typeof value !== 'object' || !currentNode) return null;
+    if (value.nodeId != null && String(value.nodeId) !== String(currentNode.id)) return null;
+    if (executionId && value.executionId && String(value.executionId) !== String(executionId)) return null;
+    const completed = Number(value.completed), total = Number(value.total);
+    if (!Number.isFinite(completed) || !Number.isFinite(total)
+            || completed < 0 || total <= 0 || completed > total) return null;
+    return {
+        stage: String(value.stage || '').trim().slice(0, 80),
+        message: String(value.message || '').trim().slice(0, 180),
+        completed, total,
+        unit: String(value.unit || '').trim().slice(0, 24)
+    };
 }
 
 /** Human review is inline and never silently dispatches another click or submission. */
@@ -203,7 +257,11 @@ async function showOutcomeReview(botBody) {
                 if (!result.ok || !resolved.success) throw new Error(resolved.message || '核验未通过');
                 if (currentId !== sessionId || !panel.isConnected) return;
                 const progress = resolved.data.progress;
-                renderTaskProgress(botBody, progress.items, { status: progress.status, reason: progress.reason, live: false });
+                renderTaskProgress(botBody, progress.items, {
+                    status: progress.status, reason: progress.reason, live: false,
+                    summary: progress.summary, currentNodeId: progress.currentNodeId,
+                    currentProgress: progress.currentProgress, executionId: progress.executionId
+                });
                 form.remove();
                 if (resolved.data.nodes?.length) {
                     notice.textContent = '核验已记录。原任务还有操作结果待核验，请继续检查其他步骤。';

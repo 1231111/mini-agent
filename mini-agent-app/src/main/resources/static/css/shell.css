@@ -617,6 +617,20 @@
     gap: 5px;
 }
 
+.insp-dependencies {
+    color: var(--text3);
+    overflow-wrap: anywhere;
+}
+
+.insp-block-reason {
+    color: color-mix(in srgb, #ef4444 76%, var(--text));
+    max-height: 120px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    scrollbar-width: thin;
+}
+
 .insp-step.todo-pending .insp-step-icon,
 .insp-step.pending .insp-step-icon {
     border-color: var(--border-strong);

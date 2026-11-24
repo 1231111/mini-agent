@@ -25,7 +25,7 @@ const INSP_PUSH_DEBOUNCE_MS = 500;
 const INSP_MIN_STEP_REFRESH_MS = 5000;
 const INSP_RECONNECT_BASE_MS = 1000;
 const INSP_RECONNECT_MAX_MS = 30000;
-const INSP_MAX_STEPS = 6;      // 侧栏只保留少量 DAG 节点；完整轨迹在 /trace
+const INSP_MAX_TRACE_ROWS = 6; // 非 DAG trace 事件列表限量；真实 DAG 节点不截断
 const INSP_MAX_TOOLS = 3;
 const INSP_MAX_PREFERENCES = 3;
 
@@ -362,9 +362,13 @@ function buildInspectorTaskDetails(execution, todos, steps, taskRunning) {
 function buildInspectorTodoRows(todos, steps) {
     if (!todos.length) return '<div class="insp-empty">当前任务还没有待办步骤。</div>';
     const timestamps = todoTraceTimestamps(steps);
+    const todoById = new Map(todos.filter(todo => todo && todo.id != null)
+        .map(todo => [String(todo.id), todo]));
     const currentTodo = todos.find(todo => todo &&
-        ['in_progress', 'awaiting_confirm'].includes(String(todo.status || '')));
-    const rows = todos.slice(0, INSP_MAX_STEPS).map(todo => {
+        ['in_progress', 'awaiting_confirm', 'blocked', 'failed'].includes(String(todo.status || '')));
+    // The inspector is the authoritative full-DAG view. Keep every node from the
+    // todo projection; only non-DAG trace/activity rows are intentionally capped.
+    const rows = todos.map(todo => {
         const status = String(todo.status || 'pending');
         const state = status === 'completed' || status === 'cancelled' ? 'done'
             : status === 'awaiting_confirm' ? 'awaiting'
@@ -375,8 +379,16 @@ function buildInspectorTodoRows(todos, steps) {
             completed: '已完成', cancelled: '已取消', blocked: '受阻'
         };
         const title = shortText(todo.content || '', 100);
-        const note = shortText(todo.note || '', 60);
+        const rawNote = String(todo.note || '');
+        const note = rawNote;
         const time = timestamps.get(String(todo.id) + ':' + status);
+        const dependencyIds = Array.isArray(todo.dependsOn) ? todo.dependsOn
+            : Array.isArray(todo.depends_on) ? todo.depends_on : [];
+        const dependencyNames = dependencyIds.map(id => {
+            const dependency = todoById.get(String(id));
+            return dependency && dependency.content
+                ? String(dependency.content) : '节点 #' + String(id);
+        });
         // 规划器投影带过来的两个标记：retryCount=被恢复机制重跑过几次，
         // replanGeneration=这条是第几次重规划生成的新节点（图 id 前缀 rpN_）。
         const retry = Number(todo.retryCount || 0);
@@ -391,22 +403,22 @@ function buildInspectorTodoRows(todos, steps) {
                 ' 次重规划重新生成">重规划 R' + replan + '</span>');
         }
         const meta = [labels[status] || status,
-            currentTodo && currentTodo.id === todo.id ? '当前步骤' : '',
+            currentTodo && String(currentTodo.id) === String(todo.id) ? '当前步骤' : '',
             formatClock(time)].filter(Boolean).join(' · ');
         const classes = ['insp-step', state, 'todo-' + status];
         if (retry > 0) classes.push('rerun');
         if (replan > 0) classes.push('replanned');
-        return `<div class="${classes.join(' ')}">
+        return `<div class="${classes.join(' ')}" role="listitem" data-node-id="${escQ(esc(String(todo.id)))}">
             <span class="insp-step-icon"></span>
             <div class="insp-step-body">
                 <div class="insp-step-title">${esc(title)}${tags.join('')}</div>
                 <div class="insp-step-meta status-meta">${esc(meta)}</div>
-                ${note ? `<div class="insp-step-meta">${esc(note)}</div>` : ''}
+                ${dependencyNames.length ? `<div class="insp-step-meta insp-dependencies" title="${escQ(esc(dependencyNames.join('、')))}">依赖：${dependencyNames.map(name => esc(name)).join('、')}</div>` : ''}
+                ${note ? `<div class="insp-step-meta insp-block-reason" title="${escQ(esc(rawNote))}">${esc(note)}</div>` : ''}
             </div>
         </div>`;
     }).join('');
-    return rows + (todos.length > INSP_MAX_STEPS
-        ? `<div class="insp-empty">另有 ${todos.length - INSP_MAX_STEPS} 个步骤，完整轨迹见任务中心。</div>` : '');
+    return `<div class="insp-dag-list" role="list" aria-label="完整任务 DAG">${rows}</div>`;
 }
 
 /** 恢复类轨迹节点：规则恢复和模型重规划都落成这四类，页面上统一按"重跑 / 重规划"表达。 */
@@ -519,7 +531,7 @@ function buildInspectorStepRows(steps, execution) {
         });
     });
 
-    const tail = rows.slice(-INSP_MAX_STEPS);
+    const tail = rows.slice(-INSP_MAX_TRACE_ROWS);
     if (!tail.length) {
         const terminal = execution && INSP_SUCCESS_STATUS.has(String(execution.status || '').toUpperCase());
         return `<div class="insp-empty">${terminal

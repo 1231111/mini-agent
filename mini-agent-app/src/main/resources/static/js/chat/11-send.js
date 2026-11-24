@@ -190,6 +190,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         let turnIncomplete = false;
         let turnFailed = false, turnWaiting = false;
         let taskOutcomeStatus = null, taskOutcomeReason = '';
+        let taskSummary = '', currentNodeId = null, currentProgress = null, taskProgressVersion = 0;
         const MAX_THINK_CHARS = 12000;
         let thinkPaintTimer = null;
         // 增量渲染的 DOM 引用与已渲染游标（避免每个 token 重建整棵子树导致闪烁）
@@ -494,7 +495,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             todoEl = renderTaskProgress(botBody, todoItems, {
                 live: isStreaming && !done, waiting: turnWaiting, incomplete: turnIncomplete,
                 failed: turnFailed, cancelled: turnCancelled, status: taskOutcomeStatus,
-                reason: taskOutcomeReason, allowConfirm: true
+                reason: taskOutcomeReason, allowConfirm: true, summary: taskSummary,
+                currentNodeId, currentProgress, executionId: botBody.dataset.executionId
             });
             ensureTyping();
         }
@@ -716,12 +718,56 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                     const payload = typeof data === 'string' ? JSON.parse(data) : data;
                     const items = payload && payload.items ? payload.items : [];
                     todoItems = Array.isArray(items) ? items : [];
+                    if (typeof payload?.summary === 'string') taskSummary = payload.summary;
+                    if (payload && Object.prototype.hasOwnProperty.call(payload, 'currentNodeId')) {
+                        const nextNodeId = payload.currentNodeId == null ? null : String(payload.currentNodeId);
+                        if (currentNodeId !== nextNodeId) currentProgress = null;
+                        currentNodeId = nextNodeId;
+                    }
+                    if (payload && Number.isFinite(Number(payload.version)))
+                        taskProgressVersion = Math.max(taskProgressVersion, Number(payload.version));
+                    if (payload && Object.prototype.hasOwnProperty.call(payload, 'currentProgress'))
+                        currentProgress = payload.currentProgress || null;
                     paintTodo();
                     syncPendingConfirm(todoItems);
                 } catch (e) { /* 忽略坏 payload */ }
+            } else if (name === 'task_summary') {
+                try {
+                    const payload = typeof data === 'string' ? JSON.parse(data) : data;
+                    const eventExecutionId = String(payload && payload.executionId || '');
+                    const activeExecutionId = String(botBody.dataset.executionId || '');
+                    const version = Number(payload && payload.version);
+                    if (activeExecutionId && eventExecutionId && activeExecutionId !== eventExecutionId) return;
+                    if (Number.isFinite(version) && version < taskProgressVersion) return;
+                    if (Number.isFinite(version)) taskProgressVersion = version;
+                    if (payload && typeof payload.summary === 'string') taskSummary = payload.summary;
+                    paintTodo();
+                } catch (_) { /* malformed summaries are display-only and ignored */ }
+            } else if (name === 'execution_progress') {
+                try {
+                    const payload = typeof data === 'string' ? JSON.parse(data) : data;
+                    if (!payload || typeof payload !== 'object') return;
+                    const eventExecutionId = String(payload.executionId || '');
+                    const activeExecutionId = String(botBody.dataset.executionId || '');
+                    if (activeExecutionId && eventExecutionId && activeExecutionId !== eventExecutionId) return;
+                    const version = Number(payload.version);
+                    if (!Number.isFinite(version) || version < taskProgressVersion) return;
+                    taskProgressVersion = version;
+                    currentNodeId = payload.nodeId == null ? currentNodeId : String(payload.nodeId);
+                    currentProgress = {
+                        executionId: eventExecutionId,
+                        version,
+                        nodeId: currentNodeId,
+                        stage: payload.stage,
+                        message: payload.message,
+                        completed: payload.completed,
+                        total: payload.total,
+                        unit: payload.unit
+                    };
+                    paintTodo();
+                } catch (_) { /* malformed progress must not alter task state */ }
             } else if (name === 'subgoal') {
-                // A loop's subgoal counter is not a decomposed task graph. The
-                // dedicated node snapshot above drives the card and its percentage.
+                // Legacy model-loop counters are free-form and never become business progress.
             } else if (name === 'seal' || name === 'reset') {
                 // 封存过程正文进时间线，再开下一段（兼容旧 reset）
                 sealAnswerToTimeline();
@@ -748,6 +794,10 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                         taskOutcomeStatus = status;
                         taskOutcomeReason = String(payload.reason || '');
                         if (payload.executionId) botBody.dataset.executionId = String(payload.executionId);
+                        if (payload.summary) taskSummary = String(payload.summary);
+                        if (payload.version != null && Number.isFinite(Number(payload.version)))
+                            taskProgressVersion = Math.max(taskProgressVersion, Number(payload.version));
+                        paintTodo();
                     }
                 } catch (_) { /* Legacy streams may not carry a structured outcome. */ }
             } else if (name === 'end') {

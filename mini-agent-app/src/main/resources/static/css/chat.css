@@ -1933,6 +1933,56 @@
             border: 0;
             background: transparent;
         }
+        .todo-panel .todo-summary-label,
+        .todo-panel .todo-current-label {
+            color: var(--text3);
+            font-size: 10px;
+            font-weight: 650;
+            letter-spacing: .02em;
+            text-transform: uppercase;
+        }
+        .todo-panel .todo-task-summary {
+            color: var(--heading);
+            font-size: 13px;
+            line-height: 1.5;
+            overflow-wrap: anywhere;
+        }
+        .todo-panel .todo-progress-title {
+            margin-top: 8px;
+        }
+        .todo-panel .todo-current-node {
+            margin-top: 9px;
+            padding: 9px 10px;
+            border-radius: 10px;
+            background: var(--card-tint);
+        }
+        .todo-panel .todo-current-node[hidden],
+        .todo-panel .todo-current-detail[hidden],
+        .todo-panel .todo-current-progress[hidden] { display: none; }
+        .todo-panel .todo-current-title {
+            margin-top: 2px;
+            color: var(--heading);
+            font-size: 13px;
+            font-weight: 600;
+            line-height: 1.45;
+            overflow-wrap: anywhere;
+        }
+        .todo-panel .todo-current-detail {
+            margin-top: 4px;
+            color: var(--text2);
+            font-size: 11px;
+            line-height: 1.4;
+            overflow-wrap: anywhere;
+        }
+        .todo-panel .todo-current-progress {
+            margin-top: 6px;
+        }
+        .todo-panel .todo-current-progress .todo-progress-track {
+            margin-top: 0;
+        }
+        .todo-panel .todo-current-node[data-state="blocked"] .todo-current-title,
+        .todo-panel .todo-current-node[data-state="failed"] .todo-current-title { color: var(--danger); }
+        .todo-panel .todo-current-node[data-state="awaiting_confirm"] .todo-current-title { color: #b98225; }
         .todo-progress-top {
             display: flex;
             align-items: flex-start;
