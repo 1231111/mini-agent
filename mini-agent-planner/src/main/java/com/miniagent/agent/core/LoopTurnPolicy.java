@@ -1,5 +1,7 @@
 package com.miniagent.agent.core;
 
+import com.miniagent.agent.tool.ToolResult;
+
 import java.util.List;
 import java.util.Set;
 
@@ -21,6 +23,19 @@ public interface LoopTurnPolicy {
     String denyTool(String toolName);
 
     String denyTodoArgs(String argumentsJson);
+
+    /** Per-invocation authorization, after the model has supplied tool arguments. */
+    default String denyToolInvocation(String toolName, String argumentsJson) {
+        return denyTool(toolName);
+    }
+
+    /** Observe one terminal tool result. Returns a stop reason when the node is stagnating. */
+    default String observeToolOutcome(String toolName, String argumentsJson, ToolResult result) {
+        return "";
+    }
+
+    /** A policy may terminate the current loop after a hard per-node circuit breaker trips. */
+    default String stopReason() { return ""; }
 
     String focusLabel();
 

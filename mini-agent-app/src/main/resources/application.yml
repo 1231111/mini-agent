@@ -447,6 +447,9 @@ agent:
     proposal-browser-max-iterations: 16
     # 同一节点配额用尽后接着同一份 messages 再跑，最多这么多段
     proposal-max-chunks: 6
+    # 单个逻辑节点累计最多执行 12 次工具调用；预算持久化，跨续段及用户继续不重置。
+    # 节点失败后需修正验收/计划或由用户明确开启新计划，不能靠重复重试清空预算。
+    proposal-max-tool-calls: 12
     compiler-retry: 1
     max-outer-rounds: 24
     hard-proposal: true

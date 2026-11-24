@@ -22,6 +22,46 @@ import static org.mockito.Mockito.when;
 class PlanningLoopResumeRecoveryTest {
 
     @Test
+    void nodeToolBudgetIsDurableAcrossResumesAndScopedToPlanVersion() {
+        String sessionId = "s_node_tool_budget";
+        String executionId = "exec_node_tool_budget";
+        Goal goal = new Goal("goal", "制作页面", "", "code", Map.of(), List.of(), List.of());
+        TaskGraph graph = new TaskGraph(List.of(new TaskNode("page", "实现页面", "file_write",
+                List.of(), List.of(), List.of("index.html"), TaskNodeStatus.PENDING,
+                90, DoneWhen.file("index.html"), "", "", 0, "")));
+        PlannerStateStore store = new PlannerStateStore();
+        StateSnapshot snapshot = store.init(sessionId, executionId, goal, graph);
+        TaskGraph running = snapshot.graph().replace(
+                snapshot.graph().byId("page").withStatus(TaskNodeStatus.RUNNING));
+        snapshot = store.commit(sessionId, snapshot.version(), snapshot.withGraph(running));
+
+        PlannerStateStore.NodeToolCallReservation first = store.reserveNodeToolCall(
+                sessionId, executionId, snapshot.planVersion(), "page", 2);
+        PlannerStateStore.NodeToolCallReservation second = store.reserveNodeToolCall(
+                sessionId, executionId, snapshot.planVersion(), "page", 2);
+        // Simulate a new PlanningLoop instance handling an explicit continue: it reads
+        // the same durable state rather than rebuilding a per-run in-memory counter.
+        StateSnapshot resumed = store.get(sessionId).orElseThrow();
+        PlannerStateStore.NodeToolCallReservation exhausted = store.reserveNodeToolCall(
+                sessionId, executionId, resumed.planVersion(), "page", 2);
+
+        assertThat(first.reserved()).isTrue();
+        assertThat(second.reserved()).isTrue();
+        assertThat(exhausted.reserved()).isFalse();
+        assertThat(exhausted.callsUsed()).isEqualTo(2);
+        assertThat(exhausted.reason()).contains("工具调用上限 2");
+        assertThat(resumed.execution().get(PlannerStateStore.EXECUTION_NODE_TOOL_BUDGETS))
+                .isInstanceOf(Map.class)
+                .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.MAP)
+                .containsEntry(snapshot.planVersion() + ":page", 2);
+        assertThat(store.events(sessionId)).filteredOn(event ->
+                event.type() == DomainEventType.NODE_TOOL_CALL_RESERVED)
+                .hasSize(2)
+                .allSatisfy(event -> assertThat(event.payload()).containsKeys(
+                        "planVersion", "callsUsed", "maxCalls"));
+    }
+
+    @Test
     void explicitContinueGetsOneReplanForCancelledPrerequisiteAfterAutomaticRecoveryBudgetIsExhausted() {
         TaskGraph graph = blockedGraph();
 

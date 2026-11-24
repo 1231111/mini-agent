@@ -156,6 +156,7 @@ public class AgentLoop {
     public static final String PERM_ASK = "PERM_ASK";
     public static final String USER_QUESTION = "USER_QUESTION";
     public static final String OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN";
+    public static final String NO_PROGRESS = "NO_PROGRESS";
     public static final String CANCELLED = "CANCELLED";
     public static final String DEADLINE_EXCEEDED = "DEADLINE_EXCEEDED";
     public static final String RESOURCE_QUOTA_EXCEEDED = "RESOURCE_EXCEEDED";
@@ -622,6 +623,7 @@ public class AgentLoop {
         volatile ExecutionControl.StopReason controlStopReason = ExecutionControl.StopReason.NONE;
         volatile boolean unknownOutcome = false;
         volatile String unknownOutcomeMessage = "";
+        volatile String noProgressReason = "";
         volatile Set<String> allowedToolsForTurn = Set.of();
         String sessionId;
         boolean codeChangeTask;
@@ -1348,8 +1350,12 @@ public class AgentLoop {
         String rawTaskGoal = taskPlan == null ? userTextForFilePattern : taskPlan.taskGoal();
         boolean pendingCodeReview = codeDiffReviewService != null
                 && codeDiffReviewService.hasPendingBaseline(sessionId);
-        state.codeChangeTask = pendingCodeReview || (!LoopTurnContext.current().hardGate()
-                && CodeValidationPolicy.isCodeChangeGoal(rawTaskGoal));
+        // DAG mode owns code validation and the independent review at PlanningLoop
+        // level. Running a second review inside each node exposed its workspace-level
+        // infrastructure errors to the model as if they were code findings; this let
+        // a node attempt unrelated workspace cleanup to satisfy the review gate.
+        state.codeChangeTask = !LoopTurnContext.current().hardGate()
+                && (pendingCodeReview || CodeValidationPolicy.isCodeChangeGoal(rawTaskGoal));
         if (state.codeChangeTask && codeDiffReviewService != null) {
             state.codeReviewBaseline = codeDiffReviewService.captureForSession(sessionId);
             state.codeReviewerModel = chatModel;
@@ -1692,6 +1698,16 @@ public class AgentLoop {
                 try {
                     var metadata = response.metadata();
                     var usage = response.tokenUsage();
+                    // langchain4j 的 OpenAI 客户端已经把 prompt_tokens_details.cached_tokens
+                    // 解析进 OpenAiTokenUsage，只是被父接口 TokenUsage 挡住了。
+                    // -1 表示上游没返回（未采集），0 才是确认零命中 —— 两者计费口径不同。
+                    long cachedInput = -1;
+                    if (usage instanceof dev.langchain4j.model.openai.OpenAiTokenUsage openAiUsage) {
+                        var inputDetails = openAiUsage.inputTokensDetails();
+                        if (inputDetails != null && inputDetails.cachedTokens() != null) {
+                            cachedInput = inputDetails.cachedTokens();
+                        }
+                    }
                     String metadataId = metadata == null ? null : metadata.id();
                     String requestId = StringUtils.isNotBlank(metadataId)
                             ? metadataId
@@ -1707,7 +1723,7 @@ public class AgentLoop {
                             "TOKEN",
                             "",
                             usage == null ? 0 : usage.inputTokenCount(),
-                            0,
+                            cachedInput,
                             usage == null ? 0 : usage.outputTokenCount(),
                             0,
                             state.lastTtftMillis,
@@ -1893,6 +1909,16 @@ public class AgentLoop {
                     log.info("等待用户回答问题");
                     state.loopEndReason = USER_QUESTION;
                     return finish(state.userQuestionText, state, messages);
+                }
+                String policyStopReason = LoopTurnContext.current().stopReason();
+                if (StringUtils.isNotBlank(policyStopReason)) {
+                    state.noProgressReason = policyStopReason;
+                }
+                if (StringUtils.isNotBlank(state.noProgressReason)) {
+                    state.loopEndReason = NO_PROGRESS;
+                    log.warn("Agent 节点连续重复相同工具结果，停止空转 task={} detail={}",
+                            LoopTurnContext.current().focusLabel(), state.noProgressReason);
+                    return finish(state.noProgressReason, state, messages);
                 }
                 if (focusTodosCompleted(sessionId)
                         && taskTodoStore.hasIncomplete(sessionId)) {
@@ -3369,6 +3395,8 @@ public class AgentLoop {
         ToolResult actual = structuredResult == null ? ToolResult.fromLegacy(result) : structuredResult;
         state.noteToolFinished(name, args, actual,
                 toolRegistry == null ? Set.of() : toolRegistry.getToolNames());
+        String progressStop = LoopTurnContext.current().observeToolOutcome(name, args, actual);
+        if (StringUtils.isNotBlank(progressStop)) state.noProgressReason = progressStop;
         if (Objects.nonNull(traceRecorder))
             traceRecorder.recordToolResult(
                     currentSessionId.get(), state.currentTurn, name, actual, Math.max(0L, durationMs));
@@ -3672,6 +3700,13 @@ public class AgentLoop {
                         review.passed() ? RunStatus.SUCCESS.name() : RunStatus.FAILURE.name(), 0);
             }
             if (!review.passed()) {
+                if (!review.actionable()) {
+                    state.codeReviewBlocked = true;
+                    state.loopEndReason = "CODE_REVIEW_BLOCKED";
+                    return "代码审查基础设施无法验证本次改动，任务未标记完成。"
+                            + review.feedback()
+                            + "系统不会要求智能体移动、删除或归档工作区文件来绕过审查门禁。";
+                }
                 if (review.diffHash().equals(state.lastCodeReviewHash)) state.codeReviewBlocks++;
                 else {
                     state.lastCodeReviewHash = review.diffHash();

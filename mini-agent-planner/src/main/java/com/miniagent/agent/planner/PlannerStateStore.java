@@ -36,6 +36,14 @@ public class PlannerStateStore {
     public static final String EXECUTION_PLAN_APPROVAL = "planApproval";
     public static final String PLAN_APPROVAL_PENDING = "pending";
     public static final String PLAN_APPROVAL_APPROVED = "approved";
+    public static final String EXECUTION_NODE_TOOL_BUDGETS = "nodeToolBudgets";
+
+    public record NodeToolCallReservation(boolean reserved, int callsUsed, String reason) {
+        public NodeToolCallReservation {
+            callsUsed = Math.max(0, callsUsed);
+            reason = reason == null ? "" : reason;
+        }
+    }
 
     public static final class VersionConflictException extends RuntimeException {
         private final long expected;
@@ -101,6 +109,72 @@ public class PlannerStateStore {
         if (k == null || proposal == null || proposal.actions().isEmpty()) return false;
         return persistence != null ? persistence.dispatchFenceValid(k, proposal)
                 : PlannerDispatchFence.matches(memory.get(k), k, proposal);
+    }
+
+    /**
+     * Durably reserves one tool invocation for a logical DAG node. The counter is
+     * keyed by plan version and node id, so continuation chunks and explicit user
+     * resumes cannot reset the node circuit breaker. A revised graph gets a fresh
+     * budget because its plan version changes.
+     */
+    public NodeToolCallReservation reserveNodeToolCall(String sessionId, String executionId,
+                                                        long planVersion, String nodeId,
+                                                        int maximumCalls) {
+        if (sessionId == null || sessionId.isBlank() || nodeId == null || nodeId.isBlank()) {
+            return new NodeToolCallReservation(false, 0, "节点预算缺少任务或节点标识");
+        }
+        int limit = Math.max(1, Math.min(120, maximumCalls));
+        String budgetKey = planVersion + ":" + nodeId;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            StateSnapshot current = get(sessionId).orElse(null);
+            if (current == null || current.planVersion() != planVersion
+                    || !Objects.equals(current.executionId(), executionId)) {
+                return new NodeToolCallReservation(false, 0,
+                        "当前执行图已变化，节点工具预算拒绝继续派发");
+            }
+            TaskNode node = current.graph().byId(nodeId);
+            if (node == null || node.status() != TaskNodeStatus.RUNNING) {
+                return new NodeToolCallReservation(false, 0,
+                        "当前节点不处于运行态，节点工具预算拒绝继续派发");
+            }
+            Map<String, Integer> budgets = readNodeToolBudgets(current.execution()
+                    .get(EXECUTION_NODE_TOOL_BUDGETS));
+            String currentPlanPrefix = planVersion + ":";
+            budgets.keySet().removeIf(key -> !key.startsWith(currentPlanPrefix));
+            int used = budgets.getOrDefault(budgetKey, 0);
+            if (used >= limit) {
+                return new NodeToolCallReservation(false, used,
+                        "节点「" + node.name() + "」已达到工具调用上限 " + limit
+                                + "；任务已停止以避免继续空转。修正验收目标或用户指令后再重试。");
+            }
+            budgets.put(budgetKey, used + 1);
+            Map<String, Object> execution = new java.util.LinkedHashMap<>(current.execution());
+            execution.put(EXECUTION_NODE_TOOL_BUDGETS, budgets);
+            try {
+                DomainEvent event = new DomainEvent("ev_" + UUID.randomUUID().toString().substring(0, 8),
+                        DomainEventType.NODE_TOOL_CALL_RESERVED, null, nodeId,
+                        Map.of("planVersion", planVersion, "callsUsed", used + 1, "maxCalls", limit), null);
+                StateSnapshot committed = commit(sessionId, current.version(),
+                        current.withExecution(execution), List.of(event));
+                return new NodeToolCallReservation(true, used + 1, "");
+            } catch (VersionConflictException conflict) {
+                // A concurrent state transition may have committed between the read
+                // and reservation. Retry against the authoritative snapshot.
+            }
+        }
+        return new NodeToolCallReservation(false, 0,
+                "无法可靠保存节点工具预算，已按安全策略停止继续派发");
+    }
+
+    private static Map<String, Integer> readNodeToolBudgets(Object value) {
+        Map<String, Integer> result = new java.util.LinkedHashMap<>();
+        if (!(value instanceof Map<?, ?> values)) return result;
+        for (Map.Entry<?, ?> entry : values.entrySet()) {
+            if (entry.getKey() == null || !(entry.getValue() instanceof Number number)) continue;
+            int count = number.intValue();
+            if (count > 0) result.put(entry.getKey().toString(), count);
+        }
+        return result;
     }
 
     /** 当前是否有整图计划等待用户批准。 */

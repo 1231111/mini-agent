@@ -19,6 +19,7 @@ import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -122,6 +123,86 @@ class CodeDiffReviewWorkspaceBaselineTest {
 
         Files.writeString(workspace.resolve("modified.html"), "<main>changed after review</main>\n");
         assertThat(service.isCurrent(baseline, diff.hash())).isFalse();
+    }
+
+    @Test
+    void taskScopedBaselineDoesNotRequireArchivingUnrelatedLargeWorkspaceFiles() throws Exception {
+        Path workspace = createWorkspace("workspace-scoped-baseline");
+        Files.writeString(workspace.resolve("five-step-admin.html"), "<main>before</main>\n");
+        Files.writeString(workspace.resolve("unrelated-large.html"), "x".repeat(700_000));
+        Assumptions.assumeTrue(initializeGitRepository(workspace),
+                "Git is required to ensure task-scoped snapshots also bypass repository-wide diffing");
+        CodeDiffReviewService service = new CodeDiffReviewService(null, null);
+
+        CodeDiffReviewService.Baseline baseline = service.captureForSession(
+                "scoped-review", Set.of("five-step-admin.html"));
+
+        assertThat(baseline.available()).isTrue();
+        assertThat(baseline.kind()).isEqualTo(CodeDiffReviewService.BaselineKind.WORKSPACE_SNAPSHOT);
+        assertThat(baseline.workspaceScopePaths()).containsExactly("five-step-admin.html");
+        assertThat(baseline.initialWorkspaceInventory()).containsKeys(
+                "five-step-admin.html", "unrelated-large.html");
+        Files.writeString(workspace.resolve("five-step-admin.html"), "<main>after</main>\n");
+        CodeDiffReviewService.DiffSnapshot diff = service.collectDiff(baseline);
+
+        assertThat(diff.error()).isEmpty();
+        assertThat(diff.changedPaths()).containsExactly("five-step-admin.html");
+        assertThat(diff.content()).contains("<main>before</main>", "<main>after</main>")
+                .doesNotContain("unrelated-large.html");
+    }
+
+    @Test
+    void taskScopedReviewBlocksChangesToUndeclaredWorkspaceFilesWithoutReadingTheirContents() throws Exception {
+        Path workspace = createWorkspace("workspace-unscoped-mutation");
+        Files.writeString(workspace.resolve("page.html"), "<main>before</main>\n");
+        Files.writeString(workspace.resolve("unrelated.js"), "const marker = 'before';\n");
+        CodeDiffReviewService service = new CodeDiffReviewService(null, null);
+        CodeDiffReviewService.Baseline baseline = service.captureForSession(
+                "unscoped-mutation", Set.of("page.html"));
+        Files.writeString(workspace.resolve("page.html"), "<main>after</main>\n");
+        Files.writeString(workspace.resolve("unrelated.js"), "const marker = 'after';\n");
+
+        CodeDiffReviewService.DiffSnapshot diff = service.collectDiff(baseline);
+
+        assertThat(diff.hasChanges()).isTrue();
+        assertThat(diff.error()).contains("交付物以外的 workspace 文件变更", "unrelated.js")
+                .contains("需先由用户核验");
+    }
+
+    @Test
+    void pendingReviewBaselineExpandsAcrossContinuationWithoutLosingEarlierChanges() throws Exception {
+        Path workspace = createWorkspace("workspace-pending-scopes");
+        Files.writeString(workspace.resolve("first.html"), "<main>first</main>\n");
+        Files.writeString(workspace.resolve("second.js"), "const second = true;\n");
+        CodeDiffReviewService service = new CodeDiffReviewService(null, null);
+
+        CodeDiffReviewService.Baseline first = service.captureForSession("pending-scopes", Set.of("first.html"));
+        Files.writeString(workspace.resolve("first.html"), "<main>first updated</main>\n");
+        CodeDiffReviewService.Baseline second = service.captureForSession("pending-scopes", Set.of("second.js"));
+        Files.writeString(workspace.resolve("second.js"), "const second = false;\n");
+        CodeDiffReviewService.DiffSnapshot diff = service.collectDiff(second);
+
+        assertThat(first.workspaceScopePaths()).containsExactly("first.html");
+        assertThat(second.workspaceScopePaths()).containsExactlyInAnyOrder("first.html", "second.js");
+        assertThat(second.initialContents()).containsEntry("first.html", "<main>first</main>\n")
+                .containsEntry("second.js", "const second = true;\n");
+        assertThat(diff.error()).isEmpty();
+        assertThat(diff.changedPaths()).containsExactlyInAnyOrder("first.html", "second.js");
+        assertThat(diff.content()).contains("<main>first updated</main>", "const second = false");
+    }
+
+    @Test
+    void invalidReviewBaselineIsInfrastructureFailureAndIsNotPresentedAsModelFixableFinding() throws Exception {
+        CodeDiffReviewService service = new CodeDiffReviewService(null, null);
+        CodeDiffReviewService.Baseline unavailable = new CodeDiffReviewService.Baseline(
+                null, "", java.util.Map.of(), java.util.Set.of(), "workspace scan unavailable",
+                CodeDiffReviewService.BaselineKind.UNAVAILABLE);
+
+        CodeDiffReviewService.Review result = service.review(unavailable, mock(ChatModel.class));
+
+        assertThat(result.passed()).isFalse();
+        assertThat(result.actionable()).isFalse();
+        assertThat(result.failureKind()).isEqualTo(CodeDiffReviewService.ReviewFailureKind.INFRASTRUCTURE);
     }
 
     @Test

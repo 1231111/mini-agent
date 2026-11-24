@@ -42,6 +42,8 @@ public class PlannerProperties {
     private int proposalBrowserMaxIterations = 16;
     /** 同一节点配额用尽后最多续跑几段（含第一段） */
     private int proposalMaxChunks = 6;
+    /** 单个 DAG 节点生命周期内可执行的工具调用硬上限，跨 chunk 和用户续跑持久化。 */
+    private int proposalMaxToolCalls = 12;
     private int compilerRetry = 1;
     private int maxOuterRounds = 24;
     /** Proposal 硬闸门：锁定工具面 + 禁止改其它 todo */
@@ -107,6 +109,11 @@ public class PlannerProperties {
     public int getProposalMaxChunks() { return proposalMaxChunks; }
     public void setProposalMaxChunks(int proposalMaxChunks) {
         this.proposalMaxChunks = proposalMaxChunks;
+    }
+
+    public int getProposalMaxToolCalls() { return proposalMaxToolCalls; }
+    public void setProposalMaxToolCalls(int proposalMaxToolCalls) {
+        this.proposalMaxToolCalls = Math.max(1, Math.min(120, proposalMaxToolCalls));
     }
 
     public int getCompilerRetry() { return compilerRetry; }

@@ -392,8 +392,7 @@ public class PlanningLoop {
 
         boolean codeReviewRequired = CodeValidationPolicy.isCodeChangeGoal(taskPlan.taskGoal())
                 || CodeValidationPolicy.isCodeChangeGoal(userMessage);
-        CodeDiffReviewService.Baseline codeReviewBaseline = codeReviewRequired && codeDiffReviewService != null
-                ? codeDiffReviewService.captureForSession(sessionId) : null;
+        CodeDiffReviewService.Baseline codeReviewBaseline = null;
 
         if (route.artifactDeliveryRequested() != null) {
             taskPlan = taskPlan.withArtifactDeliveryRequested(route.artifactDeliveryRequested());
@@ -520,6 +519,14 @@ public class PlanningLoop {
         }
         final String admittedExecutionId = snap.executionId();
         final String admittedScopeId = snap.sessionId();
+        codeReviewRequired = codeReviewRequired || hasReviewableCodeDeliverable(snap);
+        if (codeReviewRequired && codeDiffReviewService != null) {
+            // Capture only task-declared code outputs in non-Git workspaces. A large
+            // workspace baseline is an infrastructure problem, never a reason for the
+            // model to archive or move unrelated user files.
+            codeReviewBaseline = codeDiffReviewService.captureForSession(
+                    sessionId, codeReviewScopePaths(snap));
+        }
         if (taskPlan.artifactDeliveryRequested() != null
                 && !taskPlan.artifactDeliveryRequested().equals(snap.execution().get("artifactDeliveryRequested"))) {
             Map<String, Object> metadata = new LinkedHashMap<>(snap.execution());
@@ -575,11 +582,12 @@ public class PlanningLoop {
         AcceptedNodeAnswer acceptedAnswer = null;
         int rounds = 0;
         boolean attemptedCancelledDependencyResume = false;
+        Map<String, ProposalTurnPolicy.ProgressGuard> nodeProgressGuards = new HashMap<>();
         String acceptedCodeReviewHash = "";
         String unfinishedDetail = "";
         // 只有"图全部通过终验"这一条路会把 completed 置真；其余出口都是"没做完"。
         String unfinishedReason = "NO_READY_NODES";
-        while (rounds++ < properties.getMaxOuterRounds()) {
+        executionLoop: while (rounds++ < properties.getMaxOuterRounds()) {
             if (!sessionLock.renewSessionLock(sessionId, fencingToken)) {
                 log.warn("PlanningLoop 会话锁丢失，中止 session={} code={}",
                         sessionId, ErrorCode.AGENT_PLANNER_LOCK_LOST.getCode());
@@ -661,11 +669,19 @@ public class PlanningLoop {
                 if (codeReviewRequired) {
                     CodeDiffReviewService.Review review = codeDiffReviewService == null
                             ? new CodeDiffReviewService.Review("", false, true,
-                                    "独立代码审查服务不可用，按安全策略阻止完成")
+                                    "独立代码审查服务不可用，按安全策略阻止完成",
+                                    CodeDiffReviewService.ReviewFailureKind.INFRASTRUCTURE)
                             : codeDiffReviewService.review(codeReviewBaseline, chat);
                     if (review.passed()) acceptedCodeReviewHash = review.diffHash();
                     if (!review.passed()) {
                         String reviewReason = review.feedback();
+                        if (!review.actionable()) {
+                            return RunOutcome.unfinished(
+                                    "任务内容已完成，但独立审查基础设施不可用，尚未通过最终验收。\n"
+                                            + reviewReason
+                                            + "\n系统不会要求智能体修改工作区来绕过此门禁。",
+                                    "CODE_REVIEW_INFRASTRUCTURE_UNAVAILABLE");
+                        }
                         TaskNode bad = resolveAcceptFailNode(snap.graph(), "");
                         if (bad == null) {
                             return RunOutcome.unfinished(
@@ -825,7 +841,8 @@ public class PlanningLoop {
             if ((boundCodeWrite || boundShellAction) && codeReviewBaseline == null
                     && codeDiffReviewService != null) {
                 // Capture before any direct bound action can write files.
-                codeReviewBaseline = codeDiffReviewService.captureForSession(sessionId);
+                codeReviewBaseline = codeDiffReviewService.captureForSession(
+                        sessionId, codeReviewScopePaths(snap));
             }
             if (boundCodeWrite) codeReviewRequired = true;
 
@@ -848,7 +865,7 @@ public class PlanningLoop {
             }
             StepExec step = executeProposal(chat, systemPrompt, stepUser,
                     multimodalUser, history, taskPlan, proposal, snap.graph(),
-                    snap.version(), sessionId, streamSink);
+                    snap.version(), sessionId, streamSink, nodeProgressGuards);
             if (boundShellAction && !codeReviewRequired) {
                 if (codeDiffReviewService == null
                         || codeDiffReviewService.hasChangedCodeArtifact(codeReviewBaseline)) {
@@ -901,6 +918,7 @@ public class PlanningLoop {
                         "OUTCOME_UNKNOWN");
             }
             boolean anyFail = false;
+            boolean noProgressAbort = false;
             TaskGraph g = snap.graph();
             List<NodeOutcome> pendingOutcomes = new ArrayList<>();
             for (ActionSpec action : proposal.actions()) {
@@ -972,6 +990,7 @@ public class PlanningLoop {
                 }
                 TaskNodeStatus next = statusAfterChunk(ev.ok(), quotaAbort);
                 if (next == TaskNodeStatus.SUCCESS) {
+                    nodeProgressGuards.remove(progressGuardKey(proposal.basedOnPlanVersion(), node.id()));
                     TaskNode completed = node.withStatus(TaskNodeStatus.SUCCESS).withError("")
                             .withToolStatus(step.structuredResult() == null
                                     ? null : step.structuredResult().status())
@@ -1014,12 +1033,27 @@ public class PlanningLoop {
                         log.warn("状态冲突，触发 replan: {}", e.getMessage());
                         break;
                     }
+                    if (AgentLoop.NO_PROGRESS.equals(step.endReason())) {
+                        // A repeated tool/result fingerprint is not a normal execution
+                        // failure to feed back into the same model loop. Persist it as a
+                        // failed node and stop this graph run; a later explicit user retry
+                        // starts a fresh, inspectable attempt.
+                        unfinishedReason = AgentLoop.NO_PROGRESS;
+                        unfinishedDetail = clip(step.text(), AWAITING_HINT_CHARS);
+                        noProgressAbort = true;
+                        continue;
+                    }
                     RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap, node, dx, action.taskId(),
                             chat, userMessage, taskPlan, history);
                     if (recovery.stop() != null) return recovery.stop();
                     snap = recovery.snapshot();
                     g = snap.graph();
                 }
+            }
+            if (noProgressAbort) {
+                todoProjector.project(sessionId,
+                        stateStore.get(sessionId).map(StateSnapshot::graph).orElse(g));
+                break executionLoop;
             }
             if (!anyFail) {
                 try {
@@ -1486,7 +1520,8 @@ public class PlanningLoop {
                                      TaskGraph graph,
                                      long dispatchStateVersion,
                                      String sessionId,
-                                     AgentStreamSink streamSink) {
+                                     AgentStreamSink streamSink,
+                                     Map<String, ProposalTurnPolicy.ProgressGuard> nodeProgressGuards) {
         AgentStreamSink evidenceStream = nodeEvidenceStream(streamSink);
         List<String> allowed = toolRouter.allowedFor(
                 proposal, graph, properties.isHardProposal());
@@ -1508,11 +1543,29 @@ public class PlanningLoop {
         boolean hard = properties.isHardProposal();
         String label = StringUtils.isNotBlank(focusName) ? focusName : focusTask;
         int timeoutSec = properties.getActionTimeoutSeconds();
+        Set<String> declaredFilePaths = Set.of();
+        String requiredCommand = "";
         if (!proposal.actions().isEmpty()) {
-            timeoutSec = proposal.actions().get(0).timeoutSeconds();
+            ActionSpec action = proposal.actions().get(0);
+            timeoutSec = action.timeoutSeconds();
+            TaskNode focusNode = graph == null ? null : graph.byId(action.taskId());
+            declaredFilePaths = declaredFilePaths(focusNode);
+            if (focusNode != null && focusNode.doneWhen() != null
+                    && focusNode.doneWhen().isCommand()) {
+                requiredCommand = focusNode.doneWhen().criteria();
+            }
         }
+        String progressKey = progressGuardKey(proposal.basedOnPlanVersion(), focusTask);
+        ProposalTurnPolicy.ProgressGuard progressGuard = nodeProgressGuards.computeIfAbsent(
+                progressKey, ignored -> new ProposalTurnPolicy.ProgressGuard(() -> {
+                    PlannerStateStore.NodeToolCallReservation reservation = stateStore.reserveNodeToolCall(
+                            sessionId, proposal.executionId(), proposal.basedOnPlanVersion(), focusTask,
+                            properties.getProposalMaxToolCalls());
+                    return reservation.reserved() ? "" : reservation.reason();
+                }));
         ProposalTurnPolicy policy = new ProposalTurnPolicy(
-                allowed, hard, label, focusTodos, timeoutSec);
+                allowed, hard, label, focusTodos, timeoutSec,
+                declaredFilePaths, requiredCommand, progressGuard, true);
         LoopTurnContext.set(policy);
         List<ExecutionTurnContext.ActionBinding> bindings = proposal.actions().stream()
                 .map(a -> new ExecutionTurnContext.ActionBinding(
@@ -1609,6 +1662,12 @@ public class PlanningLoop {
         String end = ok ? AgentLoop.STEP_SEGMENT_DONE
                 : result.status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN
                 ? AgentLoop.OUTCOME_UNKNOWN : RunStatus.FAILURE.name();
+        String policyStop = LoopTurnContext.current().stopReason();
+        if (StringUtils.isNotBlank(policyStop)) {
+            text = policyStop;
+            end = AgentLoop.NO_PROGRESS;
+            ok = false;
+        }
         if (invocation != null) {
             switch (invocation.outcome()) {
                 case CONTROL_STOP -> {
@@ -1695,6 +1754,12 @@ public class PlanningLoop {
         sb.append("- planVersion: ").append(proposal.basedOnPlanVersion()).append('\n');
         sb.append("- focusTodoIds: ").append(focusTodos).append('\n');
         sb.append(MessageConstants.PLANNER_FOCUS_RULES).append('\n');
+        if (hard) {
+            sb.append("【本节点范围】只完成下方 ActionProposal 的当前节点和已声明交付物。"
+                    + "不得清理、归档、迁移、删除或重命名工作区中其他文件；"
+                    + "不得为了绕过验收/审查门禁改变文件基线。"
+                    + "文件写入和编辑会在运行时按当前节点声明路径逐次校验；shell 只允许运行本节点声明的验收命令。\n");
+        }
         sb.append("本步动作：\n");
         for (ActionSpec a : proposal.actions()) {
             TaskNode n = graph == null ? null : graph.byId(a.taskId());
@@ -1730,6 +1795,8 @@ public class PlanningLoop {
                     .append(" timeoutSeconds=").append(a.timeoutSeconds())
                     .append(" retryMax=").append(a.retryPolicy().maxAttempts())
                     .append(" concurrencyKey=").append(a.concurrencyKey());
+            Set<String> declaredPaths = declaredFilePaths(n);
+            if (!declaredPaths.isEmpty()) sb.append(" declaredFilePaths=").append(declaredPaths);
             if (StringUtils.isNotBlank(a.compensation())) {
                 sb.append(" compensation=").append(a.compensation());
             }
@@ -1746,6 +1813,57 @@ public class PlanningLoop {
         }
         sb.append(MessageConstants.DAG_EVIDENCE_SUBMISSION).append('\n');
         return sb.toString();
+    }
+
+    private static Set<String> declaredFilePaths(TaskNode node) {
+        if (node == null) return Set.of();
+        Set<String> paths = new LinkedHashSet<>();
+        if (node.doneWhen() != null && node.doneWhen().isFile()) {
+            addDeclaredFilePath(paths, node.doneWhen().path(), true);
+        }
+        for (String output : node.outputs()) addDeclaredFilePath(paths, output, false);
+        Object boundPath = node.toolArguments().get("path");
+        if (boundPath instanceof String path) addDeclaredFilePath(paths, path, true);
+        return Set.copyOf(paths);
+    }
+
+    private static void addDeclaredFilePath(Set<String> paths, String candidate, boolean explicitPath) {
+        if (candidate == null || candidate.isBlank()) return;
+        String path = candidate.trim().replace('\\', '/');
+        if (!explicitPath && !path.matches("(?i).*(?:/|\\.[a-z0-9]{1,12})[^/]*$")) return;
+        String normalized = ProposalTurnPolicy.normalizeWorkspacePath(path);
+        if (!normalized.isBlank()) paths.add(normalized);
+    }
+
+    private static boolean hasReviewableCodeDeliverable(StateSnapshot snapshot) {
+        return !codeReviewScopePaths(snapshot).isEmpty();
+    }
+
+    private static Set<String> codeReviewScopePaths(StateSnapshot snapshot) {
+        if (snapshot == null) return Set.of();
+        Set<String> paths = new LinkedHashSet<>();
+        if (snapshot.intent() != null) {
+            snapshot.intent().deliverables().stream().map(TaskIntent.Deliverable::path)
+                    .filter(CodeValidationPolicy::isReviewableCodeArtifact).forEach(paths::add);
+        }
+        if (snapshot.graph() != null) {
+            for (TaskNode node : snapshot.graph().nodes()) {
+                if (node.doneWhen() != null && node.doneWhen().isFile()
+                        && CodeValidationPolicy.isReviewableCodeArtifact(node.doneWhen().path())) {
+                    paths.add(node.doneWhen().path());
+                }
+                node.outputs().stream().filter(CodeValidationPolicy::isReviewableCodeArtifact).forEach(paths::add);
+                Object path = node.toolArguments().get("path");
+                if (path instanceof String value && CodeValidationPolicy.isReviewableCodeArtifact(value)) {
+                    paths.add(value);
+                }
+            }
+        }
+        return Set.copyOf(paths);
+    }
+
+    private static String progressGuardKey(long planVersion, String taskId) {
+        return planVersion + ":" + StringUtils.defaultString(taskId);
     }
 
     /** 整图审批的状态机：不介入 / 拦下等人 / 放行。 */

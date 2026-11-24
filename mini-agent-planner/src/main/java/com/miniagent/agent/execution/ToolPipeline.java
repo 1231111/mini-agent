@@ -193,7 +193,7 @@ public class ToolPipeline {
             return ToolInvocation.policyDenied(
                     name, ToolResult.fromLegacy(request.probeDeny()));
         }
-        String proposalDeny = run.turnPolicy().denyTool(name);
+        String proposalDeny = run.turnPolicy().denyToolInvocation(name, request.arguments());
         if (proposalDeny != null) {
             recordNode(sid, turn, AgentStepNode.HOOK_DENY,
                     "{\"tool\":\"" + name + "\",\"reason\":\"planner_hard_gate\"}",
