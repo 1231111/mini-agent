@@ -162,9 +162,9 @@ public class AccountUsageController {
         if (body == null) {
             return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "请求体不能为空");
         }
-        return calls.record(body)
-                ? ApiResponse.ok(null)
-                : ApiResponse.fail(ErrorCode.CONFIG_INVALID, "调用明细未被接受，请检查 userId 与 requestId");
+        return calls.record(body) == LlmCallUsageService.RecordOutcome.REJECTED
+                ? ApiResponse.fail(ErrorCode.CONFIG_INVALID, "调用明细未被接受，请检查 userId 与 requestId")
+                : ApiResponse.ok(null);
     }
 
     private static long valueOrZero(Long value) {

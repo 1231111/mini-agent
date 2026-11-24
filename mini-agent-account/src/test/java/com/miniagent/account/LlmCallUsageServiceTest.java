@@ -5,6 +5,7 @@ import com.miniagent.account.service.LlmCallUsageService;
 import com.miniagent.account.web.dto.LatencyStatsResponse;
 import com.miniagent.account.web.dto.LlmCallUsageResponse;
 import org.junit.jupiter.api.BeforeEach;
+import com.miniagent.account.service.UsageQueryService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -44,10 +45,16 @@ class LlmCallUsageServiceTest {
     private LlmCallUsageService service;
     @Autowired
     private UserLlmCallUsageRepository repository;
+    @Autowired
+    private UsageQueryService queries;
+    @Autowired
+    private com.miniagent.account.repository.UserDailyUsageRepository aggregateRepository;
 
     @BeforeEach
     void reset() {
         repository.deleteAll();
+        // 聚合表按「用户 × 日期 × 模型」唯一，前一个用例留下的行会让计数断言失真。
+        aggregateRepository.deleteAll();
     }
 
     private LlmCallUsageService.RecordCommand command(String requestId, boolean streaming,
@@ -61,8 +68,9 @@ class LlmCallUsageServiceTest {
 
     @Test
     void duplicateRequestIdIsIdempotent() {
-        assertTrue(service.record(command("req-1", true, 131, 4990, 7890)));
-        assertTrue(service.record(command("req-1", true, 131, 4990, 7890)));
+        assertEquals(LlmCallUsageService.RecordOutcome.INSERTED, service.record(command("req-1", true, 131, 4990, 7890)));
+        // 第二次同 requestId：明细不新增，返回值必须能区分出这是重复。
+        assertEquals(LlmCallUsageService.RecordOutcome.DUPLICATE, service.record(command("req-1", true, 131, 4990, 7890)));
         assertEquals(1, repository.count());
     }
 
@@ -110,7 +118,7 @@ class LlmCallUsageServiceTest {
 
     @Test
     void missingRequestIdRejected() {
-        assertEquals(false, service.record(command("", true, 10, 100, 1000)));
+        assertEquals(LlmCallUsageService.RecordOutcome.REJECTED, service.record(command("", true, 10, 100, 1000)));
         assertEquals(0, repository.count());
     }
 
@@ -154,5 +162,41 @@ class LlmCallUsageServiceTest {
         LlmCallUsageResponse item = service.detail(USER, TODAY, TODAY, 0, 10).getContent().get(0);
         assertEquals(19_584, item.cachedInputTokens());
         assertEquals(19_666, item.inputTokens());
+    }
+
+    /** 明细落库后，按天聚合必须同步可见 —— 否则页面上「按模型」永远为空。 */
+    @Test
+    void aggregateIsWrittenAlongsideDetail() {
+        service.record(new LlmCallUsageService.RecordCommand(
+                USER, "s", "agg-1", "model-a", "", "", true, "TOKEN", "",
+                2_000, 0, 300, 2_300, 500, 100, 900, ""));
+
+        var summary = queries.summary(USER, LocalDate.now(), LocalDate.now());
+        assertEquals(1, summary.byModel().size());
+        assertEquals("model-a", summary.byModel().get(0).model());
+        assertEquals(2_000, summary.inputTokens());
+        assertEquals(300, summary.outputTokens());
+        assertEquals(500, summary.costMicros());
+    }
+
+    /**
+     * 重复上报同一 requestId 时，明细不新增、聚合也不能重复累加。
+     *
+     * <p>这是聚合接入后最容易出错的地方：重试与断线重连都会重复投递同一次调用，
+     * 如果累加不区分 INSERTED/DUPLICATE，费用会被算两遍。</p>
+     */
+    @Test
+    void duplicateReportDoesNotDoubleCountAggregate() {
+        LlmCallUsageService.RecordCommand cmd = new LlmCallUsageService.RecordCommand(
+                USER, "s", "agg-dup", "model-b", "", "", true, "TOKEN", "",
+                10_000, 0, 500, 10_500, 1_000, 100, 1_000, "");
+
+        assertEquals(LlmCallUsageService.RecordOutcome.INSERTED, service.record(cmd));
+        assertEquals(LlmCallUsageService.RecordOutcome.DUPLICATE, service.record(cmd));
+
+        var summary = queries.summary(USER, LocalDate.now(), LocalDate.now());
+        assertEquals(1, summary.eventCount());
+        assertEquals(10_000, summary.inputTokens());
+        assertEquals(1_000, summary.costMicros());
     }
 }

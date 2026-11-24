@@ -36,6 +36,17 @@ public class LlmCallUsageService {
 
     @Autowired
     private UserLlmCallUsageRepository repository;
+    @Autowired
+    private UsageRecordingService recordingService;
+
+    /**
+     * 写入结果。
+     *
+     * <p>{@code INSERTED} 与 {@code DUPLICATE} 的区别很重要：只有真正新插入的那次才允许
+     * 累加按天聚合。重复上报（重试、断线重连、outbox 重复投递）如果也累加，
+     * 同一次调用的费用会在聚合表里被算两遍。</p>
+     */
+    public enum RecordOutcome { INSERTED, DUPLICATE, REJECTED }
 
     public record RecordCommand(
             Long userId,
@@ -60,17 +71,18 @@ public class LlmCallUsageService {
     /**
      * 记录一次调用。
      *
-     * @return true 表示已记录（含重复上报）；false 表示参数不可用，调用方应告警
+     * @return {@code INSERTED} 新写入；{@code DUPLICATE} 已有同一 requestId；
+     *         {@code REJECTED} 参数不可用（调用方应告警）
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public boolean record(RecordCommand command) {
+    public RecordOutcome record(RecordCommand command) {
         if (command == null || command.userId() == null
                 || command.requestId() == null || command.requestId().isBlank()) {
             log.warn("调用明细缺少 userId 或 requestId，已丢弃");
-            return false;
+            return RecordOutcome.REJECTED;
         }
         String requestId = truncate(command.requestId(), 128);
-        if (repository.existsByRequestId(requestId)) return true;
+        if (repository.existsByRequestId(requestId)) return RecordOutcome.DUPLICATE;
 
         UserLlmCallUsage row = new UserLlmCallUsage();
         row.setUserId(command.userId());
@@ -101,10 +113,32 @@ public class LlmCallUsageService {
 
         try {
             repository.saveAndFlush(row);
-            return true;
+            recordAggregate(row);
+            return RecordOutcome.INSERTED;
         } catch (DataIntegrityViolationException duplicate) {
-            // 并发下另一个请求先写入了同一 requestId；视为已记录。
-            return true;
+            // 并发下另一个请求先写入了同一 requestId；不重复累加聚合。
+            return RecordOutcome.DUPLICATE;
+        }
+    }
+
+    /**
+     * 把这次调用累加到「用户 × 日期 × 模型」的聚合表。
+     *
+     * <p>失败只记日志，不回滚明细：明细是事实源，聚合是派生视图。
+     * 聚合丢了可以从明细重算，明细丢了就永久缺一条，两者不能同等对待。</p>
+     *
+     * <p>日期取服务器当天，与实体 {@code createdAt} 的 {@code LocalDateTime.now()} 同一个时区口径。
+     * 跨零点的那一次调用可能落到前一天，这是可接受的误差 —— 换时区重算会引入更大的不一致。</p>
+     */
+    private void recordAggregate(UserLlmCallUsage row) {
+        try {
+            Long cached = row.getCachedInputTokens();
+            recordingService.record(row.getUserId(), LocalDate.now(), row.getModel(),
+                    row.getInputTokens(), cached == null ? 0L : cached,
+                    row.getOutputTokens(), row.getTotalTokens(), row.getCostMicros(), 1L);
+        } catch (RuntimeException aggregationFailure) {
+            log.warn("聚合累加失败，明细已落库可重建: userId={} requestId={} cause={}",
+                    row.getUserId(), row.getRequestId(), aggregationFailure.getMessage());
         }
     }
 
