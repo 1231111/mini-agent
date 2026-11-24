@@ -5,46 +5,116 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>MiniAgent 账号</title>
     <style>
-        :root { color-scheme: dark; }
+        :root {
+            color-scheme: dark;
+            --bg: #0e0e0e;
+            --panel: #171717;
+            --line: rgba(255, 255, 255, .08);
+            --text: #ececec;
+            --muted: #9ca3af;
+            --brand: #10a37f;
+            --sidebar: #121212;
+        }
         * { box-sizing: border-box; }
         body {
             margin: 0; min-height: 100vh;
-            font: 14px/1.5 "Segoe UI", sans-serif;
-            background: #0e0e0e; color: #ececec;
+            font: 14px/1.55 "Segoe UI", "Microsoft YaHei", sans-serif;
+            background: var(--bg); color: var(--text);
         }
-        main { max-width: 880px; margin: 0 auto; padding: 32px 20px 64px; }
-        h1 { font-size: 22px; margin: 0 0 4px; }
-        .muted { color: #9ca3af; }
-        .card {
-            background: #171717; border: 1px solid rgba(255,255,255,.08);
-            border-radius: 12px; padding: 16px; margin-top: 16px;
+        button {
+            border: 0; border-radius: 8px; padding: 8px 12px;
+            background: var(--brand); color: #fff; font-weight: 600;
+            cursor: pointer; font-size: 13px;
         }
-        label { display: block; margin: 10px 0; }
+        button.ghost { background: transparent; border: 1px solid rgba(255, 255, 255, .16); }
+        button:disabled { opacity: .5; cursor: default; }
         input {
             width: 100%; margin-top: 4px; padding: 10px 12px;
-            border-radius: 8px; border: 1px solid rgba(255,255,255,.12);
+            border-radius: 8px; border: 1px solid rgba(255, 255, 255, .12);
+            background: #212121; color: inherit; font-size: 14px;
+        }
+        label { display: block; margin: 10px 0; }
+        h1 { font-size: 22px; margin: 0 0 4px; }
+        h2 { font-size: 15px; margin: 0 0 10px; }
+        .muted { color: var(--muted); }
+        .err { color: #f87171; min-height: 1.2em; margin: 8px 0 0; }
+        .card {
+            background: var(--panel); border: 1px solid var(--line);
+            border-radius: 12px; padding: 16px; margin-bottom: 16px;
+        }
+        table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+        th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+        th { color: var(--muted); font-weight: 600; font-size: 12px; white-space: nowrap; }
+        td { font-size: 13px; }
+        .num { text-align: right; }
+
+        .centered { max-width: 420px; margin: 0 auto; padding: 64px 20px; }
+        .tabs { display: flex; gap: 8px; margin-bottom: 8px; }
+        .tabs button { background: transparent; color: var(--muted); }
+        .tabs button.on { background: #212121; color: #fff; }
+
+        .app { display: grid; grid-template-columns: 210px 1fr; min-height: 100vh; }
+        .sidebar {
+            background: var(--sidebar); border-right: 1px solid var(--line);
+            padding: 20px 14px; display: flex; flex-direction: column;
+            position: sticky; top: 0; height: 100vh;
+        }
+        .brand { font-weight: 700; font-size: 15px; padding: 0 6px 4px; }
+        .brand small { display: block; color: var(--muted); font-weight: 400; font-size: 12px; }
+        nav { display: flex; flex-direction: column; gap: 4px; margin-top: 18px; }
+        nav button {
+            background: transparent; color: var(--muted); text-align: left;
+            padding: 10px 12px; border-radius: 8px; font-weight: 500;
+        }
+        nav button:hover { background: rgba(255, 255, 255, .04); color: var(--text); }
+        nav button.on { background: rgba(16, 163, 127, .14); color: #7ee2c6; font-weight: 600; }
+        .sidebar .spacer { flex: 1; }
+
+        .content { padding: 28px 32px 64px; max-width: 1180px; width: 100%; }
+        .page-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+        .page-head h1 { font-size: 20px; margin: 0; }
+        .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+        .toolbar select {
+            width: auto; margin: 0; padding: 6px 10px; font-size: 13px;
+            border-radius: 8px; border: 1px solid rgba(255, 255, 255, .12);
             background: #212121; color: inherit;
         }
-        button, .linkish {
-            border: 0; border-radius: 8px; padding: 8px 12px;
-            background: #10a37f; color: #fff; font-weight: 600; cursor: pointer;
+
+        .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+        .kpi {
+            background: var(--panel); border: 1px solid var(--line);
+            border-radius: 10px; padding: 12px 14px;
         }
-        button.ghost { background: transparent; border: 1px solid rgba(255,255,255,.16); }
-        .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-        .err { color: #f87171; min-height: 1.2em; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid rgba(255,255,255,.08); }
-        .tabs button { background: transparent; color: #9ca3af; }
-        .tabs button.on { color: #fff; background: #212121; }
+        .kpi span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+        .kpi strong { font-size: 18px; font-variant-numeric: tabular-nums; }
+
+        .panel { display: none; }
+        .panel.on { display: block; }
+        .empty { color: var(--muted); padding: 14px 0; margin: 0; }
+
+        @media (max-width: 760px) {
+            .app { grid-template-columns: 1fr; }
+            .sidebar {
+                position: static; height: auto; flex-direction: row;
+                align-items: center; gap: 8px; padding: 12px;
+                border-right: 0; border-bottom: 1px solid var(--line);
+                overflow-x: auto;
+            }
+            .brand small { display: none; }
+            nav { flex-direction: row; margin: 0; gap: 4px; }
+            nav button { white-space: nowrap; padding: 8px 10px; }
+            .sidebar .spacer { display: none; }
+            .content { padding: 18px 16px 48px; }
+        }
     </style>
 </head>
 <body>
-<main>
+
+<div id="authView" class="centered" hidden>
     <h1>MiniAgent 账号</h1>
     <p class="muted">注册、会员和充值在这里。桌面客户端只负责登录。</p>
-
-    <section id="auth" class="card" hidden>
-        <div class="tabs row">
+    <div class="card">
+        <div class="tabs">
             <button type="button" id="tabLogin" class="on">登录</button>
             <button type="button" id="tabRegister">注册</button>
         </div>
@@ -60,298 +130,518 @@
             <button type="submit">注册</button>
         </form>
         <p class="err" id="authErr"></p>
-    </section>
+    </div>
+</div>
 
-    <section id="desk" hidden>
-        <div class="card row">
-            <div>
-                <div id="who"></div>
-                <div class="muted" id="plan"></div>
+<div id="appView" class="app" hidden>
+    <aside class="sidebar">
+        <div class="brand">MiniAgent<small>账号中心</small></div>
+        <nav id="nav">
+            <button type="button" data-panel="overview">概览</button>
+            <button type="button" data-panel="usage" class="on">用量</button>
+            <button type="button" data-panel="billing">充值</button>
+            <button type="button" data-panel="orders">订单</button>
+        </nav>
+        <span class="spacer"></span>
+        <button type="button" class="ghost" id="logoutBtn">退出登录</button>
+    </aside>
+
+    <main class="content">
+
+        <section class="panel" data-panel-view="overview">
+            <div class="page-head"><h1>概览</h1></div>
+            <div class="card">
+                <h2>账号</h2>
+                <p id="ovWho" class="muted">—</p>
+                <p id="ovPlan" class="muted">—</p>
             </div>
-            <span style="flex:1"></span>
-            <button type="button" class="ghost" id="logoutBtn">退出</button>
-        </div>
-        <div class="card">
-            <h2 style="margin:0 0 8px;font-size:16px;">用量</h2>
-            <p class="muted">MiniAgent 不设置 token 日限额；请求限制由你配置的模型服务商 API Key 及其账户策略决定。下方统计为异步上报的参考数据。</p>
-            <p class="muted" id="usageSummary">暂无用量</p>
-            <table>
-                <thead>
-                <tr>
-                    <th>时间</th><th>套餐</th><th>输入 token</th>
-                    <th>输出 token</th><th>合计</th>
-                </tr>
-                </thead>
-                <tbody id="usageDays"></tbody>
-            </table>
-        </div>
-        <div class="card">
-            <h2 style="margin:0 0 8px;font-size:16px;">充值</h2>
-            <p class="muted">无真实支付渠道。开发演示模式下的模拟支付不会扣款，只会开通套餐。</p>
-            <p class="muted" id="paymentNotice">正在读取支付方式…</p>
-            <div id="plans"></div>
-        </div>
-        <div class="card">
-            <h2 style="margin:0 0 8px;font-size:16px;">订单</h2>
-            <table>
-                <thead>
-                <tr><th>单号</th><th>套餐</th><th>金额</th><th>状态</th><th>支付截止</th><th></th></tr>
-                </thead>
-                <tbody id="orders"></tbody>
-            </table>
-        </div>
+            <div class="card">
+                <h2>用量概况</h2>
+                <p class="muted" style="margin:0 0 12px">
+                    来自客户端上报的汇总事件。更细的模型、缓存、费用与延迟见「用量」。
+                </p>
+                <div class="kpis">
+                    <div class="kpi"><span>总 token</span><strong id="ovTokens">0</strong></div>
+                    <div class="kpi"><span>缓存命中</span><strong id="ovCached">—</strong></div>
+                    <div class="kpi"><span>费用</span><strong id="ovCost">—</strong></div>
+                    <div class="kpi"><span>调用次数</span><strong id="ovCalls">0</strong></div>
+                </div>
+            </div>
+        </section>
+
+        <section class="panel on" data-panel-view="usage">
+            <div class="page-head">
+                <h1>用量</h1>
+                <span class="muted" id="usageRange"></span>
+            </div>
+
+            <div class="toolbar">
+                <select id="rangeSelect">
+                    <option value="7">最近 7 天</option>
+                    <option value="30">最近 30 天</option>
+                    <option value="90">最近 90 天</option>
+                </select>
+                <button type="button" class="ghost" id="refreshBtn">刷新</button>
+            </div>
+
+            <div class="kpis" style="margin-bottom:16px">
+                <div class="kpi"><span>输入 token</span><strong id="kInput">0</strong></div>
+                <div class="kpi"><span>其中缓存命中</span><strong id="kCached">0</strong></div>
+                <div class="kpi"><span>输出 token</span><strong id="kOutput">0</strong></div>
+                <div class="kpi"><span>费用</span><strong id="kCost">¥0.0000</strong></div>
+                <div class="kpi"><span>平均首 token</span><strong id="kTtft">—</strong></div>
+                <div class="kpi"><span>平均耗时</span><strong id="kDur">—</strong></div>
+            </div>
+
+            <div class="card">
+                <h2>按模型</h2>
+                <table>
+                    <thead><tr>
+                        <th>模型</th><th class="num">输入</th><th class="num">缓存</th>
+                        <th class="num">输出</th><th class="num">费用</th><th class="num">调用</th>
+                    </tr></thead>
+                    <tbody id="modelRows"></tbody>
+                </table>
+                <p class="empty" id="modelEmpty" hidden>这段时间没有按模型的记录。</p>
+            </div>
+
+            <div class="card">
+                <h2>按天</h2>
+                <table>
+                    <thead><tr>
+                        <th>日期</th><th class="num">输入</th><th class="num">缓存</th>
+                        <th class="num">输出</th><th class="num">费用</th>
+                    </tr></thead>
+                    <tbody id="dayRows"></tbody>
+                </table>
+                <p class="empty" id="dayEmpty" hidden>这段时间没有按天的记录。</p>
+            </div>
+
+            <div class="card">
+                <h2>调用明细</h2>
+                <p class="muted" style="margin:0 0 10px">
+                    一行一次模型调用。首 token 仅对流式调用有意义，非流式显示为 —。
+                    该统计依赖客户端上报明细；在上报接入之前，这里会显示为空。
+                </p>
+                <table>
+                    <thead><tr>
+                        <th>时间</th><th>模型</th><th>推理</th>
+                        <th class="num">输入</th><th class="num">缓存</th><th class="num">输出</th>
+                        <th class="num">费用</th><th class="num">首 token</th>
+                        <th class="num">耗时</th><th class="num">输出 TPS</th>
+                    </tr></thead>
+                    <tbody id="callRows"></tbody>
+                </table>
+                <p class="empty" id="callEmpty" hidden>这段时间没有调用记录。</p>
+                <div style="margin-top:12px;display:flex;gap:8px;align-items:center">
+                    <button type="button" class="ghost" id="moreBtn" hidden>加载更多</button>
+                    <span class="muted" id="callCount"></span>
+                </div>
+            </div>
+        </section>
+
+        <section class="panel" data-panel-view="billing">
+            <div class="page-head"><h1>充值</h1></div>
+            <div class="card">
+                <p class="muted" id="paymentNotice">正在读取支付方式…</p>
+                <div id="plans" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px"></div>
+            </div>
+        </section>
+
+        <section class="panel" data-panel-view="orders">
+            <div class="page-head"><h1>订单</h1></div>
+            <div class="card">
+                <table>
+                    <thead><tr>
+                        <th>单号</th><th>套餐</th><th class="num">金额</th>
+                        <th>状态</th><th>支付截止</th><th></th>
+                    </tr></thead>
+                    <tbody id="orderRows"></tbody>
+                </table>
+                <p class="empty" id="orderEmpty" hidden>还没有订单。</p>
+            </div>
+        </section>
+
         <p class="err" id="deskErr"></p>
-    </section>
-</main>
+    </main>
+</div>
+
 <script>
-const MIN_PASSWORD_LENGTH = 12;
-const auth = document.getElementById('auth');
-const desk = document.getElementById('desk');
-const loginForm = document.getElementById('loginForm');
-const registerForm = document.getElementById('registerForm');
-let csrfToken = '';
-const csrfReady = (async function () {
-    const response = await fetch('/api/portal/csrf', { credentials: 'same-origin' });
-    const body = await response.json();
-    if (!response.ok || !body.success || !body.data || !body.data.token) {
-        throw new Error('无法初始化安全请求令牌');
-    }
-    csrfToken = body.data.token;
-})();
+    const MIN_PASSWORD_LENGTH = 12;
+    const authView = document.getElementById('authView');
+    const appView = document.getElementById('appView');
+    const loginForm = document.getElementById('loginForm');
+    const registerForm = document.getElementById('registerForm');
+    let csrfToken = '';
+    let callPage = 0;
+    let callTotalPages = 0;
+    let simulatedPaymentEnabled = false;
 
-function yuan(cents) {
-    return (Number(cents) / 100).toFixed(2) + ' 元';
-}
-
-async function call(path, options) {
-    const requestOptions = Object.assign({
-        credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' }
-    }, options || {});
-    requestOptions.headers = Object.assign(
-        { 'Content-Type': 'application/json' }, (options && options.headers) || {});
-    if (String(requestOptions.method || 'GET').toUpperCase() === 'POST') {
-        await csrfReady;
-        requestOptions.headers['X-CSRF-TOKEN'] = csrfToken;
-    }
-    const res = await fetch(path, requestOptions);
-    return res.json();
-}
-
-function showAuth(register) {
-    auth.hidden = false;
-    desk.hidden = true;
-    loginForm.hidden = !!register;
-    registerForm.hidden = !register;
-    document.getElementById('tabLogin').classList.toggle('on', !register);
-    document.getElementById('tabRegister').classList.toggle('on', !!register);
-}
-
-document.getElementById('tabLogin').onclick = function () { showAuth(false); };
-document.getElementById('tabRegister').onclick = function () { showAuth(true); };
-
-loginForm.onsubmit = async function (event) {
-    event.preventDefault();
-    const err = document.getElementById('authErr');
-    err.textContent = '';
-    const body = await call('/api/portal/session', {
-        method: 'POST',
-        body: JSON.stringify({
-            username: document.getElementById('loginUser').value.trim(),
-            password: document.getElementById('loginPass').value
-        })
-    });
-    if (!body.success) {
-        err.textContent = body.message || '登录失败';
-        return;
-    }
-    location.href = '/account';
-};
-
-registerForm.onsubmit = async function (event) {
-    event.preventDefault();
-    const err = document.getElementById('authErr');
-    err.textContent = '';
-    const password = document.getElementById('regPass').value;
-    if (password.length < MIN_PASSWORD_LENGTH) {
-        err.textContent = '密码至少 ' + MIN_PASSWORD_LENGTH + ' 位';
-        return;
-    }
-    const body = await call('/api/portal/users', {
-        method: 'POST',
-        body: JSON.stringify({
-            username: document.getElementById('regUser').value.trim(),
-            password: password,
-            displayName: document.getElementById('regName').value.trim()
-        })
-    });
-    if (!body.success) {
-        err.textContent = body.message || '注册失败';
-        return;
-    }
-    const fromDesktop = new URLSearchParams(location.search).get('desktop') === '1';
-    if (fromDesktop) {
-        const ticket = await call('/api/portal/desktop-ticket', { method: 'POST' });
-        if (ticket.success && ticket.data && ticket.data.ticket) {
-            location.href = 'miniagent://login?ticket='
-                + encodeURIComponent(ticket.data.ticket);
-            return;
+    const csrfReady = (async function () {
+        const response = await fetch('/api/portal/csrf', { credentials: 'same-origin' });
+        const body = await response.json();
+        if (!response.ok || !body.success || !body.data || !body.data.token) {
+            throw new Error('无法初始化安全请求令牌');
         }
-    }
-    location.href = '/account';
-};
+        csrfToken = body.data.token;
+    })();
 
-async function loadDesk() {
-    const me = await call('/api/portal/me');
-    if (!me.success) {
-        location.href = '/login';
-        return;
+    async function call(path, options) {
+        const requestOptions = Object.assign({
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' }
+        }, options || {});
+        requestOptions.headers = Object.assign(
+            { 'Content-Type': 'application/json' }, (options && options.headers) || {});
+        if (String(requestOptions.method || 'GET').toUpperCase() === 'POST') {
+            await csrfReady;
+            requestOptions.headers['X-CSRF-TOKEN'] = csrfToken;
+        }
+        const res = await fetch(path, requestOptions);
+        return res.json();
     }
-    auth.hidden = true;
-    desk.hidden = false;
-    document.getElementById('who').textContent =
-        (me.data.displayName || me.data.username) + ' · ' + me.data.username;
-    const plan = await call('/api/portal/membership');
-    document.getElementById('plan').textContent = plan.success
-        ? ('当前套餐 ' + plan.data.planName)
-        : (plan.message || '没有生效中的订阅');
-    const usage = await call('/api/portal/usage');
-    if (usage.success && usage.data) {
-        const d = usage.data;
-        document.getElementById('usageSummary').textContent =
-            '今日 ' + d.date + ' · 已上报 token ' + d.totalTokens
-            + ' · 输入 ' + d.inputTokens + ' · 输出 ' + d.outputTokens
-            + ' · LLM 请求 ' + d.llmCalls + ' 次';
-        const usageBody = document.getElementById('usageDays');
-        usageBody.replaceChildren();
-        (d.events || []).forEach(function (row) {
-            const when = String(row.reportedAt || '').replace('T', ' ').slice(0, 19);
-            const tr = document.createElement('tr');
-            [when, row.planCode, row.inputTokens, row.outputTokens,
-                row.totalTokens].forEach(function (cell) {
-                const td = document.createElement('td');
-                td.textContent = cell;
-                tr.appendChild(td);
-            });
-            usageBody.appendChild(tr);
+
+    function int(value) {
+        return Number(value || 0).toLocaleString('zh-CN');
+    }
+    function money(micros) {
+        return '¥' + (Number(micros || 0) / 1e6).toFixed(4);
+    }
+    function millis(value) {
+        const n = Number(value || 0);
+        return n ? (n / 1000).toFixed(2) + 's' : '—';
+    }
+    function tps(outputTokens, durationMillis) {
+        const d = Number(durationMillis || 0);
+        return d ? (Number(outputTokens || 0) * 1000 / d).toFixed(1) : '—';
+    }
+    function stamp(value) {
+        return value ? String(value).replace('T', ' ').slice(0, 19) : '—';
+    }
+    function cell(row, text, className) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        if (className) td.className = className;
+        row.appendChild(td);
+        return td;
+    }
+
+    function showAuth(register) {
+        authView.hidden = false;
+        appView.hidden = true;
+        loginForm.hidden = !!register;
+        registerForm.hidden = !register;
+        document.getElementById('tabLogin').classList.toggle('on', !register);
+        document.getElementById('tabRegister').classList.toggle('on', !!register);
+    }
+    document.getElementById('tabLogin').onclick = function () { showAuth(false); };
+    document.getElementById('tabRegister').onclick = function () { showAuth(true); };
+
+    loginForm.onsubmit = async function (event) {
+        event.preventDefault();
+        const err = document.getElementById('authErr');
+        err.textContent = '';
+        const body = await call('/api/portal/session', {
+            method: 'POST',
+            body: JSON.stringify({
+                username: document.getElementById('loginUser').value.trim(),
+                password: document.getElementById('loginPass').value
+            })
         });
-    }
-    const mode = await call('/api/portal/payment-mode');
-    const simulatedPaymentEnabled = !!(mode.success && mode.data
-        && mode.data.simulatedPaymentEnabled);
-    document.getElementById('paymentNotice').textContent = simulatedPaymentEnabled
-        ? '模拟支付已启用：不会产生真实扣款，确认后会立即开通所选套餐。'
-        : '真实支付渠道尚未接入，当前不能购买套餐。';
-    const plans = await call('/api/portal/plans');
-    const box = document.getElementById('plans');
-    box.replaceChildren();
-    (plans.data || []).forEach(function (item) {
-        if (item.priceCents <= 0) {
+        if (!body.success) {
+            err.textContent = body.message || '登录失败';
             return;
         }
-        if (!simulatedPaymentEnabled) {
+        location.href = '/account';
+    };
+
+    registerForm.onsubmit = async function (event) {
+        event.preventDefault();
+        const err = document.getElementById('authErr');
+        err.textContent = '';
+        const password = document.getElementById('regPass').value;
+        if (password.length < MIN_PASSWORD_LENGTH) {
+            err.textContent = '密码至少 ' + MIN_PASSWORD_LENGTH + ' 位';
             return;
         }
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.textContent = item.name + ' · ' + yuan(item.priceCents);
-        btn.appendChild(document.createTextNode('（模拟支付）'));
-        btn.onclick = function () { buy(item.code); };
-        box.appendChild(btn);
-    });
-    const orders = await call('/api/portal/orders');
-    const tbody = document.getElementById('orders');
-    tbody.replaceChildren();
-    (orders.data || []).forEach(function (order) {
-        const tr = document.createElement('tr');
-        const cells = [
-            order.orderNo, order.planCode, yuan(order.amountCents), order.status,
-            order.expiresAt ? new Date(order.expiresAt).toLocaleString() : '—'
-        ];
-        cells.forEach(function (text) {
-            const td = document.createElement('td');
-            td.textContent = text;
-            tr.appendChild(td);
+        const body = await call('/api/portal/users', {
+            method: 'POST',
+            body: JSON.stringify({
+                username: document.getElementById('regUser').value.trim(),
+                password: password,
+                displayName: document.getElementById('regName').value.trim()
+            })
         });
-        const action = document.createElement('td');
-        if (order.status === 'PENDING') {
-            if (simulatedPaymentEnabled) {
-                const btn = document.createElement('button');
-                btn.type = 'button';
-                btn.setAttribute('aria-label', '模拟支付，不会扣款');
-                btn.textContent = '模拟支付（不扣款）';
-                btn.onclick = function () { confirmPay(order.orderNo); };
-                action.appendChild(btn);
+        if (!body.success) {
+            err.textContent = body.message || '注册失败';
+            return;
+        }
+        const fromDesktop = new URLSearchParams(location.search).get('desktop') === '1';
+        if (fromDesktop) {
+            const ticket = await call('/api/portal/desktop-ticket', { method: 'POST' });
+            if (ticket.success && ticket.data && ticket.data.ticket) {
+                location.href = 'miniagent://login?ticket=' + encodeURIComponent(ticket.data.ticket);
+                return;
             }
-            const cancel = document.createElement('button');
-            cancel.type = 'button';
-            cancel.textContent = '取消订单';
-            cancel.onclick = function () { cancelOrder(order.orderNo); };
-            action.appendChild(cancel);
         }
-        tr.appendChild(action);
-        tbody.appendChild(tr);
+        location.href = '/account';
+    };
+
+    document.getElementById('nav').addEventListener('click', function (event) {
+        const button = event.target.closest('button[data-panel]');
+        if (button) switchPanel(button.dataset.panel);
     });
-}
 
-async function buy(planCode) {
-    const err = document.getElementById('deskErr');
-    err.textContent = '';
-    const body = await call('/api/portal/orders', {
-        method: 'POST',
-        body: JSON.stringify({ planCode: planCode })
-    });
-    if (!body.success) {
-        err.textContent = body.message || '下单失败';
-        return;
+    function switchPanel(name) {
+        document.querySelectorAll('#nav button').forEach(function (item) {
+            item.classList.toggle('on', item.dataset.panel === name);
+        });
+        document.querySelectorAll('[data-panel-view]').forEach(function (panel) {
+            panel.classList.toggle('on', panel.dataset.panelView === name);
+        });
+        if (name === 'usage') loadUsage();
+        if (name === 'orders') loadOrders();
+        if (name === 'billing') loadBilling();
+        if (name === 'overview') loadOverview();
     }
-    await loadDesk();
-}
 
-async function confirmPay(orderNo) {
-    const err = document.getElementById('deskErr');
-    err.textContent = '';
-    if (!window.confirm('这是模拟支付，不会扣款。确认后会立即开通套餐，继续吗？')) {
-        return;
+    async function loadOverview() {
+        // 概览读历史汇总接口（membership_usage_events）。新明细表要等客户端上报才有数据，
+        // 概览如果也读新表，在没有上报之前会整页显示 0，看起来像坏了。
+        const legacy = await call('/api/portal/usage');
+        if (legacy.success && legacy.data) {
+            const d = legacy.data;
+            document.getElementById('ovTokens').textContent = int(d.totalTokens);
+            document.getElementById('ovCached').textContent = '—';
+            document.getElementById('ovCost').textContent = '—';
+            document.getElementById('ovCalls').textContent = int(d.llmCalls);
+        }
     }
-    const body = await call('/api/portal/orders/' + encodeURIComponent(orderNo) + '/confirm', {
-        method: 'POST'
-    });
-    if (!body.success) {
-        err.textContent = body.message || '确认失败';
-        return;
-    }
-    await loadDesk();
-}
 
-async function cancelOrder(orderNo) {
-    if (!window.confirm('确认取消这笔待支付订单吗？')) {
-        return;
-    }
-    const body = await call('/api/portal/orders/' + encodeURIComponent(orderNo) + '/cancel', {
-        method: 'POST'
-    });
-    if (!body.success) {
-        document.getElementById('deskErr').textContent = body.message || '取消失败';
-        return;
-    }
-    await loadDesk();
-}
+    document.getElementById('rangeSelect').onchange = function () {
+        callPage = 0;
+        renderEmpty();
+        loadUsage();
+    };
+    document.getElementById('refreshBtn').onclick = function () {
+        callPage = 0;
+        renderEmpty();
+        loadUsage();
+    };
+    document.getElementById('moreBtn').onclick = function () {
+        if (callPage + 1 >= callTotalPages) return;
+        callPage += 1;
+        loadCalls(true);
+    };
 
-document.getElementById('logoutBtn').onclick = async function () {
-    await call('/api/portal/logout', { method: 'POST' });
-    location.href = '/login';
-};
+    function renderEmpty() {
+        ['modelRows', 'dayRows', 'callRows'].forEach(function (id) {
+            document.getElementById(id).replaceChildren();
+        });
+        document.getElementById('moreBtn').hidden = true;
+        document.getElementById('callCount').textContent = '';
+    }
 
-const path = location.pathname.replace(/\/+$/, '') || '/';
-const fromDesktop = new URLSearchParams(location.search).get('desktop') === '1';
-if (path === '/account') {
-    loadDesk();
-} else if (path === '/register' || fromDesktop) {
-    showAuth(true);
-} else {
-    showAuth(false);
-}
+    async function loadUsage() {
+        const summary = await call('/api/portal/usage/summary');
+        if (summary.success && summary.data) {
+            const d = summary.data;
+            document.getElementById('usageRange').textContent =
+                '统计区间 ' + d.from + ' 至 ' + d.to;
+            document.getElementById('kInput').textContent = int(d.inputTokens);
+            document.getElementById('kCached').textContent = int(d.cachedInputTokens);
+            document.getElementById('kOutput').textContent = int(d.outputTokens);
+            document.getElementById('kCost').textContent = money(d.costMicros);
+
+            const modelRows = document.getElementById('modelRows');
+            modelRows.replaceChildren();
+            (d.byModel || []).forEach(function (m) {
+                const tr = document.createElement('tr');
+                cell(tr, m.model || '（未标注）');
+                cell(tr, int(m.inputTokens), 'num');
+                cell(tr, int(m.cachedInputTokens), 'num');
+                cell(tr, int(m.outputTokens), 'num');
+                cell(tr, money(m.costMicros), 'num');
+                cell(tr, int(m.eventCount), 'num');
+                modelRows.appendChild(tr);
+            });
+            document.getElementById('modelEmpty').hidden = (d.byModel || []).length > 0;
+
+            const dayRows = document.getElementById('dayRows');
+            dayRows.replaceChildren();
+            (d.byDay || []).forEach(function (day) {
+                const tr = document.createElement('tr');
+                cell(tr, day.day);
+                cell(tr, int(day.inputTokens), 'num');
+                cell(tr, int(day.cachedInputTokens), 'num');
+                cell(tr, int(day.outputTokens), 'num');
+                cell(tr, money(day.costMicros), 'num');
+                dayRows.appendChild(tr);
+            });
+            document.getElementById('dayEmpty').hidden = (d.byDay || []).length > 0;
+        }
+
+        const latency = await call('/api/portal/usage/latency');
+        if (latency.success && latency.data) {
+            const l = latency.data;
+            document.getElementById('kTtft').textContent =
+                l.ttftSamples > 0 ? millis(l.avgTtftMillis) : '—';
+            document.getElementById('kDur').textContent =
+                l.callCount > 0 ? millis(l.avgDurationMillis) : '—';
+        }
+
+        callPage = 0;
+        await loadCalls(false);
+    }
+
+    async function loadCalls(append) {
+        const body = await call('/api/portal/usage/calls?page=' + callPage + '&size=50');
+        if (!body.success || !body.data) return;
+        const page = body.data;
+        callTotalPages = page.totalPages;
+
+        const tbody = document.getElementById('callRows');
+        if (!append) tbody.replaceChildren();
+        (page.items || []).forEach(function (item) {
+            const tr = document.createElement('tr');
+            cell(tr, stamp(item.createdAt));
+            cell(tr, item.model || '—');
+            cell(tr, item.reasoningEffort || '—');
+            cell(tr, int(item.inputTokens), 'num');
+            cell(tr, int(item.cachedInputTokens), 'num');
+            cell(tr, int(item.outputTokens), 'num');
+            cell(tr, money(item.costMicros), 'num');
+            cell(tr, item.streaming ? millis(item.ttftMillis) : '—', 'num');
+            cell(tr, millis(item.durationMillis), 'num');
+            cell(tr, item.durationMillis ? tps(item.outputTokens, item.durationMillis) : '—', 'num');
+            tbody.appendChild(tr);
+        });
+        document.getElementById('callEmpty').hidden = page.total > 0;
+        document.getElementById('callCount').textContent =
+            page.total > 0 ? ('共 ' + int(page.total) + ' 次调用') : '';
+        document.getElementById('moreBtn').hidden = callPage + 1 >= callTotalPages;
+    }
+
+    async function loadBilling() {
+        const mode = await call('/api/portal/payment-mode');
+        simulatedPaymentEnabled = !!(mode.success && mode.data && mode.data.simulatedPaymentEnabled);
+        document.getElementById('paymentNotice').textContent = simulatedPaymentEnabled
+            ? '模拟支付已启用：不会产生真实扣款，确认后会立即开通所选套餐。'
+            : '真实支付渠道尚未接入，当前不能购买套餐。';
+        const plans = await call('/api/portal/plans');
+        const box = document.getElementById('plans');
+        box.replaceChildren();
+        (plans.data || []).forEach(function (item) {
+            if (item.priceCents <= 0) return;
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = item.name + ' · ' + (Number(item.priceCents) / 100).toFixed(2) + ' 元'
+                + (simulatedPaymentEnabled ? '（模拟支付）' : '');
+            btn.disabled = !simulatedPaymentEnabled;
+            btn.onclick = function () { buy(item.code); };
+            box.appendChild(btn);
+        });
+    }
+
+    async function buy(planCode) {
+        const err = document.getElementById('deskErr');
+        err.textContent = '';
+        const body = await call('/api/portal/orders', {
+            method: 'POST',
+            body: JSON.stringify({ planCode: planCode })
+        });
+        if (!body.success) {
+            err.textContent = body.message || '下单失败';
+            return;
+        }
+        await loadOrders();
+        switchPanel('orders');
+    }
+
+    async function loadOrders() {
+        const orders = await call('/api/portal/orders');
+        const tbody = document.getElementById('orderRows');
+        tbody.replaceChildren();
+        (orders.data || []).forEach(function (order) {
+            const tr = document.createElement('tr');
+            cell(tr, order.orderNo);
+            cell(tr, order.planCode);
+            cell(tr, (Number(order.amountCents) / 100).toFixed(2) + ' 元', 'num');
+            cell(tr, order.status);
+            cell(tr, order.expiresAt ? new Date(order.expiresAt).toLocaleString() : '—');
+            const action = document.createElement('td');
+            if (order.status === 'PENDING') {
+                if (simulatedPaymentEnabled) {
+                    const btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.setAttribute('aria-label', '模拟支付，不会扣款');
+                    btn.textContent = '模拟支付（不扣款）';
+                    btn.onclick = function () { confirmPay(order.orderNo); };
+                    action.appendChild(btn);
+                }
+                const cancel = document.createElement('button');
+                cancel.type = 'button';
+                cancel.className = 'ghost';
+                cancel.textContent = '取消订单';
+                cancel.onclick = function () { cancelOrder(order.orderNo); };
+                action.appendChild(cancel);
+            }
+            tr.appendChild(action);
+            tbody.appendChild(tr);
+        });
+        document.getElementById('orderEmpty').hidden = (orders.data || []).length > 0;
+    }
+
+    async function confirmPay(orderNo) {
+        const err = document.getElementById('deskErr');
+        err.textContent = '';
+        if (!window.confirm('这是模拟支付，不会扣款。确认后会立即开通套餐，继续吗？')) return;
+        const body = await call('/api/portal/orders/' + encodeURIComponent(orderNo) + '/confirm', {
+            method: 'POST'
+        });
+        if (!body.success) {
+            err.textContent = body.message || '确认失败';
+            return;
+        }
+        await loadOrders();
+    }
+
+    async function cancelOrder(orderNo) {
+        if (!window.confirm('确认取消这笔待支付订单吗？')) return;
+        const body = await call('/api/portal/orders/' + encodeURIComponent(orderNo) + '/cancel', {
+            method: 'POST'
+        });
+        if (!body.success) {
+            document.getElementById('deskErr').textContent = body.message || '取消失败';
+            return;
+        }
+        await loadOrders();
+    }
+
+    document.getElementById('logoutBtn').onclick = async function () {
+        await call('/api/portal/logout', { method: 'POST' });
+        location.href = '/login';
+    };
+
+    (async function boot() {
+        const me = await call('/api/portal/me');
+        if (!me.success) {
+            showAuth(false);
+            return;
+        }
+        authView.hidden = true;
+        appView.hidden = false;
+        document.getElementById('ovWho').textContent =
+            (me.data.displayName || me.data.username) + ' · ' + me.data.username;
+
+        const plan = await call('/api/portal/membership');
+        document.getElementById('ovPlan').textContent = plan.success
+            ? ('当前套餐 ' + plan.data.planName)
+            : (plan.message || '没有生效中的订阅');
+
+        await loadBilling();
+        switchPanel('usage');
+    })();
 </script>
 </body>
 </html>

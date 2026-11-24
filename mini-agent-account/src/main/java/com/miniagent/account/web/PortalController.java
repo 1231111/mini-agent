@@ -5,14 +5,24 @@ import com.miniagent.account.entity.User;
 import com.miniagent.account.repository.UserRepository;
 import com.miniagent.account.service.AccountAuthService;
 import com.miniagent.account.service.DesktopLoginTicketStore;
+import com.miniagent.account.service.LlmCallUsageService;
 import com.miniagent.account.service.MembershipService;
+import com.miniagent.account.service.UsageQueryService;
 import com.miniagent.account.web.dto.AccountUserResponse;
+import com.miniagent.account.web.dto.LatencyStatsResponse;
+import com.miniagent.account.web.dto.LlmCallUsageResponse;
+import com.miniagent.account.web.dto.PageResponse;
+import com.miniagent.account.web.dto.UsageSummaryResponse;
 import com.miniagent.common.ApiResponse;
 import com.miniagent.common.ErrorCode;
 import com.miniagent.common.exception.BusinessException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpSession;
 import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.data.domain.Page;
+import org.springframework.web.bind.annotation.RequestParam;
+import java.time.LocalDate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseCookie;
@@ -58,6 +68,10 @@ public class PortalController {
     private UserRepository users;
     @Autowired
     private DesktopLoginTicketStore tickets;
+    @Autowired
+    private UsageQueryService usageQueries;
+    @Autowired
+    private LlmCallUsageService callUsage;
 
     public record LoginBody(String username, String password) {
     }
@@ -185,6 +199,66 @@ public class PortalController {
     public ApiResponse<MembershipService.UsageView> usage(HttpServletRequest request) {
         Long userId = requireUser(request).getId();
         return ApiResponse.ok(membership.usageOf(userId));
+    }
+
+    /**
+     * 按「天 × 模型」汇总的用量。
+     *
+     * <p>数据来自 {@code user_daily_usage}，与旧的 {@code /api/portal/usage} 不是同一张表：
+     * 旧接口读 {@code membership_usage_events}，只有输入/输出两个数；
+     * 这里能给出缓存命中、费用、按模型拆分。</p>
+     */
+    @GetMapping(value = "/api/portal/usage/summary", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<UsageSummaryResponse> usageSummary(
+            HttpServletRequest request,
+            @RequestParam(value = "from", required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(value = "to", required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to) {
+        Long userId = requireUser(request).getId();
+        try {
+            return ApiResponse.ok(usageQueries.summary(userId, from, to));
+        } catch (IllegalArgumentException invalid) {
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, invalid.getMessage());
+        }
+    }
+
+    /** 单次调用明细：首 token、耗时、输出 TPS、模型与端点。 */
+    @GetMapping(value = "/api/portal/usage/calls", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<PageResponse<LlmCallUsageResponse>> usageCalls(
+            HttpServletRequest request,
+            @RequestParam(value = "from", required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(value = "to", required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            @RequestParam(value = "page", required = false, defaultValue = "0") int page,
+            @RequestParam(value = "size", required = false, defaultValue = "50") int size) {
+        Long userId = requireUser(request).getId();
+        try {
+            Page<LlmCallUsageResponse> result = callUsage.detail(userId, from, to, page, size);
+            return ApiResponse.ok(PageResponse.of(result, item -> item));
+        } catch (IllegalArgumentException invalid) {
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, invalid.getMessage());
+        }
+    }
+
+    /** 区间延迟：平均首 token、平均耗时、最大耗时。 */
+    @GetMapping(value = "/api/portal/usage/latency", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<LatencyStatsResponse> usageLatency(
+            HttpServletRequest request,
+            @RequestParam(value = "from", required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(value = "to", required = false)
+            @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to) {
+        Long userId = requireUser(request).getId();
+        try {
+            return ApiResponse.ok(callUsage.latency(userId, from, to));
+        } catch (IllegalArgumentException invalid) {
+            return ApiResponse.fail(ErrorCode.CONFIG_INVALID, invalid.getMessage());
+        }
     }
 
     @GetMapping(value = "/api/portal/orders", produces = MediaType.APPLICATION_JSON_VALUE)
