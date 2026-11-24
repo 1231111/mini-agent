@@ -508,7 +508,8 @@
             cell(tr, item.model || '—');
             cell(tr, item.reasoningEffort || '—');
             cell(tr, int(item.inputTokens), 'num');
-            cell(tr, int(item.cachedInputTokens), 'num');
+            // null 表示上游没返回缓存明细，不能显示 0 —— 那会被读成「零命中」。
+            cell(tr, item.cachedInputTokens === null ? '未采集' : int(item.cachedInputTokens), 'num');
             cell(tr, int(item.outputTokens), 'num');
             cell(tr, money(item.costMicros), 'num');
             cell(tr, item.streaming ? millis(item.ttftMillis) : '—', 'num');

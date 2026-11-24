@@ -14,6 +14,8 @@ import java.time.LocalDate;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -120,5 +122,37 @@ class LlmCallUsageServiceTest {
         service.record(oversized);
         LlmCallUsageResponse item = service.detail(USER, TODAY, TODAY, 0, 10).getContent().get(0);
         assertEquals(100, item.cachedInputTokens());
+    }
+
+    /** -1 是调用方「没拿到缓存明细」的约定值，必须落成 NULL，不能落成 0。 */
+    @Test
+    void unknownCachedIsStoredAsNull() {
+        service.record(new LlmCallUsageService.RecordCommand(
+                USER, "s", "unknown-cached", "m", "", "", true, "TOKEN", "",
+                10_000, -1, 500, 10_500, 0, 100, 1000, ""));
+        LlmCallUsageResponse item = service.detail(USER, TODAY, TODAY, 0, 10).getContent().get(0);
+        assertNull(item.cachedInputTokens());
+    }
+
+    /** 0 是「确认零命中」，与 NULL 必须区分，否则下游无从判断该不该按缓存价计费。 */
+    @Test
+    void zeroCachedStaysZero() {
+        service.record(new LlmCallUsageService.RecordCommand(
+                USER, "s", "zero-cached", "m", "", "", true, "TOKEN", "",
+                10_000, 0, 500, 10_500, 0, 100, 1000, ""));
+        LlmCallUsageResponse item = service.detail(USER, TODAY, TODAY, 0, 10).getContent().get(0);
+        assertEquals(0, item.cachedInputTokens());
+        assertNotNull(item.cachedInputTokens());
+    }
+
+    /** 真实命中值必须原样落库 —— 这正是「拿到了但没人读」那个静默 bug 的回归测试。 */
+    @Test
+    void cachedHitIsPersistedVerbatim() {
+        service.record(new LlmCallUsageService.RecordCommand(
+                USER, "s", "hit-cached", "m", "", "", true, "TOKEN", "",
+                19_666, 19_584, 82, 19_748, 0, 120, 900, ""));
+        LlmCallUsageResponse item = service.detail(USER, TODAY, TODAY, 0, 10).getContent().get(0);
+        assertEquals(19_584, item.cachedInputTokens());
+        assertEquals(19_666, item.inputTokens());
     }
 }

@@ -66,8 +66,14 @@ public class UserLlmCallUsage {
     @Column(name = "input_tokens", nullable = false)
     private long inputTokens;
 
-    @Column(name = "cached_input_tokens", nullable = false)
-    private long cachedInputTokens;
+    /**
+     * 缓存命中的输入 token。{@code null} = 上游未返回（未采集），0 = 确认零命中。
+     *
+     * <p>不能默认成 0：那会让"不知道"看起来像"零命中"，下游按全价计费，
+     * 而缓存价通常只有十分之一，账单会偏高 2~3 倍且没有任何报错。</p>
+     */
+    @Column(name = "cached_input_tokens")
+    private Long cachedInputTokens;
 
     @Column(name = "output_tokens", nullable = false)
     private long outputTokens;
@@ -128,8 +134,8 @@ public class UserLlmCallUsage {
     }
     public long getInputTokens() { return inputTokens; }
     public void setInputTokens(long inputTokens) { this.inputTokens = inputTokens; }
-    public long getCachedInputTokens() { return cachedInputTokens; }
-    public void setCachedInputTokens(long cachedInputTokens) { this.cachedInputTokens = cachedInputTokens; }
+    public Long getCachedInputTokens() { return cachedInputTokens; }
+    public void setCachedInputTokens(Long cachedInputTokens) { this.cachedInputTokens = cachedInputTokens; }
     public long getOutputTokens() { return outputTokens; }
     public void setOutputTokens(long outputTokens) { this.outputTokens = outputTokens; }
     public long getTotalTokens() { return totalTokens; }

@@ -7,6 +7,9 @@ import java.time.LocalDateTime;
 /**
  * 单次调用明细。字段与上游控制台的列一一对应：
  * 模型 / 推理强度 / 端点 / 类型 / 计费模式 / TOKEN / 费用 / 首 TOKEN / 耗时 / 输出 TPS / 时间 / USER-AGENT。
+ *
+ * <p>{@code cachedInputTokens} 为 {@code null} 表示上游没有返回缓存明细（未采集），
+ * 与 {@code 0}（确认零命中）语义不同。前端必须分开显示，否则用户会把"不知道"读成"没命中"。</p>
  */
 public record LlmCallUsageResponse(
         Long id,
@@ -19,7 +22,7 @@ public record LlmCallUsageResponse(
         String billingMode,
         String apiKeyHint,
         long inputTokens,
-        long cachedInputTokens,
+        Long cachedInputTokens,
         long outputTokens,
         long totalTokens,
         long costMicros,

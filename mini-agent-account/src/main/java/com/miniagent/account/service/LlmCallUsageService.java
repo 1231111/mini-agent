@@ -85,7 +85,10 @@ public class LlmCallUsageService {
 
         long input = Math.max(0, command.inputTokens());
         row.setInputTokens(input);
-        row.setCachedInputTokens(Math.min(Math.max(0, command.cachedInputTokens()), input));
+        // 负数表示调用方没拿到缓存明细（上游未返回 details），存 NULL 而不是 0。
+        // 存 0 会被当成「确认零命中」，下游按全价计费且无法自证。
+        long cachedRaw = command.cachedInputTokens();
+        row.setCachedInputTokens(cachedRaw < 0 ? null : Math.min(cachedRaw, input));
         row.setOutputTokens(Math.max(0, command.outputTokens()));
         row.setTotalTokens(command.totalTokens() > 0
                 ? command.totalTokens() : input + Math.max(0, command.outputTokens()));
