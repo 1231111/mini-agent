@@ -146,7 +146,9 @@ public class LlmCallUsageService {
     public Page<LlmCallUsageResponse> detail(Long userId, LocalDate from, LocalDate to, int page, int size) {
         if (userId == null) throw new IllegalArgumentException("userId 不能为空");
         LocalDate end = to == null ? LocalDate.now() : to;
-        LocalDate start = from == null ? end.minusDays(6) : from;
+        // 默认 30 天，与 UsageQueryService.summary 一致：三个接口对「不传日期」的理解必须相同，
+        // 否则页面上 KPI 统计 30 天、明细只列 7 天，用户会以为数据丢了。
+        LocalDate start = from == null ? end.minusDays(29) : from;
         if (start.isAfter(end)) throw new IllegalArgumentException("起始日期不能晚于结束日期");
         if (start.plusDays(UsageQueryService.MAX_RANGE_DAYS).isBefore(end))
             throw new IllegalArgumentException("查询跨度不能超过 " + UsageQueryService.MAX_RANGE_DAYS + " 天");
@@ -163,7 +165,7 @@ public class LlmCallUsageService {
     public LatencyStatsResponse latency(Long userId, LocalDate from, LocalDate to) {
         if (userId == null) throw new IllegalArgumentException("userId 不能为空");
         LocalDate end = to == null ? LocalDate.now() : to;
-        LocalDate start = from == null ? end.minusDays(6) : from;
+        LocalDate start = from == null ? end.minusDays(29) : from;
         if (start.isAfter(end)) throw new IllegalArgumentException("起始日期不能晚于结束日期");
 
         var rows = repository.latencyStats(userId, start.atStartOfDay(), end.atTime(LocalTime.MAX));

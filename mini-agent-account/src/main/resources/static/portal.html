@@ -318,6 +318,22 @@
     function stamp(value) {
         return value ? String(value).replace('T', ' ').slice(0, 19) : '—';
     }
+
+    // 本地日期按 YYYY-MM-DD 输出。
+    // 不能用 toISOString().slice(0,10)：那是 UTC 日期，北京早上 8 点前会算成前一天，
+    // 用户会看到「最近 7 天」实际查了 8 天、或者少了一天。
+    function isoDate(date) {
+        const pad = n => String(n).padStart(2, '0');
+        return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate());
+    }
+
+    // 当前选择的时间窗，供 summary / calls / latency 三个请求共用。
+    function rangeQuery() {
+        const to = new Date();
+        const from = new Date();
+        from.setDate(from.getDate() - (rangeDays - 1));
+        return 'from=' + isoDate(from) + '&to=' + isoDate(to);
+    }
     function cell(row, text, className) {
         const td = document.createElement('td');
         td.textContent = text;
@@ -443,7 +459,7 @@
     }
 
     async function loadUsage() {
-        const summary = await call('/api/portal/usage/summary');
+        const summary = await call('/api/portal/usage/summary?' + rangeQuery());
         if (summary.success && summary.data) {
             const d = summary.data;
             document.getElementById('usageRange').textContent =
@@ -481,7 +497,7 @@
             document.getElementById('dayEmpty').hidden = (d.byDay || []).length > 0;
         }
 
-        const latency = await call('/api/portal/usage/latency');
+        const latency = await call('/api/portal/usage/latency?' + rangeQuery());
         if (latency.success && latency.data) {
             const l = latency.data;
             document.getElementById('kTtft').textContent =
@@ -495,7 +511,8 @@
     }
 
     async function loadCalls(append) {
-        const body = await call('/api/portal/usage/calls?page=' + callPage + '&size=50');
+        const body = await call('/api/portal/usage/calls?' + rangeQuery()
+            + '&page=' + callPage + '&size=50');
         if (!body.success || !body.data) return;
         const page = body.data;
         callTotalPages = page.totalPages;
