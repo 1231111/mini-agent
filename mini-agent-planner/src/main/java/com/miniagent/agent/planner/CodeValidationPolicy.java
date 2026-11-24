@@ -17,6 +17,13 @@ public final class CodeValidationPolicy {
                     + "(?:更新|修改|更改|变更|update|change|modify|edit)\\s*(?:the\\s+|a\\s+|an\\s+)?[\\w./\\\\-]+\\.(?:java|py|js|jsx|ts|tsx|mjs|cjs|go|rs|cs|cpp|c|h|hpp|sql|sh|ps1|kt|kts|swift|rb|php)\\b|"
                     + "fix(?:\\s+[a-z]|\\s+bug)?\\b|"
                     + "implement|add\\s+(?:a\\s+)?feature|refactor\\s+code)");
+    private static final Pattern CODE_VALIDATION_ACTION = Pattern.compile(
+            "(?i)(检查|校验|验证|测试|审查|review|verify|validate|test|audit)");
+    private static final Pattern EXISTING_CODE_TARGET = Pattern.compile(
+            "(?i)(已有|现有|已存在|当前|existing|already[\\s-]+existing|current)");
+    private static final Pattern EXPLICITLY_NO_CODE_CHANGE = Pattern.compile(
+            "(?i)(?:不要|不必|无需|不需要|不得|禁止).{0,8}(?:修改|改动|更改|编辑|修复|写入|覆盖)|"
+                    + "(?:do\\s+not|don't|without|no\\s+need\\s+to)\\s+(?:modify|change|edit|fix|write|overwrite)");
     private static final Pattern CODE_ARTIFACT = Pattern.compile(
             "(?i)(\\.(?:java|py|js|jsx|ts|tsx|mjs|cjs|go|rs|cs|cpp|c|h|hpp|sql|sh|ps1|"
                     + "html|css|scss|sass|less|vue|svelte|kt|kts|swift|rb|php)\\b|"
@@ -36,7 +43,27 @@ public final class CodeValidationPolicy {
     private CodeValidationPolicy() {}
 
     public static boolean isCodeChangeGoal(String text) {
-        return text != null && CODE_CHANGE_GOAL.matcher(text).find();
+        return text != null && !isVerificationOnlyCodeGoal(text)
+                && CODE_CHANGE_GOAL.matcher(text).find();
+    }
+
+    /**
+     * Existing-code inspection is accepted from its verification evidence, not
+     * from a diff review. A reviewer requires a task-local diff and correctly
+     * rejects an unchanged workspace; that is the wrong completion contract
+     * when the user asked only to inspect already-existing code.
+     *
+     * <p>Explicit repair/edit language wins, except when the user explicitly
+     * forbids changes. This keeps "inspect and fix if needed" on the code-change
+     * path while "verify the existing page without edits" remains read-only.</p>
+     */
+    public static boolean isVerificationOnlyCodeGoal(String text) {
+        if (text == null || text.isBlank()
+                || !CODE_VALIDATION_ACTION.matcher(text).find()
+                || !EXISTING_CODE_TARGET.matcher(text).find()
+                || !isCodeArtifact(text)) return false;
+        if (EXPLICITLY_NO_CODE_CHANGE.matcher(text).find()) return true;
+        return !CODE_CHANGE_GOAL.matcher(text).find();
     }
 
     public static boolean isCodeArtifact(String text) {

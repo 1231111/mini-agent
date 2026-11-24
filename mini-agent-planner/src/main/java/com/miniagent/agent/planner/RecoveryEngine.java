@@ -270,7 +270,7 @@ public class RecoveryEngine {
                     null);
             StateSnapshot committed = stateStore.commit(sessionId, cur.version(), patched,
                     List.of(recoveryEvent));
-            traceRecovery(sessionId, dx);
+            traceRecovery(sessionId, dx, node);
             if (traceRecorder != null) {
                 traceRecorder.recordNode(sessionId, 0, AgentStepNode.STATE_COMMIT.name(),
                         "{\"version\":" + committed.version() + ",\"recovery\":true}",
@@ -286,18 +286,26 @@ public class RecoveryEngine {
         }
     }
 
-    private void traceRecovery(String sessionId, FailureDiagnosis dx) {
+    /**
+     * 恢复事件写进轨迹。
+     *
+     * <p>{@code taskName} 是给人看的：前端要把「从哪个节点重跑/重规划」直接渲染出来，
+     * 只有图里那串 {@code rp1_node3} 的 id 没法读。所以这里把节点名一起带上。</p>
+     */
+    private void traceRecovery(String sessionId, FailureDiagnosis dx, TaskNode failed) {
         if (traceRecorder == null) {
             return;
         }
-        String node = switch (dx.failureClass()) {
+        String stepType = switch (dx.failureClass()) {
             case LOCAL_REPAIR -> AgentStepNode.RECOVERY_LOCAL.name();
             case REPLACE_TOOL -> AgentStepNode.RECOVERY_REPLACE_TOOL.name();
             case REWRITE_GRAPH -> AgentStepNode.RECOVERY_REWRITE_GRAPH.name();
             case REVISE_GOAL -> AgentStepNode.RECOVERY_REVISE_GOAL.name();
         };
-        traceRecorder.recordNode(sessionId, 0, node,
-                "{\"taskId\":\"" + dx.taskId() + "\",\"kind\":\"" + dx.kind()
+        String taskName = failed == null ? "" : StringUtils.defaultString(failed.name());
+        traceRecorder.recordNode(sessionId, 0, stepType,
+                "{\"taskId\":\"" + dx.taskId() + "\",\"taskName\":" + quote(taskName)
+                        + ",\"kind\":\"" + dx.kind()
                         + "\",\"tool\":\"" + dx.tool()
                         + "\",\"reason\":" + quote(dx.reason()) + "}",
                 RunStatus.SUCCESS.name(), 0);

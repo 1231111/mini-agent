@@ -267,9 +267,26 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
             return null;
         }
         String ev = evidence.trim();
+        if (isAcceptanceFileSnapshot(ev)) {
+            // This envelope is created only from the evaluator's bounded,
+            // authorized, stable byte read. Preserve its metadata instead of
+            // treating its path field as a request to load plain file text.
+            return ev;
+        }
         String hinted = filePathInEvidence(ev);
         // A declared file that cannot be read must fail; its path or receipt is not its contents.
         return hinted == null ? ev : AcceptanceEvidenceFiles.readText(hinted);
+    }
+
+    private static boolean isAcceptanceFileSnapshot(String evidence) {
+        if (evidence == null || evidence.length() > 52_000 || !evidence.startsWith("{")) return false;
+        try {
+            return "ACCEPTANCE_FILE_SNAPSHOT".equals(
+                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(evidence)
+                            .path("kind").asText());
+        } catch (Exception malformed) {
+            return false;
+        }
     }
 
     static String evidenceManifest(String payload) {

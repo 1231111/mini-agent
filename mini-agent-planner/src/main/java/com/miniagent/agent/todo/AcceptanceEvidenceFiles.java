@@ -16,6 +16,9 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Objects;
 import java.util.HexFormat;
 import java.security.MessageDigest;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 /** One bounded, authorized UTF-8 snapshot; unreadable or changing artifacts are not evidence. */
 public final class AcceptanceEvidenceFiles {
@@ -27,6 +30,30 @@ public final class AcceptanceEvidenceFiles {
      * active model-context budget before making a request.
      */
     private static final int MAX_CHARS = 48_000;
+    private static final ObjectMapper JSON = new ObjectMapper();
+
+    /** Stable metadata and strict UTF-8 text decoded from the same bounded file read. */
+    public record TextSnapshot(String path, int byteLength, boolean utf8Valid,
+                               boolean utf8Bom, boolean hasLineBreak,
+                               String sha256, String content) {
+        public String toEvidenceJson() {
+            Map<String, Object> evidence = new LinkedHashMap<>();
+            evidence.put("kind", "ACCEPTANCE_FILE_SNAPSHOT");
+            evidence.put("path", path);
+            evidence.put("byteLength", byteLength);
+            evidence.put("encoding", utf8Valid ? "UTF-8" : "invalid-UTF-8");
+            evidence.put("utf8Valid", utf8Valid);
+            evidence.put("utf8Bom", utf8Bom);
+            evidence.put("hasLineBreak", hasLineBreak);
+            evidence.put("sha256", sha256);
+            evidence.put("content", content);
+            try {
+                return JSON.writeValueAsString(evidence);
+            } catch (Exception impossible) {
+                throw new IllegalStateException("Could not serialize file acceptance snapshot", impossible);
+            }
+        }
+    }
 
     private AcceptanceEvidenceFiles() { }
 
@@ -35,6 +62,12 @@ public final class AcceptanceEvidenceFiles {
     }
 
     public static String readText(String declaredPath, String expectedSha256) {
+        TextSnapshot snapshot = readSnapshot(declaredPath, expectedSha256);
+        return snapshot == null ? null : snapshot.content();
+    }
+
+    /** Read a bounded, authorized, stable byte snapshot for semantic acceptance. */
+    public static TextSnapshot readSnapshot(String declaredPath, String expectedSha256) {
         if (declaredPath == null || declaredPath.isBlank()) return null;
         try {
             Path candidate = resolveDeclaredFile(declaredPath);
@@ -70,7 +103,22 @@ public final class AcceptanceEvidenceFiles {
             String content = StandardCharsets.UTF_8.newDecoder()
                     .onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
                     .decode(ByteBuffer.wrap(bytes)).toString();
-            return content.isBlank() || content.length() > MAX_CHARS || content.indexOf('\0') >= 0 ? null : content;
+            if (content.isBlank() || content.length() > MAX_CHARS || content.indexOf('\0') >= 0) return null;
+            boolean bom = bytes.length >= 3 && (bytes[0] & 0xff) == 0xef
+                    && (bytes[1] & 0xff) == 0xbb && (bytes[2] & 0xff) == 0xbf;
+            boolean lineBreak = false;
+            for (byte value : bytes) {
+                if (value == '\n' || value == '\r') {
+                    lineBreak = true;
+                    break;
+                }
+            }
+            // The judge only needs a stable artifact label. Never send the host's
+            // absolute workspace path to a remote model as part of evidence.
+            String artifactName = candidate.getFileName() == null
+                    ? "artifact" : candidate.getFileName().toString();
+            return new TextSnapshot(artifactName, bytes.length, true, bom, lineBreak,
+                    HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)), content);
         } catch (Exception failure) {
             ModelCallControl.rethrowIfStopped(failure);
             return null;

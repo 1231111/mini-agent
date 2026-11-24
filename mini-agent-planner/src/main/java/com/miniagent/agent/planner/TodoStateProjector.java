@@ -48,12 +48,35 @@ public class TodoStateProjector {
             m.put("done_when", n.doneWhen());
             m.put("evidence", n.output());
             m.put("depends_on", deps);
+            // 重跑 / 重规划标记：页面要区分"这个节点被恢复机制重跑过"和"这是重规划新生成的节点"。
+            // retryCount 来自图节点；replanGeneration 只能从图 id 前缀 rpN_ 反推
+            // （mergeKeepSuccess 生成的新节点一律带该前缀）。
+            m.put("retry_count", n.retryCount());
+            m.put("replan_generation", replanGeneration(n.id()));
             if (n.lastError() != null && !n.lastError().isBlank()) {
                 m.put("note", n.lastError());
             }
             raw.add(m);
         }
         taskTodoStore.overwrite(sessionId, raw);
+    }
+
+    /** 图节点 id 形如 {@code rp2_node1}：2 表示第 2 次重规划生成；原始节点返回 0。 */
+    static int replanGeneration(String taskId) {
+        if (taskId == null || taskId.length() < 5 || !taskId.startsWith("rp")) {
+            return 0;
+        }
+        int sep = taskId.indexOf('_');
+        if (sep <= 2) {
+            return 0;
+        }
+        try {
+            int gen = Integer.parseInt(taskId.substring(2, sep));
+            return Math.max(0, gen);
+        }
+        catch (NumberFormatException ignored) {
+            return 0;
+        }
     }
 
     /** taskId(图节点) → todo 数字 id */

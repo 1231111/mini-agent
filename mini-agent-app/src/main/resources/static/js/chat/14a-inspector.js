@@ -190,6 +190,7 @@ async function loadInspectorCatalog() {
 async function renderInspectorSteps(sid) {
     const $steps = document.getElementById('inspSteps');
     const $tools = document.getElementById('inspTools');
+    const $events = document.getElementById('inspEvents');
     if (!$steps || !$tools) return;
 
     if (!sid) {
@@ -200,6 +201,7 @@ async function renderInspectorSteps(sid) {
         $tools.innerHTML = '<div class="insp-empty">本次任务尚未调用工具。</div>';
         const $details = document.getElementById('inspTaskDetails');
         if ($details) $details.innerHTML = '<div class="insp-empty">发起任务后显示实际执行信息。</div>';
+        if ($events) $events.innerHTML = '';
         setInspectorProgress(0, 0);
         setInspectorState('空闲', 'done');
         return;
@@ -248,7 +250,7 @@ async function renderInspectorSteps(sid) {
     const signature = JSON.stringify({
         executionId: latestExecution && latestExecution.executionId,
         userQuestion: latestExecution && latestExecution.userQuestion,
-        todos: todos.map(t => [t.id, t.content, t.status]),
+        todos: todos.map(t => [t.id, t.content, t.status, t.retryCount, t.replanGeneration]),
         steps: steps.map(s => [s.id, s.stepType, s.toolName, s.status, s.durationMs,
             s.createdAt, s.content]),
         taskRunning,
@@ -259,6 +261,7 @@ async function renderInspectorSteps(sid) {
         $steps.innerHTML = buildInspectorCurrentTask(latestExecution) + (todos.length
             ? buildInspectorTodoRows(todos, steps)
             : buildInspectorStepRows(steps, latestExecution));
+        if ($events) $events.innerHTML = buildInspectorRecoveryRows(steps);
         $tools.innerHTML = buildInspectorToolRows(steps, {
             taskRunning,
             executionStatus: latestExecution && latestExecution.status
@@ -361,7 +364,7 @@ function buildInspectorTodoRows(todos, steps) {
     const timestamps = todoTraceTimestamps(steps);
     const currentTodo = todos.find(todo => todo &&
         ['in_progress', 'awaiting_confirm'].includes(String(todo.status || '')));
-    return todos.slice(0, INSP_MAX_STEPS).map(todo => {
+    const rows = todos.slice(0, INSP_MAX_STEPS).map(todo => {
         const status = String(todo.status || 'pending');
         const state = status === 'completed' || status === 'cancelled' ? 'done'
             : status === 'awaiting_confirm' ? 'awaiting'
@@ -374,19 +377,91 @@ function buildInspectorTodoRows(todos, steps) {
         const title = shortText(todo.content || '', 100);
         const note = shortText(todo.note || '', 60);
         const time = timestamps.get(String(todo.id) + ':' + status);
+        // 规划器投影带过来的两个标记：retryCount=被恢复机制重跑过几次，
+        // replanGeneration=这条是第几次重规划生成的新节点（图 id 前缀 rpN_）。
+        const retry = Number(todo.retryCount || 0);
+        const replan = Number(todo.replanGeneration || 0);
+        const tags = [];
+        if (retry > 0) {
+            tags.push('<span class="insp-tag insp-tag-rerun" title="该节点执行失败后被恢复机制重新执行 ' +
+                retry + ' 次">重跑 ×' + retry + '</span>');
+        }
+        if (replan > 0) {
+            tags.push('<span class="insp-tag insp-tag-replan" title="该节点由第 ' + replan +
+                ' 次重规划重新生成">重规划 R' + replan + '</span>');
+        }
         const meta = [labels[status] || status,
             currentTodo && currentTodo.id === todo.id ? '当前步骤' : '',
             formatClock(time)].filter(Boolean).join(' · ');
-        return `<div class="insp-step ${state} todo-${esc(status)}">
+        const classes = ['insp-step', state, 'todo-' + status];
+        if (retry > 0) classes.push('rerun');
+        if (replan > 0) classes.push('replanned');
+        return `<div class="${classes.join(' ')}">
             <span class="insp-step-icon"></span>
             <div class="insp-step-body">
-                <div class="insp-step-title">${esc(title)}</div>
+                <div class="insp-step-title">${esc(title)}${tags.join('')}</div>
                 <div class="insp-step-meta status-meta">${esc(meta)}</div>
                 ${note ? `<div class="insp-step-meta">${esc(note)}</div>` : ''}
             </div>
         </div>`;
-    }).join('') + (todos.length > INSP_MAX_STEPS
+    }).join('');
+    return rows + (todos.length > INSP_MAX_STEPS
         ? `<div class="insp-empty">另有 ${todos.length - INSP_MAX_STEPS} 个步骤，完整轨迹见任务中心。</div>` : '');
+}
+
+/** 恢复类轨迹节点：规则恢复和模型重规划都落成这四类，页面上统一按"重跑 / 重规划"表达。 */
+const INSP_RECOVERY_KIND = {
+    RECOVERY_LOCAL: { label: '局部重跑', tone: 'rerun' },
+    RECOVERY_REPLACE_TOOL: { label: '换工具重跑', tone: 'rerun' },
+    RECOVERY_REWRITE_GRAPH: { label: '重规划', tone: 'replan' },
+    RECOVERY_REVISE_GOAL: { label: '重规划 · 改目标', tone: 'replan' }
+};
+
+function inspectorRecoveryEvents(steps) {
+    const events = [];
+    (steps || []).forEach(step => {
+        const kind = step && INSP_RECOVERY_KIND[step.stepType];
+        if (!kind) return;
+        let payload = {};
+        try {
+            payload = parseJson(step.content) || {};
+        } catch (e) {
+            payload = {};
+        }
+        events.push({
+            tone: kind.tone,
+            label: kind.label,
+            node: payload.taskName || '',
+            tool: payload.tool || '',
+            reason: shortText(payload.reason || '', 96),
+            llm: payload.llmReplan === true,
+            at: step.createdAt
+        });
+    });
+    return events;
+}
+
+function buildInspectorRecoveryRows(steps) {
+    const events = inspectorRecoveryEvents(steps);
+    if (!events.length) return '';
+    const shown = events.slice(-4);
+    const items = shown.map(ev => {
+        const where = ev.node ? '从「' + ev.node + '」' : '';
+        const why = ev.reason ? ev.reason : (ev.tool ? '工具 ' + ev.tool + ' 未通过' : '');
+        const detail = [where, why].filter(Boolean).join(' · ');
+        return `<div class="insp-event ${ev.tone}">
+            <span class="insp-event-mark"></span>
+            <div class="insp-event-body">
+                <div class="insp-event-head"><b>${esc(ev.label)}</b><span class="insp-event-time">${esc(formatClock(ev.at))}</span></div>
+                ${detail ? `<div class="insp-event-text">${esc(detail)}</div>` : ''}
+            </div>
+        </div>`;
+    }).join('');
+    const more = events.length > shown.length
+        ? `<div class="insp-event-more">更早的 ${events.length - shown.length} 次恢复事件见任务中心</div>` : '';
+    return `<div class="insp-events">
+        <div class="insp-events-head">执行事件</div>${items}${more}
+    </div>`;
 }
 
 function todoTraceTimestamps(steps) {

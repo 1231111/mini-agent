@@ -17,7 +17,7 @@ final class DataflowNormalizer {
 
     private static final String OUTPUT_SUFFIX = "_out";
     private static final Pattern FILE_IN_NAME = Pattern.compile(
-            "([A-Za-z0-9_./-]+\\.(md|txt|json|png|mmd|java|py|html"
+            "([A-Za-z0-9_./-]+\\.(md|txt|json|png|mmd|java|py|js|mjs|cjs|ts|tsx|html"
                     + "|docx|xlsx|pptx|csv|pdf))",
             Pattern.CASE_INSENSITIVE);
 

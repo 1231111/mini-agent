@@ -39,14 +39,14 @@ class AgentQuestionAnswerEndpointTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
-    // Match the application's 30-minute async task deadline, with room for the
-    // HTTP exchange to finish after the server has produced its terminal event.
-    private static final Duration RESPONSE_TIMEOUT = Duration.ofMinutes(31);
+    // Match the 30-minute Agent deadline plus the server's five-minute
+    // terminal-event grace period.
+    private static final Duration RESPONSE_TIMEOUT = Duration.ofMinutes(36);
     private static final String DEFAULT_PROMPT = "请简短回答：2 + 2 等于几？不要调用工具。";
 
     @Test
     @Tag("agent-e2e")
-    @Timeout(value = 32, unit = java.util.concurrent.TimeUnit.MINUTES)
+    @Timeout(value = 37, unit = java.util.concurrent.TimeUnit.MINUTES)
     void sendsQuestionToAgentEndpointAndReceivesCompletedAnswer() throws Exception {
         String baseUrl = setting("MINI_AGENT_E2E_BASE_URL", "agent.e2e.baseUrl", null);
         String bearerToken = setting("MINI_AGENT_E2E_BEARER_TOKEN", "agent.e2e.bearerToken", null);
@@ -78,6 +78,7 @@ class AgentQuestionAnswerEndpointTest {
         String sessionId = isNotBlank(requestedSessionId)
                 ? validateSessionId(requestedSessionId.trim())
                 : createConversation(client, root, authorization);
+        System.out.printf("AGENT_E2E_SESSION sessionId=%s%n", sessionId);
         Map<String, String> payload = new LinkedHashMap<>();
         payload.put("message", prompt);
         String permissionMode = setting("MINI_AGENT_E2E_PERMISSION_MODE", "agent.e2e.permissionMode", null);
@@ -94,8 +95,19 @@ class AgentQuestionAnswerEndpointTest {
                 .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8))
                 .build();
 
-        HttpResponse<String> response = client.send(chatRequest,
-                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response;
+        try {
+            response = client.send(chatRequest,
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        } catch (Exception requestFailure) {
+            // Preserve the original timeout/transport failure while still
+            // collecting the trace for the task that just ran.
+            printLatestTraceSafely(client, root, authorization, sessionId, requestFailure);
+            throw requestFailure;
+        }
+        // Capture trace before asserting HTTP status/content type: rejected or
+        // prematurely closed endpoints still need actionable task evidence.
+        printLatestTraceSafely(client, root, authorization, sessionId, null);
         assertThat(response.statusCode())
                 .withFailMessage("Agent endpoint returned HTTP %s", response.statusCode())
                 .isEqualTo(200);
@@ -115,7 +127,6 @@ class AgentQuestionAnswerEndpointTest {
         String status = outcome.path("status").asText("").toUpperCase(Locale.ROOT);
         String reason = outcome.path("reason").asText("");
         System.out.printf("AGENT_E2E_RESULT sessionId=%s status=%s reason=%s%n", sessionId, status, reason);
-        printLatestTrace(client, root, authorization, sessionId);
         assertThat(errorEvent)
                 .withFailMessage("Agent SSE error (status=%s, reason=%s): %s",
                         status, reason, dataOf(errorEvent))
@@ -127,6 +138,14 @@ class AgentQuestionAnswerEndpointTest {
                 .withFailMessage("Agent stream did not include its terminal end event")
                 .isNotNull();
         assertThat(endEvent.data()).isNotBlank();
+        String expectedAnswer = setting(
+                "MINI_AGENT_E2E_EXPECTED_ANSWER", "agent.e2e.expectedAnswer", null);
+        if (isNotBlank(expectedAnswer)) {
+            assertThat(endEvent.data())
+                    .withFailMessage("Agent final answer did not include expected evidence '%s': %s",
+                            expectedAnswer, clip(endEvent.data(), 1_200))
+                    .contains(expectedAnswer);
+        }
     }
 
     @Test
@@ -290,6 +309,17 @@ class AgentQuestionAnswerEndpointTest {
                 System.out.printf("AGENT_E2E_TRACE_STEP type=%s status=%s tool=%s content=%s%n",
                         type, status, step.path("toolName").asText(""), clip(content, 1800));
             }
+        }
+    }
+
+    private static void printLatestTraceSafely(HttpClient client, String root, String authorization,
+                                               String sessionId, Exception requestFailure) {
+        try {
+            printLatestTrace(client, root, authorization, sessionId);
+        } catch (Exception traceFailure) {
+            if (requestFailure != null) requestFailure.addSuppressed(traceFailure);
+            System.err.printf("AGENT_E2E_TRACE_ERROR sessionId=%s error=%s: %s%n",
+                    sessionId, traceFailure.getClass().getSimpleName(), clip(traceFailure.getMessage(), 500));
         }
     }
 

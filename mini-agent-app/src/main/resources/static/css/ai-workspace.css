@@ -102,54 +102,67 @@ body { font-family: "Inter", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-s
     background-color: var(--bg);
     background-image: radial-gradient(ellipse at 50% 0, var(--workspace-glow), transparent 56%);
 }
+/* 侧栏空间分配：上部（品牌 / 新建 / 导航 / 搜索 / 工作区）整体压紧，
+   把省下来的高度全部让给 .sb-history 里的会话列表。
+   改动前 22/12/12 内边距 + 43px 品牌块 + 42px 按钮 + 6×42px 导航，
+   在 800px 高的窗口里只剩约 120px 给任务列表；改动后同一窗口约剩 300px。 */
 .sidebar {
     background: radial-gradient(ellipse at 0 0, var(--sidebar-wash), transparent 65%), var(--sidebar-bg);
     border-right-color: var(--border);
-    padding: 22px 12px 12px;
+    padding: 12px 10px 8px;
 }
-.sb-brand { gap: 10px; padding: 0 6px 23px; }
+.sb-brand { gap: 8px; padding: 2px 4px 10px; }
 .sb-brand-mark {
-    width: 43px; height: 43px; flex: 0 0 43px;
-    border-radius: 13px;
+    width: 36px; height: 36px; flex: 0 0 36px;
+    border-radius: 11px;
     border: 1px solid var(--identity-border);
     background: var(--identity-bg);
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, .5), 0 3px 12px rgba(99, 113, 208, .08);
 }
-.sb-brand-mark svg { width: 34px; height: 34px; }
-.sb-brand-copy strong { display: flex; align-items: center; gap: 8px; font-size: 18px; font-weight: 650; letter-spacing: -.025em; }
+.sb-brand-mark svg { width: 28px; height: 28px; }
+.sb-brand-copy strong { display: flex; align-items: center; gap: 7px; font-size: 15.5px; font-weight: 650; letter-spacing: -.02em; }
 .sb-brand-copy .sb-ai-badge {
     color: var(--accent); border: 1px solid var(--identity-border); background: var(--accent-soft);
     padding: 1px 4px; border-radius: 4px; font-size: 9px; font-weight: 700; letter-spacing: .06em;
+    /* 品牌名用了 background-clip:text，父级 color 为 transparent；
+       徽章必须自己把填充色定死，否则 "AI" 两个字会跟着变透明。 */
+    -webkit-text-fill-color: var(--accent);
 }
-.sb-brand-copy > span { margin-top: 2px; font-size: 10px; letter-spacing: .06em; }
+.sb-brand-copy > span { margin-top: 1px; font-size: 10px; letter-spacing: .04em; }
 .sb-new {
-    min-height: 42px; margin-bottom: 18px; border-radius: 10px;
+    min-height: 32px; margin-bottom: 8px; padding: 0 10px; border-radius: 9px;
     color: var(--heading); border: 1px solid var(--border-strong);
     background: transparent;
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, .3);
-    font-size: 13px; font-weight: 550;
+    font-size: 12.5px; font-weight: 550;
 }
 .sb-new:hover { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
-.sb-nav { padding-bottom: 16px; margin-bottom: 15px; gap: 4px; }
-.sb-nav-item { height: 42px; gap: 12px; border-radius: 10px; color: var(--text2); font-size: 13px; }
-.sb-nav-item svg { color: var(--text2); width: 19px; height: 19px; }
+.sb-nav { padding-bottom: 6px; margin-bottom: 6px; gap: 1px; }
+.sb-nav-item { height: 31px; gap: 9px; border-radius: 9px; color: var(--text2); font-size: 12.5px; }
+.sb-nav-item svg { color: var(--text2); width: 16px; height: 16px; }
 .sb-nav-item.active { position: relative; color: var(--accent); background: var(--sidebar-selected); }
 .sb-nav-item.active svg { color: var(--accent); }
+/* 左侧发光竖条由文件末尾的 HOLO 段落接管（这里必须先清空 content，
+   否则 shell.css 的旧实现会和新样式叠在一起）。 */
 .sb-nav-item.active::before { content: none; }
-.sb-history-title { color: var(--text2); font-weight: 500; font-size: 12px; }
-.sb-search { height: 32px; background: var(--surface); border-color: var(--border); border-radius: 8px; }
+.sb-history-head { padding: 2px 2px 4px; }
+.sb-history-title { color: var(--text2); font-weight: 500; font-size: 11px; letter-spacing: .04em; }
+.sb-search { height: 27px; margin-bottom: 5px; background: var(--surface); border-color: var(--border); border-radius: 7px; }
 .sb-search input { font-size: 11px; }
 .sb-search input::placeholder { color: var(--text3); }
 .sb-search:focus-within { border-color: #5f90cf; box-shadow: 0 0 0 2px rgba(98, 158, 239, .1); }
-.sb-section { margin-top: 6px; padding-bottom: 12px; }
-.sb-item { min-height: 44px; border-radius: 10px; }
+.sb-section { margin-top: 2px; padding-bottom: 4px; }
+.sb-section-head { padding: 2px 8px 2px 8px; font-size: 11px; letter-spacing: .04em; }
+.sb-ws-item { height: 27px; font-size: 12.5px; gap: 8px; }
+.sb-item { min-height: 31px; border-radius: 9px; }
 .sb-item.active { background: var(--sidebar-selected); color: var(--heading); }
 .sb-item-title { font-size: 12px; }
 .sb-item-icon { background: var(--accent-soft); color: var(--accent); border-color: var(--border); box-shadow: none; }
-.sb-date-label { color: var(--text3); font-size: 10px; }
-.sb-footer { margin-top: 8px; }
+.sb-date-label { padding: 5px 8px 2px; color: var(--text3); font-size: 10px; }
+.sb-footer { margin-top: 4px; padding-top: 6px; padding-bottom: 4px; }
+.sb-user { padding: 4px 8px; }
 .sb-user-name { color: var(--text); }
-.sb-user-avatar { background: var(--identity-bg); border: 1px solid var(--identity-border); box-shadow: none; }
+.sb-user-avatar { width: 26px; height: 26px; font-size: 12px; background: var(--identity-bg); border: 1px solid var(--identity-border); box-shadow: none; }
 .conversation-header {
     min-height: 70px; padding: 12px 26px; gap: 12px;
     border-bottom-color: transparent; background: transparent;
@@ -246,8 +259,24 @@ body { font-family: "Inter", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-s
 .inspector-dot.running { background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 12%, transparent); }
 .inspector-dot.running + span, .inspector-dot.done + span { color: var(--success); }
 .inspector-close { color: var(--text3); }
-.insp-section, .insp-runtime-card { padding: 16px; border-radius: 15px; border-color: var(--border); background: var(--surface); box-shadow: var(--card-shadow); transform: none; }
-.insp-section:hover, .insp-runtime-card:hover { box-shadow: var(--card-shadow); border-color: var(--border-strong); transform: none; }
+/* 检查器去容器化：不再有卡片盒子。
+   信息直接浮在面板背景上，层次只靠标题、文字、状态节点和它们的连线。
+   想加回去的时候记住：一加 background/border，扫描光和节点辉光就会被切碎。 */
+.insp-section, .insp-runtime-card {
+    position: relative;
+    padding: 6px 2px 18px;
+    border: 0;
+    border-radius: 0;
+    background: none;
+    box-shadow: none;
+    transform: none;
+}
+.insp-section:hover, .insp-runtime-card:hover {
+    border: 0;
+    background: none;
+    box-shadow: none;
+    transform: none;
+}
 .insp-head { margin-bottom: 14px; gap: 8px; color: var(--heading); font-size: 13px; font-weight: 650; }
 .insp-head a { font-size: 10px; color: var(--accent); font-weight: 400; }
 .insp-head-icon { width: 26px; height: 26px; flex-basis: 26px; border-radius: 8px; box-shadow: none; }
@@ -356,4 +385,776 @@ body { font-family: "Inter", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-s
 }
 @media (prefers-reduced-motion: reduce) {
     .todo-panel, .bot-avatar, .input-box, .sidebar, .main { animation: none; transition: none; }
+}
+
+/* ==========================================================================
+   HOLO DECK — 侧栏全息投影视觉
+
+   只用 CSS 叠出来的"全息"四件套，没有任何位图资源：
+     1. 投影底座   .sb-brand::before            品牌图标下方的一团彩色辉光
+     2. 浮空倾斜   .sb-brand-mark 的 3D transform
+     3. 流动描边   .sb-brand-mark::before       1px 渐变色环 + 背景位移动画
+     4. 扫描光带   .sb-brand-mark::after        从上往下扫过的亮带，clip-path 裁进圆角
+
+   为什么不用伪元素做侧栏背景光：绝对定位伪元素在层叠顺序上会盖住非定位的子元素，
+   要修就得给每个子元素补 z-index，还会牵连 .sb-ws-menu 的弹出层级。
+   侧栏顶部辉光直接用 .sidebar 的多层 background 叠加，零层叠风险。
+   ========================================================================== */
+.sidebar {
+    --holo-a: rgba(84, 142, 255, .72);
+    --holo-b: rgba(140, 108, 240, .58);
+    --holo-c: rgba(86, 214, 255, .5);
+    --holo-scan: rgba(255, 255, 255, .9);
+    --holo-text-a: #1a45c4;
+    --holo-text-b: #5533c9;
+    background:
+        radial-gradient(72% 30% at 16% 0%, rgba(96, 152, 255, .22), transparent 72%),
+        radial-gradient(56% 24% at 84% 1%, rgba(150, 116, 255, .16), transparent 74%),
+        radial-gradient(ellipse at 0 0, var(--sidebar-wash), transparent 65%),
+        var(--sidebar-bg);
+}
+[data-theme="dark"] .sidebar {
+    --holo-a: rgba(116, 174, 255, .7);
+    --holo-b: rgba(168, 130, 255, .62);
+    --holo-c: rgba(110, 226, 255, .5);
+    --holo-scan: rgba(198, 230, 255, .85);
+    --holo-text-a: #9ec8ff;
+    --holo-text-b: #c8b0ff;
+    background:
+        radial-gradient(72% 30% at 16% 0%, rgba(48, 104, 190, .3), transparent 72%),
+        radial-gradient(56% 24% at 84% 1%, rgba(92, 66, 168, .26), transparent 74%),
+        radial-gradient(ellipse at 0 0, var(--sidebar-wash), transparent 65%),
+        var(--sidebar-bg);
+}
+
+/* —— 品牌块：投影底座 + 透视 —— */
+.sb-brand {
+    position: relative;
+    perspective: 620px;
+    perspective-origin: 26% 40%;
+}
+.sb-brand::before {
+    content: '';
+    position: absolute;
+    z-index: 0;
+    left: 0;
+    bottom: 2px;
+    width: 44px;
+    height: 14px;
+    border-radius: 50%;
+    background: radial-gradient(ellipse at center, var(--holo-a), var(--holo-c) 42%, transparent 74%);
+    filter: blur(6px);
+    opacity: .9;
+    pointer-events: none;
+    animation: holo-base 5.4s ease-in-out infinite;
+}
+/* 图标背后向上打的投影光柱：让图标看起来是"投"在侧栏上的，不是贴上去的 */
+.sb-brand::after {
+    content: '';
+    position: absolute;
+    z-index: 0;
+    left: -6px;
+    top: -8px;
+    width: 52px;
+    height: 60px;
+    pointer-events: none;
+    background: linear-gradient(180deg, transparent 4%, var(--holo-a) 52%, var(--holo-b) 88%, transparent);
+    filter: blur(7px);
+    opacity: .26;
+    mask-image: radial-gradient(58% 62% at 50% 52%, #000 12%, transparent 78%);
+    -webkit-mask-image: radial-gradient(58% 62% at 50% 52%, #000 12%, transparent 78%);
+}
+.sb-brand-copy { position: relative; z-index: 1; }
+
+/* —— 品牌图标：立起来的全息片 —— */
+.sb-brand-mark {
+    position: relative;
+    z-index: 1;
+    transform-style: preserve-3d;
+    transform: rotateY(-15deg) rotateX(7deg);
+    animation: holo-float 7.5s ease-in-out infinite;
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, .8),
+        0 6px 16px rgba(84, 130, 240, .22),
+        0 0 20px rgba(120, 160, 255, .26),
+        0 0 8px rgba(86, 214, 255, .28);
+}
+.sb-brand-mark svg { filter: drop-shadow(0 1px 4px rgba(64, 116, 226, .35)); }
+
+/* 流动描边：mask 只留 1px 边缘，里面那层渐变跟着 background-position 走 */
+.sb-brand-mark::before {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    padding: 1px;
+    border-radius: 12px;
+    background: linear-gradient(150deg, var(--holo-a), transparent 38%, var(--holo-b) 64%, transparent 88%);
+    background-size: 220% 220%;
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    mask-composite: exclude;
+    animation: holo-rim 6s linear infinite;
+    pointer-events: none;
+}
+
+/* 扫描光带：从图标上沿移到下沿，clip-path 保证不溢出圆角 */
+.sb-brand-mark::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    clip-path: inset(0 round 11px);
+    background: linear-gradient(180deg,
+        transparent 0%, transparent 34%,
+        var(--holo-scan) 50%,
+        transparent 66%, transparent 100%);
+    background-size: 100% 280%;
+    background-position: 0 -70%;
+    opacity: .5;
+    pointer-events: none;
+    animation: holo-scan 4.2s ease-in-out infinite;
+}
+
+/* —— 品牌名：全息渐变字 —— */
+.sb-brand-copy strong {
+    background-image: linear-gradient(102deg, var(--holo-text-a) 0%, #2f6fe0 42%, var(--holo-text-b) 78%, var(--holo-text-a) 100%);
+    background-size: 260% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: holo-text 9s ease-in-out infinite;
+}
+[data-theme="dark"] .sb-brand-copy strong {
+    background-image: linear-gradient(102deg, #b9d8ff 0%, #7fb4ff 42%, #c3a8ff 78%, #b9d8ff 100%);
+}
+
+/* —— 导航：悬停浮起 + 选中项发光竖条 —— */
+.sb-nav-item {
+    transform: translateZ(0);
+    transition: background .15s, color .15s, transform .18s ease, box-shadow .18s ease;
+}
+.sb-nav-item:hover {
+    transform: translateX(2px);
+    box-shadow: 0 4px 12px rgba(74, 105, 190, .12);
+}
+.sb-nav-item.active {
+    background: linear-gradient(100deg, var(--sidebar-selected), color-mix(in srgb, var(--sidebar-selected) 45%, transparent));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .6), 0 3px 10px rgba(64, 104, 200, .1);
+}
+.sb-nav-item.active::before {
+    content: '';
+    position: absolute;
+    left: 1px;
+    top: 50%;
+    width: 3px;
+    height: 14px;
+    margin-top: -7px;
+    border-radius: 2px;
+    background: linear-gradient(180deg, var(--accent), var(--accent-2));
+    box-shadow: 0 0 7px color-mix(in srgb, var(--accent) 65%, transparent);
+}
+[data-theme="dark"] .sb-nav-item.active::before { box-shadow: 0 0 9px var(--accent); }
+
+/* —— 新建任务：按下沉、松开浮起，和全息块同一套光感 —— */
+.sb-new {
+    transition: background .15s, border-color .15s, color .15s, transform .16s ease, box-shadow .16s ease;
+}
+.sb-new:hover {
+    transform: translateY(-1px);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .4), 0 6px 16px rgba(64, 104, 200, .14);
+}
+.sb-new:active { transform: translateY(1px) scale(.995); box-shadow: none; }
+
+/* —— 搜索框聚焦时接上全息色 —— */
+.sb-search:focus-within {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent), 0 0 14px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+@keyframes holo-float {
+    0%, 100% { transform: rotateY(-15deg) rotateX(7deg) translateY(0); }
+    50%      { transform: rotateY(-7deg) rotateX(3deg) translateY(-2px); }
+}
+@keyframes holo-base {
+    0%, 100% { opacity: .7; transform: scaleX(.94); }
+    50%      { opacity: .95; transform: scaleX(1.06); }
+}
+@keyframes holo-rim {
+    0%   { background-position: 0% 50%; }
+    100% { background-position: 200% 50%; }
+}
+@keyframes holo-scan {
+    0%, 12%  { background-position: 0 -70%; opacity: 0; }
+    26%      { opacity: .5; }
+    62%      { background-position: 0 170%; opacity: .5; }
+    78%, 100% { background-position: 0 170%; opacity: 0; }
+}
+@keyframes holo-text {
+    0%, 100% { background-position: 0% 50%; }
+    50%      { background-position: 100% 50%; }
+}
+
+/* ==========================================================================
+   HOLO HUD — 检查器去容器化
+
+   要求是「去掉边框，只保留文字、状态节点和连线」。所以这里把 .insp-section 的
+   背景 / 边框 / 阴影全部清掉，信息直接浮在面板背景上。
+   「全息」由三处承载，都不依赖卡片盒子：
+     · 面板顶部一层投影光（.inspector 的 background）
+     · 状态节点做成空心环 + 辉光，完成 / 进行中 / 失败各有自己的颜色
+     · 节点之间的连线是渐变发光，进行中那一段带流动
+   子块（当前任务 / 工具 / 快捷操作 / 记忆条目）同样去底色，只留图标和文字。
+   ========================================================================== */
+.inspector {
+    --hud-accent: color-mix(in srgb, var(--accent) 62%, transparent);
+    --hud-grid: rgba(64, 110, 220, .045);
+    --rerun: #d99426;
+    --rerun-ink: #a05c00;
+    --replan: #7c5cff;
+    --replan-ink: #5b3fd0;
+    gap: 2px;
+    border-left-color: transparent;
+    background:
+        radial-gradient(84% 20% at 58% -2%, color-mix(in srgb, var(--accent) 13%, transparent), transparent 74%),
+        linear-gradient(var(--hud-grid) 1px, transparent 1px) 0 0 / 24px 24px,
+        linear-gradient(90deg, var(--hud-grid) 1px, transparent 1px) 0 0 / 24px 24px,
+        linear-gradient(180deg, var(--sidebar-bg), var(--bg));
+}
+[data-theme="dark"] .inspector {
+    --hud-grid: rgba(120, 170, 255, .05);
+    --rerun: #f0b04a;
+    --rerun-ink: #f5c06a;
+    --replan: #a68cff;
+    --replan-ink: #c3b0ff;
+    background:
+        radial-gradient(84% 20% at 58% -2%, color-mix(in srgb, var(--accent) 20%, transparent), transparent 74%),
+        linear-gradient(var(--hud-grid) 1px, transparent 1px) 0 0 / 24px 24px,
+        linear-gradient(90deg, var(--hud-grid) 1px, transparent 1px) 0 0 / 24px 24px,
+        linear-gradient(180deg, var(--sidebar-bg), var(--bg));
+}
+/* 网格铺在面板背景上（background 不随内容滚动），内容本身没有底色，
+   所以网格会从字间透出来 —— 这是"信息投在投影面上"的那层底纹。 */
+
+/* —— 标题：小号 + 字距，图标改成发光线框 —— */
+.inspector-head { margin: 0 0 12px; padding: 0; }
+.inspector-title { font-size: 12px; font-weight: 600; letter-spacing: .05em; color: var(--heading); }
+.insp-head {
+    margin-bottom: 12px;
+    gap: 8px;
+    color: var(--heading);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: .05em;
+}
+.insp-head a { letter-spacing: 0; }
+.insp-head-icon {
+    width: 22px;
+    height: 22px;
+    flex-basis: 22px;
+    border-radius: 7px;
+    background: transparent;
+    border: 1px solid color-mix(in srgb, currentColor 24%, transparent);
+    box-shadow: 0 0 12px -4px color-mix(in srgb, currentColor 60%, transparent);
+    transform: none;
+}
+.insp-head-icon svg { width: 13px; height: 13px; }
+
+/* —— 状态节点：空心环 + 辉光，勾和感叹号跟着描边同色 —— */
+.insp-step-icon {
+    width: 17px;
+    height: 17px;
+    margin-top: 1px;
+    font-size: 10px;
+    border-width: 1.5px;
+    background: transparent;
+    border-color: color-mix(in srgb, var(--border-strong) 90%, transparent);
+    color: var(--text3);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 4%, transparent);
+}
+.insp-section--timeline .insp-step-icon { width: 17px; height: 17px; border-width: 1.5px; }
+.insp-step.done .insp-step-icon {
+    background: transparent;
+    border-color: var(--success);
+    color: var(--success);
+    box-shadow:
+        0 0 0 3px color-mix(in srgb, var(--success) 12%, transparent),
+        0 0 14px color-mix(in srgb, var(--success) 40%, transparent);
+}
+.insp-step.running .insp-step-icon {
+    background: transparent;
+    border-color: var(--accent);
+    color: var(--accent);
+    box-shadow:
+        0 0 0 4px color-mix(in srgb, var(--accent) 10%, transparent),
+        0 0 16px color-mix(in srgb, var(--accent) 46%, transparent);
+    animation: hud-node-pulse 2.2s ease-in-out infinite;
+}
+.insp-step.running .insp-step-icon::after {
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent);
+}
+.insp-step.failed .insp-step-icon {
+    background: transparent;
+    border-color: var(--danger);
+    color: var(--danger);
+    box-shadow:
+        0 0 0 3px color-mix(in srgb, var(--danger) 12%, transparent),
+        0 0 14px color-mix(in srgb, var(--danger) 38%, transparent);
+}
+.insp-step.awaiting .insp-step-icon {
+    background: transparent;
+    border-color: #e6a23c;
+    color: #e6a23c;
+    box-shadow:
+        0 0 0 3px rgba(230, 162, 60, .12),
+        0 0 14px rgba(230, 162, 60, .35);
+}
+.insp-step.pending .insp-step-icon,
+.insp-step.todo-pending .insp-step-icon {
+    background: transparent;
+    border-color: color-mix(in srgb, var(--border-strong) 75%, transparent);
+}
+
+/* —— 连线：渐变发光；完成的走绿色，进行中的那段往前流 —— */
+.insp-section--timeline .insp-step:not(:last-child)::before {
+    left: 8px;
+    top: 22px;
+    bottom: 2px;
+    width: 2px;
+    border-radius: 1px;
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--accent) 28%, transparent),
+        color-mix(in srgb, var(--accent) 8%, transparent));
+}
+.insp-step.done:not(:last-child)::before {
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--success) 52%, transparent),
+        color-mix(in srgb, var(--success) 10%, transparent));
+    box-shadow: 0 0 6px color-mix(in srgb, var(--success) 26%, transparent);
+}
+.insp-step.running:not(:last-child)::before {
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--accent) 18%, transparent),
+        color-mix(in srgb, var(--accent) 70%, transparent),
+        color-mix(in srgb, var(--accent) 12%, transparent));
+    background-size: 100% 220%;
+    box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 36%, transparent);
+    animation: hud-line-flow 2.6s linear infinite;
+}
+
+/* —— 节点行上的状态徽章：重跑 / 重规划 ——
+   重跑用琥珀、重规划用紫，和"失败红 / 进行中蓝 / 完成绿"互不抢色。 */
+.insp-tag {
+    display: inline-flex;
+    align-items: center;
+    height: 15px;
+    margin-left: 6px;
+    padding: 0 5px;
+    border-radius: 4px;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: .02em;
+    vertical-align: 1px;
+    white-space: nowrap;
+}
+.insp-tag-rerun {
+    color: var(--rerun-ink);
+    background: color-mix(in srgb, var(--rerun) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--rerun) 34%, transparent);
+}
+.insp-tag-replan {
+    color: var(--replan-ink);
+    background: color-mix(in srgb, var(--replan) 13%, transparent);
+    border: 1px solid color-mix(in srgb, var(--replan) 32%, transparent);
+}
+
+/* 重跑过的节点：虚线环 + 虚线连线，一眼能看出"这条不是第一次跑" */
+.insp-step.rerun .insp-step-icon {
+    border-style: dashed;
+    border-color: color-mix(in srgb, var(--rerun) 70%, transparent);
+    color: var(--rerun-ink);
+    box-shadow:
+        0 0 0 3px color-mix(in srgb, var(--rerun) 10%, transparent),
+        0 0 12px color-mix(in srgb, var(--rerun) 26%, transparent);
+}
+.insp-step.rerun:not(:last-child)::before {
+    background: repeating-linear-gradient(180deg,
+        color-mix(in srgb, var(--rerun) 52%, transparent) 0 4px,
+        transparent 4px 8px);
+    box-shadow: none;
+    animation: none;
+}
+/* 正在重跑：琥珀色涟漪从环上扩散出去 */
+.insp-step.rerun.running .insp-step-icon {
+    animation: hud-rerun-pulse 1.8s ease-out infinite;
+}
+.insp-step.replanned .insp-step-icon {
+    border-color: color-mix(in srgb, var(--replan) 58%, var(--border-strong));
+}
+
+/* —— 执行事件：重规划 / 局部重跑的时间线记录 ——
+   节点列表按依赖顺序排，事件按发生时间排，两类信息分开放，不互相打乱。 */
+.insp-events {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px dashed color-mix(in srgb, var(--border) 70%, transparent);
+}
+.insp-events-head {
+    margin-bottom: 7px;
+    color: var(--text3);
+    font-size: 10px;
+    letter-spacing: .06em;
+}
+.insp-event { display: flex; gap: 8px; padding: 4px 0; }
+.insp-event-mark {
+    flex: 0 0 7px;
+    width: 7px;
+    height: 7px;
+    margin-top: 5px;
+    border-radius: 2px;
+    transform: rotate(45deg);
+    background: var(--text3);
+}
+.insp-event.rerun .insp-event-mark {
+    background: var(--rerun);
+    box-shadow: 0 0 8px color-mix(in srgb, var(--rerun) 55%, transparent);
+}
+.insp-event.replan .insp-event-mark {
+    background: var(--replan);
+    box-shadow: 0 0 8px color-mix(in srgb, var(--replan) 55%, transparent);
+}
+.insp-event-body { flex: 1; min-width: 0; }
+.insp-event-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    color: var(--text);
+    font-size: 11px;
+    line-height: 1.5;
+}
+.insp-event-head b { font-weight: 600; }
+.insp-event-time {
+    flex: 0 0 auto;
+    color: var(--text3);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+}
+.insp-event-text {
+    margin-top: 2px;
+    color: var(--text2);
+    font-size: 10.5px;
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+}
+.insp-event-more {
+    padding-top: 4px;
+    color: var(--text3);
+    font-size: 10px;
+}
+
+/* —— 当前任务：换成左侧一条发光竖线，不要底色 —— */
+.insp-current-task {
+    position: relative;
+    padding: 0 0 0 11px;
+    border: 0;
+    border-radius: 0;
+    background: none;
+    box-shadow: none;
+}
+.insp-current-task::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 3px;
+    bottom: 3px;
+    width: 2px;
+    border-radius: 1px;
+    background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 10%, transparent));
+    box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
+/* —— 底部链接：只剩一行字，不再画按钮框 —— */
+.insp-timeline-link {
+    padding: 10px 0 0;
+    margin-top: 10px;
+    border-top: 0;
+    text-align: right;
+    font-size: 10.5px;
+    letter-spacing: .03em;
+}
+.insp-detail-link {
+    justify-content: flex-end;
+    min-height: 0;
+    margin-top: 4px;
+    padding: 6px 0 0;
+    border: 0;
+    border-radius: 0;
+    background: none;
+    font-size: 10.5px;
+    letter-spacing: .03em;
+}
+.insp-detail-link:hover { background: none; color: var(--accent-h); text-decoration: underline; }
+
+/* —— 字段行：去掉行距里的"表格感"，只留标签和值 —— */
+.insp-detail-row { padding: 5px 0; }
+.insp-kv { gap: 4px; }
+.insp-kv-row { min-height: 0; padding: 3px 0; }
+
+/* —— 记忆条目 / 工具 / 快捷操作：去底色，留图标和文字 —— */
+.insp-memory-item {
+    padding: 7px 0;
+    border: 0;
+    border-radius: 0;
+    background: none;
+    box-shadow: none;
+}
+/* 工具原来是 3 列竖排小卡，去掉容器后竖排会散，改成单列横排的执行流水 */
+.insp-tools { grid-template-columns: 1fr; gap: 0; }
+.insp-tool-card,
+.insp-tool-card:hover {
+    background: none;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+    transform: none;
+}
+.insp-tool-card[open] > summary.insp-tool { border-bottom: 0; }
+.insp-tool {
+    min-height: 0;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 9px;
+    padding: 8px 2px;
+    border: 0;
+    border-radius: 0;
+    background: none;
+    box-shadow: none;
+    text-align: left;
+    transform: none;
+    transition: background .15s;
+}
+.insp-tool:hover {
+    border: 0;
+    background: color-mix(in srgb, var(--accent) 5%, transparent);
+    transform: none;
+    box-shadow: none;
+}
+.insp-tool + .insp-tool { border-top: 0; }
+.insp-tool-card > summary.insp-tool { min-height: 0; padding: 8px 2px; }
+.insp-tool-card + .insp-tool-card {
+    border-top: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+}
+.insp-tool-main { width: auto; flex: 1; min-width: 0; }
+.insp-tool-name { font-size: 11px; }
+.insp-tool-state {
+    align-self: center;
+    margin: 0 0 0 auto;
+    padding: 0;
+    border-top: 0;
+    text-align: right;
+    white-space: nowrap;
+}
+.insp-tool-icon {
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
+    background: transparent;
+    border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
+    box-shadow: 0 0 12px -4px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+.insp-quick-action {
+    border: 0;
+    border-radius: 9px;
+    background: none;
+    padding: 4px 0;
+}
+.insp-quick-action:hover {
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+    transform: none;
+}
+/* 快捷操作只留发光线框图标，不再垫色块 */
+.insp-quick-icon,
+.quick-file, .quick-folder, .quick-knowledge {
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
+    background: transparent;
+    box-shadow: 0 0 12px -4px currentColor;
+}
+.insp-quick-icon { border: 1px solid color-mix(in srgb, currentColor 24%, transparent); }
+.quick-file { border: 1px solid color-mix(in srgb, #2874e8 26%, transparent); }
+.quick-folder { border: 1px solid color-mix(in srgb, #7053dc 26%, transparent); }
+.quick-knowledge { border: 1px solid color-mix(in srgb, #119879 26%, transparent); }
+.insp-quick-icon svg { width: 16px; height: 16px; }
+
+/* —— 进度条：细一点，带一段流动的高光 —— */
+.insp-progress {
+    height: 3px;
+    background: color-mix(in srgb, var(--border) 60%, transparent);
+    box-shadow: none;
+}
+.insp-progress-fill {
+    background: linear-gradient(90deg, #3f8bff, #6f7bff 55%, #a173ff);
+    background-size: 180% 100%;
+    box-shadow: 0 0 10px color-mix(in srgb, #5b8bff 55%, transparent);
+    animation: insp-flow 3.4s linear infinite;
+}
+
+@keyframes hud-node-pulse {
+    0%, 100% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 9%, transparent), 0 0 12px color-mix(in srgb, var(--accent) 34%, transparent); }
+    50%      { box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 4%, transparent), 0 0 20px color-mix(in srgb, var(--accent) 56%, transparent); }
+}
+@keyframes hud-line-flow {
+    0%   { background-position: 0 -60%; }
+    100% { background-position: 0 160%; }
+}
+@keyframes hud-rerun-pulse {
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--rerun) 45%, transparent), 0 0 10px color-mix(in srgb, var(--rerun) 34%, transparent); }
+    70%  { box-shadow: 0 0 0 7px color-mix(in srgb, var(--rerun) 0%, transparent), 0 0 18px color-mix(in srgb, var(--rerun) 14%, transparent); }
+    100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--rerun) 0%, transparent), 0 0 10px color-mix(in srgb, var(--rerun) 34%, transparent); }
+}
+@keyframes insp-flow {
+    to { background-position: 180% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .insp-step.running .insp-step-icon,
+    .insp-step.running:not(:last-child)::before,
+    .insp-step.rerun.running .insp-step-icon,
+    .insp-progress-fill { animation: none !important; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .sb-brand-mark,
+    .sb-brand-mark::before,
+    .sb-brand-mark::after,
+    .sb-brand::before,
+    .sb-brand-copy strong { animation: none !important; }
+    .sb-nav-item:hover, .sb-new:hover, .sb-new:active { transform: none; }
+}
+
+/* ==========================================================================
+   WORKING STATE — 对话区「智能体正在干活」的可视信号
+
+   问题现场：todo 卡片（data-state=running）已经渲染，但正文和思考都还没有内容。
+   此刻页面唯一的提示是输入框上方那行 12.5px 的「思考中」，离内容区很远，
+   气泡里则是一块空白 —— 观感就是"卡住了"。
+
+   这里补四处信号，全部由已有 class / data 属性驱动，不改流式协议：
+     1. .todo-panel[data-state="running"]  顶部扫光 + 标题脉冲点 + 进度条流动
+     2. .bot-row.is-working                头像外圈旋转弧（由 setStreaming 打标）
+     3. .live-status                       做成胶囊，不再是一行灰字
+     4. .typing-dots 补位                   正文未出时气泡里保留三点
+   ========================================================================== */
+
+/* 1) 运行中的任务面板 */
+.todo-panel[data-state="running"] {
+    position: relative;
+    overflow: hidden;
+    border-color: color-mix(in srgb, var(--accent) 30%, var(--card-border));
+}
+.todo-panel[data-state="running"]::before {
+    content: '';
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 2px;
+    background: linear-gradient(90deg,
+        transparent 0%, var(--accent) 42%,
+        color-mix(in srgb, var(--accent) 35%, transparent) 62%, transparent 100%);
+    background-size: 220% 100%;
+    animation: todo-run-sweep 2.4s linear infinite;
+    pointer-events: none;
+}
+.todo-panel[data-state="running"] .todo-progress-title::before {
+    content: '';
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin-right: 7px;
+    border-radius: 50%;
+    vertical-align: 1px;
+    background: var(--accent);
+    box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 60%, transparent);
+    animation: todo-run-dot 1.5s ease-in-out infinite;
+}
+.todo-panel[data-state="running"] .todo-progress-fill {
+    background: linear-gradient(90deg, #3f8bff, #6f7bff 48%, #a173ff);
+    background-size: 200% 100%;
+    animation: todo-run-flow 2.8s linear infinite;
+}
+.todo-panel[data-state="running"] .todo-item.in_progress .todo-text {
+    color: var(--heading);
+    font-weight: 550;
+}
+
+/* 2) 工作中的人机标识：头像外圈一道转着的弧 */
+.bot-row.is-working .bot-avatar { position: relative; }
+.bot-row.is-working .bot-avatar::after {
+    content: '';
+    position: absolute;
+    inset: -4px;
+    border-radius: inherit;
+    border: 1.5px solid transparent;
+    border-top-color: var(--accent);
+    border-right-color: color-mix(in srgb, var(--accent) 30%, transparent);
+    animation: bot-working-spin 1.7s linear infinite;
+    pointer-events: none;
+}
+.bot-row.is-working .bot-identity::after {
+    content: '';
+    width: 5px;
+    height: 5px;
+    margin-left: 2px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: todo-run-dot 1.5s ease-in-out infinite;
+}
+
+/* 3) 输入框上方的状态胶囊 */
+.live-status {
+    display: inline-flex;
+    align-items: center;
+    width: fit-content;
+    gap: 7px;
+    padding: 4px 11px 4px 9px;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+    background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+    color: var(--accent);
+    font-size: 11.5px;
+    font-weight: 500;
+    letter-spacing: .02em;
+}
+.live-status::before {
+    width: 5px;
+    height: 5px;
+    box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 65%, transparent);
+}
+
+/* 4) 正文未出时，三点占位跟在任务面板后面 */
+.todo-panel + .typing-dots { padding: 10px 2px 2px; }
+
+@keyframes todo-run-sweep {
+    0%   { background-position: -120% 0; }
+    100% { background-position: 220% 0; }
+}
+@keyframes todo-run-dot {
+    0%, 100% { opacity: .35; transform: scale(.85); }
+    50%      { opacity: 1; transform: scale(1.15); }
+}
+@keyframes todo-run-flow {
+    to { background-position: 180% 0; }
+}
+@keyframes bot-working-spin {
+    to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .todo-panel[data-state="running"]::before,
+    .todo-panel[data-state="running"] .todo-progress-title::before,
+    .todo-panel[data-state="running"] .todo-progress-fill,
+    .bot-row.is-working .bot-avatar::after,
+    .bot-row.is-working .bot-identity::after { animation: none !important; }
 }

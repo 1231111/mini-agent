@@ -26,7 +26,9 @@ spring:
     timeout-per-shutdown-phase: ${SERVER_SHUTDOWN_TIMEOUT:35m}
   mvc:
     async:
-      request-timeout: 1800000
+      # Keep the transport alive beyond the Agent's 30-minute execution
+      # deadline so the worker can persist and publish its terminal outcome.
+      request-timeout: ${AGENT_SSE_TIMEOUT_MS:2100000}
   datasource:
     # The secure default is intentional. Local development overrides this in
     # application-dev.yml; production still requires an explicit DB_URL and a
@@ -314,7 +316,9 @@ agent:
     planner-ttl-seconds: 86400
     run-lock-ttl-seconds: 7200
   sse:
-    timeout-ms: 1800000
+    # Must exceed agent.execution.deadline-ms; deadline handling and terminal
+    # trace/event persistence still need time after the Agent stops.
+    timeout-ms: ${AGENT_SSE_TIMEOUT_MS:2100000}
   observability:
     # 轨迹用于运行期排障和审计查询；聊天内容、任务状态和批准记录仍由各自
     # 的持久化表负责。定期按时间清理，避免高频 token/工具轨迹无限增长。

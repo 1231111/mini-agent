@@ -82,7 +82,9 @@ function renderTaskProgress(botBody, items, options = {}) {
     } else if (current && current.status === 'blocked') {
         heading = '步骤受阻：' + current.content; state = 'blocked';
     } else if (live && current) {
-        heading = (current.status === 'in_progress' ? '正在执行：' : '准备执行：') + current.content; state = 'running';
+        // live 已经表示"这一轮在跑"，pending 只是还没轮到它执行。
+        // 原来这里写「准备执行」，配上静态卡片读起来像没开始，是"看不出在干活"的一半原因。
+        heading = (current.status === 'in_progress' ? '正在执行：' : '正在处理：') + current.content; state = 'running';
     } else {
         heading = options.cancelled ? '任务已停止' : '任务步骤待继续'; state = 'idle';
     }
@@ -254,10 +256,19 @@ function setStreaming(on) {
     }
     $send.title = on ? '追加说明 (Enter)' : '发送 (Enter)';
     if (!on) parkLiveThink();
+    // 工作中的人机标识：气泡里的 todo 卡片和头像要能看出"在跑"。
+    // 只标最后一条机器人行 —— 往上滚的历史回复不该跟着转。
+    const rows = document.querySelectorAll('.bot-row.is-working');
+    rows.forEach(row => row.classList.remove('is-working'));
+    if (on) {
+        const botRows = document.querySelectorAll('.bot-row');
+        const liveRow = botRows[botRows.length - 1];
+        if (liveRow) liveRow.classList.add('is-working');
+    }
     const dock = document.getElementById('liveDock');
     if (dock) {
         dock.hidden = !on;
-        if (on) setLiveStatus('思考中');
+        if (on) setLiveStatus('正在思考');
     }
     onInputChange();
     refreshConfirmBanner();

@@ -545,6 +545,9 @@
         <div class="insp-progress" id="inspProgress" hidden>
             <div class="insp-progress-fill" id="inspProgressFill"></div>
         </div>
+        <!-- 重规划 / 重跑事件与节点列表分开：节点按依赖顺序排，事件按发生时间排。
+             放在 .insp-steps 外面，避免被它的 max-height 滚动区裁掉。 -->
+        <div class="insp-events-wrap" id="inspEvents"></div>
         <a class="insp-timeline-link" href="/trace">查看全部步骤 <span aria-hidden="true">›</span></a>
     </div>
 

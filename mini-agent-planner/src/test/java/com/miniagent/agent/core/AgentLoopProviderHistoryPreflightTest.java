@@ -96,11 +96,10 @@ class AgentLoopProviderHistoryPreflightTest {
                 .contains("write_file", "possible_side_effect", "missing_required_reasoning", "call-2")
                 .doesNotContain("written");
         assertThat(result.messages()).noneMatch(message -> message instanceof ToolExecutionResultMessage);
-        assertThat(result.messages()).anySatisfy(message -> {
-            assertThat(message).isInstanceOf(SystemMessage.class);
-            assertThat(((SystemMessage) message).text()).contains("write_file", "可能有副作用",
-                    "先通过只读观察核验状态", "禁止盲目重试", "trust=\"untrusted\"");
-        });
+        assertThat(result.messages()).filteredOn(SystemMessage.class::isInstance)
+                .singleElement().satisfies(message -> assertThat(((SystemMessage) message).text())
+                        .contains("write_file", "possible_side_effect",
+                                "必须先用只读观察核验当前状态", "禁止盲目重试", "trust=\"untrusted\""));
     }
 
     @Test
@@ -121,6 +120,37 @@ class AgentLoopProviderHistoryPreflightTest {
                 .contains("read_file", "read-call-1", "notes.txt", "read_only", "missing_required_reasoning")
                 .doesNotContain("private document body", "sk-123456789012345678901234567890");
         assertThat(result.diagnosticDetails().length()).isLessThanOrEqualTo(1_600);
+        assertThat(result.messages()).filteredOn(SystemMessage.class::isInstance)
+                .singleElement().satisfies(message -> {
+            String warning = ((SystemMessage) message).text();
+            assertThat(warning)
+                    .contains("相关调用及结果已从模型上下文移除", "read_only", "read_file",
+                            "read-call-1", "notes.txt", "正常工具与权限流程重新读取",
+                            "possible_side_effect", "只读观察核验当前状态")
+                    .doesNotContain("private document body", "sk-123456789012345678901234567890");
+        });
+    }
+
+    @Test
+    void droppedHistoryDiagnosticIsPersistedOnceAndDoesNotRepeatOnNextPreflight() {
+        ToolExecutionRequest call = ToolExecutionRequest.builder()
+                .id("read-repeat-1").name("read_file").arguments("{\"path\":\"notes.txt\"}").build();
+        List<ChatMessage> input = List.of(
+                UserMessage.from("Read notes.txt"),
+                AiMessage.builder().text("").toolExecutionRequests(List.of(call)).build());
+
+        AgentLoop.ToolHistoryPreflight first = AgentLoop.preflightToolMessages(input, true);
+        AgentLoop.ToolHistoryPreflight nextTurn = AgentLoop.preflightToolMessages(first.messages(), true);
+
+        assertThat(first.droppedCallMessages()).isEqualTo(1);
+        assertThat(first.messages()).anySatisfy(message -> {
+            assertThat(message).isInstanceOf(SystemMessage.class);
+            assertThat(((SystemMessage) message).text()).contains(
+                    "read_file", "read-repeat-1", "notes.txt", "read_only", "missing_required_reasoning");
+        });
+        assertThat(nextTurn.changed()).isFalse();
+        assertThat(nextTurn.messages()).hasSize(first.messages().size());
+        assertThat(nextTurn.messages().stream().filter(SystemMessage.class::isInstance).count()).isEqualTo(1);
     }
 
     @Test

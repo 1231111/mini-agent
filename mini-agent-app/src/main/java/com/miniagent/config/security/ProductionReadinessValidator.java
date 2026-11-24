@@ -19,6 +19,7 @@ import java.time.ZoneId;
 @Component
 @Profile("prod")
 public class ProductionReadinessValidator {
+    static final long SSE_TERMINAL_GRACE_MS = 60_000L;
 
     @Autowired
     private Environment environment;
@@ -52,6 +53,7 @@ public class ProductionReadinessValidator {
             errors.add("simulated membership payment must remain disabled in production");
         }
         validateIndependentJudge(errors);
+        validateStreamingTimeouts(environment, errors);
         boolean antivirusRequired = environment.getProperty(
                 "file.upload.antivirus.required", Boolean.class, false);
         boolean antivirusEnabled = environment.getProperty(
@@ -168,6 +170,29 @@ public class ProductionReadinessValidator {
             errors.add(key + " is required");
         }
         return value;
+    }
+
+    static void validateStreamingTimeouts(Environment environment, List<String> errors) {
+        long executionDeadline = environment.getProperty(
+                "agent.execution.deadline-ms", Long.class, 1_800_000L);
+        validateStreamingTimeout("agent.sse.timeout-ms",
+                environment.getProperty("agent.sse.timeout-ms", Long.class, 2_100_000L),
+                executionDeadline, errors);
+        validateStreamingTimeout("spring.mvc.async.request-timeout",
+                environment.getProperty("spring.mvc.async.request-timeout", Long.class, 2_100_000L),
+                executionDeadline, errors);
+    }
+
+    private static void validateStreamingTimeout(String property, long timeoutMs,
+                                                  long executionDeadlineMs, List<String> errors) {
+        // A non-positive Spring timeout disables the transport timeout. A
+        // finite timeout must leave room for cancellation, durable run cleanup,
+        // and publication of the terminal task outcome after the Agent deadline.
+        if (timeoutMs > 0 && (executionDeadlineMs <= 0
+                || timeoutMs - executionDeadlineMs < SSE_TERMINAL_GRACE_MS)) {
+            errors.add(property + " must be unlimited or at least "
+                    + SSE_TERMINAL_GRACE_MS + " ms longer than agent.execution.deadline-ms");
+        }
     }
 
     private String requireSecret(String key, List<String> errors) {

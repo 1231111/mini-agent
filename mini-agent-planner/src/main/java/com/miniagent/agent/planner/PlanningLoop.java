@@ -574,6 +574,7 @@ public class PlanningLoop {
 
         AcceptedNodeAnswer acceptedAnswer = null;
         int rounds = 0;
+        boolean attemptedCancelledDependencyResume = false;
         String acceptedCodeReviewHash = "";
         String unfinishedDetail = "";
         // 只有"图全部通过终验"这一条路会把 completed 置真；其余出口都是"没做完"。
@@ -734,6 +735,34 @@ public class PlanningLoop {
                 }
                 DependencyBlock blocked = firstPendingBlockedByCancelledDependency(snap.graph());
                 if (blocked != null) {
+                    if (shouldAttemptCancelledDependencyResume(
+                            resume, attemptedCancelledDependencyResume, snap.graph())) {
+                        attemptedCancelledDependencyResume = true;
+                        TaskNode cancelled = blocked.dependency();
+                        String reason = "用户明确要求继续，但未完成节点「" + blocked.node().name()
+                                + "」依赖的节点「" + cancelled.name() + "」此前因恢复耗尽而取消";
+                        FailureDiagnosis diagnosis = new FailureDiagnosis(
+                                FailureClass.REWRITE_GRAPH, FailureKind.DEPENDENCY_FAILED,
+                                cancelled.id(), "", reason,
+                                "只重规划未完成子图，保留已成功节点；对取消节点先只读核验可能已发生的结果，禁止盲目重复副作用操作");
+                        String continuationRequest = cancelledDependencyResumeRequest(snap, userMessage);
+                        log.warn("续跑发现已取消的前置节点，尝试一次有界重规划 session={} node={} blockedNode={} recoveryCount={}",
+                                sessionId, cancelled.id(), blocked.node().id(), snap.recoveryCount());
+                        RecoveryAttempt recovery = tryLlmReplan(sessionId, fencingToken, snap, cancelled,
+                                diagnosis, chat, continuationRequest, taskPlan, history, true);
+                        if (recovery.stop() != null) return recovery.stop();
+                        if (recovery.snapshot() != null) {
+                            metrics.recovery();
+                            snap = recovery.snapshot();
+                            todoProjector.project(sessionId, snap.graph());
+                            continue;
+                        }
+                        unfinishedReason = "CANCELLED_DEPENDENCY_RESUME_UNAVAILABLE";
+                        unfinishedDetail = "未完成步骤依赖一个已取消的前置步骤，且本次无法生成可验证的恢复计划。";
+                        log.warn("取消依赖续跑没有可用的恢复计划 session={} node={} dependency={}",
+                                sessionId, blocked.node().id(), cancelled.id());
+                        break;
+                    }
                     unfinishedReason = "DEPENDENCY_FAILED";
                     unfinishedDetail = "后续步骤「" + blocked.node().name() + "」因前置步骤「"
                             + blocked.dependency().name() + "」未通过验收而保留待处理。";
@@ -1904,6 +1933,15 @@ public class PlanningLoop {
                                                  TaskNode node, FailureDiagnosis dx,
                                                  ChatModel chat, String userMessage,
                                                  TaskPlan taskPlan, List<ChatMessage> history) {
+        return tryLlmReplan(sessionId, fencingToken, snap, node, dx, chat,
+                userMessage, taskPlan, history, false);
+    }
+
+    private RecoveryAttempt tryLlmReplan(String sessionId, String fencingToken, StateSnapshot snap,
+                                         TaskNode node, FailureDiagnosis dx,
+                                         ChatModel chat, String userMessage,
+                                         TaskPlan taskPlan, List<ChatMessage> history,
+                                         boolean explicitUserResume) {
         if (chat == null || snap == null || node == null || dx == null) {
             return RecoveryAttempt.notApplicable();
         }
@@ -1911,11 +1949,9 @@ public class PlanningLoop {
                 && dx.failureClass() != FailureClass.REVISE_GOAL) {
             return RecoveryAttempt.notApplicable();
         }
-        if (snap.recoveryCount() >= properties.getMaxRecoveries()) {
-            return RecoveryAttempt.notApplicable();
-        }
         int used = recoveryEngine.classCount(snap, dx.failureClass());
-        if (used >= recoveryEngine.classLimit(dx.failureClass())) {
+        if (!replanBudgetAvailable(snap.recoveryCount(), properties.getMaxRecoveries(),
+                used, recoveryEngine.classLimit(dx.failureClass()), dx.kind(), explicitUserResume)) {
             return RecoveryAttempt.notApplicable();
         }
         String correction = "失败节点 id=" + node.id()
@@ -1932,6 +1968,13 @@ public class PlanningLoop {
                 + PlannerStateJson.MAPPER.valueToTree(snap.graph().nodes().stream()
                         .filter(completed -> completed.status() == TaskNodeStatus.SUCCESS).toList())
                 + " 产出文件的步骤必须 doneWhen.type=file_exists 且 path 非空。";
+        if (explicitUserResume) {
+            correction += "\n这是用户明确续跑后的单次、有界恢复机会；已取消节点此前执行结果不能视为未发生。"
+                    + "对可能已产生副作用的动作，先安排只读状态核验，再决定是否重做；不得盲目重复写入、远程提交或桌面操作。"
+                    + "如果只读核验无法确定结果，保留阻塞并请求用户确认。已成功节点必须保留，不能重新执行。"
+                    + "\n已保存的结构化任务意图（继续遵循；不能扩大或删除原约束）："
+                    + intentJson(snap.intent());
+        }
         TaskPlan recoveryPlan = taskPlan.withTaskGoal(snap.goal().objective());
         GoalCompiler.CompileResult compiled;
         try {
@@ -2032,10 +2075,23 @@ public class PlanningLoop {
                     "ev_" + UUID.randomUUID().toString().substring(0, 8),
                     DomainEventType.RECOVERY_APPLIED, null, dx.taskId(),
                     Map.of("class", dx.failureClass().name(), "kind", dx.kind().name(),
-                            "tool", dx.tool(), "llmReplan", true),
+                            "tool", dx.tool(), "llmReplan", true,
+                            "explicitUserResume", explicitUserResume),
                     null);
             StateSnapshot committed = stateStore.commit(sessionId, snap.version(), patched,
                     List.of(recoveryEvent));
+            // 规则恢复走 RecoveryEngine.traceRecovery 打点；模型重规划这条路原来只写日志，
+            // 页面上就和"普通一次编译"没区别。这里补同一种事件，前端才能标出"重规划"。
+            AgentStepNode replanNode = dx.failureClass() == FailureClass.REVISE_GOAL
+                    ? AgentStepNode.RECOVERY_REVISE_GOAL : AgentStepNode.RECOVERY_REWRITE_GRAPH;
+            String replanTrace = "{\"taskId\":\"" + dx.taskId()
+                    + "\",\"taskName\":\"" + jsonEscape(node.name()) + "\""
+                    + ",\"kind\":\"" + dx.kind().name()
+                    + "\",\"tool\":\"" + jsonEscape(dx.tool())
+                    + "\",\"reason\":\"" + jsonEscape(dx.reason()) + "\""
+                    + ",\"llmReplan\":true,\"explicitUserResume\":" + explicitUserResume
+                    + ",\"generation\":" + (snap.recoveryCount() + 1) + "}";
+            trace(sessionId, replanNode, replanTrace);
             log.info("运行时 LLM replan 已提交 session={} nodes={}",
                     sessionId, committed.graph().nodes().size());
             return RecoveryAttempt.applied(committed);
@@ -2071,6 +2127,38 @@ public class PlanningLoop {
             detail.put("omittedWarnings", Math.max(0, validation.warnings().size() - 6));
         }
         return detail.toString();
+    }
+
+    static boolean shouldAttemptCancelledDependencyResume(boolean explicitResume,
+                                                          boolean alreadyAttempted,
+                                                          TaskGraph graph) {
+        return explicitResume && !alreadyAttempted
+                && firstPendingBlockedByCancelledDependency(graph) != null;
+    }
+
+    static boolean replanBudgetAvailable(int totalRecoveries, int maxRecoveries,
+                                         int classRecoveries, int classLimit,
+                                         FailureKind failureKind,
+                                         boolean explicitUserResume) {
+        // Only the explicit recovery branch for a cancelled dependency may
+        // reserve one continuation attempt beyond the exhausted automatic
+        // budget. Other replan causes remain under both normal circuit breakers.
+        if (explicitUserResume && failureKind == FailureKind.DEPENDENCY_FAILED) return true;
+        return totalRecoveries < maxRecoveries && classRecoveries < classLimit;
+    }
+
+    static String cancelledDependencyResumeRequest(StateSnapshot snapshot, String userMessage) {
+        String objective = snapshot == null || snapshot.goal() == null
+                ? "" : StringUtils.trimToEmpty(snapshot.goal().objective());
+        String current = StringUtils.trimToEmpty(userMessage);
+        StringBuilder request = new StringBuilder();
+        if (!objective.isBlank()) request.append("原始任务目标：\n").append(objective).append('\n');
+        request.append("用户本次明确要求继续未完成任务");
+        if (!current.isBlank() && !current.equals(objective)) {
+            request.append("；本次补充指示：").append(current);
+        }
+        request.append("。只恢复未完成部分，遵循已保存意图与原始约束；已成功节点不得重做。");
+        return request.toString();
     }
 
     /**
@@ -2591,7 +2679,7 @@ public class PlanningLoop {
     /**
      * 构建 CONTINUE_TASK 的总结信息
      */
-    private String buildContinueTaskSummary(StateSnapshot snap, String userMessage) {
+    static String buildContinueTaskSummary(StateSnapshot snap, String userMessage) {
         StringBuilder sb = new StringBuilder();
         sb.append("【上一个任务总结】\n");
 
@@ -2609,15 +2697,22 @@ public class PlanningLoop {
             long failedNodes = snap.graph().nodes().stream()
                     .filter(n -> n.status() == TaskNodeStatus.FAILED)
                     .count();
+            long cancelledNodes = snap.graph().nodes().stream()
+                    .filter(n -> n.status() == TaskNodeStatus.CANCELLED
+                            && n.toolStatus() != com.miniagent.agent.tool.ToolStatus.UNKNOWN)
+                    .count();
             long unknownNodes = snap.graph().nodes().stream()
                     .filter(n -> n.status() == TaskNodeStatus.OUTCOME_UNKNOWN
                             || n.toolStatus() == com.miniagent.agent.tool.ToolStatus.UNKNOWN)
                     .count();
-            long pendingNodes = totalNodes - completedNodes - failedNodes - unknownNodes;
+            long pendingNodes = totalNodes - completedNodes - failedNodes - cancelledNodes - unknownNodes;
 
             sb.append("任务进度：").append(completedNodes).append("/").append(totalNodes).append(" 已完成");
             if (failedNodes > 0) {
                 sb.append("，").append(failedNodes).append(" 个失败");
+            }
+            if (cancelledNodes > 0) {
+                sb.append("，").append(cancelledNodes).append(" 个因恢复耗尽取消（继续时需重新规划）");
             }
             if (unknownNodes > 0) {
                 sb.append("，").append(unknownNodes).append(" 个执行结果未知，需核验");
@@ -2663,6 +2758,8 @@ public class PlanningLoop {
         boolean allSuccess = snap.graph().allTerminalSuccess();
         boolean hasFailed = snap.graph().nodes().stream()
                 .anyMatch(n -> n.status() == TaskNodeStatus.FAILED);
+        boolean hasCancelled = snap.graph().nodes().stream()
+                .anyMatch(n -> n.status() == TaskNodeStatus.CANCELLED);
         boolean hasRunning = snap.graph().nodes().stream()
                 .anyMatch(n -> n.status() == TaskNodeStatus.RUNNING);
 
@@ -2672,6 +2769,8 @@ public class PlanningLoop {
             return "上一个任务已全部完成";
         } else if (hasFailed) {
             return "上一个任务存在失败步骤，将重新尝试执行";
+        } else if (hasCancelled) {
+            return "上一个任务有步骤因恢复耗尽被取消；继续时先重规划受阻部分，不会直接跳过依赖";
         } else if (hasRunning) {
             return "上一个任务正在执行中，将继续执行";
         } else {

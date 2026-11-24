@@ -18,6 +18,30 @@ class CodeValidationReceiptTest {
     Path temporaryDirectory;
 
     @Test
+    void existingCodeVerificationDoesNotRequireANewDiffReview() {
+        String verificationOnly = "验证当前已有 index.html 是否符合要求，不要修改或覆盖文件";
+        String verifyAndRepair = "检查现有 index.html，有问题就修复";
+        String implementation = "修复 index.html 的脚本错误并补充测试";
+
+        assertThat(CodeValidationPolicy.isVerificationOnlyCodeGoal(verificationOnly)).isTrue();
+        assertThat(CodeValidationPolicy.isCodeChangeGoal(verificationOnly)).isFalse();
+        assertThat(CodeValidationPolicy.isVerificationOnlyCodeGoal(verifyAndRepair)).isFalse();
+        assertThat(CodeValidationPolicy.isCodeChangeGoal(verifyAndRepair)).isTrue();
+        assertThat(CodeValidationPolicy.isVerificationOnlyCodeGoal(implementation)).isFalse();
+        assertThat(CodeValidationPolicy.isCodeChangeGoal(implementation)).isTrue();
+    }
+
+    @Test
+    void verificationOfExistingCodeWithoutAnExplicitMutationStaysReadOnly() {
+        assertThat(CodeValidationPolicy.isVerificationOnlyCodeGoal(
+                "请审查现有 Java 源代码并报告测试结果")).isTrue();
+        assertThat(CodeValidationPolicy.isVerificationOnlyCodeGoal(
+                "Verify the existing index.html and report whether it passes the checks")).isTrue();
+        assertThat(CodeValidationPolicy.isVerificationOnlyCodeGoal(
+                "实现新的 index.html 页面")).isFalse();
+    }
+
+    @Test
     void nodeBuiltInTestRunnerProvidesReceiptForStandaloneHtmlArtifact() {
         TaskTodoStore todos = new TaskTodoStore(temporaryDirectory.toString());
         String sessionId = "s_html_validation_receipt";

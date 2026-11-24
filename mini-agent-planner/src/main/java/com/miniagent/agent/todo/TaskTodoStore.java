@@ -70,13 +70,19 @@ public class TaskTodoStore {
      */
     public record TodoItem(int id, String content, Status status, String note,
                            String doneWhen, String evidence, String validationHash,
-                           List<Integer> dependsOn) {
+                           List<Integer> dependsOn,
+                           /** 该节点被恢复机制重新执行过几次（图节点 retryCount 的投影）。 */
+                           int retryCount,
+                           /** 0=原始计划；N>0=第 N 次重规划生成的节点（图 id 前缀 rpN_）。 */
+                           int replanGeneration) {
         public TodoItem {
             dependsOn = dependsOn == null ? List.of() : List.copyOf(dependsOn);
             validationHash = validationHash == null ? "" : validationHash;
             evidence = evidence == null ? "" : evidence;
             doneWhen = doneWhen == null ? "" : doneWhen;
             note = note == null ? "" : note;
+            retryCount = Math.max(0, retryCount);
+            replanGeneration = Math.max(0, replanGeneration);
         }
 
         public TodoItem(int id, String content, Status status, String note) {
@@ -91,6 +97,23 @@ public class TaskTodoStore {
         public TodoItem(int id, String content, Status status, String note,
                         String doneWhen, String evidence, String validationHash) {
             this(id, content, status, note, doneWhen, evidence, validationHash, List.of());
+        }
+
+        public TodoItem(int id, String content, Status status, String note,
+                        String doneWhen, String evidence, String validationHash,
+                        List<Integer> dependsOn) {
+            this(id, content, status, note, doneWhen, evidence, validationHash, dependsOn, 0, 0);
+        }
+
+        /** 改状态时保留重跑/重规划标记：标记挂在"这条任务"身上，不随状态回退消失。 */
+        public TodoItem withStatus(Status next, String nextNote) {
+            return new TodoItem(id, content, next, nextNote, doneWhen, evidence,
+                    validationHash, dependsOn, retryCount, replanGeneration);
+        }
+
+        public TodoItem withRetryMark(int nextRetry, int nextReplan) {
+            return new TodoItem(id, content, status, note, doneWhen, evidence,
+                    validationHash, dependsOn, nextRetry, nextReplan);
         }
     }
 
@@ -333,6 +356,14 @@ public class TaskTodoStore {
                 String doneWhen = serializeDoneWhen(raw.getOrDefault("done_when", raw.get("doneWhen")), !mergeRanks);
                 String evidence = str(raw.get("evidence"));
                 String hash = str(raw.getOrDefault("validation_hash", raw.get("validationHash")));
+                // 重跑 / 重规划标记由规划器投影写入；模型侧的 task.update 不带这两个键，
+                // 走下面的继承逻辑，保证"这条任务重跑过"不会因为改了状态就消失。
+                boolean retrySpecified = raw.containsKey("retry_count") || raw.containsKey("retryCount");
+                boolean replanSpecified = raw.containsKey("replan_generation") || raw.containsKey("replanGeneration");
+                int retryCount = retrySpecified
+                        ? intOrDefault(raw.getOrDefault("retry_count", raw.get("retryCount")), 0) : 0;
+                int replanGeneration = replanSpecified
+                        ? intOrDefault(raw.getOrDefault("replan_generation", raw.get("replanGeneration")), 0) : 0;
                 int id = raw.get("id") instanceof Number n ? n.intValue() : autoId;
                 if (id <= 0) {
                     id = autoId;
@@ -366,6 +397,12 @@ public class TaskTodoStore {
                             if (!depsSpecified && !old.dependsOn().isEmpty()) {
                                 deps = old.dependsOn();
                             }
+                            if (!retrySpecified) {
+                                retryCount = old.retryCount();
+                            }
+                            if (!replanSpecified) {
+                                replanGeneration = old.replanGeneration();
+                            }
                             break;
                         }
                     }
@@ -390,7 +427,8 @@ public class TaskTodoStore {
                     }
                 }
                 items.add(new TodoItem(
-                        id, content, status, note, doneWhen, evidence, hash, deps));
+                        id, content, status, note, doneWhen, evidence, hash, deps,
+                        retryCount, replanGeneration));
                 prevId = id;
                 autoId = Math.max(autoId, id) + 1;
             }
@@ -552,12 +590,14 @@ public class TaskTodoStore {
                 }
                 newHash = BuiltinSemanticTodoValidator.hashOf(
                         new TodoItem(it.id(), it.content(), it.status(), newNote,
-                                it.doneWhen(), newEvidence, "", it.dependsOn()),
+                                it.doneWhen(), newEvidence, "", it.dependsOn(),
+                                it.retryCount(), it.replanGeneration()),
                         newEvidence);
             }
 
             list.set(i, new TodoItem(it.id(), it.content(), status, newNote,
-                    it.doneWhen(), newEvidence, newHash, it.dependsOn()));
+                    it.doneWhen(), newEvidence, newHash, it.dependsOn(),
+                    it.retryCount(), it.replanGeneration()));
 
             if (status == Status.completed) {
                 promoteReadyItems(list);
@@ -605,12 +645,14 @@ public class TaskTodoStore {
             TodoItem it = list.get(i);
             if (it.id() == id) {
                 list.set(i, new TodoItem(it.id(), it.content(), Status.in_progress, note,
-                        it.doneWhen(), "", "", it.dependsOn()));
+                        it.doneWhen(), "", "", it.dependsOn(),
+                        it.retryCount(), it.replanGeneration()));
             } else if (cascade.contains(it.id())
                     && (it.status() == Status.completed || it.status() == Status.in_progress
                     || it.status() == Status.blocked)) {
                 list.set(i, new TodoItem(it.id(), it.content(), Status.pending,
-                        "upstream reopened #" + id, it.doneWhen(), "", "", it.dependsOn()));
+                        "upstream reopened #" + id, it.doneWhen(), "", "", it.dependsOn(),
+                        it.retryCount(), it.replanGeneration()));
             }
         }
         promoteReadyItems(list);
@@ -650,7 +692,8 @@ public class TaskTodoStore {
             String note = it.note() == null || it.note().isBlank()
                     ? "FULL_AUTO" : "FULL_AUTO: " + it.note().trim();
             list.set(i, new TodoItem(it.id(), it.content(), Status.in_progress, note,
-                    it.doneWhen(), it.evidence(), it.validationHash(), it.dependsOn()));
+                    it.doneWhen(), it.evidence(), it.validationHash(), it.dependsOn(),
+                    it.retryCount(), it.replanGeneration()));
             released++;
         }
         if (released > 0) {
@@ -698,7 +741,8 @@ public class TaskTodoStore {
                 }
             }
             list.set(i, new TodoItem(it.id(), it.content(), Status.in_progress, n,
-                    it.doneWhen(), it.evidence(), it.validationHash(), it.dependsOn()));
+                    it.doneWhen(), it.evidence(), it.validationHash(), it.dependsOn(),
+                    it.retryCount(), it.replanGeneration()));
             persist(key, list);
             log.info("todo #{} 已 CONFIRM，开始执行", id);
             return new ArrayList<>(list);
@@ -751,7 +795,8 @@ public class TaskTodoStore {
             }
             if (it.status() != Status.awaiting_confirm) {
                 list.set(i, new TodoItem(it.id(), it.content(), Status.awaiting_confirm, n,
-                        it.doneWhen(), it.evidence(), it.validationHash(), it.dependsOn()));
+                        it.doneWhen(), it.evidence(), it.validationHash(), it.dependsOn(),
+                        it.retryCount(), it.replanGeneration()));
                 changed = true;
             }
         }
@@ -776,7 +821,8 @@ public class TaskTodoStore {
             }
             String note = reason == null || reason.isBlank() ? "blocked" : reason.trim();
             list.set(i, new TodoItem(it.id(), it.content(), Status.blocked, note,
-                    it.doneWhen(), it.evidence(), it.validationHash(), it.dependsOn()));
+                    it.doneWhen(), it.evidence(), it.validationHash(), it.dependsOn(),
+                    it.retryCount(), it.replanGeneration()));
             persist(key, list);
             log.warn("todo #{} 已标记 blocked: {}", id, note);
             return true;
@@ -886,7 +932,8 @@ public class TaskTodoStore {
 
     private static TodoItem copyStatus(TodoItem it, Status status) {
         return new TodoItem(it.id(), it.content(), status, it.note(),
-                it.doneWhen(), it.evidence(), it.validationHash(), it.dependsOn());
+                it.doneWhen(), it.evidence(), it.validationHash(), it.dependsOn(),
+                it.retryCount(), it.replanGeneration());
     }
 
     private static TodoItem findById(List<TodoItem> list, int id) {
@@ -1328,7 +1375,8 @@ public class TaskTodoStore {
             if (item.status() == next && item.evidence().isBlank() && item.validationHash().isBlank()) continue;
             list.set(i, new TodoItem(item.id(), item.content(), next,
                     "代码可能已变更或命令结果未确认，先前的完成状态和下游验证已作废",
-                    item.doneWhen(), "", "", item.dependsOn()));
+                    item.doneWhen(), "", "", item.dependsOn(),
+                    item.retryCount(), item.replanGeneration()));
             persisted = true;
         }
         if (persisted) persist(key, list);
@@ -1600,6 +1648,22 @@ public class TaskTodoStore {
         return o == null ? "" : String.valueOf(o).trim();
     }
 
+    /** 投影侧传来的计数可能是 Integer/Long/String，统一按非负整数取。 */
+    private static int intOrDefault(Object o, int fallback) {
+        if (o instanceof Number n) {
+            return Math.max(0, n.intValue());
+        }
+        if (o != null) {
+            try {
+                return Math.max(0, Integer.parseInt(String.valueOf(o).trim()));
+            }
+            catch (NumberFormatException ignored) {
+                return fallback;
+            }
+        }
+        return fallback;
+    }
+
     /**
      * 任务级存储键。
      *
@@ -1772,7 +1836,7 @@ public class TaskTodoStore {
             List<Integer> deps = p.dependsOn == null ? List.of() : List.copyOf(p.dependsOn);
             items.add(new TodoItem(p.id, p.content, parseStatus(p.status),
                     nullToEmpty(p.note), nullToEmpty(p.doneWhen), nullToEmpty(p.evidence),
-                    nullToEmpty(p.validationHash), deps));
+                    nullToEmpty(p.validationHash), deps, p.retryCount, p.replanGeneration));
         }
         return items;
     }
@@ -1864,6 +1928,8 @@ public class TaskTodoStore {
             p.evidence = it.evidence();
             p.validationHash = it.validationHash();
             p.dependsOn = it.dependsOn() == null ? List.of() : new ArrayList<>(it.dependsOn());
+            p.retryCount = it.retryCount();
+            p.replanGeneration = it.replanGeneration();
             raw.add(p);
         }
         return raw;
@@ -2092,6 +2158,9 @@ public class TaskTodoStore {
         public String evidence;
         public String validationHash;
         public List<Integer> dependsOn;
+        /** 重跑次数与重规划代次；旧 JSON 缺这两个键时按 0 读。 */
+        public int retryCount;
+        public int replanGeneration;
     }
 
     public synchronized Map<String, Object> stats(String sessionId) {

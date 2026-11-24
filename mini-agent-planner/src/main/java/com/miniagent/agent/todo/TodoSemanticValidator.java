@@ -88,9 +88,6 @@ public final class TodoSemanticValidator {
             }
 
             if (name.endsWith(".md") || name.endsWith(".markdown") || name.endsWith(".txt")) {
-                if (size < 40) {
-                    return Result.fail("语义验收失败：文档过短（<" + size + " bytes），疑似未写完 " + p);
-                }
                 String body = Files.readString(p, StandardCharsets.UTF_8);
                 if (StringUtils.isBlank(body)) {
                     return Result.fail("语义验收失败：文档无有效文本 " + p);

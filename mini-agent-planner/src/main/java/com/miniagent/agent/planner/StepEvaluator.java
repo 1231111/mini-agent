@@ -361,9 +361,12 @@ public class StepEvaluator {
 
     /** Read the declared artifact itself; a write receipt or filename is not its semantic content. */
     private static String fileContentForSemanticCheck(String declaredPath, String expectedSha256) {
-        String content = AcceptanceEvidenceFiles.readText(declaredPath, expectedSha256);
-        // Mark this as already loaded text: a JSON artifact's own "path" field must not trigger another read.
-        return content == null ? null : "实际文件内容：\n" + content;
+        AcceptanceEvidenceFiles.TextSnapshot snapshot = AcceptanceEvidenceFiles.readSnapshot(
+                declaredPath, expectedSha256);
+        // Pass content and byte-level facts from one stable authorized read. The
+        // judge can now assess exact-size/encoding/BOM/newline requirements
+        // without trusting an executor's prose claim or rereading a raceable file.
+        return snapshot == null ? null : snapshot.toEvidenceJson();
     }
 
     static EvalResult checkCommand(String evidence) {

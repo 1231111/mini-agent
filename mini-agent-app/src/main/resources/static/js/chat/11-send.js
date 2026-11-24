@@ -359,6 +359,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 answerPaintTimer = null;
             }
             botBody.classList.remove('streaming');
+            // 收掉「正文未出」时的三点占位：这一轮可能只有任务卡片，没有正文和思考
+            removeTyping();
             // 保留助手气泡里的执行卡片、思考与时间线，只定稿答案区域
             ensureAnswer();
             if (typeof setMarkdownContent === 'function') setMarkdownContent(answerEl, html);
@@ -457,6 +459,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             // 别改回插到 timelineEl/answerEl 前面 —— 那样流式期间思考
             // 会落到 .tl-stream 之上（实测 DOM: think-panel, tl-stream, answer-stream）。
             insertAt(botBody, panelEl, null);
+            // 思考面板本身就是"在跑"的信号，三点占位可以撤了
+            removeTyping();
             // 有思考面板后不再用底部 liveDock 重复挂「思考中」
             const dock = document.getElementById('liveDock');
             if (dock) dock.hidden = true;
@@ -492,6 +496,24 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 failed: turnFailed, cancelled: turnCancelled, status: taskOutcomeStatus,
                 reason: taskOutcomeReason, allowConfirm: true
             });
+            ensureTyping();
+        }
+        /**
+         * 任务卡片先到、正文和思考都还没到的时候，气泡里只剩一块静态看板，
+         * 观感就是"卡住了"。这里补一个三点占位，等正文或思考任一出现再由
+         * paint() 的 removeTyping() 收掉。
+         */
+        function ensureTyping() {
+            if (answerEl || panelEl || turnFinishedAt) return;
+            if (botBody.querySelector('.typing-dots')) return;
+            const dots = document.createElement('div');
+            dots.className = 'typing-dots';
+            dots.innerHTML = '<span></span><span></span><span></span>';
+            if (todoEl && todoEl.parentElement === botBody) {
+                todoEl.after(dots);
+            } else {
+                botBody.appendChild(dots);
+            }
         }
         function removeTyping() {
             const t = botBody.querySelector('.typing-dots');

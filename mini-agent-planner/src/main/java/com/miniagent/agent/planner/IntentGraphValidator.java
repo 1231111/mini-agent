@@ -35,6 +35,10 @@ public final class IntentGraphValidator {
             }
             String path = normalizePath(deliverable.path());
             String name = normalize(deliverable.name());
+            // Conversation-level answers are synthesized only after the
+            // scheduler durably accepts the graph. They do not need a producer
+            // node inside the graph whose success they themselves gate.
+            if ("answer".equalsIgnoreCase(deliverable.type())) continue;
             if (path.isEmpty() && name.isEmpty()) {
                 continue;
             }
@@ -110,6 +114,7 @@ public final class IntentGraphValidator {
         }
         for (String criterion : intent.acceptanceCriteria()) {
             if (criterion == null || criterion.isBlank() || Goal.isPlaceholderCriterion(criterion)) continue;
+            if (TaskIntent.isSchedulerCompletionCriterion(criterion)) continue;
             if (!hasSemanticCheck(graph, criterion) && !hasExactFileCheck(graph, criterion)) {
                 errors.add(new PlanValidationReport.ValidationError(
                         PlanValidationReport.ValidationError.Type.GOAL_GRAPH_MISMATCH,
@@ -195,10 +200,34 @@ public final class IntentGraphValidator {
             // requirement that names that exact command. The scheduler later
             // requires the recorded exec_command receipt and exit_code=0.
             if (done.isCommand() && requirement != null
-                    && requirement.trim().equals(done.criteria().trim())) return true;
+                    && commandCriterionCovers(requirement, done.criteria())) return true;
             if (done.verifies(requirement)) return true;
         }
         return false;
+    }
+
+    private static boolean commandCriterionCovers(String requirement, String command) {
+        String normalizedRequirement = normalize(requirement);
+        String normalizedCommand = normalize(command);
+        if (normalizedRequirement.equals(normalizedCommand)) return true;
+        if (normalizedRequirement.contains("不要") || normalizedRequirement.contains("禁止")
+                || normalizedRequirement.contains("must not") || normalizedRequirement.contains("do not")) return false;
+        if (normalizedCommand.isEmpty() || !normalizedRequirement.contains(normalizedCommand)) return false;
+        boolean execution = normalizedRequirement.contains("实际执行")
+                || normalizedRequirement.contains("实际运行")
+                || normalizedRequirement.contains("实际为")
+                || normalizedRequirement.contains("执行命令")
+                || normalizedRequirement.contains("运行命令")
+                || (normalizedRequirement.contains("实际") && normalizedRequirement.contains("运行"))
+                || normalizedRequirement.contains("execute")
+                || normalizedRequirement.contains("run ");
+        boolean success = normalizedRequirement.contains("退出码")
+                || normalizedRequirement.contains("exitcode") || normalizedRequirement.contains("returncode")
+                || normalizedRequirement.contains("并通过") || normalizedRequirement.contains("测试通过")
+                || normalizedRequirement.contains("执行成功") || normalizedRequirement.contains("运行成功")
+                || normalizedRequirement.contains("且通过") || normalizedRequirement.contains("successful")
+                || normalizedRequirement.contains("passed") || normalizedRequirement.contains("验收");
+        return execution && (success || normalizedRequirement.contains("实际为"));
     }
 
     private static boolean hasExactFileCheck(TaskGraph graph, String criterion) {
