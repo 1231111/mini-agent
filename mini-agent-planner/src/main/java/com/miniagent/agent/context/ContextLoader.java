@@ -23,8 +23,7 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * 每轮按会话里是否有挂起的 todo 裁历史、释放上一任务的活动计划，
- * 并把 system prompt 交给 {@link ContextBuilder}。
+ * 每轮应用结构化任务边界、按作用域加载任务计划，并把 system prompt 交给 {@link ContextBuilder}。
  */
 @Component
 @Slf4j
@@ -80,19 +79,36 @@ public class ContextLoader {
         }
     }
 
+    /** Current identity for routing traces emitted before this turn's context is loaded. */
+    public long currentTaskId(String sessionId) {
+        if (sessionId == null) return 0L;
+        var scope = taskScopeRegistry.current(sessionId);
+        return scope == null ? 0L : parseTaskId(scope.scopeKey(), sessionId);
+    }
+
     public LoadedContext load(String sessionId, String query, boolean hasMedia,
                               List<ChatMessage> memMsgs) {
+        return load(sessionId, query, hasMedia, memMsgs, null);
+    }
+
+    /** Resolve an explicit semantic task boundary before building task-scoped context. */
+    public LoadedContext load(String sessionId, String query, boolean hasMedia,
+                              List<ChatMessage> memMsgs, TaskBoundary requestedBoundary) {
         ContextReferenceDecision ref = ContextReference.detect(query);
         ContextLoadPolicy policy = resolvePolicy(ref);
 
-        // 任务边界只有一个客观信号：现有清单非空、且每一条都已经是终态。
-        // 这不是对用户说了什么做解读 —— 清单状态本来就存在库里，查一下就能确认。
-        // 反过来，「上一任务没做完、用户又发了新消息」这一档框架不做任何判断：
-        // 清单留在当前任务里，要不要换由模型显式 task.set / task.clear 表达。
+        // 策略路由器可在本轮开始前明确给出 NEW；未完成旧任务仍保留在 paused scope。
+        // 若路由没有要求切换，已全部终结的清单仍按客观状态自动开启新 scope。
         boolean closed = false;
         TaskBoundary boundary = TaskBoundary.SAME;
         String boundaryReason = "same-task";
-        if (Objects.nonNull(sessionId)) {
+        if (Objects.nonNull(sessionId) && requestedBoundary == TaskBoundary.NEW) {
+            boundary = TaskBoundary.NEW;
+            boundaryReason = "semantic-new-task";
+        } else if (Objects.nonNull(sessionId) && requestedBoundary == TaskBoundary.RESUME) {
+            boundary = TaskBoundary.RESUME;
+            boundaryReason = "semantic-resume-task";
+        } else if (Objects.nonNull(sessionId)) {
             boolean waitingHuman = taskTodoStore.hasAwaitingConfirm(sessionId);
             if (waitingHuman) {
                 log.info("ContextLoader: 等待人工确认，保持当前任务 session={}", sessionId);

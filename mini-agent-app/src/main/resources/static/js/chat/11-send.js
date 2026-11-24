@@ -169,6 +169,12 @@ async function sendChatPost(text, sessionId, files, refs, botBody, questionCard)
 
 /** 复用的 SSE 渲染：首次发送与刷新重连共用同一套增量渲染逻辑 */
 const MAX_STREAM_RECONNECTS = 3;  // 单次发送内流意外中断后最多自动重连次数
+
+/** Main chat SSE is an independent refresh signal if the inspector trace stream is delayed or disconnected. */
+function refreshInspectorFromChatStream() {
+    if (typeof refreshInspector === 'function') refreshInspector(true);
+}
+
 async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
   const loadEpoch = window._msgLoadEpoch;
   const activeEpoch = streamEpoch;
@@ -821,6 +827,10 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                         if (payload.version != null && Number.isFinite(Number(payload.version)))
                             taskProgressVersion = Math.max(taskProgressVersion, Number(payload.version));
                         paintTodo();
+                        // Terminal status is also a reliable snapshot boundary. Refresh the
+                        // whole inspector (task, tools, memory and status) even if its own
+                        // trace SSE missed this execution's events.
+                        refreshInspectorFromChatStream();
                     }
                 } catch (_) { /* Legacy streams may not carry a structured outcome. */ }
             } else if (name === 'end') {
@@ -843,8 +853,12 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 }
                 answer = (taskOutcomeStatus === 'WAITING' ? '' : '❌ ')
                     + compactTaskFailure(data || (taskOutcomeStatus === 'WAITING' ? '等待你的操作后继续。' : '服务处理出错'));
+                refreshInspectorFromChatStream();
                 finish(renderMD(answer), turnCancelled);
             } else if (name === 'user') {
+                // The initial user echo arrives on the primary chat stream before
+                // planning completes, so the sidebar begins tracking this turn too.
+                refreshInspectorFromChatStream();
                 renderUserEchoIfNeeded(botBody, data);
             } else if (name === 'gone') {
                 // 通道没了：不在这里定稿，等读流结束后走 tryResumeOrFinish

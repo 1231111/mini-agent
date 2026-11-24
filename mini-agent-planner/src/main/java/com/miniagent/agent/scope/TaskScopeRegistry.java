@@ -23,15 +23,10 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <h2>任务边界判据</h2>
  *
- * <p><b>不用正则猜语义，也不看用户这句话像不像新任务。</b>边界只有一个来源：
- * {@code TaskTodoStore.hasOnlyTerminal(sessionId)} —— 当前清单存在、且每一条都是
- * completed / cancelled。这是库里的客观状态，查一下就能确认。</p>
- *
- * <p>未完成的清单<b>不</b>触发新任务：它留在当前任务里，要不要放弃由模型显式
- * {@code task.clear} / {@code task.set} 表达。这里删掉过一版相反的实现：
- * 用「会话里有没有被挂起的清单」当边界（{@code suspendActive} / {@code resumeSuspended}），
- * 那个条件一旦成立就恒成立，于是每一轮都把旧清单捞回来，
- * 新任务被上一个任务的计划接管。</p>
+ * <p>任务边界来自两个明确来源：已完成的待办清单会在下一轮自动开新作用域；
+ * 未完成任务则由策略路由器结合当前请求和活动任务目标，结构化判定 SAME / NEW。
+ * 语义不确定时保持 SAME，绝不靠关键词规则猜测。NEW 会保留旧作用域供显式恢复，
+ * 但新请求不会继续读旧图和旧 todo。</p>
  *
  * <p>{@link TaskBoundary#RESUME} 保留给「模型显式要求回到上一个任务」这种入口；
  * 当前没有任何代码会自己触发它 —— 自动触发就等于又回到了猜。</p>

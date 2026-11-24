@@ -1296,8 +1296,13 @@ public class TaskTodoStore {
                 .filter(it -> it.status() != Status.completed
                         && it.status() != Status.cancelled)
                 .count();
-        return "上一个任务（taskId=" + paused.taskId() + "）有 " + open
-                + " 条未完成。用户要求接着做时，调用 todo action=resume 恢复该任务；"
+        String nodes = items.stream()
+                .filter(it -> it.status() != Status.completed && it.status() != Status.cancelled)
+                .limit(6)
+                .map(it -> "\n- [" + it.status().name() + "] " + truncate(it.content(), 120))
+                .collect(java.util.stream.Collectors.joining());
+        return "上一个任务（taskId=" + paused.taskId() + "）有 " + open + " 条未完成：" + nodes + "\n"
+                + "用户要求接着做时，调用 todo action=resume 恢复该任务；"
                 + "否则按当前目标继续。\n";
     }
 

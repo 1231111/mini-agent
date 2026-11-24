@@ -71,7 +71,7 @@ function createHarness() {
         setInterval: () => ++timerId,
         clearInterval() {},
         fetch: async () => ({ ok: true, json: async () => ({ success: true }) }),
-        onInputChange() {}, bindLightbox() {}, stopPolling() {}, removeTaskRunningHint() {},
+        onInputChange() {}, bindLightbox() {}, stopPolling() {}, removeTaskRunningHint() {}, renderUserEchoIfNeeded() {},
         renderMD: text => String(text), renderMDStreaming: text => String(text),
         splitStreamingMarkdown: text => ({ frozen: '', tail: text }), dropLeadBlanks: text => text,
         esc: text => String(text), escQ: text => String(text)
@@ -79,6 +79,8 @@ function createHarness() {
     for (const filename of ['01-core.js', '07-permission.js', '10-stream.js', '11-send.js', '14a-inspector.js']) {
         vm.runInContext(fs.readFileSync(path.join(chat, filename), 'utf8'), context, { filename });
     }
+    context.__inspectorRefreshCount = 0;
+    vm.runInContext('refreshInspector = function () { __inspectorRefreshCount++; };', context);
     vm.runInContext("currentId = 'regression-session'; isStreaming = true; taskIsActive = true; taskRunningSessionId = currentId; turnStartedAt = Date.now() - 1000; turnFinishedAt = 0;", context);
     const bot = new Element();
     bot.className = 'bot-body streaming';
@@ -87,6 +89,7 @@ function createHarness() {
     row.appendChild(bot);
     return {
         context, bot,
+        inspectorRefreshCount: () => context.__inspectorRefreshCount,
         flushPaint() {
             for (const [id, timer] of [...timers]) {
                 if (timer.delay > 200) continue;
@@ -95,6 +98,17 @@ function createHarness() {
             }
         }
     };
+}
+
+{
+    const h = createHarness();
+    await consume(h, [
+        event('user', '开始一个新任务'),
+        event('task_outcome', JSON.stringify({ status: 'FAILURE', reason: 'PLAN_VALIDATION_FAILED' }))
+    ]);
+
+    assert.equal(h.inspectorRefreshCount(), 2);
+    console.log('PASS: user-start and terminal chat SSE refresh the full inspector independently of trace SSE');
 }
 
 function event(name, data) {

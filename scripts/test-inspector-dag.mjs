@@ -13,11 +13,17 @@ const files = ['13-markdown.js', '14a-inspector.js'].map(file => [
 
 function harness(initialSnapshot) {
     const elements = new Map();
-    const element = () => ({
-        innerHTML: '', hidden: false, title: '', style: {},
-        classList: { add() {}, remove() {}, contains: () => false },
-        querySelectorAll: () => []
-    });
+    const element = () => {
+        const classes = new Set();
+        return {
+            innerHTML: '', hidden: false, title: '', style: {},
+            classList: {
+                add: value => classes.add(value), remove: value => classes.delete(value),
+                contains: value => classes.has(value)
+            },
+            querySelectorAll: () => []
+        };
+    };
     for (const id of ['inspSteps', 'inspTools', 'inspEvents', 'inspTaskDetails',
         'inspProgress', 'inspProgressFill', 'inspStateDot', 'inspStateText']) {
         elements.set(id, element());
@@ -64,6 +70,45 @@ test('renders every DAG node and resolves dependencies from the todo projection'
     assert.match(html, /aria-label="完整任务 DAG"/);
     assert.match(html, /依赖：阶段 1、阶段 7、节点 #999/);
     assert.doesNotMatch(html, /另有 \d+ 个步骤/);
+});
+
+test('keeps the sidebar overall state in progress when the persisted DAG has a running node', async () => {
+    const todos = [
+        todo(1, '生成页面', 'completed'),
+        todo(2, '编写自检脚本', 'completed'),
+        todo(3, '验证页面结构完整性', 'in_progress', { dependsOn: [1, 2] }),
+        todo(4, '在浏览器中验证步骤切换', 'pending', { dependsOn: [1, 3] })
+    ];
+    const h = harness({
+        execution: { executionId: 'exec-in-progress', status: 'SUCCESS' },
+        running: false,
+        todos,
+        steps: []
+    });
+
+    await h.context.renderInspectorSteps('session-a');
+
+    assert.equal(h.elements.get('inspStateText').textContent, '进行中');
+    assert.equal(h.elements.get('inspStateDot').classList.contains('running'), true);
+    assert.match(h.elements.get('inspTaskDetails').innerHTML, /state-running/);
+    assert.match(h.elements.get('inspSteps').innerHTML, /验证页面结构完整性/);
+    assert.match(h.elements.get('inspSteps').innerHTML, /进行中/);
+    assert.match(h.elements.get('inspTaskDetails').innerHTML, /2 \/ 4 项完成/);
+});
+
+test('marks a pending-only DAG as waiting to execute, not completed', async () => {
+    const todos = [todo(1, '阶段一'), todo(2, '阶段二')];
+    const h = harness({
+        execution: { executionId: 'exec-pending', status: 'SUCCESS' },
+        running: false,
+        todos,
+        steps: []
+    });
+
+    await h.context.renderInspectorSteps('session-a');
+
+    assert.equal(h.elements.get('inspStateText').textContent, '待执行');
+    assert.equal(h.elements.get('inspStateDot').classList.contains('done'), false);
 });
 
 test('shows rerun and replan markers with a complete escaped blocking note', () => {

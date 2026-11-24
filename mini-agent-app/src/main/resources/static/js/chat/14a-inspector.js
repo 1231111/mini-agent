@@ -279,14 +279,15 @@ async function renderInspectorSteps(sid) {
         || (latestExecution && INSP_FAIL_STATUS.has(String(latestExecution.status || '').toUpperCase()));
     const waiting = todos.some(t => t && t.status === 'awaiting_confirm')
         || (latestExecution && INSP_WAIT_STATUS.has(String(latestExecution.status || '').toUpperCase()));
-    if (taskRunning) setInspectorState('进行中', 'running');
+    const nodeRunning = todos.some(t => t && t.status === 'in_progress');
+    if (taskRunning || nodeRunning) setInspectorState('进行中', 'running');
     else if (failed) setInspectorState('受阻', 'failed');
     else if (waiting) setInspectorState('待确认', 'waiting');
     else if (todos.length && todos.every(t => t.status === 'cancelled')) setInspectorState('已取消', 'done');
     else if (todos.length && todos.every(t => ['completed', 'cancelled'].includes(t.status)))
         setInspectorState('已完成', 'done');
-    else if (todos.some(t => t.status === 'pending' || t.status === 'in_progress'))
-        setInspectorState('待执行', 'done');
+    else if (todos.some(t => t.status === 'pending'))
+        setInspectorState('待执行', 'pending');
     else if (latestExecution && INSP_SUCCESS_STATUS.has(String(latestExecution.status || '').toUpperCase()))
         setInspectorState('已完成', 'done');
     else setInspectorState('空闲', 'done');

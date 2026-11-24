@@ -681,14 +681,33 @@ public class AgentChatApplicationService {
 
         ChatMemory memory = chatMemoryProvider.get(sessionId);
         List<ChatMessage> memMsgs = memory.messages();
-        // 不从用户文本匹配任务词表；加载上下文后由模型按依赖关系选择 direct / DAG。
+        // 本轮策略路由同时判断 direct/DAG 与是否属于当前活动任务。
         TaskPlan taskPlan = taskPlanFactory.build(userMessage);
         // 权限必须在拼上下文之前绑定：system prompt 的确认口径、todo 块的执行原则
         // 都要读当前会话的「模式 + 确认策略」。晚绑一步，全自动会话拿到的仍是默认值，
         // 于是闸门已经放开、提示词还在要求模型向用户讨确认。
         PermissionContext.setSession(sessionId);
-        LoadedContext loaded =
-                contextLoader.load(sessionId, userMessage, hasMedia, memMsgs);
+        List<String> savedImagePaths = hasImage ? multimodalBuilder.saveImagesToDisk(sessionId, images) : new ArrayList<>();
+        List<String> savedMediaPaths = hasAv ? multimodalBuilder.copyMediaToConversation(userId, sessionId, media) : List.of();
+        List<String> savedFilePaths = multimodalBuilder.referenceFilesForConversation(userId, uploadedFiles);
+        List<String> memoryMediaPaths = new ArrayList<>(savedImagePaths);
+        memoryMediaPaths.addAll(savedMediaPaths);
+        List<String> allSavedPaths = new ArrayList<>(memoryMediaPaths);
+        allSavedPaths.addAll(savedFilePaths);
+        UserMessage multimodalMsg = hasMedia
+                ? multimodalBuilder.buildMultimodalUserMessage(userId, userMessage, images, savedImagePaths, media, savedMediaPaths)
+                : null;
+        String displayQuestion = MultimodalMessageBuilder.buildDisplayQuestion(
+                Objects.requireNonNullElse(displayMessage, ""), images.size(), media.size());
+        List<ChatMessage> routingHistory = ChatMessageTexts.textOnlyHistory(memMsgs);
+        com.miniagent.agent.planner.PlanningRoute planningRoute;
+        try (TaskExecutionContext.Scope routingTaskScope = TaskExecutionContext.bind(
+                contextLoader.currentTaskId(sessionId))) {
+            planningRoute = planningLoop.selectRoute(
+                    effectiveChat, taskPlan, sessionId, userMessage, multimodalMsg, routingHistory);
+        }
+        LoadedContext loaded = contextLoader.load(sessionId, userMessage, hasMedia, memMsgs,
+                planningRoute == null ? null : planningRoute.taskBoundary());
         captureTaskId(taskId, loaded.taskId());
         try (TaskExecutionContext.Scope taskScope = TaskExecutionContext.bind(loaded.taskId())) {
         // 记录的 taskId 与本轮 LoadedContext 一致，并由 RunScope 传播到工具线程。
@@ -701,20 +720,6 @@ public class AgentChatApplicationService {
         // 按 loaded.scopeKey() 隔离，换任务后天然读不到旧状态。边界判定见 TaskScopeRegistry。
         // 历史一律文本化：旧轮 image_url 会让文本端点直接 400
         List<ChatMessage> history = ChatMessageTexts.textOnlyHistory(loaded.history());
-
-        List<String> savedImagePaths = hasImage ? multimodalBuilder.saveImagesToDisk(sessionId, images) : new ArrayList<>();
-        List<String> savedMediaPaths = hasAv ? multimodalBuilder.copyMediaToConversation(userId, sessionId, media) : List.of();
-        List<String> savedFilePaths = multimodalBuilder.referenceFilesForConversation(userId, uploadedFiles);
-        List<String> memoryMediaPaths = new ArrayList<>(savedImagePaths);
-        memoryMediaPaths.addAll(savedMediaPaths);
-        List<String> allSavedPaths = new ArrayList<>(memoryMediaPaths);
-        allSavedPaths.addAll(savedFilePaths);
-
-        UserMessage multimodalMsg = hasMedia
-                ? multimodalBuilder.buildMultimodalUserMessage(userId, userMessage, images, savedImagePaths, media, savedMediaPaths)
-                : null;
-        String displayQuestion = MultimodalMessageBuilder.buildDisplayQuestion(
-                Objects.requireNonNullElse(displayMessage, ""), images.size(), media.size());
 
         String firstLine = StringUtils.isNotBlank(userMessage)
                 ? userMessage.split("[\r\n]", 2)[0]
@@ -766,8 +771,6 @@ public class AgentChatApplicationService {
         try {
             String executionId = Objects.nonNull(traceRecorder)
                     ? traceRecorder.currentExecutionId() : null;
-            var planningRoute = planningLoop.selectRoute(effectiveChat, taskPlan, sessionId,
-                    userMessage, multimodalMsg, history);
             if (planningRoute == null || !planningRoute.resolved() || planningRoute.useDag()) {
                 dagInvoked = true;
                 PlanningLoop.RunOutcome outcome = planningLoop.runWithOutcome(

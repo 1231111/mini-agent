@@ -157,24 +157,47 @@ public class PlanningLoop {
                     ? "EXPLICIT_PLAN_MODE" : "RESUME_CURRENT_GRAPH");
             if (PermissionContext.mode() == PermissionMode.PLAN && !canResume(sessionId, requestText)) {
                 PlanningRoute semantic = new SemanticPlanningRouter(modelCallControl).decide(goalCompiler.resolvePlannerChat(chat),
-                        requestText == null ? plan.taskGoal() : requestText, multimodal, history);
+                        requestText == null ? plan.taskGoal() : requestText, multimodal, history,
+                        activeTaskRoutingContext(sessionId), todoProjector.resumableTaskContext(sessionId));
                 route = new PlanningRoute(true, "explicit", "EXPLICIT_PLAN_MODE; " + semantic.reason(),
-                        semantic.artifactDeliveryRequested());
+                        semantic.artifactDeliveryRequested(), semantic.taskBoundary());
             }
         } else if (!properties.isAutoPlanning()) {
             route = PlanningRoute.direct("configuration", "AUTO_PLANNING_DISABLED");
         } else {
             route = new SemanticPlanningRouter(modelCallControl).decide(goalCompiler.resolvePlannerChat(chat),
-                    requestText == null ? plan.taskGoal() : requestText, multimodal, history);
+                    requestText == null ? plan.taskGoal() : requestText, multimodal, history,
+                    activeTaskRoutingContext(sessionId), todoProjector.resumableTaskContext(sessionId));
         }
         trace(sessionId, AgentStepNode.PLANNING_ROUTE,
                 "{\"route\":\"" + route.routeName()
                         + "\",\"source\":\"" + jsonEscape(route.source())
-                        + "\",\"reason\":\"" + jsonEscape(route.reason()) + "\"}",
+                        + "\",\"reason\":\"" + jsonEscape(route.reason())
+                        + "\",\"taskBoundary\":\"" + route.taskBoundary().name() + "\"}",
                 route.resolved() ? RunStatus.SUCCESS : RunStatus.FAILURE);
-        log.info("任务策略 session={} route={} source={} reason={}", sessionId,
-                route.routeName(), route.source(), route.reason());
+        log.info("任务策略 session={} route={} source={} boundary={} reason={}", sessionId,
+                route.routeName(), route.source(), route.taskBoundary(), route.reason());
         return route;
+    }
+
+    private String activeTaskRoutingContext(String sessionId) {
+        if (StringUtils.isBlank(sessionId)) return "";
+        String graphContext = stateStore.get(sessionId).filter(snapshot -> snapshot.graph() != null
+                        && !snapshot.graph().isEmpty())
+                .map(snapshot -> {
+                    StringBuilder context = new StringBuilder("objective: ")
+                            .append(snapshot.goal() == null ? "" : snapshot.goal().objective());
+                    for (TaskNode node : snapshot.graph().nodes()) {
+                        if (context.length() >= 3_500) break;
+                        context.append("\n- [").append(node.status().name()).append("] ")
+                                .append(node.name());
+                    }
+                    return context.toString();
+                }).orElse("");
+        String checklistContext = todoProjector.currentTaskContext(sessionId);
+        if (graphContext.isBlank()) return checklistContext;
+        if (checklistContext.isBlank()) return graphContext;
+        return graphContext + "\n" + checklistContext;
     }
 
     /**

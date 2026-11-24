@@ -20,6 +20,25 @@ public class TodoStateProjector {
         this.taskTodoStore = taskTodoStore;
     }
 
+    /** Read-only routing hint for an explicitly resumable prior task. */
+    public String resumableTaskContext(String sessionId) {
+        return taskTodoStore == null ? "" : taskTodoStore.renderResumableHint(sessionId);
+    }
+
+    /** Compact, user-visible goals for tasks that predate or do not use a Planner graph. */
+    public String currentTaskContext(String sessionId) {
+        if (taskTodoStore == null || sessionId == null || sessionId.isBlank()) return "";
+        List<TaskTodoStore.TodoItem> items = taskTodoStore.get(sessionId);
+        if (items.isEmpty()) return "";
+        StringBuilder context = new StringBuilder("active checklist:");
+        for (TaskTodoStore.TodoItem item : items) {
+            if (context.length() >= 3_500) break;
+            context.append("\n- [").append(item.status().name()).append("] ")
+                    .append(conciseSummary(item.content()));
+        }
+        return context.toString();
+    }
+
     public void project(String sessionId, TaskGraph graph) {
         project(sessionId, graph, null);
     }
