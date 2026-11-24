@@ -57,6 +57,8 @@ public class TaskAdmissionGuard {
                     return Decision.BUSY;
                 // 额度放在最后一步：前面几步是本机状态检查，比一次远程查询便宜，
                 // 而且 BUSY 的情况下没必要去问额度。
+                // 额度兜底：HTTP 入口已由 TokenQuotaFilter 在更前面拦住，这里覆盖非 HTTP 触发的
+                // 任务（恢复、定时等）。两者共用同一份 5 分钟缓存，不会多打账号服务。
                 return entitlements.rejectionReason(userId) != null
                         ? Decision.QUOTA_EXCEEDED : Decision.ALLOW;
             } finally {

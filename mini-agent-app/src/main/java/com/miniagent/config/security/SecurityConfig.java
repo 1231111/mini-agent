@@ -195,7 +195,8 @@ public class SecurityConfig {
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http,
                                                    SignedSessionFilter signedSessionFilter,
-                                                   RateLimitFilter rateLimitFilter) throws Exception {
+                                                   RateLimitFilter rateLimitFilter,
+                                                   TokenQuotaFilter tokenQuotaFilter) throws Exception {
         http
                 // 1. CSRF：整体关闭（凭证只走 Authorization 头，且无 cookie/session 可承载 token）
                 .csrf(AbstractHttpConfigurer::disable)
@@ -212,7 +213,9 @@ public class SecurityConfig {
                 // 7. 过滤器顺序配置
                 .addFilterBefore(new org.springframework.web.filter.CorsFilter(corsConfigurationSource()), UsernamePasswordAuthenticationFilter.class)
                 .addFilterBefore(rateLimitFilter, UsernamePasswordAuthenticationFilter.class)
-                .addFilterBefore(signedSessionFilter, UsernamePasswordAuthenticationFilter.class);
+                .addFilterBefore(signedSessionFilter, UsernamePasswordAuthenticationFilter.class)
+                // 额度闸门必须排在认证之后：它读 ATTR_USER_ID，认证前拿不到用户。
+                .addFilterAfter(tokenQuotaFilter, SignedSessionFilter.class);
         return http.build();
     }
 
