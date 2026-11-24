@@ -716,6 +716,16 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             } else if (name === 'todo') {
                 try {
                     const payload = typeof data === 'string' ? JSON.parse(data) : data;
+                    const eventExecutionId = String(payload && payload.executionId || '');
+                    const activeExecutionId = String(botBody.dataset.executionId || '');
+                    const version = Number(payload && payload.version);
+                    // The todo projection is an atomic snapshot of the authoritative graph.
+                    // Bind its identity before rendering so following summary/progress events
+                    // can reject stale data from a prior execution.
+                    if (activeExecutionId && eventExecutionId && activeExecutionId !== eventExecutionId) return;
+                    if (Number.isFinite(version) && version < taskProgressVersion) return;
+                    if (eventExecutionId) botBody.dataset.executionId = eventExecutionId;
+                    if (Number.isFinite(version)) taskProgressVersion = Math.max(taskProgressVersion, version);
                     const items = payload && payload.items ? payload.items : [];
                     todoItems = Array.isArray(items) ? items : [];
                     if (typeof payload?.summary === 'string') taskSummary = payload.summary;
@@ -749,20 +759,33 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                     if (!payload || typeof payload !== 'object') return;
                     const eventExecutionId = String(payload.executionId || '');
                     const activeExecutionId = String(botBody.dataset.executionId || '');
-                    if (activeExecutionId && eventExecutionId && activeExecutionId !== eventExecutionId) return;
+                    if (activeExecutionId && (!eventExecutionId || activeExecutionId !== eventExecutionId)) return;
                     const version = Number(payload.version);
                     if (!Number.isFinite(version) || version < taskProgressVersion) return;
+                    const progressNodeId = payload.nodeId == null ? '' : String(payload.nodeId);
+                    if (!progressNodeId || !Array.isArray(todoItems)
+                            || !todoItems.some(item => item && String(item.id) === progressNodeId)) return;
+                    // Progress can refine the active node but must not switch it. The
+                    // versioned todo snapshot is the source of truth for that association.
+                    if (currentNodeId != null && String(currentNodeId) !== progressNodeId) return;
+                    const hasCompleted = payload.completed != null;
+                    const hasTotal = payload.total != null;
+                    const completed = Number(payload.completed), total = Number(payload.total);
+                    const hasMetrics = hasCompleted && hasTotal && Number.isFinite(completed)
+                        && Number.isFinite(total) && completed >= 0 && total > 0 && completed <= total;
+                    if ((hasCompleted || hasTotal) && !hasMetrics) return;
+                    const stage = String(payload.stage || '').trim().slice(0, 80);
+                    const message = String(payload.message || '').trim().slice(0, 180);
+                    if (!hasMetrics && !stage && !message) return;
                     taskProgressVersion = version;
-                    currentNodeId = payload.nodeId == null ? currentNodeId : String(payload.nodeId);
+                    if (currentNodeId == null) currentNodeId = progressNodeId;
                     currentProgress = {
                         executionId: eventExecutionId,
                         version,
-                        nodeId: currentNodeId,
-                        stage: payload.stage,
-                        message: payload.message,
-                        completed: payload.completed,
-                        total: payload.total,
-                        unit: payload.unit
+                        nodeId: progressNodeId,
+                        stage,
+                        message,
+                        ...(hasMetrics ? { completed, total, unit: String(payload.unit || '').slice(0, 24) } : {})
                     };
                     paintTodo();
                 } catch (_) { /* malformed progress must not alter task state */ }

@@ -250,7 +250,7 @@ async function renderInspectorSteps(sid) {
     const signature = JSON.stringify({
         executionId: latestExecution && latestExecution.executionId,
         userQuestion: latestExecution && latestExecution.userQuestion,
-        todos: todos.map(t => [t.id, t.content, t.status, t.retryCount, t.replanGeneration]),
+        todos: todos.map(t => [t.id, t.content, t.status, t.note, t.dependsOn, t.retryCount, t.replanGeneration]),
         steps: steps.map(s => [s.id, s.stepType, s.toolName, s.status, s.durationMs,
             s.createdAt, s.content]),
         taskRunning,

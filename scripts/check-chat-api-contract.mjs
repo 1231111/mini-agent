@@ -23,7 +23,11 @@ const here = dirname(fileURLToPath(import.meta.url));
 const templatePath = process.argv[2]
   ? resolve(process.argv[2])
   : resolve(here, '../mini-agent-app/src/main/resources/templates/chat.html');
-const source = readFileSync(templatePath, 'utf8');
+const templateSource = readFileSync(templatePath, 'utf8');
+const chatJs = resolve(here, '../mini-agent-app/src/main/resources/static/js/chat');
+const moduleNames = ['03-theme.js', '07-permission.js'];
+const source = templateSource + '\n' + moduleNames
+  .map((name) => readFileSync(resolve(chatJs, name), 'utf8')).join('\n');
 
 const failures = [];
 const checks = [];
@@ -53,7 +57,7 @@ must('grantAskTool 提交 grantToken',
   /action:\s*'grant_ask'[\s\S]{0,120}?grantToken/.test(stripped));
 
 // 4) 失败时不能只剩一个已作废的「批准并继续」按钮。
-must('存在「知道了」这类只读提示按钮', /id="askNoticeActions"/.test(source));
+must('存在「知道了」这类只读提示按钮', /id="askNoticeActions"/.test(templateSource));
 
 // 5) Procedure rewrite review UI must keep the server/API contract intact.
 must('打开设置时加载 Procedure 提案', /loadProcedureProposals\(\);/.test(stripped));
@@ -68,5 +72,5 @@ for (const c of checks) {
   console.log(`${c.ok ? 'PASS' : 'FAIL'}  ${pad(c.name, 46)}${c.ok ? '' : c.detail || ''}`);
   if (!c.ok) failed++;
 }
-console.log(`\n${checks.length - failed}/${checks.length} passed  (${templatePath})`);
+console.log(`\n${checks.length - failed}/${checks.length} passed  (${templatePath} + ${moduleNames.join(', ')})`);
 process.exit(failed === 0 ? 0 : 1);

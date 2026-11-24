@@ -15,8 +15,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const template = path.join(root, 'mini-agent-app/src/main/resources/templates/chat.html');
-const src = fs.readFileSync(template, 'utf8');
+const chatRoot = path.join(root, 'mini-agent-app/src/main/resources');
+const template = path.join(chatRoot, 'templates/chat.html');
+// Rendering helpers live in the ordered browser modules now, not inline in chat.html.
+// Combine the shipped sources so this harness executes the same function bodies.
+const src = fs.readdirSync(path.join(chatRoot, 'static/js/chat'))
+    .filter((name) => /^\d+.*\.js$/.test(name))
+    .sort((a, b) => a.localeCompare(b, 'en', { numeric: true }))
+    .map((name) => fs.readFileSync(path.join(chatRoot, 'static/js/chat', name), 'utf8'))
+    .join('\n\n');
 
 /** 按起始标记切出一个完整函数体（花括号配平）。 */
 function slice(startMarker) {
@@ -38,23 +45,45 @@ function slice(startMarker) {
 
 const pieces = [
     "const AUDIO_EXTS = new Set(['mp3', 'wav', 'flac', 'm4a', 'ogg']);",
-    // mediaSrcAttr 依赖这个缓存；真实实现里它在 IIFE 作用域，这里给同形替身
+    // mediaSrcAttr 依赖这两个模块常量；在 Node harness 中提供真实契约。
     'const MEDIA_BLOB_CACHE = new Map();',
+    "const WORKSPACE_CODE_EXTENSIONS = new Set(['HTML', 'HTM', 'JS', 'MJS', 'CJS', 'CSS', 'TS', 'TSX', 'JSX', 'JSON', 'PY', 'JAVA', 'GO', 'RS', 'C', 'H', 'CPP', 'HPP', 'SH', 'BAT', 'PS1', 'SQL', 'XML', 'YML', 'YAML']);",
     slice('function fileExt(name)'),
     slice('function escA(s)'),
     slice('function esc(s)'),
     slice('function escQ(s)'),
     slice('function balancedUrl(s, open)'),
     slice('function isAudioUrl(url)'),
+    slice('function isVideoUrl(url)'),
+    slice('function safeMediaUrl(value)'),
+    slice('function safeMediaPageUrl(value)'),
+    slice('function mediaCardUrl(item'),
+    slice('function mediaCardText(value'),
+    slice('function mediaCardKind(value)'),
+    slice('function normalizedMediaCardItem(item'),
+    slice('function renderNewsCardBlock(language'),
+    slice('function renderNativeMedia(url'),
+    slice('function renderMediaCardBlock(language'),
+    slice('function renderMediaCardItem(item)'),
     slice('function mediaSrcAttr(url)'),
     slice('function parseMediaBang(s)'),
+    slice('function renderMarkdownCodeToken(codeText'),
+    slice('function decodeURIComponentSafe(value)'),
+    slice('function inlineMarkdownFileLink(codeText'),
+    slice('function workspaceFileDownloadLink(workspacePath'),
     slice('function workspaceDownloadPath(href)'),
     // 下载链接要带会话参数（会话可绑定自己的目录），缺了它会 ReferenceError
-    'let currentId = null;',
+    // Workspace attachment checks need an active session so links become actionable chips.
+    "let currentId = 'test-session';",
     slice('function workspaceSidQuery()'),
     slice('function linkWorkspacePaths(s)'),
     slice('function parseBracketImg(s, label)'),
     slice('function parseLinks(s)'),
+    slice('function groupAdjacentMedia(markup)'),
+    slice('function travelCardText(value'),
+    slice('function travelCardSource(value'),
+    slice('function renderTravelCardBlock(language'),
+    slice('function layoutMarkdownFiles(markup)'),
     slice('function renderMD(t)'),
     slice('function renderMDStreaming(t)'),
     slice('function dropLeadBlanks(s)'),
@@ -79,26 +108,26 @@ const cases = [
     {
         name: 'Markdown 工作区文档链接走受保护下载端点',
         input: '[workspace/冠虹尽头.docx](workspace/冠虹尽头.docx)',
-        check: (h) => h.includes('data-auth-download="/api/workspace-download/%E5%86%A0%E8%99%B9%E5%B0%BD%E5%A4%B4.docx"')
+        check: (h) => h.includes('data-workspace-file-check="/api/workspace-download/%E5%86%A0%E8%99%B9%E5%B0%BD%E5%A4%B4.docx?sid=test-session"')
             && h.includes('data-download-name="冠虹尽头.docx"')
-            && h.includes('class="workspace-download-link"'),
+            && h.includes('class="workspace-download-link'),
     },
     {
         name: '纯文本 workspace/文件名 自动转换成下载链接',
         input: '文件：workspace/冠虹尽头.docx（8.2 KB，创建成功）',
-        check: (h) => h.includes('data-auth-download="/api/workspace-download/%E5%86%A0%E8%99%B9%E5%B0%BD%E5%A4%B4.docx"')
+        check: (h) => h.includes('data-workspace-file-check="/api/workspace-download/%E5%86%A0%E8%99%B9%E5%B0%BD%E5%A4%B4.docx?sid=test-session"')
             && h.includes('data-download-name="冠虹尽头.docx"')
-            && h.includes('class="workspace-download-link"'),
+            && h.includes('class="workspace-download-link'),
     },
     {
         name: '拒绝下载隐藏文件与目录路径',
         input: '[secret](workspace/.env)',
-        check: (h) => !h.includes('data-auth-download') && h.includes('[secret]'),
+        check: (h) => !h.includes('data-workspace-file-check') && h.includes('[secret]'),
     },
     {
         name: '生成图走 /api/generated-media → 受保护媒体用 data-auth-src',
         input: '![生成的图片](/api/generated-media/7/img_1792656111658_7413.png)',
-        check: (h) => h.includes('<img data-auth-src="/api/generated-media/7/img_1792656111658_7413.png"')
+        check: (h) => h.includes('<img data-media-origin="/api/generated-media/7/img_1792656111658_7413.png" data-auth-src="/api/generated-media/7/img_1792656111658_7413.png"')
             && h.includes('alt="生成的图片"')
             && !/\ssrc="\/api\//.test(h),
     },
@@ -110,7 +139,7 @@ const cases = [
     {
         name: '工作区图片走 /api/workspace-media',
         input: '![图](/api/workspace-media/cyberpunk_city_night.svg)',
-        check: (h) => h.includes('<img data-auth-src="/api/workspace-media/cyberpunk_city_night.svg"'),
+        check: (h) => h.includes('<img data-media-origin="/api/workspace-media/cyberpunk_city_night.svg" data-auth-src="/api/workspace-media/cyberpunk_city_night.svg"'),
     },
     {
         name: '中文文件名（百分号编码）',
@@ -190,13 +219,13 @@ const srcCases = [
         name: '缓存里有 objectURL → 直接写 src（重画不闪）',
         input: '/api/generated-media/7/a.png',
         setup: (url) => sandbox.MEDIA_BLOB_CACHE.set(url, { promise: Promise.resolve('blob:x'), objectUrl: 'blob:http://localhost/abc' }),
-        check: (h) => h === 'src="blob:http://localhost/abc"',
+        check: (h) => h === 'data-media-origin="/api/generated-media/7/a.png" src="blob:http://localhost/abc"',
     },
     {
         name: '缓存里只有 promise（还在下载）→ 保持 data-auth-src',
         input: '/api/generated-media/7/b.png',
         setup: (url) => sandbox.MEDIA_BLOB_CACHE.set(url, { promise: new Promise(() => {}), objectUrl: null }),
-        check: (h) => h === 'data-auth-src="/api/generated-media/7/b.png"',
+        check: (h) => h === 'data-media-origin="/api/generated-media/7/b.png" data-auth-src="/api/generated-media/7/b.png"',
     },
 ];
 

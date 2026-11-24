@@ -148,10 +148,11 @@ for (const answerFirst of [true, false]) {
     const first = makeHistoricalBody(), second = makeHistoricalBody();
     // JSON round-trip models the server response after a process restart.
     const turns = JSON.parse(JSON.stringify([
-        { id: 41, progress: { executionId: 'exec-first', status: 'SUCCESS', items: [
+        { id: 41, progress: { executionId: 'exec-first', status: 'SUCCESS', summary: '查询并核验来源', items: [
             { id: 1, content: '首轮查询来源', status: 'completed' }
         ] } },
-        { id: 42, progress: { executionId: 'exec-second', status: 'FAILURE', items: [
+        { id: 42, progress: { executionId: 'exec-second', status: 'FAILURE', summary: '生成并验证页面', currentNodeId: 2,
+            currentProgress: { executionId: 'exec-second', version: 8, nodeId: 2, stage: '运行检查', message: '检查脚本已启动', completed: 2, total: 4, unit: '项' }, items: [
             { id: 1, content: '第二轮生成页面', status: 'completed' },
             { id: 2, content: '第二轮验证页面', status: 'blocked' }
         ] } }
@@ -163,13 +164,19 @@ for (const answerFirst of [true, false]) {
     assert.equal(first.dataset.executionId, 'exec-first');
     assert.equal(second.dataset.executionId, 'exec-second');
     assert.equal(first.querySelectorAll('.todo-panel').length, 1);
-    assert.equal(first.querySelector('.todo-progress-meta').textContent, '1/1 已完成');
-    assert.equal(second.querySelector('.todo-progress-meta').textContent, '1/2 已完成');
+    assert.equal(first.querySelector('.todo-task-summary').textContent, '查询并核验来源');
+    assert.equal(second.querySelector('.todo-task-summary').textContent, '生成并验证页面');
+    assert.equal(first.querySelector('.todo-current-node').hidden, true);
+    assert.equal(second.querySelector('.todo-current-title').textContent, '第二轮验证页面');
+    assert.equal(second.querySelector('.todo-current-detail').textContent, '运行检查 · 检查脚本已启动');
+    assert.equal(second.querySelector('.todo-current-progress').querySelector('.todo-progress-fill').style.width, '50%');
+    assert.equal(first.querySelectorAll('.todo-item').length, 0);
+    assert.equal(second.querySelectorAll('.todo-item').length, 0);
     assert.equal(second.querySelector('.todo-progress-title').textContent, '任务执行失败');
     assert.ok(first.children.indexOf(first.querySelector('.todo-panel')) < first.children.indexOf(first.querySelector('.answer-stream')));
     assert.ok(second.children.indexOf(second.querySelector('.todo-panel')) < second.children.indexOf(second.querySelector('.answer-stream')));
     assert.doesNotMatch(first.textContent, /第二轮/); assert.doesNotMatch(second.textContent, /首轮/);
-    console.log('PASS: reload preserves two separate execution snapshots, order, statuses and node counts');
+    console.log('PASS: reload preserves per-turn summary/current-node state without duplicating the DAG in chat');
 }
 
 {
@@ -362,27 +369,66 @@ const finalAnswer = '已生成虚拟仿真交互页面。\n\n[查看 HTML 文件
     await consume(h, [
         todo(nodes),
         () => {
-            assert.equal(h.bot.querySelector('.todo-progress-fill').style.width, '33%');
-            assert.equal(h.bot.querySelector('.todo-progress-meta').textContent, '1/3 已完成');
-            assert.match(h.bot.querySelector('.todo-progress-title').textContent, /整理与分类照片/);
-            assert.equal(h.bot.querySelectorAll('.todo-item.completed').length, 1);
-            assert.equal(h.bot.querySelectorAll('.todo-item.in_progress').length, 1);
-            assert.equal(h.bot.querySelectorAll('.todo-item.pending').length, 1);
+            assert.match(h.bot.querySelector('.todo-progress-title').textContent, /正在执行：整理与分类照片/);
+            assert.equal(h.bot.querySelector('.todo-current-title').textContent, '整理与分类照片');
+            assert.equal(h.bot.querySelectorAll('.todo-item').length, 0);
+            assert.equal(h.bot.querySelectorAll('.insp-dag-list').length, 0);
         },
         todo(nodes.map((item, index) => ({ ...item, status: index < 2 ? 'completed' : 'in_progress' }))),
-        () => {
-            assert.equal(h.bot.querySelector('.todo-progress-fill').style.width, '67%');
-            assert.equal(h.bot.querySelectorAll('.todo-item.completed').length, 2);
-        },
+        () => assert.equal(h.bot.querySelector('.todo-current-title').textContent, '生成相册'),
         todo(nodes.map(item => ({ ...item, status: 'completed' }))),
         event('end', '相册已生成。')
     ]);
-    assert.equal(h.bot.querySelector('.todo-progress-fill').style.width, '100%');
-    assert.equal(h.bot.querySelector('.todo-progress-meta').textContent, '3/3 已完成');
-    assert.equal(h.bot.querySelectorAll('.todo-item.completed').length, 3);
+    assert.equal(h.bot.querySelector('.todo-current-node').hidden, true);
+    assert.equal(h.bot.querySelectorAll('.todo-item').length, 0);
     assert.equal(h.bot.querySelectorAll('.todo-panel').length, 1);
     assert.equal(h.bot.querySelector('.task-status-card'), null);
-    console.log('PASS: real task nodes drive 33/67/100 percent progress and completed nodes remain visible');
+    console.log('PASS: DAG snapshots drive only current-node progress in chat, leaving the full graph to the inspector');
+}
+
+{
+    const h = createHarness();
+    const nodes = [
+        { id: 1, content: '分析任务需求', status: 'in_progress' },
+        { id: 2, content: '整理与分类照片', status: 'pending' }
+    ];
+    await consume(h, [
+        event('todo', JSON.stringify({ executionId: 'exec-progress', version: 0,
+            summary: '读取并整理照片', currentNodeId: 1, items: nodes })),
+        event('execution_progress', JSON.stringify({ executionId: 'exec-progress', version: 1, nodeId: 1,
+            stage: '读取照片', message: '已识别 238 张', completed: 238, total: 300, unit: '张' })),
+        event('task_summary', JSON.stringify({ executionId: 'exec-progress', version: 2, summary: '读取、分类并整理 300 张照片' })),
+        event('task_summary', JSON.stringify({ executionId: 'exec-progress', version: 1, summary: '不应覆盖的新摘要' })),
+        event('task_summary', JSON.stringify({ executionId: 'stale-exec', version: 3, summary: '其他任务摘要' })),
+        () => {
+            const progress = h.bot.querySelector('.todo-current-progress');
+            assert.equal(progress.hidden, false);
+            assert.equal(progress.dataset.stage, '读取照片');
+            assert.equal(h.bot.querySelector('.todo-current-detail').textContent, '读取照片 · 已识别 238 张');
+            assert.equal(progress.querySelector('.todo-progress-fill').style.width, '79%');
+            assert.equal(h.bot.querySelector('.todo-task-summary').textContent, '读取、分类并整理 300 张照片');
+        },
+        event('execution_progress', JSON.stringify({ executionId: 'stale-exec', version: 2, nodeId: 1,
+            message: '过期任务数据', completed: 10, total: 20 })),
+        event('execution_progress', JSON.stringify({ executionId: 'exec-progress', version: 3, nodeId: 2,
+            message: '其他节点数据', completed: 10, total: 20 })),
+        event('execution_progress', JSON.stringify({ executionId: 'exec-progress', version: 3, nodeId: 1,
+            stage: '分类照片', message: '正在整理已识别的图片' })),
+        () => {
+            assert.equal(h.bot.querySelector('.todo-current-detail').textContent, '分类照片 · 正在整理已识别的图片');
+            assert.equal(h.bot.querySelector('.todo-current-progress').hidden, true);
+        },
+        event('execution_progress', JSON.stringify({ executionId: 'exec-progress', version: 4, nodeId: 1,
+            message: '超界数据', completed: 301, total: 300 })),
+        event('end', '处理完毕。')
+    ]);
+    assert.equal(h.bot.querySelector('.todo-current-title').textContent, '分析任务需求');
+    assert.equal(h.bot.querySelector('.todo-current-detail').textContent, '分类照片 · 正在整理已识别的图片');
+    assert.equal(h.bot.querySelector('.todo-current-progress').hidden, true);
+    assert.equal(h.bot.querySelector('.todo-current-progress').querySelector('.todo-progress-fill').style.width, '79%');
+    assert.equal(h.bot.querySelectorAll('.todo-item').length, 0);
+    assert.equal(h.bot.querySelector('.todo-task-summary').textContent, '读取、分类并整理 300 张照片');
+    console.log('PASS: structured progress is bound to its execution and current node; stale or malformed updates cannot overwrite it');
 }
 
 {
@@ -395,12 +441,11 @@ const finalAnswer = '已生成虚拟仿真交互页面。\n\n[查看 HTML 文件
         ] })),
         event('error', '用户停止执行')
     ]);
-    assert.equal(h.bot.querySelector('.todo-progress-fill').style.width, '50%');
-    assert.equal(h.bot.querySelector('.todo-progress-meta').textContent, '1/2 已完成');
     assert.equal(h.bot.querySelector('.todo-progress-title').textContent, '任务已停止');
-    assert.equal(h.bot.querySelector('.todo-item.in_progress').querySelector('.todo-node-state').textContent, '待继续');
-    assert.equal(h.bot.querySelector('.todo-item.cancelled').querySelector('.todo-node-state').textContent, '已取消');
-    console.log('PASS: stopped and cancelled nodes do not inflate completed progress');
+    assert.equal(h.bot.querySelector('.todo-current-node').hidden, false);
+    assert.equal(h.bot.querySelector('.todo-current-title').textContent, '生成页面');
+    assert.equal(h.bot.querySelectorAll('.todo-item').length, 0);
+    console.log('PASS: stopped execution exposes the resumable current node without copying graph statuses into chat');
 }
 
 {
@@ -488,10 +533,9 @@ for (const partialAnswer of ['部分结果，尚未完成', '']) {
     assert.doesNotMatch(answer.innerHTML, /ProgressController|C:\\Users|stack=|TimeoutError/);
     assert.match(answer.innerHTML, /工具执行日志/);
     assert.match(h.bot.querySelector('.todo-progress-title').textContent, /结果待核验/);
-    assert.equal(h.bot.querySelector('.todo-item.in_progress .todo-node-state'), null); // substitute does not implement descendant selectors
-    assert.equal(h.bot.querySelector('.todo-item.in_progress').querySelector('.todo-node-state').textContent, '待核验');
+    assert.equal(h.bot.querySelector('.todo-current-title').textContent, '核验候选航班可订性');
+    assert.equal(h.bot.querySelectorAll('.todo-item').length, 0);
     assert.ok(h.bot.querySelector('.outcome-review-open'));
-    assert.equal(h.bot.querySelector('.todo-progress-meta').textContent, '1/2 已完成');
     console.log('PASS: screenshot click failure hides driver stacks and shows a review action instead of misleading continue state');
 }
 
@@ -503,7 +547,8 @@ for (const partialAnswer of ['部分结果，尚未完成', '']) {
         status: 'FAILURE', reason: 'OUTCOME_UNKNOWN', items: [{ id: 1, content: '核验航班', status: 'blocked' }] } });`, h.context);
     assert.equal(body.dataset.taskReason, 'OUTCOME_UNKNOWN');
     assert.match(body.querySelector('.todo-progress-title').textContent, /待核验/);
-    assert.equal(body.querySelector('.todo-node-state').textContent, '待核验');
+    assert.equal(body.querySelector('.todo-current-title').textContent, '核验航班');
+    assert.equal(body.querySelectorAll('.todo-item').length, 0);
     assert.ok(body.querySelector('.outcome-review-open'));
     console.log('PASS: reloaded unknown task retains review status and explicit recovery entry');
 }

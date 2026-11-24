@@ -419,6 +419,8 @@ public class SessionEventCenter {
         volatile int subgoalTotal = 0;
         /** 最新 todo 计划（供重连重放） */
         volatile List<Map<String, Object>> todoItems = List.of();
+        /** 同一 planner 快照携带的摘要、版本和当前节点元数据。 */
+        volatile Map<String, Object> todoMetadata = Map.of();
         volatile String finalAnswer = "";
         volatile String errorMsg = "";
         volatile long doneAt = 0L;
@@ -504,6 +506,11 @@ public class SessionEventCenter {
 
     /** 推送完整 todo/计划列表（前端勾选列表）。 */
     public void publishTodo(String sessionId, List<Map<String, Object>> items) {
+        publishTodo(sessionId, items, Map.of());
+    }
+
+    /** Push one atomically versioned todo snapshot to live and reconnecting clients. */
+    public void publishTodo(String sessionId, List<Map<String, Object>> items, Map<String, Object> metadata) {
         SessionChannel channel = channels.get(key(sessionId));
         if (Objects.isNull(channel)) {
             return;
@@ -512,7 +519,8 @@ public class SessionEventCenter {
             if (channel.status != Status.running) return;
             List<Map<String, Object>> copy = items == null ? List.of() : List.copyOf(items);
             channel.todoItems = copy;
-            Map<String, Object> payload = todoPayload(copy);
+            channel.todoMetadata = metadata == null ? Map.of() : Map.copyOf(metadata);
+            Map<String, Object> payload = todoPayload(copy, channel.todoMetadata);
             sendToLocalClients(channel, "todo", payload);
             enqueueRedis(channel, "event", "todo", payload);
         }
@@ -527,8 +535,13 @@ public class SessionEventCenter {
     }
 
     private static Map<String, Object> todoPayload(List<Map<String, Object>> items) {
+        return todoPayload(items, Map.of());
+    }
+
+    private static Map<String, Object> todoPayload(List<Map<String, Object>> items, Map<String, Object> metadata) {
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("items", items == null ? List.of() : items);
+        if (metadata != null) map.putAll(metadata);
         return map;
     }
 
@@ -594,7 +607,7 @@ public class SessionEventCenter {
                 enqueueClient(channel, emitter, "user_question", channel.userQuestion);
             }
             if (channel.todoItems != null && !channel.todoItems.isEmpty()) {
-                enqueueClient(channel, emitter, "todo", todoPayload(channel.todoItems));
+                enqueueClient(channel, emitter, "todo", todoPayload(channel.todoItems, channel.todoMetadata));
             } else if (channel.subgoalTotal > 0) {
                 enqueueClient(channel, emitter, "subgoal", subgoalPayload(
                         channel.subgoalText, channel.subgoalDone, channel.subgoalTotal));
@@ -1036,6 +1049,7 @@ public class SessionEventCenter {
                         channel.userQuestion = null;
                         channel.taskOutcome = null;
                         channel.todoItems = List.of();
+                        channel.todoMetadata = Map.of();
                         channel.subgoalText = "";
                         channel.subgoalDone = channel.subgoalTotal = 0;
                         channel.finalAnswer = channel.errorMsg = "";
@@ -1094,7 +1108,13 @@ public class SessionEventCenter {
                 }
             }
             case "todo" -> {
-                if (data instanceof Map<?, ?> map) channel.todoItems = toTodoItems(map.get("items"));
+                if (data instanceof Map<?, ?> map) {
+                    channel.todoItems = toTodoItems(map.get("items"));
+                    Map<String, Object> metadata = new LinkedHashMap<>();
+                    for (String field : List.of("executionId", "version", "summary", "currentNodeId", "currentProgress"))
+                        if (map.containsKey(field)) metadata.put(field, map.get(field));
+                    channel.todoMetadata = Map.copyOf(metadata);
+                }
             }
             default -> applyEvent(channel, name, data == null ? "" : String.valueOf(data));
         }

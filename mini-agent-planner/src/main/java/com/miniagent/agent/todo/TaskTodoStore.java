@@ -142,6 +142,18 @@ public class TaskTodoStore {
     private final List<TodoStepValidator> validators;
     private SessionTodoPersistence persistence;
     private SessionEventCenter eventCenter;
+    private final Map<String, ProgressContext> progressContexts = new ConcurrentHashMap<>();
+
+    /** Versioned metadata projected from the authoritative planner snapshot. */
+    public record ProgressContext(String executionId, long version, String summary,
+                                  String currentNodeId, Map<String, Object> currentProgress) {
+        public ProgressContext {
+            executionId = executionId == null ? "" : executionId;
+            summary = summary == null ? "" : summary;
+            currentNodeId = currentNodeId == null ? "" : currentNodeId;
+            currentProgress = currentProgress == null ? Map.of() : Map.copyOf(currentProgress);
+        }
+    }
     /**
      * 任务作用域来源。清单按 {@code TaskScope.scopeKey(sessionId)} 分键，
      * 与 {@code PlannerStateStore}、{@code ContextCompressor} 同一口径 ——
@@ -319,6 +331,9 @@ public class TaskTodoStore {
     }
 
     public synchronized List<TodoItem> set(String sessionId, List<Map<String, Object>> rawItems) {
+        String key = safeKey(sessionId);
+        ensureLoaded(key);
+        if (!containsDagProjection(key)) progressContexts.remove(key);
         return write(sessionId, rawItems, true);
     }
 
@@ -327,7 +342,20 @@ public class TaskTodoStore {
      */
     public synchronized List<TodoItem> overwrite(
             String sessionId, List<Map<String, Object>> rawItems) {
+        progressContexts.remove(safeKey(sessionId));
         return write(sessionId, rawItems, false);
+    }
+
+    /** Planner-only projection; metadata and items are emitted as one versioned SSE snapshot. */
+    public synchronized List<TodoItem> overwrite(
+            String sessionId, List<Map<String, Object>> rawItems, ProgressContext context) {
+        String key = safeKey(sessionId);
+        if (context != null) progressContexts.put(key, context);
+        return write(sessionId, rawItems, false);
+    }
+
+    public synchronized ProgressContext progressContext(String sessionId) {
+        return progressContexts.get(safeKey(sessionId));
     }
 
     private List<TodoItem> write(
@@ -1141,6 +1169,7 @@ public class TaskTodoStore {
     public synchronized void clear(String sessionId) {
         String key = safeKey(sessionId);
         ensureLoaded(key);
+        progressContexts.remove(key);
         List<TodoItem> items = todos.remove(key);
         if (items != null && !items.isEmpty()) {
             archived.put(key, new ArrayList<>(items));
@@ -2125,9 +2154,21 @@ public class TaskTodoStore {
                 row.put("status", it.status().name());
                 row.put("note", it.note());
                 row.put("evidence", it.evidence());
+                row.put("depends_on", it.dependsOn());
+                row.put("retry_count", it.retryCount());
+                row.put("replan_generation", it.replanGeneration());
                 payload.add(row);
             }
-            eventCenter.publishTodo(sessionId, payload);
+            ProgressContext context = progressContexts.get(safeKey(sessionId));
+            Map<String, Object> metadata = new LinkedHashMap<>();
+            if (context != null) {
+                metadata.put("executionId", context.executionId());
+                metadata.put("version", context.version());
+                metadata.put("summary", context.summary());
+                metadata.put("currentNodeId", context.currentNodeId());
+                metadata.put("currentProgress", context.currentProgress());
+            }
+            eventCenter.publishTodo(sessionId, payload, metadata);
         } catch (Exception e) {
             log.debug("todo UI 推送跳过: {}", e.getMessage());
         }

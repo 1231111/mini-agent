@@ -533,7 +533,7 @@ public class PlanningLoop {
             metadata.put("artifactDeliveryRequested", taskPlan.artifactDeliveryRequested());
             snap = stateStore.commit(sessionId, snap.version(), snap.withExecution(metadata));
         }
-        todoProjector.project(sessionId, snap.graph());
+        todoProjector.project(sessionId, snap);
         // A tool whose outcome was unknown may have applied a side effect even though
         // the caller never received the result.  Keep it terminal until an explicit
         // reconciliation/reset; normalization must never replay it automatically.
@@ -618,7 +618,7 @@ public class PlanningLoop {
                     snap = stateStore.get(sessionId).orElse(snap);
                     continue;
                 }
-                todoProjector.project(sessionId, snap.graph());
+                todoProjector.project(sessionId, snap);
             }
             unknownNode = unknownOutcomeNode(snap.graph());
             if (unknownNode != null) {
@@ -663,7 +663,7 @@ public class PlanningLoop {
                             chat, userMessage, taskPlan, history);
                     if (recovery.stop() != null) return recovery.stop();
                     snap = recovery.snapshot();
-                    todoProjector.project(sessionId, snap.graph());
+                    todoProjector.project(sessionId, snap);
                     continue;
                 }
                 if (codeReviewRequired) {
@@ -705,7 +705,7 @@ public class PlanningLoop {
                                 reviewDiagnosis, "code-review-" + bad.id(), chat, userMessage, taskPlan, history);
                         if (recovery.stop() != null) return recovery.stop();
                         snap = recovery.snapshot();
-                        todoProjector.project(sessionId, snap.graph());
+                        todoProjector.project(sessionId, snap);
                         continue;
                     }
                 }
@@ -770,7 +770,7 @@ public class PlanningLoop {
                         if (recovery.snapshot() != null) {
                             metrics.recovery();
                             snap = recovery.snapshot();
-                            todoProjector.project(sessionId, snap.graph());
+                            todoProjector.project(sessionId, snap);
                             continue;
                         }
                         unfinishedReason = "CANCELLED_DEPENDENCY_RESUME_UNAVAILABLE";
@@ -853,7 +853,7 @@ public class PlanningLoop {
                         sessionId, proposal.proposalId(), snap.version(), snap.planVersion());
                 continue;
             }
-            todoProjector.project(sessionId, snap.graph());
+            todoProjector.project(sessionId, snap);
             trace(sessionId, AgentStepNode.GRAPH_UPDATED,
                     "{\"version\":" + snap.version() + ",\"running\":"
                             + proposal.actions().size() + "}");
@@ -1335,7 +1335,7 @@ public class PlanningLoop {
         metadata.put("stopReason", step.endReason());
         metadata.put("stoppedTaskIds", proposal.actions().stream().map(ActionSpec::taskId).toList());
         StateSnapshot stopped = stateStore.commit(sessionId, snapshot.version(), snapshot.withGraph(graph).withExecution(metadata));
-        todoProjector.project(sessionId, stopped.graph());
+        todoProjector.project(sessionId, stopped);
         String answer = StringUtils.defaultIfBlank(step.text(), "任务已停止，尚未完成。");
         if (unknown) answer += "\n当前节点已保留执行证据，请先核验实际状态；系统不会自动重放该节点。";
         return RunOutcome.failed(answer, step.endReason());
@@ -1385,7 +1385,7 @@ public class PlanningLoop {
                 snapshot = stateStore.get(sessionId).orElse(snapshot);
             }
         }
-        todoProjector.project(sessionId, snapshot.graph());
+        todoProjector.project(sessionId, snapshot);
         return RunOutcome.failed("节点「" + unknown.name()
                 + "」执行结果未知，已停止自动重试，请先核验实际状态。", "OUTCOME_UNKNOWN");
     }
@@ -2004,7 +2004,7 @@ public class PlanningLoop {
 
     private RecoveryAttempt rejectRecovery(String sessionId, StateSnapshot snap, String reason) {
         StateSnapshot latest = stateStore.get(sessionId).orElse(snap);
-        todoProjector.project(sessionId, latest.graph());
+        todoProjector.project(sessionId, latest);
         log.warn("任务恢复已停止 session={} reason={}", sessionId, reason);
         return new RecoveryAttempt(latest, RunOutcome.failed(
                 "任务恢复未通过校验，已保留执行进度并停止自动重试。请查看执行记录后继续。", reason));

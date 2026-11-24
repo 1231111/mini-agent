@@ -21,6 +21,20 @@ public class TodoStateProjector {
     }
 
     public void project(String sessionId, TaskGraph graph) {
+        project(sessionId, graph, null);
+    }
+
+    /** Project graph state and its authoritative identity/version as one UI snapshot. */
+    public void project(String sessionId, StateSnapshot snapshot) {
+        if (snapshot == null) return;
+        TaskTodoStore.ProgressContext context = new TaskTodoStore.ProgressContext(
+                snapshot.executionId(), snapshot.version(), conciseSummary(
+                        snapshot.goal() == null ? "" : snapshot.goal().objective()),
+                currentNodeId(snapshot.graph()), currentProgress(snapshot));
+        project(sessionId, snapshot.graph(), context);
+    }
+
+    private void project(String sessionId, TaskGraph graph, TaskTodoStore.ProgressContext context) {
         if (sessionId == null || graph == null) {
             return;
         }
@@ -58,7 +72,53 @@ public class TodoStateProjector {
             }
             raw.add(m);
         }
-        taskTodoStore.overwrite(sessionId, raw);
+        if (context == null) taskTodoStore.overwrite(sessionId, raw);
+        else taskTodoStore.overwrite(sessionId, raw, context);
+    }
+
+    private String currentNodeId(TaskGraph graph) {
+        if (graph == null) return "";
+        TaskNode current = preferredCurrentNode(graph);
+        if (current == null) return "";
+        int id = todoIdFor(graph, current.id());
+        return id <= 0 ? "" : Integer.toString(id);
+    }
+
+    private Map<String, Object> currentProgress(StateSnapshot snapshot) {
+        TaskNode current = preferredCurrentNode(snapshot.graph());
+        if (current == null) return Map.of();
+        String message = switch (current.status()) {
+            case RUNNING -> "执行器已开始此步骤";
+            case AWAITING_CONFIRM -> "此步骤正在等待你的操作";
+            case FAILED, RECOVERING, OUTCOME_UNKNOWN -> "此步骤受阻，任务状态已保留";
+            case READY, PENDING -> "此步骤尚未开始执行";
+            case SUCCESS -> "执行器已确认此步骤完成";
+            case CANCELLED -> "此步骤已取消";
+        };
+        int id = todoIdFor(snapshot.graph(), current.id());
+        if (id <= 0) return Map.of();
+        return Map.of("executionId", snapshot.executionId() == null ? "" : snapshot.executionId(),
+                "version", snapshot.version(), "nodeId", Integer.toString(id),
+                "message", message);
+    }
+
+    private static TaskNode preferredCurrentNode(TaskGraph graph) {
+        if (graph == null) return null;
+        for (TaskNodeStatus preferred : List.of(TaskNodeStatus.RUNNING, TaskNodeStatus.AWAITING_CONFIRM,
+                TaskNodeStatus.OUTCOME_UNKNOWN, TaskNodeStatus.FAILED, TaskNodeStatus.RECOVERING,
+                TaskNodeStatus.READY, TaskNodeStatus.PENDING)) {
+            for (TaskNode node : graph.nodes()) if (node.status() == preferred) return node;
+        }
+        return null;
+    }
+
+    private static String conciseSummary(String raw) {
+        if (raw == null) return "";
+        String text = raw.replaceAll("\\s+", " ").trim();
+        if (text.length() <= 180) return text;
+        int cut = text.lastIndexOf(' ', 177);
+        if (cut < 80) cut = 177;
+        return text.substring(0, cut).stripTrailing() + "…";
     }
 
     /** 图节点 id 形如 {@code rp2_node1}：2 表示第 2 次重规划生成；原始节点返回 0。 */

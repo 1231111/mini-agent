@@ -119,21 +119,24 @@ function renderTaskProgress(botBody, items, options = {}) {
             : current.status === 'blocked' || current.status === 'failed' ? '受阻步骤' : '当前步骤';
         currentTitle.textContent = String(current.content || '');
         const detailParts = [];
-        if (progress && progress.message) detailParts.push(progress.message);
+        if (progress && progress.stage) detailParts.push(progress.stage);
+        if (progress && progress.message && progress.message !== progress.stage) detailParts.push(progress.message);
         if (current.note && (current.status === 'blocked' || current.status === 'failed'))
             detailParts.push(compactTaskFailure(current.note));
         detail.textContent = detailParts.join(' · ');
         detail.hidden = !detail.textContent;
-        progressBox.hidden = !progress;
+        progressBox.hidden = !progress || !progress.hasMetrics;
         if (progress) {
-            const fill = progressBox.querySelector('.todo-progress-fill');
-            const percent = Math.round(progress.completed * 100 / progress.total);
-            fill.style.width = percent + '%';
-            fill.parentElement.setAttribute('aria-valuenow', String(percent));
-            fill.parentElement.setAttribute('aria-valuetext',
-                progress.completed + ' / ' + progress.total + (progress.unit ? ' ' + progress.unit : ''));
             progressBox.dataset.stage = progress.stage || '';
             progressBox.setAttribute('aria-label', progress.stage || '当前步骤进度');
+            if (progress.hasMetrics) {
+                const fill = progressBox.querySelector('.todo-progress-fill');
+                const percent = Math.round(progress.completed * 100 / progress.total);
+                fill.style.width = percent + '%';
+                fill.parentElement.setAttribute('aria-valuenow', String(percent));
+                fill.parentElement.setAttribute('aria-valuetext',
+                    progress.completed + ' / ' + progress.total + (progress.unit ? ' ' + progress.unit : ''));
+            }
         }
         if (current.status === 'awaiting_confirm' && options.allowConfirm) {
             let button = currentSection.querySelector('.todo-confirm-btn');
@@ -186,14 +189,14 @@ function normalizeTrustedTaskProgress(value, currentNode, executionId) {
     if (value.nodeId != null && String(value.nodeId) !== String(currentNode.id)) return null;
     if (executionId && value.executionId && String(value.executionId) !== String(executionId)) return null;
     const completed = Number(value.completed), total = Number(value.total);
-    if (!Number.isFinite(completed) || !Number.isFinite(total)
-            || completed < 0 || total <= 0 || completed > total) return null;
-    return {
-        stage: String(value.stage || '').trim().slice(0, 80),
-        message: String(value.message || '').trim().slice(0, 180),
-        completed, total,
-        unit: String(value.unit || '').trim().slice(0, 24)
-    };
+    const hasMetrics = Number.isFinite(completed) && Number.isFinite(total)
+        && completed >= 0 && total > 0 && completed <= total;
+    const stage = String(value.stage || '').trim().slice(0, 80);
+    const message = String(value.message || '').trim().slice(0, 180);
+    if (!hasMetrics && !stage && !message) return null;
+    return { stage, message, hasMetrics, ...(hasMetrics ? {
+        completed, total, unit: String(value.unit || '').trim().slice(0, 24)
+    } : {}) };
 }
 
 /** Human review is inline and never silently dispatches another click or submission. */

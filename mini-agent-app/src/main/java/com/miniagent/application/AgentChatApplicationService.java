@@ -721,9 +721,9 @@ public class AgentChatApplicationService {
                 : (hasMedia ? MessageConstants.CHAT_IMAGE_ANALYSIS : MessageConstants.CHAT_DEFAULT_SESSION);
         BuiltinTools.setCurrentTaskName(firstLine);
         TaskTodoContext.set(sessionId);
-        // 新一轮聊天流需要主动回放当前任务清单：清单可能从上一轮沿用，
-        // 本轮模型不一定再次调用 todo 工具，但聊天气泡仍应显示任务进度卡片。
-        taskTodoStore.publishCurrentState(sessionId);
+        // 不在路由决策前回放上轮清单：新一轮可能是同会话中的另一个 direct 任务。
+        // DAG 路由会由 Planner 在确认本轮 executionId 后发布权威快照；普通任务
+        // 则只展示本轮真实产生的状态，避免把旧 DAG 绑到新答复上。
         String systemPrompt = loaded.systemPrompt();
 
         final boolean streaming = Objects.nonNull(progressEmitter);
@@ -863,8 +863,9 @@ public class AgentChatApplicationService {
         task.setQuestion(displayQuestion);
         task.setAnswer(answer);
         task.setTaskProgressJson(TaskProgressSnapshot.capture(
-                progressExecutionId, loaded.taskId(),
-                runStatus.name(), endReason, taskTodoStore == null ? List.of() : taskTodoStore.get(sessionId))
+                progressExecutionId, loaded.taskId(), runStatus.name(), endReason,
+                taskTodoStore == null ? List.of() : taskTodoStore.get(sessionId),
+                taskTodoStore == null ? null : taskTodoStore.progressContext(sessionId))
                 .toJson());
         if (!allSavedPaths.isEmpty()) {
             task.setImages(String.join(",", allSavedPaths));

@@ -199,7 +199,8 @@ public class ConversationTaskProgressService {
         boolean unresolved = blocked && "OUTCOME_UNKNOWN".equals(saved.reason());
         // Human verification is not whole-goal acceptance. A later explicit turn resumes the DAG.
         return new TaskProgressSnapshot(saved.executionId(), saved.taskId(), blocked ? "FAILURE" : "WAITING",
-                unresolved ? "OUTCOME_UNKNOWN" : blocked ? "TASK_INCOMPLETE" : "OUTCOME_REVIEWED", items, receipts);
+                unresolved ? "OUTCOME_UNKNOWN" : blocked ? "TASK_INCOMPLETE" : "OUTCOME_REVIEWED",
+                items, receipts, saved.summary(), saved.version(), saved.currentNodeId(), saved.currentProgress());
     }
 
     private static boolean sameLayout(List<TaskProgressSnapshot.Item> saved, List<TaskProgressSnapshot.Item> graph) {
