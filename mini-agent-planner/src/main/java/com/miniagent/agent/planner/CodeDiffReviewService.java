@@ -113,24 +113,16 @@ public final class CodeDiffReviewService {
     public record Baseline(Path repositoryRoot, String headCommit,
                            Map<String, String> initialContents, Set<String> initialChangedPaths,
                            String unavailableReason, BaselineKind kind,
-                           Set<String> workspaceScopePaths,
-                           Map<String, String> initialWorkspaceInventory) {
+                           Set<String> workspaceScopePaths) {
         public Baseline(Path repositoryRoot, String headCommit, Map<String, String> initialContents,
                         Set<String> initialChangedPaths, String unavailableReason) {
             this(repositoryRoot, headCommit, initialContents, initialChangedPaths, unavailableReason,
-                    repositoryRoot == null ? BaselineKind.UNAVAILABLE : BaselineKind.GIT_COMMIT,
-                    Set.of(), Map.of());
+                    repositoryRoot == null ? BaselineKind.UNAVAILABLE : BaselineKind.GIT_COMMIT, Set.of());
         }
         public Baseline(Path repositoryRoot, String headCommit, Map<String, String> initialContents,
                         Set<String> initialChangedPaths, String unavailableReason, BaselineKind kind) {
             this(repositoryRoot, headCommit, initialContents, initialChangedPaths, unavailableReason,
-                    kind, Set.of(), Map.of());
-        }
-        public Baseline(Path repositoryRoot, String headCommit, Map<String, String> initialContents,
-                        Set<String> initialChangedPaths, String unavailableReason, BaselineKind kind,
-                        Set<String> workspaceScopePaths) {
-            this(repositoryRoot, headCommit, initialContents, initialChangedPaths, unavailableReason,
-                    kind, workspaceScopePaths, Map.of());
+                    kind, Set.of());
         }
         public Baseline {
             initialContents = initialContents == null ? Map.of()
@@ -138,8 +130,6 @@ public final class CodeDiffReviewService {
             initialChangedPaths = initialChangedPaths == null ? Set.of() : Set.copyOf(initialChangedPaths);
             kind = kind == null ? BaselineKind.UNAVAILABLE : kind;
             workspaceScopePaths = workspaceScopePaths == null ? Set.of() : Set.copyOf(workspaceScopePaths);
-            initialWorkspaceInventory = initialWorkspaceInventory == null ? Map.of()
-                    : java.util.Collections.unmodifiableMap(new LinkedHashMap<>(initialWorkspaceInventory));
         }
         public boolean available() {
             return repositoryRoot != null && (kind == BaselineKind.WORKSPACE_SNAPSHOT
@@ -186,6 +176,8 @@ public final class CodeDiffReviewService {
     }
 
     Baseline captureForSession(String sessionId, Set<String> workspaceScopePaths) {
+        if (workspaceScopePaths == null || workspaceScopePaths.isEmpty())
+            return unavailable("DAG 代码任务没有声明交付文件路径；请先把产物路径写入任务意图或节点 outputs，再进行独立审查");
         return captureForSession(sessionId, null, workspaceScopePaths);
     }
 
@@ -243,12 +235,8 @@ public final class CodeDiffReviewService {
             if (previous.initialContents().containsKey(path))
                 contents.put(path, previous.initialContents().get(path));
         }
-        Map<String, String> inventory = new LinkedHashMap<>(current.initialWorkspaceInventory());
-        // Preserve the earliest observed inventory so moves/deletions from an earlier
-        // chunk remain visible even if a later user continuation expands the plan.
-        inventory.putAll(previous.initialWorkspaceInventory());
         return new Baseline(current.repositoryRoot(), current.headCommit(), contents,
-                current.initialChangedPaths(), current.unavailableReason(), current.kind(), union, inventory);
+                current.initialChangedPaths(), current.unavailableReason(), current.kind(), union);
     }
 
     public void completeSessionReview(String sessionId) {
@@ -390,7 +378,7 @@ public final class CodeDiffReviewService {
         try {
             WorkspaceSnapshot snapshot = readWorkspaceSnapshot(workspaceRoot, scopePaths);
             return new Baseline(workspaceRoot, "", snapshot.contents(), Set.of(), "",
-                    BaselineKind.WORKSPACE_SNAPSHOT, scopePaths, snapshot.inventory());
+                    BaselineKind.WORKSPACE_SNAPSHOT, scopePaths);
         } catch (IOException | RuntimeException failure) {
             return unavailable("无法完整捕获活动 workspace 基线：" + safeMessage(failure.getMessage()));
         }
@@ -415,7 +403,7 @@ public final class CodeDiffReviewService {
         return Set.copyOf(normalized);
     }
 
-    private record WorkspaceSnapshot(Map<String, String> contents, Map<String, String> inventory) {}
+    private record WorkspaceSnapshot(Map<String, String> contents) {}
     private record WorkspaceFile(String content, long bytes) {}
 
     private static WorkspaceSnapshot readWorkspaceSnapshot(Path workspaceRoot) throws IOException {
@@ -429,9 +417,27 @@ public final class CodeDiffReviewService {
             throw new IOException("活动 workspace 根目录不可访问或超出允许范围");
 
         Map<String, String> contents = new LinkedHashMap<>();
-        Map<String, String> inventory = new LinkedHashMap<>();
         long[] snapshotBytes = {0};
         Set<String> scopedPaths = scopePaths == null ? Set.of() : scopePaths;
+        if (!scopedPaths.isEmpty()) {
+            for (String relative : scopedPaths) {
+                if (!validRelativePath(relative, root))
+                    throw new IOException("任务声明的审查路径越出 workspace：" + relative);
+                Path file = root.resolve(relative).normalize();
+                ensureNoSymlinkPath(root, file);
+                if (!Files.exists(file, LinkOption.NOFOLLOW_LINKS)) continue;
+                if (Files.isSymbolicLink(file)
+                        || !Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS))
+                    throw new IOException("声明的审查产物不是普通文件：" + relative);
+                WorkspaceFile snapshot = readWorkspaceFile(root, file);
+                snapshotBytes[0] += snapshot.bytes();
+                if (contents.size() >= MAX_WORKSPACE_SNAPSHOT_FILES
+                        || snapshotBytes[0] > MAX_WORKSPACE_SNAPSHOT_BYTES)
+                    throw new IOException("声明的代码交付范围超过审查快照上限");
+                contents.put(relative, snapshot.content());
+            }
+            return new WorkspaceSnapshot(java.util.Collections.unmodifiableMap(new LinkedHashMap<>(contents)));
+        }
         int[] visitedEntries = {0};
         Files.walkFileTree(root, EnumSet.noneOf(FileVisitOption.class), MAX_WORKSPACE_DEPTH,
                 new SimpleFileVisitor<>() {
@@ -468,30 +474,21 @@ public final class CodeDiffReviewService {
                         if (!attrs.isRegularFile()) {
                             return FileVisitResult.CONTINUE;
                         }
-                        inventory.put(relative, workspaceFileFingerprint(attrs));
-                        String contentKey = workspacePathKey(relative);
-                        boolean captureContent = scopedPaths.isEmpty()
-                                ? CodeValidationPolicy.isReviewableCodeArtifact(relative)
-                                : scopedPaths.contains(contentKey);
-                        if (captureContent) {
-                            if (contents.size() >= MAX_WORKSPACE_SNAPSHOT_FILES) {
-                                throw new IOException("声明的代码交付文件数超过审查上限 "
-                                        + MAX_WORKSPACE_SNAPSHOT_FILES);
-                            }
-                            WorkspaceFile snapshot = readWorkspaceFile(root, file);
-                            snapshotBytes[0] += snapshot.bytes();
-                            if (snapshotBytes[0] > MAX_WORKSPACE_SNAPSHOT_BYTES) {
-                                throw new IOException(scopedPaths.isEmpty()
-                                        ? "workspace 基线超过大小上限 " + MAX_WORKSPACE_SNAPSHOT_BYTES + " 字节"
-                                        : "声明的代码交付范围超过审查快照大小上限 "
-                                                + MAX_WORKSPACE_SNAPSHOT_BYTES + " 字节");
-                            }
-                            contents.put(scopedPaths.isEmpty() ? relative : contentKey, snapshot.content());
+                        if (!CodeValidationPolicy.isReviewableCodeArtifact(relative)) {
+                            return FileVisitResult.CONTINUE;
                         }
-                        if (inventory.size() > MAX_WORKSPACE_ENTRIES) {
-                            throw new IOException("workspace 文件清单超过审查上限 "
-                                    + MAX_WORKSPACE_ENTRIES);
+                        if (contents.size() >= MAX_WORKSPACE_SNAPSHOT_FILES) {
+                            throw new IOException("workspace 可审查文件数超过上限 "
+                                    + MAX_WORKSPACE_SNAPSHOT_FILES);
                         }
+                        WorkspaceFile snapshot = readWorkspaceFile(root, file);
+                        snapshotBytes[0] += snapshot.bytes();
+                        if (snapshotBytes[0] > MAX_WORKSPACE_SNAPSHOT_BYTES) {
+                            throw new IOException("workspace 基线超过大小上限 "
+                                    + MAX_WORKSPACE_SNAPSHOT_BYTES + " 字节");
+                        }
+                        if (contents.putIfAbsent(relative, snapshot.content()) != null)
+                            throw new IOException("workspace 存在重复的规范化文件路径：" + relative);
                         return FileVisitResult.CONTINUE;
                     }
 
@@ -508,13 +505,7 @@ public final class CodeDiffReviewService {
                         return FileVisitResult.CONTINUE;
                     }
                 });
-        return new WorkspaceSnapshot(
-                java.util.Collections.unmodifiableMap(new LinkedHashMap<>(contents)),
-                java.util.Collections.unmodifiableMap(new LinkedHashMap<>(inventory)));
-    }
-
-    private static String workspaceFileFingerprint(BasicFileAttributes attrs) {
-        return attrs.size() + "|" + attrs.lastModifiedTime() + "|" + attrs.fileKey();
+        return new WorkspaceSnapshot(java.util.Collections.unmodifiableMap(new LinkedHashMap<>(contents)));
     }
 
     private static void countWorkspaceEntry(int[] count) throws IOException {
@@ -822,24 +813,6 @@ public final class CodeDiffReviewService {
             if (!realRoot.equals(root) || !PathGuard.isAllowed(realRoot))
                 return new DiffSnapshot("", "", true, "活动 workspace 根目录发生变化或超出允许路径，审查基线失效");
             WorkspaceSnapshot current = readWorkspaceSnapshot(realRoot, baseline.workspaceScopePaths());
-            if (!baseline.workspaceScopePaths().isEmpty()) {
-                Set<String> inventoryPaths = new LinkedHashSet<>(baseline.initialWorkspaceInventory().keySet());
-                inventoryPaths.addAll(current.inventory().keySet());
-                List<String> outOfScopeChanges = inventoryPaths.stream()
-                        .filter(path -> !java.util.Objects.equals(
-                                baseline.initialWorkspaceInventory().get(path), current.inventory().get(path)))
-                        .filter(path -> !isDeclaredOutputOrParent(path, baseline.workspaceScopePaths()))
-                        .sorted().toList();
-                if (!outOfScopeChanges.isEmpty()) {
-                    String sample = outOfScopeChanges.stream().limit(8)
-                            .collect(java.util.stream.Collectors.joining(", "));
-                    return new DiffSnapshot("", "", true,
-                            "检测到任务声明交付物以外的 workspace 文件变更，共 " + outOfScopeChanges.size()
-                                    + " 项（" + sample + (outOfScopeChanges.size() > 8 ? ", …" : "")
-                                    + "）。为避免智能体通过整理、归档或迁移文件绕过审查，任务已阻止完成；"
-                                    + "需先由用户核验工作区状态。");
-                }
-            }
             Set<String> paths = new LinkedHashSet<>(baseline.initialContents().keySet());
             paths.addAll(current.contents().keySet());
             StringBuilder payload = new StringBuilder();
@@ -883,27 +856,6 @@ public final class CodeDiffReviewService {
         try { file = root.resolve(relative).normalize(); }
         catch (RuntimeException invalid) { return false; }
         return file.startsWith(root) && PathGuard.isAllowed(file);
-    }
-
-    private static boolean isDeclaredOutputOrParent(String path, Set<String> scopePaths) {
-        if (path == null || scopePaths == null) return false;
-        path = workspacePathKey(path);
-        for (String scoped : scopePaths) {
-            if (path.equals(scoped)) return true;
-            int slash = scoped.lastIndexOf('/');
-            while (slash >= 0) {
-                String parent = scoped.substring(0, slash);
-                if (path.equals(parent)) return true;
-                slash = parent.lastIndexOf('/');
-            }
-        }
-        return false;
-    }
-
-    private static String workspacePathKey(String path) {
-        String normalized = path == null ? "" : path.replace('\\', '/');
-        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win")
-                ? normalized.toLowerCase(Locale.ROOT) : normalized;
     }
 
     private static List<String> nulSeparated(String output) {

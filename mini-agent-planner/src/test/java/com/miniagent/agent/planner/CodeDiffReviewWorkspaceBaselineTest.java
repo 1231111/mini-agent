@@ -140,8 +140,6 @@ class CodeDiffReviewWorkspaceBaselineTest {
         assertThat(baseline.available()).isTrue();
         assertThat(baseline.kind()).isEqualTo(CodeDiffReviewService.BaselineKind.WORKSPACE_SNAPSHOT);
         assertThat(baseline.workspaceScopePaths()).containsExactly("five-step-admin.html");
-        assertThat(baseline.initialWorkspaceInventory()).containsKeys(
-                "five-step-admin.html", "unrelated-large.html");
         Files.writeString(workspace.resolve("five-step-admin.html"), "<main>after</main>\n");
         CodeDiffReviewService.DiffSnapshot diff = service.collectDiff(baseline);
 
@@ -152,7 +150,7 @@ class CodeDiffReviewWorkspaceBaselineTest {
     }
 
     @Test
-    void taskScopedReviewBlocksChangesToUndeclaredWorkspaceFilesWithoutReadingTheirContents() throws Exception {
+    void taskScopedReviewDoesNotCoupleCompletionToUnrelatedWorkspaceChanges() throws Exception {
         Path workspace = createWorkspace("workspace-unscoped-mutation");
         Files.writeString(workspace.resolve("page.html"), "<main>before</main>\n");
         Files.writeString(workspace.resolve("unrelated.js"), "const marker = 'before';\n");
@@ -164,9 +162,25 @@ class CodeDiffReviewWorkspaceBaselineTest {
 
         CodeDiffReviewService.DiffSnapshot diff = service.collectDiff(baseline);
 
+        assertThat(diff.error()).isEmpty();
         assertThat(diff.hasChanges()).isTrue();
-        assertThat(diff.error()).contains("交付物以外的 workspace 文件变更", "unrelated.js")
-                .contains("需先由用户核验");
+        assertThat(diff.changedPaths()).containsExactly("page.html");
+        assertThat(diff.content()).contains("<main>before</main>", "<main>after</main>")
+                .doesNotContain("unrelated.js", "const marker");
+    }
+
+    @Test
+    void dagReviewRequiresDeclaredDeliverableInsteadOfScanningTheWholeWorkspace() throws Exception {
+        Path workspace = createWorkspace("workspace-missing-declared-scope");
+        Files.writeString(workspace.resolve("existing-page.html"), "<main>existing</main>\n");
+        CodeDiffReviewService service = new CodeDiffReviewService(null, null);
+
+        CodeDiffReviewService.Baseline baseline = service.captureForSession(
+                "missing-declared-scope", Set.of());
+
+        assertThat(baseline.available()).isFalse();
+        assertThat(baseline.unavailableReason()).contains("没有声明交付文件路径")
+                .contains("节点 outputs");
     }
 
     @Test
