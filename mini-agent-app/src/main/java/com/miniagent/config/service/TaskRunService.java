@@ -7,6 +7,7 @@ import com.miniagent.replica.RedisTaskConcurrency;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import com.miniagent.config.cloud.TokenEntitlementGate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -36,6 +37,8 @@ public class TaskRunService implements SessionLock {
     private RedisTaskConcurrency taskConcurrency;
     @Autowired(required = false)
     private TaskAdmissionGuard admissionGuard;
+    @Autowired
+    private TokenEntitlementGate entitlementGate;
     @Autowired(required = false)
     private UserTokenQuotaService userTokenQuota;
     @Autowired(required = false)
@@ -198,6 +201,11 @@ public class TaskRunService implements SessionLock {
         try { decision = admissionGuard.check(userId, sessionId); }
         catch (RuntimeException unavailable) { decision = TaskAdmissionGuard.Decision.UNAVAILABLE; }
         if (decision == TaskAdmissionGuard.Decision.ALLOW) return null;
+        if (decision == TaskAdmissionGuard.Decision.QUOTA_EXCEEDED) {
+            // guard 已经判定超额，这里再取一次文案；gate 有 5 分钟缓存，不会重复打账号服务。
+            String reason = entitlementGate == null ? null : entitlementGate.rejectionReason(userId);
+            return reason != null ? reason : "今日 token 额度已用完，请明天再试";
+        }
         return decision == TaskAdmissionGuard.Decision.BUSY
                 ? "上一轮工具操作尚未结束，请稍后重试"
                 : "暂时无法确认上一轮执行状态，请稍后重试";

@@ -104,6 +104,18 @@ public class CloudMembershipClient {
         });
     }
 
+    /**
+     * 额度判定。客户机在任务开始前调一次，判断还能不能继续。
+     *
+     * <p>账号服务不可达时抛 {@code CloudAccountException}，由调用方决定是放行还是拒绝 ——
+     * 这里不做「失败即拒绝」的判断，那是业务策略不是传输层的职责。</p>
+     */
+    public EntitlementView entitlement(Long userId) {
+        return call("GET", "/api/membership/entitlement?userId=" + userId, null,
+                new TypeReference<Envelope<EntitlementView>>() {
+                });
+    }
+
     public MembershipView current(Long userId) {
         return call("GET", "/api/membership/current?userId=" + userId, null,
                 new TypeReference<Envelope<MembershipView>>() {
@@ -258,6 +270,15 @@ public class CloudMembershipClient {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
+    /**
+     * 额度视图。{@code resetAt} 用字符串接收（ISO 日期），避免为这一处引 Jackson 的日期配置。
+     * {@code remainingTokens} 为 -1 表示不限。
+     */
+    public record EntitlementView(boolean allowed, String planCode, long dailyLimitTokens,
+                                  long usedTokens, long remainingTokens,
+                                  String resetAt, String reason) {
+    }
+
     public record MembershipView(String planCode, String planName, long dailyTokenLimit,
                                  int maxConcurrentTasks, LocalDateTime expireAt,
                                  String sourceOrderNo) {

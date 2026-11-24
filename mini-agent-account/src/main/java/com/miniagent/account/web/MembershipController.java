@@ -177,4 +177,20 @@ public class MembershipController {
         usageEvents.recordUsage(req.userId(), input, output, calls, req.eventId());
         return ApiResponse.ok(null);
     }
+
+    /**
+     * 额度判定。客户机在**发起任务前**调一次，判断还能不能继续。
+     *
+     * <p>为什么不在每次模型调用前调：一个任务可能调几十次模型，逐次远程查询会加几十个 RTT。
+     * 粒度定在任务级，超支窗口由任务级 token 上限兜住。</p>
+     */
+    @GetMapping(value = "/entitlement", produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public ApiResponse<MembershipService.EntitlementView> entitlement(
+            @RequestParam(value = "userId", required = false) Long userId) {
+        if (userId == null) {
+            throw new BusinessException(ErrorCode.MEMBER_USER_NOT_FOUND, "缺少 userId");
+        }
+        return ApiResponse.ok(membership.entitlementOf(userId));
+    }
 }

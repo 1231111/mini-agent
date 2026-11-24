@@ -73,6 +73,8 @@ public class MembershipService {
     private UserRepository users;
     @Autowired
     private MembershipUsageEventRepository usageEvents;
+    @Autowired
+    private com.miniagent.account.repository.UserDailyUsageRepository dailyUsage;
 
     /** 与客户机配额日切同一时区，避免「云端的今天」和「本机的今天」差一天。 */
     @Value("${agent.quota.zone-id:Asia/Shanghai}")
@@ -199,6 +201,56 @@ public class MembershipService {
         row.setOutputTokens(output);
         row.setReportedAt(LocalDateTime.now(quotaZone));
         usageEvents.save(row);
+    }
+
+    /**
+     * 额度判定视图。
+     *
+     * @param allowed        是否还能发起新任务
+     * @param dailyLimitTokens 每日上限；0 表示不限
+     * @param usedTokens     今日已用（输入 + 输出）
+     * @param remainingTokens 剩余量；不限时为 -1
+     * @param resetAt        额度重置日（次日零点，按 {@code quotaZone}）
+     * @param reason         不允许时的可展示原因；允许时为空串
+     */
+    public record EntitlementView(boolean allowed, String planCode, long dailyLimitTokens,
+                                  long usedTokens, long remainingTokens,
+                                  LocalDate resetAt, String reason) {
+    }
+
+    /**
+     * 判断该用户今天还能否发起新任务。
+     *
+     * <p>已用量取两处较大值：{@code user_daily_usage}（明细累加，新表）与
+     * {@code membership_usage_events}（历史上报，旧表）。过渡期里两套数据可能一方有、一方没有，
+     * 取大的那个更保守 —— 宁可提前拦，也不要因为统计口径切换而让实际超额。</p>
+     *
+     * <p>这里只做判定，不做扣减：额度是「今天累计到多少」，不是「还剩多少余额」，
+     * 所以不存在并发扣减的问题，也就不需要悲观锁。</p>
+     */
+    @Transactional(readOnly = true)
+    public EntitlementView entitlementOf(Long userId) {
+        LocalDate today = LocalDate.now(quotaZone);
+        // 只查一次：limit 和 planCode 来自同一个订阅视图，查两次会多一次数据库往返。
+        MembershipView membership = current(userId).orElse(null);
+        long limit = membership == null ? 0L : membership.dailyTokenLimit();
+        String planCode = membership == null ? "" : membership.planCode();
+
+        long fromDetails = dailyUsage.tokensOn(userId, today);
+        UsageSum legacy = usageEvents.sumBetween(userId,
+                today.atStartOfDay(), today.plusDays(1).atStartOfDay());
+        long fromEvents = legacy == null ? 0 : legacy.inputTokens() + legacy.outputTokens();
+        long used = Math.max(fromDetails, fromEvents);
+
+        LocalDate resetAt = today.plusDays(1);
+        if (limit <= 0) {
+            return new EntitlementView(true, planCode, 0, used, -1, resetAt, "");
+        }
+        boolean allowed = used < limit;
+        long remaining = Math.max(0, limit - used);
+        return new EntitlementView(allowed, planCode, limit, used, remaining, resetAt,
+                allowed ? "" : "今日 token 额度已用完（" + used + " / " + limit + "），"
+                        + resetAt + " 后恢复。");
     }
 
     /**

@@ -6,6 +6,7 @@ import com.miniagent.agent.execution.ToolExecutionGuards;
 import com.miniagent.agent.tool.WorkspaceContext;
 import com.miniagent.common.context.OwnerContext;
 import com.miniagent.application.ChatStreamingService;
+import com.miniagent.config.cloud.TokenEntitlementGate;
 import com.miniagent.config.repository.UserRepository;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
@@ -13,20 +14,23 @@ import org.springframework.stereotype.Component;
 /** Prevents a new turn from overlapping unfinished local work from its previous run. */
 @Component
 public class TaskAdmissionGuard {
-    public enum Decision { ALLOW, BUSY, UNAVAILABLE }
+    public enum Decision { ALLOW, BUSY, UNAVAILABLE, QUOTA_EXCEEDED }
 
     private final ObjectProvider<ToolExecutionGuards> tools;
     private final ObjectProvider<BrowserService> browsers;
     private final ObjectProvider<ChatStreamingService> streams;
     private final UserRepository users;
+    private final TokenEntitlementGate entitlements;
 
     public TaskAdmissionGuard(ObjectProvider<ToolExecutionGuards> tools,
                               ObjectProvider<BrowserService> browsers, UserRepository users,
-                              ObjectProvider<ChatStreamingService> streams) {
+                              ObjectProvider<ChatStreamingService> streams,
+                              TokenEntitlementGate entitlements) {
         this.tools = tools;
         this.browsers = browsers;
         this.users = users;
         this.streams = streams;
+        this.entitlements = entitlements;
     }
 
     public Decision check(Long userId, String sessionId) {
@@ -49,8 +53,12 @@ public class TaskAdmissionGuard {
             String previousSession = WorkspaceContext.getSessionOverride();
             try (var ignored = OwnerContext.bind(new OwnerContext(userId, tenantId))) {
                 WorkspaceContext.setSessionOverride(sessionId);
-                return browsers.getObject().hasPendingOperations(BrowserSessionIdentity.resolve(sessionId))
-                        ? Decision.BUSY : Decision.ALLOW;
+                if (browsers.getObject().hasPendingOperations(BrowserSessionIdentity.resolve(sessionId)))
+                    return Decision.BUSY;
+                // 额度放在最后一步：前面几步是本机状态检查，比一次远程查询便宜，
+                // 而且 BUSY 的情况下没必要去问额度。
+                return entitlements.rejectionReason(userId) != null
+                        ? Decision.QUOTA_EXCEEDED : Decision.ALLOW;
             } finally {
                 // Root/task/operation group are not changed by this identity lookup.
                 WorkspaceContext.setSessionOverride(previousSession);

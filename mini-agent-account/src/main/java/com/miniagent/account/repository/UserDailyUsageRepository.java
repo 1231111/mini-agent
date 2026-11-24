@@ -15,6 +15,16 @@ public interface UserDailyUsageRepository extends JpaRepository<UserDailyUsage, 
 
     Optional<UserDailyUsage> findByUserIdAndUsageDayAndModel(Long userId, LocalDate usageDay, String model);
 
+    /**
+     * 某用户某天的总 token 数（输入 + 输出，所有模型合计）。
+     *
+     * <p>额度判断只要一个数，用聚合查询而不是把当天所有行拉回来再求和 ——
+     * 这个查询在每次任务开始前都会跑，不能做全量读取。</p>
+     */
+    @Query("select coalesce(sum(u.inputTokens + u.outputTokens), 0) from UserDailyUsage u "
+            + "where u.userId = :userId and u.usageDay = :usageDay")
+    long tokensOn(@Param("userId") Long userId, @Param("usageDay") LocalDate usageDay);
+
     /** 汇总查询按天/模型排序，让接口输出稳定，便于前端直接渲染与快照比对。 */
     List<UserDailyUsage> findByUserIdAndUsageDayBetweenOrderByUsageDayAscModelAsc(
             Long userId, LocalDate from, LocalDate to);
