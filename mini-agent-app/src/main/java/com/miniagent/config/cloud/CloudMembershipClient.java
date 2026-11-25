@@ -6,6 +6,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.common.ErrorCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import com.miniagent.config.repository.UserRepository;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
@@ -45,10 +47,17 @@ public class CloudMembershipClient {
     private static final Logger log = LoggerFactory.getLogger(CloudMembershipClient.class);
 
     private static final String HEADER_INTERNAL_KEY = "X-Account-Internal-Key";
+    private static final String HEADER_AGENT_TOKEN = "X-Agent-Token";
 
     private final ObjectMapper objectMapper;
     private final String baseUrl;
     private final String internalKey;
+    /**
+     * 本地用户表：用来取账号服务签发的客户机令牌。
+     * 取不到（例如在异步上报线程上）时不带头，退回全局 internal-key。
+     */
+    @Autowired
+    private UserRepository users;
     private final RestClient client;
 
     public CloudMembershipClient(
@@ -184,6 +193,26 @@ public class CloudMembershipClient {
         });
     }
 
+    /**
+     * 当前用户的服务令牌；没有当前用户、或本地还没保存令牌时返回 null。
+     *
+     * <p>查的是本机 H2 的一行主键，代价可以忽略，因此不做缓存 ——
+     * 缓存会让「重新登录后立刻生效」变成「最多 5 分钟后才生效」。</p>
+     */
+    private String currentAgentToken() {
+        try {
+            Long userId = com.miniagent.common.context.OwnerContext.currentUserId();
+            if (userId == null) return null;
+            return users.findById(userId)
+                    .map(com.miniagent.config.entity.User::getCloudAgentToken)
+                    .filter(token -> token != null && !token.isBlank())
+                    .orElse(null);
+        } catch (RuntimeException ignored) {
+            // 取令牌失败不能阻断业务调用：退回全局密钥，服务端仍能认证。
+            return null;
+        }
+    }
+
     // ==================== 传输与解包 ====================
 
     private <T> T call(String method, String path, Object body, TypeReference<Envelope<T>> type) {
@@ -202,6 +231,10 @@ public class CloudMembershipClient {
             RestClient.RequestBodySpec spec = client.method(org.springframework.http.HttpMethod.valueOf(method))
                     .uri(baseUrl + path)
                     .header(HEADER_INTERNAL_KEY, internalKey);
+            // 有客户机令牌就带上：它绑定了 userId，服务端据此拒绝写别人的数据。
+            // 异步线程上没有当前用户，此时只带全局密钥（过渡期仍可用）。
+            String agentToken = currentAgentToken();
+            if (agentToken != null) spec = spec.header(HEADER_AGENT_TOKEN, agentToken);
             raw = ("POST".equals(method)
                     ? spec.contentType(MediaType.APPLICATION_JSON).body(body)
                     : spec)

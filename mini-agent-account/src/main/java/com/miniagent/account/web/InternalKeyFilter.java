@@ -2,6 +2,7 @@ package com.miniagent.account.web;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.common.ApiResponse;
+import com.miniagent.account.service.AgentTokenService;
 import com.miniagent.common.ErrorCode;
 import jakarta.annotation.PostConstruct;
 import jakarta.servlet.FilterChain;
@@ -41,6 +42,13 @@ public class InternalKeyFilter extends OncePerRequestFilter {
 
     private static final String PROTECTED_PREFIX = "/api/membership/";
     private static final String HEADER = "X-Account-Internal-Key";
+    /** 客户机服务令牌头。优先于全局密钥：它绑定了用户，能拦住冒用。 */
+    private static final String TOKEN_HEADER = "X-Agent-Token";
+    /** 令牌解析出的 userId，放在 request 属性里供控制器使用（控制器应以此为准）。 */
+    public static final String ATTR_AGENT_USER_ID = "account.agentUserId";
+
+    @Autowired
+    private AgentTokenService agentTokens;
 
     @Value("${agent.account.internal-key:}")
     private String configuredKey;
@@ -73,6 +81,28 @@ public class InternalKeyFilter extends OncePerRequestFilter {
         }
 
         if (!stripContextPath(request).startsWith(PROTECTED_PREFIX)) {
+            chain.doFilter(request, response);
+            return;
+        }
+
+        String agentToken = request.getHeader(TOKEN_HEADER);
+        if (agentToken != null && !agentToken.isBlank()) {
+            Long tokenUserId = agentTokens.resolve(agentToken);
+            if (tokenUserId == null) {
+                // 无效和过期不区分：区分开等于告诉对方「这个令牌曾经有效」。
+                writeJson(response, HttpServletResponse.SC_UNAUTHORIZED,
+                        ErrorCode.AUTH_SESSION_INVALID, "客户机令牌无效或已过期，请重新登录");
+                return;
+            }
+            // GET 端点的 userId 在查询参数上，这里就能比；POST 的 body 留给控制器比。
+            String requested = request.getParameter("userId");
+            if (requested != null && !requested.isBlank()
+                    && !requested.trim().equals(String.valueOf(tokenUserId))) {
+                writeJson(response, HttpServletResponse.SC_FORBIDDEN,
+                        ErrorCode.AUTH_FORBIDDEN, "请求的用户与令牌不匹配");
+                return;
+            }
+            request.setAttribute(ATTR_AGENT_USER_ID, tokenUserId);
             chain.doFilter(request, response);
             return;
         }

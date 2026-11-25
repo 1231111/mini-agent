@@ -96,14 +96,37 @@ public class ShadowUserService {
      */
     @Transactional
     public User materialize(CloudUser cloudUser) {
+        User user;
         if (sharedDatabase) {
-            return adoptSharedRow(cloudUser);
+            user = adoptSharedRow(cloudUser);
+        } else {
+            Optional<User> existing = userRepository.findByExternalIdForUpdate(cloudUser.externalId());
+            user = existing.isPresent() ? refresh(existing.get(), cloudUser) : create(cloudUser);
         }
-        Optional<User> existing = userRepository.findByExternalIdForUpdate(cloudUser.externalId());
-        if (existing.isPresent()) {
-            return refresh(existing.get(), cloudUser);
+        return applyAgentToken(user, cloudUser);
+    }
+
+    /**
+     * 保存账号服务新签发的客户机令牌。
+     *
+     * <p>只在服务端返回了令牌时写：老版本不返回时保持原值，避免把「还没升级服务端」
+     * 误判成「令牌被撤销了」而清掉一个本来还能用的凭证。</p>
+     */
+    private User applyAgentToken(User user, CloudUser cloudUser) {
+        if (!cloudUser.hasAgentToken()) return user;
+        user.setCloudAgentToken(cloudUser.agentToken());
+        user.setCloudAgentTokenExpiresAt(parseExpiry(cloudUser.agentTokenExpiresAt()));
+        return userRepository.save(user);
+    }
+
+    /** 过期时间是可选信息：解析失败只影响本地展示，不影响能否用这把令牌（服务端会判）。 */
+    private static java.time.LocalDateTime parseExpiry(String value) {
+        if (value == null || value.isBlank()) return null;
+        try {
+            return java.time.LocalDateTime.parse(value);
+        } catch (RuntimeException ignored) {
+            return null;
         }
-        return create(cloudUser);
     }
 
     /**

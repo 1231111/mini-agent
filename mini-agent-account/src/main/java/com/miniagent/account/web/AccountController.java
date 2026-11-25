@@ -3,6 +3,7 @@ package com.miniagent.account.web;
 import com.miniagent.account.entity.User;
 import com.miniagent.account.repository.UserRepository;
 import com.miniagent.account.service.AccountAuthService;
+import com.miniagent.account.service.AgentTokenService;
 import com.miniagent.account.service.MemoryAccessTokenService;
 import com.miniagent.account.service.DesktopLoginTicketStore;
 import com.miniagent.account.web.dto.AccountUserResponse;
@@ -37,6 +38,8 @@ public class AccountController {
     private UserRepository users;
     @Autowired
     private MemoryAccessTokenService memoryTokens;
+    @Autowired
+    private AgentTokenService agentTokens;
 
     public record LoginRequest(String username, String password) {
     }
@@ -64,8 +67,10 @@ public class AccountController {
         return auth.login(req.username(), req.password())
                 .map(user -> {
                     MemoryAccessTokenService.IssuedCredential issued = memoryTokens.issue(user);
+                    // 每次登录都轮换：旧令牌立即失效，保证一把令牌只对应一次登录。
+                    AgentTokenService.Issued agentToken = agentTokens.rotate(user);
                     return ApiResponse.ok(AccountUserResponse.of(issued.user(), issued.accessToken(),
-                            issued.refreshCredential()));
+                            issued.refreshCredential(), agentToken.token(), agentToken.expiresAt()));
                 })
                 .orElse(ApiResponse.fail(ErrorCode.AUTH_LOGIN_FAILED));
     }
@@ -88,8 +93,9 @@ public class AccountController {
         }
         User user = result.user();
         MemoryAccessTokenService.IssuedCredential issued = memoryTokens.issue(user);
+        AgentTokenService.Issued agentToken = agentTokens.rotate(user);
         return ApiResponse.ok(AccountUserResponse.of(issued.user(), issued.accessToken(),
-                issued.refreshCredential()));
+                issued.refreshCredential(), agentToken.token(), agentToken.expiresAt()));
     }
 
     /**

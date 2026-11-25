@@ -27,4 +27,7 @@ public interface UserRepository extends JpaRepository<User, Long> {
     Optional<User> findByMemoryRefreshTokenHash(String memoryRefreshTokenHash);
 
     boolean existsByUsername(String username);
+
+    /** 客户机令牌校验：拿 SHA-256 反查用户。走 uk_users_agent_token_hash 索引。 */
+    java.util.Optional<User> findByAgentTokenHash(String agentTokenHash);
 }

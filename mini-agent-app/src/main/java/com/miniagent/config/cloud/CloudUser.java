@@ -15,5 +15,14 @@ package com.miniagent.config.cloud;
  * @param role        云端角色名（如 {@code USER}），可为空；本地影子用户不采纳它，理由见 CloudAccountService
  */
 public record CloudUser(String externalId, String username, String displayName, String role,
-                        String cloudTenantId, String memoryToken, String memoryRefreshCredential) {
+                        String cloudTenantId, String memoryToken, String memoryRefreshCredential,
+                        String agentToken, String agentTokenExpiresAt) {
+
+    /**
+     * 老服务端不返回 agentToken 时为 null。这时调用方应退回全局 internal-key，
+     * 而不是认为「登录失败」——版本错配不该表现成密码错误。
+     */
+    public boolean hasAgentToken() {
+        return agentToken != null && !agentToken.isBlank();
+    }
 }

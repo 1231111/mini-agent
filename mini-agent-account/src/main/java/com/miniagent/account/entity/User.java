@@ -68,4 +68,20 @@ public class User extends BaseEntity {
     @Column(name = "membership_expires_at")
     private LocalDateTime membershipExpiresAt;
 
+    /**
+     * 客户机服务令牌的 SHA-256 十六进制值。
+     *
+     * <p>同一用户同时只有一把：重新登录即轮换，旧值立即失效（单设备语义）。
+     * 库里只存哈希，和 {@code memory_refresh_token_hash} 同一个处理方式 ——
+     * 库被读走也拿不到可用于调用的原文。</p>
+     */
+    @Column(name = "agent_token_hash", length = 64)
+    private String agentTokenHash;
+
+    @Column(name = "agent_token_issued_at")
+    private LocalDateTime agentTokenIssuedAt;
+
+    @Column(name = "agent_token_expires_at")
+    private LocalDateTime agentTokenExpiresAt;
+
 }

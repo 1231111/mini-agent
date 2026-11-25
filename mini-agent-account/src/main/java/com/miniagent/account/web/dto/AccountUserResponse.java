@@ -20,15 +20,29 @@ import com.miniagent.account.entity.UserRole;
  */
 public record AccountUserResponse(Long userId, String username, String displayName,
                                   Long tenantId, UserRole role, String memoryToken,
-                                  String memoryRefreshCredential) {
+                                  String memoryRefreshCredential,
+                                  String agentToken, java.time.LocalDateTime agentTokenExpiresAt) {
 
     public static AccountUserResponse of(User user) {
         return new AccountUserResponse(user.getId(), user.getUsername(), user.getDisplayName(),
-                user.getTenantId(), user.getRole(), null, null);
+                user.getTenantId(), user.getRole(), null, null, null, null);
     }
 
     public static AccountUserResponse of(User user, String memoryToken, String memoryRefreshCredential) {
         return new AccountUserResponse(user.getId(), user.getUsername(), user.getDisplayName(),
-                user.getTenantId(), user.getRole(), memoryToken, memoryRefreshCredential);
+                user.getTenantId(), user.getRole(), memoryToken, memoryRefreshCredential, null, null);
+    }
+
+    /**
+     * 登录/注册成功的完整响应。
+     *
+     * <p>{@code agentToken} 只在这一次响应里出现，服务端之后只保留它的哈希。
+     * 客户端保存后每次调会员接口带上；不保存就只能等下次登录重新拿。</p>
+     */
+    public static AccountUserResponse of(User user, String memoryToken, String memoryRefreshCredential,
+                                         String agentToken, java.time.LocalDateTime agentTokenExpiresAt) {
+        return new AccountUserResponse(user.getId(), user.getUsername(), user.getDisplayName(),
+                user.getTenantId(), user.getRole(), memoryToken, memoryRefreshCredential,
+                agentToken, agentTokenExpiresAt);
     }
 }

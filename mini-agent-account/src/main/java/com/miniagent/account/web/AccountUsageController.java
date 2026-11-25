@@ -15,6 +15,7 @@ import org.springframework.http.MediaType;
 import org.springframework.data.domain.Page;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -158,9 +159,17 @@ public class AccountUsageController {
             produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ApiResponse<Void> recordCall(
-            @RequestBody(required = false) LlmCallUsageService.RecordCommand body) {
+            @RequestBody(required = false) LlmCallUsageService.RecordCommand body,
+            HttpServletRequest request) {
         if (body == null) {
             return ApiResponse.fail(ErrorCode.CONFIG_INVALID, "请求体不能为空");
+        }
+        // 令牌绑定 userId 时，body 里的 userId 必须与之一致 —— 这是「防冒用」的实际落点。
+        // 头部能证明「请求来自某个客户机」，只有这一步能证明「写的是自己的数据」。
+        Object tokenUserId = request.getAttribute(InternalKeyFilter.ATTR_AGENT_USER_ID);
+        if (tokenUserId instanceof Long boundUserId && body.userId() != null
+                && !boundUserId.equals(body.userId())) {
+            return ApiResponse.fail(ErrorCode.AUTH_FORBIDDEN, "请求的用户与令牌不匹配");
         }
         return calls.record(body) == LlmCallUsageService.RecordOutcome.REJECTED
                 ? ApiResponse.fail(ErrorCode.CONFIG_INVALID, "调用明细未被接受，请检查 userId 与 requestId")

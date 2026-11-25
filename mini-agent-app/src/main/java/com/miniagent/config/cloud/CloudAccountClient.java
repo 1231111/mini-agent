@@ -390,8 +390,11 @@ public class CloudAccountClient {
             throw new CloudAccountException(ErrorCode.AUTH_CLOUD_INVALID_RESPONSE,
                     "云端账号服务响应缺少云端租户或记忆访问凭证");
         }
+        // 令牌是可选的：服务端版本没跟上时不返回，此时退回全局密钥（并会在日志里说明）。
+        // 不设成必需字段，否则升级顺序一旦反了，用户会看到「云端版本与本机不一致」。
         return new CloudUser(externalId, username, text(data, "displayName"), text(data, "role"),
-                cloudTenantId, memoryToken, memoryRefreshCredential);
+                cloudTenantId, memoryToken, memoryRefreshCredential,
+                text(data, "agentToken"), text(data, "agentTokenExpiresAt"));
     }
 
     private static String text(JsonNode node, String field) {

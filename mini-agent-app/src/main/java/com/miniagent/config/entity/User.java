@@ -3,6 +3,8 @@ package com.miniagent.config.entity;
 import jakarta.persistence.*;
 import lombok.Data;
 
+import java.time.LocalDateTime;
+
 @Entity
 @Data
 @Table(name = "users", uniqueConstraints = @UniqueConstraint(name = "ux_users_external_id", columnNames = "external_id"))
@@ -67,6 +69,19 @@ public class User extends BaseEntity {
      */
     @Column(name = "external_id", length = 128)
     private String externalId;
+
+    /**
+     * 云端签发给本机的服务令牌（{@code atk_...}）。只在登录成功时写入，
+     * 之后调会员接口带 {@code X-Agent-Token}。
+     *
+     * <p>老版本服务端不返回该值时为 null，此时调用方退回全局 internal-key ——
+     * 这是升级顺序不一致时的兼容路径，不是正常状态。</p>
+     */
+    @Column(name = "cloud_agent_token", length = 128)
+    private String cloudAgentToken;
+
+    @Column(name = "cloud_agent_token_expires_at")
+    private LocalDateTime cloudAgentTokenExpiresAt;
 
     @Column(name = "cloud_tenant_id", length = 128)
     private String cloudTenantId;
