@@ -36,6 +36,12 @@ public interface LoopTurnPolicy {
         return "";
     }
 
+    /** Observe the exact result chunk made visible to the model after context shaping. */
+    default String observeToolOutcome(String toolName, String argumentsJson, ToolResult result,
+                                      String visibleResult) {
+        return observeToolOutcome(toolName, argumentsJson, result);
+    }
+
     /** A policy may terminate the current loop after a hard per-node circuit breaker trips. */
     default String stopReason() { return ""; }
 

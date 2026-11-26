@@ -23,7 +23,8 @@ class ReadFilePaginationTest {
 
     @Test
     void longUtf8LineCanBePagedByCodePointWithoutLoss() throws Exception {
-        String content = ("中😀ab").repeat(30_000);
+        // Match the 238k-code-point minified HTML line observed in the failed task trace.
+        String content = ("中😀ab").repeat(59_667) + "x";
         Files.writeString(workspace.resolve("large.html"), content);
         ToolRegistry registry = newRegistry();
         StringBuilder reconstructed = new StringBuilder();
@@ -44,9 +45,10 @@ class ReadFilePaginationTest {
     @Test
     void highLineOffsetUsesSparseIndexAndPreservesCrlfAndUnicode() throws Exception {
         List<String> lines = new ArrayList<>();
-        for (int i = 1; i <= 400; i++) lines.add("行" + i + " 😀");
+        for (int i = 1; i <= 10_000; i++) lines.add("行" + i + " 😀");
         Files.writeString(workspace.resolve("many-lines.txt"), String.join("\r\n", lines) + "\r\n");
-        ToolRegistry registry = newRegistry();
+        ToolRegistry registry = new ToolRegistry();
+        BuiltinTools tools = newTools(registry);
 
         ToolResult result = registry.executeResult("read_file",
                 "{\"path\":\"many-lines.txt\",\"offset\":250,\"limit\":5}");
@@ -55,6 +57,60 @@ class ReadFilePaginationTest {
         assertThat(result.legacyText()).contains("line_offset=250", "lines_returned=5", "250|行250 😀",
                 "251|行251 😀", "254|行254 😀");
         assertThat(result.legacyText()).doesNotContain("249|", "255|行255");
+
+        Object index = ((java.util.Map<?, ?>) ReflectionTestUtils.getField(tools, "readFileIndexCache"))
+                .values().iterator().next();
+        assertThat(ReflectionTestUtils.getField(index, "eof")).isEqualTo(false);
+        Object coverage = ReflectionTestUtils.getField(index, "coverage");
+        assertThat(ReflectionTestUtils.getField(coverage, "lineNo")).isEqualTo(250);
+
+        ToolResult nextPage = registry.executeResult("read_file",
+                "{\"path\":\"many-lines.txt\",\"offset\":255,\"limit\":5}");
+        assertThat(nextPage.isSuccess()).isTrue();
+        assertThat(nextPage.legacyText()).contains("255|行255 😀", "259|行259 😀");
+        index = ((java.util.Map<?, ?>) ReflectionTestUtils.getField(tools, "readFileIndexCache"))
+                .values().iterator().next();
+        coverage = ReflectionTestUtils.getField(index, "coverage");
+        assertThat(ReflectionTestUtils.getField(coverage, "lineNo")).isEqualTo(255);
+    }
+
+    @Test
+    void sparseIndexIsInvalidatedAfterFileContentChanges() throws Exception {
+        List<String> lines = new ArrayList<>();
+        for (int i = 1; i <= 400; i++) lines.add("line-" + i);
+        Path file = workspace.resolve("mutable.txt");
+        Files.writeString(file, String.join("\n", lines));
+        ToolRegistry registry = newRegistry();
+
+        ToolResult first = registry.executeResult("read_file",
+                "{\"path\":\"mutable.txt\",\"offset\":250,\"limit\":1}");
+        assertThat(first.legacyText()).contains("250|line-250");
+
+        Files.writeString(file, "inserted\n" + String.join("\n", lines));
+        ToolResult afterEdit = registry.executeResult("read_file",
+                "{\"path\":\"mutable.txt\",\"offset\":251,\"limit\":1}");
+
+        assertThat(afterEdit.isSuccess()).isTrue();
+        assertThat(afterEdit.legacyText()).contains("251|line-250");
+    }
+
+    @Test
+    void sparseSeekStillRejectsMalformedUtf8InsteadOfSilentlySkippingIt() throws Exception {
+        byte[] prefix = "a".repeat(20_000).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] bytes = java.util.Arrays.copyOf(prefix, prefix.length + 1);
+        bytes[bytes.length - 1] = (byte) 0xc3;
+        Files.write(workspace.resolve("broken-long.txt"), bytes);
+        ToolRegistry registry = newRegistry();
+
+        ToolResult firstPage = registry.executeResult("read_file", "{\"path\":\"broken-long.txt\"}");
+        assertThat(firstPage.isSuccess()).isTrue();
+
+        ToolResult indexedPage = registry.executeResult("read_file",
+                "{\"path\":\"broken-long.txt\",\"offset\":1,\"limit\":1,"
+                        + "\"char_offset\":16000,\"char_limit\":8000}");
+        assertThat(indexedPage.isSuccess()).isFalse();
+        assertThat(indexedPage.errorCode()).isEqualTo(ToolErrorCode.INVALID_ARGUMENT);
+        assertThat(indexedPage.message()).contains("UTF-8");
     }
 
     @Test
@@ -66,10 +122,10 @@ class ReadFilePaginationTest {
         ToolResult result = registry.executeResult("read_file", "{\"path\":\"many-long-lines.txt\"}");
 
         assertThat(result.isSuccess()).isTrue();
-        assertThat(result.legacyText()).contains("lines_returned=8", "partial=true",
-                "reason=response_char_limit next_line_offset=9");
-        assertThat(result.legacyText().lines().filter(s -> s.matches("\\d+\\|.*")).count()).isEqualTo(8);
-        assertThat(result.legacyText().length()).isLessThan(34_000);
+        assertThat(result.legacyText()).contains("lines_returned=2", "partial=true",
+                "reason=response_char_limit next_line_offset=3");
+        assertThat(result.legacyText().lines().filter(s -> s.matches("\\d+\\|.*")).count()).isEqualTo(2);
+        assertThat(result.legacyText().length()).isLessThan(9_000);
     }
 
     @Test
@@ -117,9 +173,15 @@ class ReadFilePaginationTest {
     private ToolRegistry newRegistry() {
         WorkspaceContext.setRootOverride(workspace);
         ToolRegistry registry = new ToolRegistry();
+        newTools(registry);
+        return registry;
+    }
+
+    private BuiltinTools newTools(ToolRegistry registry) {
+        WorkspaceContext.setRootOverride(workspace);
         BuiltinTools tools = new BuiltinTools();
         ReflectionTestUtils.setField(tools, "registry", registry);
         ReflectionTestUtils.invokeMethod(tools, "registerFileTools");
-        return registry;
+        return tools;
     }
 }

@@ -11,6 +11,7 @@ import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.planner.ProposalTurnPolicy;
 import com.miniagent.agent.surface.ToolSurface;
 import com.miniagent.agent.tool.ToolDescriptor;
+import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.ToolRegistry;
 import com.miniagent.agent.tool.ToolResult;
 import com.miniagent.agent.tool.ToolSideEffect;
@@ -48,6 +49,34 @@ class AgentLoopNoProgressIntegrationTest {
         AgentLoop.clearCurrentSession();
         LoopTurnContext.clear();
         PermissionContext.clear();
+    }
+
+    @Test
+    void listFilesFailureReflectionUsesStructuredErrorWithoutSuggestingWorkspaceEscape() {
+        AgentLoop loop = new AgentLoop();
+        String args = "{\"path\":\"workspace/shared\"}";
+
+        ToolResult missing = ToolResult.failure(ToolErrorCode.NOT_FOUND,
+                "目录不存在: workspace/shared", false);
+        String notFoundHint = ReflectionTestUtils.invokeMethod(loop, "buildReflectionHint",
+                "list_files", args, missing.legacyText(), missing);
+        assertThat(notFoundHint).contains("workspace/shared", "已经观察到的 workspace 清单")
+                .doesNotContain("user.home", "exec_command", "web_search", "where ");
+
+        ToolResult fileInsteadOfDirectory = ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT,
+                "目标不是目录: workspace/shared/server.js", false);
+        String invalidHint = ReflectionTestUtils.invokeMethod(loop, "buildReflectionHint",
+                "list_files", "{\"path\":\"workspace/shared/server.js\"}",
+                fileInsteadOfDirectory.legacyText(), fileInsteadOfDirectory);
+        assertThat(invalidHint).contains("read_file")
+                .doesNotContain("user.home", "exec_command", "web_search", "where ");
+
+        ToolResult denied = ToolResult.failure(ToolErrorCode.PERMISSION_DENIED,
+                "目录访问被拒绝", false);
+        String deniedHint = ReflectionTestUtils.invokeMethod(loop, "buildReflectionHint",
+                "list_files", args, denied.legacyText(), denied);
+        assertThat(deniedHint).contains("访问被拒绝", "授权范围")
+                .doesNotContain("user.home", "exec_command", "web_search", "where ");
     }
 
     @Test

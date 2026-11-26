@@ -339,7 +339,7 @@ public class BuiltinTools {
                 "只读取 UTF-8 文本文件（源码、HTML、Markdown、JSON、YAML 等），不是二进制文件查看器。"
                         + "PNG/JPEG 图片使用 image_inspect；浏览器当前页面使用 browser_screenshot；PDF/Office 使用相应文档解析工具。"
                         + "若返回非 UTF-8/二进制诊断，不要重复读取或据此判断产品损坏。默认按行分页；若提示某行被截断，使用 offset 指定该行号、limit=1，并通过 char_offset/char_limit 按行内字符范围续读。"
-                        + "每次最多返回 200 行、32,000 个正文字符；超长行会在 4,000 字符处分段。"
+                        + "每次最多返回 200 行、8,000 个正文字符；超长行会在 4,000 字符处分段。"
                         + "截断标记给出 next_char_offset，total_chars 可能为 unknown（避免扫描整条超长行）；"
                         + "按标记续读。高行号和超长行续读会使用有界稀疏 UTF-8 索引。"
                         + "返回结果会标明是否完整，不能把截断片段当作完整文件证据。",
@@ -395,9 +395,16 @@ public class BuiltinTools {
                             params.isAppendMode(), params.isForce());
                 });
 
-        registry.register("list_files", "列出目录文件",
-                ListFilesParams.class,
-                params -> listFiles(params.getPath(), params.isRecursiveOrDefault()));
+        registry.registerStructured("list_files",
+                "有界列出工作区目录。目标必须是目录；传入文件路径时请用 read_file 读取文件内容。"
+                        + "最多返回 limit（1到200）项；超出会标记 partial 并建议缩小目录范围。"
+                        + "需要行数之外的文件证据时可设置 include_metadata=true，返回结构化类型、字节数和修改时间。",
+                ToolParams.generateSchema(ListFilesParams.class),
+                arguments -> {
+                    ListFilesParams params = ToolParams.fromJson(arguments, ListFilesParams.class);
+                    return listFiles(params.getPath(), params.isRecursiveOrDefault(),
+                            params.isIncludeMetadataOrDefault(), params.getLimitOrDefault());
+                });
 
         registry.register("read_package", "按Java包名读取包下所有源码文件。传包名如 com.miniagent.agent.task，自动解析路径并返回全部代码。分析项目架构时优先用这个，不要逐个 read_file。",
                 ReadPackageParams.class,
@@ -1219,7 +1226,9 @@ public class BuiltinTools {
     private static final int READ_LINE_CAP = 4000;
     private static final int READ_CHAR_RANGE_CAP = 8000;
     private static final int READ_MAX_LINES = 200;
-    private static final int READ_RESPONSE_CHAR_BUDGET = 32_000;
+    // AgentLoop clamps read_file tool results at 10k chars. Leave room for line prefixes
+    // and metadata so this tool's own continuation cursor is emitted before that clamp.
+    private static final int READ_RESPONSE_CHAR_BUDGET = 8_000;
     private static final int READ_INDEX_TRIGGER_LINES = 128;
     private static final int READ_INDEX_TRIGGER_CHARS = 16_000;
     private static final int READ_INDEX_CACHE_ENTRIES = 16;
@@ -1227,7 +1236,8 @@ public class BuiltinTools {
 
     private record ReadCheckpoint(int lineNo, long charOffset, long byteOffset) {}
     private record ReadFileState(long size, java.nio.file.attribute.FileTime modified, Object fileKey) {}
-    private record ReadFileIndex(ReadFileState state, List<ReadCheckpoint> checkpoints) {}
+    private record ReadFileIndex(ReadFileState state, List<ReadCheckpoint> checkpoints,
+                                 ReadCheckpoint coverage, boolean eof, int totalLines) {}
 
     /**
      * Bounded sparse UTF-8 position indexes. The index stores positions only, never file
@@ -1285,7 +1295,7 @@ public class BuiltinTools {
             ReadCheckpoint checkpoint = new ReadCheckpoint(1, 0, 0);
             if (from > READ_INDEX_TRIGGER_LINES
                     || (charRange && requestedCharOffset >= READ_INDEX_TRIGGER_CHARS)) {
-                index = readFileIndex(target);
+                index = readFileIndex(target, from, charRange, requestedCharOffset);
                 checkpoint = nearestCheckpoint(index, from,
                         charRange ? requestedCharOffset : 0, charRange);
             }
@@ -1498,16 +1508,22 @@ public class BuiltinTools {
         return sawAny;
     }
 
-    private ReadFileIndex readFileIndex(Path target) throws java.io.IOException {
+    private ReadFileIndex readFileIndex(Path target, int targetLine, boolean charRange,
+                                        int targetCharOffset) throws java.io.IOException {
         String key = observationKey(target);
         ReadFileState state = readFileState(target);
+        ReadFileIndex cached;
         synchronized (readFileIndexCache) {
-            ReadFileIndex cached = readFileIndexCache.get(key);
-            if (cached != null && cached.state().equals(state)) return cached;
-            if (cached != null) readFileIndexCache.remove(key);
+            cached = readFileIndexCache.get(key);
+            if (cached != null && !cached.state().equals(state)) {
+                readFileIndexCache.remove(key);
+                cached = null;
+            }
+            if (cached != null && indexCovers(cached, targetLine, charRange, targetCharOffset)) return cached;
         }
 
-        ReadFileIndex built = buildReadFileIndex(target, state);
+        ReadFileIndex built = buildReadFileIndex(target, state, cached,
+                targetLine, charRange, targetCharOffset);
         if (!state.equals(readFileState(target))) {
             throw new java.io.IOException("文件在建立读取索引时发生变化，请重新读取");
         }
@@ -1517,64 +1533,104 @@ public class BuiltinTools {
         return built;
     }
 
+    private static boolean indexCovers(ReadFileIndex index, int targetLine,
+                                      boolean charRange, int targetCharOffset) {
+        if (index.eof()) return true;
+        ReadCheckpoint coverage = index.coverage();
+        if (coverage.lineNo() > targetLine) return true;
+        if (coverage.lineNo() < targetLine) return false;
+        return !charRange || coverage.charOffset() >= targetCharOffset;
+    }
+
     private static ReadFileState readFileState(Path target) throws java.io.IOException {
         var attributes = Files.readAttributes(target, java.nio.file.attribute.BasicFileAttributes.class);
         return new ReadFileState(attributes.size(), attributes.lastModifiedTime(), attributes.fileKey());
     }
 
-    private static ReadFileIndex buildReadFileIndex(Path target, ReadFileState state)
+    private static ReadFileIndex buildReadFileIndex(Path target, ReadFileState state,
+                                                    ReadFileIndex previous, int targetLine,
+                                                    boolean charRange, int targetCharOffset)
             throws java.io.IOException {
+        if (previous != null && previous.eof()) return previous;
         long stride = Math.max(READ_INDEX_TRIGGER_CHARS,
                 (state.size() + (READ_INDEX_MAX_CHECKPOINTS / 2L) - 1)
                         / (READ_INDEX_MAX_CHECKPOINTS / 2L));
         long lineStride = Math.max(64, stride);
-        List<ReadCheckpoint> checkpoints = new ArrayList<>();
-        checkpoints.add(new ReadCheckpoint(1, 0, 0));
-        long byteOffset = 0;
-        long lineNo = 1;
-        long lineChars = 0;
-        boolean currentLineHasContent = false;
+        List<ReadCheckpoint> checkpoints = previous == null
+                ? new ArrayList<>() : new ArrayList<>(previous.checkpoints());
+        ReadCheckpoint start = previous == null ? new ReadCheckpoint(1, 0, 0) : previous.coverage();
+        if (checkpoints.isEmpty()) checkpoints.add(start);
+        long lineNo = start.lineNo();
+        long lineChars = start.charOffset();
+        boolean currentLineExists = lineChars > 0;
+        int totalLines = 0;
+        long[] position = {start.byteOffset()};
         try (var input = new java.io.BufferedInputStream(Files.newInputStream(target), 64 * 1024)) {
-            long[] position = {0};
+            input.skipNBytes(start.byteOffset());
             int codePoint;
-            while ((codePoint = readUtf8CodePoint(input, position)) >= 0) {
-                byteOffset = position[0];
+            while (true) {
+                long codePointStart = position[0];
+                codePoint = readUtf8CodePoint(input, position);
+                if (codePoint < 0) break;
+                if (lineNo == targetLine && !currentLineExists
+                        && (!charRange || targetCharOffset == 0)) {
+                    ReadCheckpoint coverage = forceCheckpoint(checkpoints,
+                            new ReadCheckpoint(Math.toIntExact(lineNo), 0, codePointStart));
+                    return new ReadFileIndex(state, List.copyOf(checkpoints), coverage, false, 0);
+                }
                 if (codePoint == '\n') {
+                    if (charRange && lineNo == targetLine && targetCharOffset > lineChars) {
+                        ReadCheckpoint coverage = forceCheckpoint(checkpoints,
+                                new ReadCheckpoint(Math.toIntExact(lineNo), lineChars, codePointStart));
+                        return new ReadFileIndex(state, List.copyOf(checkpoints), coverage, false, 0);
+                    }
                     lineNo++;
                     lineChars = 0;
-                    currentLineHasContent = false;
+                    currentLineExists = false;
                     if ((lineNo - 1) % lineStride == 0 && checkpoints.size() < READ_INDEX_MAX_CHECKPOINTS) {
                         addCheckpoint(checkpoints, new ReadCheckpoint(
-                                Math.toIntExact(lineNo), 0, byteOffset));
+                                Math.toIntExact(lineNo), 0, position[0]));
                     }
-                } else if (codePoint != '\r') {
-                    currentLineHasContent = true;
+                } else {
+                    currentLineExists = true;
+                    if (codePoint == '\r') continue;
                     lineChars++;
                     if (lineChars % stride == 0 && checkpoints.size() < READ_INDEX_MAX_CHECKPOINTS) {
                         addCheckpoint(checkpoints, new ReadCheckpoint(
-                                Math.toIntExact(lineNo), lineChars, byteOffset));
+                                Math.toIntExact(lineNo), lineChars, position[0]));
+                    }
+                    if (charRange && lineNo == targetLine && lineChars >= targetCharOffset) {
+                        ReadCheckpoint coverage = forceCheckpoint(checkpoints,
+                                new ReadCheckpoint(Math.toIntExact(lineNo), lineChars, position[0]));
+                        return new ReadFileIndex(state, List.copyOf(checkpoints), coverage, false, 0);
                     }
                 }
             }
+            totalLines = currentLineExists ? Math.toIntExact(lineNo) : Math.toIntExact(Math.max(0, lineNo - 1));
         } catch (ArithmeticException tooManyLines) {
             throw new java.io.IOException("文件行数超过 read_file 可索引范围", tooManyLines);
         }
-        // A trailing LF terminates the previous line; it does not create an additional
-        // readable empty line. Remove the sparse checkpoint for that phantom line.
-        if (lineNo > 1 && !currentLineHasContent) {
-            int last = checkpoints.size() - 1;
-            if (last > 0 && checkpoints.get(last).lineNo() == lineNo
-                    && checkpoints.get(last).charOffset() == 0) {
-                checkpoints.remove(last);
-            }
-        }
-        return new ReadFileIndex(state, List.copyOf(checkpoints));
+        ReadCheckpoint coverage = forceCheckpoint(checkpoints,
+                new ReadCheckpoint(Math.toIntExact(lineNo), lineChars, position[0]));
+        return new ReadFileIndex(state, List.copyOf(checkpoints), coverage, true, totalLines);
     }
 
     private static void addCheckpoint(List<ReadCheckpoint> checkpoints, ReadCheckpoint next) {
         if (checkpoints.isEmpty() || checkpoints.get(checkpoints.size() - 1).byteOffset() != next.byteOffset()) {
             checkpoints.add(next);
         }
+    }
+
+    private static ReadCheckpoint forceCheckpoint(List<ReadCheckpoint> checkpoints, ReadCheckpoint next) {
+        if (!checkpoints.isEmpty() && checkpoints.get(checkpoints.size() - 1).byteOffset() == next.byteOffset()) {
+            return checkpoints.get(checkpoints.size() - 1);
+        }
+        if (checkpoints.size() >= READ_INDEX_MAX_CHECKPOINTS) {
+            // Preserve the initial anchor and recent continuation points inside a hard memory cap.
+            checkpoints.remove(Math.max(1, checkpoints.size() - 2));
+        }
+        checkpoints.add(next);
+        return next;
     }
 
     private static ReadCheckpoint nearestCheckpoint(ReadFileIndex index, int lineNo,
@@ -1839,23 +1895,108 @@ public class BuiltinTools {
         }
     }
 
-    private String listFiles(String path, boolean recursive) {
+    private static final int LIST_FILES_MAX_ENTRIES = 200;
+    private static final int LIST_FILES_MAX_METADATA_ENTRIES = 12;
+    private static final int LIST_FILES_TEXT_CHAR_BUDGET = 1_700;
+
+    private ToolResult listFiles(String path, boolean recursive, boolean includeMetadata, int limit) {
         try {
+            if (limit < 1 || limit > LIST_FILES_MAX_ENTRIES) {
+                return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT,
+                        "limit 必须在 1 到 " + LIST_FILES_MAX_ENTRIES + " 之间", false);
+            }
             Path target = resolveReadPath(path);
             if (!Files.exists(target)) {
-                return errorJson(ToolErrorCode.NOT_FOUND, "目录不存在: " + path);
+                return ToolResult.failure(ToolErrorCode.NOT_FOUND, "目录不存在: " + path, false);
             }
-            StringBuilder sb = new StringBuilder();
-            if (recursive) {
-                Files.walk(target).filter(p -> !p.equals(target)).forEach(p ->
-                        sb.append(target.relativize(p)).append(Files.isDirectory(p) ? "/" : "").append('\n'));
-            } else {
-                Files.list(target).forEach(p ->
-                        sb.append(p.getFileName()).append(Files.isDirectory(p) ? "/" : "").append('\n'));
+            if (!Files.isDirectory(target)) {
+                return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT,
+                        "目标不是目录: " + path + "。如需读取文件内容，请使用 read_file。", false);
             }
-            return sb.isEmpty() ? "（空目录）" : sb.toString();
+            if (!Files.isReadable(target)) {
+                return ToolResult.failure(ToolErrorCode.PERMISSION_DENIED, "目录不可读取: " + path, false);
+            }
+
+            List<Path> entries;
+            boolean partial;
+            try (var paths = recursive ? Files.walk(target) : Files.list(target)) {
+                List<Path> bounded = paths.filter(p -> !p.equals(target))
+                        .limit((long) limit + 1)
+                        .toList();
+                partial = bounded.size() > limit;
+                entries = bounded.stream().limit(limit).sorted(Comparator.comparing(
+                        p -> target.relativize(p).toString(), String.CASE_INSENSITIVE_ORDER)).toList();
+            }
+
+            if (includeMetadata) {
+                int metadataCount = Math.min(entries.size(), LIST_FILES_MAX_METADATA_ENTRIES);
+                partial |= metadataCount < entries.size();
+                ObjectNode result = RESULT_JSON.createObjectNode();
+                result.put("success", true);
+                result.put("path", target.toAbsolutePath().normalize().toString());
+                result.put("recursive", recursive);
+                result.put("partial", partial);
+                result.put("entriesReturned", metadataCount);
+                ArrayNode items = result.putArray("entries");
+                for (Path entry : entries.subList(0, metadataCount)) {
+                    ObjectNode item = items.addObject();
+                    item.put("path", target.relativize(entry).toString().replace('\\', '/'));
+                    var attrs = Files.readAttributes(entry,
+                            java.nio.file.attribute.BasicFileAttributes.class,
+                            java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                    String type = attrs.isSymbolicLink() ? "symlink"
+                            : attrs.isDirectory() ? "directory"
+                            : attrs.isRegularFile() ? "file" : "other";
+                    item.put("type", type);
+                    if (!attrs.isSymbolicLink()) {
+                        item.put("sizeBytes", attrs.size());
+                        item.put("modifiedAt", attrs.lastModifiedTime().toInstant().toString());
+                    }
+                }
+                if (partial) result.put("continuationHint",
+                        "目录结果超过 limit；请缩小 path 或增加 limit 后继续核验");
+                return ToolResult.success(RESULT_JSON.writeValueAsString(result));
+            }
+
+            if (entries.isEmpty()) return ToolResult.success("（空目录）");
+            StringBuilder output = new StringBuilder();
+            int emitted = 0;
+            for (Path entry : entries) {
+                var attrs = Files.readAttributes(entry,
+                        java.nio.file.attribute.BasicFileAttributes.class,
+                        java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                String line = target.relativize(entry).toString()
+                        + (attrs.isDirectory() ? "/" : "") + "\n";
+                int lineChars = line.codePointCount(0, line.length());
+                if (emitted + lineChars > LIST_FILES_TEXT_CHAR_BUDGET) {
+                    partial = true;
+                    break;
+                }
+                output.append(line);
+                emitted += lineChars;
+            }
+            if (partial) output.append("[list_files partial=true，已达到 limit=").append(limit)
+                    .append("；请缩小目录范围或提高 limit 后继续]");
+            return ToolResult.success(output.toString());
+        } catch (SecurityException denied) {
+            return ToolResult.failure(ToolErrorCode.PERMISSION_DENIED,
+                    Objects.requireNonNullElse(denied.getMessage(), "目录访问被拒绝"), false);
+        } catch (java.nio.file.InvalidPathException invalid) {
+            return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT,
+                    "目录路径无效: " + Objects.requireNonNullElse(invalid.getMessage(), ""), false);
+        } catch (java.nio.file.NoSuchFileException missing) {
+            return ToolResult.failure(ToolErrorCode.NOT_FOUND,
+                    "目录不存在: " + Objects.requireNonNullElse(missing.getFile(), path), false);
+        } catch (java.nio.file.AccessDeniedException denied) {
+            return ToolResult.failure(ToolErrorCode.PERMISSION_DENIED,
+                    "无权读取目录: " + Objects.requireNonNullElse(denied.getFile(), path), false);
+        } catch (java.nio.file.NotDirectoryException notDirectory) {
+            return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT,
+                    "目标不是目录: " + Objects.requireNonNullElse(notDirectory.getFile(), path)
+                            + "。如需读取文件内容，请使用 read_file。", false);
         } catch (Exception e) {
-            return "{\"error\":\"列出文件失败: " + e.getMessage() + "\"}";
+            return ToolResult.failure(ToolErrorCode.EXECUTION_FAILED,
+                    "列出目录失败: " + Objects.requireNonNullElse(e.getMessage(), e.getClass().getSimpleName()), false);
         }
     }
 

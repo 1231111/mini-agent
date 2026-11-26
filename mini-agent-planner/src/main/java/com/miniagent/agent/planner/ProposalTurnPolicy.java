@@ -10,8 +10,11 @@ import com.miniagent.agent.tool.ToolResult;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.HexFormat;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -19,7 +22,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 /** 提案步闸门：锁定工具面 + focus todo。 */
 public final class ProposalTurnPolicy implements LoopTurnPolicy {
 
-    private static final int IDENTICAL_SUCCESS_OUTCOME_LIMIT = 3;
+    private static final int IDENTICAL_OUTCOME_LIMIT = 3;
+    private static final int MAX_TRACKED_OUTCOME_FINGERPRINTS = 256;
     private static final ObjectMapper MAPPER = new ObjectMapper()
             .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
 
@@ -133,7 +137,14 @@ public final class ProposalTurnPolicy implements LoopTurnPolicy {
 
     @Override
     public String observeToolOutcome(String toolName, String argumentsJson, ToolResult result) {
-        return progressGuard.observe(toolName, argumentsJson, result, focusLabel);
+        return progressGuard.observe(toolName, argumentsJson, result,
+                result == null ? "" : result.legacyText(), focusLabel);
+    }
+
+    @Override
+    public String observeToolOutcome(String toolName, String argumentsJson, ToolResult result,
+                                     String visibleResult) {
+        return progressGuard.observe(toolName, argumentsJson, result, visibleResult, focusLabel);
     }
 
     @Override
@@ -171,6 +182,13 @@ public final class ProposalTurnPolicy implements LoopTurnPolicy {
         private String lastOutcomeFingerprint = "";
         private int consecutiveIdenticalOutcomes;
         private int observedCalls;
+        /**
+         * Counts exact tool-call/result pairs across the whole logical node, not
+         * just adjacent calls. Access-order eviction bounds memory while keeping
+         * frequently repeated failures resident between unrelated tool calls.
+         */
+        private final LinkedHashMap<String, Integer> outcomeOccurrences =
+                new LinkedHashMap<>(64, 0.75f, true);
         private volatile String stopReason = "";
         private volatile LoopTurnPolicy.StopKind stopKind = LoopTurnPolicy.StopKind.NONE;
         private final ToolCallBudget toolCallBudget;
@@ -182,8 +200,8 @@ public final class ProposalTurnPolicy implements LoopTurnPolicy {
         }
 
         public synchronized String reserveToolInvocation() {
-            if (toolCallBudget == null) return "";
             if (!stopReason.isBlank()) return stopReason;
+            if (toolCallBudget == null) return "";
             try {
                 BudgetDecision decision = toolCallBudget.reserve();
                 if (decision == null || !decision.reserved()) {
@@ -205,29 +223,51 @@ public final class ProposalTurnPolicy implements LoopTurnPolicy {
 
         public synchronized String observe(String toolName, String argumentsJson,
                                            ToolResult result, String focusLabel) {
+            return observe(toolName, argumentsJson, result,
+                    result == null ? "" : result.legacyText(), focusLabel);
+        }
+
+        public synchronized String observe(String toolName, String argumentsJson,
+                                           ToolResult result, String visibleResult, String focusLabel) {
+            if (!stopReason.isBlank()) return stopReason;
             if (result == null || result.status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN
                     || result.status() == com.miniagent.agent.tool.ToolStatus.AWAITING_USER) return "";
             observedCalls++;
             String call = normalizeToolCall(toolName, argumentsJson);
             String outcome = result.status().name() + "|" + result.errorCode().name() + "|"
-                    + digest(result.legacyText());
+                    + digest(visibleResult);
             String fingerprint = digest(call + "\n" + outcome);
             if (fingerprint.equals(lastOutcomeFingerprint)) consecutiveIdenticalOutcomes++;
             else {
                 lastOutcomeFingerprint = fingerprint;
                 consecutiveIdenticalOutcomes = 1;
             }
-            if (consecutiveIdenticalOutcomes < IDENTICAL_SUCCESS_OUTCOME_LIMIT) return "";
+            int occurrences = outcomeOccurrences.merge(fingerprint, 1, Integer::sum);
+            evictOldOutcomeFingerprints();
+            if (occurrences < IDENTICAL_OUTCOME_LIMIT) return "";
+            String recurrence = occurrences == consecutiveIdenticalOutcomes ? "连续" : "累计";
             stopReason = "节点「" + (focusLabel == null || focusLabel.isBlank() ? "当前步骤" : focusLabel)
-                    + "」连续 " + consecutiveIdenticalOutcomes + " 次重复相同工具调用并得到相同结果，未产生可验证的新进展。"
+                    + "」" + recurrence + " " + occurrences
+                    + " 次重复相同工具调用并得到相同结果，未产生可验证的新进展。"
                     + "系统已停止该节点，保留当前状态，不会继续消耗工具预算。请检查验收目标、文件路径和工具调用是否匹配。";
             stopKind = LoopTurnPolicy.StopKind.NO_PROGRESS;
             return stopReason;
         }
 
+        private void evictOldOutcomeFingerprints() {
+            while (outcomeOccurrences.size() > MAX_TRACKED_OUTCOME_FINGERPRINTS) {
+                Iterator<Map.Entry<String, Integer>> iterator = outcomeOccurrences.entrySet().iterator();
+                if (!iterator.hasNext()) return;
+                iterator.next();
+                iterator.remove();
+            }
+        }
+
         public synchronized int observedCalls() { return observedCalls; }
 
         public synchronized int consecutiveIdenticalOutcomes() { return consecutiveIdenticalOutcomes; }
+
+        synchronized int trackedOutcomeFingerprints() { return outcomeOccurrences.size(); }
 
         private static String normalizeToolCall(String toolName, String argumentsJson) {
             String tool = toolName == null ? "" : toolName.trim().toLowerCase(Locale.ROOT);

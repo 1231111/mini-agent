@@ -96,15 +96,14 @@ class ProposalTurnPolicyTest {
         assertThat(firstChunk.observeToolOutcome("exec_command", relative, sameNoOp)).isEmpty();
         assertThat(firstChunk.observeToolOutcome("exec_command", quotedAbsolute, sameNoOp)).isEmpty();
         assertThat(nextChunk.observeToolOutcome("exec_command", relative, sameNoOp)).isEmpty();
-        assertThat(nextChunk.observeToolOutcome("exec_command", relative, sameNoOp)).isEmpty();
         String stop = nextChunk.observeToolOutcome("exec_command", relative, sameNoOp);
 
-        assertThat(stop).contains("验证页面结构", "连续 3 次", "停止该节点");
-        assertThat(shared.observedCalls()).isEqualTo(6);
+        assertThat(stop).contains("验证页面结构", "累计 3 次", "停止该节点");
+        assertThat(shared.observedCalls()).isEqualTo(5);
     }
 
     @Test
-    void changedOutcomeStartsASeparateNoProgressFingerprint() {
+    void changedOutcomeHasItsOwnFingerprintButDoesNotEraseEarlierRepeatedOutcome() {
         ProposalTurnPolicy.ProgressGuard guard = new ProposalTurnPolicy.ProgressGuard();
         ProposalTurnPolicy policy = policy(guard);
         String args = "{\"command\":\"node --test structure.test.mjs\"}";
@@ -112,10 +111,9 @@ class ProposalTurnPolicyTest {
         assertThat(policy.observeToolOutcome("exec_command", args, ToolResult.success("exit_code=0\npass 1"))).isEmpty();
         assertThat(policy.observeToolOutcome("exec_command", args, ToolResult.success("exit_code=0\npass 1"))).isEmpty();
         assertThat(policy.observeToolOutcome("exec_command", args, ToolResult.success("exit_code=0\npass 2"))).isEmpty();
-        assertThat(policy.observeToolOutcome("exec_command", args, ToolResult.success("exit_code=0\npass 1"))).isEmpty();
-        assertThat(policy.observeToolOutcome("exec_command", args, ToolResult.success("exit_code=0\npass 1"))).isEmpty();
         assertThat(policy.observeToolOutcome("exec_command", args, ToolResult.success("exit_code=0\npass 1")))
-                .contains("连续 3 次");
+                .contains("累计 3 次");
+        assertThat(policy.denyToolInvocation("exec_command", args)).contains("累计 3 次");
     }
 
     private static ProposalTurnPolicy policy(ProposalTurnPolicy.ProgressGuard guard) {

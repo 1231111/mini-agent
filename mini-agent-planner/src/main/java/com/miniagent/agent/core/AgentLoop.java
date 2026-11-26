@@ -3182,7 +3182,7 @@ public class AgentLoop {
             log.info("  [并行] {}: {}", name, truncate(redactSensitive(result), 200));
             recordToolOutcome(state, name, argumentsOf(tc), result,
                     bindings.get(toolIdOf(tc)), structuredResult,
-                    timings.get(index) == null ? 0L : timings.get(index).elapsedMillis());
+                    timings.get(index) == null ? 0L : timings.get(index).elapsedMillis(), resultForContext);
             state.pendingObservations.add(new ToolObservationProjector.Observation(name, toolIdOf(tc), structuredResult));
             messages.add(ToolExecutionResultMessage.from(
                     toolIdOf(tc), name, resultForContext));
@@ -3296,7 +3296,7 @@ public class AgentLoop {
 
         log.info("  {}: {}", name, truncate(redactSensitive(result), 300));
         recordToolOutcome(state, name, args, result, binding, structuredResult,
-                timing == null ? 0L : timing.elapsedMillis());
+                timing == null ? 0L : timing.elapsedMillis(), resultForContext);
         state.pendingObservations.add(new ToolObservationProjector.Observation(name, toolIdOf(tc), structuredResult));
         messages.add(ToolExecutionResultMessage.from(
                 toolIdOf(tc), name, resultForContext));
@@ -3456,10 +3456,17 @@ public class AgentLoop {
     private void recordToolOutcome(LoopState state, String name, String args, String result,
                                    ExecutionTurnContext.ActionBinding binding, ToolResult structuredResult,
                                    long durationMs) {
+        recordToolOutcome(state, name, args, result, binding, structuredResult, durationMs, result);
+    }
+
+    private void recordToolOutcome(LoopState state, String name, String args, String result,
+                                   ExecutionTurnContext.ActionBinding binding, ToolResult structuredResult,
+                                   long durationMs, String visibleResult) {
         ToolResult actual = structuredResult == null ? ToolResult.fromLegacy(result) : structuredResult;
         state.noteToolFinished(name, args, actual,
                 toolRegistry == null ? Set.of() : toolRegistry.getToolNames());
-        String progressStop = LoopTurnContext.current().observeToolOutcome(name, args, actual);
+        String progressStop = LoopTurnContext.current().observeToolOutcome(
+                name, args, actual, visibleResult == null ? "" : visibleResult);
         if (StringUtils.isNotBlank(progressStop)) state.noProgressReason = progressStop;
         if (Objects.nonNull(traceRecorder))
             traceRecorder.recordToolResult(
@@ -3540,10 +3547,22 @@ public class AgentLoop {
 
         if ("list_files".equals(toolName)) {
             String path = extractJsonField(args, "path");
-            hint.append("- 路径 '").append(path).append("' 可能不存在\n");
-            hint.append("- 试用户主目录：list_files(System.getProperty(\"user.home\"))\n");
-            hint.append("- 试搜索：exec_command(\"where ").append(guessProgramName(path)).append("\")\n");
-            hint.append("- 试 web_search 搜索程序安装位置\n");
+            if (actual.errorCode() == ToolErrorCode.NOT_FOUND) {
+                hint.append("- 目标目录 '").append(path)
+                        .append("' 不存在；只可根据已经观察到的 workspace 清单修正路径。不要猜测用户主目录，"
+                                + "也不要扩大到 shell 或网页搜索。\n");
+            } else if (actual.errorCode() == ToolErrorCode.INVALID_ARGUMENT
+                    && actual.message().contains("不是目录")) {
+                hint.append("- 目标 '").append(path)
+                        .append("' 是文件而不是目录；如需读取这个已知文件，请改用 read_file。"
+                                + "不要猜测其它路径或扩大搜索范围。\n");
+            } else if (actual.errorCode() == ToolErrorCode.PERMISSION_DENIED) {
+                hint.append("- 当前目录访问被拒绝；不要通过切换到其它根目录或工具扩大访问。"
+                        + "请在已有授权范围内继续，无法读取时如实说明受阻。\n");
+            } else {
+                hint.append("- 请依据工具返回的具体错误修正本次目录读取；不要猜测用户主目录，"
+                        + "也不要扩大到 shell 或网页搜索。\n");
+            }
         } else if ("exec_command".equals(toolName)) {
             hint.append("- 命令可能被安全策略拒绝或工作目录不对\n");
             hint.append("- 试用绝对路径执行\n");
@@ -3566,20 +3585,6 @@ public class AgentLoop {
 
         hint.append("\n不要用相同参数重试。换一个完全不同的方法。");
         return hint.toString();
-    }
-
-    /** 从路径中猜测程序名 */
-    private static String guessProgramName(String path) {
-        if (Objects.isNull(path)) {
-            return "program";
-        }
-        String name = path.replace("\\", "/").trim();
-        int lastSlash = name.lastIndexOf('/');
-        if (lastSlash >= 0) {
-            name = name.substring(lastSlash + 1);
-        }
-        name = name.replace(".lnk", "").replace(".exe", "").replace(".app", "");
-        return name.isEmpty() ? "program" : name;
     }
 
     /** 更新循环状态 */
