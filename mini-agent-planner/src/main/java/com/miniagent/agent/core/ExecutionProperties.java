@@ -3,8 +3,8 @@ package com.miniagent.agent.core;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
- * 一次运行的引擎预算。规划器节点上限仍走 {@code agent.planner.*}，
- * 那是图策略，不是循环内核。
+ * 一次被接纳的请求运行的引擎预算。新用户请求创建新 run lease；
+ * 规划器节点跨续跑的持久上限走 {@code agent.planner.*}，那是图策略，不是循环内核。
  */
 @ConfigurationProperties(prefix = "agent.execution")
 public class ExecutionProperties {

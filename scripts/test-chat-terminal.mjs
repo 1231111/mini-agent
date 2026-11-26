@@ -355,7 +355,7 @@ const finalAnswer = '已生成虚拟仿真交互页面。\n\n[查看 HTML 文件
     assert.match(tools, /调用 3 次/);
     assert.doesNotMatch(tools, /重试/);
     const taskSteps = h.context.buildInspectorStepRows(steps, { status: 'SUCCESS' }, false);
-    assert.match(taskSteps, /没有拆分出独立交付步骤/);
+    assert.match(taskSteps, /没有拆分为独立交付步骤/);
     assert.doesNotMatch(taskSteps, /保存 HTML 页面/);
     console.log('PASS: repeated tool calls stay in tool history and are not presented as task deliverables');
 }

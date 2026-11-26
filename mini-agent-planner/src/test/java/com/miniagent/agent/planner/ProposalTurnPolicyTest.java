@@ -59,7 +59,11 @@ class ProposalTurnPolicyTest {
     void nodeToolBudgetStopsMixedCallsAndSurvivesPolicyChunkRecreation() {
         AtomicInteger used = new AtomicInteger();
         ProposalTurnPolicy.ProgressGuard shared = new ProposalTurnPolicy.ProgressGuard(() ->
-                used.incrementAndGet() <= 2 ? "" : "节点预算已耗尽");
+                used.incrementAndGet() <= 2
+                        ? ProposalTurnPolicy.ProgressGuard.BudgetDecision.allowed()
+                        : ProposalTurnPolicy.ProgressGuard.BudgetDecision.denied(
+                                com.miniagent.agent.core.LoopTurnPolicy.StopKind.TOOL_BUDGET_EXHAUSTED,
+                                "节点预算已耗尽"));
         ProposalTurnPolicy firstChunk = new ProposalTurnPolicy(List.of("read_file"), true,
                 "读取页面", Set.of(), 0, Set.of(), "", shared);
 
@@ -74,6 +78,8 @@ class ProposalTurnPolicyTest {
         assertThat(nextChunk.denyToolInvocation("read_file", "{\"path\":\"style.css\"}"))
                 .contains("节点预算已耗尽");
         assertThat(nextChunk.stopReason()).isEqualTo("节点预算已耗尽");
+        assertThat(nextChunk.stopKind())
+                .isEqualTo(com.miniagent.agent.core.LoopTurnPolicy.StopKind.TOOL_BUDGET_EXHAUSTED);
         assertThat(used).hasValue(3);
     }
 

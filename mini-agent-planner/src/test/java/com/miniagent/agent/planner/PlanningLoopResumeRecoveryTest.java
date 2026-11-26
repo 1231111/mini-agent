@@ -3,11 +3,15 @@ package com.miniagent.agent.planner;
 import com.miniagent.agent.core.NodeExecutor;
 import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.tool.CapabilityRegistry;
+import com.miniagent.agent.tool.ToolErrorCode;
+import com.miniagent.agent.tool.ToolResult;
 import dev.langchain4j.model.chat.ChatModel;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -73,7 +77,121 @@ class PlanningLoopResumeRecoveryTest {
         assertThat(PlanningLoop.replanBudgetAvailable(3, 3, 2, 2,
                 FailureKind.DEPENDENCY_FAILED, true)).isTrue();
         assertThat(PlanningLoop.replanBudgetAvailable(3, 3, 2, 2,
+                FailureKind.TOOL_BUDGET_EXHAUSTED, true)).isTrue();
+        assertThat(PlanningLoop.replanBudgetAvailable(3, 3, 2, 2,
                 FailureKind.GENERIC, true)).isFalse();
+    }
+
+    @Test
+    void budgetRecoveryAllowanceIsDurableAndBoundedAcrossPlanVersions() {
+        String sessionId = "s_tool_budget_recovery_total";
+        String executionId = "exec_tool_budget_recovery_total";
+        Goal goal = new Goal("goal", "完成任务", "", "code", Map.of(), List.of(), List.of());
+        TaskNode first = new TaskNode("first", "检查输入", "research", List.of(), List.of(),
+                List.of("input-facts"), TaskNodeStatus.RUNNING, 90, DoneWhen.note(), "", "", 0, "");
+        PlannerStateStore store = new PlannerStateStore();
+        StateSnapshot snapshot = store.init(sessionId, executionId, goal, new TaskGraph(List.of(first)));
+        assertThat(store.reserveNodeToolCall(sessionId, executionId, snapshot.planVersion(), "first", 1)
+                .reserved()).isTrue();
+        snapshot = store.get(sessionId).orElseThrow();
+        snapshot = store.commit(sessionId, snapshot.version(), snapshot.withGraph(snapshot.graph().replace(
+                snapshot.graph().byId("first").withStatus(TaskNodeStatus.FAILED))));
+
+        PlannerStateStore.NodeToolBudgetRecoveryReservation firstRecovery = store.reserveNodeToolBudgetRecovery(
+                sessionId, executionId, snapshot.planVersion(), "first", 1, 2, 1);
+        assertThat(firstRecovery.reserved()).isTrue();
+        StateSnapshot revised = firstRecovery.snapshot().revisePlan(new TaskGraph(List.of(
+                new TaskNode("second", "核验已有产物", "research", List.of(), List.of(),
+                        List.of("verified"), TaskNodeStatus.RUNNING, 90, DoneWhen.note(), "", "", 0, ""))),
+                goal, "test_new_generation");
+        revised = store.commit(sessionId, firstRecovery.snapshot().version(), revised);
+        assertThat(store.reserveNodeToolCall(sessionId, executionId, revised.planVersion(), "second", 1)
+                .reserved()).isTrue();
+        StateSnapshot secondSpent = store.get(sessionId).orElseThrow();
+        secondSpent = store.commit(sessionId, secondSpent.version(), secondSpent.withGraph(
+                secondSpent.graph().replace(secondSpent.graph().byId("second")
+                        .withStatus(TaskNodeStatus.FAILED))));
+
+        PlannerStateStore.NodeToolBudgetRecoveryReservation overTaskLimit = store.reserveNodeToolBudgetRecovery(
+                sessionId, executionId, secondSpent.planVersion(), "second", 1, 2, 1);
+
+        assertThat(overTaskLimit.reserved()).isFalse();
+        assertThat(overTaskLimit.reason()).contains("跨计划版本");
+        assertThat(store.get(sessionId).orElseThrow().execution())
+                .containsEntry(PlannerStateStore.EXECUTION_TOOL_BUDGET_RECOVERY_ATTEMPTS_TOTAL, 1);
+    }
+
+    @Test
+    void concurrentBudgetRecoveryReservationsCannotOverrunTheDurableTaskCap() throws Exception {
+        String sessionId = "s_tool_budget_recovery_concurrent";
+        String executionId = "exec_tool_budget_recovery_concurrent";
+        Goal goal = new Goal("goal", "完成任务", "", "code", Map.of(), List.of(), List.of());
+        TaskNode node = new TaskNode("node", "检查输入", "research", List.of(), List.of(),
+                List.of("facts"), TaskNodeStatus.RUNNING, 90, DoneWhen.note(), "", "", 0, "");
+        PlannerStateStore store = new PlannerStateStore();
+        StateSnapshot initial = store.init(sessionId, executionId, goal, new TaskGraph(List.of(node)));
+        assertThat(store.reserveNodeToolCall(sessionId, executionId, initial.planVersion(), "node", 1)
+                .reserved()).isTrue();
+        StateSnapshot spent = store.get(sessionId).orElseThrow();
+        spent = store.commit(sessionId, spent.version(), spent.withGraph(spent.graph().replace(
+                spent.graph().byId("node").withStatus(TaskNodeStatus.FAILED))));
+        long planVersion = spent.planVersion();
+
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            Future<PlannerStateStore.NodeToolBudgetRecoveryReservation> first = pool.submit(() ->
+                    store.reserveNodeToolBudgetRecovery(sessionId, executionId, planVersion,
+                            "node", 1, 2, 1));
+            Future<PlannerStateStore.NodeToolBudgetRecoveryReservation> second = pool.submit(() ->
+                    store.reserveNodeToolBudgetRecovery(sessionId, executionId, planVersion,
+                            "node", 1, 2, 1));
+
+            List<PlannerStateStore.NodeToolBudgetRecoveryReservation> reservations =
+                    List.of(first.get(), second.get());
+            assertThat(reservations).filteredOn(PlannerStateStore.NodeToolBudgetRecoveryReservation::reserved)
+                    .hasSize(1);
+        }
+
+        StateSnapshot persisted = store.get(sessionId).orElseThrow();
+        assertThat(persisted.execution())
+                .containsEntry(PlannerStateStore.EXECUTION_TOOL_BUDGET_RECOVERY_ATTEMPTS_TOTAL, 1);
+        assertThat(store.events(sessionId)).filteredOn(event ->
+                event.type() == DomainEventType.NODE_TOOL_BUDGET_RECOVERY_RESERVED).hasSize(1);
+    }
+
+    @Test
+    void preDispatchRunBudgetStopIsNotMisclassifiedAsAnUnknownSideEffect() {
+        ToolResult deniedBeforeHandler = ToolResult.failure(
+                ToolErrorCode.RATE_LIMITED, "任务已耗尽工具调用配额", false);
+        ToolResult unknownSideEffect = ToolResult.unknown("写入结果未确认", null);
+
+        assertThat(PlanningLoop.hasUnknownToolOutcome(deniedBeforeHandler, true,
+                com.miniagent.agent.core.ExecutionControl.StopReason.TOOL_BUDGET_EXCEEDED, false)).isFalse();
+        assertThat(PlanningLoop.hasUnknownToolOutcome(unknownSideEffect, true,
+                com.miniagent.agent.core.ExecutionControl.StopReason.TOOL_BUDGET_EXCEEDED, false)).isTrue();
+        assertThat(PlanningLoop.hasUnknownToolOutcome(deniedBeforeHandler, true,
+                com.miniagent.agent.core.ExecutionControl.StopReason.TOOL_BUDGET_EXCEEDED, true)).isTrue();
+        // Without a typed control receipt, keep the conservative legacy behavior.
+        assertThat(PlanningLoop.hasUnknownToolOutcome(deniedBeforeHandler, true,
+                com.miniagent.agent.core.ExecutionControl.StopReason.NONE, false)).isTrue();
+    }
+
+    @Test
+    void persistedPartialExecutionEvidenceRequiresReadOnlyReconciliationBeforeResume() {
+        TaskNode stopped = new TaskNode("page", "完成页面改造", "code", List.of(), List.of(),
+                List.of("index.html"), TaskNodeStatus.PENDING, 90, DoneWhen.file("index.html"),
+                "", "", 0, "本节点工具执行记录：write_file(index.html) -> success；exec_command(npm test) -> denied");
+
+        String evidence = PlanningLoop.previousNodeExecutionEvidence(stopped);
+
+        assertThat(evidence).contains("write_file(index.html)");
+        assertThat(evidence).hasSizeLessThanOrEqualTo(6_001);
+        assertThat(PlanningLoop.focusBlock(new ActionProposal("proposal", 1, 1, "exec",
+                        List.of(new ActionSpec("action", "page", "write_file", Map.of(),
+                                "note_required", ""))),
+                new TaskGraph(List.of(stopped)), java.util.Set.of(), true))
+                .contains("以上记录只用于了解已发生的操作")
+                .contains("先用只读方式核验外部状态")
+                .contains("不得盲目重放可能已成功的副作用");
     }
 
     @Test

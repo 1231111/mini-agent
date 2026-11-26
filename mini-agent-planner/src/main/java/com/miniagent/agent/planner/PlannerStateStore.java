@@ -37,10 +37,22 @@ public class PlannerStateStore {
     public static final String PLAN_APPROVAL_PENDING = "pending";
     public static final String PLAN_APPROVAL_APPROVED = "approved";
     public static final String EXECUTION_NODE_TOOL_BUDGETS = "nodeToolBudgets";
+    public static final String EXECUTION_NODE_TOOL_BUDGET_RECOVERY_ATTEMPTS = "nodeToolBudgetRecoveryAttempts";
+    public static final String EXECUTION_TOOL_BUDGET_RECOVERY_ATTEMPTS_TOTAL = "toolBudgetRecoveryAttemptsTotal";
 
     public record NodeToolCallReservation(boolean reserved, int callsUsed, String reason) {
         public NodeToolCallReservation {
             callsUsed = Math.max(0, callsUsed);
+            reason = reason == null ? "" : reason;
+        }
+    }
+
+    /** Durable one-shot reservation for replanning a failed node whose tool budget is exhausted. */
+    public record NodeToolBudgetRecoveryReservation(boolean reserved, StateSnapshot snapshot,
+                                                     int callsUsed, int attemptsUsed, String reason) {
+        public NodeToolBudgetRecoveryReservation {
+            callsUsed = Math.max(0, callsUsed);
+            attemptsUsed = Math.max(0, attemptsUsed);
             reason = reason == null ? "" : reason;
         }
     }
@@ -164,6 +176,115 @@ public class PlannerStateStore {
         }
         return new NodeToolCallReservation(false, 0,
                 "无法可靠保存节点工具预算，已按安全策略停止继续派发");
+    }
+
+    /**
+     * Reserve one bounded recovery attempt before calling the model. This is separate from
+     * tool dispatch: if compilation/validation fails, the same exhausted graph must not
+     * trigger another model call on every user resume.
+     */
+    public NodeToolBudgetRecoveryReservation reserveNodeToolBudgetRecovery(
+            String sessionId, String executionId, long planVersion, String nodeId,
+            int maximumToolCalls, int maximumRecoveryAttemptsPerNode,
+            int maximumRecoveryAttemptsPerTask) {
+        if (sessionId == null || sessionId.isBlank() || nodeId == null || nodeId.isBlank()) {
+            return new NodeToolBudgetRecoveryReservation(false, null, 0, 0,
+                    "预算恢复缺少任务或节点标识");
+        }
+        int toolLimit = Math.max(1, Math.min(120, maximumToolCalls));
+        int nodeRecoveryLimit = Math.max(0, Math.min(4, maximumRecoveryAttemptsPerNode));
+        int taskRecoveryLimit = Math.max(0, Math.min(8, maximumRecoveryAttemptsPerTask));
+        if (nodeRecoveryLimit == 0 || taskRecoveryLimit == 0) {
+            return new NodeToolBudgetRecoveryReservation(false, get(sessionId).orElse(null), 0, 0,
+                    "预算恢复重规划已禁用");
+        }
+        String budgetKey = planVersion + ":" + nodeId;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            StateSnapshot current = get(sessionId).orElse(null);
+            if (current == null || current.planVersion() != planVersion
+                    || !Objects.equals(current.executionId(), executionId)) {
+                return new NodeToolBudgetRecoveryReservation(false, current, 0, 0,
+                        "任务计划已变化，拒绝对过期节点重规划");
+            }
+            TaskNode node = current.graph().byId(nodeId);
+            if (node != null && (node.status() == TaskNodeStatus.OUTCOME_UNKNOWN
+                    || node.status() == TaskNodeStatus.RUNNING
+                    || node.toolStatus() == com.miniagent.agent.tool.ToolStatus.UNKNOWN)) {
+                return new NodeToolBudgetRecoveryReservation(false, current, 0, 0,
+                        "节点存在未知副作用，必须先核验实际状态");
+            }
+            if (node == null || (node.status() != TaskNodeStatus.FAILED
+                    && node.status() != TaskNodeStatus.READY
+                    && node.status() != TaskNodeStatus.PENDING)) {
+                return new NodeToolBudgetRecoveryReservation(false, current, 0, 0,
+                        "仅允许恢复未完成且没有未知副作用的预算耗尽节点");
+            }
+            Map<String, Integer> budgets = readNodeToolBudgets(current.execution()
+                    .get(EXECUTION_NODE_TOOL_BUDGETS));
+            int callsUsed = budgets.getOrDefault(budgetKey, 0);
+            if (callsUsed < toolLimit) {
+                return new NodeToolBudgetRecoveryReservation(false, current, callsUsed, 0,
+                        "节点工具预算尚未耗尽，无需预算恢复重规划");
+            }
+            Map<String, Integer> recoveryAttempts = readNodeToolBudgets(current.execution()
+                    .get(EXECUTION_NODE_TOOL_BUDGET_RECOVERY_ATTEMPTS));
+            int attemptsUsed = recoveryAttempts.getOrDefault(budgetKey, 0);
+            int totalAttemptsUsed = Math.max(
+                    readCounter(current.execution().get(EXECUTION_TOOL_BUDGET_RECOVERY_ATTEMPTS_TOTAL)),
+                    recoveryAttempts.values().stream().mapToInt(Integer::intValue).sum());
+            if (totalAttemptsUsed >= taskRecoveryLimit) {
+                return new NodeToolBudgetRecoveryReservation(false, current, callsUsed, attemptsUsed,
+                        "该任务跨计划版本的预算恢复重规划次数已用尽");
+            }
+            if (attemptsUsed >= nodeRecoveryLimit) {
+                return new NodeToolBudgetRecoveryReservation(false, current, callsUsed, attemptsUsed,
+                        "该节点的预算恢复重规划次数已用尽");
+            }
+            recoveryAttempts.put(budgetKey, attemptsUsed + 1);
+            totalAttemptsUsed++;
+            Map<String, Object> execution = new java.util.LinkedHashMap<>(current.execution());
+            execution.put(EXECUTION_NODE_TOOL_BUDGET_RECOVERY_ATTEMPTS, recoveryAttempts);
+            execution.put(EXECUTION_TOOL_BUDGET_RECOVERY_ATTEMPTS_TOTAL, totalAttemptsUsed);
+            TaskGraph graph = current.graph();
+            if (node.status() != TaskNodeStatus.FAILED) {
+                graph = graph.replace(node.withStatus(TaskNodeStatus.FAILED)
+                        .withError("TOOL_BUDGET_EXHAUSTED: 续跑前已停止旧节点，等待一次有界子图重规划"));
+            }
+            try {
+                DomainEvent event = new DomainEvent("ev_" + UUID.randomUUID().toString().substring(0, 8),
+                        DomainEventType.NODE_TOOL_BUDGET_RECOVERY_RESERVED, null, nodeId,
+                        Map.of("planVersion", planVersion, "callsUsed", callsUsed,
+                                "maxCalls", toolLimit, "attemptsUsed", attemptsUsed + 1,
+                                "maxNodeAttempts", nodeRecoveryLimit,
+                                "taskAttemptsUsed", totalAttemptsUsed,
+                                "maxTaskAttempts", taskRecoveryLimit), null);
+                StateSnapshot committed = commit(sessionId, current.version(),
+                        current.withGraph(graph).withExecution(execution), List.of(event));
+                return new NodeToolBudgetRecoveryReservation(true, committed, callsUsed,
+                        attemptsUsed + 1, "");
+            } catch (VersionConflictException conflict) {
+                // Re-read the exact graph and budget before consuming a recovery attempt.
+            }
+        }
+        return new NodeToolBudgetRecoveryReservation(false, get(sessionId).orElse(null), 0, 0,
+                "无法可靠保存预算恢复次数，已安全停止重规划");
+    }
+
+    private static int readCounter(Object value) {
+        if (value instanceof Number number) return Math.max(0, number.intValue());
+        if (value instanceof String text) {
+            try { return Math.max(0, Integer.parseInt(text)); }
+            catch (NumberFormatException ignored) { return 0; }
+        }
+        return 0;
+    }
+
+    /** Current plan-version scoped dispatch count, used for resume preflight only. */
+    public int nodeToolCallsUsed(StateSnapshot snapshot, String nodeId) {
+        if (snapshot == null || snapshot.execution() == null || nodeId == null || nodeId.isBlank()) return 0;
+        String budgetKey = snapshot.planVersion() + ":" + nodeId;
+        return readNodeToolBudgets(snapshot.execution().get(EXECUTION_NODE_TOOL_BUDGETS))
+                .getOrDefault(budgetKey, 0);
     }
 
     private static Map<String, Integer> readNodeToolBudgets(Object value) {

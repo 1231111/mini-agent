@@ -258,9 +258,9 @@ async function renderInspectorSteps(sid) {
     });
     if (signature !== inspLastSignature) {
         inspLastSignature = signature;
-        $steps.innerHTML = buildInspectorCurrentTask(latestExecution) + (todos.length
+        $steps.innerHTML = buildInspectorCurrentTask(latestExecution, todos.length > 0) + (todos.length
             ? buildInspectorTodoRows(todos, steps)
-            : buildInspectorStepRows(steps, latestExecution));
+            : buildInspectorStepRows(steps, latestExecution, taskRunning));
         if ($events) $events.innerHTML = buildInspectorRecoveryRows(steps);
         $tools.innerHTML = buildInspectorToolRows(steps, {
             taskRunning,
@@ -294,11 +294,11 @@ async function renderInspectorSteps(sid) {
     return snapshot;
 }
 
-function buildInspectorCurrentTask(execution) {
+function buildInspectorCurrentTask(execution, hasDag) {
     const question = shortText(execution && execution.userQuestion, 180);
     if (!question) return '';
     return `<div class="insp-current-task">
-        <div class="insp-current-task-label">当前任务</div>
+        <div class="insp-current-task-label">${hasDag ? '当前任务' : '当前请求'}</div>
         <div class="insp-current-task-title" title="${escQ(esc(execution.userQuestion))}">${esc(question)}</div>
     </div>`;
 }
@@ -509,7 +509,7 @@ function pickLatestExecution(execs) {
     return latest;
 }
 
-function buildInspectorStepRows(steps, execution) {
+function buildInspectorStepRows(steps, execution, taskRunning = false) {
     // Raw tool calls are implementation details, not task deliverables. The
     // separate tools section already exposes their names, arguments and results.
     const activityTypes = new Set(['WAITING_FOR_HUMAN', 'ERROR', 'CANCELED', 'ABORTED']);
@@ -534,10 +534,14 @@ function buildInspectorStepRows(steps, execution) {
 
     const tail = rows.slice(-INSP_MAX_TRACE_ROWS);
     if (!tail.length) {
-        const terminal = execution && INSP_SUCCESS_STATUS.has(String(execution.status || '').toUpperCase());
-        return `<div class="insp-empty">${terminal
-            ? '任务已完成，但没有拆分出独立交付步骤。'
-            : '当前任务没有拆分出独立交付步骤。'}具体工具操作记录见下方“本次工具”。</div>`;
+        if (!execution) {
+            return `<div class="insp-empty">${taskRunning
+                ? '任务正在启动，执行记录即将显示。'
+                : '本轮尚无执行记录。'}</div>`;
+        }
+        return `<div class="insp-empty">${taskRunning
+            ? '本轮正在执行，当前没有可展示的独立交付步骤。'
+            : '本轮没有拆分为独立交付步骤。'}具体工具操作记录见下方“本次工具”。</div>`;
     }
     return tail.map(row => {
         const meta = [row.status, formatClock(row.time), row.durationMs > 0 ? formatDuration(row.durationMs) : '']

@@ -139,18 +139,40 @@ public final class ProposalTurnPolicy implements LoopTurnPolicy {
     @Override
     public String stopReason() { return progressGuard.stopReason(); }
 
+    @Override
+    public StopKind stopKind() { return progressGuard.stopKind(); }
+
     /** Shared by every LLM continuation chunk and re-proposal for one logical DAG node. */
     public static final class ProgressGuard {
+        public record BudgetDecision(boolean reserved, LoopTurnPolicy.StopKind stopKind, String reason) {
+            public BudgetDecision {
+                stopKind = stopKind == null ? LoopTurnPolicy.StopKind.NONE : stopKind;
+                reason = reason == null ? "" : reason;
+                if (reserved && stopKind != LoopTurnPolicy.StopKind.NONE)
+                    throw new IllegalArgumentException("A reserved tool call cannot carry a stop kind");
+            }
+
+            public static BudgetDecision allowed() {
+                return new BudgetDecision(true, LoopTurnPolicy.StopKind.NONE, "");
+            }
+
+            public static BudgetDecision denied(LoopTurnPolicy.StopKind kind, String reason) {
+                if (kind == null || kind == LoopTurnPolicy.StopKind.NONE)
+                    throw new IllegalArgumentException("A denied tool call requires a typed stop kind");
+                return new BudgetDecision(false, kind, reason);
+            }
+        }
+
         @FunctionalInterface
         public interface ToolCallBudget {
-            /** Returns blank when reserved; otherwise returns the reason to stop the node. */
-            String reserve();
+            BudgetDecision reserve();
         }
 
         private String lastOutcomeFingerprint = "";
         private int consecutiveIdenticalOutcomes;
         private int observedCalls;
         private volatile String stopReason = "";
+        private volatile LoopTurnPolicy.StopKind stopKind = LoopTurnPolicy.StopKind.NONE;
         private final ToolCallBudget toolCallBudget;
 
         public ProgressGuard() { this(null); }
@@ -163,15 +185,23 @@ public final class ProposalTurnPolicy implements LoopTurnPolicy {
             if (toolCallBudget == null) return "";
             if (!stopReason.isBlank()) return stopReason;
             try {
-                String denial = toolCallBudget.reserve();
-                if (denial != null && !denial.isBlank()) stopReason = denial;
+                BudgetDecision decision = toolCallBudget.reserve();
+                if (decision == null || !decision.reserved()) {
+                    stopReason = decision == null || decision.reason().isBlank()
+                            ? "无法可靠保存当前节点的工具预算，系统已停止派发以避免重复副作用"
+                            : decision.reason();
+                    stopKind = decision == null || decision.stopKind() == LoopTurnPolicy.StopKind.NONE
+                            ? LoopTurnPolicy.StopKind.NO_PROGRESS : decision.stopKind();
+                }
             } catch (RuntimeException persistenceFailure) {
                 stopReason = "无法可靠保存当前节点的工具预算，系统已停止派发以避免重复副作用";
+                stopKind = LoopTurnPolicy.StopKind.NO_PROGRESS;
             }
             return stopReason;
         }
 
         public String stopReason() { return stopReason; }
+        public LoopTurnPolicy.StopKind stopKind() { return stopKind; }
 
         public synchronized String observe(String toolName, String argumentsJson,
                                            ToolResult result, String focusLabel) {
@@ -191,6 +221,7 @@ public final class ProposalTurnPolicy implements LoopTurnPolicy {
             stopReason = "节点「" + (focusLabel == null || focusLabel.isBlank() ? "当前步骤" : focusLabel)
                     + "」连续 " + consecutiveIdenticalOutcomes + " 次重复相同工具调用并得到相同结果，未产生可验证的新进展。"
                     + "系统已停止该节点，保留当前状态，不会继续消耗工具预算。请检查验收目标、文件路径和工具调用是否匹配。";
+            stopKind = LoopTurnPolicy.StopKind.NO_PROGRESS;
             return stopReason;
         }
 

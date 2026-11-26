@@ -11,6 +11,8 @@ import java.util.Set;
  */
 public interface LoopTurnPolicy {
 
+    enum StopKind { NONE, NO_PROGRESS, TOOL_BUDGET_EXHAUSTED }
+
     LoopTurnPolicy NONE = new Open();
 
     List<String> allowedTools();
@@ -36,6 +38,9 @@ public interface LoopTurnPolicy {
 
     /** A policy may terminate the current loop after a hard per-node circuit breaker trips. */
     default String stopReason() { return ""; }
+
+    /** Typed terminal cause for the policy stop; callers must not infer it from display text. */
+    default StopKind stopKind() { return StopKind.NONE; }
 
     String focusLabel();
 

@@ -167,15 +167,27 @@ public class AgentLoop {
 
     public record LoopOutcome(String text, String endReason, List<ChatMessage> messages,
                               List<String> toolsInvoked, ToolErrorCode lastErrorCode,
-                              ToolResult lastToolResult) {
+                              ToolResult lastToolResult,
+                              ExecutionControl.StopReason controlStopReason,
+                              boolean unknownOutcome) {
+        public LoopOutcome(String text, String endReason, List<ChatMessage> messages,
+                           List<String> toolsInvoked, ToolErrorCode lastErrorCode,
+                           ToolResult lastToolResult) {
+            this(text, endReason, messages, toolsInvoked, lastErrorCode, lastToolResult,
+                    ExecutionControl.StopReason.NONE, false);
+        }
+
         public LoopOutcome(String text, String endReason, List<ChatMessage> messages,
                            List<String> toolsInvoked, ToolErrorCode lastErrorCode) {
-            this(text, endReason, messages, toolsInvoked, lastErrorCode, null);
+            this(text, endReason, messages, toolsInvoked, lastErrorCode, null,
+                    ExecutionControl.StopReason.NONE, false);
         }
 
         public LoopOutcome {
             toolsInvoked = toolsInvoked == null ? List.of() : List.copyOf(toolsInvoked);
             lastErrorCode = lastErrorCode == null ? ToolErrorCode.NONE : lastErrorCode;
+            controlStopReason = controlStopReason == null
+                    ? ExecutionControl.StopReason.NONE : controlStopReason;
         }
 
         public boolean successful() {
@@ -786,7 +798,9 @@ public class AgentLoop {
                 messages,
                 List.copyOf(state.toolsInvoked),
                 state.lastErrorCode,
-                state.lastToolResult);
+                state.lastToolResult,
+                state.controlStopReason,
+                state.unknownOutcome);
     }
 
     private static final String TOOL_HISTORY_VALIDATION_WARNING = "【上下文安全】本次请求前发现工具调用历史不完整或配对有歧义，"
@@ -1929,6 +1943,19 @@ public class AgentLoop {
                 String policyStopReason = LoopTurnContext.current().stopReason();
                 if (StringUtils.isNotBlank(policyStopReason)) {
                     state.noProgressReason = policyStopReason;
+                }
+                if (LoopTurnContext.current().stopKind() == LoopTurnPolicy.StopKind.TOOL_BUDGET_EXHAUSTED) {
+                    // This denial was reserved before the tool handler. End the node as a
+                    // typed quota stop so PlanningLoop can preserve receipts and replan it
+                    // on the next explicit resume instead of reporting generic NO_PROGRESS.
+                    state.controlStopReason = ExecutionControl.StopReason.TOOL_BUDGET_EXCEEDED;
+                    state.loopEndReason = controlEndReason(state.controlStopReason);
+                    String stopped = controlMessage(state.controlStopReason);
+                    if (state.unknownOutcome) {
+                        stopped += "。已有工具结果仍未确认；请先核验实际状态。"
+                                + UserFacingFailure.summarize(state.unknownOutcomeMessage, "操作回执未确认。");
+                    }
+                    return finish(stopped + "。" + policyStopReason, state, messages);
                 }
                 if (StringUtils.isNotBlank(state.noProgressReason)) {
                     state.loopEndReason = NO_PROGRESS;

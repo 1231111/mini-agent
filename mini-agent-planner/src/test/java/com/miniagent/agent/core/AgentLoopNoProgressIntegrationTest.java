@@ -128,4 +128,94 @@ class AgentLoopNoProgressIntegrationTest {
         assertThat(toolExecutions).hasValue(3);
         assertThat(modelCalls).hasValue(3);
     }
+
+    @Test
+    void exhaustedPlannerNodeBudgetStopsAsTypedQuotaOutcomeWithoutAnotherModelRetry() {
+        String sessionId = "s_e4802c49c8c641628bf3fea87f6a6fce";
+        AtomicInteger modelCalls = new AtomicInteger();
+        AtomicInteger reservations = new AtomicInteger();
+        AtomicInteger handlers = new AtomicInteger();
+        ChatModel model = mock(ChatModel.class);
+        when(model.chat(any(ChatRequest.class))).thenAnswer(ignored -> {
+            int call = modelCalls.incrementAndGet();
+            ToolExecutionRequest request = ToolExecutionRequest.builder()
+                    .id("budget-call-" + call).name("exec_command")
+                    .arguments("{\"command\":\"npm test\"}").build();
+            ChatResponse response = mock(ChatResponse.class);
+            when(response.aiMessage()).thenReturn(AiMessage.builder().text("")
+                    .toolExecutionRequests(List.of(request)).build());
+            return response;
+        });
+
+        ExecutionControl control = mock(ExecutionControl.class);
+        when(control.afterModelTokens(anyString(), anyLong())).thenReturn(ExecutionControl.StopReason.NONE);
+        when(control.afterModelTokens(anyString(), anyLong(), anyString(), anyLong(), anyLong()))
+                .thenReturn(ExecutionControl.StopReason.NONE);
+        when(control.checkpoint(anyString())).thenReturn(ExecutionControl.StopReason.NONE);
+        when(control.stopReason(anyString())).thenReturn(ExecutionControl.StopReason.NONE);
+        when(control.lastInputTokens(anyString())).thenReturn(0L);
+        when(control.userId(anyString())).thenReturn(null);
+
+        ToolRegistry registry = mock(ToolRegistry.class);
+        when(registry.getToolNames()).thenReturn(Set.of("exec_command"));
+        when(registry.getSpecifications(any())).thenReturn(List.of());
+        ToolSurface surface = mock(ToolSurface.class);
+        when(surface.resolveTurn(any(), any(), anyBoolean()))
+                .thenReturn(ToolSurface.Resolved.of(Set.of("exec_command")));
+        ToolExecutionGuards guards = mock(ToolExecutionGuards.class);
+        ToolDescriptor execDescriptor = new ToolDescriptor(
+                "exec_command", "", Map.of(), ToolSideEffect.EXTERNAL_WRITE,
+                false, false, false, com.miniagent.agent.tool.ToolExecutionProfile.DEFAULT);
+        when(guards.descriptor(anyString())).thenReturn(execDescriptor);
+        when(guards.descriptor(anyString(), any())).thenReturn(execDescriptor);
+        ToolPipeline pipeline = mock(ToolPipeline.class);
+        when(pipeline.invoke(any(ToolRequest.class))).thenAnswer(invocation -> {
+            ToolRequest request = invocation.getArgument(0);
+            String denial = request.scope().turnPolicy().denyToolInvocation(
+                    request.name(), request.arguments());
+            if (denial != null) return ToolInvocation.gateDenied(
+                    request.name(), ToolResult.fromLegacy(denial));
+            handlers.incrementAndGet();
+            return ToolInvocation.executed(request.name(), ToolResult.success("exit_code=0\ntests passed\n"));
+        });
+        TaskTodoStore todos = mock(TaskTodoStore.class);
+        ContextCompressor compressor = mock(ContextCompressor.class);
+        when(compressor.maybeCompress(anyList(), anyInt(), anyString(), anyInt()))
+                .thenAnswer(invocation -> ContextCompressor.CompressResult.untouched(
+                        invocation.getArgument(0), invocation.getArgument(3)));
+
+        AgentLoop loop = new AgentLoop();
+        ReflectionTestUtils.setField(loop, "toolRegistry", registry);
+        ReflectionTestUtils.setField(loop, "toolSurface", surface);
+        ReflectionTestUtils.setField(loop, "toolExecutionGuards", guards);
+        ReflectionTestUtils.setField(loop, "toolPipeline", pipeline);
+        ReflectionTestUtils.setField(loop, "executionControl", control);
+        ReflectionTestUtils.setField(loop, "executionProperties", new ExecutionProperties());
+        ReflectionTestUtils.setField(loop, "contextCompressor", compressor);
+        ReflectionTestUtils.setField(loop, "streamingChatModel", mock(StreamingChatModel.class));
+        ReflectionTestUtils.setField(loop, "taskTodoStore", todos);
+        ReflectionTestUtils.setField(loop, "stopHookChain", new StopHookChain(List.of()));
+
+        ProposalTurnPolicy.ProgressGuard guard = new ProposalTurnPolicy.ProgressGuard(() ->
+                reservations.incrementAndGet() <= 2
+                        ? ProposalTurnPolicy.ProgressGuard.BudgetDecision.allowed()
+                        : ProposalTurnPolicy.ProgressGuard.BudgetDecision.denied(
+                                LoopTurnPolicy.StopKind.TOOL_BUDGET_EXHAUSTED,
+                                "节点「整理联机改造验收要求」已达到工具调用上限 12；继续前必须重规划"));
+        LoopTurnContext.set(new ProposalTurnPolicy(List.of("exec_command"), true,
+                "整理联机改造验收要求", Set.of(), 0, Set.of(), "npm test", guard));
+        AgentLoop.setCurrentSession(sessionId);
+        PermissionContext.force(sessionId, PermissionMode.ACCEPT_EDITS, ConfirmPolicy.DANGEROUS, true);
+
+        AgentLoop.LoopOutcome outcome = loop.runOutcome(model, "system",
+                "继续整理联机改造验收要求", List.of(), 90, null, null);
+
+        assertThat(outcome.endReason()).isEqualTo(AgentLoop.RESOURCE_QUOTA_EXCEEDED);
+        assertThat(outcome.controlStopReason()).isEqualTo(ExecutionControl.StopReason.TOOL_BUDGET_EXCEEDED);
+        assertThat(outcome.unknownOutcome()).isFalse();
+        assertThat(outcome.text()).contains("工具调用配额", "节点「整理联机改造验收要求」");
+        assertThat(modelCalls).hasValue(3); // two reserved calls plus the denied request, no reflection/retry call
+        assertThat(reservations).hasValue(3);
+        assertThat(handlers).hasValue(2); // denied call never reaches the tool handler
+    }
 }

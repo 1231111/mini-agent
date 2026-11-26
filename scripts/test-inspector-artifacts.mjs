@@ -37,7 +37,8 @@ test('HTML writes expose the saved page and original tool identity', () => {
     assert.match(tools, /kind-code/);
     assert.doesNotMatch(tools, /验证通过|浏览器验收通过/);
     const taskSteps = context.buildInspectorStepRows(steps, { status: 'SUCCESS' }, false);
-    assert.match(taskSteps, /没有拆分出独立交付步骤/);
+    assert.match(taskSteps, /没有拆分为独立交付步骤/);
+    assert.doesNotMatch(taskSteps, /任务已完成/);
     assert.match(taskSteps, /具体工具操作记录见下方/);
     assert.doesNotMatch(taskSteps, /保存 HTML 页面/);
 });
@@ -103,6 +104,7 @@ test('unmatched tool calls after task completion show a missing result, not acti
     const stepsHtml = context.buildInspectorStepRows(steps, { status: 'SUCCESS' }, false);
     assert.match(stepsHtml, /具体工具操作记录见下方/);
     assert.doesNotMatch(stepsHtml, /提取网页内容|进行中/);
+    assert.doesNotMatch(stepsHtml, /任务已完成/);
 });
 
 test('unmatched tool calls remain active while the task is running', () => {
@@ -115,8 +117,29 @@ test('unmatched tool calls remain active while the task is running', () => {
     assert.match(tools, /执行中/);
     assert.match(tools, /等待工具返回/);
     const stepsHtml = context.buildInspectorStepRows(steps, { status: 'RUNNING' }, true);
+    assert.match(stepsHtml, /本轮正在执行，当前没有可展示的独立交付步骤/);
     assert.match(stepsHtml, /具体工具操作记录见下方/);
-    assert.doesNotMatch(stepsHtml, /提取网页内容|进行中/);
+    assert.doesNotMatch(stepsHtml, /提取网页内容|任务已完成/);
+});
+
+test('a successful last trace step cannot make an active no-DAG turn look completed', () => {
+    const stepsHtml = context.buildInspectorStepRows(
+        [{ stepType: 'ANSWER', status: 'SUCCESS', content: '可以帮助撰写。' }],
+        { status: 'SUCCESS' }, true);
+    assert.match(stepsHtml, /本轮正在执行，当前没有可展示的独立交付步骤/);
+    assert.doesNotMatch(stepsHtml, /任务已完成/);
+});
+
+test('no execution snapshot does not claim that a task completed without steps', () => {
+    assert.match(context.buildInspectorStepRows([], null, false), /本轮尚无执行记录/);
+    assert.match(context.buildInspectorStepRows([], null, true), /任务正在启动/);
+});
+
+test('labels a direct dialog request separately from an active DAG task', () => {
+    const execution = { userQuestion: '这些能写论文和技术文献吗？' };
+    assert.match(context.buildInspectorCurrentTask(execution, false), /当前请求/);
+    assert.doesNotMatch(context.buildInspectorCurrentTask(execution, false), /当前任务/);
+    assert.match(context.buildInspectorCurrentTask(execution, true), /当前任务/);
 });
 
 test('page source is folded and stays escaped with secrets redacted', () => {

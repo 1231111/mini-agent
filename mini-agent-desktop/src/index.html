@@ -6,39 +6,40 @@
   <style>
     * { box-sizing: border-box; }
     html, body { margin: 0; width: 100%; height: 100%; overflow: hidden;
-      background: #0b1020; color: #eef2ff; font: 14px/1.45 "Segoe UI", sans-serif; }
+      background: #f4f7fb; color: #17223b; font: 14px/1.45 "Segoe UI", sans-serif; }
     #boot { position: relative; isolation: isolate; display: grid; place-items: center;
       width: 100%; height: 100%; overflow: hidden;
-      background: radial-gradient(ellipse at 50% 37%, rgba(79, 105, 214, .2), transparent 42%),
-        radial-gradient(ellipse at 50% 110%, rgba(43, 65, 133, .18), transparent 50%), #0b1020; }
-    #boot::before { content: ""; position: absolute; inset: 0; z-index: 0; opacity: .22;
-      background-image: linear-gradient(rgba(164, 180, 255, .045) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(164, 180, 255, .045) 1px, transparent 1px);
-      background-size: 36px 36px; mask-image: linear-gradient(to bottom, transparent, #000 30%, #000 82%, transparent); }
+      background: radial-gradient(ellipse at 50% 35%, rgba(111, 139, 226, .14), transparent 44%),
+        radial-gradient(ellipse at 50% 110%, rgba(115, 174, 214, .11), transparent 52%), #f4f7fb; }
+    #boot::before { content: ""; position: absolute; inset: 0; z-index: 0; opacity: .72;
+      background-image: linear-gradient(rgba(74, 96, 139, .055) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(74, 96, 139, .055) 1px, transparent 1px);
+      background-size: 36px 36px; mask-image: linear-gradient(to bottom, transparent, #000 26%, #000 84%, transparent); }
     .boot-box { position: relative; z-index: 1; width: 100%; height: 100%; padding: 30px 34px 24px; display: flex;
       flex-direction: column; align-items: center; justify-content: center; text-align: center; }
     .boot-mark { position: relative; display: grid; place-items: center; width: 92px; height: 92px;
-      margin-bottom: 22px; border-radius: 28px; background: rgba(255,255,255,.055);
-      box-shadow: 0 16px 55px rgba(44, 74, 180, .2), inset 0 1px 0 rgba(255,255,255,.08); }
+      margin-bottom: 22px; border-radius: 28px; background: rgba(255,255,255,.9);
+      border: 1px solid #dce4f1;
+      box-shadow: 0 18px 44px rgba(63, 85, 133, .16), inset 0 1px 0 rgba(255,255,255,.95); }
     .boot-mark::before { content: ""; position: absolute; inset: -9px; border-radius: 34px;
-      border: 1px solid rgba(140, 162, 255, .18); animation: mark-pulse 2.8s ease-in-out infinite; }
+      border: 1px solid rgba(91, 119, 207, .22); animation: mark-pulse 2.8s ease-in-out infinite; }
     .boot-mark img { width: 76px; height: 76px; border-radius: 19px; animation: mark-float 3.4s ease-in-out infinite; }
     .boot-name { font-size: 19px; line-height: 1.2; letter-spacing: .16em; font-weight: 650; }
-    .boot-subtitle { margin-top: 8px; color: #8994b8; font-size: 12px; letter-spacing: .04em; }
+    .boot-subtitle { margin-top: 8px; color: #60708f; font-size: 12px; letter-spacing: .04em; }
     .boot-progress { width: 250px; height: 3px; margin-top: 28px; overflow: hidden;
-      border-radius: 99px; background: rgba(151, 166, 218, .14); }
+      border-radius: 99px; background: #dce5f2; }
     .boot-progress span { display: block; width: 34%; height: 100%; border-radius: inherit;
-      background: linear-gradient(90deg, #727ff1, #72d4ff); box-shadow: 0 0 14px rgba(113, 164, 255, .65);
+      background: linear-gradient(90deg, #5d78e8, #4bb8e8); box-shadow: 0 0 14px rgba(93, 120, 232, .38);
       animation: progress-run 1.6s ease-in-out infinite; }
-    .boot-stage { min-height: 1.5em; margin-top: 16px; color: #c4cbea; font-size: 13px; }
-    .boot-elapsed { margin-top: 5px; color: #7480a5; font-size: 11px; font-variant-numeric: tabular-nums; }
-    .boot-tip { position: absolute; bottom: 21px; max-width: 360px; color: #677394;
+    .boot-stage { min-height: 1.5em; margin-top: 16px; color: #34466a; font-size: 13px; }
+    .boot-elapsed { margin-top: 5px; color: #71809b; font-size: 11px; font-variant-numeric: tabular-nums; }
+    .boot-tip { position: absolute; bottom: 21px; max-width: 360px; color: #71809b;
       font-size: 11px; line-height: 1.5; }
-    #boot.boot-failed { background: radial-gradient(ellipse at 50% 25%, rgba(120, 44, 63, .23), transparent 52%), #0b1020; }
+    #boot.boot-failed { background: radial-gradient(ellipse at 50% 25%, rgba(211, 80, 101, .12), transparent 52%), #fff7f8; }
     #boot.boot-failed .boot-box { justify-content: center; }
     #boot.boot-failed .boot-mark, .boot-done .boot-tip { display: none; }
     #boot.boot-failed .boot-name { margin-bottom: 18px; }
-    #boot.boot-failed .boot-stage { color: #ff9eaa; }
+    #boot.boot-failed .boot-stage { color: #b4233b; }
     #boot.boot-failed .boot-progress { display: none; }
     #boot.boot-ready .boot-box { opacity: 0; transform: translateY(-8px) scale(.97);
       transition: opacity .32s ease, transform .32s ease; }

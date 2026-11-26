@@ -394,6 +394,8 @@ agent:
     timeout-overrides: {}
   execution:
     deadline-ms: 1800000
+    # 每个被接纳的请求运行最多 120 次工具调用；用户发起新的续跑请求会拿到新租约。
+    # DAG 节点跨请求的持久配额单独由 agent.planner.proposal-max-tool-calls 控制。
     max-tool-calls: 120
     # 单任务累计 token 的**告警线**，不是终止线。
     # 累计 token = Σ(每轮 input)，随任务时长线性增长；正常长任务与原地打转的死循环
@@ -448,8 +450,11 @@ agent:
     # 同一节点配额用尽后接着同一份 messages 再跑，最多这么多段
     proposal-max-chunks: 6
     # 单个逻辑节点累计最多执行 12 次工具调用；预算持久化，跨续段及用户继续不重置。
-    # 节点失败后需修正验收/计划或由用户明确开启新计划，不能靠重复重试清空预算。
+    # 触顶后明确续跑会进入单独的有限子图恢复，而不会重置原节点或重放已完成动作。
     proposal-max-tool-calls: 12
+    # 单个触顶节点最多尝试 2 次预算恢复；整个任务跨新计划版本累计最多 3 次。
+    max-tool-budget-recovery-replans-per-node: 2
+    max-tool-budget-recovery-replans-per-task: 3
     compiler-retry: 1
     max-outer-rounds: 24
     hard-proposal: true

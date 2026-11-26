@@ -5,6 +5,7 @@ import com.miniagent.agent.core.AgentStreamSink;
 import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.core.ExecutionTurnContext;
 import com.miniagent.agent.core.LoopTurnContext;
+import com.miniagent.agent.core.LoopTurnPolicy;
 import com.miniagent.agent.core.NodeExecutor;
 import com.miniagent.agent.execution.ToolInvocation;
 import com.miniagent.agent.task.TaskPlan;
@@ -181,7 +182,7 @@ public class PlanningLoop {
                     }
                     return context.toString();
                 }).orElse("");
-        String checklistContext = todoProjector.currentTaskContext(sessionId);
+        String checklistContext = StringUtils.defaultString(todoProjector.currentTaskContext(sessionId));
         if (graphContext.isBlank()) return checklistContext;
         if (checklistContext.isBlank()) return graphContext;
         return graphContext + "\n" + checklistContext;
@@ -489,11 +490,80 @@ public class PlanningLoop {
             log.info("PlanningLoop 按审批意见重编译 session={} nodes={}",
                     sessionId, compiled.graph().nodes().size());
         } else if (resume) {
-            snap = consumeHumanWait(sessionId, existing.get());
+            snap = existing.get();
+            boolean budgetReplanned = false;
+            TaskNode exhaustedNode = awaitingPlanApproval || snap.graph().hasAwaitingConfirm()
+                    ? null : exhaustedToolBudgetNode(snap);
+            if (exhaustedNode != null) {
+                TaskNode unknown = unknownOutcomeNode(snap.graph());
+                if (unknown != null) return stopUnknownOutcome(sessionId, snap, unknown);
+
+                if (chat == null) {
+                    String reason = "规划模型不可用，未消耗预算恢复次数；请在模型恢复后继续";
+                    trace(sessionId, AgentStepNode.ERROR, toolBudgetRecoveryTrace(
+                            exhaustedNode, stateStore.nodeToolCallsUsed(snap, exhaustedNode.id()),
+                            properties.getProposalMaxToolCalls(), reason), RunStatus.FAILURE);
+                    return RunOutcome.failed(toolBudgetRecoveryBlockedMessage(exhaustedNode,
+                                    stateStore.nodeToolCallsUsed(snap, exhaustedNode.id()),
+                                    properties.getProposalMaxToolCalls(), reason),
+                            "TOOL_BUDGET_RECOVERY_UNAVAILABLE");
+                }
+                if (!sessionLock.renewSessionLock(sessionId, fencingToken)) {
+                    return RunOutcome.failed("任务执行租约已失效，未消耗预算恢复次数，请基于最新状态继续。",
+                            "SESSION_LOCK_LOST");
+                }
+
+                PlannerStateStore.NodeToolBudgetRecoveryReservation reservation =
+                        stateStore.reserveNodeToolBudgetRecovery(sessionId, snap.executionId(),
+                                snap.planVersion(), exhaustedNode.id(), properties.getProposalMaxToolCalls(),
+                                properties.getMaxToolBudgetRecoveryReplansPerNode(),
+                                properties.getMaxToolBudgetRecoveryReplansPerTask());
+                if (!reservation.reserved()) {
+                    // Do not ask the node model to propose another tool call that the durable
+                    // budget gate will reject again. The original graph and successful receipts
+                    // remain intact for a user-directed revision.
+                    trace(sessionId, AgentStepNode.ERROR, toolBudgetRecoveryTrace(
+                            exhaustedNode, reservation.callsUsed(), properties.getProposalMaxToolCalls(),
+                            reservation.reason()), RunStatus.FAILURE);
+                    return RunOutcome.failed(toolBudgetRecoveryBlockedMessage(
+                                    exhaustedNode, reservation.callsUsed(), properties.getProposalMaxToolCalls(),
+                                    reservation.reason()),
+                            "TOOL_BUDGET_RECOVERY_EXHAUSTED");
+                }
+                snap = reservation.snapshot();
+                FailureDiagnosis diagnosis = new FailureDiagnosis(
+                        FailureClass.REWRITE_GRAPH, FailureKind.TOOL_BUDGET_EXHAUSTED,
+                        exhaustedNode.id(), "", exhaustedNode.lastError(),
+                        "只重规划这个已耗尽预算的失败节点并保留成功节点；先用 search_code/已知工作目录定位所需逻辑，"
+                                + "不要猜嵌套路径或重读重叠片段；分段读取必须依据工具返回的真实行数和非重叠范围。"
+                                + "新节点必须缩小职责并给出可独立验收的进展；无法可靠拆解时先请求用户澄清。");
+                log.warn("续跑发现节点工具预算耗尽，预留一次有界重规划 session={} node={} calls={}/{} attempt={}/{}",
+                        sessionId, exhaustedNode.id(), reservation.callsUsed(), properties.getProposalMaxToolCalls(),
+                        reservation.attemptsUsed(), properties.getMaxToolBudgetRecoveryReplansPerNode());
+                RecoveryAttempt budgetRecovery = tryLlmReplan(sessionId, fencingToken, snap, exhaustedNode,
+                        diagnosis, chat, userMessage, taskPlan, history, true);
+                if (budgetRecovery.stop() != null) return budgetRecovery.stop();
+                if (budgetRecovery.snapshot() == null) {
+                    trace(sessionId, AgentStepNode.ERROR, toolBudgetRecoveryTrace(
+                            exhaustedNode, reservation.callsUsed(), properties.getProposalMaxToolCalls(),
+                            "未生成通过校验的替代计划"), RunStatus.FAILURE);
+                    return RunOutcome.failed(toolBudgetRecoveryBlockedMessage(
+                                    exhaustedNode, reservation.callsUsed(), properties.getProposalMaxToolCalls(),
+                                    "未生成通过校验的替代计划"),
+                            "TOOL_BUDGET_RECOVERY_FAILED");
+                }
+                snap = budgetRecovery.snapshot();
+                existing = Optional.of(snap);
+                metrics.recovery();
+                budgetReplanned = true;
+            } else {
+                snap = consumeHumanWait(sessionId, snap);
+                existing = Optional.of(snap);
+            }
             compiled = new GoalCompiler.CompileResult(snap.goal(), snap.graph(), snap.degraded(),
                     snap.compilationSource(), "", snap.intent());
-            log.info("PlanningLoop 续跑已有图 session={} version={} nodes={}",
-                    sessionId, snap.version(), snap.graph().nodes().size());
+            log.info("PlanningLoop 续跑已有图 session={} version={} nodes={} budgetReplanned={}",
+                    sessionId, snap.version(), snap.graph().nodes().size(), budgetReplanned);
 
             // ===== 续跑已有图时的进度汇报 =====
             // 走到这里就说明本轮被判定为续跑，不再额外看「用户是否说了继续」。
@@ -1283,9 +1353,13 @@ public class PlanningLoop {
     private record StepExec(String text, String endReason, boolean drifted,
                             String lastTool, ToolErrorCode lastErrorCode,
                             List<ChatMessage> messages, ToolResult structuredResult, boolean toolAttempted,
+                            com.miniagent.agent.core.ExecutionControl.StopReason controlStopReason,
+                            boolean unknownOutcome,
                             List<StepEvaluator.CommandReceipt> commandReceipts) {
         StepExec {
             messages = messages == null ? List.of() : List.copyOf(messages);
+            controlStopReason = controlStopReason == null
+                    ? com.miniagent.agent.core.ExecutionControl.StopReason.NONE : controlStopReason;
             commandReceipts = commandReceipts == null ? List.of() : List.copyOf(commandReceipts);
         }
     }
@@ -1315,30 +1389,49 @@ public class PlanningLoop {
     private RunOutcome stopExecution(String sessionId, StateSnapshot snapshot, ActionProposal proposal,
                                      StepExec step, String userMessage) {
         TaskGraph graph = snapshot.graph();
-        boolean unknown = step.toolAttempted();
+        boolean unknown = hasUnknownToolOutcome(step.structuredResult(), step.toolAttempted(),
+                step.controlStopReason(), step.unknownOutcome());
         for (ActionSpec action : proposal.actions()) {
             TaskNode node = graph.byId(action.taskId());
             if (node == null) continue;
+            NodeOutputBinder.Bound evidence = NodeOutputBinder.bind(
+                    node, "", step.messages(), "", step.structuredResult());
             TaskNode stopped = node.withStatus(unknown ? TaskNodeStatus.OUTCOME_UNKNOWN : TaskNodeStatus.PENDING)
                     .withToolStatus(unknown ? com.miniagent.agent.tool.ToolStatus.UNKNOWN : null)
-                    .withError(step.endReason() + ": " + clip(step.text(), AWAITING_HINT_CHARS));
-            if (unknown) {
-                NodeOutputBinder.Bound evidence = NodeOutputBinder.bind(
-                        node, "", step.messages(), "", step.structuredResult());
-                stopped = stopped.withOutput(clip(evidence.evidence(), 12000), clipBindings(evidence.bindings()));
-            }
+                    .withError(step.endReason() + ": " + clip(step.text(), AWAITING_HINT_CHARS))
+                    .withOutput(clip(evidence.evidence(), 12000), clipBindings(evidence.bindings()));
             graph = graph.replace(stopped);
             // A control stop or unknown external effect is not a verified
             // procedure failure. Preserve evidence without training a verdict.
         }
         Map<String, Object> metadata = new LinkedHashMap<>(snapshot.execution());
         metadata.put("stopReason", step.endReason());
+        metadata.put("controlStopReason", step.controlStopReason().name());
         metadata.put("stoppedTaskIds", proposal.actions().stream().map(ActionSpec::taskId).toList());
         StateSnapshot stopped = stateStore.commit(sessionId, snapshot.version(), snapshot.withGraph(graph).withExecution(metadata));
         todoProjector.project(sessionId, stopped);
+        trace(sessionId, AgentStepNode.ERROR,
+                "{\"reason\":\"EXECUTION_CONTROL_STOP\",\"controlStopReason\":\""
+                        + step.controlStopReason().name() + "\",\"outcomeUnknown\":" + unknown
+                        + ",\"stoppedTaskIds\":[" + proposal.actions().stream()
+                        .map(ActionSpec::taskId).map(id -> "\"" + jsonEscape(id) + "\"")
+                        .collect(Collectors.joining(",")) + "]}", RunStatus.FAILURE);
         String answer = StringUtils.defaultIfBlank(step.text(), "任务已停止，尚未完成。");
         if (unknown) answer += "\n当前节点已保留执行证据，请先核验实际状态；系统不会自动重放该节点。";
         return RunOutcome.failed(answer, step.endReason());
+    }
+
+    static boolean hasUnknownToolOutcome(ToolResult result, boolean toolAttempted,
+                                         com.miniagent.agent.core.ExecutionControl.StopReason stopReason,
+                                         boolean stickyUnknownOutcome) {
+        if (stickyUnknownOutcome) return true;
+        if (result != null && result.status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN) return true;
+        // A typed control-plane stop is returned before its requested handler starts.
+        // Earlier completed calls have receipts; only UNKNOWN means an external side effect
+        // may still be in flight or unconfirmed.
+        if (stopReason != null && stopReason != com.miniagent.agent.core.ExecutionControl.StopReason.NONE)
+            return false;
+        return toolAttempted;
     }
 
     /** 轮次用尽就续跑。file_exists 可能只是写了个开头，不能当「做完了」。 */
@@ -1565,7 +1658,11 @@ public class PlanningLoop {
                     PlannerStateStore.NodeToolCallReservation reservation = stateStore.reserveNodeToolCall(
                             sessionId, proposal.executionId(), proposal.basedOnPlanVersion(), focusTask,
                             properties.getProposalMaxToolCalls());
-                    return reservation.reserved() ? "" : reservation.reason();
+                    if (reservation.reserved()) return ProposalTurnPolicy.ProgressGuard.BudgetDecision.allowed();
+                    LoopTurnPolicy.StopKind kind = reservation.callsUsed() >= properties.getProposalMaxToolCalls()
+                            ? LoopTurnPolicy.StopKind.TOOL_BUDGET_EXHAUSTED
+                            : LoopTurnPolicy.StopKind.NO_PROGRESS;
+                    return ProposalTurnPolicy.ProgressGuard.BudgetDecision.denied(kind, reservation.reason());
                 }));
         ProposalTurnPolicy policy = new ProposalTurnPolicy(
                 allowed, hard, label, focusTodos, timeoutSec,
@@ -1622,6 +1719,8 @@ public class PlanningLoop {
                 return new StepExec(out.text(), out.endReason(), policy.consumeDrift(),
                         lastInvokedTool(out), lastToolResult == null ? out.lastErrorCode()
                         : lastToolResult.errorCode(), out.messages(), lastToolResult, toolAttempted,
+                        out.controlStopReason(),
+                        out.unknownOutcome(),
                         toolExecutionReceipts(out.messages()));
             } catch (RuntimeException ex) {
                 com.miniagent.agent.core.ModelCallControl.rethrowIfStopped(ex);
@@ -1630,7 +1729,8 @@ public class PlanningLoop {
                 log.warn("节点执行异常，停止自动重试 task={}", focusTask, ex);
                 String message = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
                 return new StepExec("节点执行结果未知：" + message, AgentLoop.OUTCOME_UNKNOWN,
-                        policy.consumeDrift(), "", ToolErrorCode.OUTCOME_UNKNOWN, List.of(), null, true, List.of());
+                        policy.consumeDrift(), "", ToolErrorCode.OUTCOME_UNKNOWN, List.of(), null, true,
+                        com.miniagent.agent.core.ExecutionControl.StopReason.NONE, true, List.of());
             }
         } finally {
             ExecutionTurnContext.clear();
@@ -1707,6 +1807,9 @@ public class PlanningLoop {
         toolMessages.add(msg);
         return new StepExec(ok ? AgentLoop.STEP_SEGMENT_DONE : text, end, false,
                 action.tool(), code, List.copyOf(toolMessages), result, attempted,
+                invocation == null ? com.miniagent.agent.core.ExecutionControl.StopReason.NONE
+                        : invocation.controlStopReason(),
+                result.status() == com.miniagent.agent.tool.ToolStatus.UNKNOWN,
                 toolExecutionReceipts(toolMessages));
     }
 
@@ -1773,6 +1876,14 @@ public class PlanningLoop {
                 sb.append("上一轮失败上下文（必须先处理，不要盲重试）：")
                         .append(n.lastError()).append('\n');
             }
+            String previousEvidence = previousNodeExecutionEvidence(n);
+            if (!previousEvidence.isBlank()) {
+                sb.append("【此前执行回执（不可视为未执行）】\n")
+                        .append(previousEvidence)
+                        .append("\n以上记录只用于了解已发生的操作。继续前先用只读方式核验外部状态；"
+                                + "无法确认写入、提交或桌面操作结果时必须停下并请求用户核验，"
+                                + "不得盲目重放可能已成功的副作用。\n");
+            }
             if (n != null && StringUtils.isNotBlank(n.procedureSnapshotJson())) {
                 try {
                     ProcedurePromptInput procedure = new com.fasterxml.jackson.databind.ObjectMapper()
@@ -1817,6 +1928,11 @@ public class PlanningLoop {
         }
         sb.append(MessageConstants.DAG_EVIDENCE_SUBMISSION).append('\n');
         return sb.toString();
+    }
+
+    static String previousNodeExecutionEvidence(TaskNode node) {
+        if (node == null || StringUtils.isBlank(node.output())) return "";
+        return clip(node.output(), 6_000);
     }
 
     private static Set<String> declaredFilePaths(TaskNode node) {
@@ -2097,6 +2213,14 @@ public class PlanningLoop {
                     + "\n已保存的结构化任务意图（继续遵循；不能扩大或删除原约束）："
                     + intentJson(snap.intent());
         }
+        if (dx.kind() == FailureKind.TOOL_BUDGET_EXHAUSTED) {
+            correction += "\n【节点工具预算恢复】原节点生命周期预算已耗尽，本轮只允许生成一次替代子图，"
+                    + "不能再次提交原节点，也不能仅改写节点名称后重复相同读取策略。"
+                    + "保留所有 SUCCESS 节点及其回执；将剩余工作拆成更聚焦、能独立验收的节点。"
+                    + "读取代码优先使用 search_code 定位所需逻辑，再读取准确路径；不得拼接 workspace 子目录猜路径。"
+                    + "大文件按实际返回的行数使用不重叠范围分段，不能猜测文件偏移或越过文件末尾。"
+                    + "新子图仍须通过完整 PlanValidator 和意图校验，不能降低原验收要求。";
+        }
         TaskPlan recoveryPlan = taskPlan.withTaskGoal(snap.goal().objective());
         GoalCompiler.CompileResult compiled;
         try {
@@ -2262,10 +2386,10 @@ public class PlanningLoop {
                                          int classRecoveries, int classLimit,
                                          FailureKind failureKind,
                                          boolean explicitUserResume) {
-        // Only the explicit recovery branch for a cancelled dependency may
-        // reserve one continuation attempt beyond the exhausted automatic
-        // budget. Other replan causes remain under both normal circuit breakers.
-        if (explicitUserResume && failureKind == FailureKind.DEPENDENCY_FAILED) return true;
+        // Explicit continuation recovery has its own durable, task-scoped budget.
+        // Do not let automatic-recovery counters consume that separately reserved allowance.
+        if (explicitUserResume && (failureKind == FailureKind.DEPENDENCY_FAILED
+                || failureKind == FailureKind.TOOL_BUDGET_EXHAUSTED)) return true;
         return totalRecoveries < maxRecoveries && classRecoveries < classLimit;
     }
 
@@ -2488,6 +2612,35 @@ public class PlanningLoop {
             }
         }
         return nodes.isEmpty() ? null : nodes.get(nodes.size() - 1);
+    }
+
+    private TaskNode exhaustedToolBudgetNode(StateSnapshot snapshot) {
+        if (snapshot == null || snapshot.graph() == null) return null;
+        int maximum = properties.getProposalMaxToolCalls();
+        for (TaskNode node : snapshot.graph().nodes()) {
+            if (node == null || (node.status() != TaskNodeStatus.FAILED
+                    && node.status() != TaskNodeStatus.READY
+                    && node.status() != TaskNodeStatus.PENDING)) continue;
+            if (stateStore.nodeToolCallsUsed(snapshot, node.id()) >= maximum) return node;
+        }
+        return null;
+    }
+
+    private static String toolBudgetRecoveryBlockedMessage(TaskNode node, int callsUsed,
+                                                            int maximum, String detail) {
+        String name = node == null || StringUtils.isBlank(node.name()) ? "失败节点" : node.name();
+        return "节点「" + name + "」已用完工具预算（" + callsUsed + "/" + maximum
+                + "）。系统没有继续派发旧节点，以免重复空转；" + StringUtils.defaultIfBlank(detail, "安全重规划未完成")
+                + "。原有已验收进度已保留，请调整该步骤目标或验收要求后再继续。";
+    }
+
+    private static String toolBudgetRecoveryTrace(TaskNode node, int callsUsed,
+                                                  int maximum, String reason) {
+        return "{\"reason\":\"TOOL_BUDGET_RECOVERY_STOPPED\",\"nodeId\":\""
+                + jsonEscape(node == null ? "" : node.id()) + "\",\"nodeName\":\""
+                + jsonEscape(node == null ? "" : node.name()) + "\",\"callsUsed\":"
+                + Math.max(0, callsUsed) + ",\"maxCalls\":" + Math.max(1, maximum)
+                + ",\"detail\":\"" + jsonEscape(reason) + "\"}";
     }
 
     /** A selected DAG cannot execute until compilation and validation succeed. */

@@ -127,6 +127,7 @@ public class RecoveryEngine {
         return switch (kind) {
             case PARAM_ERROR, HARD_GATE -> FailureClass.LOCAL_REPAIR;
             case UNKNOWN_TOOL -> FailureClass.REPLACE_TOOL;
+            case TOOL_BUDGET_EXHAUSTED -> FailureClass.REWRITE_GRAPH;
             case DRIFT -> retryCount >= 1 ? FailureClass.REWRITE_GRAPH : FailureClass.LOCAL_REPAIR;
             case EVAL_FAILED, TOOL_ERROR, GENERIC, ORPHAN_RUNNING -> {
                 if (retryCount >= 2) {

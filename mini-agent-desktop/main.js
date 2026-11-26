@@ -660,14 +660,14 @@ function createWindow() {
     // macOS 不去框：红绿灯是平台惯例，hiddenInset 只收掉标题栏文字、保留红绿灯，
     // 页面让出顶部空间（preload 按平台处理）。
     ...(process.platform === 'darwin'
-      ? { frame: true, titleBarStyle: 'hiddenInset', backgroundColor: '#0e0f12' }
+      ? { frame: true, titleBarStyle: 'hiddenInset', backgroundColor: '#f4f7fb' }
       : bootPresenting
         ? {
             frame: false,
-            backgroundColor: '#0b1020',
+            backgroundColor: '#f4f7fb',
             skipTaskbar: true
           }
-        : { frame: false, backgroundColor: '#0e0f12' }),
+        : { frame: false, backgroundColor: '#f4f7fb' }),
     show: false
   });
 

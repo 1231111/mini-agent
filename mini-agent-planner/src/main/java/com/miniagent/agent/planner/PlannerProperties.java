@@ -44,6 +44,10 @@ public class PlannerProperties {
     private int proposalMaxChunks = 6;
     /** 单个 DAG 节点生命周期内可执行的工具调用硬上限，跨 chunk 和用户续跑持久化。 */
     private int proposalMaxToolCalls = 12;
+    /** 同一耗尽节点的预算恢复重规划次数；允许一次短暂的模型/编译失败后由用户继续。 */
+    private int maxToolBudgetRecoveryReplansPerNode = 2;
+    /** 整个任务跨计划版本的预算恢复重规划总上限，防止不断生成新节点绕过熔断。 */
+    private int maxToolBudgetRecoveryReplansPerTask = 3;
     private int compilerRetry = 1;
     private int maxOuterRounds = 24;
     /** Proposal 硬闸门：锁定工具面 + 禁止改其它 todo */
@@ -114,6 +118,15 @@ public class PlannerProperties {
     public int getProposalMaxToolCalls() { return proposalMaxToolCalls; }
     public void setProposalMaxToolCalls(int proposalMaxToolCalls) {
         this.proposalMaxToolCalls = Math.max(1, Math.min(120, proposalMaxToolCalls));
+    }
+
+    public int getMaxToolBudgetRecoveryReplansPerNode() { return maxToolBudgetRecoveryReplansPerNode; }
+    public void setMaxToolBudgetRecoveryReplansPerNode(int attempts) {
+        this.maxToolBudgetRecoveryReplansPerNode = Math.max(0, Math.min(2, attempts));
+    }
+    public int getMaxToolBudgetRecoveryReplansPerTask() { return maxToolBudgetRecoveryReplansPerTask; }
+    public void setMaxToolBudgetRecoveryReplansPerTask(int attempts) {
+        this.maxToolBudgetRecoveryReplansPerTask = Math.max(0, Math.min(8, attempts));
     }
 
     public int getCompilerRetry() { return compilerRetry; }
