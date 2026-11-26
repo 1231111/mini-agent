@@ -327,7 +327,10 @@ public class AgentLoop {
             Map.entry("browser_screenshot", 1000),
             Map.entry("desktop_observe",    4000),
             Map.entry("desktop_act",        4000),
-            Map.entry("read_package",       15000)
+            Map.entry("read_package",       15000),
+            // A submit receipt carries the node's acceptance evidence and the
+            // structured todo list; both are contract data, not context noise.
+            Map.entry("todo",               16000)
     );
     /** 未在 TOOL_RESULT_LIMITS 中的工具使用此默认值 */
     private static final int DEFAULT_TOOL_RESULT_MAX = 4000;
@@ -1685,7 +1688,8 @@ public class AgentLoop {
                 executionControl.recordInputTokens(sessionId, response.tokenUsage().inputTokenCount());
             }
             // 累计 token 越线只告警，不终止任务（口径与 WorkBuddy 一致：任务不该因为"干得久"而停）。
-            // 真正的失控拦截是 deadline / maxToolCalls / 轮次上限 / 重复工具检测，四者都与工作量无关。
+            // 失控拦截是 deadline / 租户配额 / 轮次上限 / 重复无进展检测。
+            // maxToolCalls 是可选的部署级硬配额，默认关闭，不能代替进展判断。
             if (executionControl.markTokenSoftLimitWarned(sessionId)) {
                 long used = executionControl.estimatedTokens(sessionId);
                 log.warn("本任务累计 token 已越过告警线（{} > {}），任务继续执行；"
@@ -4142,6 +4146,15 @@ public class AgentLoop {
             state.toolResultOffsets.remove(cacheKey);
             return result;
         }
+        // A structured result is a contract, not prose. Cutting it at a raw
+        // character offset produces invalid JSON, and downstream readers
+        // (acceptance evidence binding, resumable prompts) then silently see
+        // nothing. Shrink it at field level so it stays parseable.
+        String structured = clampStructuredResult(result, limit);
+        if (structured != null) {
+            state.toolResultOffsets.remove(cacheKey);
+            return structured;
+        }
         boolean resumable = state.toolResultCache.containsKey(cacheKey);
         int offset = resumable ? state.toolResultOffsets.getOrDefault(cacheKey, 0) : 0;
         int end = Math.min(result.length(), offset + limit);
@@ -4158,6 +4171,103 @@ public class AgentLoop {
                     + " chars. Use the tool's pagination parameters or a narrower query to retrieve more.]";
         }
         return chunk;
+    }
+
+    /**
+     * Fields that carry the acceptance contract. Shrinking them would change
+     * what the executor is graded on, so a structured result keeps them in full
+     * even when that means staying above the soft context limit.
+     */
+    private static final java.util.Set<String> CONTEXT_KEEP_FIELDS =
+            java.util.Set.of("evidence", "doneWhen", "done_when", "criteria");
+
+    private record TextSlot(ObjectNode parent, String field) { }
+
+    /**
+     * Shrinks a JSON tool result without breaking it. Returns {@code null} when
+     * the payload is not a JSON object, so the caller falls back to the legacy
+     * character clamp for genuinely textual output.
+     */
+    private static String clampStructuredResult(String result, int limit) {
+        String trimmed = result == null ? "" : result.trim();
+        if (!trimmed.startsWith("{")) return null;
+        JsonNode parsed;
+        try {
+            parsed = ARGUMENT_MAPPER.readTree(trimmed);
+        } catch (Exception notJson) {
+            return null;
+        }
+        if (!(parsed instanceof ObjectNode root)) return null;
+        // "todo" is a human-readable rendering of "items"; dropping the copy
+        // halves the payload without losing any contract field.
+        if (root.has("todo") && root.has("items")) {
+            root.remove("todo");
+        }
+        boolean trimmedContent = false;
+        String compact = root.toString();
+        while (compact.length() > limit) {
+            TextSlot slot = longestTrimmable(root);
+            if (slot == null) break;
+            String value = slot.parent().get(slot.field()).asText();
+            int target = Math.max(160, value.length() / 2);
+            int head = target * 2 / 3;
+            int tail = target - head;
+            slot.parent().put(slot.field(), value.substring(0, head)
+                    + "\n[上下文裁剪：省略 " + (value.length() - target) + " 字符]\n"
+                    + value.substring(value.length() - tail));
+            trimmedContent = true;
+            compact = root.toString();
+        }
+        if (trimmedContent) {
+            root.put("_contextTruncated", true);
+            compact = root.toString();
+        }
+        if (compact.length() > limit) {
+            log.warn("结构化工具结果保留验收字段后仍超过上下文上限: {} > {}（保持 JSON 完整）",
+                    compact.length(), limit);
+        }
+        return compact;
+    }
+
+    private static TextSlot longestTrimmable(JsonNode node) {
+        TextSlot best = null;
+        int bestLength = 0;
+        if (node instanceof ObjectNode object) {
+            var fields = object.fields();
+            while (fields.hasNext()) {
+                var entry = fields.next();
+                JsonNode value = entry.getValue();
+                if (value.isTextual()) {
+                    if (CONTEXT_KEEP_FIELDS.contains(entry.getKey())) continue;
+                    int length = value.asText().length();
+                    if (length > 200 && length > bestLength) {
+                        best = new TextSlot(object, entry.getKey());
+                        bestLength = length;
+                    }
+                } else if (value.isContainerNode()) {
+                    TextSlot nested = longestTrimmable(value);
+                    if (nested != null) {
+                        int length = nested.parent().get(nested.field()).asText().length();
+                        if (length > bestLength) {
+                            best = nested;
+                            bestLength = length;
+                        }
+                    }
+                }
+            }
+        } else if (node instanceof ArrayNode array) {
+            for (JsonNode child : array) {
+                TextSlot nested = longestTrimmable(child);
+                if (nested != null) {
+                    int length = nested.parent().get(nested.field()).asText().length();
+                    if (length > bestLength) {
+                        best = nested;
+                        bestLength = length;
+                    }
+                }
+            }
+        }
+        return best;
     }
     private static String formatProgressMsg(String toolName, String arguments) {
         return switch (toolName) {

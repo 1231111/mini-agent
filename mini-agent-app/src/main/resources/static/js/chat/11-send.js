@@ -172,7 +172,10 @@ const MAX_STREAM_RECONNECTS = 3;  // 单次发送内流意外中断后最多自�
 
 /** Main chat SSE is an independent refresh signal if the inspector trace stream is delayed or disconnected. */
 function refreshInspectorFromChatStream() {
-    if (typeof refreshInspector === 'function') refreshInspector(true);
+    if (typeof refreshInspector === 'function'
+            && (typeof inspectorIsOpen !== 'function' || inspectorIsOpen())) {
+        refreshInspector(true);
+    }
 }
 
 async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
@@ -746,6 +749,14 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                         currentProgress = payload.currentProgress || null;
                     paintTodo();
                     syncPendingConfirm(todoItems);
+                    // The main chat stream carries the authoritative todo
+                    // projection. Use it as an independent inspector refresh
+                    // signal so the right DAG view stays current even when the
+                    // trace SSE is delayed, reconnected, or rate-limited.
+                    if (typeof refreshInspector === 'function'
+                            && (typeof inspectorIsOpen !== 'function' || inspectorIsOpen())) {
+                        refreshInspector(true, true);
+                    }
                 } catch (e) { /* 忽略坏 payload */ }
             } else if (name === 'task_summary') {
                 try {

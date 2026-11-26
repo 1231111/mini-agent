@@ -22,7 +22,10 @@
 const INSP_LS_KEY = 'mini_agent_inspector';
 const INSP_NARROW_PX = 1180;
 const INSP_PUSH_DEBOUNCE_MS = 500;
-const INSP_MIN_STEP_REFRESH_MS = 5000;
+// Trace events are already coalesced below. Five seconds made the authoritative
+// DAG view visibly stale while a node was changing (especially during a long
+// read_file sequence), so keep the transport throttle to one bounded second.
+const INSP_MIN_STEP_REFRESH_MS = 1000;
 const INSP_RECONNECT_BASE_MS = 1000;
 const INSP_RECONNECT_MAX_MS = 30000;
 const INSP_MAX_TRACE_ROWS = 6; // 非 DAG trace 事件列表限量；真实 DAG 节点不截断
@@ -134,9 +137,11 @@ function refreshInspector(force, stepsOnly) {
     inspBusy = true;
     Promise.resolve()
         .then(() => stepsOnly
-            ? renderInspectorSteps(currentId).then(snapshot => renderInspectorMemory(currentId, snapshot))
+            ? renderInspectorSteps(currentId).then(snapshot =>
+                snapshot ? renderInspectorMemory(currentId, snapshot) : undefined)
             : Promise.all([renderInspectorStatus(), renderInspectorSteps(currentId)])
-                .then(([, snapshot]) => renderInspectorMemory(currentId, snapshot)))
+                .then(([, snapshot]) =>
+                    snapshot ? renderInspectorMemory(currentId, snapshot) : undefined))
         .catch(e => console.warn('[Inspector] refresh failed:', e))
         .finally(() => {
             inspBusy = false;
@@ -219,7 +224,7 @@ async function renderInspectorSteps(sid) {
             const transient = resp.status === 408 || resp.status === 429 || resp.status >= 500;
             if (transient) {
                 setInspectorState('同步重试中', 'waiting');
-                scheduleInspectorDataRetry(sid);
+                scheduleInspectorDataRetry(sid, retryAfterMs(resp));
             }
             // Keep the last good snapshot. A temporary 429 must not replace a
             // real execution with an empty list and an "idle" status.
@@ -233,6 +238,10 @@ async function renderInspectorSteps(sid) {
     } catch (e) {
         console.warn('[Inspector] task details failed:', e);
         scheduleInspectorDataRetry(sid);
+        // Keep the last successful snapshot on network/JSON failures. Rendering
+        // an empty fallback here would temporarily make an active DAG look idle
+        // and overwrite the user's current-node view.
+        return null;
     }
     if (sid !== currentId) return null;
     if (!Array.isArray(todos)) todos = [];
@@ -1322,10 +1331,24 @@ function scheduleInspectorReconnect(sid) {
     }, delay);
 }
 
-function scheduleInspectorDataRetry(sid) {
+function retryAfterMs(resp) {
+    if (!resp || !resp.headers) return 0;
+    const raw = resp.headers.get('Retry-After');
+    if (!raw) return 0;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+        return Math.min(INSP_RECONNECT_MAX_MS, Math.max(0, Math.round(seconds * 1000)));
+    }
+    const when = Date.parse(raw);
+    return Number.isFinite(when)
+        ? Math.min(INSP_RECONNECT_MAX_MS, Math.max(0, when - Date.now())) : 0;
+}
+
+function scheduleInspectorDataRetry(sid, serverDelayMs = 0) {
     if (inspDataRetryTimer || sid !== currentId || !inspectorIsOpen()) return;
     const exponent = Math.min(inspDataRetryAttempt, 5);
-    const delay = Math.min(INSP_RECONNECT_MAX_MS, INSP_RECONNECT_BASE_MS * (2 ** exponent));
+    const backoff = INSP_RECONNECT_BASE_MS * (2 ** exponent);
+    const delay = Math.min(INSP_RECONNECT_MAX_MS, Math.max(backoff, Number(serverDelayMs) || 0));
     inspDataRetryAttempt++;
     inspDataRetryTimer = setTimeout(() => {
         inspDataRetryTimer = null;

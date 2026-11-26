@@ -58,6 +58,7 @@ public class TodoStateProjector {
             return;
         }
         Map<String, Integer> idMap = todoIdMap(graph);
+        Map<Integer, String> acceptedEvidence = acceptedEvidence(sessionId);
         List<Map<String, Object>> raw = new ArrayList<>();
         for (TaskNode n : graph.nodes()) {
             if (n.status() == TaskNodeStatus.CANCELLED) {
@@ -79,7 +80,17 @@ public class TodoStateProjector {
             m.put("content", n.name());
             m.put("status", toTodoStatus(n.status()));
             m.put("done_when", n.doneWhen());
-            m.put("evidence", n.output());
+            // The graph only carries committed output. While a node is still
+            // executing, its output is empty — projecting that empty value would
+            // erase the evidence the executor just submitted, and the scheduler
+            // would then grade the node on an unrelated last tool receipt.
+            String nodeOutput = n.output();
+            if ((nodeOutput == null || nodeOutput.isBlank())
+                    && (n.status() == TaskNodeStatus.RUNNING
+                        || n.status() == TaskNodeStatus.AWAITING_CONFIRM)) {
+                nodeOutput = acceptedEvidence.getOrDefault(id, "");
+            }
+            m.put("evidence", nodeOutput);
             m.put("depends_on", deps);
             // 重跑 / 重规划标记：页面要区分"这个节点被恢复机制重跑过"和"这是重规划新生成的节点"。
             // retryCount 来自图节点；replanGeneration 只能从图 id 前缀 rpN_ 反推
@@ -95,8 +106,37 @@ public class TodoStateProjector {
         else taskTodoStore.overwrite(sessionId, raw, context);
     }
 
-    private String currentNodeId(TaskGraph graph) {
-        if (graph == null) return "";
+    /** Evidence already accepted for this session's todos, keyed by todo id. */
+    private Map<Integer, String> acceptedEvidence(String sessionId) {
+        if (taskTodoStore == null) {
+            return Map.of();
+        }
+        Map<Integer, String> evidence = new LinkedHashMap<>();
+        for (TaskTodoStore.TodoItem item : taskTodoStore.get(sessionId)) {
+            if (item.evidence() != null && !item.evidence().isBlank()) {
+                evidence.put(item.id(), item.evidence());
+            }
+        }
+        return evidence;
+    }
+
+    /**
+     * Authoritative evidence submitted for one node. This is the persisted todo
+     * record, not the conversation copy that the context budget clamps.
+     */
+    public String submittedEvidence(String sessionId, int todoId) {
+        if (taskTodoStore == null || sessionId == null || todoId <= 0) {
+            return "";
+        }
+        for (TaskTodoStore.TodoItem item : taskTodoStore.get(sessionId)) {
+            if (item.id() == todoId) {
+                return item.evidence() == null ? "" : item.evidence();
+            }
+        }
+        return "";
+    }
+
+    private String currentNodeId(TaskGraph graph) {        if (graph == null) return "";
         TaskNode current = preferredCurrentNode(graph);
         if (current == null) return "";
         int id = todoIdFor(graph, current.id());

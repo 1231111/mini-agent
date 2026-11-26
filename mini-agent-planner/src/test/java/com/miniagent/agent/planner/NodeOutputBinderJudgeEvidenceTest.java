@@ -84,6 +84,54 @@ class NodeOutputBinderJudgeEvidenceTest {
         }
     }
 
+    @Test
+    void semanticCheckNodeBindsSubmittedEvidenceNotTheLastToolReceipt() throws Exception {
+        Map<String, Object> receipt = new java.util.LinkedHashMap<>();
+        receipt.put("success", true);
+        receipt.put("action", "submit");
+        receipt.put("id", CURRENT_TODO_ID);
+        receipt.put("evidence", CLAIMED_EVIDENCE);
+        List<ChatMessage> messages = List.of(
+                ToolExecutionResultMessage.from("submit-1", CapabilityRegistry.FALLBACK_TOOL,
+                        JSON.writeValueAsString(receipt)),
+                ToolExecutionResultMessage.from("read-1", "read_file",
+                        "[read_file path=C:\\ws\\package.json line_offset=1 char_offset=0 "
+                                + "char_limit=4000 lines_returned=14 partial=false]\n1|{\"name\":\"demo\"}"));
+
+        NodeOutputBinder.Bound bound = NodeOutputBinder.bind(
+                semanticNode(), "", messages, "", null, "", CURRENT_TODO_ID, CLAIMED_EVIDENCE);
+
+        assertThat(bound.evidence()).isEqualTo(CLAIMED_EVIDENCE);
+        assertThat(bound.evidence()).doesNotContain("package.json");
+    }
+
+    @Test
+    void truncatedSubmitReceiptIsSalvagedInsteadOfFallingBackToLastReceipt() throws Exception {
+        Map<String, Object> receipt = new java.util.LinkedHashMap<>();
+        receipt.put("success", true);
+        receipt.put("action", "submit");
+        receipt.put("id", CURRENT_TODO_ID);
+        receipt.put("evidence", CLAIMED_EVIDENCE);
+        receipt.put("items", List.of(Map.of("content", "x".repeat(4000))));
+        String full = JSON.writeValueAsString(receipt);
+        String truncated = full.substring(0, full.indexOf("\"items\"") + 20);
+        assertThat(truncated).doesNotEndWith("}");
+
+        NodeOutputBinder.Bound bound = NodeOutputBinder.bind(
+                judgeNode(), "", List.of(ToolExecutionResultMessage.from(
+                        "truncated-submit", CapabilityRegistry.FALLBACK_TOOL, truncated)),
+                "PASS", null, "", CURRENT_TODO_ID, "");
+
+        assertThat(bound.evidence()).isEqualTo(CLAIMED_EVIDENCE);
+    }
+
+    private static TaskNode semanticNode() {
+        return new TaskNode("research", "确认原单机玩法结构与联机验收要求", "research",
+                List.of(), List.of(), List.of(), TaskNodeStatus.RUNNING, 0,
+                new DoneWhen("note", "", "", List.of("列出启动、移动和渲染循环的函数名与行号")),
+                "", "", 0, "");
+    }
+
     private static TaskNode judgeNode() {
         return new TaskNode("architecture", "梳理五步信息架构", "research",
                 List.of(), List.of(), List.of(), TaskNodeStatus.RUNNING, 0,

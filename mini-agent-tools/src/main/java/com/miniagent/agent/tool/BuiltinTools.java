@@ -212,11 +212,16 @@ public class BuiltinTools {
 
     /** 登记一次读取观察。{@code partial} 只读了一部分时置 true。 */
     private void rememberRead(Path target, boolean partial) {
-        String digest = digestOf(target);
-        if (digest.isEmpty()) {
+        // Partial reads can never authorize an overwrite, so hashing the whole file here
+        // only adds an O(file-size) pass to every page of a large-file read.
+        if (partial) {
+            readObservations.put(observationKey(target), new ReadObservation("", true));
             return;
         }
-        readObservations.put(observationKey(target), new ReadObservation(digest, partial));
+        String digest = digestOf(target);
+        if (!digest.isEmpty()) {
+            readObservations.put(observationKey(target), new ReadObservation(digest, false));
+        }
     }
 
     /**
@@ -334,6 +339,9 @@ public class BuiltinTools {
                 "只读取 UTF-8 文本文件（源码、HTML、Markdown、JSON、YAML 等），不是二进制文件查看器。"
                         + "PNG/JPEG 图片使用 image_inspect；浏览器当前页面使用 browser_screenshot；PDF/Office 使用相应文档解析工具。"
                         + "若返回非 UTF-8/二进制诊断，不要重复读取或据此判断产品损坏。默认按行分页；若提示某行被截断，使用 offset 指定该行号、limit=1，并通过 char_offset/char_limit 按行内字符范围续读。"
+                        + "每次最多返回 200 行、32,000 个正文字符；超长行会在 4,000 字符处分段。"
+                        + "截断标记给出 next_char_offset，total_chars 可能为 unknown（避免扫描整条超长行）；"
+                        + "按标记续读。高行号和超长行续读会使用有界稀疏 UTF-8 索引。"
                         + "返回结果会标明是否完整，不能把截断片段当作完整文件证据。",
                 ToolParams.generateSchema(ReadFileParams.class),
                 arguments -> {
@@ -1210,8 +1218,30 @@ public class BuiltinTools {
 
     private static final int READ_LINE_CAP = 4000;
     private static final int READ_CHAR_RANGE_CAP = 8000;
+    private static final int READ_MAX_LINES = 200;
+    private static final int READ_RESPONSE_CHAR_BUDGET = 32_000;
+    private static final int READ_INDEX_TRIGGER_LINES = 128;
+    private static final int READ_INDEX_TRIGGER_CHARS = 16_000;
+    private static final int READ_INDEX_CACHE_ENTRIES = 16;
+    private static final int READ_INDEX_MAX_CHECKPOINTS = 8192;
 
-    private record ReadLineSlice(String text, int startOffset, int totalChars,
+    private record ReadCheckpoint(int lineNo, long charOffset, long byteOffset) {}
+    private record ReadFileState(long size, java.nio.file.attribute.FileTime modified, Object fileKey) {}
+    private record ReadFileIndex(ReadFileState state, List<ReadCheckpoint> checkpoints) {}
+
+    /**
+     * Bounded sparse UTF-8 position indexes. The index stores positions only, never file
+     * contents, and is invalidated by ordinary file metadata changes.
+     */
+    private final Map<String, ReadFileIndex> readFileIndexCache =
+            Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, ReadFileIndex> eldest) {
+                    return size() > READ_INDEX_CACHE_ENTRIES;
+                }
+            });
+
+    private record ReadLineSlice(String text, int startOffset, long totalChars,
                                  boolean truncatedBefore, boolean truncatedAfter) {
         boolean truncated() { return truncatedBefore || truncatedAfter; }
     }
@@ -1228,49 +1258,97 @@ public class BuiltinTools {
             if (!Files.exists(target)) {
                 return errorJson(ToolErrorCode.NOT_FOUND, "文件不存在: " + path);
             }
-            int from = Math.max(1, offset);
-            int maxLines = Math.max(0, limit);
+            if (offset < 1) {
+                return errorJson(ToolErrorCode.INVALID_ARGUMENT, "offset 必须大于等于 1");
+            }
+            if (limit < 1 || limit > READ_MAX_LINES) {
+                return errorJson(ToolErrorCode.INVALID_ARGUMENT,
+                        "limit 必须在 1 到 " + READ_MAX_LINES + " 之间（默认 200）");
+            }
+            if (charOffset < 0) {
+                return errorJson(ToolErrorCode.INVALID_ARGUMENT, "char_offset 必须大于等于 0");
+            }
+            if (charRange && (charLimit < 1 || charLimit > READ_CHAR_RANGE_CAP)) {
+                return errorJson(ToolErrorCode.INVALID_ARGUMENT,
+                        "char_limit 必须在 1 到 " + READ_CHAR_RANGE_CAP + " 之间");
+            }
+            int from = offset;
+            int maxLines = limit;
             if (charRange && maxLines != 1) {
                 return errorJson(ToolErrorCode.INVALID_ARGUMENT,
                         "char_offset/char_limit 仅支持 limit=1；请用 offset 指定目标行号");
             }
-            int requestedCharOffset = Math.max(0, charOffset);
-            int requestedCharLimit = Math.max(1, Math.min(READ_CHAR_RANGE_CAP, charLimit));
+            int requestedCharOffset = charOffset;
+            int requestedCharLimit = charLimit;
+
+            ReadFileIndex index = null;
+            ReadCheckpoint checkpoint = new ReadCheckpoint(1, 0, 0);
+            if (from > READ_INDEX_TRIGGER_LINES
+                    || (charRange && requestedCharOffset >= READ_INDEX_TRIGGER_CHARS)) {
+                index = readFileIndex(target);
+                checkpoint = nearestCheckpoint(index, from,
+                        charRange ? requestedCharOffset : 0, charRange);
+            }
             StringBuilder sb = new StringBuilder();
-            int lineNo = 0;
+            int lineNo = checkpoint.lineNo() - 1;
             int written = 0;
+            int returnedCharsTotal = 0;
             boolean hitLimit = false;
             boolean lineTruncated = false;
+            boolean responseLimit = false;
             List<String> truncatedLines = new ArrayList<>();
             int returnedCharOffset = charRange ? requestedCharOffset : 0;
-            try (var reader = Files.newBufferedReader(target, StandardCharsets.UTF_8)) {
+            var decoder = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
+            try (var channel = java.nio.channels.FileChannel.open(target, java.nio.file.StandardOpenOption.READ)) {
+                channel.position(checkpoint.byteOffset());
+                try (var reader = new java.io.BufferedReader(new java.io.InputStreamReader(
+                        java.nio.channels.Channels.newInputStream(channel), decoder), 8192)) {
+                while (lineNo + 1 < from) {
+                    if (!skipPhysicalLine(reader)) break;
+                    lineNo++;
+                }
                 while (true) {
+                    if (lineNo + 1 < from) break;
                     if (written >= maxLines) {
                         reader.mark(1);
                         if (reader.read() >= 0) hitLimit = true;
                         reader.reset();
                         break;
                     }
-                    int sliceOffset = charRange && written == 0 ? requestedCharOffset : 0;
-                    int sliceLimit = charRange && written == 0 ? requestedCharLimit : READ_LINE_CAP;
-                    ReadLineSlice line = readLineSlice(reader, sliceOffset, sliceLimit);
+                    if (returnedCharsTotal >= READ_RESPONSE_CHAR_BUDGET) {
+                        reader.mark(2);
+                        int next = reader.read();
+                        reader.reset();
+                        responseLimit = next >= 0;
+                        break;
+                    }
+                    int sliceOffset = charRange && lineNo + 1 == from ? requestedCharOffset : 0;
+                    int remainingBudget = READ_RESPONSE_CHAR_BUDGET - returnedCharsTotal;
+                    int sliceLimit = charRange && lineNo + 1 == from
+                            ? Math.min(requestedCharLimit, remainingBudget)
+                            : Math.min(READ_LINE_CAP, remainingBudget);
+                    ReadLineSlice line = readLineSlice(reader,
+                            lineNo + 1 == checkpoint.lineNo() ? checkpoint.charOffset() : 0,
+                            sliceOffset, sliceLimit);
                     if (line == null) break;
                     lineNo++;
-                    if (lineNo < from) {
-                        continue;
-                    }
-                    if (charRange && lineNo == from && requestedCharOffset > line.totalChars()) {
+                    if (charRange && lineNo == from && line.totalChars() >= 0
+                            && requestedCharOffset > line.totalChars()) {
                         return errorJson(ToolErrorCode.INVALID_ARGUMENT,
                                 "char_offset=" + requestedCharOffset + " 超出目标行长度 total_chars="
                                         + line.totalChars());
                     }
                     sb.append(lineNo).append('|').append(line.text());
+                    int returnedChars = line.text().codePointCount(0, line.text().length());
+                    returnedCharsTotal += returnedChars;
                     if (line.truncated()) {
                         lineTruncated = true;
-                        int returnedChars = line.text().codePointCount(0, line.text().length());
                         sb.append(" [read_file 行内截断：char_offset=").append(line.startOffset())
                                 .append("，已返回=").append(returnedChars)
-                                .append("，total_chars=").append(line.totalChars())
+                                .append("，total_chars=")
+                                .append(line.totalChars() < 0 ? "unknown" : line.totalChars())
                                 .append("，next_char_offset=")
                                 .append(line.startOffset() + returnedChars).append(']');
                         truncatedLines.add(lineNo + ":" + line.startOffset() + ":"
@@ -1278,9 +1356,14 @@ public class BuiltinTools {
                     }
                     sb.append('\n');
                     written++;
+                    if (line.truncated()) {
+                        responseLimit = returnedCharsTotal >= READ_RESPONSE_CHAR_BUDGET;
+                        break;
+                    }
+                }
                 }
             }
-            boolean partial = from > 1 || hitLimit || lineTruncated;
+            boolean partial = from > 1 || hitLimit || lineTruncated || responseLimit;
             // A line cap is a partial read too. Never authorize whole-file overwrite based on a slice.
             rememberRead(target, partial);
             if (written == 0 && lineNo > 0 && from > lineNo) {
@@ -1295,7 +1378,9 @@ public class BuiltinTools {
                     + " char_limit=" + (charRange ? requestedCharLimit : READ_LINE_CAP)
                     + " lines_returned=" + written
                     + " partial=" + partial
-                    + (hitLimit ? " reason=line_limit" : "")
+                    + (hitLimit ? " reason=line_limit next_line_offset=" + (lineNo + 1) : "")
+                    + (responseLimit ? " reason=response_char_limit"
+                            + (lineTruncated ? "" : " next_line_offset=" + (lineNo + 1)) : "")
                     + (truncatedLines.isEmpty() ? "" : " truncated_lines=" + String.join(",", truncatedLines))
                     + "]\n";
             return metadata + sb;
@@ -1341,20 +1426,33 @@ public class BuiltinTools {
         }
     }
 
-    /** Reads a bounded Unicode-code-point slice of one physical line without retaining the rest. */
-    private static ReadLineSlice readLineSlice(java.io.BufferedReader reader, int charOffset, int cap)
-            throws java.io.IOException {
-        int ch = reader.read();
-        if (ch < 0) {
-            return null;
-        }
-        StringBuilder sb = new StringBuilder();
-        int totalChars = 0;
+    /**
+     * Reads at most {@code cap} Unicode code points from a physical line. It deliberately
+     * stops after one look-ahead character instead of scanning the rest of a huge minified
+     * line just to report its total length.
+     */
+    private static ReadLineSlice readLineSlice(java.io.BufferedReader reader, long baseOffset,
+                                               int sliceOffset, int cap) throws java.io.IOException {
+        reader.mark(4);
+        int first = reader.read();
+        reader.reset();
+        if (first < 0) return null;
+
+        StringBuilder sb = new StringBuilder(Math.min(cap, 4096));
+        long totalChars = Math.max(0, baseOffset);
         int returnedChars = 0;
-        int startOffset = Math.max(0, charOffset);
-        while (ch >= 0 && ch != '\n') {
+        while (true) {
+            int ch = reader.read();
+            if (ch < 0) {
+                return new ReadLineSlice(sb.toString(), sliceOffset, totalChars,
+                        sliceOffset > 0, false);
+            }
+            if (ch == '\n') {
+                return new ReadLineSlice(sb.toString(), sliceOffset, totalChars,
+                        sliceOffset > 0, false);
+            }
             if (ch == '\r') {
-                ch = reader.read();
+                // Preserve the existing read_file normalization: CR is omitted and LF ends a line.
                 continue;
             }
 
@@ -1368,17 +1466,171 @@ public class BuiltinTools {
                     reader.reset();
                 }
             }
-            if (totalChars >= startOffset && returnedChars < cap) {
+            if (totalChars >= sliceOffset && returnedChars < cap) {
                 sb.appendCodePoint(codePoint);
                 returnedChars++;
             }
             totalChars++;
-            ch = reader.read();
+
+            if (returnedChars >= cap && totalChars >= (long) sliceOffset + cap) {
+                reader.mark(4);
+                int lookAhead = reader.read();
+                while (lookAhead == '\r') lookAhead = reader.read();
+                boolean hasMore = lookAhead >= 0 && lookAhead != '\n';
+                reader.reset();
+                if (hasMore) {
+                    return new ReadLineSlice(sb.toString(), sliceOffset, -1,
+                            sliceOffset > 0, true);
+                }
+                // The requested slice ended exactly at line end; consume the delimiter and
+                // return a known line length rather than marking a false truncation.
+            }
         }
-        boolean truncatedBefore = startOffset > 0;
-        boolean truncatedAfter = totalChars > startOffset + returnedChars;
-        return new ReadLineSlice(sb.toString(), startOffset, totalChars,
-                truncatedBefore, truncatedAfter);
+    }
+
+    private static boolean skipPhysicalLine(java.io.BufferedReader reader) throws java.io.IOException {
+        boolean sawAny = false;
+        int ch;
+        while ((ch = reader.read()) >= 0) {
+            sawAny = true;
+            if (ch == '\n') return true;
+        }
+        return sawAny;
+    }
+
+    private ReadFileIndex readFileIndex(Path target) throws java.io.IOException {
+        String key = observationKey(target);
+        ReadFileState state = readFileState(target);
+        synchronized (readFileIndexCache) {
+            ReadFileIndex cached = readFileIndexCache.get(key);
+            if (cached != null && cached.state().equals(state)) return cached;
+            if (cached != null) readFileIndexCache.remove(key);
+        }
+
+        ReadFileIndex built = buildReadFileIndex(target, state);
+        if (!state.equals(readFileState(target))) {
+            throw new java.io.IOException("文件在建立读取索引时发生变化，请重新读取");
+        }
+        synchronized (readFileIndexCache) {
+            readFileIndexCache.put(key, built);
+        }
+        return built;
+    }
+
+    private static ReadFileState readFileState(Path target) throws java.io.IOException {
+        var attributes = Files.readAttributes(target, java.nio.file.attribute.BasicFileAttributes.class);
+        return new ReadFileState(attributes.size(), attributes.lastModifiedTime(), attributes.fileKey());
+    }
+
+    private static ReadFileIndex buildReadFileIndex(Path target, ReadFileState state)
+            throws java.io.IOException {
+        long stride = Math.max(READ_INDEX_TRIGGER_CHARS,
+                (state.size() + (READ_INDEX_MAX_CHECKPOINTS / 2L) - 1)
+                        / (READ_INDEX_MAX_CHECKPOINTS / 2L));
+        long lineStride = Math.max(64, stride);
+        List<ReadCheckpoint> checkpoints = new ArrayList<>();
+        checkpoints.add(new ReadCheckpoint(1, 0, 0));
+        long byteOffset = 0;
+        long lineNo = 1;
+        long lineChars = 0;
+        boolean currentLineHasContent = false;
+        try (var input = new java.io.BufferedInputStream(Files.newInputStream(target), 64 * 1024)) {
+            long[] position = {0};
+            int codePoint;
+            while ((codePoint = readUtf8CodePoint(input, position)) >= 0) {
+                byteOffset = position[0];
+                if (codePoint == '\n') {
+                    lineNo++;
+                    lineChars = 0;
+                    currentLineHasContent = false;
+                    if ((lineNo - 1) % lineStride == 0 && checkpoints.size() < READ_INDEX_MAX_CHECKPOINTS) {
+                        addCheckpoint(checkpoints, new ReadCheckpoint(
+                                Math.toIntExact(lineNo), 0, byteOffset));
+                    }
+                } else if (codePoint != '\r') {
+                    currentLineHasContent = true;
+                    lineChars++;
+                    if (lineChars % stride == 0 && checkpoints.size() < READ_INDEX_MAX_CHECKPOINTS) {
+                        addCheckpoint(checkpoints, new ReadCheckpoint(
+                                Math.toIntExact(lineNo), lineChars, byteOffset));
+                    }
+                }
+            }
+        } catch (ArithmeticException tooManyLines) {
+            throw new java.io.IOException("文件行数超过 read_file 可索引范围", tooManyLines);
+        }
+        // A trailing LF terminates the previous line; it does not create an additional
+        // readable empty line. Remove the sparse checkpoint for that phantom line.
+        if (lineNo > 1 && !currentLineHasContent) {
+            int last = checkpoints.size() - 1;
+            if (last > 0 && checkpoints.get(last).lineNo() == lineNo
+                    && checkpoints.get(last).charOffset() == 0) {
+                checkpoints.remove(last);
+            }
+        }
+        return new ReadFileIndex(state, List.copyOf(checkpoints));
+    }
+
+    private static void addCheckpoint(List<ReadCheckpoint> checkpoints, ReadCheckpoint next) {
+        if (checkpoints.isEmpty() || checkpoints.get(checkpoints.size() - 1).byteOffset() != next.byteOffset()) {
+            checkpoints.add(next);
+        }
+    }
+
+    private static ReadCheckpoint nearestCheckpoint(ReadFileIndex index, int lineNo,
+                                                   long charOffset, boolean charRange) {
+        ReadCheckpoint nearest = index.checkpoints().get(0);
+        for (ReadCheckpoint candidate : index.checkpoints()) {
+            if (candidate.lineNo() > lineNo) break;
+            if (!charRange && candidate.lineNo() == lineNo && candidate.charOffset() > 0) continue;
+            if (charRange && candidate.lineNo() == lineNo && candidate.charOffset() > charOffset) continue;
+            if (candidate.lineNo() > nearest.lineNo()
+                    || (candidate.lineNo() == nearest.lineNo()
+                    && candidate.charOffset() > nearest.charOffset())) {
+                nearest = candidate;
+            }
+        }
+        return nearest;
+    }
+
+    /** Strictly validates UTF-8 while building byte-position checkpoints. */
+    private static int readUtf8CodePoint(java.io.InputStream input, long[] position) throws java.io.IOException {
+        int first = input.read();
+        if (first < 0) return -1;
+        position[0]++;
+        if (first <= 0x7f) return first;
+        if (first >= 0xc2 && first <= 0xdf) {
+            int b2 = readUtf8Continuation(input, position);
+            return ((first & 0x1f) << 6) | (b2 & 0x3f);
+        }
+        if (first >= 0xe0 && first <= 0xef) {
+            int b2 = readUtf8Continuation(input, position);
+            int b3 = readUtf8Continuation(input, position);
+            if ((first == 0xe0 && b2 < 0xa0) || (first == 0xed && b2 >= 0xa0)) {
+                throw new java.nio.charset.MalformedInputException(1);
+            }
+            return ((first & 0x0f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f);
+        }
+        if (first >= 0xf0 && first <= 0xf4) {
+            int b2 = readUtf8Continuation(input, position);
+            int b3 = readUtf8Continuation(input, position);
+            int b4 = readUtf8Continuation(input, position);
+            if ((first == 0xf0 && b2 < 0x90) || (first == 0xf4 && b2 > 0x8f)) {
+                throw new java.nio.charset.MalformedInputException(1);
+            }
+            return ((first & 0x07) << 18) | ((b2 & 0x3f) << 12)
+                    | ((b3 & 0x3f) << 6) | (b4 & 0x3f);
+        }
+        throw new java.nio.charset.MalformedInputException(1);
+    }
+
+    private static int readUtf8Continuation(java.io.InputStream input, long[] position)
+            throws java.io.IOException {
+        int next = input.read();
+        if (next < 0) throw new java.nio.charset.MalformedInputException(1);
+        position[0]++;
+        if ((next & 0xc0) != 0x80) throw new java.nio.charset.MalformedInputException(1);
+        return next;
     }
 
     private String readPackage(String packageName, int maxChars) {

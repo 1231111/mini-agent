@@ -93,7 +93,11 @@ public class CapabilityRegistry implements SmartInitializingSingleton {
             Map.entry("file", merge(FILE_WRITE, FILE_READ, SHELL)),
             Map.entry("deliver", merge(FILE_WRITE, FILE_READ, SHELL)),
             Map.entry("web", merge(WEB, BROWSER)),
-            Map.entry("research", merge(WEB, BROWSER, FILE_READ)),
+            // Research may mean investigating a local codebase (for example, mapping
+            // an existing application before a change). Keep it read-only, but give
+            // the planner the bounded search tools so it does not have to page large
+            // source files with read_file just to locate symbols and call sites.
+            Map.entry("research", merge(WEB, BROWSER, FILE_READ, CODE_SEARCH)),
             Map.entry("browser", BROWSER),
             Map.entry("desktop", DESKTOP),
             Map.entry("image", merge(IMAGE, List.of(WRITE_FILE, "edit_file"))),

@@ -40,10 +40,13 @@ public class PlannerProperties {
     private int proposalMaxIterations = 8;
     /** 本步工具含 browser_* 时的每段轮次上限 */
     private int proposalBrowserMaxIterations = 16;
-    /** 同一节点配额用尽后最多续跑几段（含第一段） */
-    private int proposalMaxChunks = 6;
-    /** 单个 DAG 节点生命周期内可执行的工具调用硬上限，跨 chunk 和用户续跑持久化。 */
-    private int proposalMaxToolCalls = 12;
+    /** 单个节点每段到达模型循环保护后的续跑上限；0 表示由任务 deadline/no-progress 熔断。 */
+    private int proposalMaxChunks = 0;
+    /**
+     * 单个 DAG 节点的可选基础工具预算，跨 chunk 和用户续跑持久化。
+     * 0 表示不按调用次数截断；任务仍受 deadline、租户配额和无进展检测保护。
+     */
+    private int proposalMaxToolCalls = 0;
     /** 同一耗尽节点的预算恢复重规划次数；允许一次短暂的模型/编译失败后由用户继续。 */
     private int maxToolBudgetRecoveryReplansPerNode = 2;
     /** 整个任务跨计划版本的预算恢复重规划总上限，防止不断生成新节点绕过熔断。 */
@@ -117,7 +120,7 @@ public class PlannerProperties {
 
     public int getProposalMaxToolCalls() { return proposalMaxToolCalls; }
     public void setProposalMaxToolCalls(int proposalMaxToolCalls) {
-        this.proposalMaxToolCalls = Math.max(1, Math.min(120, proposalMaxToolCalls));
+        this.proposalMaxToolCalls = Math.max(0, Math.min(120, proposalMaxToolCalls));
     }
 
     public int getMaxToolBudgetRecoveryReplansPerNode() { return maxToolBudgetRecoveryReplansPerNode; }

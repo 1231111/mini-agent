@@ -394,16 +394,16 @@ agent:
     timeout-overrides: {}
   execution:
     deadline-ms: 1800000
-    # 每个被接纳的请求运行最多 120 次工具调用；用户发起新的续跑请求会拿到新租约。
+    # 0 表示不按工具调用次数截断；deadline、取消/租户配额和无进展检测仍生效。
     # DAG 节点跨请求的持久配额单独由 agent.planner.proposal-max-tool-calls 控制。
-    max-tool-calls: 120
+    max-tool-calls: 0
     # 单任务累计 token 的**告警线**，不是终止线。
     # 累计 token = Σ(每轮 input)，随任务时长线性增长；正常长任务与原地打转的死循环
     # 在这条线上长得一样，拿它当终止判据必然误杀长时间任务（旧行为：超过
     # max-estimated-tokens 直接结束，用户看到「任务已耗尽 token 预算」）。
     # 现在越线只写一条 TOKEN_USAGE_WARN 轨迹 + 一条 WARN 日志，任务继续跑完。
-    # 真正拦失控的是下面三道，加上重复工具检测 —— 这四项都与工作量无关：
-    #   deadline-ms（墙钟）、max-tool-calls（工具次数）、max-iterations（轮次）。
+    # 失控由 deadline、租户资源配额、轮次上限和重复无进展检测拦截。
+    # max-tool-calls 默认关闭；只有部署明确设置正数时才作为额外硬配额。
     token-soft-limit: 8000000
     # 直跑循环上限（引擎封顶）。规划器节点上限仍是 planner.proposal-max-iterations。
     max-iterations: 90
@@ -447,12 +447,12 @@ agent:
     proposal-batch-size: 1
     proposal-max-iterations: 8
     proposal-browser-max-iterations: 16
-    # 同一节点配额用尽后接着同一份 messages 再跑，最多这么多段
-    proposal-max-chunks: 6
-    # 单个逻辑节点累计最多执行 12 次工具调用；预算持久化，跨续段及用户继续不重置。
-    # 触顶后明确续跑会进入单独的有限子图恢复，而不会重置原节点或重放已完成动作。
-    proposal-max-tool-calls: 12
-    # 单个触顶节点最多尝试 2 次预算恢复；整个任务跨新计划版本累计最多 3 次。
+    # 每段循环保护后沿同一节点续跑；0 表示不限续跑段数，由 deadline/取消/租户配额/无进展熔断。
+    proposal-max-chunks: 0
+    # 0 表示不因节点工具调用次数截断；deadline、租户配额和重复无进展检测仍生效。
+    # 部署需要硬基础设施配额时可显式设置正数，预算仍会持久化并跨续段生效。
+    proposal-max-tool-calls: 0
+    # 仅在显式启用 proposal-max-tool-calls 正数硬配额时使用的恢复上限。
     max-tool-budget-recovery-replans-per-node: 2
     max-tool-budget-recovery-replans-per-task: 3
     compiler-retry: 1

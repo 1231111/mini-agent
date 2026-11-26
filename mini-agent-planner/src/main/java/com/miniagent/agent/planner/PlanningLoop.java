@@ -562,6 +562,7 @@ public class PlanningLoop {
             }
             compiled = new GoalCompiler.CompileResult(snap.goal(), snap.graph(), snap.degraded(),
                     snap.compilationSource(), "", snap.intent());
+            snap = resetRoundRecoveryBudget(sessionId, snap);
             log.info("PlanningLoop 续跑已有图 session={} version={} nodes={} budgetReplanned={}",
                     sessionId, snap.version(), snap.graph().nodes().size(), budgetReplanned);
 
@@ -1034,11 +1035,19 @@ public class PlanningLoop {
                 }
                 String judgeAnswer = node.doneWhen() != null && node.doneWhen().isJudge()
                         ? step.text() : "";
-                int expectedTodoId = node.doneWhen() != null && node.doneWhen().isJudge()
+                boolean semanticAcceptance = node.doneWhen() != null
+                        && (node.doneWhen().isJudge()
+                            || !node.doneWhen().semanticChecks().isEmpty());
+                int expectedTodoId = semanticAcceptance
                         ? todoProjector.todoIdFor(g, node.id()) : 0;
+                // The persisted todo record is the authority. The conversation
+                // copy of a large submit receipt may have been clamped to the
+                // context budget, so grading must not depend on re-parsing it.
+                String submittedEvidence = expectedTodoId <= 0 ? ""
+                        : todoProjector.submittedEvidence(sessionId, expectedTodoId);
                 NodeOutputBinder.Bound bound = NodeOutputBinder.bind(
                         node, "", step.messages(), judgeAnswer, step.structuredResult(),
-                        predecessorOutputs(g, proposal), expectedTodoId);
+                        predecessorOutputs(g, proposal), expectedTodoId, submittedEvidence);
                 StepEvaluator.EvalResult ev;
                 if (RunStatus.FAILURE.name().equals(step.endReason())) {
                     ev = StepEvaluator.EvalResult.fail("tool execution failed: " + clip(step.text(), 400));
@@ -1436,7 +1445,7 @@ public class PlanningLoop {
 
     /** 轮次用尽就续跑。file_exists 可能只是写了个开头，不能当「做完了」。 */
     static boolean shouldResumeChunk(String endReason, int chunk, int maxChunks) {
-        return chunk < maxChunks
+        return (maxChunks <= 0 || chunk < maxChunks)
                 && isLoopLimit(endReason);
     }
 
@@ -1659,7 +1668,8 @@ public class PlanningLoop {
                             sessionId, proposal.executionId(), proposal.basedOnPlanVersion(), focusTask,
                             properties.getProposalMaxToolCalls());
                     if (reservation.reserved()) return ProposalTurnPolicy.ProgressGuard.BudgetDecision.allowed();
-                    LoopTurnPolicy.StopKind kind = reservation.callsUsed() >= properties.getProposalMaxToolCalls()
+                    LoopTurnPolicy.StopKind kind = properties.getProposalMaxToolCalls() > 0
+                            && reservation.callsUsed() >= properties.getProposalMaxToolCalls()
                             ? LoopTurnPolicy.StopKind.TOOL_BUDGET_EXHAUSTED
                             : LoopTurnPolicy.StopKind.NO_PROGRESS;
                     return ProposalTurnPolicy.ProgressGuard.BudgetDecision.denied(kind, reservation.reason());
@@ -1705,9 +1715,10 @@ public class PlanningLoop {
                 ToolResult lastToolResult = out.lastToolResult();
                 boolean toolAttempted = !out.toolsInvoked().isEmpty() || lastToolResult != null;
                 int chunks = 1;
-                int maxChunks = Math.max(1, properties.getProposalMaxChunks());
+                int maxChunks = properties.getProposalMaxChunks();
                 while (shouldResumeChunk(out.endReason(), chunks, maxChunks)) {
-                    log.info("配额续跑 chunk={}/{} task={}", chunks + 1, maxChunks, focusTask);
+                    log.info("循环保护后续跑 chunk={}/{} task={}", chunks + 1,
+                            maxChunks <= 0 ? "∞" : maxChunks, focusTask);
                     ArrayList<ChatMessage> live = new ArrayList<>(out.messages());
                     live.add(new SystemMessage(MessageConstants.PLANNER_CONTINUE_HINT));
                     out = nodeExecutor.continueNode(chat, live, userMessage,
@@ -2126,8 +2137,39 @@ public class PlanningLoop {
                 "任务恢复未通过校验，已保留执行进度并停止自动重试。请查看执行记录后继续。", reason));
     }
 
-    private RecoveryAttempt applyRecoveryOrCancel(String sessionId, String fencingToken, StateSnapshot snap,
-                                                TaskNode node, FailureDiagnosis dx,
+    /**
+     * A new user request starts a new recovery budget.
+     *
+     * <p>The graph generation ({@code recoveryCount}) keeps increasing so
+     * replanned node ids stay unique, but the hard gate must not inherit the
+     * failures of earlier rounds: once the lifetime counter hit the limit, every
+     * later "continue" started already exhausted and any single failed
+     * acceptance cancelled the node and its whole downstream chain. The lifetime
+     * total is preserved in {@code recoveryCountTotal} for auditing.</p>
+     */
+    private StateSnapshot resetRoundRecoveryBudget(String sessionId, StateSnapshot snap) {
+        int round = RecoveryEngine.counter(
+                snap.execution().get(PlannerStateStore.EXECUTION_ROUND_RECOVERY_COUNT));
+        if (round <= 0) {
+            return snap;
+        }
+        Map<String, Object> exec = new LinkedHashMap<>(snap.execution());
+        int total = RecoveryEngine.counter(
+                exec.get(PlannerStateStore.EXECUTION_RECOVERY_COUNT_TOTAL)) + round;
+        exec.put(PlannerStateStore.EXECUTION_RECOVERY_COUNT_TOTAL, total);
+        exec.put(PlannerStateStore.EXECUTION_ROUND_RECOVERY_COUNT, 0);
+        try {
+            StateSnapshot reset = stateStore.commit(sessionId, snap.version(), snap.withExecution(exec));
+            log.info("新请求重置本轮恢复预算 session={} previousRound={} total={}",
+                    sessionId, round, total);
+            return reset;
+        } catch (PlannerStateStore.VersionConflictException conflict) {
+            metrics.casConflict();
+            return stateStore.get(sessionId).orElse(snap);
+        }
+    }
+
+    private RecoveryAttempt applyRecoveryOrCancel(String sessionId, String fencingToken, StateSnapshot snap,                                                TaskNode node, FailureDiagnosis dx,
                                                 String taskId, ChatModel chat,
                                                 String userMessage, TaskPlan taskPlan,
                                                 List<ChatMessage> history) {
@@ -2140,7 +2182,9 @@ public class PlanningLoop {
             metrics.recovery();
             return llm;
         }
-        boolean atLimit = snap.recoveryCount() >= properties.getMaxRecoveries()
+        boolean atLimit = RecoveryEngine.counter(
+                        snap.execution().get(PlannerStateStore.EXECUTION_ROUND_RECOVERY_COUNT))
+                        >= properties.getMaxRecoveries()
                 || recoveryEngine.classCount(snap, dx.failureClass())
                 >= recoveryEngine.classLimit(dx.failureClass());
         if (recoveryEngine.recover(sessionId, snap, dx).isPresent()) {
@@ -2617,6 +2661,7 @@ public class PlanningLoop {
     private TaskNode exhaustedToolBudgetNode(StateSnapshot snapshot) {
         if (snapshot == null || snapshot.graph() == null) return null;
         int maximum = properties.getProposalMaxToolCalls();
+        if (maximum <= 0) return null;
         for (TaskNode node : snapshot.graph().nodes()) {
             if (node == null || (node.status() != TaskNodeStatus.FAILED
                     && node.status() != TaskNodeStatus.READY

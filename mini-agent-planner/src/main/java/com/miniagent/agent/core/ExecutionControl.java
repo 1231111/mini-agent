@@ -27,8 +27,8 @@ public class ExecutionControl {
      * <p>这里<b>没有</b>「累计 token 耗尽」这一项，是刻意的：累计 token 度量的是
      * 「这个任务花了多少」，它随任务时长线性增长，与「任务是否失控」没有因果关系。
      * 一个正常的 60 轮任务和一次原地打转的死循环在这条线上长得一样，拿它做终止判据
-     * 必然误杀长时间任务。失控由 {@code deadline}（墙钟）、{@code maxToolCalls}（工具次数）、
-     * 循环轮次上限和重复工具检测拦截，这四道与工作量无关。</p>
+     * 必然误杀长时间任务。失控由 {@code deadline}（墙钟）、租户资源配额、循环轮次上限
+     * 和重复工具检测拦截；{@code maxToolCalls} 只在部署显式配置正数时作为额外硬配额。</p>
      *
      * <p>累计 token 仍然统计（{@link #estimatedTokens}），但只用于展示与
      * {@code tokenSoftLimit} 告警 —— 超了只记一条轨迹，不结束任务。</p>
@@ -115,7 +115,11 @@ public class ExecutionControl {
         ExecutionProperties props = properties == null
                 ? new ExecutionProperties() : properties;
         this.deadlineMillis = Math.max(1_000L, props.getDeadlineMs());
-        this.maxToolCalls = Math.max(1, props.getMaxToolCalls());
+        // 0 means no product-level tool-count ceiling. Safety is provided by
+        // the deadline, cancellation/tenant controls and no-progress guards;
+        // a finite value remains available for deployments that explicitly
+        // require a hard infrastructure quota.
+        this.maxToolCalls = Math.max(0, props.getMaxToolCalls());
         this.tokenSoftLimit = Math.max(1_000L, props.getTokenSoftLimit());
         this.signalStore = Objects.requireNonNullElse(signalStore, Optional.empty());
     }
@@ -503,7 +507,9 @@ public class ExecutionControl {
         Lease lease = lease(sessionId);
         StopReason checkpoint = checkpoint(sessionId);
         if (checkpoint != StopReason.NONE) return checkpoint;
-        return lease.toolCalls.incrementAndGet() > lease.maxToolCalls ? StopReason.TOOL_BUDGET_EXCEEDED : StopReason.NONE;
+        int used = lease.toolCalls.incrementAndGet();
+        return lease.maxToolCalls > 0 && used > lease.maxToolCalls
+                ? StopReason.TOOL_BUDGET_EXCEEDED : StopReason.NONE;
     }
 
     /** 可重入的暂停/取消/超时安全边界，不会消耗工具调用预算。 */

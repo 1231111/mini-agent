@@ -1,5 +1,6 @@
 package com.miniagent.agent.planner;
 
+import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.core.NodeExecutor;
 import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.tool.CapabilityRegistry;
@@ -66,6 +67,27 @@ class PlanningLoopResumeRecoveryTest {
     }
 
     @Test
+    void zeroNodeToolBudgetDoesNotTurnToolCountIntoTaskFailure() {
+        String sessionId = "s_node_tool_budget_unlimited";
+        String executionId = "exec_node_tool_budget_unlimited";
+        Goal goal = new Goal("goal", "读取并核验资料", "", "research", Map.of(), List.of(), List.of());
+        TaskNode node = new TaskNode("research", "读取并核验资料", "research", List.of(), List.of(),
+                List.of("facts"), TaskNodeStatus.RUNNING, 90, DoneWhen.note(), "", "", 0, "");
+        PlannerStateStore store = new PlannerStateStore();
+        StateSnapshot snapshot = store.init(sessionId, executionId, goal, new TaskGraph(List.of(node)));
+
+        for (int call = 0; call < 200; call++) {
+            PlannerStateStore.NodeToolCallReservation reservation = store.reserveNodeToolCall(
+                    sessionId, executionId, snapshot.planVersion(), "research", 0);
+            assertThat(reservation.reserved()).isTrue();
+            snapshot = store.get(sessionId).orElseThrow();
+        }
+        assertThat(store.nodeToolCallsUsed(snapshot, "research")).isEqualTo(200);
+        assertThat(store.events(sessionId)).filteredOn(event ->
+                event.type() == DomainEventType.NODE_TOOL_CALL_RESERVED).hasSize(200);
+    }
+
+    @Test
     void explicitContinueGetsOneReplanForCancelledPrerequisiteAfterAutomaticRecoveryBudgetIsExhausted() {
         TaskGraph graph = blockedGraph();
 
@@ -80,6 +102,15 @@ class PlanningLoopResumeRecoveryTest {
                 FailureKind.TOOL_BUDGET_EXHAUSTED, true)).isTrue();
         assertThat(PlanningLoop.replanBudgetAvailable(3, 3, 2, 2,
                 FailureKind.GENERIC, true)).isFalse();
+    }
+
+    @Test
+    void zeroChunkLimitContinuesAfterPerSegmentLoopGuardUntilOtherSafetyStop() {
+        assertThat(PlanningLoop.shouldResumeChunk(AgentLoop.LOOP_MAX_ITERATIONS, 1, 0)).isTrue();
+        assertThat(PlanningLoop.shouldResumeChunk(AgentLoop.LOOP_MAX_ITERATIONS, 50, 0)).isTrue();
+        assertThat(PlanningLoop.shouldResumeChunk(AgentLoop.LOOP_MAX_ITERATIONS, 5, 6)).isTrue();
+        assertThat(PlanningLoop.shouldResumeChunk(AgentLoop.LOOP_MAX_ITERATIONS, 6, 6)).isFalse();
+        assertThat(PlanningLoop.shouldResumeChunk(AgentLoop.NO_PROGRESS, 1, 0)).isFalse();
     }
 
     @Test

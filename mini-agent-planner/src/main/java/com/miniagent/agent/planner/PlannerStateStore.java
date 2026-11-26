@@ -39,6 +39,14 @@ public class PlannerStateStore {
     public static final String EXECUTION_NODE_TOOL_BUDGETS = "nodeToolBudgets";
     public static final String EXECUTION_NODE_TOOL_BUDGET_RECOVERY_ATTEMPTS = "nodeToolBudgetRecoveryAttempts";
     public static final String EXECUTION_TOOL_BUDGET_RECOVERY_ATTEMPTS_TOTAL = "toolBudgetRecoveryAttemptsTotal";
+    /**
+     * Recoveries consumed by the current user request. The budget resets when a
+     * new request resumes the graph; the lifetime total stays in
+     * {@code recoveryCountTotal} for auditing. Using the lifetime counter as the
+     * hard gate made a session permanently unrecoverable after a few rounds.
+     */
+    public static final String EXECUTION_ROUND_RECOVERY_COUNT = "roundRecoveryCount";
+    public static final String EXECUTION_RECOVERY_COUNT_TOTAL = "recoveryCountTotal";
 
     public record NodeToolCallReservation(boolean reserved, int callsUsed, String reason) {
         public NodeToolCallReservation {
@@ -135,7 +143,7 @@ public class PlannerStateStore {
         if (sessionId == null || sessionId.isBlank() || nodeId == null || nodeId.isBlank()) {
             return new NodeToolCallReservation(false, 0, "节点预算缺少任务或节点标识");
         }
-        int limit = Math.max(1, Math.min(120, maximumCalls));
+        int limit = Math.max(0, Math.min(120, maximumCalls));
         String budgetKey = planVersion + ":" + nodeId;
         for (int attempt = 0; attempt < 8; attempt++) {
             StateSnapshot current = get(sessionId).orElse(null);
@@ -154,7 +162,7 @@ public class PlannerStateStore {
             String currentPlanPrefix = planVersion + ":";
             budgets.keySet().removeIf(key -> !key.startsWith(currentPlanPrefix));
             int used = budgets.getOrDefault(budgetKey, 0);
-            if (used >= limit) {
+            if (limit > 0 && used >= limit) {
                 return new NodeToolCallReservation(false, used,
                         "节点「" + node.name() + "」已达到工具调用上限 " + limit
                                 + "；任务已停止以避免继续空转。修正验收目标或用户指令后再重试。");
@@ -191,10 +199,10 @@ public class PlannerStateStore {
             return new NodeToolBudgetRecoveryReservation(false, null, 0, 0,
                     "预算恢复缺少任务或节点标识");
         }
-        int toolLimit = Math.max(1, Math.min(120, maximumToolCalls));
+        int toolLimit = Math.max(0, Math.min(120, maximumToolCalls));
         int nodeRecoveryLimit = Math.max(0, Math.min(4, maximumRecoveryAttemptsPerNode));
         int taskRecoveryLimit = Math.max(0, Math.min(8, maximumRecoveryAttemptsPerTask));
-        if (nodeRecoveryLimit == 0 || taskRecoveryLimit == 0) {
+        if (toolLimit == 0 || nodeRecoveryLimit == 0 || taskRecoveryLimit == 0) {
             return new NodeToolBudgetRecoveryReservation(false, get(sessionId).orElse(null), 0, 0,
                     "预算恢复重规划已禁用");
         }

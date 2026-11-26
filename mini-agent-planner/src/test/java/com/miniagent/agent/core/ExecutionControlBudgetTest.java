@@ -42,4 +42,19 @@ class ExecutionControlBudgetTest {
             control.finish("s_execution_budget", "run-2");
         }
     }
+
+    @Test
+    void zeroRunToolBudgetMeansNoCountBasedTermination() {
+        ExecutionControl control = new ExecutionControl(60_000, 0, 1_000_000);
+        control.start("s_execution_unlimited", null, "run-unlimited");
+        try (TaskExecutionContext.Scope ignored = TaskExecutionContext.bindRun("run-unlimited")) {
+            for (int call = 0; call < 500; call++) {
+                assertThat(control.beforeTool("s_execution_unlimited"))
+                        .as("unlimited tool call %s", call + 1)
+                        .isEqualTo(ExecutionControl.StopReason.NONE);
+            }
+        } finally {
+            control.finish("s_execution_unlimited", "run-unlimited");
+        }
+    }
 }

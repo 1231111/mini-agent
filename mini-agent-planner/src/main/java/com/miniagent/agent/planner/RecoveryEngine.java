@@ -158,8 +158,22 @@ public class RecoveryEngine {
         };
     }
 
-    public int classCount(StateSnapshot snap, FailureClass fc) {
-        if (snap == null || snap.execution() == null) {
+    /** Recovery counters live in the execution map so old snapshots stay readable. */
+    public static int counter(Object value) {
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value == null) {
+            return 0;
+        }
+        try {
+            return Integer.parseInt(String.valueOf(value).trim());
+        } catch (NumberFormatException malformed) {
+            return 0;
+        }
+    }
+
+    public int classCount(StateSnapshot snap, FailureClass fc) {        if (snap == null || snap.execution() == null) {
             return 0;
         }
         Object v = snap.execution().get(RECOVERY_KEY_PREFIX + fc.name());
@@ -193,8 +207,10 @@ public class RecoveryEngine {
             log.info("Recovery 拒绝过期失败诊断 session={} task={}", sessionId, dx.taskId());
             return Optional.empty();
         }
-        if (cur.recoveryCount() >= properties.getMaxRecoveries()) {
-            log.warn("Recovery 总上限 session={} count={}", sessionId, cur.recoveryCount());
+        int roundUsed = counter(cur.execution().get(PlannerStateStore.EXECUTION_ROUND_RECOVERY_COUNT));
+        if (roundUsed >= properties.getMaxRecoveries()) {
+            log.warn("Recovery 本轮上限 session={} round={}/{} total={}",
+                    sessionId, roundUsed, properties.getMaxRecoveries(), cur.recoveryCount());
             return Optional.empty();
         }
         int used = classCount(cur, dx.failureClass());
@@ -252,6 +268,9 @@ public class RecoveryEngine {
 
         Map<String, Object> exec = new HashMap<>(cur.execution());
         exec.put(RECOVERY_KEY_PREFIX + dx.failureClass().name(), used + 1);
+        exec.put(PlannerStateStore.EXECUTION_ROUND_RECOVERY_COUNT, roundUsed + 1);
+        exec.put(PlannerStateStore.EXECUTION_RECOVERY_COUNT_TOTAL,
+                counter(exec.get(PlannerStateStore.EXECUTION_RECOVERY_COUNT_TOTAL)) + 1);
         exec.put("lastFailureKind", dx.kind().name());
 
         // Recovery 可能替换工具、重写节点或修订目标，必须让旧 dispatch fence 失效。

@@ -5,6 +5,7 @@ import com.miniagent.agent.tool.CapabilityRegistry;
 import com.miniagent.agent.todo.AcceptanceEvidenceFiles;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.ToolExecutionResultMessage;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 
 import java.util.LinkedHashMap;
@@ -20,12 +21,15 @@ import java.util.regex.Pattern;
  * 从 todo evidence / 本步工具结果 / file path 抽出契约产出。
  * 不用整轮模型散文当 SUCCESS 证据。
  */
+@Slf4j
 final class NodeOutputBinder {
 
     private static final int MAX_VERIFICATION_EVIDENCE_CHARS = 12_000;
     private static final int MAX_VERIFICATION_RECEIPT_CHARS = 2_000;
     private static final Pattern READ_FILE_RANGE = Pattern.compile(
             "(?i)\\[read_file path=(.*?) line_offset=(\\d+) char_offset=(\\d+)");
+    private static final Pattern EVIDENCE_FIELD = Pattern.compile(
+            "\"evidence\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
 
     // Delivery links are emitted as ordinary ASCII URLs in browser receipts.
     // Stop before adjacent CJK prose/punctuation so the named binding remains
@@ -97,6 +101,20 @@ final class NodeOutputBinder {
     static Bound bind(TaskNode node, String todoEvidence, List<ChatMessage> messages,
                       String judgeAnswer, com.miniagent.agent.tool.ToolResult structuredResult,
                       String predecessorEvidence, int expectedTodoId) {
+        return bind(node, todoEvidence, messages, judgeAnswer, structuredResult,
+                predecessorEvidence, expectedTodoId, "");
+    }
+
+    /**
+     * Resolves node evidence. {@code submittedEvidence} is the accepted
+     * {@code todo.submit} value read back from the todo store, which is the
+     * authoritative record. Conversation messages are a lossy copy: a large
+     * submit receipt is clamped to the context budget, so parsing it back can
+     * fail and silently degrade acceptance to an unrelated tool receipt.
+     */
+    static Bound bind(TaskNode node, String todoEvidence, List<ChatMessage> messages,
+                      String judgeAnswer, com.miniagent.agent.tool.ToolResult structuredResult,
+                      String predecessorEvidence, int expectedTodoId, String submittedEvidence) {
         if (node == null) {
             return new Bound("", Map.of());
         }
@@ -127,6 +145,17 @@ final class NodeOutputBinder {
         String tools = structuredResult == null
                 ? lastUsefulToolText(messages) : usable(structuredResult.legacyText());
         boolean requireSubmittedJudgeEvidence = dw.isJudge();
+        // A semantic acceptance node (judge, validation, or any done_when with
+        // explicit checks) is graded on the evidence this node produced, not on
+        // whichever tool happened to run last. Using the last receipt alone
+        // turns "read package.json" into the whole proof of a research node.
+        boolean semanticAcceptance = requireSubmittedJudgeEvidence
+                || dw.isValidation() || !dw.semanticChecks().isEmpty();
+        if (semanticAcceptance && structuredResult == null) {
+            String history = verificationToolEvidence(messages);
+            if (StringUtils.isNotBlank(history)) tools = history;
+        }
+        String submitted = usable(submittedEvidence);
         if (requireSubmittedJudgeEvidence) {
             // Judge DAG nodes must be grounded in the current node's accepted todo.submit
             // receipt. Missing todo mapping is a failed-closed condition; the final
@@ -134,14 +163,18 @@ final class NodeOutputBinder {
             if (expectedTodoId <= 0) {
                 return new Bound("", Map.of());
             }
-            todo = lastTodoEvidence(messages, expectedTodoId);
+            todo = submitted.isEmpty() ? lastTodoEvidence(messages, expectedTodoId) : submitted;
+        } else if (!submitted.isEmpty()) {
+            // Non-judge semantic checks (done_when with checks) must also see the
+            // evidence the executor actually submitted, not a fallback receipt.
+            todo = submitted;
         }
         if (structuredResult == null && StepEvaluator.looksLikeToolError(tools)) {
             // Do not let an old file path or earlier successful tool hide a failed
             // final action. The evaluator must see the failure before world checks.
             return new Bound(tools, Map.of());
         }
-        if (dw.isJudge() || dw.isValidation() || dw.isCommand()) {
+        if (dw.isCommand()) {
             // A verification spans observations and actions. The final receipt
             // alone (often just todo.update or a reset click) loses that proof.
             String history = verificationToolEvidence(messages);
@@ -238,13 +271,56 @@ final class NodeOutputBinder {
             if (!(message instanceof ToolExecutionResultMessage result)
                     || !CapabilityRegistry.FALLBACK_TOOL.equals(result.toolName())) continue;
             JsonNode root = parseObject(result.text());
-            if (root == null || !root.path("success").asBoolean(false)
+            if (root == null) {
+                // The context budget clamps oversized tool results by characters,
+                // which can cut a large submit receipt into invalid JSON. The
+                // evidence field sits before the truncated tail, so recovering it
+                // is exact rather than a guess. Staying silent here used to make
+                // acceptance fall through to an unrelated last tool receipt.
+                String salvaged = salvageTruncatedSubmit(result.text(), expectedTodoId);
+                if (!salvaged.isEmpty()) {
+                    log.warn("todo 提交回执被上下文裁剪成非法 JSON，已按字段恢复 evidence: chars={}",
+                            salvaged.length());
+                    return salvaged;
+                }
+                continue;
+            }
+            if (!root.path("success").asBoolean(false)
                     || !"submit".equalsIgnoreCase(root.path("action").asText("").trim())
                     || root.path("id").asInt(-1) != expectedTodoId) continue;
             String evidence = usable(root.path("evidence").asText(""));
             if (!evidence.isEmpty()) return evidence;
         }
         return "";
+    }
+
+    /**
+     * Recovers the {@code evidence} value from a submit receipt whose JSON was
+     * cut off by the context clamp. Only the head of the receipt is inspected,
+     * and success/action/id must all still be present, so a receipt for another
+     * todo can never be substituted.
+     */
+    static String salvageTruncatedSubmit(String raw, int expectedTodoId) {
+        if (StringUtils.isBlank(raw) || !raw.startsWith("{")) return "";
+        if (!matchesField(raw, "success", "true")
+                || !matchesField(raw, "action", "submit")
+                || !raw.matches("(?s).*?\"id\"\\s*:\\s*" + expectedTodoId + "\\b.*")) {
+            return "";
+        }
+        Matcher matcher = EVIDENCE_FIELD.matcher(raw);
+        if (!matcher.find()) return "";
+        try {
+            String decoded = PlannerStateJson.MAPPER.readValue(
+                    "\"" + matcher.group(1) + "\"", String.class);
+            return usable(decoded);
+        } catch (Exception truncatedEscape) {
+            return "";
+        }
+    }
+
+    private static boolean matchesField(String raw, String field, String expected) {
+        return Pattern.compile("\"" + field + "\"\\s*:\\s*\"?" + Pattern.quote(expected) + "\"?")
+                .matcher(raw).find();
     }
 
     /** Return the newest failed todo submit/update receipt, if any. */

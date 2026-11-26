@@ -10,7 +10,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 public class ExecutionProperties {
 
     private long deadlineMs = 1_800_000L;
-    private int maxToolCalls = 120;
+    /** 0 = no count-based stop; deployment may opt into a positive hard quota. */
+    private int maxToolCalls = 0;
     /**
      * 单任务累计 token 的<b>告警线</b>（不是终止线）。
      *
@@ -48,7 +49,7 @@ public class ExecutionProperties {
     }
 
     public void setMaxToolCalls(int maxToolCalls) {
-        this.maxToolCalls = maxToolCalls;
+        this.maxToolCalls = Math.max(0, maxToolCalls);
     }
 
     public long getTokenSoftLimit() {

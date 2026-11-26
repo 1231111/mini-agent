@@ -5,6 +5,9 @@
 const sidebarRunningSessions = new Set();
 let sidebarRefreshTimer = null;
 let sidebarRenderEpoch = 0;
+let sidebarRunningRefreshInFlight = false;
+let sidebarRunningRefreshPending = false;
+let sidebarLastFullSweepAt = 0;
 /** 历史对话搜索框的当前关键词（小写）。renderSidebar() 重建 DOM 后要据此重新过滤。 */
 let convSearchQuery = '';
 
@@ -80,12 +83,29 @@ function applyConvFilter() {
     }
 }
 
-async function refreshSidebarRunningSessions() {
+async function refreshSidebarRunningSessions(forceAll = false) {
+    if (sidebarRunningRefreshInFlight) {
+        sidebarRunningRefreshPending = sidebarRunningRefreshPending || forceAll;
+        return;
+    }
     const rows = [...document.querySelectorAll('.sb-item[data-session-id]')];
-    const states = await Promise.all(rows.map(async row => {
+    if (forceAll) sidebarLastFullSweepAt = Date.now();
+    // The history list can contain dozens of sessions. Only the selected session
+    // and sessions already known to be running need live polling. A full sweep is
+    // performed once after rendering the history so an already-running old task is
+    // still discovered; the interval never fans out across the whole history.
+    const candidates = forceAll ? rows : rows.filter(row => {
+        const sid = row.dataset.sessionId;
+        return sid === currentId || sidebarRunningSessions.has(sid)
+            || row.classList.contains('is-running');
+    });
+    if (!candidates.length) return;
+    sidebarRunningRefreshInFlight = true;
+    const states = await Promise.all(candidates.map(async row => {
         const sid = row.dataset.sessionId;
         try {
             const resp = await fetch('/api/conversations/' + encodeURIComponent(sid) + '/task');
+            // A transient 429/5xx must not clear the last known running state.
             if (!resp.ok) return null;
             const status = await apiJson(resp) || {};
             return [sid, status.running === true];
@@ -98,6 +118,12 @@ async function refreshSidebarRunningSessions() {
     });
     rows.forEach(row => updateSidebarRunningIndicator(row));
     syncConversationHeader();
+    sidebarRunningRefreshInFlight = false;
+    if (sidebarRunningRefreshPending) {
+        const pendingAll = sidebarRunningRefreshPending;
+        sidebarRunningRefreshPending = false;
+        refreshSidebarRunningSessions(pendingAll);
+    }
 }
 
 function updateSidebarRunningIndicator(row) {
@@ -191,7 +217,11 @@ async function renderSidebar() {
     applyConvFilter();
     syncConversationHeader();
     if (renderEpoch === sidebarRenderEpoch) {
-        refreshSidebarRunningSessions();
+        // A history render happens after every send and conversation switch. Do
+        // not repeat a full-history sweep each time; it can otherwise consume
+        // the read budget before the selected inspector gets a response.
+        const fullSweep = Date.now() - sidebarLastFullSweepAt >= 60_000;
+        refreshSidebarRunningSessions(fullSweep);
         startSidebarRunningRefresh();
     }
 }

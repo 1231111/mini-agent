@@ -230,12 +230,30 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
     private String rateKey(HttpServletRequest request, boolean backgroundRead) {
         Long uid = jwtSessionService.resolveUserIdAndRefresh(request);
-        String bucket = backgroundRead ? "background-read:" : "request:";
+        String bucket = backgroundRead ? "background-read:" + backgroundReadKind(request) + ":" : "request:";
         if (uid != null) {
             return bucket + "u:" + uid;
         }
         String ip = clientAddress(request);
         return bucket + "ip:" + (ip == null ? "unknown" : ip);
+    }
+
+    /**
+     * Keep the sidebar's per-session liveness sweep from consuming the
+     * inspector's snapshot budget. Both endpoints are cheap reads, but they
+     * have different freshness requirements and are driven by independent UI
+     * streams. A shared bucket made a history with many sessions starve the
+     * currently selected task and leave the right panel on its last snapshot.
+     */
+    private String backgroundReadKind(HttpServletRequest request) {
+        String path = applicationPath(request);
+        if (PATH_MATCHER.match("/api/conversations/*/inspector-snapshot", path)) {
+            return "inspector";
+        }
+        if (PATH_MATCHER.match("/api/conversations/*/task", path)) {
+            return "task";
+        }
+        return "other";
     }
 
     private String clientAddress(HttpServletRequest request) {
