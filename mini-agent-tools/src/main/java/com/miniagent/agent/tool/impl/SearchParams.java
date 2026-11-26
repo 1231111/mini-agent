@@ -12,7 +12,7 @@ import lombok.EqualsAndHashCode;
 @EqualsAndHashCode(callSuper = true)
 public class SearchParams extends ToolParams {
 
-    @ToolParamSchema(description = "正则表达式（ripgrep/Java 正则语法）", required = true)
+    @ToolParamSchema(description = "RE2 正则表达式（最多512字符，不支持回溯引用/前后向断言）", required = true)
     private String pattern;
 
     @ToolParamSchema(description = "搜索目录或文件，默认项目根目录")
@@ -21,7 +21,7 @@ public class SearchParams extends ToolParams {
     @ToolParamSchema(description = "文件名过滤，如 *.java、*.{ts,tsx}")
     private String glob;
 
-    @ToolParamSchema(description = "最大匹配条数，默认100", defaultValue = "100")
+    @ToolParamSchema(description = "最大匹配条数，默认100，允许1到100；返回结果同时受上下文字数预算限制", defaultValue = "100")
     private Integer maxResults;
 
     /**

@@ -4,10 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
-import java.util.Collection;
-import java.util.Locale;
 import java.util.Map;
-import java.util.Objects;
 
 /** 在调用 handler 前执行最小 JSON Schema 校验。 */
 public final class ToolArgumentValidator {
@@ -27,57 +24,14 @@ public final class ToolArgumentValidator {
         } catch (Exception e) {
             return ValidationResult.failure("工具参数不是合法 JSON: " + e.getMessage());
         }
-        if (schema == null || schema.isEmpty()) {
-            return args.isEmpty()
-                    ? ValidationResult.success(args)
-                    : ValidationResult.failure("工具不接受参数: " + args.fieldNames().next());
-        }
-        var fieldNames = args.fieldNames();
-        while (fieldNames.hasNext()) {
-            String fieldName = fieldNames.next();
-            if (!schema.containsKey(fieldName)) {
-                return ValidationResult.failure("未知参数: " + fieldName);
-            }
-        }
-        for (Map.Entry<String, Object> entry : schema.entrySet()) {
-            if (!(entry.getValue() instanceof Map<?, ?> def)) {
-                continue;
-            }
-            JsonNode value = args.get(entry.getKey());
-            if ((value == null || value.isNull()) && Boolean.TRUE.equals(def.get("required"))) {
-                return ValidationResult.failure("缺少必填参数: " + entry.getKey());
-            }
-            if (value == null || value.isNull()) {
-                continue;
-            }
-            String type = Objects.toString(def.get("type"), "string").toLowerCase(Locale.ROOT);
-            if (!matches(type, value)) {
-                return ValidationResult.failure("参数 " + entry.getKey() + " 类型错误，期望 " + type);
-            }
-            if (value.isArray() && def.get("items") instanceof Map<?, ?> items) {
-                String itemType = Objects.toString(items.get("type"), "string");
-                for (JsonNode item : value) {
-                    if (item == null || item.isNull() || !matches(itemType, item))
-                        return ValidationResult.failure("参数 " + entry.getKey() + " 的数组元素类型错误，期望 " + itemType);
-                }
-            }
-            if (def.get("enum") instanceof Collection<?> allowed
-                    && allowed.stream().noneMatch(v -> Objects.equals(String.valueOf(v), value.asText()))) {
-                return ValidationResult.failure("参数 " + entry.getKey() + " 不在允许值中: " + allowed);
-            }
-        }
-        return ValidationResult.success(args);
-    }
-
-    private static boolean matches(String type, JsonNode value) {
-        return switch (type) {
-            case "integer" -> value.isIntegralNumber();
-            case "number" -> value.isNumber();
-            case "boolean" -> value.isBoolean();
-            case "object" -> value.isObject();
-            case "array" -> value.isArray();
-            default -> value.isTextual();
-        };
+        // Flat built-in parameter maps and complete MCP root schemas must share
+        // exactly one executable contract.  Keeping a second recursive validator
+        // here caused nested objects, refs, enums and additionalProperties to
+        // diverge between discovery and dispatch.  ToolSchemaContract wraps a
+        // legacy flat map into the same object schema before validating it.
+        String schemaFailure = ToolSchemaContract.validate(schema, args);
+        return schemaFailure == null ? ValidationResult.success(args)
+                : ValidationResult.failure(schemaFailure);
     }
 
     public record ValidationResult(boolean valid, ObjectNode arguments, ToolResult error) {

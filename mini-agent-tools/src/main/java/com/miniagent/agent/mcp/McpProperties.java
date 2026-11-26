@@ -91,7 +91,7 @@ public class McpProperties {
         public void setMaxFrameBytes(int maxFrameBytes) { this.maxFrameBytes = maxFrameBytes; }
         public int getRequestTimeoutSeconds() { return requestTimeoutSeconds; }
         public void setRequestTimeoutSeconds(int requestTimeoutSeconds) {
-            this.requestTimeoutSeconds = requestTimeoutSeconds;
+            this.requestTimeoutSeconds = Math.max(1, Math.min(600, requestTimeoutSeconds));
         }
     }
 }

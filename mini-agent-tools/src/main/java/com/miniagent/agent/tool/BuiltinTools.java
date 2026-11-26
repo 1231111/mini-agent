@@ -7,6 +7,7 @@ import com.miniagent.agent.browser.BrowserService;
 import com.miniagent.agent.browser.BrowserSessionIdentity;
 import com.miniagent.agent.browser.BrowserUploadFiles;
 import com.miniagent.common.context.OwnerContext;
+import com.miniagent.common.io.AtomicFiles;
 import com.miniagent.agent.skill.SkillStore;
 import com.miniagent.agent.song.LyriaMusicService;
 import com.miniagent.agent.song.MiniMaxMusicService;
@@ -25,11 +26,12 @@ import jakarta.annotation.PostConstruct;
 
 import java.io.File;
 import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -102,8 +104,14 @@ public class BuiltinTools {
      * Key = "toolName|argumentsJson"，Value = 上次执行结果。
      * 在每次新用户消息处理开始时由 AgentChatApplicationService 调用 clearToolCache() 清空。
      */
-    private final ConcurrentHashMap<String, String> toolResultCache =
-            new ConcurrentHashMap<>();
+    private static final int MAX_TOOL_RESULT_CACHE_ENTRIES = 256;
+    private final Map<String, String> toolResultCache = Collections.synchronizedMap(
+            new LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+                    return size() > MAX_TOOL_RESULT_CACHE_ENTRIES;
+                }
+            });
 
     /**
      * 读观察账本：本次用户消息内「模型看过哪个文件的哪个版本」。
@@ -150,7 +158,9 @@ public class BuiltinTools {
 
     /** 清空工具结果缓存（每条新用户消息开始时调用） */
     public void clearToolCache() {
-        toolResultCache.clear();
+        synchronized (toolResultCache) {
+            toolResultCache.clear();
+        }
         // 读观察随缓存一起作废：新用户消息开始时，上一轮看到的文件版本不再可信。
         readObservations.clear();
     }
@@ -162,16 +172,49 @@ public class BuiltinTools {
      */
     private void invalidateReadCache(String path) {
         if (StringUtils.isBlank(path)) {
-            toolResultCache.clear();
+            synchronized (toolResultCache) {
+                toolResultCache.clear();
+            }
             return;
         }
         String norm = path.replace('\\', '/').trim();
         // 文件名（最后一段）作为兜底匹配，覆盖相对/绝对路径的不同写法
         String fileName = norm.contains("/") ? norm.substring(norm.lastIndexOf('/') + 1) : norm;
-        toolResultCache.keySet().removeIf(k -> {
-            String kn = k.replace('\\', '/');
-            return kn.contains(norm) || (!StringUtils.isBlank(fileName) && kn.contains(fileName));
-        });
+        synchronized (toolResultCache) {
+            toolResultCache.keySet().removeIf(k -> {
+                String kn = k.replace('\\', '/');
+                return kn.contains(norm) || (!StringUtils.isBlank(fileName) && kn.contains(fileName));
+            });
+        }
+    }
+
+    /** Cache entries are scoped to the effective workspace, user, and logical conversation. */
+    private String toolCacheKey(String toolName, String arguments) {
+        Path root = effectiveWorkspaceRoot().toAbsolutePath().normalize();
+        try {
+            root = root.toRealPath();
+        } catch (Exception ignored) {
+            // The workspace may not exist yet; its normalized absolute path is still a stable scope key.
+        }
+        String session = WorkspaceContext.getOperationRootSession();
+        if (StringUtils.isBlank(session)) session = WorkspaceContext.getSessionOverride();
+        Long userId = OwnerContext.currentUserId();
+        return toolName + "|root=" + root + "|tenant=" + OwnerContext.effectiveTenantId() + "|user=" + Objects.toString(userId, "")
+                + "|session=" + Objects.toString(session, "") + "|" + Objects.requireNonNullElse(arguments, "");
+    }
+
+    private String readObservationKey(Path target) {
+        return toolCacheKey("observation", observationKey(target));
+    }
+
+    /** Starting one conversation must not invalidate another conversation's active read/overwrite receipts. */
+    public void clearToolCache(String sessionId) {
+        if (StringUtils.isBlank(sessionId)) return;
+        String marker = "|session=" + sessionId + "|";
+        synchronized (toolResultCache) {
+            toolResultCache.keySet().removeIf(key -> key.contains(marker));
+        }
+        readObservations.keySet().removeIf(key -> key.contains(marker));
     }
 
     // ==================== 读观察账本 ====================
@@ -215,12 +258,12 @@ public class BuiltinTools {
         // Partial reads can never authorize an overwrite, so hashing the whole file here
         // only adds an O(file-size) pass to every page of a large-file read.
         if (partial) {
-            readObservations.put(observationKey(target), new ReadObservation("", true));
+            readObservations.put(readObservationKey(target), new ReadObservation("", true));
             return;
         }
         String digest = digestOf(target);
         if (!digest.isEmpty()) {
-            readObservations.put(observationKey(target), new ReadObservation(digest, false));
+            readObservations.put(readObservationKey(target), new ReadObservation(digest, false));
         }
     }
 
@@ -235,7 +278,7 @@ public class BuiltinTools {
         if (digest.isEmpty()) {
             return;
         }
-        readObservations.put(observationKey(target), new ReadObservation(digest, false));
+        readObservations.put(readObservationKey(target), new ReadObservation(digest, false));
     }
 
     /**
@@ -247,7 +290,7 @@ public class BuiltinTools {
         if (force) {
             return null;
         }
-        ReadObservation observed = readObservations.get(observationKey(target));
+        ReadObservation observed = readObservations.get(readObservationKey(target));
         if (observed == null) {
             return errorJson(ToolErrorCode.CONFLICT,
                     "拒绝覆盖未读取过的文件 " + path + "（该文件已存在）。"
@@ -346,8 +389,23 @@ public class BuiltinTools {
                 ToolParams.generateSchema(ReadFileParams.class),
                 arguments -> {
                     ReadFileParams params = ToolParams.fromJson(arguments, ReadFileParams.class);
-                    String cacheKey = "read_file|" + params.toJson();
-                    String cached = toolResultCache.get(cacheKey);
+                    final String cacheKey;
+                    try {
+                        Path target = resolveReadPath(params.getPath());
+                        var state = readFileState(target);
+                        cacheKey = toolCacheKey("read_file", observationKey(target) + "|" + state + "|" + params.toJson());
+                    } catch (SecurityException denied) {
+                        return ToolResult.failure(ToolErrorCode.PERMISSION_DENIED, denied.getMessage(), false);
+                    } catch (java.nio.file.NoSuchFileException missing) {
+                        return ToolResult.failure(ToolErrorCode.NOT_FOUND, "文件不存在: " + params.getPath(), false);
+                    } catch (Exception invalid) {
+                        return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT,
+                                "无法读取文件元数据: " + invalid.getMessage(), false);
+                    }
+                    String cached;
+                    synchronized (toolResultCache) {
+                        cached = toolResultCache.get(cacheKey);
+                    }
                     if (Objects.nonNull(cached)) {
                         log.debug("read_file 缓存命中: {}", cacheKey);
                         return ToolResult.success(cached);
@@ -361,7 +419,11 @@ public class BuiltinTools {
                     // just because the document itself contains JSON fields like "error".
                     ToolResult classified = result.isEmpty() || result.startsWith("[read_file path=")
                             ? ToolResult.success(result) : ToolResult.fromLegacy(result);
-                    if (classified.isSuccess()) toolResultCache.put(cacheKey, result);
+                    if (classified.isSuccess()) {
+                        synchronized (toolResultCache) {
+                            toolResultCache.put(cacheKey, result);
+                        }
+                    }
                     return classified;
                 });
 
@@ -406,9 +468,15 @@ public class BuiltinTools {
                             params.isIncludeMetadataOrDefault(), params.getLimitOrDefault());
                 });
 
-        registry.register("read_package", "按Java包名读取包下所有源码文件。传包名如 com.miniagent.agent.task，自动解析路径并返回全部代码。分析项目架构时优先用这个，不要逐个 read_file。",
-                ReadPackageParams.class,
-                params -> readPackage(params.getPackageName(), params.getMaxCharsPerFileOrDefault()));
+        registry.registerStructured("read_package",
+                "按严格 Java 包名读取项目根或直接子模块 src/main/java 中的源码。"
+                        + "每次最多读取 24 个文件、每文件 4000 字符、总响应 12000 字符；"
+                        + "结果会标记 partial 和截断计数，超出时请按具体文件使用 read_file。",
+                ToolParams.generateSchema(ReadPackageParams.class),
+                arguments -> {
+                    ReadPackageParams params = ToolParams.fromJson(arguments, ReadPackageParams.class);
+                    return readPackage(params.getPackageName(), params.getMaxCharsPerFileOrDefault());
+                });
 
         registry.register("undo_last_file_change",
                 "仅当用户明确要求撤销/回滚最近一次智能体文件修改时使用。按会话和用户隔离；若文件在智能体写入后被外部修改，会拒绝覆盖。仅能撤销 write_file/edit_file 最近一次成功操作。",
@@ -449,19 +517,32 @@ public class BuiltinTools {
     // ==================== 代码检索 + 精确编辑（Cursor 风格） ====================
 
     private void registerSearchAndEditTools() {
-        // search_code：ripgrep 优先，Java 正则兜底。定位代码/符号的首选，取代逐个 read_file 盲找。
+        // One bounded linear-time regex search; use search hits instead of blind file pagination.
         registry.register("search_code",
                 "在代码/文本文件中按正则搜索内容，返回 文件:行号:匹配行。定位函数、类、符号、关键字时优先用这个，不要逐个 read_file 盲找。" +
-                "path 默认项目根目录；glob 可限定文件类型如 *.java。",
+                "path 默认项目根目录；glob 可限定文件类型如 *.java。使用 RE2 正则，不支持回溯引用和前后向断言。"
+                        + "扫描受文件数/字节/单行/时间上限保护，partial=true 时必须缩小路径或 glob，不能把部分扫描当作无匹配。",
                 SearchParams.class,
                 params -> {
                     if (StringUtils.isBlank(params.getPattern())) {
-                        return "{\"error\":\"pattern 不能为空\"}";
+                        return errorJson(ToolErrorCode.INVALID_ARGUMENT, "pattern 不能为空");
+                    }
+                    if (params.getPattern().length() > MAX_SEARCH_PATTERN_CHARS) {
+                        return errorJson(ToolErrorCode.INVALID_ARGUMENT,
+                                "pattern 超过 " + MAX_SEARCH_PATTERN_CHARS + " 字符上限");
+                    }
+                    if (params.getGlob() != null && params.getGlob().length() > 128) {
+                        return errorJson(ToolErrorCode.INVALID_ARGUMENT, "glob 超过 128 字符上限");
+                    }
+                    int maxResults = params.getMaxResultsOrDefault();
+                    if (maxResults < 1 || maxResults > MAX_SEARCH_RESULTS) {
+                        return errorJson(ToolErrorCode.INVALID_ARGUMENT,
+                                "maxResults 必须在 1 到 " + MAX_SEARCH_RESULTS + " 之间");
                     }
                     return searchCode(params.getPattern(), 
                                     params.getPath(), 
                                     params.getGlob(), 
-                                    params.getMaxResultsOrDefault());
+                                    maxResults);
                 });
 
         // edit_file：锚点替换，改已有文件只传 diff，不重发整文件。
@@ -476,139 +557,22 @@ public class BuiltinTools {
                                  params.isReplaceAllOrDefault()));
     }
 
-    /** search_code 实现：优先 ripgrep，失败回退 Java 正则扫描。 */
+    private static final int MAX_SEARCH_PATTERN_CHARS = 512;
+    private static final int MAX_SEARCH_RESULTS = 100;
+
+    /** One linear-time engine keeps regex, glob, path security and budget semantics identical on every host. */
     private String searchCode(String pattern, String path, String glob, int maxResults) {
-        Path root = (StringUtils.isBlank(path))
-                ? Path.of(System.getProperty("user.dir")).toAbsolutePath()
-                : resolveSearchPath(path);
-        if (!Files.exists(root)) {
-            return errorJson(ToolErrorCode.NOT_FOUND, "路径不存在: " + path);
-        }
-
-        String rg = ripgrepPath();
-        if (Objects.nonNull(rg)) {
-            String r = searchViaRipgrep(rg, pattern, root, glob, maxResults);
-            if (Objects.nonNull(r)) return r;  // null 表示 rg 执行异常，回退
-        }
-        return searchViaJava(pattern, root, glob, maxResults);
-    }
-
-    /** 探测 ripgrep 是否可用，返回可执行路径或 null。结果缓存避免每次 where 调用。 */
-    private static volatile String cachedRgPath;   // null=未探测; ""=不可用; 其它=路径
-    private String ripgrepPath() {
-        if (Objects.nonNull(cachedRgPath)) {
-            return cachedRgPath.isEmpty() ? null : cachedRgPath;
-        }
-        synchronized (BuiltinTools.class) {
-            if (Objects.nonNull(cachedRgPath)) {
-                return cachedRgPath.isEmpty() ? null : cachedRgPath;
-            }
-            try {
-                boolean win = System.getProperty("os.name", "").toLowerCase().contains("win");
-                ProcessBuilder pb = win ? new ProcessBuilder("where", "rg")
-                                        : new ProcessBuilder("which", "rg");
-                pb.redirectErrorStream(true);
-                Process proc = pb.start();
-                String out = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
-                boolean ok = proc.waitFor(5, java.util.concurrent.TimeUnit.SECONDS) && proc.exitValue() == 0;
-                cachedRgPath = (ok && !StringUtils.isBlank(out)) ? out.lines().findFirst().orElse("rg").trim() : "";
-            } catch (Exception e) {
-                cachedRgPath = "";
-            }
-            return cachedRgPath.isEmpty() ? null : cachedRgPath;
-        }
-    }
-
-    private String searchViaRipgrep(String rg, String pattern, Path root, String glob, int maxResults) {
         try {
-            List<String> cmd = new ArrayList<>(List.of(
-                    rg, "--line-number", "--no-heading", "--color", "never",
-                    "--max-count", String.valueOf(Math.max(1, maxResults))));
-            if (StringUtils.isNotBlank(glob)) { cmd.add("--glob"); cmd.add(glob); }
-            cmd.add(pattern);
-            cmd.add(root.toString());
-            ProcessBuilder pb = new ProcessBuilder(cmd);
-            pb.redirectErrorStream(true);
-            Process proc = pb.start();
-            String out = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            boolean finished = proc.waitFor(30, java.util.concurrent.TimeUnit.SECONDS);
-            if (!finished) { proc.destroyForcibly(); return "{\"error\":\"搜索超时（30s）\"}"; }
-            // rg 退出码：0=有匹配 1=无匹配 2=出错。出错则回退 Java 实现
-            if (proc.exitValue() == 2) {
-                return null;
-            }
-            return formatSearchOutput(out, root, maxResults, "ripgrep");
-        } catch (Exception e) {
-            return null; // 回退 Java 实现
+            Path root = StringUtils.isBlank(path)
+                    ? requireAllowed(Path.of(System.getProperty("user.dir")).toAbsolutePath(), "search")
+                    : resolveSearchPath(path);
+            if (!Files.exists(root)) return errorJson(ToolErrorCode.NOT_FOUND, "路径不存在: " + path);
+            return BoundedCodeSearch.search(pattern, root, glob, maxResults, Duration.ofSeconds(25));
+        } catch (SecurityException denied) {
+            return errorJson(ToolErrorCode.PERMISSION_DENIED, denied.getMessage());
+        } catch (java.nio.file.InvalidPathException invalid) {
+            return errorJson(ToolErrorCode.INVALID_ARGUMENT, "搜索路径无效: " + invalid.getMessage());
         }
-    }
-
-    private String searchViaJava(String pattern, Path root, String glob, int maxResults) {
-        java.util.regex.Pattern re;
-        try {
-            re = java.util.regex.Pattern.compile(pattern);
-        } catch (Exception e) {
-            return "{\"error\":\"正则非法: " + e.getMessage() + "\"}";
-        }
-        java.util.regex.Pattern globRe = globToRegex(glob);
-        StringBuilder sb = new StringBuilder();
-        int[] count = {0};
-        try (var stream = Files.walk(root)) {
-            var it = stream.filter(Files::isRegularFile)
-                    .filter(f -> !isBinaryOrIgnored(f))
-                    .filter(f -> Objects.isNull(globRe) || globRe.matcher(f.getFileName().toString()).matches())
-                    .iterator();
-            while (it.hasNext() && count[0] < maxResults) {
-                Path f = it.next();
-                List<String> lines;
-                try { lines = Files.readAllLines(f, StandardCharsets.UTF_8); }
-                catch (Exception e) { continue; } // 跳过非 UTF-8/不可读
-                for (int i = 0; i < lines.size() && count[0] < maxResults; i++) {
-                    if (re.matcher(lines.get(i)).find()) {
-                        sb.append(root.relativize(f).toString().replace('\\', '/'))
-                          .append(':').append(i + 1).append(':')
-                          .append(truncate(lines.get(i).strip(), 300)).append('\n');
-                        count[0]++;
-                    }
-                }
-            }
-        } catch (Exception e) {
-            return "{\"error\":\"搜索失败: " + e.getMessage() + "\"}";
-        }
-        if (count[0] == 0) {
-            return "（无匹配）pattern=" + pattern;
-        }
-        return "匹配 " + count[0] + " 处（Java 正则扫描" + (count[0] >= maxResults ? "，已达上限" : "") + "）:\n" + sb;
-    }
-
-    private String formatSearchOutput(String raw, Path root, int maxResults, String engine) {
-        if (StringUtils.isBlank(raw)) {
-            return "（无匹配）";
-        }
-        String[] lines = raw.split("\n");
-        StringBuilder sb = new StringBuilder();
-        int n = 0;
-        for (String line : lines) {
-            if (StringUtils.isBlank(line)) {
-                continue;
-            }
-            if (n >= maxResults) {
-                break;
-            }
-            // rg 输出绝对路径，转相对路径更紧凑
-            String rel = line;
-            String absRoot = root.toString().replace('\\', '/');
-            String norm = line.replace('\\', '/');
-            if (norm.startsWith(absRoot)) {
-                rel = norm.substring(absRoot.length()).replaceFirst("^/", "");
-            }
-            sb.append(truncate(rel, 300)).append('\n');
-            n++;
-        }
-        if (n == 0) {
-            return "（无匹配）";
-        }
-        return "匹配 " + n + " 处（" + engine + (n >= maxResults ? "，已达上限" : "") + "）:\n" + sb;
     }
 
     /** edit_file 实现：校验唯一匹配后替换。 */
@@ -629,7 +593,22 @@ public class BuiltinTools {
             if (!Files.exists(target)) {
                 return errorJson(ToolErrorCode.NOT_FOUND, "文件不存在: " + path + "（新建文件用 write_file）");
             }
-            String content = Files.readString(target, StandardCharsets.UTF_8);
+            byte[] beforeBytes;
+            try {
+                beforeBytes = readBoundedFile(target, MAX_EDIT_FILE_BYTES, "edit_file");
+            } catch (java.nio.file.FileSystemException tooLargeOrChanged) {
+                return errorJson(ToolErrorCode.CONFLICT, tooLargeOrChanged.getMessage());
+            }
+            String content;
+            try {
+                content = StandardCharsets.UTF_8.newDecoder()
+                        .onMalformedInput(CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(CodingErrorAction.REPORT)
+                        .decode(java.nio.ByteBuffer.wrap(beforeBytes)).toString();
+            } catch (CharacterCodingException invalidUtf8) {
+                return errorJson(ToolErrorCode.INVALID_ARGUMENT,
+                        "edit_file 仅支持有效 UTF-8 文本；请使用对应的二进制/文档工具处理该文件");
+            }
 
             int occurrences = countOccurrences(content, oldStr);
             if (occurrences == 0) {
@@ -650,13 +629,14 @@ public class BuiltinTools {
             if (updated.getBytes(StandardCharsets.UTF_8).length > 8L * 1024 * 1024)
                 return errorJson(ToolErrorCode.CONFLICT, "编辑结果超过安全回滚快照上限 8 MiB");
             if (fileChangeLedger != null && undoSnapshot != null) {
-                String conflict = fileChangeLedger.verifyUnchanged(undoSnapshot, content.getBytes(StandardCharsets.UTF_8));
+                String conflict = fileChangeLedger.verifyUnchanged(undoSnapshot, beforeBytes);
                 if (conflict != null) return errorJson(ToolErrorCode.CONFLICT, conflict);
             }
 
-            Files.writeString(target, updated, StandardCharsets.UTF_8);
+            byte[] updatedBytes = updated.getBytes(StandardCharsets.UTF_8);
+            AtomicFiles.write(target, out -> out.write(updatedBytes));
             if (fileChangeLedger != null && undoSnapshot != null) {
-                fileChangeLedger.record(undoSnapshot, updated.getBytes(StandardCharsets.UTF_8));
+                fileChangeLedger.record(undoSnapshot, updatedBytes);
                 undoRecorded = true;
             }
             invalidateReadCache(path);
@@ -677,7 +657,9 @@ public class BuiltinTools {
         if (fileChangeLedger == null) return "{\"error\":\"文件回滚能力当前不可用\"}";
         String result = fileChangeLedger.undoLast();
         if (result.contains("\"success\":true")) {
-            toolResultCache.clear();
+            synchronized (toolResultCache) {
+                toolResultCache.clear();
+            }
             readObservations.clear();
         }
         return result;
@@ -687,6 +669,39 @@ public class BuiltinTools {
         int n = 0, idx = 0;
         while ((idx = haystack.indexOf(needle, idx)) != -1) { n++; idx += needle.length(); }
         return n;
+    }
+
+    private static final long MAX_EDIT_FILE_BYTES = 8L * 1024 * 1024;
+
+    /** Reads at most maxBytes+1 to enforce the edit budget even if the file grows after stat. */
+    private static byte[] readBoundedFile(Path file, long maxBytes, String operation) throws java.io.IOException {
+        var before = Files.readAttributes(file, java.nio.file.attribute.BasicFileAttributes.class,
+                java.nio.file.LinkOption.NOFOLLOW_LINKS);
+        if (before.isSymbolicLink() || !before.isRegularFile()) {
+            throw new java.nio.file.FileSystemException(file.toString(), null,
+                    operation + " 仅支持普通文件，且不跟随符号链接");
+        }
+        if (before.size() > maxBytes) {
+            throw new java.nio.file.FileSystemException(file.toString(), null,
+                    operation + " 拒绝读取超过 " + maxBytes + " 字节的文件；请用更窄的 edit_file 锚点或专用大文件处理流程");
+        }
+        byte[] bytes;
+        try (var input = Files.newInputStream(file)) {
+            bytes = input.readNBytes(Math.toIntExact(maxBytes + 1));
+        }
+        if (bytes.length > maxBytes) {
+            throw new java.nio.file.FileSystemException(file.toString(), null,
+                    operation + " 文件在读取期间超过 " + maxBytes + " 字节上限，已拒绝继续处理");
+        }
+        var after = Files.readAttributes(file, java.nio.file.attribute.BasicFileAttributes.class,
+                java.nio.file.LinkOption.NOFOLLOW_LINKS);
+        if (after.isSymbolicLink() || before.size() != after.size()
+                || !before.lastModifiedTime().equals(after.lastModifiedTime())
+                || !Objects.equals(before.fileKey(), after.fileKey())) {
+            throw new java.nio.file.FileSystemException(file.toString(), null,
+                    operation + " 文件在读取期间发生变化，请重新读取后重试");
+        }
+        return bytes;
     }
 
     /**
@@ -1689,69 +1704,249 @@ public class BuiltinTools {
         return next;
     }
 
-    private String readPackage(String packageName, int maxChars) {
-        try {
-            // 包名转路径：com.miniagent.agent.tool → src/main/java/com/miniagent/agent/tool
+    private static final int READ_PACKAGE_MAX_FILES = 24;
+    private static final int READ_PACKAGE_MAX_FILE_CHARS = 4_000;
+    private static final int READ_PACKAGE_MAX_RESPONSE_CHARS = 12_000;
+    private static final int READ_PACKAGE_METADATA_RESERVE = 900;
+    private static final int READ_PACKAGE_MAX_DIRECTORY_ENTRIES = 2_048;
+    private static final int READ_PACKAGE_MAX_MODULE_ENTRIES = 1_024;
+    private static final Set<String> JAVA_KEYWORDS = Set.of(
+            "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
+            "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
+            "finally", "float", "for", "goto", "if", "implements", "import", "instanceof", "int",
+            "interface", "long", "native", "new", "package", "private", "protected", "public",
+            "return", "short", "static", "strictfp", "super", "switch", "synchronized", "this",
+            "throw", "throws", "transient", "try", "void", "volatile", "while", "true", "false",
+            "null", "_");
 
-            String relativePath = packageName.replace('.', File.separatorChar);
-            // 从项目根目录查找 src/main/java 下的包路径
-            Path projectRoot = Path.of(System.getProperty("user.dir")).toAbsolutePath();
-            Path pkgDir = projectRoot.resolve("src").resolve("main").resolve("java").resolve(relativePath);
+    private record PackageSource(Path directory, String rootKind) {}
+    private record PackagePrefix(String text, boolean truncated) {}
 
-            // 如果当前目录找不到，向上一级查找（适配多模块项目）
-            if (!Files.isDirectory(pkgDir)) {
-                Path alt = projectRoot.resolve("mini-agent-app").resolve("src").resolve("main")
-                        .resolve("java").resolve(relativePath);
-                if (Files.isDirectory(alt)) {
-                    pkgDir = alt;
-                }
-            }
-            if (!Files.isDirectory(pkgDir)) {
-                // 尝试直接在项目根目录下搜索
-                try (var stream = Files.walk(projectRoot, 6)) {
-                    Optional<Path> found = stream
-                            .filter(Files::isDirectory)
-                            .filter(p -> p.endsWith(relativePath.replace('/', File.separatorChar)))
-                            .findFirst();
-                    if (found.isPresent()) {
-                        pkgDir = found.get();
-                    }
-                }
-            }
-
-            if (!Files.isDirectory(pkgDir)) {
-                return errorJson(ToolErrorCode.NOT_FOUND, "包不存在: " + packageName + "（已尝试解析为 " + pkgDir + "）");
-            }
-
-            List<Path> files = Files.walk(pkgDir, 1)
-                    .filter(Files::isRegularFile)
-                    .filter(p -> p.toString().endsWith(".java"))
-                    .sorted()
-                    .toList();
-
-            if (files.isEmpty()) {
-                return "{\"files\":0,\"package\":\"" + packageName + "\"}";
-            }
-
-            StringBuilder sb = new StringBuilder();
-            sb.append("包 ").append(packageName).append(" 共 ").append(files.size()).append(" 个文件:\n\n");
-            for (Path f : files) {
-                String fileName = f.getFileName().toString();
-                try {
-                    String fileContent = Files.readString(f, StandardCharsets.UTF_8);
-                    if (fileContent.length() > maxChars) {
-                        fileContent = fileContent.substring(0, maxChars) + "\n... (截断，共 " + fileContent.length() + " 字符)";
-                    }
-                    sb.append("=== ").append(fileName).append(" ===\n");
-                    sb.append(fileContent).append("\n\n");
-                } catch (Exception e) {
-                    sb.append("=== ").append(fileName).append(" === (读取失败: ").append(e.getMessage()).append(")\n\n");
-                }
-            }
-            return sb.toString();
-        } catch (Exception e) {
-            return "{\"error\":\"读取包失败: " + e.getMessage() + "\"}";
+    private ToolResult readPackage(String packageName, int requestedMaxCharsPerFile) {
+        if (!validJavaPackageName(packageName)) {
+            return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT,
+                    "packageName 必须是合法的点分隔 Java 包名，例如 com.example.service；不接受路径、绝对路径或 ..", false);
         }
+        if (requestedMaxCharsPerFile < 1) {
+            return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT,
+                    "maxCharsPerFile 必须大于 0", false);
+        }
+
+        int perFileLimit = Math.min(requestedMaxCharsPerFile, READ_PACKAGE_MAX_FILE_CHARS);
+        try {
+            String userDir = System.getProperty("user.dir");
+            if (StringUtils.isBlank(userDir)) {
+                return ToolResult.failure(ToolErrorCode.NOT_FOUND, "项目根目录未配置，无法定位 Java 源码", false);
+            }
+            Path projectRoot = Path.of(userDir).toAbsolutePath().normalize();
+            if (!Files.isDirectory(projectRoot)) {
+                return ToolResult.failure(ToolErrorCode.NOT_FOUND, "项目根目录不存在", false);
+            }
+
+            List<PackageSource> matches = locatePackageSources(projectRoot, packageName);
+            if (matches.isEmpty()) {
+                return ToolResult.failure(ToolErrorCode.NOT_FOUND,
+                        "未在项目根或直接子模块的 src/main/java 中找到包: " + packageName, false);
+            }
+            if (matches.size() > 1) {
+                return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT,
+                        "包名在多个常规源码根中重复，无法安全选择: " + packageName, false);
+            }
+
+            PackageSource source = matches.get(0);
+            List<Path> files = new ArrayList<>();
+            boolean partial = false;
+            int scannedEntries = 0;
+            try (var entries = Files.newDirectoryStream(source.directory())) {
+                for (Path entry : entries) {
+                    if (++scannedEntries > READ_PACKAGE_MAX_DIRECTORY_ENTRIES) {
+                        partial = true;
+                        break;
+                    }
+                    if (Files.isSymbolicLink(entry)
+                            || !Files.isRegularFile(entry, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                            || !entry.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".java")) {
+                        continue;
+                    }
+                    try {
+                        PathGuard.assertAllowed(entry, "read_package");
+                    } catch (SecurityException sensitiveOrDenied) {
+                        // Do not turn package listing into a route around the global
+                        // credential deny rule. Other safe source files can still be read.
+                        partial = true;
+                        continue;
+                    }
+                    files.add(entry);
+                    if (files.size() > READ_PACKAGE_MAX_FILES) {
+                        partial = true;
+                    }
+                }
+            }
+            files.sort(Comparator.comparing(path -> path.getFileName().toString(), String.CASE_INSENSITIVE_ORDER));
+            if (files.size() > READ_PACKAGE_MAX_FILES) {
+                files = new ArrayList<>(files.subList(0, READ_PACKAGE_MAX_FILES));
+            }
+
+            int bodyBudget = READ_PACKAGE_MAX_RESPONSE_CHARS - READ_PACKAGE_METADATA_RESERVE;
+            StringBuilder body = new StringBuilder(Math.min(bodyBudget, 4096));
+            int filesReturned = 0;
+            int truncatedFiles = 0;
+            for (Path file : files) {
+                String fileName = safePackageFileName(file.getFileName().toString());
+                String heading = "=== " + fileName + " ===\n";
+                int available = bodyBudget - body.length();
+                if (available <= heading.length() + 1) {
+                    partial = true;
+                    break;
+                }
+                body.append(heading);
+                available = bodyBudget - body.length();
+                int fileLimit = Math.min(perFileLimit, Math.max(0, available - 1));
+                if (fileLimit <= 0) {
+                    body.setLength(body.length() - heading.length());
+                    partial = true;
+                    break;
+                }
+                PackagePrefix prefix;
+                try {
+                    prefix = readUtf8Prefix(file, fileLimit);
+                } catch (java.nio.charset.CharacterCodingException malformedUtf8) {
+                    return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT,
+                            "Java 源文件不是有效 UTF-8，已停止读取包内容", false);
+                }
+                body.append(prefix.text()).append('\n');
+                filesReturned++;
+                if (prefix.truncated()) {
+                    truncatedFiles++;
+                    partial = true;
+                }
+                if (body.length() >= bodyBudget) {
+                    partial = true;
+                    break;
+                }
+            }
+
+            String metadata = "[read_package package=" + packageName
+                    + " root=" + source.rootKind()
+                    + " files_returned=" + filesReturned
+                    + " truncated_files=" + truncatedFiles
+                    + " partial=" + partial + "]\n";
+            String result = metadata + body;
+            if (result.length() > READ_PACKAGE_MAX_RESPONSE_CHARS) {
+                // Metadata is deliberately reserved, but keep a final invariant in case
+                // package/source names grow or the format changes later.
+                int budget = Math.max(0, READ_PACKAGE_MAX_RESPONSE_CHARS - metadata.length());
+                result = metadata + body.substring(0, Math.min(body.length(), budget));
+            }
+            return ToolResult.success(result);
+        } catch (SecurityException denied) {
+            return ToolResult.failure(ToolErrorCode.PERMISSION_DENIED,
+                    Objects.requireNonNullElse(denied.getMessage(), "源码包访问被拒绝"), false);
+        } catch (java.nio.file.InvalidPathException invalid) {
+            return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT, "Java 包名无效", false);
+        } catch (java.nio.file.AccessDeniedException denied) {
+            return ToolResult.failure(ToolErrorCode.PERMISSION_DENIED, "无权读取该 Java 包源码", false);
+        } catch (java.io.IOException failure) {
+            return ToolResult.failure(ToolErrorCode.EXECUTION_FAILED,
+                    "读取 Java 包失败: " + Objects.requireNonNullElse(failure.getMessage(), "I/O error"), false);
+        }
+    }
+
+    private static List<PackageSource> locatePackageSources(Path projectRoot, String packageName)
+            throws java.io.IOException {
+        List<PackageSource> sources = new ArrayList<>();
+        Path projectSourceRoot = projectRoot.resolve("src").resolve("main").resolve("java");
+        addPackageSource(sources, projectSourceRoot, "project", packageName);
+
+        int inspected = 0;
+        int moduleCount = 0;
+        try (var children = Files.list(projectRoot)) {
+            var iterator = children.iterator();
+            while (iterator.hasNext()) {
+                Path child = iterator.next();
+                if (++inspected > READ_PACKAGE_MAX_MODULE_ENTRIES) {
+                    throw new java.io.IOException("项目根直接子项超过 read_package 的发现上限");
+                }
+                if (Files.isSymbolicLink(child)
+                        || !Files.isDirectory(child, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                    continue;
+                }
+                Path moduleSourceRoot = child.resolve("src").resolve("main").resolve("java");
+                if (Files.isDirectory(moduleSourceRoot, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                        && !Files.isSymbolicLink(moduleSourceRoot)) {
+                    if (++moduleCount > READ_PACKAGE_MAX_FILES) {
+                        throw new java.io.IOException("项目直接子模块源码根超过 read_package 的发现上限");
+                    }
+                    addPackageSource(sources, moduleSourceRoot, "module:" + safePackageFileName(
+                            child.getFileName().toString()), packageName);
+                }
+            }
+        }
+        sources.sort(Comparator.comparing(PackageSource::rootKind, String.CASE_INSENSITIVE_ORDER));
+        return sources;
+    }
+
+    private static void addPackageSource(List<PackageSource> matches, Path sourceRoot,
+                                         String rootKind, String packageName) throws java.io.IOException {
+        if (!Files.isDirectory(sourceRoot, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                || Files.isSymbolicLink(sourceRoot)) {
+            return;
+        }
+        Path candidate = sourceRoot;
+        for (String segment : packageName.split("\\.")) candidate = candidate.resolve(segment);
+        if (!Files.isDirectory(candidate)) return;
+        Path realSourceRoot = sourceRoot.toRealPath();
+        Path realCandidate = candidate.toRealPath();
+        if (!realCandidate.startsWith(realSourceRoot)) {
+            throw new SecurityException("包路径通过符号链接越出常规 Java 源码根，已拒绝读取");
+        }
+        PathGuard.assertAllowed(realSourceRoot, "read_package source root");
+        PathGuard.assertAllowed(realCandidate, "read_package");
+        matches.add(new PackageSource(realCandidate, rootKind));
+    }
+
+    private static boolean validJavaPackageName(String packageName) {
+        if (packageName == null || packageName.isBlank() || packageName.length() > 512) return false;
+        String[] segments = packageName.split("\\.", -1);
+        for (String segment : segments) {
+            if (segment.isEmpty() || JAVA_KEYWORDS.contains(segment)) return false;
+            int offset = 0;
+            int first = segment.codePointAt(offset);
+            if (!Character.isJavaIdentifierStart(first)) return false;
+            offset += Character.charCount(first);
+            while (offset < segment.length()) {
+                int codePoint = segment.codePointAt(offset);
+                if (!Character.isJavaIdentifierPart(codePoint)) return false;
+                offset += Character.charCount(codePoint);
+            }
+        }
+        return true;
+    }
+
+    private static PackagePrefix readUtf8Prefix(Path file, int maxChars) throws java.io.IOException {
+        StringBuilder prefix = new StringBuilder(Math.min(maxChars, 4096));
+        boolean truncated;
+        try (var reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+            char[] chunk = new char[Math.min(1024, Math.max(1, maxChars + 1))];
+            while (prefix.length() <= maxChars) {
+                int remaining = maxChars + 1 - prefix.length();
+                int read = reader.read(chunk, 0, Math.min(chunk.length, remaining));
+                if (read < 0) break;
+                prefix.append(chunk, 0, read);
+            }
+            truncated = prefix.length() > maxChars;
+        }
+        if (truncated) prefix.setLength(maxChars);
+        if (prefix.length() > 0 && Character.isHighSurrogate(prefix.charAt(prefix.length() - 1))) {
+            prefix.setLength(prefix.length() - 1);
+            truncated = true;
+        }
+        return new PackagePrefix(prefix.toString(), truncated);
+    }
+
+    private static String safePackageFileName(String value) {
+        if (value == null) return "source.java";
+        return value.replace('\r', '_').replace('\n', '_').replace('\t', '_');
     }
 
     private static final int KEEP_LARGE_FILE_MIN_BYTES = 10_000;
@@ -1784,12 +1979,12 @@ public class BuiltinTools {
             Files.createDirectories(target.getParent());
             // 保留受保护的媒体 URL；不再把旧路径改写成匿名静态资源。
             String finalContent = content;
+            byte[] incomingBytes = finalContent.getBytes(StandardCharsets.UTF_8);
             undoSnapshot = fileChangeLedger == null ? null : fileChangeLedger.capture(target);
             if (undoSnapshot != null && !undoSnapshot.accepted())
                 return errorJson(ToolErrorCode.CONFLICT, undoSnapshot.error());
             long currentBytes = Files.exists(target) ? Files.size(target) : 0L;
-            long resultingBytes = append ? currentBytes + finalContent.getBytes(StandardCharsets.UTF_8).length
-                    : finalContent.getBytes(StandardCharsets.UTF_8).length;
+            long resultingBytes = append ? currentBytes + incomingBytes.length : incomingBytes.length;
             if (resultingBytes > 8L * 1024 * 1024)
                 return errorJson(ToolErrorCode.CONFLICT, "文件结果超过安全回滚快照上限 8 MiB");
             if (fileChangeLedger != null && undoSnapshot != null) {
@@ -1798,9 +1993,11 @@ public class BuiltinTools {
             }
 
             if (append) {
-                Files.writeString(target, finalContent, StandardCharsets.UTF_8,
-                        java.nio.file.StandardOpenOption.CREATE,
-                        java.nio.file.StandardOpenOption.APPEND);
+                byte[] before = Files.exists(target) ? readBoundedFile(target, MAX_EDIT_FILE_BYTES, "write_file append") : new byte[0];
+                AtomicFiles.write(target, output -> {
+                    output.write(before);
+                    output.write(incomingBytes);
+                });
             } else if (Files.exists(target)) {
                 // 先过一致性闸门：覆盖一个「没读过」或「读过之后又被改过」的文件，
                 // 会把别人的改动静默回滚掉。append 不需要（它不丢内容）。
@@ -1816,9 +2013,9 @@ public class BuiltinTools {
                                     + "（现有 " + existing + " 字节，本次 " + incoming
                                     + "）。请改写其他文件名，或用 mode=append。");
                 }
-                Files.writeString(target, finalContent, StandardCharsets.UTF_8);
+                AtomicFiles.write(target, output -> output.write(incomingBytes));
             } else {
-                Files.writeString(target, finalContent, StandardCharsets.UTF_8);
+                AtomicFiles.write(target, output -> output.write(incomingBytes));
             }
             if (fileChangeLedger != null && undoSnapshot != null) {
                 byte[] incoming = finalContent.getBytes(StandardCharsets.UTF_8);
@@ -2248,7 +2445,7 @@ public class BuiltinTools {
         // 是否允许执行由 AgentLoop 会话授权闸门决定；此处只做命令安全检查。
         String command = Objects.isNull(params) ? null : params.getCommand();
         if (StringUtils.isBlank(command)) {
-            return "{\"error\":\"command 不能为空\"}";
+            return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT, "command 不能为空", false).legacyText();
         }
         int timeoutSeconds = params.requestedTimeoutSeconds();
         log.info("执行命令（timeout={}s, 描述={}）: {}", timeoutSeconds,
@@ -2260,38 +2457,41 @@ public class BuiltinTools {
         for (String bad : DANGEROUS_COMMANDS) {
             if (lc.contains(bad.toLowerCase())) {
                 log.warn("安全拦截 - 黑名单命中: {}", redactSensitive(command));
-                return errorJson(ToolErrorCode.PERMISSION_DENIED, "命令被安全策略拒绝：该命令包含危险操作。");
+                return ToolResult.failure(ToolErrorCode.PERMISSION_DENIED, "命令被安全策略拒绝：该命令包含危险操作。", false).legacyText();
             }
         }
 
         // 第2层：正则模式匹配（防止编码绕过）
         if (DANGEROUS_PATTERN.matcher(command).find()) {
             log.warn("安全拦截 - 危险模式命中: {}", redactSensitive(command));
-            return errorJson(ToolErrorCode.PERMISSION_DENIED, "命令被安全策略拒绝：检测到危险操作模式。");
+            return ToolResult.failure(ToolErrorCode.PERMISSION_DENIED, "命令被安全策略拒绝：检测到危险操作模式。", false).legacyText();
         }
 
         // 第3层：命令注入防护（检测链式命令）
         if (containsCommandInjection(command)) {
             log.warn("安全拦截 - 命令注入检测: {}", redactSensitive(command));
-            return errorJson(ToolErrorCode.PERMISSION_DENIED, "命令被安全策略拒绝：检测到可能的命令注入。");
+            return ToolResult.failure(ToolErrorCode.PERMISSION_DENIED, "命令被安全策略拒绝：检测到可能的命令注入。", false).legacyText();
         }
 
         // 第3.5层：常驻/前台服务器命令拦截。这类命令永不退出，前台跑会把工具线程挂死，
         // 且智能体也无法与服务器交互。直接拒绝并引导正确做法。
         if (LONG_RUNNING_SERVER_PATTERN.matcher(command).find()) {
             log.warn("安全拦截 - 常驻服务器命令: {}", redactSensitive(command));
-            return "{\"error\":\"该命令会启动一个常驻服务器（永不退出），不能在前台执行——会一直阻塞。\","
-                    + "\"hint\":\"不需要起服务器来'验证'前端产物：HTML/JS 文件写好后直接交付给用户，由用户在浏览器打开即可。"
-                    + "若确实要本地预览，请让用户自己执行启动命令，不要由你在工具里前台运行。\"}";
+            return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT,
+                    "该命令会启动常驻服务器，不能在前台执行；请使用支持后台进程生命周期管理的执行方式。", false).legacyText();
         }
 
+        Process process = null;
+        Thread drainer = null;
+        Set<ProcessHandle> descendants = new LinkedHashSet<>();
         try {
+            if (Thread.currentThread().isInterrupted()) throw new InterruptedException("命令启动前已取消");
             boolean isWindows = System.getProperty("os.name", "").toLowerCase().contains("win");
             final java.nio.charset.Charset cs;
             try {
                 cs = ProcessOutputEncoding.resolve(params.getOutputEncoding(), command, isWindows);
             } catch (IllegalArgumentException unsupportedEncoding) {
-                return errorJson(ToolErrorCode.INVALID_ARGUMENT, unsupportedEncoding.getMessage());
+                return ToolResult.failure(ToolErrorCode.INVALID_ARGUMENT, unsupportedEncoding.getMessage(), false).legacyText();
             }
             ProcessBuilder pb = isWindows
                     ? new ProcessBuilder("cmd.exe", "/c", command)
@@ -2312,7 +2512,8 @@ public class BuiltinTools {
             pb.environment().put("PYTHONIOENCODING", "UTF-8");
             log.info("命令子进程环境已收敛: 丢弃 {} 个继承变量（需要放行用 agent.tools.env-passthrough）", dropped);
             pb.redirectErrorStream(true);
-            Process proc = pb.start();
+            final Process proc = pb.start();
+            process = proc;
 
             // 关键修复：异步读流 + 主线程限时等待。
             // 旧实现先 readAllBytes() 再 waitFor()，而 readAllBytes() 会阻塞到进程关闭 stdout
@@ -2328,45 +2529,67 @@ public class BuiltinTools {
             // 否则子进程会因管道写满而阻塞），但不再累积；超过 MAX_HARD_CAPTURE 直接判为
             // 失控输出并强杀。
             final BoundedOutputCapture capture = new BoundedOutputCapture(
-                    MAX_EXEC_CAPTURE_BYTES, MAX_EXEC_HARD_CAPTURE_BYTES);
-            Thread drainer = new Thread(() -> {
+                    MAX_EXEC_CAPTURE_BYTES, MAX_EXEC_HARD_CAPTURE_BYTES, () -> killProcessTree(proc));
+            final java.util.concurrent.atomic.AtomicReference<Exception> drainFailure = new java.util.concurrent.atomic.AtomicReference<>();
+            drainer = new Thread(() -> {
                 try (var in = proc.getInputStream()) {
                     byte[] chunk = new byte[8192];
                     int n;
                     while ((n = in.read(chunk)) != -1) {
                         capture.write(chunk, n);
                     }
-                } catch (Exception ignored) {
-                    // 进程被强杀时读流会抛异常，属预期，忽略
+                } catch (Exception failedRead) {
+                    drainFailure.compareAndSet(null, failedRead);
                 }
             }, "exec-cmd-drainer");
             drainer.setDaemon(true);
             drainer.start();
 
-            boolean finished = proc.waitFor(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS);
+            long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(timeoutSeconds);
+            boolean finished = false;
+            do {
+                proc.descendants().forEach(descendants::add);
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) break;
+                finished = proc.waitFor(Math.min(remaining, java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(100)),
+                        java.util.concurrent.TimeUnit.NANOSECONDS);
+            } while (!finished);
             if (!finished) {
                 killProcessTree(proc);
                 proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
-                drainer.interrupt();
+                drainer.join(1000);
                 String partial = capture.asString(cs);
                 String persisted = persistLongOutput(command, partial);
                 String shown = truncateTail(partial, MAX_TIMEOUT_PARTIAL_CHARS);
-                return "{\"error\":\"命令执行超时（" + timeoutSeconds + "s），已强制终止整棵进程树，未产生后续副作用。"
-                        + "若是启动服务器/常驻进程，请改为交付文件由用户自行运行；"
-                        + "若是构建/测试类慢命令，请调大 timeout 参数（上限 "
-                        + ExecCommandParams.MAX_TIMEOUT_SECONDS + "）。\","
-                        + "\"exit_code\":-1,"
-                        + (persisted.isEmpty() ? "" : "\"partial_output_path\":" + jsonString(persisted) + ",")
-                        + "\"partial_output\":" + jsonString(shown) + "}";
+                ObjectNode timeout = RESULT_JSON.createObjectNode();
+                timeout.put("success", false);
+                timeout.put("status", "timeout");
+                timeout.put("errorCode", ToolErrorCode.TIMEOUT.name());
+                timeout.put("retriable", false);
+                timeout.put("error", "命令执行超时（" + timeoutSeconds + "s），已请求终止进程树。命令可能已产生文件或外部状态变更，请检查现状后再决定是否重试。"
+                        + "构建或测试可按需调整 timeout（上限 " + ExecCommandParams.MAX_TIMEOUT_SECONDS + " 秒）。");
+                timeout.put("exit_code", -1);
+                timeout.put("partial_output", shown);
+                if (!persisted.isEmpty()) timeout.put("partial_output_path", persisted);
+                return timeout.toString();
             }
-            // 输出失控（超过硬上限）时同样强杀整棵树：这种进程几乎必然是 `yes` 之类的刷屏命令，
-            // 让它跑完只会把磁盘/内存/管道拖满。
+            drainer.join(2000);
+            // The output drainer terminates the process immediately on overflow, independently of waitFor.
             if (capture.overflowed()) {
                 killProcessTree(proc);
-                log.warn("命令输出超过硬上限 {} 字节，已强杀整棵进程树: {}",
-                        MAX_EXEC_HARD_CAPTURE_BYTES, redactSensitive(truncate(command, 120)));
+                return ToolResult.failure(ToolErrorCode.EXECUTION_FAILED,
+                        "命令输出超过硬上限 " + MAX_EXEC_HARD_CAPTURE_BYTES
+                                + " 字节，已请求终止进程树；命令可能已产生副作用，请检查现状并缩小输出范围。", false).legacyText();
             }
-            drainer.join(2000); // 等读流线程把剩余输出读完
+            if (drainer.isAlive()) {
+                return ToolResult.failure(ToolErrorCode.OUTCOME_UNKNOWN,
+                        "命令已退出，但输出管道仍被子进程占用，无法确认完整执行结果；已请求清理进程树，请检查现状后再决定是否重试。", false).legacyText();
+            }
+            if (drainFailure.get() != null) {
+                return ToolResult.failure(ToolErrorCode.EXECUTION_FAILED,
+                        "命令输出读取失败: " + drainFailure.get().getMessage()
+                                + "；命令可能已产生副作用，请检查现状后再决定是否重试。", false).legacyText();
+            }
             int exitCode;
             try {
                 exitCode = proc.exitValue();
@@ -2382,9 +2605,51 @@ public class BuiltinTools {
                         + " 字节，只保留了前 " + MAX_EXEC_CAPTURE_BYTES + " 字节（共 "
                         + capture.totalBytes() + " 字节）。请缩小命令的输出范围（如 grep/head）。";
             }
+            if (CommandSemantics.isFailure(command, exitCode)) {
+                ObjectNode failed = RESULT_JSON.createObjectNode();
+                failed.put("success", false);
+                failed.put("status", "failed");
+                failed.put("errorCode", ToolErrorCode.EXECUTION_FAILED.name());
+                failed.put("retriable", false);
+                failed.put("exit_code", exitCode);
+                failed.put("error", "命令退出码为 " + exitCode + "；请检查输出和已产生的状态变更后决定下一步。");
+                failed.put("output", formatted);
+                return failed.toString();
+            }
             return formatted;
+        } catch (InterruptedException cancelled) {
+            Thread.currentThread().interrupt();
+            return ToolResult.failure(ToolErrorCode.CANCELLED,
+                    process == null ? "命令启动前已取消，未启动子进程。"
+                            : "命令执行已取消，已请求终止进程树；命令可能已产生文件或外部状态变更，请检查现状后再决定是否重试。",
+                    false).legacyText();
         } catch (Exception e) {
-            return "{\"error\":\"命令执行失败: " + e.getMessage() + "\"}";
+            return ToolResult.failure(ToolErrorCode.EXECUTION_FAILED,
+                    "命令执行失败: " + e.getMessage() + (process == null ? "；未启动子进程。"
+                            : "；已请求终止进程树，命令可能已产生副作用，请检查现状后再决定是否重试。"), false).legacyText();
+        } finally {
+            // A cancelled future must not leave its shell, descendants or output reader running.
+            // Clear interruption only while awaiting bounded cleanup, then restore the caller's signal.
+            boolean interrupted = Thread.interrupted();
+            if (process != null) {
+                try { process.descendants().forEach(descendants::add); } catch (Exception ignored) { }
+                List<ProcessHandle> handles = new ArrayList<>(descendants);
+                Collections.reverse(handles);
+                for (ProcessHandle handle : handles) {
+                    try { if (handle.isAlive()) handle.destroyForcibly(); } catch (Exception ignored) { }
+                }
+                killProcessTree(process);
+                try { process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS); }
+                catch (InterruptedException again) { interrupted = true; }
+                try { process.getOutputStream().close(); } catch (Exception ignored) { }
+                try { process.getInputStream().close(); } catch (Exception ignored) { }
+                try { process.getErrorStream().close(); } catch (Exception ignored) { }
+            }
+            if (drainer != null && drainer.isAlive()) {
+                drainer.interrupt();
+                try { drainer.join(1000); } catch (InterruptedException again) { interrupted = true; }
+            }
+            if (interrupted) Thread.currentThread().interrupt();
         }
     }
 

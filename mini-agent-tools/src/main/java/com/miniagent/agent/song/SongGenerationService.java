@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.impl.SongGenerateParams;
+import com.miniagent.agent.security.GuardedHttpClient;
+import com.miniagent.agent.security.GuardedMediaDownloader;
 import com.miniagent.config.storage.MediaStorage;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
@@ -65,6 +67,7 @@ public class SongGenerationService {
     private static final long POLL_INTERVAL_MS = 5_000L;
     /** 写进错误信息里的响应体上限，避免把整页 HTML 灌进模型上下文。 */
     private static final int BODY_SNIPPET_CHARS = 300;
+    private static final int MAX_AUDIO_BYTES = 32 * 1024 * 1024;
 
     /**
      * SenseAudio Music 2.0 唯一可用模型（官方 enum）。
@@ -79,6 +82,8 @@ public class SongGenerationService {
 
     @Autowired
     private MediaStorage mediaStorage;
+    @Autowired
+    private GuardedMediaDownloader mediaDownloader;
 
     @Value("${song.gen.senseaudio-key:${SENSEAUDIO_API_KEY:}}")
     private String apiKey;
@@ -284,10 +289,8 @@ public class SongGenerationService {
     /**
      * 拿到 {@code audio_url} 后下载并落盘。
      *
-     * <p>落盘失败时的降级是有意为之的：{@code audio_url} 是能直接播的 https 地址，
-     * 前端对 https 是放行的。宁可给用户一个会过期的远端链接，也不要让他什么都没有；
-     * 但<b>缺少 owner 上下文必须显性失败</b> —— {@code MediaStorage} 的设计就是拒绝无 owner 写入，
-     * 这里不能悄悄换目录把问题藏起来。
+     * <p>必须经过有界下载和格式校验后落盘。下载/落盘失败显式报错，未经验证的远端链接
+     * 不能作为成功交付；缺少 owner 上下文也必须显性失败。
      */
     private String deliverSong(String taskId, JsonNode body) {
         JsonNode song = firstElement(body.path("response").path("data"));
@@ -297,10 +300,16 @@ public class SongGenerationService {
                     "audio_url 为空；taskId=" + taskId + "，原始响应 " + snippet(body));
         }
 
-        byte[] audio = download(audioUrl);
+        byte[] audio;
+        try {
+            audio = download(audioUrl);
+        } catch (GuardedHttpClient.NetworkRejectedException rejected) {
+            return errorJson(ToolErrorCode.PERMISSION_DENIED, "音频服务返回的下载地址违反网络安全策略",
+                    "已拒绝访问 localhost、私有网络或重定向到私有网络的地址；taskId=" + taskId);
+        }
         if (audio == null || audio.length == 0) {
-            log.warn("生歌音频下载失败，回退远端链接: task={} url={}", taskId, audioUrl);
-            return "![生成的歌曲](" + audioUrl + ")";
+            return errorJson(ToolErrorCode.EXECUTION_FAILED, "音频下载或格式校验失败",
+                    "taskId=" + taskId + "；未将未经验证的远端音频链接作为成功交付");
         }
 
         String filename = "song_" + System.currentTimeMillis() + "_"
@@ -312,26 +321,34 @@ public class SongGenerationService {
             return errorJson(ToolErrorCode.INTERNAL_ERROR, "无法落盘：缺少登录用户上下文",
                     noOwner.getMessage());
         } catch (Exception e) {
-            log.warn("生歌落盘失败，回退远端链接: {}", e.getMessage());
-            return "![生成的歌曲](" + audioUrl + ")";
+            return errorJson(ToolErrorCode.EXECUTION_FAILED, "音频落盘失败", e.getMessage());
         }
 
         log.info("生歌已落盘: {}（{} 字节, task={}）", url, audio.length, taskId);
         return "![生成的歌曲](" + url + ")";
     }
 
-    private byte[] download(String url) {
+    private byte[] download(String url) throws GuardedHttpClient.NetworkRejectedException {
         try {
-            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
-                    .timeout(Duration.ofSeconds(DOWNLOAD_TIMEOUT_SECONDS))
-                    .GET()
-                    .build();
-            HttpResponse<byte[]> response = HTTP.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            GuardedMediaDownloader.Download response = mediaDownloader.download(
+                    url, Duration.ofSeconds(DOWNLOAD_TIMEOUT_SECONDS), MAX_AUDIO_BYTES);
             if (response.statusCode() != 200) {
                 log.warn("下载音频返回 {}", response.statusCode());
                 return null;
             }
-            return response.body();
+            String mime = response.contentType().split(";", 2)[0].trim().toLowerCase(Locale.ROOT);
+            if (!mime.isEmpty() && !mime.startsWith("audio/")
+                    && !"application/octet-stream".equals(mime)) {
+                log.warn("音频下载返回非音频 MIME {}", mime);
+                return null;
+            }
+            byte[] bytes = response.body();
+            return GuardedMediaDownloader.isRecognizedAudio(bytes) ? bytes : null;
+        } catch (GuardedHttpClient.NetworkRejectedException rejected) {
+            throw rejected;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return null;
         } catch (Exception e) {
             log.warn("下载音频失败: {}", e.getMessage());
             return null;

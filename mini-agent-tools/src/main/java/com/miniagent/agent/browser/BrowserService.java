@@ -45,13 +45,10 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.Objects;
@@ -722,22 +719,71 @@ public class BrowserService {
     private final Map<String, Observation> observations = new LinkedHashMap<>();
     private final ReentrantLock pageLock = new ReentrantLock();
     private final ObjectMapper resultJson = new ObjectMapper();
-    private volatile Thread actorThread;
     private long observationSequence;
-    // Playwright Java objects must always be used from the thread that created them.
-    private final ThreadPoolExecutor actor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
-            new ArrayBlockingQueue<>(64), work -> {
-                Thread thread = new Thread(() -> {
-                    actorThread = Thread.currentThread();
-                    work.run();
-                }, "miniagent-browser");
-                thread.setDaemon(true);
-                // Tool workers may originate in ForkJoinPool.commonPool(), whose
-                // context loader cannot see Spring Boot's nested dependencies.
-                // Playwright uses the context loader to locate driver/platform.
-                thread.setContextClassLoader(BrowserService.class.getClassLoader());
-                return thread;
-            }, new ThreadPoolExecutor.AbortPolicy());
+    /** Each worker owns its own Playwright instance, browser, maps, lock, and actor thread. */
+    private final boolean isolatedWorker;
+    private final Map<String, BrowserService> sessionWorkers = new LinkedHashMap<>();
+    private final AtomicBoolean shuttingDown = new AtomicBoolean();
+    private volatile OwnedBrowserProcess ownedBrowserProcess;
+    private final BoundedBrowserActor actor = new BoundedBrowserActor("miniagent-browser", 8,
+            this::terminateOwnedBrowserProcess, this::shutdownOnActor);
+    private record OwnedBrowserProcess(ProcessHandle handle, java.time.Instant startedAt) { }
+
+    public BrowserService() { this(false); }
+    BrowserService(boolean isolatedWorker) { this.isolatedWorker = isolatedWorker; }
+
+    @Value("${agent.browser.actor-operation-timeout-ms:30000}")
+    private long actorOperationTimeoutMillis = 30_000;
+    @Value("${agent.browser.max-active-sessions:8}")
+    private int maxActiveSessions = 8;
+
+    private synchronized BrowserService workerFor(String sessionId) {
+        if (shuttingDown.get()) return null;
+        if (isolatedWorker) return this;
+        if (StringUtils.isBlank(sessionId)) throw new IllegalArgumentException("浏览器操作需要可信会话标识");
+        BrowserService current = sessionWorkers.get(sessionId);
+        if (current != null && !current.actor.isTerminated()) return current;
+        if (current != null) sessionWorkers.remove(sessionId);
+        sessionWorkers.entrySet().removeIf(entry -> entry.getValue().actor.isTerminated());
+        if (sessionWorkers.size() >= Math.max(1, Math.min(32, maxActiveSessions))) {
+            for (var entry : sessionWorkers.entrySet()) {
+                if (entry.getValue().actor.isIdleFor(TimeUnit.MINUTES.toNanos(5)))
+                    entry.getValue().actor.quarantine();
+            }
+            sessionWorkers.entrySet().removeIf(entry -> entry.getValue().actor.isTerminated());
+        }
+        if (sessionWorkers.size() >= Math.max(1, Math.min(32, maxActiveSessions))) return null;
+        BrowserService worker = new BrowserService(true);
+        worker.networkGuard = networkGuard;
+        worker.sessionStateStore = sessionStateStore;
+        worker.headless = headless;
+        worker.actorOperationTimeoutMillis = actorOperationTimeoutMillis;
+        sessionWorkers.put(sessionId, worker);
+        return worker;
+    }
+
+    private String delegate(String sessionId, java.util.function.Function<BrowserService, String> operation) {
+        BrowserService worker = workerFor(sessionId);
+        return worker == null ? unavailableWorkerError()
+                : operation.apply(worker);
+    }
+
+    private String unavailableWorkerError() {
+        return shuttingDown.get()
+                ? browserError("DEPENDENCY_UNAVAILABLE", "浏览器服务正在关闭，未执行本次操作")
+                : browserError("RESOURCE_BUSY", "浏览器会话容量已满，请先关闭空闲会话后重试");
+    }
+
+    /** Only ProcessHandle APIs run off-actor; no Playwright object is ever closed on another thread. */
+    private void terminateOwnedBrowserProcess() {
+        OwnedBrowserProcess owned = ownedBrowserProcess;
+        if (owned == null) return;
+        if (owned.startedAt() == null) return;
+        ProcessHandle handle = owned.handle();
+        if (!handle.isAlive() || !handle.info().startInstant().filter(owned.startedAt()::equals).isPresent()) return;
+        handle.descendants().forEach(child -> { try { child.destroyForcibly(); } catch (RuntimeException ignored) { } });
+        try { handle.destroyForcibly(); } catch (RuntimeException ignored) { }
+    }
 
     private record ObservedElement(String description, ElementHandle handle) {}
     private static final class PageDiagnostics {
@@ -791,7 +837,7 @@ public class BrowserService {
     }
 
     private String onActor(Callable<String> operation, Runnable completed) {
-        if (Thread.currentThread() == actorThread) {
+        if (actor.isOwnerThread()) {
             try { return operation.call(); }
             catch (RuntimeException error) { throw error; }
             catch (Exception error) { throw new IllegalStateException(error); }
@@ -803,40 +849,29 @@ public class BrowserService {
         }
         ActorInputGate inputGate = new ActorInputGate();
         ToolExecutionDeadline.Deadline operationDeadline = ToolExecutionDeadline.current();
-        AtomicInteger state = new AtomicInteger(); // queued / running / cancelled / finished
-        Future<String> pending;
+        long timeoutMillis = Math.max(1, actorOperationTimeoutMillis);
         try {
-            pending = actor.submit(() -> {
-                try {
-                    if (!state.compareAndSet(0, 1)) return browserError("CANCELLED", "浏览器操作在执行前已取消");
-                    actorInputGate.set(inputGate);
-                    try (var deadlineScope = ToolExecutionDeadline.bind(operationDeadline)) { return operation.call(); }
-                    finally { actorInputGate.remove(); state.set(3); }
-                } finally {
-                    // A stopped caller does not imply that Playwright has finished its input.
-                    completed.run();
-                }
-            });
-        } catch (RuntimeException | Error rejected) {
+            if (operationDeadline != null) timeoutMillis = Math.min(timeoutMillis, operationDeadline.timeoutMillis(1));
+        } catch (ToolExecutionDeadline.Expired expired) {
             completed.run();
-            throw rejected;
+            return browserError("TIMEOUT", "浏览器操作在排队前已超过执行预算");
         }
-        try {
-            return pending.get();
-        } catch (InterruptedException interrupted) {
-            inputGate.stop(); // Stops later input boundaries, including after an earlier input.
-            boolean beforeStart = state.compareAndSet(0, 2);
-            Thread.currentThread().interrupt();
-            // Never interrupt the shared Playwright event loop: an already-dispatched click
-            // may have committed. The tool pipeline must retain that uncertainty.
-            return beforeStart ? browserError("CANCELLED", "浏览器操作在执行前已取消")
-                    : "{\"success\":false,\"status\":\"unknown\",\"errorCode\":\"OUTCOME_UNKNOWN\","
-                    + "\"error\":\"浏览器操作已派发，尚未确认结果；请重新观察，禁止直接重试\"}";
-        } catch (ExecutionException error) {
-            Throwable cause = error.getCause();
-            if (cause instanceof RuntimeException runtime) throw runtime;
-            throw new IllegalStateException(cause);
-        }
+        BoundedBrowserActor.Result<String> outcome = actor.invoke(() -> {
+            actorInputGate.set(inputGate);
+            try (var deadlineScope = ToolExecutionDeadline.bind(operationDeadline)) { return operation.call(); }
+            finally { actorInputGate.remove(); }
+        }, timeoutMillis, inputGate::stop, completed);
+        return switch (outcome.status()) {
+            case COMPLETED -> outcome.value();
+            case QUEUE_FULL -> browserError("RESOURCE_BUSY", "当前浏览器会话队列已满，未执行本次操作");
+            case UNAVAILABLE -> browserError("DEPENDENCY_UNAVAILABLE", "浏览器执行器正在恢复；旧执行器退出后会重新建立会话，请稍后重试并重新观察");
+            case EXPIRED_QUEUED -> browserError("TIMEOUT", "浏览器排队等待超过预算，本次操作未执行");
+            case CANCELLED_QUEUED -> browserError("CANCELLED", "浏览器操作在执行前已取消");
+            case EXPIRED_RUNNING, CANCELLED_RUNNING -> inputGate.inputStarted()
+                    ? unknownAction("浏览器执行器已隔离并请求终止其受控进程；此前输入可能已生效，禁止直接重试，请恢复后重新观察")
+                    : browserError(outcome.status() == BoundedBrowserActor.Status.CANCELLED_RUNNING ? "CANCELLED" : "TIMEOUT",
+                    "浏览器观察未完成；执行器已隔离并请求终止其受控进程，恢复后请重新观察");
+        };
     }
 
     private String browserError(String code, String message) {
@@ -846,6 +881,11 @@ public class BrowserService {
 
     /** The key must be the trusted session resource key used to dispatch browser tools. */
     public boolean hasPendingOperations(String trustedSessionResourceKey) {
+        if (!isolatedWorker) {
+            synchronized (this) {
+                return sessionWorkers.values().stream().anyMatch(worker -> worker.hasPendingOperations(trustedSessionResourceKey));
+            }
+        }
         return trustedSessionResourceKey != null
                 && pendingSessionOperations.getOrDefault(trustedSessionResourceKey, 0) > 0;
     }
@@ -902,29 +942,70 @@ public class BrowserService {
         }
     }
 
-    public String navigate(String sessionId, String url) { return onSessionActor(sessionId, () -> navigateOnActor(sessionId, url)); }
-    public String snapshot(String sessionId, boolean full) { return onSessionActor(sessionId, () -> snapshotOnActor(sessionId, full)); }
-    public String formInspect(String sessionId) { return onSessionActor(sessionId, () -> formInspectOnActor(sessionId)); }
+    public String navigate(String sessionId, String url) {
+        return !isolatedWorker ? delegate(sessionId, worker -> worker.navigate(sessionId, url))
+                : onSessionActor(sessionId, () -> navigateOnActor(sessionId, url));
+    }
+    public String snapshot(String sessionId, boolean full) {
+        return !isolatedWorker ? delegate(sessionId, worker -> worker.snapshot(sessionId, full))
+                : onSessionActor(sessionId, () -> snapshotOnActor(sessionId, full));
+    }
+    public String formInspect(String sessionId) {
+        return !isolatedWorker ? delegate(sessionId, worker -> worker.formInspect(sessionId))
+                : onSessionActor(sessionId, () -> formInspectOnActor(sessionId));
+    }
     public String formVerify(String sessionId, String ref, String expectedValue, Boolean expectedChecked,
                              List<String> expectedValues, List<String> expectedFiles) {
-        return onSessionActor(sessionId, () -> formVerifyOnActor(sessionId, ref, expectedValue, expectedChecked, expectedValues, expectedFiles));
+        return !isolatedWorker ? delegate(sessionId, worker -> worker.formVerify(sessionId, ref, expectedValue,
+                expectedChecked, expectedValues, expectedFiles))
+                : onSessionActor(sessionId, () -> formVerifyOnActor(sessionId, ref, expectedValue, expectedChecked, expectedValues, expectedFiles));
     }
     public String click(String sessionId, String ref) { return click(sessionId, ref, "auto"); }
-    public String click(String sessionId, String ref, String by) { return onSessionActor(sessionId, () -> clickOnActor(sessionId, ref, by)); }
-    public String type(String sessionId, String ref, String text) { return onSessionActor(sessionId, () -> typeOnActor(sessionId, ref, text)); }
+    public String click(String sessionId, String ref, String by) {
+        return !isolatedWorker ? delegate(sessionId, worker -> worker.click(sessionId, ref, by))
+                : onSessionActor(sessionId, () -> clickOnActor(sessionId, ref, by));
+    }
+    public String type(String sessionId, String ref, String text) {
+        return !isolatedWorker ? delegate(sessionId, worker -> worker.type(sessionId, ref, text))
+                : onSessionActor(sessionId, () -> typeOnActor(sessionId, ref, text));
+    }
     public String select(String sessionId, String ref, List<String> values, String by) {
-        return onSessionActor(sessionId, () -> selectOnActor(sessionId, ref, values, by));
+        return !isolatedWorker ? delegate(sessionId, worker -> worker.select(sessionId, ref, values, by))
+                : onSessionActor(sessionId, () -> selectOnActor(sessionId, ref, values, by));
     }
     public String setChecked(String sessionId, String ref, boolean checked) {
-        return onSessionActor(sessionId, () -> setCheckedOnActor(sessionId, ref, checked));
+        return !isolatedWorker ? delegate(sessionId, worker -> worker.setChecked(sessionId, ref, checked))
+                : onSessionActor(sessionId, () -> setCheckedOnActor(sessionId, ref, checked));
     }
     public String upload(String sessionId, String ref, List<Path> trustedPaths) {
-        return onSessionActor(sessionId, () -> uploadOnActor(sessionId, ref, trustedPaths));
+        return !isolatedWorker ? delegate(sessionId, worker -> worker.upload(sessionId, ref, trustedPaths))
+                : onSessionActor(sessionId, () -> uploadOnActor(sessionId, ref, trustedPaths));
     }
-    public String press(String sessionId, String key) { return onSessionActor(sessionId, () -> pressOnActor(sessionId, key)); }
-    public String scroll(String sessionId, String direction) { return onSessionActor(sessionId, () -> scrollOnActor(sessionId, direction)); }
-    public String screenshot(String sessionId, Path workspaceRoot) { return onSessionActor(sessionId, () -> screenshotOnActor(sessionId, workspaceRoot)); }
-    public String close(String sessionId) { return onTrackedSessionActor(sessionId, () -> closeOnActor(sessionId)); }
+    public String press(String sessionId, String key) {
+        return !isolatedWorker ? delegate(sessionId, worker -> worker.press(sessionId, key))
+                : onSessionActor(sessionId, () -> pressOnActor(sessionId, key));
+    }
+    public String scroll(String sessionId, String direction) {
+        return !isolatedWorker ? delegate(sessionId, worker -> worker.scroll(sessionId, direction))
+                : onSessionActor(sessionId, () -> scrollOnActor(sessionId, direction));
+    }
+    public String screenshot(String sessionId, Path workspaceRoot) {
+        return !isolatedWorker ? delegate(sessionId, worker -> worker.screenshot(sessionId, workspaceRoot))
+                : onSessionActor(sessionId, () -> screenshotOnActor(sessionId, workspaceRoot));
+    }
+    public String close(String sessionId) {
+        if (!isolatedWorker) return delegate(sessionId, worker -> worker.close(sessionId));
+        AtomicBoolean closed = new AtomicBoolean();
+        String result = onTrackedSessionActor(sessionId, () -> {
+            String outcome = closeOnActor(sessionId);
+            // A failed close deliberately retains handles for an explicit retry. Do not
+            // discard those references by shutting down the whole worker on that path.
+            closed.set(!pages.containsKey(sessionId) && !sessionContexts.containsKey(sessionId));
+            return outcome;
+        });
+        if (closed.get()) actor.quarantine();
+        return result;
+    }
     public String extractArticleText(String sessionId) { return extractArticleText(sessionId, null); }
     public String extractArticleText(String sessionId, Path imageDir) { return extractArticleWithMetadata(sessionId, imageDir).text(); }
 
@@ -942,6 +1023,11 @@ public class BrowserService {
     }
 
     public ArticleExtractionResult extractArticleWithMetadata(String sessionId, Path imageDir) {
+        if (!isolatedWorker) {
+            BrowserService worker = workerFor(sessionId);
+            return worker == null ? ArticleExtractionResult.failed(unavailableWorkerError())
+                    : worker.extractArticleWithMetadata(sessionId, imageDir);
+        }
         AtomicReference<ArticleExtractionResult> completed = new AtomicReference<>();
         String delivered = onSessionActor(sessionId, () -> {
             ArticleExtractionResult extracted = extractArticleWithMetadataOnActor(sessionId, imageDir);
@@ -959,10 +1045,14 @@ public class BrowserService {
         }
         return new ArticleExtractionResult(true, delivered, extracted.sources());
     }
-    public String evaluate(String sessionId, String expression) { return onSessionActor(sessionId, () -> evaluateOnActor(sessionId, expression)); }
+    public String evaluate(String sessionId, String expression) {
+        return !isolatedWorker ? delegate(sessionId, worker -> worker.evaluate(sessionId, expression))
+                : onSessionActor(sessionId, () -> evaluateOnActor(sessionId, expression));
+    }
 
     /** Explicitly discard this chat's saved authentication; never implied by an ordinary close. */
     public String clearSessionState(String sessionId) {
+        if (!isolatedWorker) return delegate(sessionId, worker -> worker.clearSessionState(sessionId));
         return onTrackedSessionActor(sessionId, () -> {
             try {
                 if (sessionStateStore == null) return browserError("DEPENDENCY_UNAVAILABLE", "浏览器登录态持久化未配置");
@@ -1017,7 +1107,30 @@ public class BrowserService {
                 log.info("浏览器走环境变量代理");
             }
             browser = playwright.chromium().launch(opts);
+            captureOwnedBrowserProcess();
             log.info("浏览器已启动 (headless={})", headless);
+        }
+    }
+
+    /** Obtains the native PID from this browser's own CDP connection on its owner thread. */
+    private void captureOwnedBrowserProcess() {
+        CDPSession cdp = null;
+        try {
+            cdp = browser.newBrowserCDPSession();
+            var processInfo = cdp.send("SystemInfo.getProcessInfo").getAsJsonArray("processInfo");
+            for (var entry : processInfo) {
+                var info = entry.getAsJsonObject();
+                if (!"browser".equals(info.get("type").getAsString())) continue;
+                ProcessHandle.of(info.get("id").getAsLong()).ifPresent(handle ->
+                        handle.info().startInstant().ifPresent(startedAt ->
+                                ownedBrowserProcess = new OwnedBrowserProcess(handle, startedAt)));
+                break;
+            }
+        } catch (Exception unsupported) {
+            // A missing PID cannot justify touching another process. Quarantine still bounds dispatch/resources.
+            log.warn("当前 Chromium 未提供受控进程句柄，超时后将隔离此会话直到 owner 线程退出");
+        } finally {
+            if (cdp != null) try { cdp.detach(); } catch (Exception ignored) { }
         }
     }
 
@@ -3098,8 +3211,13 @@ public class BrowserService {
 
     @PreDestroy
     public void shutdown() {
-        try { onActor(() -> { shutdownOnActor(); return "closed"; }); }
-        finally { actor.shutdown(); }
+        if (!shuttingDown.compareAndSet(false, true)) return;
+        if (!isolatedWorker) {
+            List<BrowserService> workers;
+            synchronized (this) { workers = new ArrayList<>(sessionWorkers.values()); }
+            workers.forEach(worker -> worker.actor.quarantine());
+        }
+        actor.quarantine();
     }
 
     private void shutdownOnActor() {

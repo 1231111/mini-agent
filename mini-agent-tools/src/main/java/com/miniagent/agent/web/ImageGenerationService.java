@@ -6,12 +6,15 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.miniagent.agent.tool.ToolErrorCode;
+import com.miniagent.agent.security.GuardedHttpClient;
+import com.miniagent.agent.security.GuardedMediaDownloader;
 import com.miniagent.config.storage.MediaStorage;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -26,10 +29,11 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -69,10 +73,14 @@ public class ImageGenerationService {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
-            .followRedirects(HttpClient.Redirect.NORMAL)
+            // Provider redirects are not a safe way to move an authenticated request to
+            // another host.  Media URLs are validated separately after the provider call.
+            .followRedirects(HttpClient.Redirect.NEVER)
             .build();
-    /** 后端竞速 / 熔断专用虚拟线程池 */
-    private static final ExecutorService BACKEND_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
+    /** Bounded executor for one provider attempt.  Attempts are deliberately sequential. */
+    private static final ExecutorService BACKEND_EXECUTOR = new ThreadPoolExecutor(0, 8, 60,
+            TimeUnit.SECONDS, new SynchronousQueue<>(), Thread.ofVirtual().name("image-provider-", 0).factory(),
+            new ThreadPoolExecutor.AbortPolicy());
 
     /** 各后端默认外层等待（秒）；chatanywhere 慢模型（gpt-image-2-ca）走配置项覆盖 */
     private static final Map<String, Long> BACKEND_TIMEOUT_SECONDS = Map.of(
@@ -98,6 +106,8 @@ public class ImageGenerationService {
 
     @Autowired
     private MediaStorage mediaStorage;
+    @Autowired
+    private GuardedMediaDownloader mediaDownloader;
 
     // ========== 环境变量配置 ==========
 
@@ -117,7 +127,7 @@ public class ImageGenerationService {
     @Value("${image.gen.chatanywhere-timeout-seconds:500}")
     private long chatAnywhereTimeoutSeconds;
 
-    /** 单次 image_generate 调用的内层总预算默认值（秒）：竞速段 + 降级尾巴 + 落盘都在这之内。 */
+    /** 单次 image_generate 调用的内层预算默认值（秒），覆盖顺序后端尝试。 */
     public static final long DEFAULT_TOTAL_BUDGET_SECONDS = 540;
 
     /** 剩余预算低于此值不再开新一轮后端尝试（开了也必然被砍，还多花一次钱）。 */
@@ -128,8 +138,7 @@ public class ImageGenerationService {
     private long configuredTotalBudgetSeconds;
 
     /**
-     * 内层总预算（秒）：工具到点自己强杀并返回「哪些后端试过、各自什么错」（可控终态），
-     * 绝不把等待拖到外层闸门 —— 外层先触发会被判成「终态未知」并中止整轮。
+     * 内层总预算（秒）：到点中断本地请求，服务端结果无法确认时返回 OUTCOME_UNKNOWN。
      *
      * <p>注册期（{@code BuiltinTools.registerImageGenerateTool}）把它写进执行契约：
      * 外层闸门 = 预算 + {@code ToolConcurrencyPolicy} REMOTE_GENERATION 档的 30s 余量。</p>
@@ -141,11 +150,9 @@ public class ImageGenerationService {
     /**
      * 每个后端的单次等待上限（秒）。
      *
-     * <p>竞速段与单跑段共用这一个口径 —— 改造前竞速段用静态表 {@code BACKEND_TIMEOUT_SECONDS}、
-     * 单跑段用配置敏感的 {@link #chatAnywhereWaitSeconds()}，配置调到 700s 时会出现
-     * 「单跑等 700s、竞速 510s 就被取消」的自相矛盾。</p>
+     * <p>每次顺序尝试均被此上限和剩余总预算共同约束。</p>
      */
-    private long backendWaitSeconds(String backend) {
+    long backendWaitSeconds(String backend) {
         return "chatanywhere".equals(backend)
                 ? chatAnywhereWaitSeconds()
                 : BACKEND_TIMEOUT_SECONDS.getOrDefault(backend, 120L);
@@ -210,7 +217,7 @@ public class ImageGenerationService {
         String primaryBackend = resolveBackend();
         String imageSize = mapAspectRatio(aspectRatio);
         // 落盘要用 owner 目录（media/generated/<owner>/），这里先抓住调用方的身份：
-        // 竞速/串行都在自己的 future 里绑 owner，回到本线程时只剩这一份快照可用。
+        // 后端请求在线程中绑定同一 owner，落盘仍使用调用方的身份快照。
         OwnerContext ownerCtx = OwnerContext.capture();
         log.info("图像生成: backend={} aspect={} prompt='{}'", primaryBackend, aspectRatio,
                 prompt.substring(0, Math.min(80, prompt.length())));
@@ -227,40 +234,28 @@ public class ImageGenerationService {
         // 内层总预算截止点：所有降级尝试都必须在它之内结束，到点工具自己收尾（可控终态）。
         long deadlineMs = System.currentTimeMillis() + totalBudgetSeconds() * 1000L;
 
-        // 前两个后端并行竞速，谁先成功用谁；都失败再串行尝试剩余
-        if (chain.size() >= 2) {
-            BackendAttempt raced = raceBackends(chain.subList(0, 2), prompt, imageSize, deadlineMs);
-            if (raced.isOk()) {
-                return toMarkdownImage(raced.url(), ownerCtx);
+        // Provider generation is a paid, non-idempotent operation.  Never race two
+        // providers: cancelling a CompletableFuture cannot cancel a request already
+        // accepted by the remote service and used to create duplicate images/costs.
+        for (int i = 0; i < chain.size(); i++) {
+            String backend = chain.get(i);
+            if (remainingSeconds(deadlineMs) < MIN_ATTEMPT_REMAINING_SECONDS) {
+                lastError += "；预算（" + totalBudgetSeconds() + "s）耗尽，未再试: "
+                        + chain.subList(i, chain.size());
+                break;
             }
-            lastError = "并行竞速失败（" + raced.error() + "）";
-            for (int i = 2; i < chain.size(); i++) {
-                if (remainingSeconds(deadlineMs) < MIN_ATTEMPT_REMAINING_SECONDS) {
-                    lastError += "；预算（" + totalBudgetSeconds() + "s）耗尽，未再试: "
-                            + chain.subList(i, chain.size());
-                    break;
-                }
-                BackendAttempt attempt = tryBackend(chain.get(i), prompt, imageSize, deadlineMs);
-                if (attempt.isOk()) {
-                    return toMarkdownImage(attempt.url(), ownerCtx);
-                }
-                // 累积而不是覆盖：模型要看到「每一个后端各自为什么不行」，
-                // 才可能判断是换后端、改 prompt 还是等一会儿再来。
-                lastError += "；" + attempt.describe(chain.get(i));
+            BackendAttempt attempt = tryBackend(backend, prompt, imageSize, deadlineMs);
+            if (attempt.isOk()) {
+                return toMarkdownImage(attempt.url(), ownerCtx);
             }
-        } else {
-            for (int i = 0; i < chain.size(); i++) {
-                String backend = chain.get(i);
-                if (remainingSeconds(deadlineMs) < MIN_ATTEMPT_REMAINING_SECONDS) {
-                    lastError += "；预算（" + totalBudgetSeconds() + "s）耗尽，未再试: "
-                            + chain.subList(i, chain.size());
-                    break;
-                }
-                BackendAttempt attempt = tryBackend(backend, prompt, imageSize, deadlineMs);
-                if (attempt.isOk()) {
-                    return toMarkdownImage(attempt.url(), ownerCtx);
-                }
-                lastError += "；" + attempt.describe(backend);
+            lastError += "；" + attempt.describe(backend);
+            // A timeout/interruption leaves the provider outcome unknown.  Retrying with
+            // another provider would be a second non-idempotent submission, so stop and
+            // surface an explicit reconciliation state to the caller.
+            if (attempt.uncertain()) {
+                return errorJson(ToolErrorCode.OUTCOME_UNKNOWN,
+                        "图像生成结果未知：后端 " + backend + " 已提交或连接中断，未自动向其他后端重复提交。"
+                                + "请先确认该后端任务/账单状态，再决定是否重试。详情：" + attempt.error());
             }
         }
 
@@ -276,79 +271,6 @@ public class ImageGenerationService {
                         + "。文生图在本次运行内不可用（下一轮会从工具表移除）："
                         + "架构图/流程图/时序图/ER 图改用 render_diagram 出 .svg；"
                         + "插画/封面类降不了级，如实告知用户，不要用 ASCII 图冒充交付物。");
-    }
-
-    /** 并行竞速：任一成功即返回其尝试结果；全部失败返回聚合了各方原因的失败结果 */
-    private BackendAttempt raceBackends(List<String> backends, String prompt, String imageSize, long deadlineMs) {
-        log.info("并行竞速后端: {}", backends);
-        OwnerContext owner = OwnerContext.capture();
-        List<String> names = new ArrayList<>(backends);
-        List<CompletableFuture<BackendAttempt>> futures = new ArrayList<>();
-        for (String backend : backends) {
-            futures.add(CompletableFuture.supplyAsync(
-                    () -> {
-                        try (var ignored = OwnerContext.bind(owner)) {
-                            return tryBackend(backend, prompt, imageSize, deadlineMs);
-                        }
-                    }, BACKEND_EXECUTOR));
-        }
-        // 竞速段整体等待与单后端等待同口径（backendWaitSeconds），再被内层总预算封顶。
-        // 改造前这里读静态表、tryBackend 读配置敏感值，口径不一致。
-        long maxWait = Math.min(backends.stream()
-                .mapToLong(this::backendWaitSeconds)
-                .max().orElse(120L) + 10, remainingSeconds(deadlineMs));
-
-        long deadline = System.currentTimeMillis() + maxWait * 1000L;
-        while (System.currentTimeMillis() < deadline) {
-            boolean allDone = true;
-            for (CompletableFuture<BackendAttempt> f : futures) {
-                if (!f.isDone()) {
-                    allDone = false;
-                    continue;
-                }
-                try {
-                    BackendAttempt r = f.getNow(null);
-                    if (r != null && r.isOk()) {
-                        for (CompletableFuture<BackendAttempt> other : futures) {
-                            if (other != f) {
-                                other.cancel(true);
-                            }
-                        }
-                        return r;
-                    }
-                } catch (Exception ignored) { /* 单个失败继续等 */ }
-            }
-            if (allDone) {
-                break;
-            }
-            try { Thread.sleep(200); } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-        // 取消前先把已拿到结果的原因摘出来：cancel 之后 getNow 会抛 CancellationException，
-        // 那时再取就只剩「未完成」三个字了。
-        StringBuilder err = new StringBuilder();
-        for (int i = 0; i < futures.size(); i++) {
-            CompletableFuture<BackendAttempt> f = futures.get(i);
-            String why;
-            try {
-                BackendAttempt r = f.getNow(null);
-                why = r == null ? "尚未返回（竞速窗口内未完成）" : r.error();
-            } catch (java.util.concurrent.CancellationException ce) {
-                why = "尚未返回（竞速窗口内未完成）";
-            } catch (Exception e) {
-                why = e.getClass().getSimpleName();
-            }
-            if (err.length() > 0) {
-                err.append("；");
-            }
-            err.append(names.get(i)).append("：").append(why);
-        }
-        for (CompletableFuture<BackendAttempt> f : futures) {
-            f.cancel(true);
-        }
-        return BackendAttempt.fail(err.toString());
     }
 
     /** ChatAnywhere 实际等待秒数（2CA 慢模型用加长超时） */
@@ -368,13 +290,17 @@ public class ImageGenerationService {
      * 模型既不知道是超时、限流、鉴权还是响应格式不对，也就无从据此改方案
      * （用户看到的正是这句，2026-10-15）。</p>
      */
-    private record BackendAttempt(String url, String error) {
+    private record BackendAttempt(String url, String error, boolean uncertain) {
         static BackendAttempt ok(String url) {
-            return new BackendAttempt(url, "");
+            return new BackendAttempt(url, "", false);
         }
 
         static BackendAttempt fail(String error) {
-            return new BackendAttempt("", StringUtils.isBlank(error) ? "未知原因" : error);
+            return new BackendAttempt("", StringUtils.isBlank(error) ? "未知原因" : error, false);
+        }
+
+        static BackendAttempt unknown(String error) {
+            return new BackendAttempt("", StringUtils.isBlank(error) ? "请求结果未知" : error, true);
         }
 
         boolean isOk() {
@@ -389,6 +315,7 @@ public class ImageGenerationService {
 
     /** 尝试单个后端；失败记录熔断并把原因带出去 */
     private BackendAttempt tryBackend(String backend, String prompt, String imageSize, long deadlineMs) {
+        Future<String> future = null;
         try {
             log.info("尝试后端: {}", backend);
             // 单次等待 = 后端自身上限与内层总预算剩余的较小值 —— 绝不越过预算截止点。
@@ -397,27 +324,36 @@ public class ImageGenerationService {
                 return BackendAttempt.fail("内层预算已耗尽，未发起请求");
             }
             OwnerContext owner = OwnerContext.capture();
-            CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
+            future = BACKEND_EXECUTOR.submit(() -> {
                 try (var ignored = OwnerContext.bind(owner)) {
                     return invokeBackend(backend, prompt, imageSize);
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
                 }
-            }, BACKEND_EXECUTOR);
+            });
             String imageUrl = future.get(timeoutSec, TimeUnit.SECONDS);
             if (StringUtils.isNotBlank(imageUrl)) {
                 recordSuccess(backend);
                 return BackendAttempt.ok(imageUrl);
             }
-            log.warn("后端 {} 未返回图片，尝试下一个", backend);
+            log.warn("后端 {} 未返回图片，暂停提交并要求核对结果", backend);
             recordFailure(backend);
-            return BackendAttempt.fail("请求成功但没有拿到图片地址");
+            return BackendAttempt.unknown("服务端已响应但未提供可交付的图片，需先核对生成结果");
+        } catch (java.util.concurrent.TimeoutException e) {
+            if (future != null) future.cancel(true);
+            recordFailure(backend);
+            return BackendAttempt.unknown("后端等待超过 " + backendWaitSeconds(backend)
+                    + " 秒；请求可能已被服务端接受，未自动重复提交");
         } catch (java.util.concurrent.CancellationException e) {
-            log.info("后端 {} 竞速取消（另一后端已先返回）", backend);
-            return BackendAttempt.fail("竞速被取消（另一后端已先返回）");
+            return BackendAttempt.unknown("请求被取消，服务端是否已接受未知");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            if (future != null) future.cancel(true);
+            return BackendAttempt.unknown("调用线程被中断，服务端是否已接受未知");
+        } catch (java.util.concurrent.RejectedExecutionException busy) {
+            return BackendAttempt.fail("本地图片请求并发已满，未提交到服务端");
         } catch (Exception e) {
             Throwable root = e;
-            while (Objects.nonNull(root.getCause()) && root.getCause() != root) {
+            while ((root instanceof java.util.concurrent.ExecutionException || root instanceof java.util.concurrent.CompletionException)
+                    && root.getCause() != null) {
                 root = root.getCause();
             }
             // 限速有确定的恢复窗口：计熔断会把「等 45 秒就能用」变成「5 分钟全废」，
@@ -428,11 +364,10 @@ public class ImageGenerationService {
                 return BackendAttempt.fail(rateLimited.getMessage());
             }
             String detail = Optional.ofNullable(root.getMessage()).orElse(e.getMessage());
-            log.warn("后端 {} 异常，尝试下一个: {}", backend, detail);
+            log.warn("后端 {} 异常: {}", backend, detail);
             recordFailure(backend);
-            // 这句 return 是本次修复的重点：detail 以前只进日志，
-            // 最终错误里只剩「后端 X 失败」。
-            return BackendAttempt.fail(detail);
+            return root instanceof BackendRejectedException
+                    ? BackendAttempt.fail(detail) : BackendAttempt.unknown(detail);
         }
     }
     /**
@@ -446,9 +381,12 @@ public class ImageGenerationService {
         String preview = bodyPreview(body, 180);
 
         if (status < 200 || status >= 300) {
-            throw new RuntimeException(backend + " HTTP " + status
+            String message = backend + " HTTP " + status
                     + (StringUtils.isBlank(contentType) ? "" : " content-type=" + contentType)
-                    + " body=" + preview);
+                    + " body=" + preview;
+            if (status >= 400 && status < 500 && status != 408 && status != 409)
+                throw new BackendRejectedException(message);
+            throw new RuntimeException(message);
         }
         String trimmed = body.stripLeading();
         boolean looksJson = trimmed.startsWith("{") || trimmed.startsWith("[");
@@ -475,7 +413,7 @@ public class ImageGenerationService {
         return oneLine.length() <= max ? oneLine : oneLine.substring(0, max) + "…";
     }
 
-    private String invokeBackend(String backend, String prompt, String imageSize) throws Exception {
+    protected String invokeBackend(String backend, String prompt, String imageSize) throws Exception {
         return switch (backend) {
             case "chatanywhere" -> generateViaChatAnywhere(prompt, imageSize);
             case "mimo", "xiaomi" -> generateViaMimo(prompt, imageSize);
@@ -489,6 +427,13 @@ public class ImageGenerationService {
 
     /** 单张生成图的字节上限：再大就不是正常出图结果，别把内存和磁盘交给对端。 */
     private static final long MAX_IMAGE_BYTES = 32L * 1024 * 1024;
+    private static final int MAX_JSON_RESPONSE_BYTES = 2 * 1024 * 1024;
+    private static final int MAX_API_RESPONSE_BYTES = (int) ((MAX_IMAGE_BYTES + 2) / 3 * 4 + 64 * 1024);
+
+    /** Explicit pre-execution provider rejection; only these may safely fall through. */
+    static class BackendRejectedException extends RuntimeException {
+        BackendRejectedException(String message) { super(message); }
+    }
 
     /** Pollinations 把 prompt 放在 URL 路径里，超长会被网关拒；按字符截断而不是整条丢弃。 */
     private static final int MAX_POLLINATIONS_PROMPT_CHARS = 800;
@@ -569,18 +514,19 @@ public class ImageGenerationService {
      * <p>落盘后走 {@code /api/generated-media/<owner>/<file>}（带登录鉴权、Range、
      * nosniff 与 CSP sandbox，见 {@code MediaResponses}），图片才是本机资产。
      *
-     * <p>任何一步失败都退回原 URL 并记 warn：能看比"干净"重要，
-     * 不能因为下载失败让整个出图工具报错。
+     * <p>下载或落盘失败必须显式报告；远端 URL 未经完整读取验证时不能作为成功图片返回。
      */
     private String toMarkdownImage(String imageUrl, OwnerContext ownerCtx) {
         if (StringUtils.isBlank(imageUrl)) {
             return imageUrl;
         }
         // chatanywhere 的 2ca 分支已经落盘并拼好了 markdown
-        if (imageUrl.startsWith("![")) {
-            return imageUrl;
+        String persisted = persistImage(imageUrl, ownerCtx);
+        if (StringUtils.isBlank(persisted)) {
+            return errorJson(ToolErrorCode.EXECUTION_FAILED,
+                    "图像下载或落盘未通过验证，未返回未经验证的远端链接");
         }
-        return "![生成的图片](" + persistImage(imageUrl, ownerCtx) + ")";
+        return "![生成的图片](" + persisted + ")";
     }
 
     /** 包可见以便用本地假服务器测「下载 → 判类型 → 落盘」全流程（不依赖外网）。 */
@@ -591,44 +537,40 @@ public class ImageGenerationService {
             if (imageUrl.startsWith("data:")) {
                 int comma = imageUrl.indexOf(',');
                 if (comma < 0) {
-                    return imageUrl;
+                    return null;
                 }
                 contentType = imageUrl.substring(5, comma).split(";")[0];
+                if (imageUrl.length() - comma - 1 > ((MAX_IMAGE_BYTES + 2) / 3) * 4) {
+                    log.warn("拒绝解码超过图片预算的 data URI");
+                    return null;
+                }
                 bytes = Base64.getDecoder().decode(imageUrl.substring(comma + 1));
             } else if (imageUrl.startsWith("http://") || imageUrl.startsWith("https://")) {
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(imageUrl))
-                        .timeout(Duration.ofSeconds(60))
-                        .GET()
-                        .build();
-                HttpResponse<java.io.InputStream> response =
-                        HTTP.send(request, HttpResponse.BodyHandlers.ofInputStream());
+                GuardedMediaDownloader.Download response = mediaDownloader.download(
+                        imageUrl, Duration.ofSeconds(60), (int) MAX_IMAGE_BYTES);
                 if (response.statusCode() != 200) {
-                    log.warn("生成图下载失败 HTTP {}，退回原链接: {}",
+                    log.warn("生成图下载失败 HTTP {}: {}",
                             response.statusCode(), abbreviateUrl(imageUrl));
-                    return imageUrl;
+                    return null;
                 }
-                contentType = response.headers().firstValue("content-type").orElse("");
-                try (java.io.InputStream in = response.body()) {
-                    // 多读 1 字节用于判定超限，不把对端给的任意长度读进内存
-                    bytes = in.readNBytes((int) MAX_IMAGE_BYTES + 1);
-                }
+                contentType = response.contentType();
+                bytes = response.body();
                 if (bytes.length > MAX_IMAGE_BYTES) {
-                    log.warn("生成图超过 {} 字节上限，退回原链接: {}", MAX_IMAGE_BYTES, abbreviateUrl(imageUrl));
-                    return imageUrl;
+                    log.warn("生成图超过 {} 字节上限: {}", MAX_IMAGE_BYTES, abbreviateUrl(imageUrl));
+                    return null;
                 }
             } else {
-                // 已经是站内地址（/api/...），不需要再存一次
-                return imageUrl;
+                // Only known server-generated media routes may already be persisted.
+                return imageUrl.startsWith("/api/generated-media/") ? imageUrl : null;
             }
             if (bytes.length == 0) {
-                return imageUrl;
+                return null;
             }
             String ext = imageExtension(bytes, contentType);
             if (ext == null) {
-                log.warn("下载内容不是可识别的图片（content-type={}），退回原链接: {}",
+                log.warn("下载内容不是可识别的图片（content-type={}）: {}",
                         contentType, abbreviateUrl(imageUrl));
-                return imageUrl;
+                return null;
             }
             String fileName = String.format("img_%d_%d.%s",
                     System.currentTimeMillis(), ThreadLocalRandom.current().nextInt(10000), ext);
@@ -639,9 +581,15 @@ public class ImageGenerationService {
             }
             log.info("生成图已落盘: {} ({} 字节, 来源 {})", storedUrl, bytes.length, abbreviateUrl(imageUrl));
             return storedUrl;
+        } catch (GuardedHttpClient.NetworkRejectedException rejected) {
+            log.warn("拒绝下载不安全的生图地址: {} ({})", abbreviateUrl(imageUrl), rejected.getMessage());
+            return null;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return null;
         } catch (Exception e) {
-            log.warn("生成图落盘失败，退回原链接: {} ({})", abbreviateUrl(imageUrl), e.toString());
-            return imageUrl;
+            log.warn("生成图落盘失败: {} ({})", abbreviateUrl(imageUrl), e.toString());
+            return null;
         }
     }
 
@@ -649,7 +597,7 @@ public class ImageGenerationService {
      * 按<b>文件头魔数</b>判图片类型，不只看 content-type：对象存储常把图片标成
      * {@code application/octet-stream}，而扩展名决定了 {@code /api/generated-media}
      * 会不会放行（`approvedInlineMediaType` 按扩展名查白名单）。
-     * 判定不了返回 null，调用方退原链接 —— 不猜。
+     * 判定不了返回 null；不能仅凭服务端 MIME 声明把 HTML/JSON 错误页当成图片。
      */
     static String imageExtension(byte[] bytes, String contentType) {
         if (Objects.nonNull(bytes)) {
@@ -669,19 +617,6 @@ public class ImageGenerationService {
                     && bytes[10] == 'B' && bytes[11] == 'P') {
                 return "webp";
             }
-        }
-        String lower = Objects.requireNonNullElse(contentType, "").toLowerCase();
-        if (lower.contains("jpeg") || lower.contains("jpg")) {
-            return "jpg";
-        }
-        if (lower.contains("png")) {
-            return "png";
-        }
-        if (lower.contains("gif")) {
-            return "gif";
-        }
-        if (lower.contains("webp")) {
-            return "webp";
         }
         return null;
     }
@@ -769,7 +704,7 @@ public class ImageGenerationService {
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload), StandardCharsets.UTF_8))
                 .build();
 
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = ProviderHttp.send(HTTP, request, ProviderHttp.utf8(MAX_JSON_RESPONSE_BYTES));
         JsonNode root = parseApiJson("ChatAnywhere", response);
         JsonNode data = root.path("data");
         if (data.isArray() && !data.isEmpty()) {
@@ -784,7 +719,7 @@ public class ImageGenerationService {
         log.error("ChatAnywhere 图像生成响应异常: HTTP {} {}", response.statusCode(), msg);
         throw new RuntimeException("ChatAnywhere: " + msg);
     }
-    private String generateImageBy2ca(String prompt, String imageSize) {
+    private String generateImageBy2ca(String prompt, String imageSize) throws Exception {
         String key = resolveKey(chatAnywhereKey, "CHATANYWHERE_API_KEY");
         String base = (StringUtils.isBlank(chatAnywhereBaseUrl))
                 ? "https://api.chatanywhere.tech/v1"
@@ -795,8 +730,6 @@ public class ImageGenerationService {
         payload.put("n", 1);
         payload.put("model", chatAnywhereModel);
         payload.put("size", mapToOpenAiImageSize(imageSize));
-
-        Path imageDir = mediaStorage.generatedOwnerDir();
 
         try {
             long httpTimeout = chatAnywhereWaitSeconds();
@@ -810,74 +743,45 @@ public class ImageGenerationService {
                     .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload), StandardCharsets.UTF_8))
                     .build();
 
-            HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            HttpResponse<String> response = ProviderHttp.send(HTTP, request, ProviderHttp.utf8(MAX_API_RESPONSE_BYTES));
 
-            JsonNode root;
-            try {
-                root = parseApiJson("ChatAnywhere-2CA", response);
-            } catch (RuntimeException bad) {
-                log.error("API 请求失败: {}", bad.getMessage());
-                return null;
-            }
+            JsonNode root = parseApiJson("ChatAnywhere-2CA", response);
 
             if (root.has("error")) {
-                log.error("API 返回错误: {}", root.path("error").path("message").asText());
-                return null;
+                throw new IOException("ChatAnywhere API 返回错误: "
+                        + root.path("error").path("message").asText(bodyPreview(response.body(), 200)));
             }
 
             JsonNode data = root.path("data");
             if (!data.isArray() || data.size() == 0) {
-                log.error("返回数据为空");
-                return null;
+                throw new IOException("ChatAnywhere API 返回数据为空");
             }
 
             String b64Json = data.get(0).path("b64_json").asText();
             if (StringUtils.isBlank(b64Json)) {
-                log.error("未找到 b64_json 字段");
-                return null;
+                throw new IOException("ChatAnywhere API 响应缺少 b64_json");
+            }
+            if (b64Json.length() > ((MAX_IMAGE_BYTES + 2) / 3) * 4) {
+                throw new IOException("ChatAnywhere 图片超过安全大小上限");
             }
 
             // 解码 Base64
             byte[] imageBytes = Base64.getDecoder().decode(b64Json);
-
-            // 确保目录存在
-            if (!Files.exists(imageDir)) {
-                Files.createDirectories(imageDir);
-                log.info("创建图片目录: {}", imageDir.toAbsolutePath());
+            String extension = imageExtension(imageBytes, "");
+            if (imageBytes.length == 0 || imageBytes.length > MAX_IMAGE_BYTES || extension == null) {
+                throw new IOException("ChatAnywhere 返回的图片内容无效或超过安全大小上限");
             }
 
-            // 生成唯一文件名（格式：img_时间戳_随机数.png）
-            String fileName = String.format("img_%d_%d.png",
-                    System.currentTimeMillis(),
-                    ThreadLocalRandom.current().nextInt(10000));
-            Path outputPath = imageDir.resolve(fileName);
-
-            // 保存图片
-            Files.write(outputPath, imageBytes);
-
-            log.info("图片已保存到: {}", outputPath.toAbsolutePath());
-
-            // 返回 markdown 图片链接（前端可直接渲染，AgentLoop 可识别为媒体交付）
-            return "![生成的图片](" + mediaStorage.generatedUrl(fileName) + ")";
+            // Provider workers only fetch/validate.  The caller owns the single commit
+            // through persistImage, so a cancelled worker cannot write a late artifact.
+            return "data:image/" + extension + ";base64," + b64Json;
 
         } catch (java.net.http.HttpTimeoutException e) {
             log.error("ChatAnywhere 2CA 超时（{}s）: {}", chatAnywhereWaitSeconds(), e.getMessage());
-            // 超时后放宽到 10 分钟窗口找落盘图片（服务端可能已生成完但客户端先断）
-            String recentImage = findRecentGeneratedImage(imageDir, 600);
-            if (Objects.nonNull(recentImage)) {
-                log.info("HTTP 超时但发现最近生成的图片: {}", recentImage);
-                return "![生成的图片](" + mediaStorage.generatedUrl(recentImage) + ")";
-            }
-            return null;
+            throw new IOException("ChatAnywhere 图片生成请求超时；远端结果未确认，未复用其它请求的图片", e);
         } catch (Exception e) {
             log.error("ChatAnywhere 2CA 图像生成失败: {}", e.getMessage(), e);
-            // 安全网：HTTP 失败但图片可能已保存到磁盘（竞态条件），检查最近生成的图片
-            String recentImage = findRecentGeneratedImage(imageDir, 600);
-            if (Objects.nonNull(recentImage)) {
-                log.info("HTTP 失败但发现最近生成的图片: {}", recentImage);
-                return "![生成的图片](" + mediaStorage.generatedUrl(recentImage) + ")";
-            }
-            return null;
+            throw e;
         }
     }
 
@@ -911,7 +815,7 @@ public class ImageGenerationService {
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload), StandardCharsets.UTF_8))
                 .build();
 
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = ProviderHttp.send(HTTP, request, ProviderHttp.utf8(MAX_JSON_RESPONSE_BYTES));
         JsonNode root = parseApiJson("MiMo", response);
         JsonNode data = root.path("data");
         if (data.isArray() && !data.isEmpty()) {
@@ -965,7 +869,7 @@ public class ImageGenerationService {
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload)))
                 .build();
 
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = ProviderHttp.send(HTTP, request, ProviderHttp.utf8(MAX_JSON_RESPONSE_BYTES));
         JsonNode root = parseApiJson("FAL", response);
 
         // 同步模式直接返回 images
@@ -998,7 +902,7 @@ public class ImageGenerationService {
                     .GET()
                     .build();
 
-            HttpResponse<String> pollResp = HTTP.send(pollReq, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> pollResp = ProviderHttp.send(HTTP, pollReq, ProviderHttp.utf8(MAX_JSON_RESPONSE_BYTES));
             JsonNode pollRoot;
             try {
                 pollRoot = parseApiJson("FAL-poll", pollResp);
@@ -1052,7 +956,7 @@ public class ImageGenerationService {
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload)))
                 .build();
 
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = ProviderHttp.send(HTTP, request, ProviderHttp.utf8(MAX_JSON_RESPONSE_BYTES));
         JsonNode root = parseApiJson("SiliconFlow", response);
         JsonNode images = root.path("images");
 
@@ -1088,7 +992,7 @@ public class ImageGenerationService {
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload)))
                 .build();
 
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = ProviderHttp.send(HTTP, request, ProviderHttp.utf8(MAX_JSON_RESPONSE_BYTES));
         JsonNode root = parseApiJson("CogView", response);
         JsonNode data = root.path("data");
 
@@ -1141,20 +1045,13 @@ public class ImageGenerationService {
                 .timeout(Duration.ofSeconds(90))
                 .GET()
                 .build();
-        HttpResponse<java.io.InputStream> response =
-                HTTP.send(request, HttpResponse.BodyHandlers.ofInputStream());
+        HttpResponse<byte[]> response =
+                ProviderHttp.send(HTTP, request, ProviderHttp.bytes((int) MAX_IMAGE_BYTES));
 
         int status = response.statusCode();
         String contentType = response.headers().firstValue("content-type").orElse("");
         if (status != 200) {
-            // 错误响应也要把 body 读掉再关闭，否则连接不会归还连接池，
-            // 高频限速场景下会积压成「后面所有请求都超时」的假象。
-            String errBody;
-            try (java.io.InputStream in = response.body()) {
-                errBody = new String(in.readNBytes(600), StandardCharsets.UTF_8);
-            } catch (Exception ignored) {
-                errBody = "";
-            }
+            String errBody = new String(response.body(), 0, Math.min(600, response.body().length), StandardCharsets.UTF_8);
             // 402/429 是「限速」，不是「后端坏了」：抛专用异常，让上层不计熔断
             if (status == 402 || status == 429) {
                 long retryAfter = parseRetryAfterSeconds(response, errBody);
@@ -1167,15 +1064,14 @@ public class ImageGenerationService {
                                 + "；需要连续出图请配置 SILICONFLOW_API_KEY 等有额度的后端",
                         retryAfter);
             }
-            throw new RuntimeException("Pollinations HTTP " + status
+            String error = "Pollinations HTTP " + status
                     + (StringUtils.isBlank(contentType) ? "" : " content-type=" + contentType)
-                    + " body=" + bodyPreview(errBody, 180));
+                    + " body=" + bodyPreview(errBody, 180);
+            if (status >= 400 && status < 500 && status != 408 && status != 409)
+                throw new BackendRejectedException(error);
+            throw new RuntimeException(error);
         }
-        byte[] bytes;
-        try (java.io.InputStream in = response.body()) {
-            // 多读 1 字节判超限，不把对端给的长度直接读进内存
-            bytes = in.readNBytes((int) MAX_IMAGE_BYTES + 1);
-        }
+        byte[] bytes = response.body();
         if (bytes.length == 0) {
             throw new RuntimeException("Pollinations 返回空响应");
         }
@@ -1359,33 +1255,6 @@ public class ImageGenerationService {
             case "square_4K" -> "3840x2160";
             default -> "1024x1024";
         };
-    }
-
-    /**
-     * 安全网：在 generated-images 目录中查找最近 N 秒内生成的图片。
-     * 用于处理 HTTP 超时但图片已保存到磁盘的竞态条件。
-     */
-    private String findRecentGeneratedImage(Path imageDir, int withinSeconds) {
-        if (!Files.exists(imageDir)) {
-            return null;
-        }
-        long cutoff = System.currentTimeMillis() - withinSeconds * 1000L;
-        try (var stream = Files.list(imageDir)) {
-            return stream
-                    .filter(p -> p.toString().endsWith(".png") || p.toString().endsWith(".jpg"))
-                    .filter(p -> {
-                        try { return Files.getLastModifiedTime(p).toMillis() > cutoff; }
-                        catch (Exception e) { return false; }
-                    })
-                    .max(java.util.Comparator.comparingLong(p -> {
-                        try { return Files.getLastModifiedTime(p).toMillis(); }
-                        catch (Exception e) { return 0; }
-                    }))
-                    .map(p -> p.getFileName().toString())
-                    .orElse(null);
-        } catch (Exception e) {
-            return null;
-        }
     }
 
     static String errorJson(String message) {

@@ -3,10 +3,12 @@ package com.miniagent.agent.tool;
 import com.miniagent.common.SafeSegments;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -30,6 +32,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li>项目根（{@code user.dir}）—— 编码任务要读真实源码，这是产品能力不是漏洞；</li>
  *   <li>{@code agent.tools.allowed-read-roots} 显式列出的额外根（逗号分隔）。</li>
  * </ol>
+ * 常见密钥库、凭证文件和私钥文件在所有根下默认拒绝；添加额外根不会放宽此 deny rule。
+ * 普通源码、配置模板和公开证书不按名称中的 secret/credential 子串拒绝。
  *
  * <p><b>符号链接 / junction</b>：词法前缀比较挡不住"workspace 里放一个指向 C:\Users 的
  * junction"这类绕过（Windows 上建 junction 不需要管理员权限）。所以判定取
@@ -37,6 +41,21 @@ import java.util.concurrent.ConcurrentHashMap;
  * 再拼回未存在的尾部 —— 这样"通过 junction 新建文件"也落在真实根之外。</p>
  */
 public final class PathGuard {
+
+    private static final Set<String> SENSITIVE_DIRECTORY_NAMES = Set.of(
+            ".ssh", ".aws", ".azure", ".kube", ".gnupg", ".docker");
+    private static final Set<String> SENSITIVE_FILE_NAMES = Set.of(
+            ".netrc", ".npmrc", ".pypirc", ".htpasswd", ".git-credentials",
+            "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "kubeconfig",
+            "credentials", "credentials.json", "secrets", "secret", "token", "token.json", "access_token", "refresh_token",
+            "auth.json", "service-account.json", "service_account.json");
+    // PEM is a shared public/private container. Keep it denied without inspecting
+    // file contents; public certificates can be supplied as .crt/.cer instead.
+    private static final Set<String> PRIVATE_KEY_EXTENSIONS = Set.of(
+            ".pem", ".key", ".p12", ".pfx", ".p8", ".jks", ".keystore");
+    private static final Set<String> TEMPLATE_SUFFIXES = Set.of(".example", ".sample", ".template", ".dist");
+    private static final Set<String> CREDENTIAL_DATA_EXTENSIONS = Set.of(
+            ".json", ".yaml", ".yml", ".toml", ".ini", ".conf", ".properties");
 
     /** 由配置额外放行的根（{@code agent.tools.allowed-read-roots}）。 */
     private static final Set<Path> EXTRA_ROOTS = ConcurrentHashMap.newKeySet();
@@ -106,7 +125,17 @@ public final class PathGuard {
         if (candidate == null) {
             return false;
         }
+        Path lexical = candidate.toAbsolutePath().normalize();
+        // Check the caller-visible spelling before resolving links. A safe alias must
+        // not make a credential-named path look harmless, and a link to a credential
+        // must not make a harmless-looking path readable either.
+        if (isSensitivePath(lexical)) {
+            return false;
+        }
         Path effective = realPathOfNearestExisting(candidate);
+        if (isSensitivePath(effective)) {
+            return false;
+        }
         for (Path root : allowedRoots()) {
             if (effective.startsWith(realPathOfNearestExisting(root))) {
                 return true;
@@ -125,6 +154,13 @@ public final class PathGuard {
         if (isAllowed(candidate)) {
             return;
         }
+        Path normalized = candidate == null ? null : candidate.toAbsolutePath().normalize();
+        Path effective = normalized == null ? null : realPathOfNearestExisting(normalized);
+        if (isSensitivePath(normalized) || isSensitivePath(effective)) {
+            throw new SecurityException("拒绝访问敏感凭证或密钥路径（" + purpose + "）："
+                    + (normalized == null ? "(null)" : normalized)
+                    + "。如确需访问，请由运维将脱敏副本放入工作区；不支持直接放行密钥文件。");
+        }
         List<String> roots = new ArrayList<>();
         for (Path root : allowedRoots()) {
             roots.add(root.toString());
@@ -133,6 +169,46 @@ public final class PathGuard {
                 + (candidate == null ? "(null)" : candidate.toAbsolutePath().normalize())
                 + "。允许的根目录: " + String.join(" | ", roots)
                 + "。确实需要访问其他目录时，由运维在 agent.tools.allowed-read-roots 中显式放行。");
+    }
+
+    /**
+     * Default-deny explicit credential stores and terminal credential/private-key files.
+     * File-name rules apply only to the leaf: a business package named credentials
+     * or a SecretsService.java source must remain usable by coding tools.
+     * This is intentionally applied to both the normalized lexical path and its
+     * nearest-existing-real-path counterpart in {@link #isAllowed(Path)}.
+     */
+    private static boolean isSensitivePath(Path path) {
+        if (path == null) return false;
+        Path normalized = path.toAbsolutePath().normalize();
+        boolean previousWasConfig = false;
+        for (int index = 0; index < normalized.getNameCount(); index++) {
+            Path part = normalized.getName(index);
+            String name = part.toString().toLowerCase(Locale.ROOT);
+            if (SENSITIVE_DIRECTORY_NAMES.contains(name)) return true;
+            if (previousWasConfig && "gcloud".equals(name)) return true;
+            previousWasConfig = ".config".equals(name);
+            if (index != normalized.getNameCount() - 1 || Files.isDirectory(normalized)) continue;
+            if (isCredentialFileName(name)) return true;
+            if (PRIVATE_KEY_EXTENSIONS.stream().anyMatch(name::endsWith)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isCredentialFileName(String name) {
+        boolean template = TEMPLATE_SUFFIXES.stream().anyMatch(name::endsWith);
+        if (template) return false;
+        if (name.equals(".env") || name.startsWith(".env.")) return true;
+        if (SENSITIVE_FILE_NAMES.contains(name) || name.endsWith(".token") || name.endsWith(".secret")) return true;
+        for (String extension : CREDENTIAL_DATA_EXTENSIONS) {
+            if (!name.endsWith(extension)) continue;
+            String stem = name.substring(0, name.length() - extension.length());
+            if (Set.of("credential", "credentials", "secret", "secrets", "token", "access_token", "refresh_token")
+                    .contains(stem) || stem.endsWith(".credentials") || stem.endsWith(".secrets")) return true;
+            if (stem.equals("service-account") || stem.startsWith("service-account-")
+                    || stem.equals("service_account") || stem.startsWith("service_account_")) return true;
+        }
+        return false;
     }
 
     /**

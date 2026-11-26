@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.miniagent.agent.tool.ProcessEnv;
+import com.miniagent.agent.tool.ToolSchemaContract;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.BufferedInputStream;
@@ -20,6 +21,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.Semaphore;
@@ -38,14 +43,23 @@ public class McpStdioClient implements AutoCloseable {
     private static final int DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024;
     private static final int MAX_HEADER_BYTES = 16 * 1024;
     private static final int MAX_PENDING_REQUESTS = 256;
+    private static final int MAX_TOOLS_LIST_PAGES = 100;
+    private static final int MAX_DISCOVERED_TOOLS = 2_000;
+    private static final int DEFAULT_WRITE_TIMEOUT_SECONDS = 10;
+    private static final int CANCELLATION_WRITE_TIMEOUT_SECONDS = 2;
+
+    private record PendingRequest(long id, String method, CompletableFuture<JsonNode> response) {}
 
     private final String serverId;
     private final Process process;
     private final int maxFrameBytes;
     private final int requestTimeoutSeconds;
+    private final int writeTimeoutSeconds;
     private final AtomicLong nextId = new AtomicLong(1);
     private final ConcurrentHashMap<Long, CompletableFuture<JsonNode>> pending = new ConcurrentHashMap<>();
     private final Semaphore pendingSlots = new Semaphore(MAX_PENDING_REQUESTS);
+    /** A stalled child must not block the caller thread while writing a large stdio frame. */
+    private final ThreadPoolExecutor writer;
     private volatile boolean closed;
 
     public McpStdioClient(String serverId, Process process) {
@@ -54,11 +68,21 @@ public class McpStdioClient implements AutoCloseable {
 
     public McpStdioClient(String serverId, Process process,
                           int maxFrameBytes, int requestTimeoutSeconds) {
+        this(serverId, process, maxFrameBytes, requestTimeoutSeconds, DEFAULT_WRITE_TIMEOUT_SECONDS);
+    }
+
+    McpStdioClient(String serverId, Process process, int maxFrameBytes,
+                   int requestTimeoutSeconds, int writeTimeoutSeconds) {
         this.serverId = serverId;
         this.process = process;
         this.maxFrameBytes = Math.max(64 * 1024,
                 Math.min(64 * 1024 * 1024, maxFrameBytes));
         this.requestTimeoutSeconds = Math.max(1, Math.min(600, requestTimeoutSeconds));
+        this.writeTimeoutSeconds = Math.max(1, Math.min(60, writeTimeoutSeconds));
+        this.writer = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(64),
+                Thread.ofVirtual().name("mcp-stdio-writer-" + serverId).factory(),
+                new ThreadPoolExecutor.AbortPolicy());
         Thread.ofVirtual().name("mcp-stdio-" + serverId).start(this::readLoop);
         Thread.ofVirtual().name("mcp-stderr-" + serverId).start(this::drainStderr);
     }
@@ -123,23 +147,46 @@ public class McpStdioClient implements AutoCloseable {
     }
 
     public List<McpToolDef> listTools() throws Exception {
-        JsonNode result = await(request("tools/list", MAPPER.createObjectNode()),
-                Math.min(30, requestTimeoutSeconds));
         List<McpToolDef> out = new ArrayList<>();
-        JsonNode tools = Objects.isNull(result) ? null : result.get("tools");
-        if (Objects.isNull(tools) || !tools.isArray()) {
-            return out;
-        }
-        for (JsonNode t : tools) {
-            String name = text(t, "name");
-            if (StringUtils.isBlank(name)) {
-                continue;
+        java.util.Set<String> requestedCursors = new java.util.HashSet<>();
+        long listingDeadline = System.nanoTime()
+                + TimeUnit.SECONDS.toNanos(Math.min(requestTimeoutSeconds, 120));
+        String cursor = "";
+        for (int page = 0; page < MAX_TOOLS_LIST_PAGES; page++) {
+            if (!cursor.isBlank() && !requestedCursors.add(cursor)) {
+                throw new IllegalStateException("MCP tools/list 重复返回分页游标，拒绝无限分页: " + serverId);
             }
-            String desc = text(t, "description");
-            Map<String, Object> params = schemaToParams(t.get("inputSchema"));
-            out.add(new McpToolDef(name, Optional.ofNullable(desc).orElse(""), params));
+            ObjectNode params = MAPPER.createObjectNode();
+            if (!cursor.isBlank()) params.put("cursor", cursor);
+            long remainingNanos = listingDeadline - System.nanoTime();
+            if (remainingNanos <= 0) {
+                throw new TimeoutException("MCP tools/list discovery deadline exceeded: " + serverId);
+            }
+            int pageTimeout = (int) Math.max(1L, Math.min(30L,
+                    TimeUnit.NANOSECONDS.toSeconds(remainingNanos)));
+            JsonNode result = await(request("tools/list", params), pageTimeout);
+            JsonNode tools = Objects.isNull(result) ? null : result.get("tools");
+            if (Objects.nonNull(tools) && !tools.isArray()) {
+                throw new IllegalStateException("MCP tools/list tools 字段不是数组: " + serverId);
+            }
+            if (tools instanceof ArrayNode array) {
+                for (JsonNode t : array) {
+                    String name = text(t, "name");
+                    if (StringUtils.isBlank(name)) continue;
+                    String desc = text(t, "description");
+                    Map<String, Object> toolParams = schemaToParams(t.get("inputSchema"));
+                    out.add(new McpToolDef(name, Optional.ofNullable(desc).orElse(""), toolParams));
+                    if (out.size() > MAX_DISCOVERED_TOOLS) {
+                        throw new IllegalStateException("MCP tools/list 超过工具数量上限 "
+                                + MAX_DISCOVERED_TOOLS + ": " + serverId);
+                    }
+                }
+            }
+            String next = text(result, "nextCursor");
+            if (StringUtils.isBlank(next)) return List.copyOf(out);
+            cursor = next;
         }
-        return out;
+        throw new IllegalStateException("MCP tools/list 超过分页上限 " + MAX_TOOLS_LIST_PAGES + ": " + serverId);
     }
 
     public String callTool(String name, String argumentsJson) throws Exception {
@@ -162,18 +209,71 @@ public class McpStdioClient implements AutoCloseable {
         return !closed && process.isAlive();
     }
 
-    private JsonNode await(CompletableFuture<JsonNode> future, int timeoutSeconds)
+    private JsonNode await(PendingRequest request, int timeoutSeconds)
             throws Exception {
         try {
-            return future.get(timeoutSeconds, TimeUnit.SECONDS);
-        } catch (TimeoutException | InterruptedException e) {
-            // A caller that stopped waiting no longer owns a pending slot.
-            // Otherwise repeated cancellation against a silent server can fill
-            // the connection's entire request capacity before any timeout fires.
-            pending.values().remove(future);
-            future.cancel(true);
+            return request.response().get(timeoutSeconds, TimeUnit.SECONDS);
+        } catch (TimeoutException timeout) {
+            cancelAndInvalidate(request, "request timed out");
+            throw new TimeoutException("MCP " + request.method() + " timed out after "
+                    + timeoutSeconds + "s; cancellation was sent when possible and the stdio process was restarted; "
+                    + "remote side effects may already have happened");
+        } catch (InterruptedException interrupted) {
+            cancelAndInvalidate(request, "caller interrupted");
+            Thread.currentThread().interrupt();
+            throw interrupted;
+        }
+    }
+
+    private void cancelAndInvalidate(PendingRequest request, String reason) {
+        pending.remove(request.id(), request.response());
+        request.response().cancel(true);
+        if (!closed) {
+            ObjectNode params = MAPPER.createObjectNode();
+            params.put("requestId", request.id());
+            params.put("reason", reason);
+            ObjectNode notification = MAPPER.createObjectNode();
+            notification.put("jsonrpc", "2.0");
+            notification.put("method", "notifications/cancelled");
+            notification.set("params", params);
+            try {
+                writeFrame(notification, CANCELLATION_WRITE_TIMEOUT_SECONDS);
+                // The writer is single-threaded; waiting for writeFrame's future means
+                // the notification bytes reached the child stream before teardown begins.
+            } catch (Exception sendFailure) {
+                log.debug("MCP[{}] 无法发送取消通知；将关闭失效 stdio 连接: {}", serverId,
+                        sendFailure.getMessage());
+            }
+        }
+        // Cancellation in MCP is advisory and has no acknowledgement. Retire this child
+        // so a server that ignores the notification cannot keep doing local work forever.
+        terminateConnection("MCP request cancelled; remote outcome remains unknown");
+    }
+
+    private PendingRequest request(String method, JsonNode params) throws Exception {
+        if (closed) {
+            throw new IllegalStateException("MCP 连接已关闭");
+        }
+        if (!pendingSlots.tryAcquire()) {
+            throw new IllegalStateException("MCP pending 请求超过上限");
+        }
+        long id = nextId.getAndIncrement();
+        CompletableFuture<JsonNode> fut = new CompletableFuture<>();
+        fut.whenComplete((ignored, failure) -> pendingSlots.release());
+        pending.put(id, fut);
+        ObjectNode msg = MAPPER.createObjectNode();
+        msg.put("jsonrpc", "2.0");
+        msg.put("id", id);
+        msg.put("method", method);
+        if (Objects.nonNull(params)) msg.set("params", params);
+        try {
+            writeFrame(msg, writeTimeoutSeconds);
+        } catch (Exception e) {
+            pending.remove(id, fut);
+            fut.completeExceptionally(e);
             throw e;
         }
+        return new PendingRequest(id, method, fut);
     }
 
     private String formatCallResult(JsonNode result) throws Exception {
@@ -211,36 +311,6 @@ public class McpStdioClient implements AutoCloseable {
         return sb.isEmpty() ? MAPPER.writeValueAsString(result) : sb.toString();
     }
 
-    private CompletableFuture<JsonNode> request(String method, JsonNode params) throws Exception {
-        if (closed) {
-            throw new IllegalStateException("MCP 连接已关闭");
-        }
-        if (!pendingSlots.tryAcquire()) {
-            throw new IllegalStateException("MCP pending 请求超过上限");
-        }
-        long id = nextId.getAndIncrement();
-        CompletableFuture<JsonNode> fut = new CompletableFuture<>();
-        // Semaphore acquisition is the atomic bound; completion releases the
-        // slot for success, error, timeout, cancellation, write failure and close.
-        fut.whenComplete((ignored, failure) -> pendingSlots.release());
-        pending.put(id, fut);
-        ObjectNode msg = MAPPER.createObjectNode();
-        msg.put("jsonrpc", "2.0");
-        msg.put("id", id);
-        msg.put("method", method);
-        if (Objects.nonNull(params)) {
-            msg.set("params", params);
-        }
-        try {
-            writeFrame(msg);
-        } catch (Exception e) {
-            pending.remove(id, fut);
-            fut.completeExceptionally(e);
-            throw e;
-        }
-        return fut;
-    }
-
     private void notify(String method, JsonNode params) throws Exception {
         ObjectNode msg = MAPPER.createObjectNode();
         msg.put("jsonrpc", "2.0");
@@ -248,16 +318,49 @@ public class McpStdioClient implements AutoCloseable {
         if (Objects.nonNull(params)) {
             msg.set("params", params);
         }
-        writeFrame(msg);
+        writeFrame(msg, writeTimeoutSeconds);
     }
 
-    private synchronized void writeFrame(JsonNode msg) throws Exception {
+    private void writeFrame(JsonNode msg, int timeoutSeconds) throws Exception {
+        if (closed) throw new IllegalStateException("MCP 连接已关闭");
         byte[] body = MAPPER.writeValueAsBytes(msg);
-        OutputStream out = process.getOutputStream();
-        String header = "Content-Length: " + body.length + "\r\n\r\n";
-        out.write(header.getBytes(StandardCharsets.UTF_8));
-        out.write(body);
-        out.flush();
+        if (body.length > maxFrameBytes) {
+            throw new IllegalArgumentException("MCP 请求帧超过配置上限: " + body.length);
+        }
+        Future<?> write;
+        try {
+            write = writer.submit(() -> {
+                OutputStream out = process.getOutputStream();
+                String header = "Content-Length: " + body.length + "\r\n\r\n";
+                out.write(header.getBytes(StandardCharsets.UTF_8));
+                out.write(body);
+                out.flush();
+                return null;
+            });
+        } catch (java.util.concurrent.RejectedExecutionException saturated) {
+            terminateConnection("MCP stdio writer queue saturated");
+            throw new IllegalStateException("MCP stdio writer queue saturated; connection closed", saturated);
+        }
+        try {
+            write.get(Math.max(1, timeoutSeconds), TimeUnit.SECONDS);
+        } catch (TimeoutException timeout) {
+            write.cancel(true);
+            terminateConnection("MCP stdio write timed out");
+            throw new TimeoutException("MCP stdio 写入超时；连接已关闭");
+        } catch (InterruptedException interrupted) {
+            write.cancel(true);
+            terminateConnection("MCP stdio write interrupted");
+            throw interrupted;
+        } catch (ExecutionException | java.util.concurrent.RejectedExecutionException failure) {
+            terminateConnection("MCP stdio write failed");
+            Throwable cause = failure instanceof ExecutionException execution
+                    ? execution.getCause() : failure;
+            if (cause instanceof java.io.IOException io) {
+                throw new TimeoutException("MCP stdio 写入失败/管道不可用，连接已关闭: " + io.getMessage());
+            }
+            if (cause instanceof Exception exception) throw exception;
+            throw new IllegalStateException("MCP stdio 写入失败", cause);
+        }
     }
 
     private void readLoop() {
@@ -278,8 +381,7 @@ public class McpStdioClient implements AutoCloseable {
             // Terminate the child as well as failing waiters so a broken MCP server
             // cannot remain orphaned after its reader has exited.
             boolean wasClosed = closed;
-            closed = true;
-            if (!wasClosed && process.isAlive()) process.destroyForcibly();
+            terminateConnection(wasClosed ? "MCP reader stopped" : "MCP reader stopped after protocol failure");
             pending.forEach((id, fut) -> fut.completeExceptionally(new IllegalStateException("MCP 连接关闭")));
             pending.clear();
         }
@@ -397,31 +499,16 @@ public class McpStdioClient implements AutoCloseable {
     }
 
     private Map<String, Object> schemaToParams(JsonNode schema) {
-        Map<String, Object> params = new LinkedHashMap<>();
-        if (Objects.isNull(schema) || !schema.isObject()) {
-            return params;
-        }
-        JsonNode props = schema.get("properties");
-        JsonNode required = schema.get("required");
-        java.util.Set<String> req = new java.util.HashSet<>();
-        if (required instanceof ArrayNode arr) {
-            arr.forEach(n -> req.add(n.asText()));
-        }
-        if (Objects.nonNull(props) && props.isObject()) {
-            props.fields().forEachRemaining(e -> {
-                JsonNode def = e.getValue();
-                Map<String, Object> p = new LinkedHashMap<>();
-                p.put("type", def.path("type").asText("string"));
-                if (def.has("description")) {
-                    p.put("description", def.get("description").asText());
-                }
-                if (req.contains(e.getKey())) {
-                    p.put("required", true);
-                }
-                params.put(e.getKey(), p);
-            });
-        }
-        return params;
+        return ToolSchemaContract.fromJsonSchema(schema);
+    }
+
+    private void terminateConnection(String reason) {
+        if (closed) return;
+        closed = true;
+        try { writer.shutdownNow(); } catch (Exception ignored) {}
+        try { process.destroyForcibly(); } catch (Exception ignored) {}
+        pending.forEach((id, future) -> future.completeExceptionally(new IllegalStateException(reason)));
+        pending.clear();
     }
 
     private static String text(JsonNode n, String field) {
@@ -431,10 +518,7 @@ public class McpStdioClient implements AutoCloseable {
 
     @Override
     public void close() {
-        closed = true;
-        try { process.destroyForcibly(); } catch (Exception ignored) {}
-        pending.forEach((id, fut) -> fut.completeExceptionally(new IllegalStateException("closed")));
-        pending.clear();
+        terminateConnection("closed");
     }
 
     public record McpToolDef(String name, String description, Map<String, Object> parameters) {}

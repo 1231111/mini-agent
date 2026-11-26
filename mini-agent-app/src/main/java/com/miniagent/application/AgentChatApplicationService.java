@@ -663,7 +663,7 @@ public class AgentChatApplicationService {
         RunStatus runStatus = RunStatus.SUCCESS;
 
         contextCompressor.setCurrentSession(sessionId);
-        builtinTools.clearToolCache();
+        builtinTools.clearToolCache(sessionId);
         if (Objects.nonNull(diagnosticCollector)) {
             diagnosticCollector.clear();
         }

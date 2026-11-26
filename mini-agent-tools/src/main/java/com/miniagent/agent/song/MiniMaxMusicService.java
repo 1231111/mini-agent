@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.tool.impl.MiniMaxMusicParams;
+import com.miniagent.agent.security.GuardedHttpClient;
+import com.miniagent.agent.security.GuardedMediaDownloader;
 import com.miniagent.config.storage.MediaStorage;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
@@ -38,6 +40,7 @@ public class MiniMaxMusicService {
     private static final int LYRICS_TIMEOUT_SECONDS = 45;
     private static final int MUSIC_TIMEOUT_SECONDS = 150;
     private static final int DOWNLOAD_TIMEOUT_SECONDS = 60;
+    private static final int MAX_AUDIO_BYTES = 32 * 1024 * 1024;
     private static final int SNIPPET = 300;
     private static final int LYRICS_MAX = 3500;
     private static final int PROMPT_MAX = 2000;
@@ -50,6 +53,8 @@ public class MiniMaxMusicService {
 
     @Autowired
     private MediaStorage mediaStorage;
+    @Autowired
+    private GuardedMediaDownloader mediaDownloader;
 
     @Value("${minimax.music.api-key:${MINIMAX_API_KEY:}}")
     private String apiKey;
@@ -151,13 +156,23 @@ public class MiniMaxMusicService {
             return errorJson(ToolErrorCode.EMPTY_RESULT, "响应没有音频",
                     snippet(resp));
         }
-        byte[] bytes = audioField.startsWith("http")
-                ? download(audioField) : decodeHex(audioField);
+        byte[] bytes;
+        try {
+            bytes = audioField.startsWith("http") ? download(audioField) : decodeHex(audioField);
+        } catch (GuardedHttpClient.NetworkRejectedException rejected) {
+            return errorJson(ToolErrorCode.PERMISSION_DENIED,
+                    "MiniMax 返回的音频下载地址违反网络安全策略",
+                    "已拒绝访问 localhost、私有网络或重定向到私有网络的地址");
+        }
         if (bytes == null || bytes.length == 0) {
             if (audioField.startsWith("http")) {
-                return "![生成的歌曲](" + audioField + ")";
+                return errorJson(ToolErrorCode.EXECUTION_FAILED, "音频下载或格式校验失败",
+                        "未将未经验证的远端音频链接作为成功交付");
             }
             return errorJson(ToolErrorCode.EMPTY_RESULT, "音频解码失败", snippet(resp));
+        }
+        if (!GuardedMediaDownloader.isRecognizedAudio(bytes)) {
+            return errorJson(ToolErrorCode.EXECUTION_FAILED, "音频格式校验失败", "响应未包含已识别的音频容器");
         }
         String filename = "minimax_" + System.currentTimeMillis() + "_"
                 + ThreadLocalRandom.current().nextInt(10000) + ".mp3";
@@ -170,9 +185,6 @@ public class MiniMaxMusicService {
                     noOwner.getMessage());
         } catch (Exception e) {
             log.warn("MiniMax 落盘失败: {}", e.getMessage());
-            if (audioField.startsWith("http")) {
-                return "![生成的歌曲](" + audioField + ")";
-            }
             return errorJson(ToolErrorCode.INTERNAL_ERROR, "落盘失败", e.getMessage());
         }
     }
@@ -208,17 +220,26 @@ public class MiniMaxMusicService {
         }
     }
 
-    private byte[] download(String url) {
+    private byte[] download(String url) throws GuardedHttpClient.NetworkRejectedException {
         try {
-            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
-                    .timeout(Duration.ofSeconds(DOWNLOAD_TIMEOUT_SECONDS))
-                    .GET()
-                    .build();
-            HttpResponse<byte[]> response = HTTP.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            GuardedMediaDownloader.Download response = mediaDownloader.download(
+                    url, Duration.ofSeconds(DOWNLOAD_TIMEOUT_SECONDS), MAX_AUDIO_BYTES);
             if (response.statusCode() != 200) {
                 return null;
             }
-            return response.body();
+            String mime = response.contentType().split(";", 2)[0].trim().toLowerCase(java.util.Locale.ROOT);
+            if (!mime.isEmpty() && !mime.startsWith("audio/")
+                    && !"application/octet-stream".equals(mime)) {
+                log.warn("下载 MiniMax 音频返回非音频 MIME {}", mime);
+                return null;
+            }
+            byte[] bytes = response.body();
+            return GuardedMediaDownloader.isRecognizedAudio(bytes) ? bytes : null;
+        } catch (GuardedHttpClient.NetworkRejectedException rejected) {
+            throw rejected;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return null;
         } catch (Exception e) {
             log.warn("下载 MiniMax 音频失败: {}", e.getMessage());
             return null;
@@ -230,7 +251,7 @@ public class MiniMaxMusicService {
             return null;
         }
         String s = hex.trim();
-        if (s.length() < 2 || (s.length() % 2) != 0) {
+        if (s.length() < 2 || s.length() > (long) MAX_AUDIO_BYTES * 2 || (s.length() % 2) != 0) {
             return null;
         }
         byte[] out = new byte[s.length() / 2];

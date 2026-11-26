@@ -46,8 +46,10 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
     public static ToolResult failure(ToolErrorCode code, String message, boolean retriable,
                                      String rawTextOverride) {
         ToolErrorCode actual = code == null ? ToolErrorCode.INTERNAL_ERROR : code;
-        ToolStatus status = actual == ToolErrorCode.TIMEOUT ? ToolStatus.TIMEOUT
+        ToolStatus status = actual == ToolErrorCode.OUTCOME_UNKNOWN ? ToolStatus.UNKNOWN
+                : actual == ToolErrorCode.TIMEOUT ? ToolStatus.TIMEOUT
                 : actual == ToolErrorCode.CANCELLED ? ToolStatus.CANCELLED : ToolStatus.FAILED;
+        if (actual == ToolErrorCode.OUTCOME_UNKNOWN || actual == ToolErrorCode.CANCELLED) retriable = false;
         String msg = Objects.requireNonNullElse(message, "工具执行失败");
         String raw = rawTextOverride != null && !rawTextOverride.isBlank()
                 ? rawTextOverride
@@ -59,8 +61,20 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
 
     public static ToolResult unknown(String message, String rawText) {
         String msg = Objects.requireNonNullElse(message, "工具结果未知");
-        String raw = rawText == null ? "{\"success\":false,\"status\":\"unknown\",\"errorCode\":\"OUTCOME_UNKNOWN\",\"error\":"
-                + TextNode.valueOf(msg) + "}" : rawText;
+        com.fasterxml.jackson.databind.node.ObjectNode normalized = JSON.createObjectNode();
+        if (rawText != null) {
+            try {
+                JsonNode source = JSON.readTree(rawText);
+                if (source instanceof com.fasterxml.jackson.databind.node.ObjectNode object) normalized = object.deepCopy();
+                else normalized.put("detail", rawText);
+            } catch (Exception ignored) { normalized.put("detail", rawText); }
+        }
+        normalized.put("success", false);
+        normalized.put("status", "unknown");
+        normalized.put("errorCode", ToolErrorCode.OUTCOME_UNKNOWN.name());
+        normalized.put("error", msg);
+        normalized.put("retriable", false);
+        String raw = normalized.toString();
         return new ToolResult(ToolStatus.UNKNOWN, ToolErrorCode.OUTCOME_UNKNOWN, msg, data(raw), false, "", raw);
     }
 
@@ -93,11 +107,12 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
                 boolean failed = (node.has("success") && !node.path("success").asBoolean(true))
                         || (!node.has("success") && node.has("error")
                         && !node.path("error").asText("").isBlank());
-                if ("unknown".equals(status)) {
+                if ("unknown".equals(status)
+                        || "OUTCOME_UNKNOWN".equalsIgnoreCase(node.path("errorCode").asText(node.path("error_code").asText("")))) {
                     return unknown(node.path("error").asText("工具结果未知"), rawText);
                 }
                 if ("timeout".equals(status)) {
-                    return failure(ToolErrorCode.TIMEOUT, node.path("error").asText("工具超时"), true,
+                    return failure(ToolErrorCode.TIMEOUT, node.path("error").asText("工具超时"), retryPolicy(node, true),
                             rawText);
                 }
                 if ("cancelled".equals(status) || "canceled".equals(status)) {
@@ -123,7 +138,8 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
                                     node.path("error_code").asText("")))
                             : classifyLegacyFailure(message);
                     if (code == null || code == ToolErrorCode.NONE) code = ToolErrorCode.EXECUTION_FAILED;
-                    boolean retriable = isRetriable(code);
+                    boolean retriable = code != ToolErrorCode.OUTCOME_UNKNOWN && code != ToolErrorCode.CANCELLED
+                            && retryPolicy(node, isRetriable(code));
                     // Normalize legacy failures centrally while preserving unknown
                     // diagnostic fields. Tool consumers always get one contract.
                     com.fasterxml.jackson.databind.node.ObjectNode normalized = node.isObject()
@@ -132,6 +148,7 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
                     normalized.put("success", false);
                     normalized.put("status", code == ToolErrorCode.TIMEOUT ? "timeout"
                             : code == ToolErrorCode.CANCELLED ? "cancelled"
+                            : code == ToolErrorCode.OUTCOME_UNKNOWN ? "unknown"
                             : status.isBlank() ? "failed" : status);
                     normalized.put("errorCode", code.name());
                     normalized.put("error", message);
@@ -163,6 +180,12 @@ public record ToolResult(ToolStatus status, ToolErrorCode errorCode, String mess
             return failure(ToolErrorCode.EXECUTION_FAILED, rawText, false);
         }
         return success(rawText);
+    }
+
+    /** A producer's explicit boolean is authoritative; only legacy text uses defaults. */
+    private static boolean retryPolicy(JsonNode result, boolean defaultValue) {
+        JsonNode explicit = result.get("retriable");
+        return explicit != null && explicit.isBoolean() ? explicit.booleanValue() : defaultValue;
     }
 
     /** exec_command 契约行：{@code exit_code=N} 必须在第一行。 */

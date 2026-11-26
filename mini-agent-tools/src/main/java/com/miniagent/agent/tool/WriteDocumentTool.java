@@ -1,6 +1,7 @@
 package com.miniagent.agent.tool;
 
 import com.miniagent.agent.tool.impl.*;
+import com.miniagent.common.io.AtomicFiles;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -58,6 +59,10 @@ public class WriteDocumentTool {
 
     private String handle(WriteDocumentParams params) {
         try {
+            DocumentResourceBudget.requireText(params.getContent(), "document content");
+            DocumentResourceBudget.requireText(params.getTitle(), "title");
+            DocumentResourceBudget.requireText(params.getAuthor(), "author");
+            DocumentResourceBudget.requireText(params.getHeaders(), "headers");
             String format = params.getFormatOrDefault();
             log.info("统一文档写入: 格式={}, 路径={}", format, params.getPath());
             
@@ -93,9 +98,18 @@ public class WriteDocumentTool {
         docxParams.setContent(params.getContent());
         docxParams.setAuthor(params.getAuthor());
         docxParams.setAddHeaderFooter(false);
+        docxParams.setStyle(params.getStyle());
+        docxParams.setFontFamily(params.getFontFamily());
+        docxParams.setFontSize(params.getFontSize());
+        docxParams.setTitleFontSize(params.getTitleFontSize());
+        docxParams.setTextColor(params.getTextColor());
+        docxParams.setTitleColor(params.getTitleColor());
+        docxParams.setAlignment(params.getAlignment());
+        docxParams.setLineSpacing(params.getLineSpacing());
+        docxParams.setJustify(params.getJustify());
         
         // 如果内容包含HTML标签，使用HTML转Word
-        if (params.getContent() != null && params.getContent().contains("<")) {
+        if (params.getContent() != null && params.getContent().matches("(?is).*<\\s*(?:!doctype|html|body|p|div|h[1-6]|ul|ol|li|table|strong|b|em|i|br)(?:\\s|>|/).*")) {
             return writeHtmlToDocx(params);
         }
         
@@ -175,7 +189,8 @@ public class WriteDocumentTool {
         try {
             java.nio.file.Path targetPath = resolvePath(path);
             java.nio.file.Files.createDirectories(targetPath.getParent());
-            java.nio.file.Files.writeString(targetPath, content, java.nio.charset.StandardCharsets.UTF_8);
+            byte[] bytes = content.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            DocumentResourceBudget.write(targetPath, out -> out.write(bytes));
             
             long fileSize = targetPath.toFile().length();
             return String.format(

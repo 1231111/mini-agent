@@ -18,6 +18,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.io.IOException;
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
@@ -33,6 +35,9 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Flow;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.apache.commons.lang3.StringUtils;
@@ -70,6 +75,66 @@ public class WebSearchService {
     // web_search is clamped to 8,000 characters downstream; reserve space for web facts.
     static final int MAX_IMAGE_CANDIDATE_JSON_CHARS = 3000;
     private static final int MAX_CONTENT_LENGTH = 15000; // web_extract 单页最大字符数
+    static final int MAX_PROVIDER_RESPONSE_BYTES = 2 * 1024 * 1024;
+
+    /** Request timeout remains active until this bounded subscriber completes the full response body. */
+    static HttpResponse.BodyHandler<String> boundedUtf8Body(int maxBytes) {
+        if (maxBytes < 1) throw new IllegalArgumentException("maxBytes must be positive");
+        return info -> new HttpResponse.BodySubscriber<>() {
+            private final CompletableFuture<String> result = new CompletableFuture<>();
+            private final ByteArrayOutputStream bytes = new ByteArrayOutputStream(Math.min(maxBytes, 8192));
+            private Flow.Subscription subscription;
+            @Override public CompletionStage<String> getBody() { return result; }
+            @Override public void onSubscribe(Flow.Subscription incoming) {
+                subscription = incoming;
+                long declared = info.headers().firstValueAsLong("Content-Length").orElse(-1);
+                if (declared > maxBytes) {
+                    incoming.cancel();
+                    result.completeExceptionally(new IOException("HTTP response body exceeds limit " + maxBytes));
+                } else incoming.request(1);
+            }
+            @Override public void onNext(List<ByteBuffer> items) {
+                if (result.isDone()) return;
+                for (ByteBuffer item : items) {
+                    if ((long) bytes.size() + item.remaining() > maxBytes) {
+                        subscription.cancel();
+                        result.completeExceptionally(new IOException("HTTP response body exceeds limit " + maxBytes));
+                        return;
+                    }
+                    byte[] chunk = new byte[item.remaining()];
+                    item.get(chunk);
+                    bytes.writeBytes(chunk);
+                }
+                subscription.request(1);
+            }
+            @Override public void onError(Throwable error) { result.completeExceptionally(error); }
+            @Override public void onComplete() { result.complete(bytes.toString(StandardCharsets.UTF_8)); }
+        };
+    }
+
+    static HttpResponse<String> sendProviderRequest(HttpRequest request, String provider)
+            throws IOException, InterruptedException {
+        var pending = HTTP.sendAsync(request, boundedUtf8Body(MAX_PROVIDER_RESPONSE_BYTES));
+        HttpResponse<String> response;
+        try {
+            response = pending.get(request.timeout().orElse(Duration.ofSeconds(30)).toMillis(),
+                    java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException timedOut) {
+            pending.cancel(true);
+            throw new java.net.http.HttpTimeoutException(provider + " response body deadline exceeded");
+        } catch (InterruptedException interrupted) {
+            pending.cancel(true);
+            throw interrupted;
+        } catch (java.util.concurrent.ExecutionException failed) {
+            Throwable cause = failed.getCause();
+            if (cause instanceof IOException io) throw io;
+            throw new IOException(provider + " request failed", cause);
+        }
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new IOException(provider + " HTTP " + response.statusCode());
+        }
+        return response;
+    }
     private static final Pattern META_TAG = Pattern.compile("(?is)<meta\\b[^>]*>");
     private static final Pattern TITLE_TAG = Pattern.compile("(?is)<title\\b[^>]*>(.*?)</title\\s*>");
     private static final Pattern HTML_ATTRIBUTE = Pattern.compile("(?is)([\\w:-]+)\\s*=\\s*(['\\\"])(.*?)\\2");
@@ -269,7 +334,7 @@ public class WebSearchService {
                 .timeout(searchTimeout(Duration.ofSeconds(8)))
                 .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload)))
                 .build();
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = sendProviderRequest(request, "Web provider");
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
             throw new IOException("DeepSeek Search HTTP " + response.statusCode());
         }
@@ -299,7 +364,7 @@ public class WebSearchService {
                     .timeout(extractionTimeout(Duration.ofSeconds(12)))
                     .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload)))
                     .build();
-            HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> response = sendProviderRequest(request, "Web provider");
             if (response.statusCode() < 200 || response.statusCode() >= 300) return null;
             JsonNode page = MAPPER.readTree(response.body());
             String title = page.path("title").asText("");
@@ -537,7 +602,7 @@ public class WebSearchService {
                     .POST(HttpRequest.BodyPublishers.ofString(MAPPER.writeValueAsString(payload)))
                     .build();
 
-            HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> response = sendProviderRequest(request, "Web provider");
             JsonNode root = MAPPER.readTree(response.body());
             JsonNode results = root.path("results");
 
@@ -653,7 +718,7 @@ public class WebSearchService {
 
     /** Package seam to verify the real request and response mapping without calling a provider. */
     JsonNode executeTavilySearch(HttpRequest request) throws Exception {
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = sendProviderRequest(request, "Web provider");
         if (response.statusCode() < 200 || response.statusCode() >= 300)
             throw new IllegalStateException("Tavily Search HTTP " + response.statusCode());
         return MAPPER.readTree(response.body());
@@ -750,7 +815,7 @@ public class WebSearchService {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = sendProviderRequest(request, "Web provider");
         JsonNode root = MAPPER.readTree(response.body());
         return mapBingResults(root, currentSearchZone());
     }
@@ -791,7 +856,7 @@ public class WebSearchService {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = sendProviderRequest(request, "Web provider");
         JsonNode root = MAPPER.readTree(response.body());
         return mapGoogleResults(root, currentSearchZone());
     }
@@ -829,7 +894,7 @@ public class WebSearchService {
                 .GET()
                 .build();
 
-        HttpResponse<String> response = HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = sendProviderRequest(request, "Web provider");
         JsonNode root = MAPPER.readTree(response.body());
         return mapDuckDuckGoResults(root, query, limit);
     }

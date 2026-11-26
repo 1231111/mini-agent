@@ -133,7 +133,7 @@ public final class ToolConcurrencyPolicy {
      * uncertain timeout so operators can reconcile the remote state.
      */
     private static final ToolExecutionProfile MCP_EXTERNAL_WRITE = new ToolExecutionProfile(
-            60, 15, 10, ToolConcurrencyScope.GLOBAL, "", "",
+            120, 15, 10, ToolConcurrencyScope.SHARED_RESOURCE, "", "mcp:unconfigured",
             ToolTimeoutRecovery.ABORT,
             "，MCP 远端状态未知；先到服务端核验操作结果，禁止直接重试", 0);
 
@@ -277,7 +277,8 @@ public final class ToolConcurrencyPolicy {
             return ToolExecutionProfile.DEFAULT;
         }
         if (name.startsWith("mcp__")) {
-            return MCP_EXTERNAL_WRITE;
+            return MCP_EXTERNAL_WRITE.withConcurrency(ToolConcurrencyScope.SHARED_RESOURCE,
+                    "", "mcp:" + mcpServerId(name));
         }
         return switch (name) {
             // ── 只读 ──
@@ -329,6 +330,22 @@ public final class ToolConcurrencyPolicy {
             // ── 浏览器动作族（click / type / press / scroll / navigate） ──
             default -> name.startsWith("browser_") ? BROWSER : ToolExecutionProfile.DEFAULT;
         };
+    }
+
+    /** Builds the MCP call budget and an isolated lock key for one configured server. */
+    public static ToolExecutionProfile mcpExternalWriteProfile(String serverId, int requestTimeoutSeconds) {
+        long boundedTimeout = Math.max(1, Math.min(600, requestTimeoutSeconds));
+        String key = serverId == null || serverId.isBlank() ? "unconfigured" : serverId.trim();
+        return MCP_EXTERNAL_WRITE.withBudget(boundedTimeout)
+                .withConcurrency(ToolConcurrencyScope.SHARED_RESOURCE, "", "mcp:" + key);
+    }
+
+    private static String mcpServerId(String registeredName) {
+        String name = registeredName == null ? "" : registeredName;
+        int separator = name.indexOf("__", "mcp__".length());
+        if (separator < 0) return "unconfigured";
+        String id = name.substring("mcp__".length(), separator);
+        return id.isBlank() ? "unconfigured" : id;
     }
 
     /**

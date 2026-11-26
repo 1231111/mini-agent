@@ -29,13 +29,19 @@ final class BoundedOutputCapture {
     private final AtomicLong total = new AtomicLong();
     private final AtomicBoolean truncated = new AtomicBoolean();
     private final AtomicBoolean overflowed = new AtomicBoolean();
+    private final Runnable onOverflow;
 
     BoundedOutputCapture(int captureLimit, int hardLimit) {
+        this(captureLimit, hardLimit, () -> { });
+    }
+
+    BoundedOutputCapture(int captureLimit, int hardLimit, Runnable onOverflow) {
         // 不要在这里加"最小值兜底"：调用方给的是显式契约，被悄悄抬高会让
         // "上限到底是多少"变得不可预测（测试也证明不了边界行为）。
         this.captureLimit = Math.max(1, captureLimit);
         this.hardLimit = Math.max(this.captureLimit, hardLimit);
         this.buf = new java.io.ByteArrayOutputStream(Math.min(this.captureLimit, 64 * 1024));
+        this.onOverflow = onOverflow;
     }
 
     void write(byte[] chunk, int length) {
@@ -43,8 +49,8 @@ final class BoundedOutputCapture {
             return;
         }
         long after = total.addAndGet(length);
-        if (after > hardLimit) {
-            overflowed.set(true);
+        if (after > hardLimit && overflowed.compareAndSet(false, true)) {
+            onOverflow.run();
         }
         synchronized (this) {
             int room = captureLimit - buf.size();

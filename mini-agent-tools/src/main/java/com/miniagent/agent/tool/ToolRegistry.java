@@ -6,8 +6,6 @@ import org.springframework.stereotype.Component;
 
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
-import dev.langchain4j.model.chat.request.json.JsonArraySchema;
-import dev.langchain4j.model.chat.request.json.JsonStringSchema;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -276,76 +274,13 @@ public class ToolRegistry {
      * 将 Tool 转换为 LangChain4j 的 ToolSpecification。
      * LangChain4j 0.x 曾提供 {@code ToolParameters}；自 1.x 起改用 {@link JsonObjectSchema}（见 ToolSpecification.Builder#parameters）。
      */
-    @SuppressWarnings("unchecked")
     private ToolSpecification toSpecification(Tool tool) {
         ToolSpecification.Builder builder = ToolSpecification.builder()
                 .name(tool.getName())
                 .description(tool.getDescription());
 
         Map<String, Object> params = tool.getParameters();
-        if (Objects.nonNull(params) && !params.isEmpty()) {
-            JsonObjectSchema.Builder schema = JsonObjectSchema.builder()
-                    .additionalProperties(false);
-            List<String> required = new ArrayList<>();
-
-            for (Map.Entry<String, Object> entry : params.entrySet()) {
-                String paramName = entry.getKey();
-                Object paramDef = entry.getValue();
-
-                if (paramDef instanceof Map) {
-                    Map<String, Object> def = (Map<String, Object>) paramDef;
-                    String type = String.valueOf(def.getOrDefault("type", "string")).toLowerCase(Locale.ROOT);
-                    String desc = Objects.toString(def.getOrDefault("description", ""), "");
-                    boolean isRequired = Boolean.TRUE.equals(def.get("required"));
-                    List<String> allowedValues = def.get("enum") instanceof Collection<?> values
-                            ? values.stream().map(Objects::toString).toList() : List.of();
-
-                    switch (type) {
-                        case "array" -> schema.addProperty(paramName, JsonArraySchema.builder()
-                                .description(desc).items(new JsonStringSchema()).build());
-                        case "integer" -> {
-                            if (StringUtils.isBlank(desc)) {
-                                schema.addIntegerProperty(paramName);
-                            } else {
-                                schema.addIntegerProperty(paramName, desc);
-                            }
-                        }
-                        case "number" -> {
-                            if (StringUtils.isBlank(desc)) {
-                                schema.addNumberProperty(paramName);
-                            } else {
-                                schema.addNumberProperty(paramName, desc);
-                            }
-                        }
-                        case "boolean" -> {
-                            if (StringUtils.isBlank(desc)) {
-                                schema.addBooleanProperty(paramName);
-                            } else {
-                                schema.addBooleanProperty(paramName, desc);
-                            }
-                        }
-                        default -> {
-                            if (!allowedValues.isEmpty()) {
-                                schema.addEnumProperty(paramName, allowedValues, desc);
-                            } else if (StringUtils.isBlank(desc)) {
-                                schema.addStringProperty(paramName);
-                            } else {
-                                schema.addStringProperty(paramName, desc);
-                            }
-                        }
-                    }
-
-                    if (isRequired) {
-                        required.add(paramName);
-                    }
-                }
-            }
-
-            if (!required.isEmpty()) {
-                schema.required(required);
-            }
-            builder.parameters(schema.build());
-        }
+        if (Objects.nonNull(params) && !params.isEmpty()) builder.parameters(ToolSchemaContract.modelSchema(params));
 
         return builder.build();
     }

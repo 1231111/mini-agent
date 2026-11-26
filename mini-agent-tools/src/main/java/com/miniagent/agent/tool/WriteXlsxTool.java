@@ -3,6 +3,7 @@ package com.miniagent.agent.tool;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.tool.impl.WriteXlsxParams;
+import com.miniagent.common.io.AtomicFiles;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.xssf.usermodel.*;
@@ -24,7 +25,9 @@ public class WriteXlsxTool {
     @Autowired
     private ToolRegistry toolRegistry;
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final ObjectMapper MAPPER = new ObjectMapper()
+            .enable(com.fasterxml.jackson.databind.DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
+            .enable(com.fasterxml.jackson.databind.DeserializationFeature.USE_BIG_INTEGER_FOR_INTS);
 
     @PostConstruct
     public void register() {
@@ -40,30 +43,32 @@ public class WriteXlsxTool {
 
     public String handle(WriteXlsxParams params) {
         try {
+            DocumentResourceBudget.requireText(params.getHeaders(), "Excel headers JSON");
+            DocumentResourceBudget.requireText(params.getData(), "Excel data JSON");
+            org.apache.poi.ss.util.WorkbookUtil.validateSheetName(params.getSheetNameOrDefault());
+            List<String> headers = params.getHeaders() == null || params.getHeaders().isBlank() ? List.of()
+                    : MAPPER.readValue(params.getHeaders(), new TypeReference<List<String>>() {});
+            List<List<Object>> data = params.getData() == null || params.getData().isBlank() ? List.of()
+                    : MAPPER.readValue(params.getData(), new TypeReference<List<List<Object>>>() {});
+            validateWorkbookInput(headers, data);
             // 解析路径
             Path targetPath = resolveXlsxPath(params.getPath());
             
             // 创建Excel工作簿
-            XSSFWorkbook workbook = new XSSFWorkbook();
+            try (XSSFWorkbook workbook = new XSSFWorkbook()) {
             
             // 创建工作表
             XSSFSheet sheet = workbook.createSheet(params.getSheetNameOrDefault());
             
             // 创建表头
-            String headersJson = params.getHeaders();
             int headerRowIndex = 0;
-            if (headersJson != null && !headersJson.isEmpty()) {
-                List<String> headers = MAPPER.readValue(
-                        headersJson, new TypeReference<List<String>>() {});
+            if (!headers.isEmpty()) {
                 createHeaderRow(sheet, headers, headerRowIndex);
                 headerRowIndex = 1;
             }
             
             // 创建数据行
-            String dataJson = params.getData();
-            if (dataJson != null && !dataJson.isEmpty()) {
-                List<List<Object>> data = MAPPER.readValue(
-                        dataJson, new TypeReference<List<List<Object>>>() {});
+            if (!data.isEmpty()) {
                 createDataRows(sheet, data, headerRowIndex);
             }
             
@@ -73,27 +78,56 @@ public class WriteXlsxTool {
             }
             
             // 保存工作簿
-            try (FileOutputStream out = new FileOutputStream(targetPath.toFile())) {
-                workbook.write(out);
-            }
-            
-            workbook.close();
+            DocumentResourceBudget.write(targetPath, workbook::write);
             
             long fileSize = targetPath.toFile().length();
             log.info("Excel表格已创建: {} ({} 字节)", targetPath.toAbsolutePath(), fileSize);
             
             return String.format(
                     "{\"success\":true,\"path\":\"%s\",\"size\":%d,\"rows\":%d,\"columns\":%d,\"message\":\"Excel表格创建成功\"}",
-                    targetPath.toString().replace("\\", "/"),
+                    BuiltinTools.jsonEscape(targetPath.toString().replace("\\", "/")),
                     fileSize,
                     sheet.getLastRowNum() + 1,
                     sheet.getRow(0) != null ? sheet.getRow(0).getPhysicalNumberOfCells() : 0
             );
+            }
             
         } catch (Exception e) {
             log.error("创建Excel表格失败", e);
-            return "{\"success\":false,\"error\":\"创建Excel表格失败: " + e.getMessage() + "\"}";
+            return ToolResult.failure(ToolErrorCode.EXECUTION_FAILED, "创建Excel表格失败: " + e.getMessage(), false).legacyText();
         }
+    }
+
+    private static void validateWorkbookInput(List<String> headers, List<List<Object>> data) {
+        if (headers == null || data == null) throw new IllegalArgumentException("Excel headers/data 必须是数组，不能为 null");
+        long rows = (headers.isEmpty() ? 0L : 1L) + data.size();
+        if (rows > DocumentResourceBudget.MAX_SPREADSHEET_ROWS)
+            throw new IllegalArgumentException("Excel 行数超过上限 " + DocumentResourceBudget.MAX_SPREADSHEET_ROWS);
+        if (headers.size() > DocumentResourceBudget.MAX_SPREADSHEET_COLUMNS)
+            throw new IllegalArgumentException("Excel 列数超过上限 " + DocumentResourceBudget.MAX_SPREADSHEET_COLUMNS);
+        long cells = headers.size(), text = 0;
+        for (String header : headers) text += validateCell(header);
+        for (List<Object> row : data) {
+            DocumentResourceBudget.requireActive();
+            if (row == null) throw new IllegalArgumentException("Excel 每一行必须是数组，不能为 null");
+            if (row.size() > DocumentResourceBudget.MAX_SPREADSHEET_COLUMNS)
+                throw new IllegalArgumentException("Excel 列数超过上限 " + DocumentResourceBudget.MAX_SPREADSHEET_COLUMNS);
+            cells += row.size();
+            if (cells > DocumentResourceBudget.MAX_SPREADSHEET_CELLS)
+                throw new IllegalArgumentException("Excel 单元格数超过上限 " + DocumentResourceBudget.MAX_SPREADSHEET_CELLS);
+            for (Object value : row) text += validateCell(value);
+            if (text > DocumentResourceBudget.MAX_CONTENT_CHARS)
+                throw new IllegalArgumentException("Excel 单元格文本总量超过上限 " + DocumentResourceBudget.MAX_CONTENT_CHARS);
+        }
+    }
+
+    private static int validateCell(Object value) {
+        if (value != null && !(value instanceof String) && !(value instanceof Number) && !(value instanceof Boolean))
+            throw new IllegalArgumentException("Excel 单元格仅支持字符串、数字、布尔值或 null，不支持嵌套数组/对象");
+        String text = value == null ? "" : value.toString();
+        if (text.length() > DocumentResourceBudget.MAX_CELL_CHARS)
+            throw new IllegalArgumentException("Excel 单元格文本超过上限 " + DocumentResourceBudget.MAX_CELL_CHARS);
+        return text.length();
     }
 
     /**
@@ -102,15 +136,15 @@ public class WriteXlsxTool {
     private void createHeaderRow(XSSFSheet sheet, List<String> headers, int rowIndex) {
         XSSFRow headerRow = sheet.createRow(rowIndex);
         
+        XSSFCellStyle headerStyle = sheet.getWorkbook().createCellStyle();
+        XSSFFont headerFont = sheet.getWorkbook().createFont();
+        headerFont.setBold(true);
+        headerStyle.setFont(headerFont);
         for (int i = 0; i < headers.size(); i++) {
             XSSFCell cell = headerRow.createCell(i);
             cell.setCellValue(headers.get(i));
             
             // 设置表头样式
-            XSSFCellStyle headerStyle = sheet.getWorkbook().createCellStyle();
-            XSSFFont headerFont = sheet.getWorkbook().createFont();
-            headerFont.setBold(true);
-            headerStyle.setFont(headerFont);
             cell.setCellStyle(headerStyle);
         }
     }
@@ -120,6 +154,7 @@ public class WriteXlsxTool {
      */
     private void createDataRows(XSSFSheet sheet, List<List<Object>> data, int startRowIndex) {
         for (int i = 0; i < data.size(); i++) {
+            DocumentResourceBudget.requireActive();
             List<Object> rowData = data.get(i);
             XSSFRow row = sheet.createRow(startRowIndex + i);
             
@@ -129,8 +164,11 @@ public class WriteXlsxTool {
                 
                 if (value == null) {
                     cell.setCellValue("");
-                } else if (value instanceof Number) {
-                    cell.setCellValue(((Number) value).doubleValue());
+                } else if (value instanceof Number number) {
+                    java.math.BigDecimal decimal = new java.math.BigDecimal(number.toString());
+                    // Excel stores only 15 significant decimal digits; preserve identifiers exactly as text.
+                    if (decimal.precision() > 15 || !Double.isFinite(number.doubleValue())) cell.setCellValue(number.toString());
+                    else cell.setCellValue(number.doubleValue());
                 } else if (value instanceof Boolean) {
                     cell.setCellValue((Boolean) value);
                 } else {
@@ -155,6 +193,7 @@ public class WriteXlsxTool {
         
         // 调整每列宽度
         for (int i = 0; i < maxColumns; i++) {
+            DocumentResourceBudget.requireActive();
             sheet.autoSizeColumn(i);
             
             // 确保最小宽度

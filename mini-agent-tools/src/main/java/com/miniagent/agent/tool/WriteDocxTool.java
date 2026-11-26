@@ -3,6 +3,7 @@ package com.miniagent.agent.tool;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.tool.impl.DocumentStyle;
 import com.miniagent.agent.tool.impl.WriteDocxParams;
+import com.miniagent.common.io.AtomicFiles;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.wp.usermodel.HeaderFooterType;
@@ -10,7 +11,8 @@ import org.apache.poi.xwpf.usermodel.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
-import java.io.FileOutputStream;
+import java.math.BigInteger;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.*;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -44,11 +46,15 @@ public class WriteDocxTool {
 
     public String handle(WriteDocxParams params) {
         try {
+            DocumentResourceBudget.requireText(params.getContent(), "Word content");
+            DocumentResourceBudget.requireText(params.getTitle(), "title");
+            DocumentResourceBudget.requireText(params.getAuthor(), "author");
             // 解析路径
             Path targetPath = resolveDocxPath(params.getPath());
             
             // 创建Word文档
-            XWPFDocument document = new XWPFDocument();
+            try (XWPFDocument document = new XWPFDocument()) {
+            initializeStyles(document);
             
             // 设置文档属性
             if (params.getTitle() != null && !params.getTitle().isEmpty()) {
@@ -73,11 +79,7 @@ public class WriteDocxTool {
             }
             
             // 保存文档
-            try (FileOutputStream out = new FileOutputStream(targetPath.toFile())) {
-                document.write(out);
-            }
-            
-            document.close();
+            DocumentResourceBudget.write(targetPath, document::write);
             
             long fileSize = targetPath.toFile().length();
             log.info("Word文档已创建: {} ({} 字节)", targetPath.toAbsolutePath(), fileSize);
@@ -87,10 +89,11 @@ public class WriteDocxTool {
                     targetPath.toString().replace("\\", "/"),
                     fileSize
             );
+            }
             
         } catch (Exception e) {
             log.error("创建Word文档失败", e);
-            return "{\"success\":false,\"error\":\"创建Word文档失败: " + e.getMessage() + "\"}";
+            return ToolResult.failure(ToolErrorCode.EXECUTION_FAILED, "创建Word文档失败: " + e.getMessage(), false).legacyText();
         }
     }
 
@@ -98,6 +101,8 @@ public class WriteDocxTool {
      * 添加文档内容（支持简单的Markdown格式，使用样式配置）
      */
     private void addContent(XWPFDocument document, String content, DocumentStyle style) {
+        if (content.chars().filter(ch -> ch == '\n').count() + 1 > DocumentResourceBudget.MAX_BLOCKS)
+            throw new IllegalArgumentException("Word 段落数超过上限 " + DocumentResourceBudget.MAX_BLOCKS);
         String[] lines = content.split("\n");
         
         for (String line : lines) {
@@ -119,7 +124,7 @@ public class WriteDocxTool {
             // 处理列表
             else if (line.startsWith("- ") || line.startsWith("* ")) {
                 addListItem(document, line.substring(2), false, style);
-            } else if (line.startsWith("1. ") || line.startsWith("2. ")) {
+            } else if (line.matches("\\d+\\. .+")) {
                 addListItem(document, line.substring(line.indexOf(".") + 2), true, style);
             }
             // 处理引用
@@ -236,10 +241,8 @@ public class WriteDocxTool {
         
         // 设置段落格式
         if (style.getLineSpacing() != null) {
-            // 使用setSpacingBetweenLines设置行间距
-            // 简化实现：只设置行间距值，不设置lineRule
-            paragraph.getCTP().addNewPPr().addNewSpacing()
-                    .setLine((int) (style.getLineSpacing() * 240));  // 240 twips per line
+            // POI reuses the paragraph properties rather than introducing a second w:pPr.
+            paragraph.setSpacingBetween(style.getLineSpacing());
         }
         if (style.getSpaceBefore() != null) {
             paragraph.setSpacingBefore((int) (style.getSpaceBefore() * 20)); // 20 twips per point
@@ -277,6 +280,7 @@ public class WriteDocxTool {
     private void addListItem(XWPFDocument document, String text, boolean numbered, DocumentStyle style) {
         XWPFParagraph paragraph = document.createParagraph();
         paragraph.setStyle(numbered ? "ListNumber" : "ListBullet");
+        applyListNumbering(document, paragraph, numbered);
         
         // 设置列表缩进
         if (style.getListIndent() != null && style.getListIndent() > 0) {
@@ -334,9 +338,59 @@ public class WriteDocxTool {
         footerParagraph.setAlignment(ParagraphAlignment.CENTER);
         XWPFRun footerRun = footerParagraph.createRun();
         footerRun.setText("第 ");
-        footerRun = footerParagraph.createRun();
+        footerParagraph.getCTP().addNewFldSimple().setInstr(" PAGE ");
         footerRun = footerParagraph.createRun();
         footerRun.setText(" 页");
+    }
+
+    /** Install actual OOXML style and numbering definitions before referencing their identifiers. */
+    static void initializeStyles(XWPFDocument document) {
+        XWPFStyles styles = document.createStyles();
+        for (int level = 0; level <= 4; level++) {
+            String id = level == 0 ? "Normal" : "Heading" + level;
+            if (styles.styleExist(id)) continue;
+            CTStyle definition = CTStyle.Factory.newInstance();
+            definition.setStyleId(id);
+            definition.setType(STStyleType.PARAGRAPH);
+            definition.addNewName().setVal(level == 0 ? "Normal" : "heading " + level);
+            if (level > 0) {
+                definition.addNewBasedOn().setVal("Normal");
+                definition.addNewPPr().addNewOutlineLvl().setVal(BigInteger.valueOf(level - 1));
+                var runProperties = definition.addNewRPr();
+                runProperties.addNewB();
+                runProperties.addNewSz().setVal(BigInteger.valueOf(level == 1 ? 48 : level == 2 ? 40 : level == 3 ? 32 : 28));
+            }
+            styles.addStyle(new XWPFStyle(definition));
+        }
+        for (String id : List.of("ListBullet", "ListNumber")) {
+            if (styles.styleExist(id)) continue;
+            CTStyle definition = CTStyle.Factory.newInstance();
+            definition.setStyleId(id);
+            definition.setType(STStyleType.PARAGRAPH);
+            definition.addNewName().setVal(id);
+            definition.addNewBasedOn().setVal("Normal");
+            styles.addStyle(new XWPFStyle(definition));
+        }
+    }
+
+    static void applyListNumbering(XWPFDocument document, XWPFParagraph paragraph, boolean numbered) {
+        XWPFNumbering numbering = document.getNumbering();
+        if (numbering == null) numbering = document.createNumbering();
+        BigInteger abstractId = BigInteger.valueOf(numbered ? 1 : 0);
+        if (numbering.getAbstractNum(abstractId) == null) {
+            CTAbstractNum definition = CTAbstractNum.Factory.newInstance();
+            definition.setAbstractNumId(abstractId);
+            CTLvl level = definition.addNewLvl();
+            level.setIlvl(BigInteger.ZERO);
+            level.addNewStart().setVal(BigInteger.ONE);
+            level.addNewNumFmt().setVal(numbered ? STNumberFormat.DECIMAL : STNumberFormat.BULLET);
+            level.addNewLvlText().setVal(numbered ? "%1." : "•");
+            numbering.addAbstractNum(new XWPFAbstractNum(definition));
+        }
+        BigInteger numId = abstractId.add(BigInteger.ONE);
+        if (!numbering.numExist(numId)) numbering.addNum(abstractId, numId);
+        paragraph.setNumID(numId);
+        paragraph.setNumILvl(BigInteger.ZERO);
     }
 
     /**

@@ -13,7 +13,7 @@ import lombok.EqualsAndHashCode;
 @EqualsAndHashCode(callSuper = true)
 public class EditDocumentParams extends ToolParams {
 
-    @ToolParamSchema(description = "文件路径（支持 .docx/.pptx/.xlsx/.md/.html/.txt）", required = true)
+    @ToolParamSchema(description = "文件路径（支持 .docx/.md/.html/.txt；不支持 .pptx/.xlsx 编辑）", required = true)
     private String path;
 
     @ToolParamSchema(description = "修改指令（自然语言描述要修改的内容）", required = true)
@@ -31,7 +31,7 @@ public class EditDocumentParams extends ToolParams {
     @ToolParamSchema(description = "内容（用于替换或追加内容，可选）")
     private String newContent;
 
-    @ToolParamSchema(description = "操作类型：replace/append/prepend/insert_after/insert_before/delete（可选，默认智能判断）")
+    @ToolParamSchema(description = "操作类型：replace/append/prepend/delete（可选；replace 使用 findText/replaceText，其他操作使用 newContent）", allowedValues = {"replace", "append", "prepend", "delete"})
     private String operation;
 
     /**

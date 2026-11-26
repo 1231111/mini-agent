@@ -235,7 +235,8 @@ public class McpToolBridge {
                     .sideEffect(com.miniagent.agent.tool.ToolSideEffect.EXTERNAL_WRITE)
                     .idempotent(false)
                     .cancellable(false)
-                    .executionProfile(ToolConcurrencyPolicy.profileOf(regName))
+                    .executionProfile(ToolConcurrencyPolicy.mcpExternalWriteProfile(
+                            serverId, cfg.getRequestTimeoutSeconds()))
                     .resultHandler(args -> invoke(serverId, toolName, args))
                     .build());
             names.add(regName);

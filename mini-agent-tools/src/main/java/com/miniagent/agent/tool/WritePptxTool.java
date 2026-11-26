@@ -3,6 +3,7 @@ package com.miniagent.agent.tool;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.tool.impl.WritePptxParams;
+import com.miniagent.common.io.AtomicFiles;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.xslf.usermodel.*;
 import org.springframework.stereotype.Component;
@@ -24,49 +25,88 @@ public class WritePptxTool {
 
     public String handle(WritePptxParams params) {
         try {
+            DocumentResourceBudget.requireText(params.getTitle(), "PowerPoint title");
+            DocumentResourceBudget.requireText(params.getAuthor(), "PowerPoint author");
+            DocumentResourceBudget.requireText(params.getSlides(), "PowerPoint slides JSON");
+            String size = params.getSizeOrDefault();
+            if (!"wide".equalsIgnoreCase(size) && !"standard".equalsIgnoreCase(size))
+                throw new IllegalArgumentException("PowerPoint size 只支持 wide/standard");
+            List<Map<String, Object>> slides = params.getSlides() == null || params.getSlides().isBlank() ? List.of()
+                    : MAPPER.readValue(params.getSlides(), new TypeReference<List<Map<String, Object>>>() {});
+            validateSlides(slides);
             // 解析路径
             Path targetPath = resolvePptxPath(params.getPath());
             
             // 创建PowerPoint演示文稿
-            XMLSlideShow presentation = new XMLSlideShow();
+            try (XMLSlideShow presentation = new XMLSlideShow()) {
+            if (params.getTitle() != null) presentation.getProperties().getCoreProperties().setTitle(params.getTitle());
+            if (params.getAuthor() != null) presentation.getProperties().getCoreProperties().setCreator(params.getAuthor());
             
             // 设置幻灯片尺寸
             if ("wide".equalsIgnoreCase(params.getSizeOrDefault())) {
-                presentation.setPageSize(new java.awt.Dimension(12192, 6858)); // 16:9
+                presentation.setPageSize(new java.awt.Dimension(960, 540)); // POI dimensions are points, 16:9
             } else {
-                presentation.setPageSize(new java.awt.Dimension(9144, 6858)); // 4:3
+                presentation.setPageSize(new java.awt.Dimension(720, 540)); // 4:3
             }
             
             // 解析幻灯片内容
-            String slidesJson = params.getSlides();
-            if (slidesJson != null && !slidesJson.isEmpty()) {
-                List<Map<String, Object>> slides = MAPPER.readValue(
-                        slidesJson, new TypeReference<List<Map<String, Object>>>() {});
+            if (!slides.isEmpty()) {
                 
                 // 创建幻灯片
                 for (Map<String, Object> slideData : slides) {
+                    DocumentResourceBudget.requireActive();
                     createSlide(presentation, slideData);
                 }
             }
             
             // 保存演示文稿
-            try (FileOutputStream out = new FileOutputStream(targetPath.toFile())) {
-                presentation.write(out);
-            }
+            DocumentResourceBudget.write(targetPath, presentation::write);
             
             long fileSize = targetPath.toFile().length();
             log.info("PowerPoint演示文稿已创建: {} ({} 字节)", targetPath.toAbsolutePath(), fileSize);
             
             return String.format(
                     "{\"success\":true,\"path\":\"%s\",\"size\":%d,\"slides\":%d,\"message\":\"PowerPoint演示文稿创建成功\"}",
-                    targetPath.toString().replace("\\", "/"),
+                    BuiltinTools.jsonEscape(targetPath.toString().replace("\\", "/")),
                     fileSize,
                     presentation.getSlides().size()
             );
+            }
             
         } catch (Exception e) {
             log.error("创建PowerPoint演示文稿失败", e);
-            return "{\"success\":false,\"error\":\"创建PowerPoint演示文稿失败: " + e.getMessage() + "\"}";
+            return ToolResult.failure(ToolErrorCode.EXECUTION_FAILED, "创建PowerPoint演示文稿失败: " + e.getMessage(), false).legacyText();
+        }
+    }
+
+    private static void validateSlides(List<Map<String, Object>> slides) {
+        if (slides == null) throw new IllegalArgumentException("PowerPoint slides 必须是数组，不能为 null");
+        if (slides.size() > DocumentResourceBudget.MAX_SLIDES)
+            throw new IllegalArgumentException("PowerPoint 幻灯片数超过上限 " + DocumentResourceBudget.MAX_SLIDES);
+        long chars = 0, blocks = 0;
+        for (Map<String, Object> slide : slides) {
+            DocumentResourceBudget.requireActive();
+            if (slide == null) throw new IllegalArgumentException("PowerPoint 每张幻灯片必须是对象，不能为 null");
+            Object layout = slide.get("layout");
+            if (layout != null && !"title_and_content".equals(layout))
+                throw new IllegalArgumentException("PowerPoint 当前只支持 title_and_content 布局");
+            for (String field : List.of("title", "notes")) {
+                Object value = slide.get(field);
+                if (value != null && !(value instanceof String)) throw new IllegalArgumentException("PowerPoint " + field + " 必须是字符串");
+                if (value instanceof String text) { chars += text.length(); blocks += text.lines().count(); }
+            }
+            Object content = slide.get("content");
+            if (content instanceof String text) { chars += text.length(); blocks += text.lines().count(); }
+            else if (content instanceof List<?> items) {
+                if (items.size() > DocumentResourceBudget.MAX_SLIDE_ITEMS)
+                    throw new IllegalArgumentException("PowerPoint 单页条目数超过上限 " + DocumentResourceBudget.MAX_SLIDE_ITEMS);
+                for (Object item : items) {
+                    if (!(item instanceof String text)) throw new IllegalArgumentException("PowerPoint 列表条目必须是字符串");
+                    chars += text.length(); blocks += Math.max(1L, text.lines().count());
+                }
+            } else if (content != null) throw new IllegalArgumentException("PowerPoint content 必须是字符串或字符串数组");
+            if (chars > DocumentResourceBudget.MAX_CONTENT_CHARS || blocks > DocumentResourceBudget.MAX_BLOCKS)
+                throw new IllegalArgumentException("PowerPoint 文本或段落数量超过文档安全预算");
         }
     }
 
@@ -89,7 +129,7 @@ public class WritePptxTool {
         // 创建内容
         Object content = slideData.get("content");
         if (content != null) {
-            if (content instanceof String) {
+            if (content instanceof String && !((String) content).isEmpty()) {
                 // 文本内容
                 createTextContent(slide, (String) content);
             } else if (content instanceof List) {
@@ -125,20 +165,19 @@ public class WritePptxTool {
         
         // 如果占位符不存在，手动创建文本框
         if (titleShape == null) {
-            java.awt.Rectangle anchor = new java.awt.Rectangle(50, 50, 900, 100);
+            java.awt.geom.Rectangle2D anchor = new java.awt.geom.Rectangle2D.Double(36, 30,
+                    slide.getSlideShow().getPageSize().getWidth() - 72, 70);
             titleShape = slide.createTextBox();
             titleShape.setAnchor(anchor);
             titleShape.setText(title);
         }
         
         // 设置标题样式
-        XSLFTextParagraph paragraph = titleShape.getTextParagraphs().get(0);
-        // PowerPoint中设置对齐方式 - 使用段落属性
-        // 注意：XSLFTextParagraph可能没有setAlign方法，这里简化处理
-        
-        XSLFTextRun run = paragraph.getTextRuns().get(0);
-        run.setBold(true);
-        run.setFontSize(44.0);
+        for (XSLFTextParagraph paragraph : titleShape.getTextParagraphs())
+            for (XSLFTextRun run : paragraph.getTextRuns()) {
+                run.setBold(true);
+                run.setFontSize(44.0);
+            }
         
         return titleShape;
     }
@@ -163,19 +202,17 @@ public class WritePptxTool {
         
         // 如果占位符不存在，手动创建文本框
         if (contentShape == null) {
-            java.awt.Rectangle anchor = new java.awt.Rectangle(50, 180, 900, 400);
+            java.awt.geom.Rectangle2D anchor = new java.awt.geom.Rectangle2D.Double(36, 120,
+                    slide.getSlideShow().getPageSize().getWidth() - 72,
+                    slide.getSlideShow().getPageSize().getHeight() - 156);
             contentShape = slide.createTextBox();
             contentShape.setAnchor(anchor);
             contentShape.setText(content);
         }
         
         // 设置内容样式
-        XSLFTextParagraph paragraph = contentShape.getTextParagraphs().get(0);
-        // PowerPoint中设置对齐方式 - 使用段落属性
-        // 注意：XSLFTextParagraph可能没有setAlign方法，这里简化处理
-        
-        XSLFTextRun run = paragraph.getTextRuns().get(0);
-        run.setFontSize(24.0);
+        for (XSLFTextParagraph paragraph : contentShape.getTextParagraphs())
+            for (XSLFTextRun run : paragraph.getTextRuns()) run.setFontSize(24.0);
     }
 
     /**
@@ -194,7 +231,9 @@ public class WritePptxTool {
         
         // 如果占位符不存在，手动创建文本框
         if (contentShape == null) {
-            java.awt.Rectangle anchor = new java.awt.Rectangle(50, 180, 900, 400);
+            java.awt.geom.Rectangle2D anchor = new java.awt.geom.Rectangle2D.Double(36, 120,
+                    slide.getSlideShow().getPageSize().getWidth() - 72,
+                    slide.getSlideShow().getPageSize().getHeight() - 156);
             contentShape = slide.createTextBox();
             contentShape.setAnchor(anchor);
         }
@@ -221,19 +260,14 @@ public class WritePptxTool {
      * 创建备注
      */
     private void createNotes(XSLFSlide slide, String notes) {
-        XSLFNotes notesShape = slide.getNotes();
-        if (notesShape != null) {
-            // 获取备注的文本段落
-            List<List<XSLFTextParagraph>> paragraphs = notesShape.getTextParagraphs();
-            if (paragraphs != null && !paragraphs.isEmpty() && !paragraphs.get(0).isEmpty()) {
-                // 修改第一个段落的文本
-                XSLFTextParagraph paragraph = paragraphs.get(0).get(0);
-                List<XSLFTextRun> runs = paragraph.getTextRuns();
-                if (runs != null && !runs.isEmpty()) {
-                    runs.get(0).setText(notes);
-                }
+        XSLFNotes notesShape = slide.getSlideShow().getNotesSlide(slide);
+        for (XSLFShape shape : notesShape.getShapes()) {
+            if (shape instanceof XSLFTextShape text && text.getTextType() == org.apache.poi.sl.usermodel.Placeholder.BODY) {
+                text.setText(notes);
+                return;
             }
         }
+        notesShape.createTextBox().setText(notes);
     }
 
     /**
