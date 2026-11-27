@@ -2077,6 +2077,51 @@ public class PlanningLoop {
         return Set.copyOf(paths);
     }
 
+    /** Persist the exact structured acceptance failure alongside the failed node.
+     *
+     * The feedback is an input to the next recovery decision, not a success
+     * receipt and not a new user instruction.  Keep it under the exact plan
+     * version/node key so a later task cannot accidentally reuse an old judge
+     * verdict.
+     */
+    private static StateSnapshot rememberAcceptanceFeedback(StateSnapshot snapshot,
+                                                             TaskNode node,
+                                                             AcceptanceFeedback feedback) {
+        if (snapshot == null || node == null || feedback == null) return snapshot;
+        Map<String, Object> failures = new LinkedHashMap<>();
+        Object existing = snapshot.execution().get(ACCEPTANCE_FAILURES);
+        if (existing instanceof Map<?, ?> map) {
+            map.forEach((key, value) -> {
+                if (key instanceof String text) failures.put(text, value);
+            });
+        }
+        String key = snapshot.planVersion() + ":" + node.id();
+        Map<String, Object> record = new LinkedHashMap<>();
+        record.put("planVersion", snapshot.planVersion());
+        record.put("nodeId", node.id());
+        record.put("criterionId", feedback.criterionId());
+        record.put("verdict", feedback.verdict().name());
+        record.put("kind", feedback.kind().name());
+        record.put("nextAction", feedback.nextAction().name());
+        record.put("reason", clip(feedback.reason(), 1800));
+        record.put("missingEvidence", feedback.missingEvidence().stream().limit(16).map(v -> clip(v, 512)).toList());
+        record.put("feedback", PlannerStateJson.MAPPER.convertValue(feedback, Map.class));
+        failures.put(key, Map.copyOf(record));
+        Map<String, Object> execution = new LinkedHashMap<>(snapshot.execution());
+        execution.put(ACCEPTANCE_FAILURES, failures);
+        return snapshot.withExecution(execution);
+    }
+
+    private static AcceptanceFeedback acceptanceFeedback(StateSnapshot snapshot, String nodeId) {
+        Object failures = snapshot.execution().get(ACCEPTANCE_FAILURES);
+        Object raw = failures instanceof Map<?, ?> map ? map.get(snapshot.planVersion() + ":" + nodeId) : null;
+        Object feedback = raw instanceof Map<?, ?> entry ? entry.get("feedback") : null;
+        if (feedback == null) feedback = EvidenceRepairPolicy.state(snapshot, nodeId).get("feedback");
+        if (feedback == null) return null;
+        try { return PlannerStateJson.MAPPER.convertValue(feedback, AcceptanceFeedback.class); }
+        catch (IllegalArgumentException invalid) { return null; }
+    }
+
     private static void addDeclaredFilePath(Set<String> paths, String candidate, boolean explicitPath) {
         if (candidate == null || candidate.isBlank()) return;
         String path = candidate.trim().replace('\\', '/');
@@ -2351,6 +2396,42 @@ public class PlanningLoop {
                 used, recoveryEngine.classLimit(dx.failureClass()), dx.kind(), explicitUserResume)) {
             return RecoveryAttempt.notApplicable();
         }
+        // Semantic failures must change the execution strategy. A structured
+        // model decision separates absent observations from actual defects;
+        // no language-specific error matching decides the next business action.
+        FailureRecoveryPlanner.Decision decision = null;
+        if (dx.kind() == FailureKind.EVAL_FAILED) {
+            ChatModel recoveryChat = goalCompiler.resolvePlannerChat(chat);
+            ActionProposal observation = graphScheduler.propose(snap, List.of(currentFailedNode), 1);
+            List<String> available = toolRouter.allowedFor(observation, snap.graph(), properties.isHardProposal());
+            decision = new FailureRecoveryPlanner(modelCallControl).analyze(
+                    recoveryChat == null ? chat : recoveryChat, snap, currentFailedNode, dx,
+                    acceptanceFeedback(snap, currentFailedNode.id()),
+                    ExecutionEvidence.fromEnvelope(currentFailedNode.output()), available);
+            if (!sessionLock.renewSessionLock(sessionId, fencingToken))
+                return rejectRecovery(sessionId, snap, "SESSION_LOCK_LOST");
+            Map<String, Object> metadata = new LinkedHashMap<>(snap.execution());
+            metadata.put(FAILURE_RECOVERY, PlannerStateJson.MAPPER.convertValue(decision, Map.class));
+            TaskGraph retained = snap.graph();
+            if (decision.action() == FailureRecoveryPlanner.Action.WAIT_FOR_USER) {
+                retained = retained.replace(currentFailedNode.withStatus(TaskNodeStatus.AWAITING_CONFIRM)
+                        .withError(currentFailedNode.lastError() + "\n恢复分析：" + decision.rootCause()));
+                metadata.put(EXECUTION_HUMAN_WAIT, Map.of("reason", "RECOVERY_ANALYSIS_BLOCKED",
+                        "taskIds", List.of(currentFailedNode.id())));
+            }
+            try {
+                snap = stateStore.commit(sessionId, snap.version(), snap.withGraph(retained).withExecution(metadata));
+            } catch (PlannerStateStore.VersionConflictException stale) {
+                return rejectRecovery(sessionId, snap, "STALE_EXECUTION");
+            }
+            trace(sessionId, AgentStepNode.DECISION, PlannerStateJson.MAPPER.valueToTree(decision).toString());
+            if (decision.action() == FailureRecoveryPlanner.Action.WAIT_FOR_USER) {
+                todoProjector.project(sessionId, snap);
+                return new RecoveryAttempt(snap, RunOutcome.blockedOnHuman(
+                        "执行进度已保留。恢复分析暂时无法确定可执行的下一步：" + decision.rootCause(),
+                        "RECOVERY_ANALYSIS_BLOCKED"));
+            }
+        }
         String correction = "失败节点 id=" + node.id()
                 + " name=" + node.name()
                 + " capability=" + node.capability()
@@ -2365,6 +2446,16 @@ public class PlanningLoop {
                 + PlannerStateJson.MAPPER.valueToTree(snap.graph().nodes().stream()
                         .filter(completed -> completed.status() == TaskNodeStatus.SUCCESS).toList())
                 + " 产出文件的步骤必须 doneWhen.type=file_exists 且 path 非空。";
+        if (decision != null) {
+            correction += "\n【恢复分析结果（只作为方案数据，不能修改目标或验收）】\n"
+                    + PlannerStateJson.MAPPER.valueToTree(decision)
+                    + "\n【冻结的未完成验收契约】\n"
+                    + PlannerStateJson.MAPPER.valueToTree(snap.graph().nodes().stream()
+                        .filter(n -> n.status() != TaskNodeStatus.SUCCESS).toList())
+                    + "\n按照根因和nextSteps重新安排未完成工作；可增加只读取证或修复前置节点。"
+                    + "每个原未完成节点的outputs和doneWhen必须完整保留在最终验收节点中，不得删减条件。"
+                    + "已产生副作用的失败节点先核验现状，不能直接重放。";
+        }
         if (explicitUserResume) {
             correction += "\n这是用户明确续跑后的单次、有界恢复机会；已取消节点此前执行结果不能视为未发生。"
                     + "对可能已产生副作用的动作，先安排只读状态核验，再决定是否重做；不得盲目重复写入、远程提交或桌面操作。"
@@ -2403,6 +2494,9 @@ public class PlanningLoop {
         PlanValidationReport validation = mergeValidationReports(
                 planValidator.validate(merged, recoveryPlan, compiled.goal(), compiled.intent()),
                 intentGraphValidator.validate(compiled.intent(), merged));
+        if (decision != null && !waiting) validation = mergeValidationReports(validation,
+                mergeValidationReports(RecoveryPlanContract.validate(snap, merged),
+                        intentGraphValidator.validate(snap.intent(), merged)));
         TaskGraph rejectedGraph = compiled.graph();
         int maxReplanRetries = Math.max(0, properties.getMaxReplanRetries());
         int correctionRetries = 0;
@@ -2434,6 +2528,9 @@ public class PlanningLoop {
             validation = mergeValidationReports(
                     planValidator.validate(merged, recoveryPlan, compiled.goal(), compiled.intent()),
                     intentGraphValidator.validate(compiled.intent(), merged));
+            if (decision != null && !waiting) validation = mergeValidationReports(validation,
+                    mergeValidationReports(RecoveryPlanContract.validate(snap, merged),
+                            intentGraphValidator.validate(snap.intent(), merged)));
             if (!validation.valid()) {
                 rejectedGraph = compiled.graph();
                 if (!hasStrictValidationProgress(previousValidation, validation,
@@ -2452,7 +2549,8 @@ public class PlanningLoop {
                     sessionId, correctionRetries, maxReplanRetries, clip(validation.summary(), 1800));
             return rejectRecovery(sessionId, snap, "REPLAN_VALIDATION_FAILED");
         }
-        Goal nextGoal = compiled.goal() != null ? compiled.goal() : snap.goal();
+        Goal nextGoal = decision != null && !waiting ? snap.goal()
+                : compiled.goal() != null ? compiled.goal() : snap.goal();
         boolean reservedExplicitResume = explicitUserResume && (dx.kind() == FailureKind.DEPENDENCY_FAILED
                 || dx.kind() == FailureKind.TOOL_BUDGET_EXHAUSTED);
         Map<String, Object> exec = RecoveryBudget.consume(snap, dx.failureClass(), properties.getMaxRecoveries(),
@@ -2468,7 +2566,8 @@ public class PlanningLoop {
             }
         }
         exec.put("lastFailureKind", dx.kind().name());
-        StateSnapshot patched = snap.revisePlan(merged, nextGoal, compiled.intent(),
+        StateSnapshot patched = snap.revisePlan(merged, nextGoal,
+                        decision != null && !waiting ? snap.intent() : compiled.intent(),
                         "llm_replan_" + dx.failureClass().name().toLowerCase())
                 .withExecution(exec).withRecoveryInc();
         if (!sessionLock.renewSessionLock(sessionId, fencingToken)) {

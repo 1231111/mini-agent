@@ -3,6 +3,7 @@ package com.miniagent.agent.planner;
 import com.miniagent.agent.todo.AcceptanceFeedback;
 import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.core.ModelCallControl;
+import com.miniagent.agent.core.TokenUsageTracker;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
@@ -16,6 +17,9 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.times;
@@ -151,6 +155,48 @@ class FailureRecoveryPlannerContractTest {
                         node.id(), "", "failed", "replan"), null, "", List.of("read_file"));
         assertThat(decision.action()).isEqualTo(FailureRecoveryPlanner.Action.WAIT_FOR_USER);
         verify(model, times(1)).chat(any(ChatRequest.class));
+    }
+
+    @Test
+    void executionControlCanStopRecoveryBeforeAnyProviderCall() {
+        StateSnapshot snapshot = state();
+        TaskNode node = snapshot.graph().byId("inspect");
+        ChatModel model = mock(ChatModel.class);
+        ExecutionControl control = mock(ExecutionControl.class);
+        when(control.afterModelTokens(snapshot.sessionId(), 0))
+                .thenReturn(ExecutionControl.StopReason.CANCELLED);
+
+        assertThatThrownBy(() -> new FailureRecoveryPlanner(null, control).analyze(model, snapshot, node,
+                new FailureDiagnosis(FailureClass.REWRITE_GRAPH, FailureKind.EVAL_FAILED,
+                        node.id(), "", "failed", "replan"), null, "", List.of("read_file")))
+                .isInstanceOf(ModelCallControl.StoppedException.class);
+        verify(model, org.mockito.Mockito.never()).chat(any(ChatRequest.class));
+    }
+
+    @Test
+    void completedRecoveryCallAccountsUsageAndPostCallStopCannotAdvanceTheGraph() {
+        StateSnapshot snapshot = state();
+        TaskNode node = snapshot.graph().byId("inspect");
+        ChatModel model = mock(ChatModel.class);
+        ChatResponse response = mock(ChatResponse.class);
+        when(response.aiMessage()).thenReturn(AiMessage.from("{}"));
+        when(model.chat(any(ChatRequest.class))).thenReturn(response);
+        ExecutionControl control = mock(ExecutionControl.class);
+        when(control.afterModelTokens(snapshot.sessionId(), 0)).thenReturn(ExecutionControl.StopReason.NONE);
+        when(control.afterModelTokens(eq(snapshot.sessionId()), anyLong(), anyString(), anyLong(), anyLong()))
+                .thenReturn(ExecutionControl.StopReason.DEADLINE_EXCEEDED);
+        TokenUsageTracker.clear(snapshot.sessionId());
+        try {
+            assertThatThrownBy(() -> new FailureRecoveryPlanner(null, control).analyze(model, snapshot, node,
+                    new FailureDiagnosis(FailureClass.REWRITE_GRAPH, FailureKind.EVAL_FAILED,
+                            node.id(), "", "failed", "replan"), null, "", List.of("read_file")))
+                    .isInstanceOf(ModelCallControl.StoppedException.class);
+            assertThat(TokenUsageTracker.get(snapshot.sessionId()).llmCalls).isEqualTo(1);
+            assertThat(TokenUsageTracker.get(snapshot.sessionId()).totalTokens()).isPositive();
+            verify(control).afterModelTokens(eq(snapshot.sessionId()), anyLong(), anyString(), anyLong(), anyLong());
+        } finally {
+            TokenUsageTracker.clear(snapshot.sessionId());
+        }
     }
 
     private static StateSnapshot state() {

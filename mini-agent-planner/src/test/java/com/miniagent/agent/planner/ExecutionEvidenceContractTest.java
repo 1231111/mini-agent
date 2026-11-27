@@ -128,6 +128,63 @@ class ExecutionEvidenceContractTest {
     }
 
     @Test
+    void persistedEnvelopeRetainsObservationIdentityOrderAndIncompleteMetadata() throws Exception {
+        String envelope = ExecutionEvidence.build("entry found", List.of(
+                call("search", "search_code", "{\"path\":\"index.html\"}"),
+                result("search", "search_code", "index.html:6202:start"),
+                call("missing", "read_file", "{}")));
+        ExecutionEvidence parsed = ExecutionEvidence.fromEnvelope(envelope);
+
+        assertThat(parsed.modelClaims()).isEqualTo("entry found");
+        assertThat(parsed.observations()).hasSize(1);
+        assertThat(parsed.observations().get(0).toolName()).isEqualTo("search_code");
+        assertThat(parsed.observations().get(0).resultMessageIndex()).isGreaterThan(
+                parsed.observations().get(0).callMessageIndex());
+        assertThat(parsed.completeness().complete()).isFalse();
+        assertThat(parsed.completeness().unpairedCallCount()).isEqualTo(1);
+        assertThat(parsed.completeness().callCount()).isEqualTo(2);
+    }
+
+    @Test
+    void malformedDuplicateAndOversizedEnvelopesCannotCreateObservations() {
+        String malformed = "{\"kind\":\"EXECUTION_EVIDENCE\",\"observations\":[";
+        ExecutionEvidence incomplete = ExecutionEvidence.fromEnvelope(malformed);
+        assertThat(incomplete.observations()).isEmpty();
+        assertThat(incomplete.modelClaims()).isEqualTo(malformed);
+        assertThat(incomplete.completeness().complete()).isFalse();
+
+        String encoded = ExecutionEvidence.build("claim", List.of(
+                call("read", "read_file", "{}"), result("read", "read_file", "real")));
+        String duplicateKind = encoded.substring(0, encoded.length() - 1) + ",\"kind\":\"EXECUTION_EVIDENCE\"}";
+        assertThat(ExecutionEvidence.fromEnvelope(duplicateKind).observations()).isEmpty();
+        assertThat(ExecutionEvidence.fromEnvelope(encoded + " trailing").observations()).isEmpty();
+        ExecutionEvidence oversized = ExecutionEvidence.fromEnvelope("x".repeat(48_001));
+        assertThat(oversized.observations()).isEmpty();
+        assertThat(oversized.modelClaims().length()).isLessThanOrEqualTo(24_000);
+        assertThat(oversized.completeness().truncated()).isTrue();
+    }
+
+    @Test
+    void moreThan128RealReceiptsAreBoundedWithoutFailingTheRun() throws Exception {
+        List<ChatMessage> messages = new ArrayList<>();
+        for (int i = 0; i < 150; i++) {
+            messages.add(call("read" + i, "read_file", "{}"));
+            messages.add(result("read" + i, "read_file", "receipt" + i));
+        }
+        ExecutionEvidence captured = ExecutionEvidence.fromMessages("", messages);
+        assertThat(captured.observations()).hasSize(128);
+        assertThat(captured.completeness().pairedCount()).isEqualTo(150);
+        assertThat(captured.completeness().omittedObservationCount()).isEqualTo(22);
+        assertThat(captured.completeness().truncated()).isTrue();
+        String envelope = ExecutionEvidence.build("\"".repeat(8_001), messages);
+        assertThat(envelope.length()).isLessThanOrEqualTo(11_200);
+        ExecutionEvidence parsed = ExecutionEvidence.fromEnvelope(envelope);
+        assertThat(parsed.completeness().pairedCount()).isEqualTo(150);
+        assertThat(parsed.completeness().omittedObservationCount()).isPositive();
+        assertThat(parsed.completeness().complete()).isFalse();
+    }
+
+    @Test
     void semanticEvidenceWrapsClaimsButKeepsNamedOutputBindingsUnchanged() throws Exception {
         TaskNode node = new TaskNode("inspect", "Inspect game entry", "file_read", List.of(), List.of(),
                 List.of("game-structure"), TaskNodeStatus.RUNNING, 1,

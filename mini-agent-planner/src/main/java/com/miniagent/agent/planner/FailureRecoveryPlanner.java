@@ -2,7 +2,7 @@ package com.miniagent.agent.planner;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.miniagent.agent.core.AgentLoop;
+import com.miniagent.agent.core.ExecutionControl;
 import com.miniagent.agent.core.ModelCallControl;
 import com.miniagent.agent.todo.AcceptanceFeedback;
 import com.miniagent.agent.core.TokenUsageTracker;
@@ -53,6 +53,8 @@ public final class FailureRecoveryPlanner {
 
             先根据失败原因、冻结 doneWhen、实际工具面和真实执行回执判断根因。把模型提交的文字主张与工具回执区分：
             主张不能替代工具事实。保留已成功节点，不得重新执行成功节点或扩大原始目标。
+            completeness 中 complete=false、truncated=true 或 unpaired/omitted 计数非零时，工具事实只是不完整的子集；
+            不得据缺失记录推断操作已发生、未发生或产物有缺陷，应选择有针对性的补取和验证。
             action=REPLAN 时 nextSteps 必须是具体、按顺序、可验收的后续动作；必要时 evidenceNeeded 列出需要补取的事实。
             action=WAIT_FOR_USER 仅用于缺少权限、无法可信判断、模型/验收基础设施不可用或没有安全下一步的情况。
             不能为了继续而降低或改写验收条件，也不能把失败改写成成功。
@@ -98,9 +100,16 @@ public final class FailureRecoveryPlanner {
     }
 
     private final ModelCallControl modelCallControl;
+    private final ExecutionControl executionControl;
 
     public FailureRecoveryPlanner(ModelCallControl modelCallControl) {
+        this(modelCallControl, null);
+    }
+
+    /** Optional execution control keeps compatibility with standalone planner tests. */
+    public FailureRecoveryPlanner(ModelCallControl modelCallControl, ExecutionControl executionControl) {
         this.modelCallControl = modelCallControl;
+        this.executionControl = executionControl;
     }
 
     /**
@@ -144,11 +153,12 @@ public final class FailureRecoveryPlanner {
         }
 
         try {
+            checkpointModelCall(snapshot.sessionId());
             ChatRequest request = ChatRequest.builder().messages(List.of(
                     SystemMessage.from(SYSTEM), UserMessage.from(payload))).build();
             ChatResponse response = modelCallControl == null ? chat.chat(request)
                     : modelCallControl.call(() -> chat.chat(request));
-            recordUsage(response, payload);
+            recordUsage(snapshot.sessionId(), response, payload);
             String text = response == null || response.aiMessage() == null
                     ? "" : response.aiMessage().text();
             return parse(text, snapshot, node);
@@ -159,6 +169,14 @@ public final class FailureRecoveryPlanner {
             return Decision.blocked(snapshot.sessionId(), snapshot.executionId(), snapshot.planVersion(),
                     node.id(), "恢复规划调用失败，已保留执行进度");
         }
+    }
+
+    private void checkpointModelCall(String session) {
+        if (executionControl == null) return;
+        if (StringUtils.isBlank(session)) return;
+        ExecutionControl.StopReason reason = executionControl.afterModelTokens(session, 0);
+        if (reason != ExecutionControl.StopReason.NONE)
+            throw new ModelCallControl.StoppedException(reason);
     }
 
     /** Strict parser exposed for contract tests and non-Spring planner integration. */
@@ -224,13 +242,14 @@ public final class FailureRecoveryPlanner {
         // validate any resulting graph and commit it under CAS.
         root.put("executionEvidence", executionEvidence == null ? Map.of()
                 : Map.of("observations", executionEvidence.observations(),
+                        "completeness", executionEvidence.completeness(),
                         "modelClaims", bounded(executionEvidence.modelClaims(), 12_000)));
         root.put("availableTools", boundedList(availableTools, 64, 200));
         root.put("trustedContract", Map.of(
-                "constraints", boundedList(snapshot.goal() == null ? List.of() : snapshot.goal().constraints(), 32, 800),
-                "successCriteria", boundedList(snapshot.goal() == null ? List.of() : snapshot.goal().successCriteria(), 32, 800),
+                "constraints", snapshot.goal() == null ? List.of() : snapshot.goal().constraints(),
+                "successCriteria", snapshot.goal() == null ? List.of() : snapshot.goal().successCriteria(),
                 "intentAcceptanceCriteria", snapshot.intent() == null ? List.of()
-                        : boundedList(snapshot.intent().acceptanceCriteria(), 32, 800)));
+                        : snapshot.intent().acceptanceCriteria()));
         List<Map<String, Object>> success = snapshot.graph().nodes().stream()
                 .filter(candidate -> candidate.status() == TaskNodeStatus.SUCCESS)
                 .limit(32)
@@ -259,8 +278,7 @@ public final class FailureRecoveryPlanner {
                 .map(value -> bounded(value, maxChars)).toList();
     }
 
-    private static void recordUsage(ChatResponse response, String payload) {
-        String session = AgentLoop.getCurrentSession();
+    private void recordUsage(String session, ChatResponse response, String payload) {
         if (StringUtils.isBlank(session)) return;
         long input = response != null && response.tokenUsage() != null && response.tokenUsage().inputTokenCount() != null
                 ? response.tokenUsage().inputTokenCount() : payload.getBytes(StandardCharsets.UTF_8).length;
@@ -268,7 +286,14 @@ public final class FailureRecoveryPlanner {
                 ? response.tokenUsage().outputTokenCount()
                 : response == null || response.aiMessage() == null || response.aiMessage().text() == null ? 0
                 : response.aiMessage().text().getBytes(StandardCharsets.UTF_8).length;
-        TokenUsageTracker.add(session, input, output, 0);
+        String eventId = "recovery-" + java.util.UUID.randomUUID();
+        Long userId = executionControl == null ? null : executionControl.userId(session);
+        TokenUsageTracker.add(session, eventId, userId, input, output, 0);
+        if (executionControl != null) {
+            ExecutionControl.StopReason reason = executionControl.afterModelTokens(session, input + output,
+                    eventId, input, output);
+            if (reason != ExecutionControl.StopReason.NONE) throw new ModelCallControl.StoppedException(reason);
+        }
     }
 
     private static String bounded(String value, int limit) {
