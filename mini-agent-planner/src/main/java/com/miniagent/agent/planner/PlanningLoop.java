@@ -15,6 +15,7 @@ import com.miniagent.agent.planner.TaskNodeStatus;
 import com.miniagent.agent.permission.PermissionContext;
 import com.miniagent.agent.permission.PermissionMode;
 import com.miniagent.agent.todo.HumanYield;
+import com.miniagent.agent.todo.AcceptanceFeedback;
 import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.agent.trace.TraceDataSanitizer;
 import com.miniagent.agent.trace.TraceRecorder;
@@ -61,6 +62,8 @@ public class PlanningLoop {
     private static final int AWAITING_HINT_CHARS = 500;
     public static final String EXECUTION_HUMAN_WAIT = "humanWait";
     static final String RECOVERY_CLARIFICATION = "recoveryClarification";
+    static final String FAILURE_RECOVERY = "failureRecovery";
+    static final String ACCEPTANCE_FAILURES = "acceptanceFailures";
 
     /** Completed receipts stay outside the single-node clarification graph while it waits. */
     private record RecoveryContinuation(String executionId, TaskGraph completed) {}
@@ -723,7 +726,7 @@ public class PlanningLoop {
                     TaskGraph g = snap.graph().replace(
                             bad.withStatus(TaskNodeStatus.FAILED)
                                     .withError(acc.reason()));
-                    FailureDiagnosis dx = recoveryEngine.diagnose(
+                    FailureDiagnosis dx = recoveryEngine.diagnoseSemanticFailure(
                             bad, diagnoseTool(bad, ""), acc.reason());
                     try {
                         snap = commitNodeOutcomes(sessionId, fencingToken, snap, snap.withGraph(g), List.of(
@@ -774,7 +777,7 @@ public class PlanningLoop {
                             metrics.casConflict();
                             continue;
                         }
-                        FailureDiagnosis reviewDiagnosis = recoveryEngine.diagnose(
+                        FailureDiagnosis reviewDiagnosis = recoveryEngine.diagnoseSemanticFailure(
                                 bad, diagnoseTool(bad, ""), reviewReason);
                         RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap, bad,
                                 reviewDiagnosis, "code-review-" + bad.id(), chat, userMessage, taskPlan, history);
@@ -1116,25 +1119,24 @@ public class PlanningLoop {
                     blocked.put("feedback", PlannerStateJson.MAPPER.convertValue(feedback, Map.class));
                     String reason = feedback.infrastructureFailure() ? "验收服务尚不可用，已保留产物和执行回执，等待恢复后重新验收。"
                             : "只读补证据未产生可验收进展或预算已用尽，已保留产物和缺失项，需要处理后继续。";
-                    TaskNode waiting = node.withStatus(TaskNodeStatus.AWAITING_CONFIRM).withToolStatus(null)
-                            .withError(reason + " " + feedback.reason()).withOutput(bound.evidence(), bound.bindings());
-                    snap = stateStore.commit(sessionId, snap.version(), EvidenceRepairPolicy.put(
-                            snap.withGraph(g.replace(waiting)), node.id(), blocked));
-                    todoProjector.project(sessionId, snap);
-                    return RunOutcome.blockedOnHuman(reason + "\n" + feedback.legacyError(),
-                            feedback.infrastructureFailure() ? "ACCEPTANCE_JUDGE_UNAVAILABLE" : "EVIDENCE_REPAIR_EXHAUSTED");
+                    if (feedback.infrastructureFailure()) {
+                        TaskNode waiting = node.withStatus(TaskNodeStatus.AWAITING_CONFIRM).withToolStatus(null)
+                                .withError(reason + " " + feedback.reason()).withOutput(bound.evidence(), bound.bindings());
+                        snap = stateStore.commit(sessionId, snap.version(), EvidenceRepairPolicy.put(
+                                snap.withGraph(g.replace(waiting)), node.id(), blocked));
+                        todoProjector.project(sessionId, snap);
+                        return RunOutcome.blockedOnHuman(reason + "\n" + feedback.legacyError(),
+                                "ACCEPTANCE_JUDGE_UNAVAILABLE");
+                    }
+                    // Exhausting a collection strategy is input for a new strategy,
+                    // not an instruction to ask the user to press Continue forever.
+                    snap = EvidenceRepairPolicy.put(snap, node.id(), blocked);
                 }
                 if (repairingEvidence && !ev.ok()) {
                     // A collection failure never replays the original write action through generic recovery.
                     Map<String, Object> blocked = new LinkedHashMap<>(EvidenceRepairPolicy.state(snap, node.id()));
                     blocked.put("phase", "BLOCKED");
-                    TaskNode waiting = node.withStatus(TaskNodeStatus.AWAITING_CONFIRM).withToolStatus(null)
-                            .withError("补证据未通过：" + ev.reason());
-                    snap = stateStore.commit(sessionId, snap.version(), EvidenceRepairPolicy.put(
-                            snap.withGraph(g.replace(waiting)), node.id(), blocked));
-                    todoProjector.project(sessionId, snap);
-                    return RunOutcome.blockedOnHuman("产物和进度已保留；补证据未通过，请处理缺失项后继续。\n" + ev.reason(),
-                            "EVIDENCE_REPAIR_BLOCKED");
+                    snap = EvidenceRepairPolicy.put(snap, node.id(), blocked);
                 }
                 if (repairingEvidence && ev.ok()) {
                     Map<String, Object> complete = new LinkedHashMap<>(EvidenceRepairPolicy.state(snap, node.id()));
@@ -1177,11 +1179,15 @@ public class PlanningLoop {
                             ? clip(step.text(), AWAITING_HINT_CHARS) : ev.reason();
                     g = g.replace(node.withStatus(TaskNodeStatus.FAILED)
                             .withToolStatus(step.structuredResult() == null
-                                    ? null : step.structuredResult().status()).withError(failureReason));
-                    FailureDiagnosis dx = recoveryEngine.diagnose(
-                            node, diagnoseTool(node, step.lastTool()), failureReason,
-                            step.lastErrorCode());
-                    StateSnapshot failedSnap = snap.withGraph(g);
+                                    ? null : step.structuredResult().status()).withError(failureReason)
+                            .withOutput(bound.evidence(), bound.bindings()));
+                    FailureDiagnosis dx = feedback != null
+                            ? recoveryEngine.diagnoseAcceptance(node, diagnoseTool(node, step.lastTool()), feedback)
+                            : semanticAcceptance && !noProgress
+                            ? recoveryEngine.diagnoseSemanticFailure(node, diagnoseTool(node, step.lastTool()), failureReason)
+                            : recoveryEngine.diagnose(node, diagnoseTool(node, step.lastTool()), failureReason,
+                                    step.lastErrorCode());
+                    StateSnapshot failedSnap = rememberAcceptanceFeedback(snap.withGraph(g), node, feedback);
                     try {
                         snap = commitNodeOutcomes(sessionId, fencingToken, snap, failedSnap, List.of(
                                 new NodeOutcome(action.actionId(), node, NodeTerminalCommitPort.Result.FAILURE,
@@ -1463,7 +1469,7 @@ public class PlanningLoop {
         for (Object taskId : taskIds) {
             TaskNode node = taskId instanceof String id ? graph.byId(id) : null;
             if (node != null && node.status() == TaskNodeStatus.AWAITING_CONFIRM)
-                graph = graph.replace(node.withStatus(TaskNodeStatus.PENDING).withToolStatus(null).withError(""));
+                graph = graph.replace(node.withStatus(TaskNodeStatus.PENDING).withToolStatus(null));
         }
         Map<String, Object> metadata = new LinkedHashMap<>(snapshot.execution());
         metadata.remove(EXECUTION_HUMAN_WAIT);

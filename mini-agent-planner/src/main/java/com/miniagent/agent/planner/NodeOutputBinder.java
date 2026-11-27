@@ -151,6 +151,7 @@ final class NodeOutputBinder {
         // turns "read package.json" into the whole proof of a research node.
         boolean semanticAcceptance = requireSubmittedJudgeEvidence
                 || dw.isValidation() || !dw.semanticChecks().isEmpty();
+        boolean envelopeAcceptance = semanticAcceptance && !dw.isCommand() && !dw.isFile() && !dw.isMedia();
         if (semanticAcceptance && structuredResult == null) {
             String history = verificationToolEvidence(messages);
             if (StringUtils.isNotBlank(history)) tools = history;
@@ -164,11 +165,13 @@ final class NodeOutputBinder {
                 return new Bound("", Map.of());
             }
             todo = submitted.isEmpty() ? lastTodoEvidence(messages, expectedTodoId) : submitted;
+            if (todo.isEmpty()) return new Bound("", Map.of());
         } else if (!submitted.isEmpty()) {
             // Non-judge semantic checks (done_when with checks) must also see the
             // evidence the executor actually submitted, not a fallback receipt.
             todo = submitted;
         }
+        String executionEvidence = envelopeAcceptance ? ExecutionEvidence.build(todo, messages) : "";
         if (structuredResult == null && StepEvaluator.looksLikeToolError(tools)) {
             // Do not let an old file path or earlier successful tool hide a failed
             // final action. The evaluator must see the failure before world checks.
@@ -184,6 +187,7 @@ final class NodeOutputBinder {
         // Command acceptance must persist the actual command tool result for
         // graph re-evaluation. Model-submitted todo text is never its proof.
         String evidence = dw.isCommand() ? tools
+                : semanticAcceptance && StringUtils.isNotBlank(executionEvidence) ? executionEvidence
                 : requireSubmittedJudgeEvidence ? todo : firstNonBlank(todo, tools);
         if (StringUtils.isBlank(evidence)) {
             evidence = predecessor;
@@ -201,10 +205,15 @@ final class NodeOutputBinder {
             if (StringUtils.isBlank(evidence) && !requireSubmittedJudgeEvidence) {
                 evidence = ans;
             }
-            fillMissing(bindings, node, requireSubmittedJudgeEvidence ? evidence : ans);
+            fillMissing(bindings, node, requireSubmittedJudgeEvidence ? todo : ans);
         }
         fillPredecessorBindings(bindings, node, predecessor);
-        fillMissing(bindings, node, evidence);
+        // Named output ports remain bound to the submitted claim (or the raw
+        // tool result for an ordinary node). The execution envelope is for
+        // acceptance only and must not leak into a downstream artifact path.
+        String bindingEvidence = semanticAcceptance && StringUtils.isNotBlank(todo)
+                ? todo : evidence;
+        fillMissing(bindings, node, bindingEvidence);
         if (StringUtils.isBlank(evidence) && !bindings.isEmpty()) {
             evidence = firstBinding(bindings, node);
         }

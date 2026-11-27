@@ -265,7 +265,11 @@ public class TodoStateProjector {
         if (n == null || n.status() != TaskNodeStatus.AWAITING_CONFIRM) {
             return graph;
         }
-        return graph.replace(n.withStatus(TaskNodeStatus.PENDING).withError(""));
+        // Confirmation releases the execution gate; it does not resolve the
+        // failure. Keep the diagnostic, accepted output and retry history so
+        // the resumed executor can change its next action instead of repeating
+        // the strategy that caused this wait. Successful acceptance clears it.
+        return graph.replace(n.withStatus(TaskNodeStatus.PENDING).withToolStatus(null));
     }
 
     private static String toTodoStatus(TaskNodeStatus s) {

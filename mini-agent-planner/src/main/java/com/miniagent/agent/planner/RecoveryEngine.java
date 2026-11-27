@@ -3,6 +3,7 @@ package com.miniagent.agent.planner;
 import com.miniagent.agent.tool.CapabilityRegistry;
 import com.miniagent.agent.tool.ToolErrorCode;
 import com.miniagent.agent.trace.AgentStepNode;
+import com.miniagent.agent.todo.AcceptanceFeedback;
 import com.miniagent.agent.trace.TraceRecorder;
 import com.miniagent.common.RunStatus;
 import org.apache.commons.lang3.StringUtils;
@@ -60,6 +61,43 @@ public class RecoveryEngine {
             case REVISE_GOAL -> "修订 Goal 约束";
         };
         return new FailureDiagnosis(fc, kind, node == null ? "" : node.id(), tool, error, fix);
+    }
+
+    /**
+     * Acceptance is a control-loop failure, not an ordinary tool retry.  The
+     * feedback is already the result of a frozen-criterion evaluation, so the
+     * next action must be a strategy change (a focused sub-graph) rather than
+     * another invocation of the same node with a larger retry counter.
+     */
+    public FailureDiagnosis diagnoseAcceptance(TaskNode node, String tool, AcceptanceFeedback feedback) {
+        String id = node == null ? "" : node.id();
+        String reason = acceptanceReason(feedback);
+        String fix = feedback != null && feedback.nextAction() == AcceptanceFeedback.NextAction.COLLECT_EVIDENCE
+                ? "按验收反馈补齐缺失的真实工具证据；保留已有产物和成功节点，完成后重新验收"
+                : "根据验收反馈重新规划未完成子图；先核验现状，再修复实际缺陷并重新验收";
+        return new FailureDiagnosis(FailureClass.REWRITE_GRAPH, FailureKind.EVAL_FAILED,
+                id, tool, reason, fix);
+    }
+
+    /** Semantic checks without a structured judge response still require a strategy change. */
+    public FailureDiagnosis diagnoseSemanticFailure(TaskNode node, String tool, String reason) {
+        return new FailureDiagnosis(FailureClass.REWRITE_GRAPH, FailureKind.EVAL_FAILED,
+                node == null ? "" : node.id(), tool,
+                reason == null ? "语义验收未通过" : reason,
+                "重新规划当前验收失败节点；先补齐可信观察或验证步骤，禁止盲目重复相同动作");
+    }
+
+    private static String acceptanceReason(AcceptanceFeedback feedback) {
+        if (feedback == null) return "语义验收未通过：未返回结构化反馈";
+        StringBuilder out = new StringBuilder("语义验收反馈")
+                .append(" criterionId=").append(feedback.criterionId())
+                .append(" kind=").append(feedback.kind())
+                .append(" nextAction=").append(feedback.nextAction())
+                .append(" reason=").append(abbreviate(feedback.reason(), 1200));
+        if (!feedback.missingEvidence().isEmpty()) {
+            out.append(" missingEvidence=").append(feedback.missingEvidence());
+        }
+        return abbreviate(out.toString(), 2200);
     }
 
     static FailureKind classify(ToolErrorCode code, String error) {

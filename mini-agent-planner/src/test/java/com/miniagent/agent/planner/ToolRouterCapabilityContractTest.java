@@ -13,6 +13,27 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ToolRouterCapabilityContractTest {
 
     @Test
+    void fileReadNodeCanSearchWithinTheSameHardGateAndStillHonorsBlockedTools() {
+        ToolRegistry tools = new ToolRegistry();
+        List.of("read_file", "list_files", "search_code", "write_file", "exec_command", "todo")
+                .forEach(name -> tools.register(name, "test tool", Map.of(), ignored -> "ok"));
+        ToolRouter router = new ToolRouter(new CapabilityRegistry(tools));
+        TaskNode node = new TaskNode("inspect", "先检索再读取游戏入口", "file_read",
+                List.of(), List.of(), List.of(), TaskNodeStatus.READY, 50,
+                DoneWhen.note(), "", "", 0, "");
+        ActionProposal proposal = new ActionProposal("proposal", 1, "execution",
+                List.of(new ActionSpec("action", "inspect", "read_file",
+                        Map.of("path", "index.html"), "note_required", "")));
+
+        assertThat(router.allowedFor(proposal, new TaskGraph(List.of(node)), true))
+                .contains("read_file", "search_code", "todo")
+                .doesNotContain("write_file", "exec_command", "memory");
+        assertThat(router.allowedFor(proposal,
+                new TaskGraph(List.of(node.withBlockedTool("search_code"))), true))
+                .contains("read_file", "todo").doesNotContain("search_code", "write_file", "exec_command");
+    }
+
+    @Test
     void researchNodeReceivesCodeSearchToolsWithoutWriteOrShellCapabilities() {
         ToolRegistry tools = new ToolRegistry();
         List.of("read_file", "list_files", "read_package", "image_inspect",

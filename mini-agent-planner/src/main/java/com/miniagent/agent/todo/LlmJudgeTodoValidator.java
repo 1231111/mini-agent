@@ -179,10 +179,17 @@ public class LlmJudgeTodoValidator implements TodoStepValidator {
                 不得把文件修改时间/mtime、行数、条目数、目录结构、额外格式或其它元数据缺失作为 FAIL 理由。
                 证据缺少某项未被 criteria/checks 要求的信息，不构成失败；不得修改、扩展或重解释冻结的验收标准。
                 只输出一个严格 JSON 对象（无代码围栏、无其它字段），使用下一条数据中的 criterionId 原值：
-                {"schemaVersion":1,"criterionId":"原值","verdict":"PASS|FAIL", "kind":"NONE|MISSING_EVIDENCE|ARTIFACT_DEFECT|JUDGE_UNAVAILABLE",
+                {"schemaVersion":1,"criterionId":"原值","verdict":"PASS|FAIL", "kind":"NONE|MISSING_EVIDENCE|PROCESS_EVIDENCE_GAP|ARTIFACT_DEFECT|JUDGE_UNAVAILABLE",
                  "reason":"简短理由","missingEvidence":[],"nextAction":"NONE|COLLECT_EVIDENCE|FIX_ARTIFACT|WAIT_FOR_JUDGE"}
                 PASS 必须 kind=NONE、missingEvidence=[]、nextAction=NONE。
                 FAIL 必须明确归因：事实证据尚未提交且可以只读补取时，kind=MISSING_EVIDENCE、missingEvidence列出最多16项冻结条件的具体缺口，nextAction=COLLECT_EVIDENCE；
+                冻结条件要求的工具操作或先后顺序缺少真实执行回执时，kind=PROCESS_EVIDENCE_GAP、missingEvidence列出待补的过程事实，nextAction=COLLECT_EVIDENCE。
+                EXECUTION_EVIDENCE 中 claims 是执行模型的提交说明，不能据此推断 search/read/命令等操作确实执行；
+                observations 才是调度器从同一节点当前轮成对调用与工具返回构造的记录。按 sequence、batch、callMessageIndex、resultMessageIndex核对顺序；
+                observations 的 toolName/arguments/status/receipt 分别是工具名、实际参数、执行状态与工具返回；
+                同一 batch 的多工具可以并行返回，不能将数组位置误认成完成先后顺序。
+                unpaired/omitted/claimsTruncated/truncated 表示材料不完整；缺失或截断的字段不能被当成成功证明或产物缺陷。
+                若冻结条件只要求文本内容或结论，不要求实际操作，则可根据 claims 内容判断该文本条件，不能追加必须调用工具的要求。
                 已观察到产物不符合冻结条件时，kind=ARTIFACT_DEFECT、missingEvidence=[]、nextAction=FIX_ARTIFACT。
                 评判基础设施或材料无法完成可信评判时，kind=JUDGE_UNAVAILABLE、missingEvidence=[]、nextAction=WAIT_FOR_JUDGE。
                 不得把产物缺陷伪装成缺证据；不得要求额外写入、执行命令或修改冻结条件来补证据。

@@ -43,8 +43,11 @@ public class CapabilityRegistry implements SmartInitializingSingleton {
             "file_read", "file_write", "web", "code", "image", "browser", "desktop", "shell",
             "research", "deliver", "plan", GENERAL);
 
+    // File analysis needs bounded keyword lookup as well as byte/line reads.
+    // Keep this family read-only: exposing search_code does not grant shell,
+    // file writes, browser actions or a broader permission scope.
     private static final List<String> FILE_READ =
-            List.of(READ_FILE, "list_files", "read_package", "image_inspect");
+            List.of(READ_FILE, "list_files", "read_package", "image_inspect", "search_code");
 
     /**
      * 纯文本落盘 + Office/HTML 交付。PowerPoint 与 HTML→Word 已收敛进 write_document。

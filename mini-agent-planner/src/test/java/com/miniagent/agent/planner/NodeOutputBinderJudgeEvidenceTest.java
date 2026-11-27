@@ -34,7 +34,8 @@ class NodeOutputBinderJudgeEvidenceTest {
         NodeOutputBinder.Bound bound = NodeOutputBinder.bind(
                 node, "", messages, "I completed the task successfully.", null, "", CURRENT_TODO_ID);
 
-        assertThat(bound.evidence()).isEqualTo(CLAIMED_EVIDENCE);
+        assertThat(JSON.readTree(bound.evidence()).path("claims").asText()).isEqualTo(CLAIMED_EVIDENCE);
+        assertThat(JSON.readTree(bound.evidence()).path("observations").isEmpty()).isTrue();
         assertThat(bound.evidence()).doesNotContain("I completed the task successfully");
     }
 
@@ -101,7 +102,8 @@ class NodeOutputBinderJudgeEvidenceTest {
         NodeOutputBinder.Bound bound = NodeOutputBinder.bind(
                 semanticNode(), "", messages, "", null, "", CURRENT_TODO_ID, CLAIMED_EVIDENCE);
 
-        assertThat(bound.evidence()).isEqualTo(CLAIMED_EVIDENCE);
+        assertThat(JSON.readTree(bound.evidence()).path("claims").asText()).isEqualTo(CLAIMED_EVIDENCE);
+        assertThat(JSON.readTree(bound.evidence()).path("unpairedResultCount").asInt()).isEqualTo(1);
         assertThat(bound.evidence()).doesNotContain("package.json");
     }
 
@@ -122,7 +124,7 @@ class NodeOutputBinderJudgeEvidenceTest {
                         "truncated-submit", CapabilityRegistry.FALLBACK_TOOL, truncated)),
                 "PASS", null, "", CURRENT_TODO_ID, "");
 
-        assertThat(bound.evidence()).isEqualTo(CLAIMED_EVIDENCE);
+        assertThat(JSON.readTree(bound.evidence()).path("claims").asText()).isEqualTo(CLAIMED_EVIDENCE);
     }
 
     private static TaskNode semanticNode() {

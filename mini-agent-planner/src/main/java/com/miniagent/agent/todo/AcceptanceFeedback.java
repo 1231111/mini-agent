@@ -16,7 +16,15 @@ public record AcceptanceFeedback(int schemaVersion, String criterionId, Verdict 
                                  String reason, List<String> missingEvidence, NextAction nextAction,
                                  Protocol protocol) {
     public enum Verdict { PASS, FAIL }
-    public enum FailureKind { NONE, MISSING_EVIDENCE, ARTIFACT_DEFECT, JUDGE_UNAVAILABLE, INVALID_RESPONSE }
+    /**
+     * PROCESS_EVIDENCE_GAP is deliberately separate from ARTIFACT_DEFECT.  A
+     * frozen check may require proof that an observation was performed in a
+     * particular order (for example, search before reading a large file).  The
+     * artifact can be perfectly valid while that proof is absent; treating it
+     * as a write repair would replay the wrong action and consume recovery
+     * budget without changing the evidence.
+     */
+    public enum FailureKind { NONE, MISSING_EVIDENCE, PROCESS_EVIDENCE_GAP, ARTIFACT_DEFECT, JUDGE_UNAVAILABLE, INVALID_RESPONSE }
     public enum NextAction { NONE, COLLECT_EVIDENCE, FIX_ARTIFACT, WAIT_FOR_JUDGE }
     public enum Protocol { STRUCTURED, LEGACY, SYSTEM }
     private static final ObjectMapper JSON = new ObjectMapper()
@@ -36,7 +44,8 @@ public record AcceptanceFeedback(int schemaVersion, String criterionId, Verdict 
         if (verdict == Verdict.PASS && (kind != FailureKind.NONE || nextAction != NextAction.NONE
                 || !missingEvidence.isEmpty())) throw new IllegalArgumentException("Conflicting PASS feedback");
         if (verdict == Verdict.FAIL && (kind == FailureKind.NONE
-                || kind == FailureKind.MISSING_EVIDENCE && (missingEvidence.isEmpty() || nextAction != NextAction.COLLECT_EVIDENCE)
+                || (kind == FailureKind.MISSING_EVIDENCE || kind == FailureKind.PROCESS_EVIDENCE_GAP)
+                && (missingEvidence.isEmpty() || nextAction != NextAction.COLLECT_EVIDENCE)
                 || kind == FailureKind.ARTIFACT_DEFECT && (nextAction != NextAction.FIX_ARTIFACT || !missingEvidence.isEmpty())
                 || (kind == FailureKind.JUDGE_UNAVAILABLE || kind == FailureKind.INVALID_RESPONSE)
                 && (nextAction != NextAction.WAIT_FOR_JUDGE || !missingEvidence.isEmpty())))
@@ -45,7 +54,8 @@ public record AcceptanceFeedback(int schemaVersion, String criterionId, Verdict 
 
     public boolean passed() { return verdict == Verdict.PASS; }
     public boolean repairableEvidence() {
-        return verdict == Verdict.FAIL && kind == FailureKind.MISSING_EVIDENCE
+        return verdict == Verdict.FAIL && (kind == FailureKind.MISSING_EVIDENCE
+                || kind == FailureKind.PROCESS_EVIDENCE_GAP)
                 && protocol != Protocol.LEGACY;
     }
     public boolean infrastructureFailure() {
