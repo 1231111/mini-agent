@@ -7,6 +7,7 @@ import com.miniagent.agent.core.ContextCompressor;
 import com.miniagent.agent.context.ContextLoader;
 import com.miniagent.agent.context.LoadedContext;
 import com.miniagent.agent.core.SessionEventCenter;
+import com.miniagent.agent.core.GoalContinuationContext;
 import jakarta.annotation.PostConstruct;
 
 import com.miniagent.agent.core.AgentLoop;
@@ -18,6 +19,7 @@ import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.task.TaskPlanFactory;
 import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.agent.planner.PlanningLoop;
+import com.miniagent.agent.planner.StateSnapshot;
 import com.miniagent.memory.MemoryService;
 import com.miniagent.memory.MemoryStore;
 import com.miniagent.agent.todo.TaskTodoContext;
@@ -208,6 +210,40 @@ public class AgentChatApplicationService {
         return executeAgentWithProgress(
                 userId, sid, userMessage.trim(), userMessage.trim(), null,
                 List.of(), List.of(), List.of(), null, null).answer();
+    }
+
+    /**
+     * 无人值守续跑入口：{@link AutonomousGoalService} 拿到租约后调用。
+     *
+     * <p><b>为什么复用 {@code executeAgentWithProgress} 而不是新写一条链路</b>：续跑必须和用户
+     * 亲手发消息走完全相同的路径 —— 租约（{@code TaskRunService}）、会话工作区
+     * （{@code applySessionWorkspace}）、{@code OwnerContext}、权限闸门、上下文压缩、trace
+     * 全部一致。任何"简化版执行"都会让续跑绕过其中某一道，而绕过的那道往往正是安全边界。</p>
+     *
+     * <p><b>唯一额外动作</b>：把 {@link GoalContinuationContext} 绑到当前线程。它不是提示词约束，
+     * 而是由 {@code ToolPipeline} 在派发边界读取的硬白名单 —— 续跑期间模型只能调用只读工具，
+     * 且有副作用的节点会由 {@code GoalContinuationPolicy.readOnlyNode} 在调度层被过滤掉。
+     * 该上下文只能由受信任的调用方创建，模型文本无法构造。</p>
+     *
+     * <p>快照从 {@code plannerStates} 取最新一版，供 {@code AutonomousGoalService} 计算
+     * progress hash 与终态；取不到时返回 {@code null}，由调用方按"无进展"处理。</p>
+     */
+    AutonomousGoalService.Outcome resumeGoal(GoalQueue.Goal goal) {
+        if (Objects.isNull(goal)) {
+            throw new IllegalArgumentException("goal 不能为空");
+        }
+        if (StringUtils.isBlank(goal.objective())) {
+            return new AutonomousGoalService.Outcome(RunStatus.FAILURE, "GOAL_OBJECTIVE_MISSING", null);
+        }
+        try (var ignored = GoalContinuationContext.bind(new GoalContinuationContext.Continuation(
+                goal.executionId(), goal.taskId(), goal.roundId(), goal.reason()))) {
+            AgentResult result = executeAgentWithProgress(
+                    goal.userId(), goal.sessionId(), goal.objective(), goal.objective(),
+                    null, List.of(), List.of(), List.of(), null, null);
+            StateSnapshot snapshot = Objects.isNull(plannerStates)
+                    ? null : plannerStates.get(goal.sessionId()).orElse(null);
+            return new AutonomousGoalService.Outcome(result.status(), result.reason(), snapshot);
+        }
     }
 
     /**

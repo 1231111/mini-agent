@@ -3,6 +3,7 @@ package com.miniagent.agent.planner;
 import com.miniagent.agent.core.AgentLoop;
 import com.miniagent.agent.todo.LlmJudgeTodoValidator;
 import com.miniagent.agent.todo.AcceptanceEvidenceFiles;
+import com.miniagent.agent.todo.AcceptanceFeedback;
 import com.miniagent.agent.todo.TaskTodoStore;
 import com.miniagent.agent.todo.TodoSemanticValidator;
 import com.miniagent.agent.tool.CapabilityRegistry;
@@ -28,10 +29,15 @@ public class StepEvaluator {
     private static final Pattern EXIT_CODE =
             Pattern.compile("^\\s*exit_code\\s*=\\s*(-?\\d+)(?:\\s|$)", Pattern.CASE_INSENSITIVE);
 
-    public record EvalResult(boolean ok, String reason, SemanticAcceptanceReceipts.Proof acceptanceProof) {
-        public EvalResult(boolean ok, String reason) { this(ok, reason, null); }
+    public record EvalResult(boolean ok, String reason, SemanticAcceptanceReceipts.Proof acceptanceProof,
+                             AcceptanceFeedback feedback) {
+        public EvalResult(boolean ok, String reason) { this(ok, reason, null, null); }
+        public EvalResult(boolean ok, String reason, SemanticAcceptanceReceipts.Proof proof) { this(ok, reason, proof, null); }
         public static EvalResult pass() { return new EvalResult(true, ""); }
         public static EvalResult fail(String r) { return new EvalResult(false, r == null ? "" : r); }
+        public static EvalResult feedback(AcceptanceFeedback feedback) {
+            return new EvalResult(feedback.passed(), feedback.passed() ? "" : feedback.legacyError(), null, feedback);
+        }
     }
 
     /**
@@ -129,7 +135,8 @@ public class StepEvaluator {
         EvalResult structural;
         String artifactHash = "";
         if (dw.isJudge()) {
-            structural = StringUtils.isBlank(ev) ? reject("缺少语义验收 evidence") : EvalResult.pass();
+            structural = StringUtils.isBlank(ev) ? EvalResult.feedback(AcceptanceFeedback.missing(dw.criteria(),
+                    "缺少语义验收 evidence", List.of("冻结验收条件对应的当前工具事实证据"))) : EvalResult.pass();
         } else if (dw.isCommand()) {
             structural = checkCommand(commandReceipts, dw.criteria());
         } else if (dw.isValidation()) {
@@ -344,19 +351,23 @@ public class StepEvaluator {
 
     private EvalResult judge(TaskNode node, String criteria, String evidence) {
         if (llmJudge == null) {
-            return reject("llm_judge 未启用");
+            return EvalResult.feedback(AcceptanceFeedback.unavailable(criteria, "llm_judge 未启用"));
         }
-        if (StringUtils.isBlank(criteria) || StringUtils.isBlank(evidence)) return reject("语义验收缺少条件或 evidence");
+        if (StringUtils.isBlank(criteria)) return EvalResult.feedback(AcceptanceFeedback.invalid(criteria, "语义验收缺少冻结条件"));
+        if (StringUtils.isBlank(evidence)) return EvalResult.feedback(AcceptanceFeedback.missing(criteria,
+                "语义验收缺少 evidence", List.of("冻结条件对应的可核验事实证据")));
         // AcceptanceEvidenceFiles bounds file reads at 48k bytes/chars.  Keep
         // the evaluator aligned with that bound; the LLM judge performs the
         // final context-window check using the active model's real budget.
-        if (evidence.length() > 48000) return reject("语义验收 evidence 超出完整校验范围，尚未验证；请拆分验证材料");
+        if (evidence.length() > 48000) return EvalResult.feedback(AcceptanceFeedback.unavailable(criteria,
+                "语义验收 evidence 超出完整校验范围，尚未验证；请拆分验证材料"));
         String spec = DoneWhen.JUDGE + ":" + criteria;
         TaskTodoStore.TodoItem item = new TaskTodoStore.TodoItem(
                 0, node.name(), TaskTodoStore.Status.in_progress, "",
                 spec, evidence, "", List.of());
-        String err = llmJudge.validate(item, evidence);
-        return err == null ? EvalResult.pass() : reject(err);
+        AcceptanceFeedback feedback = llmJudge.validateFeedback(item, evidence);
+        if (feedback == null) return reject("llm_judge 返回空的结构化判定，尚未验证");
+        return EvalResult.feedback(feedback);
     }
 
     /** Read the declared artifact itself; a write receipt or filename is not its semantic content. */

@@ -108,6 +108,11 @@ public class ContextLoader {
         } else if (Objects.nonNull(sessionId) && requestedBoundary == TaskBoundary.RESUME) {
             boundary = TaskBoundary.RESUME;
             boundaryReason = "semantic-resume-task";
+        } else if (Objects.nonNull(sessionId) && com.miniagent.agent.core.GoalContinuationContext.active()) {
+            var continuation = com.miniagent.agent.core.GoalContinuationContext.current();
+            if (currentTaskId(sessionId) != continuation.taskId())
+                throw new IllegalStateException("Background goal task identity changed");
+            boundaryReason = "durable-goal-continuation";
         } else if (Objects.nonNull(sessionId)) {
             boolean waitingHuman = taskTodoStore.hasAwaitingConfirm(sessionId);
             if (waitingHuman) {

@@ -47,7 +47,8 @@ public record RunScope(
         String executionRunToken,
         SearchDateContext.Window searchDateWindow,
         String operationRootSession,
-        com.miniagent.agent.trace.TraceRecorder.TraceContext traceContext
+        com.miniagent.agent.trace.TraceRecorder.TraceContext traceContext,
+        GoalContinuationContext.Continuation goalContinuation
 ) {
     @FunctionalInterface
     public interface Binding extends AutoCloseable {
@@ -88,7 +89,7 @@ public record RunScope(
                 EffectiveModelContext.currentSendThinking(),
                 OwnerContext.currentProjectId(), TaskExecutionContext.currentRunToken(), SearchDateContext.current(),
                 WorkspaceContext.getOperationRootSession(),
-                com.miniagent.agent.trace.TraceRecorder.captureThreadContext());
+                com.miniagent.agent.trace.TraceRecorder.captureThreadContext(), GoalContinuationContext.current());
     }
 
     public RunScope withSession(String sid) {
@@ -97,7 +98,7 @@ public record RunScope(
                 subagent, parentSessionId, role, taskName, writeTask, workspaceRoot,
                 execution, taskId, chatModel, streamingModel, contextWindowTokens, sendThinking,
                 projectId, executionRunToken, searchDateWindow,
-                subagent ? operationRootSession : sid, traceContext);
+                subagent ? operationRootSession : sid, traceContext, goalContinuation);
     }
 
     /**
@@ -125,7 +126,7 @@ public record RunScope(
                 execution == null ? null : execution.forSubagent(subSessionId),
                 taskId, chatModel, streamingModel, contextWindowTokens, sendThinking,
                 projectId, executionRunToken, searchDateWindow,
-                root, traceContext);
+                root, traceContext, goalContinuation);
     }
 
     /**
@@ -145,6 +146,7 @@ public record RunScope(
     }
 
     void applyLocals() {
+        GoalContinuationContext.restore(goalContinuation);
         com.miniagent.agent.trace.TraceRecorder.restoreThreadContext(traceContext);
         OwnerContext.setCurrentProjectId(projectId);
         if (sessionId != null && !sessionId.isBlank()) {

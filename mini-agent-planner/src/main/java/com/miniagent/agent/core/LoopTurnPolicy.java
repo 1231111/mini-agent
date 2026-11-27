@@ -31,6 +31,9 @@ public interface LoopTurnPolicy {
         return denyTool(toolName);
     }
 
+    /** Revalidate a hook-rewritten invocation without charging its execution budget twice. */
+    default String denyRewrittenToolInvocation(String toolName, String argumentsJson) { return denyTool(toolName); }
+
     /** Observe one terminal tool result. Returns a stop reason when the node is stagnating. */
     default String observeToolOutcome(String toolName, String argumentsJson, ToolResult result) {
         return "";

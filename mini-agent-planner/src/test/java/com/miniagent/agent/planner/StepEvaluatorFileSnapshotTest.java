@@ -1,6 +1,7 @@
 package com.miniagent.agent.planner;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.miniagent.agent.todo.AcceptanceFeedback;
 import com.miniagent.agent.todo.LlmJudgeTodoValidator;
 import com.miniagent.agent.tool.WorkspaceContext;
 import org.junit.jupiter.api.AfterEach;
@@ -35,7 +36,10 @@ class StepEvaluatorFileSnapshotTest {
         WorkspaceContext.setRootOverride(workspace);
         Files.writeString(workspace.resolve("fixture.txt"), "hello from dag", StandardCharsets.UTF_8);
         LlmJudgeTodoValidator judge = mock(LlmJudgeTodoValidator.class);
-        when(judge.validate(any(), anyString())).thenReturn(null);
+        // StepEvaluator 已从 validate()（字符串错误）切到 validateFeedback()（结构化判定），
+        // mock 必须跟上新入口，否则返回 null 会被判成「未验证」。
+        when(judge.validateFeedback(any(), anyString())).thenReturn(
+                AcceptanceFeedback.pass("fixture.txt", "内容与冻结条件一致", AcceptanceFeedback.Protocol.STRUCTURED));
         StepEvaluator evaluator = new StepEvaluator(new PlannerProperties(), new PlannerMetrics(), judge);
         TaskNode node = new TaskNode("n1", "Exact UTF-8 fixture", "file_write", List.of(), List.of(),
                 List.of("fixture.txt"), TaskNodeStatus.PENDING, 50,
@@ -46,7 +50,7 @@ class StepEvaluatorFileSnapshotTest {
 
         assertThat(result.ok()).isTrue();
         ArgumentCaptor<String> evidence = ArgumentCaptor.forClass(String.class);
-        verify(judge).validate(any(), evidence.capture());
+        verify(judge).validateFeedback(any(), evidence.capture());
         var snapshot = new ObjectMapper().readTree(evidence.getValue());
         assertThat(snapshot.path("kind").asText()).isEqualTo("ACCEPTANCE_FILE_SNAPSHOT");
         assertThat(snapshot.path("byteLength").asInt()).isEqualTo(14);

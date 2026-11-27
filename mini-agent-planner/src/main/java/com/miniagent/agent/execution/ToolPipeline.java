@@ -194,6 +194,10 @@ public class ToolPipeline {
                     name, ToolResult.fromLegacy(request.probeDeny()));
         }
         String proposalDeny = run.turnPolicy().denyToolInvocation(name, request.arguments());
+        if (run.goalContinuation() != null && !com.miniagent.agent.core.GoalContinuationContext.allows(name)) {
+            return ToolInvocation.policyDenied(name, ToolResult.failure(ToolErrorCode.PERMISSION_DENIED,
+                    "无人值守续跑只允许读取和补充证据；该动作需要用户确认后继续: " + name, false));
+        }
         if (proposalDeny != null) {
             recordNode(sid, turn, AgentStepNode.HOOK_DENY,
                     "{\"tool\":\"" + name + "\",\"reason\":\"planner_hard_gate\"}",
@@ -243,6 +247,10 @@ public class ToolPipeline {
         }
         String effective = (pre != null && pre.argumentsJson() != null)
                 ? pre.argumentsJson() : args;
+        String rewrittenDeny = run.turnPolicy().denyRewrittenToolInvocation(name, effective);
+        if (rewrittenDeny != null) {
+            return ToolInvocation.gateDenied(name, ToolResult.fromLegacy(rewrittenDeny));
+        }
         // Grants are exact invocation approvals. A grant for one command or
         // request must never become a standing approval for the tool name.
         boolean granted = sid != null

@@ -23,9 +23,9 @@ public class ExecutionProperties {
      */
     private long tokenSoftLimit = 8_000_000L;
     /** 直跑循环上限；调用方传入值不得高于此。 */
-    private int maxIterations = 90;
+    private int maxIterations = 190;
     /** delegate_task 内层循环上限。 */
-    private int subagentMaxIterations = 25;
+    private int subagentMaxIterations = 125;
 
     public ExecutionProperties() {
     }

@@ -574,13 +574,8 @@ public class DefaultMemoryManager implements MemoryManager, ProcedurePromptPort 
                     owner.tenantId(), AgentMemoryEntryEntity.ScopeType.PROJECT, projectId,
                     AgentMemoryEntryEntity.Status.ACTIVE));
         }
-        List<ProcedurePromptInput> stored = candidates.stream()
-                .filter(p -> query == null || query.isBlank()
-                        || p.getName().toLowerCase(Locale.ROOT).contains(query.toLowerCase(Locale.ROOT))
-                        || Objects.toString(p.getDescription(), "").toLowerCase(Locale.ROOT)
-                                .contains(query.toLowerCase(Locale.ROOT)))
+        List<ProcedurePromptInput> stored = ProcedureRelevanceRanker.rank(candidates, query, 20).stream()
                 .map(this::promptOf)
-                .limit(20)
                 .toList();
         return stored;
     }

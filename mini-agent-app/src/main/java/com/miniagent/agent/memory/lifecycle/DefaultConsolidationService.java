@@ -12,7 +12,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.miniagent.agent.memory.entity.AgentEventEntity;
 import com.miniagent.agent.memory.entity.AgentEpisodeEntity;
-import com.miniagent.agent.memory.manager.ProcedureRewriteProposalService;
+import com.miniagent.agent.memory.manager.FailureLearningOutboxService;
 import com.miniagent.agent.memory.repository.AgentEventRepository;
 import com.miniagent.agent.memory.repository.AgentEpisodeRepository;
 import com.miniagent.memory.MemoryKeys;
@@ -93,6 +93,9 @@ public class DefaultConsolidationService implements ConsolidationService {
 
     @Autowired
     private PlatformTransactionManager transactionManager;
+
+    @Autowired
+    private FailureLearningOutboxService failureLearning;
 
     @Autowired(required = false)
     private SubjectErasureService subjectErasureService;
@@ -184,7 +187,8 @@ public class DefaultConsolidationService implements ConsolidationService {
         TransactionTemplate transaction = new TransactionTemplate(transactionManager);
         transaction.executeWithoutResult(status -> {
             assertEpisodeWritable(episode);
-            episodeRepository.save(episode);
+            AgentEpisodeEntity saved = episodeRepository.saveAndFlush(episode);
+            failureLearning.enqueue(saved);
             eventRepository.markProcessed(unprocessed.stream().map(AgentEventEntity::getId).toList());
         });
     }
@@ -228,7 +232,8 @@ public class DefaultConsolidationService implements ConsolidationService {
                     if (carried != null) {
                         new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
                             assertEpisodeWritable(carried);
-                            episodeRepository.save(carried);
+                            AgentEpisodeEntity saved = episodeRepository.saveAndFlush(carried);
+                            failureLearning.enqueue(saved);
                         });
                         workingMemoryManager.touch(sessionId);
                         log.info("工作记忆结转: tenant={}, session={}, goal={}",
@@ -249,7 +254,8 @@ public class DefaultConsolidationService implements ConsolidationService {
                 TransactionTemplate transaction = new TransactionTemplate(transactionManager);
                 transaction.executeWithoutResult(status -> {
                     assertEpisodeWritable(episode);
-                    episodeRepository.save(episode);
+                    AgentEpisodeEntity saved = episodeRepository.saveAndFlush(episode);
+                    failureLearning.enqueue(saved);
                     eventRepository.markProcessed(ids);
                 });
                 workingMemoryManager.touch(sessionId);

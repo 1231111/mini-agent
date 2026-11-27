@@ -85,6 +85,7 @@ public class ProcedureRewriteProposalService {
         }
         AgentProcedureEntity measured = procedures.findById(application.getProcedureId()).orElse(null);
         if (!governanceProperties.isEnabled() || measured == null
+                || measured.getAttemptCount() == null
                 || measured.getAttemptCount() < governanceProperties.getMinAttempts()
                 || measured.getSuccessRate() == null
                 || measured.getSuccessRate() > governanceProperties.getArchiveMaxSuccessRate()) {
@@ -159,7 +160,8 @@ public class ProcedureRewriteProposalService {
                 || current.getScopeType() != AgentMemoryEntryEntity.ScopeType.USER
                 || !String.valueOf(owner.userId()).equals(current.getScopeId())
                 || !proposal.getBaseVersion().equals(current.getProcedureVersion())
-                || current.getStatus() != AgentMemoryEntryEntity.Status.ACTIVE) {
+                || (current.getStatus() != AgentMemoryEntryEntity.Status.ACTIVE
+                    && current.getStatus() != AgentMemoryEntryEntity.Status.ARCHIVED)) {
             proposal.setStatus(ProcedureRewriteProposalEntity.Status.CONFLICT);
             proposal.setReviewedBy(String.valueOf(owner.userId()));
             proposal.setReviewedAt(LocalDateTime.now());

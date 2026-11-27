@@ -810,6 +810,19 @@ public class PlanningLoop {
                         compiled.degraded());
             }
             List<TaskNode> ready = graphScheduler.select(snap.graph());
+            if (com.miniagent.agent.core.GoalContinuationContext.active()) {
+                var continuation = com.miniagent.agent.core.GoalContinuationContext.current();
+                if (!java.util.Objects.equals(continuation.executionId(), snap.executionId()))
+                    return RunOutcome.failed("待续跑目标已经变化，旧执行已停止。", "STALE_EXECUTION");
+                // snap 在主循环里被反复重赋值，不能直接被 lambda 捕获（编译期要求
+                // effectively final）。这里固定的是「本轮 ready 选择时看到的那一版快照」，
+                // 与 stream 的立即求值语义一致：filter 执行期间不会有人再改 snap。
+                final StateSnapshot readyView = snap;
+                ready = ready.stream().filter(n -> GoalContinuationPolicy.readOnlyNode(readyView, n)).toList();
+                if (ready.isEmpty() && !snap.graph().allTerminalSuccess())
+                    return RunOutcome.blockedOnHuman("已完成可自动执行的读取和核验；剩余动作需要你确认后继续。",
+                            "BACKGROUND_ACTION_REQUIRES_CONFIRM");
+            }
             if (ready.isEmpty()) {
                 if (snap.graph().hasAwaitingConfirm()) {
                     log.info("PlanningLoop 等待人工 confirm session={}", sessionId);
@@ -1066,6 +1079,62 @@ public class PlanningLoop {
                                 ? stepEvaluator.evaluateAfterLoop(node, bound.evidence())
                                 : stepEvaluator.evaluate(node, step.structuredResult(), bound.evidence());
                     }
+                }
+                com.miniagent.agent.todo.AcceptanceFeedback feedback = ev.feedback();
+                boolean repairingEvidence = EvidenceRepairPolicy.active(snap, node.id());
+                if (!ev.ok() && feedback != null
+                        && (feedback.repairableEvidence() || feedback.infrastructureFailure())) {
+                    Map<String, Object> admission = feedback.repairableEvidence()
+                            ? EvidenceRepairPolicy.admission(snap, node, feedback, bound.evidence(),
+                                    evidenceRepairPaths(snap, node)) : Map.of();
+                    if (!admission.isEmpty()) {
+                        // The same node enters a restricted collection phase. Its product action,
+                        // completed dependencies, bindings, and original receipt remain intact.
+                        TaskNode pendingRepair = node.withStatus(TaskNodeStatus.PENDING).withToolStatus(null)
+                                .withError(feedback.legacyError()).withOutput(bound.evidence(), bound.bindings());
+                        StateSnapshot repairing = EvidenceRepairPolicy.put(snap.withGraph(g.replace(pendingRepair)),
+                                node.id(), admission);
+                        snap = stateStore.commit(sessionId, snap.version(), repairing);
+                        g = snap.graph();
+                        anyFail = true;
+                        acceptedAnswer = null;
+                        nodeProgressGuards.remove(progressGuardKey(proposal.basedOnPlanVersion(), node.id()));
+                        trace(sessionId, AgentStepNode.GRAPH_UPDATED,
+                                "{\"acceptanceRepair\":true,\"nodeId\":\"" + jsonEscape(node.id())
+                                        + "\",\"attempt\":" + admission.get("attempts")
+                                        + ",\"criterionId\":\"" + feedback.criterionId() + "\"}");
+                        continue;
+                    }
+                    Map<String, Object> blocked = new LinkedHashMap<>(EvidenceRepairPolicy.state(snap, node.id()));
+                    blocked.put("phase", feedback.infrastructureFailure() ? "JUDGE_BLOCKED" : "EXHAUSTED");
+                    blocked.put("feedback", PlannerStateJson.MAPPER.convertValue(feedback, Map.class));
+                    String reason = feedback.infrastructureFailure() ? "验收服务尚不可用，已保留产物和执行回执，等待恢复后重新验收。"
+                            : "只读补证据未产生可验收进展或预算已用尽，已保留产物和缺失项，需要处理后继续。";
+                    TaskNode waiting = node.withStatus(TaskNodeStatus.AWAITING_CONFIRM).withToolStatus(null)
+                            .withError(reason + " " + feedback.reason()).withOutput(bound.evidence(), bound.bindings());
+                    snap = stateStore.commit(sessionId, snap.version(), EvidenceRepairPolicy.put(
+                            snap.withGraph(g.replace(waiting)), node.id(), blocked));
+                    todoProjector.project(sessionId, snap);
+                    return RunOutcome.blockedOnHuman(reason + "\n" + feedback.legacyError(),
+                            feedback.infrastructureFailure() ? "ACCEPTANCE_JUDGE_UNAVAILABLE" : "EVIDENCE_REPAIR_EXHAUSTED");
+                }
+                if (repairingEvidence && !ev.ok()) {
+                    // A collection failure never replays the original write action through generic recovery.
+                    Map<String, Object> blocked = new LinkedHashMap<>(EvidenceRepairPolicy.state(snap, node.id()));
+                    blocked.put("phase", "BLOCKED");
+                    TaskNode waiting = node.withStatus(TaskNodeStatus.AWAITING_CONFIRM).withToolStatus(null)
+                            .withError("补证据未通过：" + ev.reason());
+                    snap = stateStore.commit(sessionId, snap.version(), EvidenceRepairPolicy.put(
+                            snap.withGraph(g.replace(waiting)), node.id(), blocked));
+                    todoProjector.project(sessionId, snap);
+                    return RunOutcome.blockedOnHuman("产物和进度已保留；补证据未通过，请处理缺失项后继续。\n" + ev.reason(),
+                            "EVIDENCE_REPAIR_BLOCKED");
+                }
+                if (repairingEvidence && ev.ok()) {
+                    Map<String, Object> complete = new LinkedHashMap<>(EvidenceRepairPolicy.state(snap, node.id()));
+                    complete.put("phase", "VERIFIED");
+                    complete.put("verifiedEvidence", clip(bound.evidence(), 12000));
+                    snap = EvidenceRepairPolicy.put(snap, node.id(), complete);
                 }
                 boolean noProgress = AgentLoop.NO_PROGRESS.equals(step.endReason());
                 TaskNodeStatus next = noProgress ? TaskNodeStatus.FAILED
@@ -1378,6 +1447,8 @@ public class PlanningLoop {
         Object pending = snapshot.execution().get(EXECUTION_HUMAN_WAIT);
         if (!(pending instanceof Map<?, ?> wait)
                 || !(wait.get("taskIds") instanceof List<?> taskIds)) return snapshot;
+        if (RecoveryBudget.EXHAUSTED_REASON.equalsIgnoreCase(String.valueOf(wait.get("reason")))
+                && !RecoveryBudget.isNewUserRound(snapshot)) return snapshot;
         TaskGraph graph = snapshot.graph();
         for (Object taskId : taskIds) {
             TaskNode node = taskId instanceof String id ? graph.byId(id) : null;
@@ -1386,6 +1457,7 @@ public class PlanningLoop {
         }
         Map<String, Object> metadata = new LinkedHashMap<>(snapshot.execution());
         metadata.remove(EXECUTION_HUMAN_WAIT);
+        metadata.remove("recoveryBudgetBlocked");
         return stateStore.commit(sessionId, snapshot.version(), snapshot.withGraph(graph).withExecution(metadata));
     }
 
@@ -1677,7 +1749,17 @@ public class PlanningLoop {
         ProposalTurnPolicy policy = new ProposalTurnPolicy(
                 allowed, hard, label, focusTodos, timeoutSec,
                 declaredFilePaths, requiredCommand, progressGuard, true);
-        LoopTurnContext.set(policy);
+        StateSnapshot repairSnapshot = stateStore.get(sessionId).orElse(null);
+        boolean evidenceRepair = repairSnapshot != null
+                && java.util.Objects.equals(proposal.executionId(), repairSnapshot.executionId())
+                && proposal.basedOnPlanVersion() == repairSnapshot.planVersion()
+                && EvidenceRepairPolicy.active(repairSnapshot, focusTask);
+        LoopTurnPolicy effectivePolicy = evidenceRepair ? new EvidenceRepairPolicy(policy,
+                EvidenceRepairPolicy.allowedPaths(repairSnapshot, focusTask),
+                () -> EvidenceRepairPolicy.reserve(stateStore, sessionId, proposal.executionId(),
+                        proposal.basedOnPlanVersion(), focusTask)) : policy;
+        if (evidenceRepair) allowed = effectivePolicy.allowedTools();
+        LoopTurnContext.set(effectivePolicy);
         List<ExecutionTurnContext.ActionBinding> bindings = proposal.actions().stream()
                 .map(a -> new ExecutionTurnContext.ActionBinding(
                         a.actionId(), a.taskId(), a.tool(), a.idempotencyKey()))
@@ -1695,14 +1777,17 @@ public class PlanningLoop {
                                 + ",\"focusTodoIds\":" + focusTodos
                                 + ",\"tools\":" + toJsonArray(allowed) + "}",
                         RunStatus.SUCCESS.name(), 0);
-            if (ActionBinder.canDirect(proposal)) {
+            if (!evidenceRepair && ActionBinder.canDirect(proposal)) {
                 StepExec bound = executeBoundAction(proposal.actions().get(0));
                 if (bound != null) {
                     return bound;
                 }
             }
             String focus = systemPrompt + "\n\n" + focusBlock(proposal, graph, focusTodos, hard);
+            if (evidenceRepair) focus += "\n\n" + EvidenceRepairPolicy.prompt(
+                    EvidenceRepairPolicy.state(repairSnapshot, focusTask));
             int maxIter = Math.max(2, properties.getProposalMaxIterations());
+            if (evidenceRepair) maxIter = Math.min(4, maxIter);
             for (String t : allowed) {
                 if (t.startsWith("browser_")) {
                     maxIter = Math.max(maxIter, properties.getProposalBrowserMaxIterations());
@@ -1715,7 +1800,7 @@ public class PlanningLoop {
                 ToolResult lastToolResult = out.lastToolResult();
                 boolean toolAttempted = !out.toolsInvoked().isEmpty() || lastToolResult != null;
                 int chunks = 1;
-                int maxChunks = properties.getProposalMaxChunks();
+                int maxChunks = evidenceRepair ? 1 : properties.getProposalMaxChunks();
                 while (shouldResumeChunk(out.endReason(), chunks, maxChunks)) {
                     log.info("循环保护后续跑 chunk={}/{} task={}", chunks + 1,
                             maxChunks <= 0 ? "∞" : maxChunks, focusTask);
@@ -1727,7 +1812,7 @@ public class PlanningLoop {
                     toolAttempted |= !out.toolsInvoked().isEmpty() || out.lastToolResult() != null;
                     chunks++;
                 }
-                return new StepExec(out.text(), out.endReason(), policy.consumeDrift(),
+                return new StepExec(out.text(), out.endReason(), effectivePolicy.consumeDrift(),
                         lastInvokedTool(out), lastToolResult == null ? out.lastErrorCode()
                         : lastToolResult.errorCode(), out.messages(), lastToolResult, toolAttempted,
                         out.controlStopReason(),
@@ -1740,7 +1825,7 @@ public class PlanningLoop {
                 log.warn("节点执行异常，停止自动重试 task={}", focusTask, ex);
                 String message = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
                 return new StepExec("节点执行结果未知：" + message, AgentLoop.OUTCOME_UNKNOWN,
-                        policy.consumeDrift(), "", ToolErrorCode.OUTCOME_UNKNOWN, List.of(), null, true,
+                        effectivePolicy.consumeDrift(), "", ToolErrorCode.OUTCOME_UNKNOWN, List.of(), null, true,
                         com.miniagent.agent.core.ExecutionControl.StopReason.NONE, true, List.of());
             }
         } finally {
@@ -1958,6 +2043,24 @@ public class PlanningLoop {
         return Set.copyOf(paths);
     }
 
+    /** Evidence collection can observe only the current node's declared files and dependency artifacts. */
+    private static Set<String> evidenceRepairPaths(StateSnapshot snapshot, TaskNode node) {
+        if (snapshot == null || node == null) return Set.of();
+        LinkedHashSet<String> paths = new LinkedHashSet<>();
+        LinkedHashSet<String> visited = new LinkedHashSet<>();
+        java.util.ArrayDeque<String> pending = new java.util.ArrayDeque<>();
+        pending.add(node.id());
+        while (!pending.isEmpty()) {
+            String id = pending.removeFirst();
+            if (!visited.add(id)) continue;
+            TaskNode candidate = snapshot.graph().byId(id);
+            if (candidate == null) continue;
+            paths.addAll(declaredFilePaths(candidate));
+            pending.addAll(candidate.dependsOn());
+        }
+        return Set.copyOf(paths);
+    }
+
     private static void addDeclaredFilePath(Set<String> paths, String candidate, boolean explicitPath) {
         if (candidate == null || candidate.isBlank()) return;
         String path = candidate.trim().replace('\\', '/');
@@ -2137,31 +2240,16 @@ public class PlanningLoop {
                 "任务恢复未通过校验，已保留执行进度并停止自动重试。请查看执行记录后继续。", reason));
     }
 
-    /**
-     * A new user request starts a new recovery budget.
-     *
-     * <p>The graph generation ({@code recoveryCount}) keeps increasing so
-     * replanned node ids stay unique, but the hard gate must not inherit the
-     * failures of earlier rounds: once the lifetime counter hit the limit, every
-     * later "continue" started already exhausted and any single failed
-     * acceptance cancelled the node and its whole downstream chain. The lifetime
-     * total is preserved in {@code recoveryCountTotal} for auditing.</p>
-     */
+    /** Normalize the trusted request round; automatic wakes never mint a new allowance. */
     private StateSnapshot resetRoundRecoveryBudget(String sessionId, StateSnapshot snap) {
-        int round = RecoveryEngine.counter(
-                snap.execution().get(PlannerStateStore.EXECUTION_ROUND_RECOVERY_COUNT));
-        if (round <= 0) {
-            return snap;
-        }
-        Map<String, Object> exec = new LinkedHashMap<>(snap.execution());
-        int total = RecoveryEngine.counter(
-                exec.get(PlannerStateStore.EXECUTION_RECOVERY_COUNT_TOTAL)) + round;
-        exec.put(PlannerStateStore.EXECUTION_RECOVERY_COUNT_TOTAL, total);
-        exec.put(PlannerStateStore.EXECUTION_ROUND_RECOVERY_COUNT, 0);
+        Map<String, Object> exec = RecoveryBudget.prepare(snap);
+        if (exec.equals(snap.execution())) return snap;
         try {
             StateSnapshot reset = stateStore.commit(sessionId, snap.version(), snap.withExecution(exec));
-            log.info("新请求重置本轮恢复预算 session={} previousRound={} total={}",
-                    sessionId, round, total);
+            log.info("恢复预算轮次已规范化 session={} round={} used={} total={}", sessionId,
+                    exec.get(RecoveryBudget.ROUND_ID),
+                    exec.get(PlannerStateStore.EXECUTION_ROUND_RECOVERY_COUNT),
+                    exec.get(PlannerStateStore.EXECUTION_RECOVERY_COUNT_TOTAL));
             return reset;
         } catch (PlannerStateStore.VersionConflictException conflict) {
             metrics.casConflict();
@@ -2182,9 +2270,7 @@ public class PlanningLoop {
             metrics.recovery();
             return llm;
         }
-        boolean atLimit = RecoveryEngine.counter(
-                        snap.execution().get(PlannerStateStore.EXECUTION_ROUND_RECOVERY_COUNT))
-                        >= properties.getMaxRecoveries()
+        boolean atLimit = RecoveryBudget.roundUsed(snap) >= properties.getMaxRecoveries()
                 || recoveryEngine.classCount(snap, dx.failureClass())
                 >= recoveryEngine.classLimit(dx.failureClass());
         if (recoveryEngine.recover(sessionId, snap, dx).isPresent()) {
@@ -2195,18 +2281,26 @@ public class PlanningLoop {
             log.warn("Recovery 失败 task={}", taskId);
             return RecoveryAttempt.applied(stateStore.get(sessionId).orElse(snap));
         }
-        log.warn("Recovery 耗尽，取消节点 task={}", taskId);
+        log.warn("Recovery 耗尽，保留节点等待用户继续 task={}", taskId);
         TaskNode latest = snap.graph().byId(node.id());
         if (latest == null) {
             latest = node;
         }
         TaskGraph g = snap.graph().replace(
-                latest.withStatus(TaskNodeStatus.CANCELLED).withError("recovery_exhausted"));
+                latest.withStatus(TaskNodeStatus.AWAITING_CONFIRM).withError(RecoveryBudget.EXHAUSTED_REASON + ": "
+                        + "本轮自动恢复额度已耗尽，已保留执行进度；请检查失败原因后明确继续。"));
+        Map<String, Object> blockedExecution = RecoveryBudget.prepare(snap);
+        blockedExecution.put("recoveryBudgetBlocked", Map.of("reason", RecoveryBudget.EXHAUSTED_REASON,
+                "taskId", latest.id(), "roundId", blockedExecution.get(RecoveryBudget.ROUND_ID),
+                "roundUsed", RecoveryBudget.roundUsed(snap), "failureClass", dx.failureClass().name()));
+        blockedExecution.put(EXECUTION_HUMAN_WAIT,
+                Map.of("reason", RecoveryBudget.EXHAUSTED_REASON, "taskIds", List.of(latest.id())));
         try {
-            return RecoveryAttempt.applied(stateStore.commit(sessionId, snap.version(), snap.withGraph(g)));
+            return RecoveryAttempt.applied(stateStore.commit(sessionId, snap.version(),
+                    snap.withGraph(g).withExecution(blockedExecution)));
         } catch (PlannerStateStore.VersionConflictException e) {
             metrics.casConflict();
-            log.warn("取消耗尽节点冲突 task={}: {}", taskId, e.getMessage());
+            log.warn("保存恢复等待状态冲突 task={}: {}", taskId, e.getMessage());
             return RecoveryAttempt.applied(stateStore.get(sessionId).orElse(snap));
         }
     }
@@ -2231,8 +2325,13 @@ public class PlanningLoop {
                 && dx.failureClass() != FailureClass.REVISE_GOAL) {
             return RecoveryAttempt.notApplicable();
         }
-        int used = recoveryEngine.classCount(snap, dx.failureClass());
-        if (!replanBudgetAvailable(snap.recoveryCount(), properties.getMaxRecoveries(),
+        TaskNode currentFailedNode = snap.graph().byId(node.id());
+        if (currentFailedNode == null || currentFailedNode.status() == TaskNodeStatus.OUTCOME_UNKNOWN
+                || currentFailedNode.status() == TaskNodeStatus.RUNNING
+                || currentFailedNode.toolStatus() == com.miniagent.agent.tool.ToolStatus.UNKNOWN)
+            return RecoveryAttempt.notApplicable();
+        int used = RecoveryBudget.classUsed(snap, dx.failureClass());
+        if (!replanBudgetAvailable(RecoveryBudget.roundUsed(snap), properties.getMaxRecoveries(),
                 used, recoveryEngine.classLimit(dx.failureClass()), dx.kind(), explicitUserResume)) {
             return RecoveryAttempt.notApplicable();
         }
@@ -2338,7 +2437,10 @@ public class PlanningLoop {
             return rejectRecovery(sessionId, snap, "REPLAN_VALIDATION_FAILED");
         }
         Goal nextGoal = compiled.goal() != null ? compiled.goal() : snap.goal();
-        Map<String, Object> exec = new HashMap<>(snap.execution());
+        boolean reservedExplicitResume = explicitUserResume && (dx.kind() == FailureKind.DEPENDENCY_FAILED
+                || dx.kind() == FailureKind.TOOL_BUDGET_EXHAUSTED);
+        Map<String, Object> exec = RecoveryBudget.consume(snap, dx.failureClass(), properties.getMaxRecoveries(),
+                recoveryEngine.classLimit(dx.failureClass()), reservedExplicitResume);
         if (waiting) {
             try {
                 TaskGraph completed = new TaskGraph(snap.graph().nodes().stream()
@@ -2349,7 +2451,6 @@ public class PlanningLoop {
                 return rejectRecovery(sessionId, snap, "RECOVERY_CONTEXT_INVALID");
             }
         }
-        exec.put("recovery." + dx.failureClass().name(), used + 1);
         exec.put("lastFailureKind", dx.kind().name());
         StateSnapshot patched = snap.revisePlan(merged, nextGoal, compiled.intent(),
                         "llm_replan_" + dx.failureClass().name().toLowerCase())
@@ -2426,7 +2527,7 @@ public class PlanningLoop {
                 && firstPendingBlockedByCancelledDependency(graph) != null;
     }
 
-    static boolean replanBudgetAvailable(int totalRecoveries, int maxRecoveries,
+    static boolean replanBudgetAvailable(int roundRecoveries, int maxRecoveries,
                                          int classRecoveries, int classLimit,
                                          FailureKind failureKind,
                                          boolean explicitUserResume) {
@@ -2434,7 +2535,7 @@ public class PlanningLoop {
         // Do not let automatic-recovery counters consume that separately reserved allowance.
         if (explicitUserResume && (failureKind == FailureKind.DEPENDENCY_FAILED
                 || failureKind == FailureKind.TOOL_BUDGET_EXHAUSTED)) return true;
-        return totalRecoveries < maxRecoveries && classRecoveries < classLimit;
+        return RecoveryBudget.available(roundRecoveries, maxRecoveries, classRecoveries, classLimit);
     }
 
     static String cancelledDependencyResumeRequest(StateSnapshot snapshot, String userMessage) {
