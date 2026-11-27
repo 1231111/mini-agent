@@ -59,6 +59,7 @@ public class SubjectErasureService {
     private final ObjectProvider<CloudMemoryClient> cloud;
     private final ChatMemoryConfig chatMemory;
     private final ObjectProvider<ExecutionControl> execution;
+    private final ObjectProvider<AutonomousGoalService> autonomousGoals;
     private final TransactionTemplate tx;
     private final AtomicLong pendingRemoteGauge = new AtomicLong();
 
@@ -70,7 +71,8 @@ public class SubjectErasureService {
                                  ObjectProvider<CloudMemoryClient> cloud,
                                  ChatMemoryConfig chatMemory,
                                  PlatformTransactionManager transactions,
-                                 ObjectProvider<ExecutionControl> execution) {
+                                 ObjectProvider<ExecutionControl> execution,
+                                 ObjectProvider<AutonomousGoalService> autonomousGoals) {
         this.jdbc = jdbc;
         this.memoryStore = memoryStore;
         this.files = files;
@@ -79,6 +81,7 @@ public class SubjectErasureService {
         this.chatMemory = chatMemory;
         this.tx = new TransactionTemplate(transactions);
         this.execution = execution;
+        this.autonomousGoals = autonomousGoals;
     }
 
     @PostConstruct
@@ -246,6 +249,13 @@ public class SubjectErasureService {
     private void eraseLocalInternal(long userId, String tenantId) {
         jdbc.update("UPDATE memory_subject_erasure SET status='PENDING_LOCAL',updated_at=CURRENT_TIMESTAMP(6),"
                 + "last_error=NULL WHERE tenant_id=? AND user_id=?", tenantId, userId);
+
+        // Revoke both queued and in-flight autonomous continuations before
+        // deleting their source conversations.  The queue is owner-scoped and
+        // therefore must be part of subject erasure, otherwise a later scheduler
+        // tick could resume a deleted goal with stale credentials.
+        AutonomousGoalService goals = autonomousGoals.getIfAvailable();
+        if (goals != null) goals.eraseOwner(userId, tenantId);
 
         List<Long> entryIds = ids("SELECT id FROM agent_memory_entries WHERE tenant_id=?"
                 + " AND scope_type='USER' AND scope_id=?", tenantId, String.valueOf(userId));

@@ -1058,7 +1058,8 @@ public class SessionEventCenter {
                             channel.pendingUserMessages.clear();
                         }
                         channel.doneAt = 0L;
-                        sendToLocalClients(channel, "user", channel.userMessage);
+                        if (!channel.userMessage.isEmpty())
+                            sendToLocalClients(channel, "user", channel.userMessage);
                     }
                     case "complete" -> {
                         if (channel.status != Status.running) return;

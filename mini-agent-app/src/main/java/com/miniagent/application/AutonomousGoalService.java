@@ -79,6 +79,16 @@ public class AutonomousGoalService {
         active.values().stream().filter(a -> a.goal().userId() == user && a.goal().sessionId().equals(session))
                 .forEach(a -> a.thread().interrupt());
     }
+    /**
+     * Subject erasure fence: revoke durable rows and interrupt in-flight workers
+     * before the caller removes the subject's conversations and memory.
+     */
+    public void eraseOwner(long user, String tenant) {
+        active.values().stream()
+                .filter(a -> a.goal().userId() == user && tenant.equals(a.goal().tenantId()))
+                .forEach(a -> a.thread().interrupt());
+        queue.eraseOwner(user, tenant, clock.millis());
+    }
 
     @Scheduled(fixedDelayString = "${agent.goals.scan-ms:1000}")
     public void tick() {

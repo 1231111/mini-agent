@@ -100,4 +100,8 @@ public class GoalQueue {
     public void cancel(long owner, String session, long now) {
         jdbc.update("UPDATE agent_pending_goals SET goal_state='CANCELLED',wakeup_reason='USER_CANCELLED',lease_token=NULL,lease_until_ms=0,row_version=row_version+1,updated_ms=? WHERE user_id=? AND session_id=? AND goal_state NOT IN ('COMPLETED','CANCELLED','SUPERSEDED')", now, owner, session);
     }
+    /** Delete every durable continuation for an erased subject. */
+    public void eraseOwner(long owner, String tenant, long now) {
+        jdbc.update("DELETE FROM agent_pending_goals WHERE user_id=? AND tenant_id=?", owner, tenant);
+    }
 }

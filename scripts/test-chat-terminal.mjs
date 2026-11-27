@@ -566,3 +566,136 @@ for (const partialAnswer of ['部分结果，尚未完成', '']) {
     assert.ok(body.querySelector('.outcome-review-open'));
     console.log('PASS: reloaded unknown task retains review status and explicit recovery entry');
 }
+
+{
+    const h = createHarness(), requests = [], echoes = [], alerts = [];
+    const historyWrites = [];
+    h.context.confirmBody = h.bot;
+    h.context.alert = text => alerts.push(text);
+    h.context.renderUserMsg = text => echoes.push(text);
+    h.context.addMsgToConv = (...args) => historyWrites.push(args);
+    h.context.renderBotMsg = () => { throw new Error('confirmation must reuse the existing bot row'); };
+    vm.runInContext(`isStreaming = false; renderTaskProgress(confirmBody, [
+        { id: 1, content: '核验原有文件', status: 'awaiting_confirm' }
+    ], { executionId: 'exec-confirm', version: 12, summary: '改造并验收联机游戏',
+        currentNodeId: '1', status: 'WAITING', allowConfirm: true });`, h.context);
+    const originalCard = h.bot.querySelector('.todo-panel');
+    const oldAnswer = new Element(); oldAnswer.className = 'answer-stream';
+    oldAnswer.textContent = '请确认后继续'; h.bot.appendChild(oldAnswer);
+    h.context.fetch = async (url, options) => {
+        requests.push({ url, options });
+        let used = false;
+        return { ok: true, headers: { get: () => 'text/event-stream' }, body: { getReader: () => ({ async read() {
+            if (used) return { done: true };
+            used = true;
+            return { done: false, value: Buffer.from(
+                event('todo', JSON.stringify({ executionId: 'exec-confirm', version: 13,
+                    summary: '改造并验收联机游戏', currentNodeId: '1', items: [
+                        { id: 1, content: '核验原有文件', status: 'completed' }
+                    ] })) + event('task_outcome', JSON.stringify({ status: 'SUCCESS', executionId: 'exec-confirm' }))
+                    + event('end', '联机改造已验收')) };
+        } }) } };
+    };
+    await h.context.confirmTodoAndContinue(1, h.bot);
+    assert.equal(requests.length, 1);
+    assert.match(requests[0].url, /\/todos\/1\/continue$/);
+    assert.equal(requests[0].options.method, 'POST');
+    assert.deepEqual(JSON.parse(requests[0].options.body), { executionId: 'exec-confirm', version: 12 });
+    assert.equal(echoes.length, 0);
+    assert.equal(historyWrites.length, 0);
+    assert.deepEqual(alerts, []);
+    assert.equal(h.bot.querySelector('.todo-panel'), originalCard);
+    assert.equal(h.bot.querySelectorAll('.todo-panel').length, 1);
+    assert.equal(h.bot.querySelector('.todo-task-summary').textContent, '改造并验收联机游戏');
+    assert.equal(h.bot.querySelector('.answer-stream').innerHTML, '联机改造已验收');
+    console.log('PASS: confirming resumes the typed execution in the original card without a synthetic user message');
+}
+
+{
+    const h = createHarness(), alerts = [];
+    h.context.confirmBody = h.bot; h.context.alert = text => alerts.push(text);
+    vm.runInContext(`isStreaming = false; renderTaskProgress(confirmBody, [
+        { id: 1, content: '检查文件', status: 'awaiting_confirm' }
+    ], { executionId: 'exec-conflict', version: 8, status: 'WAITING', allowConfirm: true });`, h.context);
+    const originalCard = h.bot.querySelector('.todo-panel');
+    h.context.fetch = async () => ({ ok: false, status: 409, headers: { get: () => 'application/json' },
+        text: async () => JSON.stringify({ message: '任务版本已变化' }) });
+    await h.context.confirmTodoAndContinue(1, h.bot);
+    assert.equal(h.bot.querySelector('.todo-panel'), originalCard);
+    assert.equal(h.bot.querySelectorAll('.todo-panel').length, 1);
+    assert.match(alerts[0], /任务版本已变化/);
+    assert.equal(vm.runInContext('isStreaming', h.context), false);
+    console.log('PASS: rejected continuation preserves the existing card and unlocks confirmation controls');
+}
+
+{
+    const h = createHarness(); let requests = 0, release;
+    h.context.confirmBody = h.bot; h.context.alert = () => {};
+    vm.runInContext(`isStreaming = false; renderTaskProgress(confirmBody, [
+        { id: 1, content: '核验原有文件', status: 'awaiting_confirm' }
+    ], { executionId: 'exec-double', version: 12, status: 'WAITING', allowConfirm: true });`, h.context);
+    h.context.fetch = async () => {
+        requests++;
+        return await new Promise(resolve => { release = resolve; });
+    };
+    const first = h.context.confirmTodoAndContinue(1, h.bot);
+    await h.context.confirmTodoAndContinue(1, h.bot);
+    assert.equal(requests, 1);
+    release({ ok: false, status: 409, headers: { get: () => 'application/json' },
+        text: async () => JSON.stringify({ message: '已处理' }) });
+    await first;
+    assert.equal(h.bot.querySelectorAll('.todo-panel').length, 1);
+    assert.equal(vm.runInContext('isStreaming', h.context), false);
+    console.log('PASS: repeated confirmation clicks issue only one continuation request');
+}
+
+{
+    const h = createHarness();
+    h.context.confirmBody = h.bot;
+    vm.runInContext(`renderTaskProgress(confirmBody, [
+        { id: 1, content: '当前确认步骤', status: 'awaiting_confirm' }
+    ], { executionId: 'exec-versioned', version: 12, summary: '原目标', status: 'WAITING' });
+    confirmBody._resumeExistingTask = true;`, h.context);
+    const originalCard = h.bot.querySelector('.todo-panel');
+    await consume(h, [
+        event('todo', JSON.stringify({ executionId: 'exec-versioned', version: 11,
+            summary: '旧版本不应覆盖', items: [{ id: 1, content: '旧步骤', status: 'completed' }] })),
+        event('todo', JSON.stringify({ executionId: 'other-execution', version: 999,
+            summary: '其他目标不应覆盖', items: [{ id: 1, content: '错误步骤', status: 'completed' }] })),
+        () => {
+            assert.equal(h.bot.querySelector('.todo-panel'), originalCard);
+            assert.equal(h.bot.querySelector('.todo-task-summary').textContent, '原目标');
+            assert.equal(h.bot.querySelector('.todo-current-title').textContent, '当前确认步骤');
+        },
+        event('todo', JSON.stringify({ executionId: 'exec-versioned', version: 13,
+            summary: '原目标', items: [{ id: 1, content: '当前确认步骤', status: 'completed' }] })),
+        event('task_outcome', JSON.stringify({ status: 'SUCCESS', executionId: 'exec-versioned' })),
+        event('end', '已完成')
+    ]);
+    assert.equal(h.bot.querySelector('.todo-panel'), originalCard);
+    assert.equal(h.bot.querySelectorAll('.todo-panel').length, 1);
+    assert.equal(h.bot.dataset.taskProgressVersion, '13');
+    console.log('PASS: resumed execution rejects stale and foreign DAG snapshots before updating the original card');
+}
+
+{
+    const h = createHarness(), alerts = [];
+    h.context.confirmBody = h.bot; h.context.alert = text => alerts.push(text);
+    vm.runInContext(`isStreaming = false; renderTaskProgress(confirmBody, [
+        { id: 1, content: '待确认节点', status: 'awaiting_confirm' }
+    ], { executionId: 'exec-not-sse', version: 4, status: 'WAITING', allowConfirm: true });`, h.context);
+    const originalCard = h.bot.querySelector('.todo-panel');
+    const answer = new Element(); answer.className = 'answer-stream';
+    answer.textContent = '已有验收结果'; h.bot.appendChild(answer);
+    h.context.fetch = async () => ({ ok: true, status: 200, headers: { get: () => 'application/json' },
+        text: async () => JSON.stringify({ message: '请求未启动，请重试' }),
+        body: { getReader: () => { throw new Error('JSON cannot be read as SSE'); } } });
+    await h.context.confirmTodoAndContinue(1, h.bot);
+    assert.equal(h.bot.querySelector('.todo-panel'), originalCard);
+    assert.equal(h.bot.querySelector('.answer-stream'), answer);
+    assert.equal(answer.textContent, '已有验收结果');
+    assert.equal(h.bot.dataset.taskStatus, undefined);
+    assert.equal(vm.runInContext('isStreaming', h.context), false);
+    assert.match(alerts[0], /请求未启动/);
+    console.log('PASS: a non-SSE continuation response preserves the original answer and card without false completion');
+}

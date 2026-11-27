@@ -44,7 +44,7 @@ public class TokenQuotaFilter extends OncePerRequestFilter {
 
     /** 只有这两个端点会触发模型调用；新建会话、上传文件、读历史都不拦。 */
     private static final Pattern GATED = Pattern.compile(
-            "^/api/conversations/[^/]+/messages(?:/stream)?$");
+            "^/api/conversations/[^/]+/(?:messages(?:/stream)?|todos/[0-9]+/continue)$");
 
     private final TokenEntitlementGate gate;
     private final ObjectMapper objectMapper;

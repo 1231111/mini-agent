@@ -19,6 +19,7 @@ import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.task.TaskPlanFactory;
 import com.miniagent.agent.trace.AgentStepNode;
 import com.miniagent.agent.planner.PlanningLoop;
+import com.miniagent.agent.planner.RecoveryBudget;
 import com.miniagent.agent.planner.StateSnapshot;
 import com.miniagent.memory.MemoryService;
 import com.miniagent.memory.MemoryStore;
@@ -105,6 +106,17 @@ public class AgentChatApplicationService {
     private ClientMultiAgent clientMultiAgent;
     @Autowired
     private PlanningLoop planningLoop;
+    @Autowired
+    private ConversationTaskContinuationService taskContinuations;
+    @Autowired
+    private com.miniagent.agent.planner.TodoStateProjector todoProjector;
+    /**
+     * Durable continuation controller.  The controller is optional for library
+     * profiles, but when present it is the only production path that registers
+     * an unfinished DAG for a later wake-up.
+     */
+    @Autowired(required = false)
+    private AutonomousGoalService autonomousGoalService;
     @Autowired(required = false)
     private com.miniagent.agent.planner.PlannerStateStore plannerStates;
     @Autowired
@@ -322,6 +334,14 @@ public class AgentChatApplicationService {
             List<FileRef> fileRefs,
             PreparedRun acceptedRun,
             String streamToken) {
+        return executeAgentWithProgress(userId, sessionId, userMessage, displayMessage, progressEmitter,
+                imageDataUrls, mediaRefs, fileRefs, acceptedRun, streamToken, null);
+    }
+
+    private AgentResult executeAgentWithProgress(Long userId, String sessionId, String userMessage,
+            String displayMessage, SseEmitter progressEmitter, List<String> imageDataUrls,
+            List<MediaRef> mediaRefs, List<FileRef> fileRefs, PreparedRun acceptedRun, String streamToken,
+            ConversationTaskContinuationService.Binding continuationBinding) {
         PreparedRun prepared = acceptedRun == null ? prepareRun(userId, sessionId) : acceptedRun;
         Long tenantId = prepared.tenantId();
         String authorizedProjectId = prepared.projectId();
@@ -334,12 +354,38 @@ public class AgentChatApplicationService {
         RunStatus terminalStatus = RunStatus.FAILURE;
         String terminalDetail = "Task worker interrupted before completion";
         RuntimeException failure = null;
+        GoalContinuationContext.Continuation continuation = GoalContinuationContext.current();
+        boolean backgroundContinuation = continuation != null && continuation.unattended();
+        String recoveryRoundId = backgroundContinuation
+                ? continuation.recoveryRoundId()
+                : "user:" + Objects.requireNonNullElse(run.fencingToken(), UUID.randomUUID().toString());
+        if (StringUtils.isBlank(recoveryRoundId)) {
+            // A persisted goal must always carry a round id.  Treat a malformed
+            // continuation as a new, fenced request instead of silently sharing
+            // the previous request's recovery allowance.
+            recoveryRoundId = "user:" + UUID.randomUUID();
+            backgroundContinuation = false;
+        }
 
         long[] taskId = {0L};
         try (var ignoredOwner = OwnerContext.bind(owner);
              var ignoredRun = TaskExecutionContext.bindRun(run.fencingToken());
              var ignoredDate = SearchDateContext.bind(SearchDateContext.fromRequest(
-                     displayMessage, prepared.requestedAt(), SearchDateContext.resolveZone(searchTimeZone)))) {
+                     displayMessage, prepared.requestedAt(), SearchDateContext.resolveZone(searchTimeZone)));
+             var ignoredRecoveryRound = RecoveryBudget.bindRound(recoveryRoundId, !backgroundContinuation)) {
+            if (!backgroundContinuation && autonomousGoalService != null) {
+                try {
+                    // A fresh user request supersedes a stale queued/claimed wake;
+                    // the result of this run will register the new fenced round.
+                    autonomousGoalService.userRequest(userId, sessionId);
+                } catch (RuntimeException coordinationFailure) {
+                    // Queue availability must not turn an otherwise valid user
+                    // request into a failed task.  The run remains observable and
+                    // can be explicitly continued after the queue recovers.
+                    log.warn("无法挂起旧的自动续跑目标，继续执行用户请求: session={}", sessionId,
+                            coordinationFailure);
+                }
+            }
             leaseRenewal = taskRunLeaseRenewer == null
                     ? null : taskRunLeaseRenewer.start(run);
             OwnerContext.setCurrentProjectId(authorizedProjectId);
@@ -375,7 +421,7 @@ public class AgentChatApplicationService {
                         mediaRefs,
                         fileRefs,
                         taskId,
-                        streamToken);
+                        streamToken, continuationBinding);
                 taskId[0] = agentResult.taskId();
                 result = agentResult;
                 String answer = agentResult.answer();
@@ -433,6 +479,25 @@ public class AgentChatApplicationService {
             } else {
                 terminalStatus = RunStatus.FAILURE;
                 terminalDetail = exceptionDetail(e);
+            }
+
+            // doExecuteAgent may persist a planner snapshot before the model,
+            // transport, or tool layer throws.  Preserve that identity so the
+            // terminally failed user run can still enter the durable continuation
+            // queue; without this fallback an exception would silently discard
+            // the only resumable DAG.
+            if (result == null && plannerStates != null) {
+                try {
+                    String executionId = traceRecorder == null ? null : traceRecorder.currentExecutionId();
+                    StateSnapshot current = plannerStates.get(sessionId).orElse(null);
+                    if (current != null && (StringUtils.isBlank(executionId)
+                            || executionId.equals(current.executionId()))) {
+                        result = new AgentResult("任务执行中断，已保留当前进度。", terminalStatus,
+                                terminalDetail, taskId[0], current.executionId());
+                    }
+                } catch (RuntimeException snapshotFailure) {
+                    log.warn("异常收口时无法读取 planner 快照: session={}", sessionId, snapshotFailure);
+                }
             }
 
             // 记录任务失败事件
@@ -506,6 +571,16 @@ public class AgentChatApplicationService {
                 else if (failure != terminalFailure) failure.addSuppressed(terminalFailure);
             }
 
+            // Register only user-owned runs.  A background worker already owns a
+            // queue lease and finishes that exact row in AutonomousGoalService;
+            // registering it here would race the lease and could resurrect a
+            // superseded goal.  The execution id match prevents a direct-mode run
+            // from registering a stale DAG snapshot left by an earlier task.
+            if (!backgroundContinuation) {
+                recordAutonomousOutcome(userId, tenantId, sessionId, taskId[0], result,
+                        terminalStatus, terminalDetail);
+            }
+
             // 巩固走后台，避免挡住 SSE end（PERM_ASK 批准后续跑会等流结束）
             if (memoryManager != null) {
                 final String consolidateSid = sessionId;
@@ -527,6 +602,33 @@ public class AgentChatApplicationService {
         }
         if (failure != null) throw failure;
         return result;
+    }
+
+    private void recordAutonomousOutcome(Long userId, Long tenantId, String sessionId,
+                                         long fallbackTaskId, AgentResult result,
+                                         RunStatus terminalStatus, String terminalDetail) {
+        if (autonomousGoalService == null || plannerStates == null || result == null
+                || StringUtils.isBlank(result.executionId())) return;
+        try {
+            StateSnapshot snapshot = plannerStates.get(sessionId)
+                    .filter(candidate -> result.executionId().equals(candidate.executionId()))
+                    .orElse(null);
+            if (snapshot == null || snapshot.goal() == null || snapshot.graph().isEmpty()) return;
+            String roundId = Objects.toString(snapshot.execution().get(RecoveryBudget.ROUND_ID), "");
+            if (StringUtils.isBlank(roundId)) return;
+            String workspace = conversationWorkspaceService.effectiveRoot(sessionId, userId)
+                    .toAbsolutePath().normalize().toString();
+            long taskId = result.taskId() > 0 ? result.taskId() : fallbackTaskId;
+            autonomousGoalService.recordUserOutcome(userId, String.valueOf(tenantId), sessionId,
+                    taskId, roundId, workspace, terminalStatus,
+                    StringUtils.defaultIfBlank(result.reason(), terminalDetail), snapshot);
+        } catch (RuntimeException registrationFailure) {
+            // The queue is a continuation aid, never the source of truth for the
+            // just-completed run.  Keep the terminal task result while exposing a
+            // durable warning for operations to repair/replay the registration.
+            log.error("记录未完成目标续跑失败: session={}, executionId={}", sessionId,
+                    result.executionId(), registrationFailure);
+        }
     }
 
     private static void stopLeaseRenewal(AutoCloseable renewal) {
@@ -684,7 +786,7 @@ public class AgentChatApplicationService {
             List<MediaRef> mediaRefs,
             List<FileRef> fileRefs,
             long[] taskId,
-            String streamToken) {
+            String streamToken, ConversationTaskContinuationService.Binding continuationBinding) {
         List<String> images = Optional.ofNullable(imageDataUrls).orElseGet(List::of).stream()
                 .filter(StringUtils::isNotBlank).toList();
         List<MediaRef> media = Optional.ofNullable(mediaRefs).orElseGet(List::of).stream()
@@ -739,8 +841,18 @@ public class AgentChatApplicationService {
         com.miniagent.agent.planner.PlanningRoute planningRoute;
         try (TaskExecutionContext.Scope routingTaskScope = TaskExecutionContext.bind(
                 contextLoader.currentTaskId(sessionId))) {
-            planningRoute = planningLoop.selectRoute(
-                    effectiveChat, taskPlan, sessionId, userMessage, multimodalMsg, routingHistory);
+            if (GoalContinuationContext.active()) {
+                var continuation = GoalContinuationContext.current();
+                StateSnapshot active = plannerStates.get(sessionId).orElseThrow(
+                        () -> new IllegalStateException("原任务已不存在，请刷新任务状态。"));
+                if (!continuation.executionId().equals(active.executionId())
+                        || contextLoader.currentTaskId(sessionId) != continuation.taskId())
+                    throw new IllegalStateException("原任务身份已变化，拒绝继续其他任务。 ");
+                planningRoute = com.miniagent.agent.planner.PlanningRoute.resume("control", continuation.wakeupReason());
+            } else {
+                planningRoute = planningLoop.selectRoute(
+                        effectiveChat, taskPlan, sessionId, userMessage, multimodalMsg, routingHistory);
+            }
         }
         LoadedContext loaded = contextLoader.load(sessionId, userMessage, hasMedia, memMsgs,
                 planningRoute == null ? null : planningRoute.taskBoundary());
@@ -749,7 +861,8 @@ public class AgentChatApplicationService {
         // 记录的 taskId 与本轮 LoadedContext 一致，并由 RunScope 传播到工具线程。
         recordEvent(sessionId, Long.toString(loaded.taskId()),
                 com.miniagent.memory.model.AgentEvent.EventType.TASK_START,
-                "user", Map.of("question", truncate(userMessage, 500)), null);
+                continuationBinding == null ? "user" : "control",
+                Map.of("question", truncate(userMessage, 500)), null);
         // 任务级隔离不在这里做.曾经的做法是在换任务时往会话里落一条 system 边界标记，
         // 下一轮重建历史时只取标记之后的消息 —— 那是拿「跨轮追问答不出来」换「不污染」，方向错了。
         // 现在：对话历史整段保留（追问要看得见上文），任务级状态（规划图、压缩摘要）
@@ -883,9 +996,9 @@ public class AgentChatApplicationService {
             log.warn("Agent 返回空最终答复，已写入兜底提示并标记未完成: session={}", sessionId);
         }
 
-        if (hasMedia) {
+        if (continuationBinding == null && hasMedia) {
             memory.add(multimodalMsg);
-        } else {
+        } else if (continuationBinding == null) {
             memory.add(UserMessage.from(userMessage));
         }
         if (runStatus == RunStatus.FAILURE) {
@@ -894,6 +1007,30 @@ public class AgentChatApplicationService {
                             ? "操作结果尚未确认，已停止自动重试。请先核验实际状态。"
                             : "本次任务未完成，请查看执行日志中的失败步骤。");
         }
+        TaskProgressSnapshot progress = TaskProgressSnapshot.capture(
+                progressExecutionId, loaded.taskId(), runStatus.name(), endReason,
+                taskTodoStore == null ? List.of() : taskTodoStore.get(sessionId),
+                taskTodoStore == null ? null : taskTodoStore.progressContext(sessionId));
+        if (continuationBinding != null) {
+            // The inner executor has released its model ThreadLocals. Restore the
+            // exact originating model context while encoding opaque tool reasoning.
+            try (var model = com.miniagent.common.model.EffectiveModelContext.bind(
+                    effectiveChat, models.streaming(), models.settings().contextWindowTokens(), models.sendThinking())) {
+                taskContinuations.complete(continuationBinding, answer, progress, agentMessages);
+            }
+            // Replace the cached waiting answer as well as the durable answer;
+            // confirmation is not a new user turn in either history representation.
+            List<ChatMessage> previous = new ArrayList<>(memory.messages());
+            for (int i = previous.size() - 1; i >= 0; i--) {
+                if (previous.get(i) instanceof AiMessage ai
+                        && Objects.equals(ai.text(), continuationBinding.expectedAnswer())) {
+                    previous.set(i, AiMessage.from(answer));
+                    memory.clear(); previous.forEach(memory::add);
+                    break;
+                }
+            }
+            return new AgentResult(answer, runStatus, endReason, loaded.taskId(), progressExecutionId);
+        }
         memory.add(AiMessage.from(answer));
 
         ChatTask task = new ChatTask();
@@ -901,11 +1038,7 @@ public class AgentChatApplicationService {
         task.setSessionId(sessionId);
         task.setQuestion(displayQuestion);
         task.setAnswer(answer);
-        task.setTaskProgressJson(TaskProgressSnapshot.capture(
-                progressExecutionId, loaded.taskId(), runStatus.name(), endReason,
-                taskTodoStore == null ? List.of() : taskTodoStore.get(sessionId),
-                taskTodoStore == null ? null : taskTodoStore.progressContext(sessionId))
-                .toJson());
+        task.setTaskProgressJson(progress.toJson());
         if (!allSavedPaths.isEmpty()) {
             task.setImages(String.join(",", allSavedPaths));
         }
@@ -1023,18 +1156,92 @@ public class AgentChatApplicationService {
             executionControl.finish(finalSid, prepared.handle().fencingToken());
             return stream.emitter();
         }
+        return dispatchAcceptedStream(userId, finalSid, finalUserMessage, finalDisplayMessage,
+                finalImages, finalMedia, finalFileRefs, finalRole, prepared, stream, null, null);
+    }
+
+    /** A control action against a fenced DAG, never a synthetic chat message. */
+    public SseEmitter confirmAndContinue(Long userId, String sessionId, int todoId,
+                                        String executionId, long version) {
+        if (todoId <= 0 || StringUtils.isBlank(executionId) || version < 0)
+            throw new org.springframework.web.server.ResponseStatusException(
+                    org.springframework.http.HttpStatus.BAD_REQUEST, "任务确认参数不完整。");
+        PreparedRun prepared;
+        try { prepared = prepareRun(userId, sessionId); }
+        catch (IllegalStateException busy) {
+            throw new org.springframework.web.server.ResponseStatusException(
+                    org.springframework.http.HttpStatus.CONFLICT, "任务正在运行，请勿重复确认。", busy);
+        }
+        ChatStreamingService.StreamStart stream = null;
+        try (var owner = OwnerContext.bind(new OwnerContext(userId, String.valueOf(prepared.tenantId())));
+             var run = TaskExecutionContext.bindRun(prepared.handle().fencingToken())) {
+            StateSnapshot snapshot = plannerStates.get(sessionId).orElseThrow(() ->
+                    new IllegalStateException("原任务已不存在，请刷新任务状态。"));
+            if (!executionId.equals(snapshot.executionId()) || snapshot.version() != version)
+                throw new IllegalStateException("任务状态已变化，请刷新后重新确认。");
+            var binding = taskContinuations.prepare(userId, sessionId, executionId);
+            if (binding == null || binding.taskId() != contextLoader.currentTaskId(sessionId))
+                throw new IllegalStateException("原任务卡与当前执行不匹配，请刷新任务状态。");
+            var graph = todoProjector.confirmByTodoId(snapshot.graph(), todoId);
+            if (graph == snapshot.graph())
+                throw new IllegalStateException("该步骤已被确认或不在等待确认状态。");
+            stream = streamingService.tryCreateStreamForAcceptedRun(sessionId, "", userId);
+            if (!stream.accepted()) throw new IllegalStateException("该会话已有任务在运行。");
+            if (!taskRunService.renewSessionLock(sessionId, prepared.handle().fencingToken()))
+                throw new IllegalStateException("任务启动租约已失效，请重新确认。");
+            Map<String, Object> execution = new LinkedHashMap<>(snapshot.execution());
+            Object waitValue = execution.get(PlanningLoop.EXECUTION_HUMAN_WAIT);
+            if (waitValue instanceof Map<?, ?> wait && wait.get("taskIds") instanceof List<?> waiting) {
+                String confirmedNode = todoProjector.nodeIdFor(snapshot.graph(), todoId);
+                List<?> remaining = waiting.stream().filter(node -> !confirmedNode.equals(node)).toList();
+                if (remaining.isEmpty()) {
+                    execution.remove(PlanningLoop.EXECUTION_HUMAN_WAIT);
+                    execution.remove("recoveryBudgetBlocked");
+                } else {
+                    Map<String, Object> remainingWait = new LinkedHashMap<>();
+                    wait.forEach((key, value) -> remainingWait.put(key.toString(), value));
+                    remainingWait.put("taskIds", remaining);
+                    execution.put(PlanningLoop.EXECUTION_HUMAN_WAIT, remainingWait);
+                }
+            }
+            StateSnapshot confirmed = plannerStates.commit(sessionId, version,
+                    snapshot.withGraph(graph).withExecution(execution));
+            todoProjector.project(sessionId, confirmed);
+            return dispatchAcceptedStream(userId, sessionId, snapshot.goal().objective(), binding.question(),
+                    List.of(), List.of(), List.of(), null, prepared, stream, binding, snapshot);
+        } catch (RuntimeException rejected) {
+            taskRunService.markFailed(prepared.handle(), "CONFIRM_CONTINUATION_REJECTED");
+            executionControl.finish(sessionId, prepared.handle().fencingToken());
+            if (stream != null && stream.accepted()) {
+                streamingService.getEventCenter().error(sessionId, exceptionDetail(rejected), stream.runToken());
+                streamingService.markIdle(sessionId);
+            }
+            if (rejected instanceof org.springframework.web.server.ResponseStatusException) throw rejected;
+            throw new org.springframework.web.server.ResponseStatusException(
+                    org.springframework.http.HttpStatus.CONFLICT, exceptionDetail(rejected), rejected);
+        }
+    }
+
+    /** Shared admitted-run worker lifecycle for both chat requests and typed controls. */
+    private SseEmitter dispatchAcceptedStream(Long userId, String finalSid, String finalUserMessage,
+            String finalDisplayMessage, List<String> finalImages, List<MediaRef> finalMedia,
+            List<FileRef> finalFileRefs, String finalRole, PreparedRun prepared,
+            ChatStreamingService.StreamStart stream, ConversationTaskContinuationService.Binding binding,
+            StateSnapshot beforeConfirmation) {
         SseEmitter emitter = stream.emitter();
 
         try {
         CompletableFuture.runAsync(() -> {
-            try {
+            try (var continuation = GoalContinuationContext.bind(binding == null ? null
+                    : new GoalContinuationContext.Continuation(binding.executionId(), binding.taskId(),
+                            "user:" + prepared.handle().fencingToken(), "NODE_CONFIRMED", false))) {
                 if (StringUtils.isNotBlank(finalRole)) {
                     RoleContext.setRole(finalRole);
                 }
                 AgentResult result = executeAgentWithProgress(
                         userId, finalSid, finalUserMessage, finalDisplayMessage,
                         emitter, finalImages, finalMedia,
-                        finalFileRefs, prepared, stream.runToken());
+                        finalFileRefs, prepared, stream.runToken(), binding);
                 streamingService.markCompleting(finalSid);
                 streamingService.getEventCenter().publish(finalSid, "task_outcome",
                         Map.of("status", result.status().name(), "reason", result.reason(),
@@ -1045,6 +1252,7 @@ public class AgentChatApplicationService {
                     streamingService.getEventCenter().complete(finalSid, result.answer(), stream.runToken());
                 }
             } catch (Exception e) {
+                restoreUndispatchedConfirmation(finalSid, beforeConfirmation);
                 streamingService.markCompleting(finalSid);
                 log.error("Agent SSE worker failed: sessionId={}, runId={}, runToken={}",
                         finalSid, prepared.handle().runId(), stream.runToken(), e);
@@ -1059,6 +1267,7 @@ public class AgentChatApplicationService {
             }
         }, agentRunExecutor);
         } catch (RuntimeException e) {
+            restoreUndispatchedConfirmation(finalSid, beforeConfirmation);
             try {
                 taskRunService.markFailed(prepared.handle(), exceptionDetail(e));
             } catch (RuntimeException terminalError) {
@@ -1081,5 +1290,20 @@ public class AgentChatApplicationService {
         }
 
         return emitter;
+    }
+
+    /** Undo only our confirmation if the executor never advanced its graph. */
+    private void restoreUndispatchedConfirmation(String sessionId, StateSnapshot before) {
+        if (before == null) return;
+        try {
+            StateSnapshot current = plannerStates.get(sessionId).orElse(null);
+            if (current == null || !before.executionId().equals(current.executionId())
+                    || current.version() != before.version() + 1) return;
+            StateSnapshot restored = plannerStates.commit(sessionId, current.version(),
+                    current.withGraph(before.graph()).withExecution(before.execution()));
+            todoProjector.project(sessionId, restored);
+        } catch (RuntimeException concurrentChange) {
+            log.warn("无法恢复尚未派发的确认状态，请读取最新任务状态: session={}", sessionId, concurrentChange);
+        }
     }
 }

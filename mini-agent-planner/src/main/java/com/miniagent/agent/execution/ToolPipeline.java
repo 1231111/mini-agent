@@ -194,7 +194,8 @@ public class ToolPipeline {
                     name, ToolResult.fromLegacy(request.probeDeny()));
         }
         String proposalDeny = run.turnPolicy().denyToolInvocation(name, request.arguments());
-        if (run.goalContinuation() != null && !com.miniagent.agent.core.GoalContinuationContext.allows(name)) {
+        if (run.goalContinuation() != null && run.goalContinuation().unattended()
+                && !com.miniagent.agent.core.GoalContinuationContext.allows(name)) {
             return ToolInvocation.policyDenied(name, ToolResult.failure(ToolErrorCode.PERMISSION_DENIED,
                     "无人值守续跑只允许读取和补充证据；该动作需要用户确认后继续: " + name, false));
         }

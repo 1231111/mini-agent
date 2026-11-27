@@ -5,7 +5,12 @@ public record TaskStatusDTO(
         String sessionId,
         boolean running,
         boolean pauseRequested,
-        boolean pausedAtCheckpoint) {
+        boolean pausedAtCheckpoint,
+        com.miniagent.application.TaskProgressSnapshot progress) {
+
+    public TaskStatusDTO(String sessionId, boolean running, boolean pauseRequested, boolean pausedAtCheckpoint) {
+        this(sessionId, running, pauseRequested, pausedAtCheckpoint, null);
+    }
 
     public TaskStatusDTO(String sessionId, boolean running) {
         this(sessionId, running, false, false);

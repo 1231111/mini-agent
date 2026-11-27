@@ -59,7 +59,7 @@ public class PlanningLoop {
     private static final Logger log = LoggerFactory.getLogger(PlanningLoop.class);
     private static final int PRIOR_OUTPUT_CHARS = 6000;
     private static final int AWAITING_HINT_CHARS = 500;
-    static final String EXECUTION_HUMAN_WAIT = "humanWait";
+    public static final String EXECUTION_HUMAN_WAIT = "humanWait";
     static final String RECOVERY_CLARIFICATION = "recoveryClarification";
 
     /** Completed receipts stay outside the single-node clarification graph while it waits. */
@@ -407,11 +407,15 @@ public class PlanningLoop {
         boolean incompleteGraph = existing.isPresent()
                 && !existing.get().graph().isEmpty()
                 && !existing.get().graph().allTerminalSuccess();
+        if (com.miniagent.agent.core.GoalContinuationContext.active()
+                && (!incompleteGraph || !java.util.Objects.equals(existing.get().executionId(),
+                    com.miniagent.agent.core.GoalContinuationContext.current().executionId())))
+            return RunOutcome.failed("原任务已完成或已变化，请刷新当前任务状态。", "STALE_EXECUTION");
         boolean awaitingPlanApproval = existing.isPresent()
                 && PlannerStateStore.PLAN_APPROVAL_PENDING.equals(
                         existing.get().execution().get(
                                 PlannerStateStore.EXECUTION_PLAN_APPROVAL));
-        boolean clarifyRecompile = existing.isPresent()
+        boolean clarifyRecompile = !com.miniagent.agent.core.GoalContinuationContext.active() && existing.isPresent()
                 && shouldRecompileClarify(
                         existing.get().goal(), existing.get().graph(), route.dagAction());
         // The semantic router chooses whether to reuse the accepted graph or compile a revision.
@@ -421,7 +425,7 @@ public class PlanningLoop {
                 && incompleteGraph;
         // 计划还在等批准时，非批准答复视为对计划的调整要求：
         // 必须带着原目标重编译，不能只拿这句话当新任务，否则原任务直接丢失。
-        boolean planRevision = awaitingPlanApproval
+        boolean planRevision = !com.miniagent.agent.core.GoalContinuationContext.active() && awaitingPlanApproval
                 && !isPlanApprovalReply(userMessage)
                 && route.taskBoundary() != com.miniagent.agent.scope.TaskBoundary.NEW;
         if ((resume || clarifyRecompile || planRevision) && taskPlan.artifactDeliveryRequested() == null) {
@@ -814,6 +818,8 @@ public class PlanningLoop {
                 var continuation = com.miniagent.agent.core.GoalContinuationContext.current();
                 if (!java.util.Objects.equals(continuation.executionId(), snap.executionId()))
                     return RunOutcome.failed("待续跑目标已经变化，旧执行已停止。", "STALE_EXECUTION");
+            }
+            if (com.miniagent.agent.core.GoalContinuationContext.unattended()) {
                 // snap 在主循环里被反复重赋值，不能直接被 lambda 捕获（编译期要求
                 // effectively final）。这里固定的是「本轮 ready 选择时看到的那一版快照」，
                 // 与 stream 的立即求值语义一致：filter 执行期间不会有人再改 snap。
@@ -1444,6 +1450,10 @@ public class PlanningLoop {
 
     /** Only executor waits are consumed by a reply; explicit Todo confirmations stay gated. */
     private StateSnapshot consumeHumanWait(String sessionId, StateSnapshot snapshot) {
+        // A typed confirmation already released its exact node under CAS. It is
+        // not a blanket approval for other nodes waiting in the same graph.
+        if (com.miniagent.agent.core.GoalContinuationContext.active()
+                && !com.miniagent.agent.core.GoalContinuationContext.unattended()) return snapshot;
         Object pending = snapshot.execution().get(EXECUTION_HUMAN_WAIT);
         if (!(pending instanceof Map<?, ?> wait)
                 || !(wait.get("taskIds") instanceof List<?> taskIds)) return snapshot;

@@ -120,6 +120,12 @@ public record TaskProgressSnapshot(String executionId, long taskId, String statu
                 snapshot.version(), currentNodeId, currentProgress);
     }
 
+    /** Same active-node numbering as TodoStateProjector and the confirmation API. */
+    public static TaskProgressSnapshot fromActiveGraph(StateSnapshot snapshot) {
+        return fromGraph(snapshot.withGraph(new com.miniagent.agent.planner.TaskGraph(
+                snapshot.graph().nodes().stream().filter(n -> n.status() != TaskNodeStatus.CANCELLED).toList())));
+    }
+
     private static String currentStateMessage(TaskNodeStatus status) {
         return switch (status) {
             case RUNNING -> "执行器已开始此步骤";

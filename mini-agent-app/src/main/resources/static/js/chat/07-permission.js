@@ -601,11 +601,11 @@ function resetExecPolicyView() {
     });
 }
 
-function syncPendingConfirm(items) {
+function syncPendingConfirm(items, context = {}) {
     const waiting = (items || []).find(it =>
         String(it.status || '').toLowerCase() === 'awaiting_confirm');
     pendingTodoConfirm = waiting
-        ? { id: waiting.id, content: waiting.content || '' }
+        ? { id: waiting.id, content: waiting.content || '', ...context }
         : null;
     refreshConfirmBanner();
 }
@@ -627,7 +627,7 @@ function refreshConfirmBanner() {
 }
 function confirmPendingTodo() {
     if (!pendingTodoConfirm) return;
-    confirmTodoAndContinue(pendingTodoConfirm.id);
+    confirmTodoAndContinue(pendingTodoConfirm.id, pendingTodoConfirm.botBody);
 }
 
 /**
@@ -657,30 +657,18 @@ function adjustPlanApproval() {
     if (banner) banner.classList.remove('show');
     $inp.focus();
 }
-async function confirmTodoAndContinue(id) {
+async function confirmTodoAndContinue(id, sourceBody) {
     if (!currentId || isStreaming) return;
-    try {
-        const resp = await fetch(
-            '/api/conversations/' + encodeURIComponent(currentId) + '/todos/' + encodeURIComponent(id),
-            { method: 'PATCH' });
-        const body = await resp.json();
-        if (!body.success) {
-            alert(body.message || '确认失败');
-            return;
-        }
-        pendingTodoConfirm = null;
-        refreshConfirmBanner();
-        const text = SYS_PREFIX + '继续执行已确认的步骤 #' + id + '，请继续。';
-        document.getElementById('welcomeScreen')?.remove();
-        renderUserMsg(text, null, 0, []);
-        addMsgToConv('user', text, null, null);
-        const botBody = renderBotMsg(
-            '<div class="typing-dots"><span></span><span></span><span></span></div>', true);
-        setStreaming(true);
-        sendChatPost(text, currentId, [], [], botBody);
-    } catch (e) {
-        alert('确认失败: ' + e.message);
+    const pending = pendingTodoConfirm && String(pendingTodoConfirm.id) === String(id)
+        ? pendingTodoConfirm : null;
+    const botBody = sourceBody || (pending && pending.botBody);
+    if (!botBody || !botBody.isConnected || !botBody.dataset.executionId) {
+        alert('任务状态已变化，请刷新当前任务后重试。');
+        return;
     }
+    // A confirmation is a typed control operation, not a user message.  Resume
+    // the existing execution card; never create a user echo or a new bot row.
+    await continueTodoStream(id, currentId, botBody);
 }
 
 (function initPermUi() {

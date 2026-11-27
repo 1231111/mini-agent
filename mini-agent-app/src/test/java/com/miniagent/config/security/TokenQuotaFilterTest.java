@@ -50,6 +50,7 @@ class TokenQuotaFilterTest {
         TokenQuotaFilter filter = filter(null);
         assertFalse(filter.shouldNotFilter(post(MESSAGES)));
         assertFalse(filter.shouldNotFilter(post(STREAM)));
+        assertFalse(filter.shouldNotFilter(post("/api/conversations/s_abc/todos/1/continue")));
     }
 
     @Test

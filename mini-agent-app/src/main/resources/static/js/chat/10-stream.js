@@ -25,6 +25,9 @@ function compactTaskFailure(detail) {
 
 function renderTaskProgress(botBody, items, options = {}) {
     if (!botBody || !Array.isArray(items)) return null;
+    if (options.executionId) botBody.dataset.executionId = String(options.executionId);
+    if (Number.isFinite(Number(options.version))) botBody.dataset.taskProgressVersion = String(options.version);
+    botBody._taskProgressSnapshot = { ...options, items };
     let card = botBody.querySelector('.todo-panel');
     if (!items.length) { if (card) card.remove(); return null; }
     if (!card) {
@@ -143,11 +146,11 @@ function renderTaskProgress(botBody, items, options = {}) {
             if (!button) {
                 button = document.createElement('button'); button.type = 'button';
                 button.className = 'todo-confirm-btn'; button.textContent = '确认并继续';
-                button.onclick = function (event) {
-                    event.preventDefault(); event.stopPropagation(); confirmTodoAndContinue(current.id);
-                };
                 currentSection.appendChild(button);
             }
+            button.onclick = function (event) {
+                event.preventDefault(); event.stopPropagation(); confirmTodoAndContinue(current.id, botBody);
+            };
             button.disabled = live;
         } else {
             currentSection.querySelector('.todo-confirm-btn')?.remove();
@@ -179,7 +182,7 @@ function restoreTaskProgress(botBody, task) {
     renderTaskProgress(botBody, snapshot.items, {
         status: snapshot.status, reason: snapshot.reason, live: false, allowConfirm: false,
         summary: snapshot.summary, currentNodeId: snapshot.currentNodeId,
-        currentProgress: snapshot.currentProgress, executionId: snapshot.executionId
+        currentProgress: snapshot.currentProgress, executionId: snapshot.executionId, version: snapshot.version
     });
 }
 

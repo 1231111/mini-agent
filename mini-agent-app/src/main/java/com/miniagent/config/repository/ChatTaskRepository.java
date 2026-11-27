@@ -49,4 +49,20 @@ public interface ChatTaskRepository extends JpaRepository<ChatTask, Long> {
     int compareAndSetTaskProgress(@Param("id") Long id, @Param("userId") Long userId,
                                   @Param("sessionId") String sessionId, @Param("expected") String expected,
                                   @Param("next") String next);
+
+    /** Update the original reply card only if no newer worker has changed it. */
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("update ChatTask t set t.answer = :answer, t.taskProgressJson = :next, "
+            + "t.updatedAt = CURRENT_TIMESTAMP where t.id = :id and t.userId = :userId "
+            + "and t.sessionId = :sessionId and t.deleted = false "
+            + "and ((t.answer = :expectedAnswer) or (t.answer is null and :expectedAnswer is null)) "
+            + "and ((t.taskProgressJson = :expectedProgress) or "
+            + "(t.taskProgressJson is null and :expectedProgress is null))")
+    int compareAndSetAnswerAndProgress(@Param("id") Long id, @Param("userId") Long userId,
+                                       @Param("sessionId") String sessionId,
+                                       @Param("expectedAnswer") String expectedAnswer,
+                                       @Param("expectedProgress") String expectedProgress,
+                                       @Param("answer") String answer,
+                                       @Param("next") String next);
 }

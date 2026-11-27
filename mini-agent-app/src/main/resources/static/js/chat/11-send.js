@@ -167,6 +167,54 @@ async function sendChatPost(text, sessionId, files, refs, botBody, questionCard)
     }
 }
 
+/** Confirm and resume the same DAG without manufacturing a conversation turn. */
+async function continueTodoStream(id, sessionId, botBody) {
+    if (isStreaming) return;
+    const epoch = ++streamEpoch;
+    const loadEpoch = window._msgLoadEpoch;
+    const isCurrent = () => sessionId === currentId
+        && loadEpoch === window._msgLoadEpoch && epoch === streamEpoch;
+    const executionId = String(botBody.dataset.executionId || '');
+    const version = Number(botBody.dataset.taskProgressVersion);
+    if (!executionId || !Number.isFinite(version)) {
+        alert('任务状态不完整，请刷新当前任务后重试。');
+        return;
+    }
+    botBody._resumeExistingTask = true;
+    botBody.classList.add('streaming');
+    setStreaming(true);
+    try {
+        const resp = await fetch('/api/conversations/' + encodeURIComponent(sessionId)
+                + '/todos/' + encodeURIComponent(id) + '/continue', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+            body: JSON.stringify({ executionId, version })
+        });
+        if (!isCurrent()) {
+            if (resp.body) await resp.body.cancel().catch(() => {});
+            return;
+        }
+        const contentType = resp.headers && typeof resp.headers.get === 'function'
+            ? String(resp.headers.get('Content-Type') || '').toLowerCase() : '';
+        if (!resp.ok || !resp.body || !contentType.includes('text/event-stream'))
+            throw new Error(await chatHttpErrorMessage(resp));
+        pendingTodoConfirm = null;
+        refreshConfirmBanner();
+        await consumeStream(resp.body.getReader(), botBody, sessionId);
+        if (isStreaming && isCurrent()) unlockComposer();
+    } catch (err) {
+        if (!isCurrent()) return;
+        // Retain the original progress/answer when admission fails; a failed
+        // control request must never erase the task card or imply completion.
+        alert('继续执行失败：' + err.message);
+        botBody.classList.remove('streaming');
+        setStreaming(false);
+        refreshInspectorFromChatStream();
+    } finally {
+        delete botBody._resumeExistingTask;
+    }
+}
+
 /** 复用的 SSE 渲染：首次发送与刷新重连共用同一套增量渲染逻辑 */
 const MAX_STREAM_RECONNECTS = 3;  // 单次发送内流意外中断后最多自动重连次数
 
@@ -199,11 +247,15 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         let turnIncomplete = false;
         let turnFailed = false, turnWaiting = false;
         let taskOutcomeStatus = null, taskOutcomeReason = '';
-        let taskSummary = '', currentNodeId = null, currentProgress = null, taskProgressVersion = 0;
+        const resumedSnapshot = botBody._resumeExistingTask && botBody._taskProgressSnapshot;
+        let taskSummary = resumedSnapshot ? String(resumedSnapshot.summary || '') : '';
+        let currentNodeId = resumedSnapshot ? resumedSnapshot.currentNodeId : null;
+        let currentProgress = resumedSnapshot ? resumedSnapshot.currentProgress : null;
+        let taskProgressVersion = resumedSnapshot ? Number(resumedSnapshot.version) || 0 : 0;
         const MAX_THINK_CHARS = 12000;
         let thinkPaintTimer = null;
         // 增量渲染的 DOM 引用与已渲染游标（避免每个 token 重建整棵子树导致闪烁）
-        let cleared = false, panelEl = null, headLabelEl = null, thinkTextEl = null,
+        let cleared = !!resumedSnapshot, panelEl = null, headLabelEl = null, thinkTextEl = null,
             timelineEl = null, answerEl = null, answerTailEl = null;
         let renderedThink = '', renderedAnswer = '', appliedCollapsed = null;
         // 流式正文的两个渲染游标：定稿块（frozen）与末尾未闭合块（tail）
@@ -211,8 +263,14 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         let answerPaintTimer = null;
         // Only real decomposed task nodes produce a progress card. Model turns and
         // free-form subgoal messages do not imply a measurable task percentage.
-        let todoItems = null;
-        let todoEl = null;
+        let todoItems = resumedSnapshot ? resumedSnapshot.items : null;
+        let todoEl = resumedSnapshot ? botBody.querySelector('.todo-panel') : null;
+        if (resumedSnapshot) {
+            // Keep the actual card node. Old waiting text/think content is a
+            // previous attempt's output and may be replaced by this continuation.
+            botBody.querySelectorAll('.answer-stream, .think-panel, .tl-stream, .typing-dots')
+                .forEach(element => element.remove());
+        }
         function clearOnce() { if (!cleared) { botBody.innerHTML = ''; cleared = true; } }
         function firstInteractionCard() {
             return botBody.querySelector('.user-question-card, .permission-request-card');
@@ -396,7 +454,9 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             if (todoItems && todoItems.length) paintTodo();
             const finalHtml = botBody.innerHTML;
             bindLightbox(botBody.closest('.bot-row'));
-            addMsgToConv('assistant', answer, finalHtml, null);
+            // The server updates the original assistant/task record for a
+            // continuation.  Do not create a second client conversation entry.
+            if (!resumedSnapshot) addMsgToConv('assistant', answer, finalHtml, null);
             scrollToBottom();
             stopPolling(sessionId);
             removeTaskRunningHint();
@@ -505,7 +565,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 live: isStreaming && !done, waiting: turnWaiting, incomplete: turnIncomplete,
                 failed: turnFailed, cancelled: turnCancelled, status: taskOutcomeStatus,
                 reason: taskOutcomeReason, allowConfirm: true, summary: taskSummary,
-                currentNodeId, currentProgress, executionId: botBody.dataset.executionId
+                currentNodeId, currentProgress, executionId: botBody.dataset.executionId,
+                version: taskProgressVersion
             });
             ensureTyping();
         }
@@ -748,7 +809,8 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                     if (payload && Object.prototype.hasOwnProperty.call(payload, 'currentProgress'))
                         currentProgress = payload.currentProgress || null;
                     paintTodo();
-                    syncPendingConfirm(todoItems);
+                    syncPendingConfirm(todoItems, { botBody, executionId: botBody.dataset.executionId,
+                        version: taskProgressVersion });
                     // The main chat stream carries the authoritative todo
                     // projection. Use it as an independent inspector refresh
                     // signal so the right DAG view stays current even when the
@@ -827,6 +889,10 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
             } else if (name === 'task_outcome') {
                 try {
                     const payload = typeof data === 'string' ? JSON.parse(data) : data;
+                    if (resumedSnapshot && payload.executionId
+                            && String(payload.executionId) !== String(botBody.dataset.executionId || '')) return;
+                    if (resumedSnapshot && payload.version != null && Number.isFinite(Number(payload.version))
+                            && Number(payload.version) < taskProgressVersion) return;
                     const rawStatus = String(payload && payload.status || '').toUpperCase();
                     const aliases = { COMPLETED: 'SUCCESS', FAILED: 'FAILURE', CANCELLED: 'CANCELED' };
                     const status = aliases[rawStatus] || rawStatus;
@@ -870,7 +936,7 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                 // The initial user echo arrives on the primary chat stream before
                 // planning completes, so the sidebar begins tracking this turn too.
                 refreshInspectorFromChatStream();
-                renderUserEchoIfNeeded(botBody, data);
+                if (!botBody._resumeExistingTask) renderUserEchoIfNeeded(botBody, data);
             } else if (name === 'gone') {
                 // 通道没了：不在这里定稿，等读流结束后走 tryResumeOrFinish
             } else if (name === 'permission_ask') {
@@ -966,7 +1032,10 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
                     if (resp.body) await resp.body.cancel().catch(() => {});
                     return;
                 }
-                if (!resp.ok || !resp.body) throw new Error('attach HTTP ' + resp.status);
+                const contentType = resp.headers && typeof resp.headers.get === 'function'
+                    ? String(resp.headers.get('Content-Type') || '').toLowerCase() : '';
+                if (!resp.ok || !resp.body || (resumedSnapshot && !contentType.includes('text/event-stream')))
+                    throw new Error('attach HTTP ' + resp.status);
                 done = true; // 交棒给重连流，避免本帧再次走收尾分支
                 await consumeStream(resp.body.getReader(), botBody, sessionId, reconnectAttempt + 1);
             } catch (e) {
@@ -1012,7 +1081,12 @@ async function consumeStream(reader, botBody, sessionId, reconnectAttempt = 0) {
         }
     } catch (err) {
         if (!isCurrentStream()) return;
-        botBody.innerHTML = renderMD('❌ ' + err.message);
+        if (botBody._resumeExistingTask) {
+            const error = document.createElement('div');
+            error.className = 'task-continuation-error';
+            error.textContent = '继续执行连接中断：' + err.message;
+            botBody.appendChild(error);
+        } else botBody.innerHTML = renderMD('❌ ' + err.message);
         botBody.classList.remove('streaming');
         setStreaming(false); onInputChange(); scrollToBottom();
     }

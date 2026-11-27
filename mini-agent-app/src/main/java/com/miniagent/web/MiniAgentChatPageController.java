@@ -1079,9 +1079,11 @@ public class MiniAgentChatPageController {
             return ApiResponse.ok(new TaskStatusDTO(sessionId, false));
         }
         boolean running = streamingService.isTaskRunning(sessionId);
+        com.miniagent.application.TaskProgressSnapshot progress = plannerStateStore.get(sessionId)
+                .map(com.miniagent.application.TaskProgressSnapshot::fromActiveGraph).orElse(null);
         return ApiResponse.ok(new TaskStatusDTO(sessionId, running,
                 running && agentService.isPauseRequested(sessionId),
-                running && agentService.isPausedAtCheckpoint(sessionId)));
+                running && agentService.isPausedAtCheckpoint(sessionId), progress));
     }
 
     /**

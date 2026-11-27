@@ -7,6 +7,35 @@ function isCurrentTaskNavigation(sid, loadEpoch) {
     return sid === currentId && loadEpoch === window._msgLoadEpoch;
 }
 
+/** Match only the trusted execution returned by /task, never a latest-row guess. */
+function findExecutionTaskBody(executionId) {
+    if (!executionId || typeof document === 'undefined') return null;
+    const bodies = [...document.querySelectorAll('.bot-body')];
+    return bodies.find(body => String(body.dataset.executionId || '') === String(executionId)) || null;
+}
+
+function restoreCurrentTaskState(status) {
+    const progress = status && status.progress;
+    if (!progress || !progress.executionId || !Array.isArray(progress.items)) return null;
+    const body = findExecutionTaskBody(progress.executionId);
+    if (!body) return null;
+    const version = Number(progress.version);
+    const oldVersion = Number(body.dataset.taskProgressVersion) || 0;
+    if (!Number.isFinite(version) || version < oldVersion) return body;
+    body.dataset.taskStatus = progress.status || '';
+    body.dataset.taskReason = progress.reason || '';
+    const currentWaiting = !status.running && String(progress.status || '').toUpperCase() === 'WAITING';
+    renderTaskProgress(body, progress.items, { ...progress, live: !!status.running,
+        allowConfirm: currentWaiting, waiting: currentWaiting });
+    // Only the current server-owned DAG can activate confirmation controls on
+    // reload. Every other restored historical execution remains read only.
+    if (currentWaiting) {
+        syncPendingConfirm(progress.items, { botBody: body, executionId: progress.executionId,
+            version: progress.version });
+    }
+    return body;
+}
+
 async function syncFromBackend(sid) {
     // Trigger a re-render of the conversation from backend data
     try {
@@ -29,6 +58,7 @@ async function checkAndPollTask(sid) {
         if (!resp.ok || !isCurrentTaskNavigation(sid, loadEpoch)) return;
         const status = await apiJson(resp) || {};
         if (!isCurrentTaskNavigation(sid, loadEpoch)) return;
+        restoreCurrentTaskState(status);
         if (status.running) {
             taskIsActive = true;
             taskRunningSessionId = sid;
@@ -36,7 +66,7 @@ async function checkAndPollTask(sid) {
             taskPausedAtCheckpoint = status.pausedAtCheckpoint === true;
             if (typeof syncTaskControlButton === 'function') syncTaskControlButton();
             // 任务正在运行 → 重连事件流，先回放已产出内容，再继续实时跟到结束
-            await reconnectStream(sid, loadEpoch);
+            await reconnectStream(sid, loadEpoch, status);
         } else if (taskRunningSessionId === sid) {
             taskIsActive = false;
             taskRunningSessionId = null;
@@ -54,16 +84,19 @@ async function checkAndPollTask(sid) {
  * 重连正在运行的会话事件流：GET .../messages/stream，复用 consumeStream 渲染。
  * 收到 gone（缓冲已驱逐）则回退轮询 + 数据库加载。
  */
-async function reconnectStream(sid, loadEpoch = window._msgLoadEpoch) {
+async function reconnectStream(sid, loadEpoch = window._msgLoadEpoch, taskStatus = null) {
     if (!isCurrentTaskNavigation(sid, loadEpoch)) return;
     let epoch = null;
+    let resumedBody = null;
     try {
         const resp = await fetch('/api/conversations/' + encodeURIComponent(sid) + '/messages/stream');
         if (!isCurrentTaskNavigation(sid, loadEpoch)) {
             if (resp.body) await resp.body.cancel().catch(() => {});
             return;
         }
-        if (!resp.ok || !resp.body) {
+        const contentType = resp.headers && typeof resp.headers.get === 'function'
+            ? String(resp.headers.get('Content-Type') || '').toLowerCase() : '';
+        if (!resp.ok || !resp.body || !contentType.includes('text/event-stream')) {
             unlockComposer();
             showTaskRunningHint(sid);
             startPolling(sid, loadEpoch);
@@ -72,7 +105,15 @@ async function reconnectStream(sid, loadEpoch = window._msgLoadEpoch) {
         epoch = ++streamEpoch;
         setStreaming(true);
         if (typeof refreshTaskPauseState === 'function') refreshTaskPauseState(sid);
-        const botBody = renderBotMsg('<div class="typing-dots"><span></span><span></span><span></span></div>', true);
+        const existingBody = taskStatus && taskStatus.progress
+            ? findExecutionTaskBody(taskStatus.progress.executionId) : null;
+        const botBody = existingBody || renderBotMsg(
+            '<div class="typing-dots"><span></span><span></span><span></span></div>', true);
+        if (existingBody) {
+            resumedBody = existingBody;
+            botBody._resumeExistingTask = true;
+            botBody.classList.add('streaming');
+        }
         await consumeStream(resp.body.getReader(), botBody, sid);
         if (isCurrentTaskNavigation(sid, loadEpoch) && isStreaming && epoch === streamEpoch) unlockComposer();
     } catch (e) {
@@ -81,6 +122,8 @@ async function reconnectStream(sid, loadEpoch = window._msgLoadEpoch) {
         unlockComposer();
         showTaskRunningHint(sid);
         startPolling(sid, loadEpoch);
+    } finally {
+        if (resumedBody) delete resumedBody._resumeExistingTask;
     }
 }
 
