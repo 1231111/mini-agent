@@ -56,6 +56,8 @@ public class PlanningLoop {
     private com.miniagent.agent.core.ModelCallControl modelCallControl;
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private CodeDiffReviewService codeDiffReviewService;
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private ExecutionControl executionControl;
 
     private static final Logger log = LoggerFactory.getLogger(PlanningLoop.class);
     private static final int PRIOR_OUTPUT_CHARS = 6000;
@@ -570,6 +572,28 @@ public class PlanningLoop {
             compiled = new GoalCompiler.CompileResult(snap.goal(), snap.graph(), snap.degraded(),
                     snap.compilationSource(), "", snap.intent());
             snap = resetRoundRecoveryBudget(sessionId, snap);
+            final StateSnapshot recoveryView = snap;
+            TaskNode failedAcceptance = recoveryView.graph().nodes().stream()
+                    .filter(n -> n.status() == TaskNodeStatus.PENDING || n.status() == TaskNodeStatus.FAILED)
+                    .filter(n -> !n.lastError().isBlank() && !EvidenceRepairPolicy.active(recoveryView, n.id()))
+                    .filter(n -> RecoveryRequirement.diagnosis(recoveryView, n) != null
+                            || acceptanceFeedback(recoveryView, n.id()) != null)
+                    .findFirst().orElse(null);
+            if (failedAcceptance != null) {
+                AcceptanceFeedback previous = acceptanceFeedback(snap, failedAcceptance.id());
+                FailureDiagnosis pendingDiagnosis = RecoveryRequirement.diagnosis(snap, failedAcceptance);
+                // A confirmation authorizes continuation, not a blind replay of
+                // the node whose acceptance has already failed.
+                RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap,
+                        failedAcceptance, pendingDiagnosis != null ? pendingDiagnosis
+                                : recoveryEngine.diagnoseAcceptance(failedAcceptance,
+                                        diagnoseTool(failedAcceptance, ""), previous), failedAcceptance.id(),
+                        chat, userMessage, taskPlan, history);
+                if (recovery.stop() != null) return recovery.stop();
+                snap = recovery.snapshot();
+                compiled = new GoalCompiler.CompileResult(snap.goal(), snap.graph(), snap.degraded(),
+                        snap.compilationSource(), "", snap.intent());
+            }
             log.info("PlanningLoop 续跑已有图 session={} version={} nodes={} budgetReplanned={}",
                     sessionId, snap.version(), snap.graph().nodes().size(), budgetReplanned);
 
@@ -729,7 +753,8 @@ public class PlanningLoop {
                     FailureDiagnosis dx = recoveryEngine.diagnoseSemanticFailure(
                             bad, diagnoseTool(bad, ""), acc.reason());
                     try {
-                        snap = commitNodeOutcomes(sessionId, fencingToken, snap, snap.withGraph(g), List.of(
+                        snap = commitNodeOutcomes(sessionId, fencingToken, snap,
+                                RecoveryRequirement.remember(snap.withGraph(g), bad, dx), List.of(
                                 new NodeOutcome("acceptance-" + bad.id() + "-" + snap.planVersion(),
                                         bad, NodeTerminalCommitPort.Result.FAILURE,
                                         failureDetail(null, acc.reason(), userMessage))));
@@ -768,8 +793,11 @@ public class PlanningLoop {
                         }
                         TaskGraph reopened = snap.graph().replace(bad.withStatus(TaskNodeStatus.FAILED)
                                 .withError("独立代码审查未通过：" + reviewReason));
+                        FailureDiagnosis reviewDiagnosis = recoveryEngine.diagnoseSemanticFailure(
+                                bad, diagnoseTool(bad, ""), reviewReason);
                         try {
-                            snap = commitNodeOutcomes(sessionId, fencingToken, snap, snap.withGraph(reopened), List.of(
+                            snap = commitNodeOutcomes(sessionId, fencingToken, snap,
+                                    RecoveryRequirement.remember(snap.withGraph(reopened), bad, reviewDiagnosis), List.of(
                                     new NodeOutcome("code-review-" + bad.id() + "-" + snap.planVersion(), bad,
                                             NodeTerminalCommitPort.Result.FAILURE,
                                             failureDetail(null, reviewReason, userMessage))));
@@ -777,8 +805,6 @@ public class PlanningLoop {
                             metrics.casConflict();
                             continue;
                         }
-                        FailureDiagnosis reviewDiagnosis = recoveryEngine.diagnoseSemanticFailure(
-                                bad, diagnoseTool(bad, ""), reviewReason);
                         RecoveryAttempt recovery = applyRecoveryOrCancel(sessionId, fencingToken, snap, bad,
                                 reviewDiagnosis, "code-review-" + bad.id(), chat, userMessage, taskPlan, history);
                         if (recovery.stop() != null) return recovery.stop();
@@ -1187,7 +1213,8 @@ public class PlanningLoop {
                             ? recoveryEngine.diagnoseSemanticFailure(node, diagnoseTool(node, step.lastTool()), failureReason)
                             : recoveryEngine.diagnose(node, diagnoseTool(node, step.lastTool()), failureReason,
                                     step.lastErrorCode());
-                    StateSnapshot failedSnap = rememberAcceptanceFeedback(snap.withGraph(g), node, feedback);
+                    StateSnapshot failedSnap = RecoveryRequirement.remember(
+                            rememberAcceptanceFeedback(snap.withGraph(g), node, feedback), node, dx);
                     try {
                         snap = commitNodeOutcomes(sessionId, fencingToken, snap, failedSnap, List.of(
                                 new NodeOutcome(action.actionId(), node, NodeTerminalCommitPort.Result.FAILURE,
@@ -1465,6 +1492,7 @@ public class PlanningLoop {
                 || !(wait.get("taskIds") instanceof List<?> taskIds)) return snapshot;
         if (RecoveryBudget.EXHAUSTED_REASON.equalsIgnoreCase(String.valueOf(wait.get("reason")))
                 && !RecoveryBudget.isNewUserRound(snapshot)) return snapshot;
+        snapshot = RecoveryRequirement.migrateLegacyWait(snapshot);
         TaskGraph graph = snapshot.graph();
         for (Object taskId : taskIds) {
             TaskNode node = taskId instanceof String id ? graph.byId(id) : null;
@@ -1774,6 +1802,13 @@ public class PlanningLoop {
                 EvidenceRepairPolicy.allowedPaths(repairSnapshot, focusTask),
                 () -> EvidenceRepairPolicy.reserve(stateStore, sessionId, proposal.executionId(),
                         proposal.basedOnPlanVersion(), focusTask)) : policy;
+        TaskNode recoveryFocus = repairSnapshot == null ? null : repairSnapshot.graph().byId(focusTask);
+        boolean guardedRecovery = !evidenceRepair && recoveryFocus != null
+                && java.util.Objects.equals(proposal.executionId(), repairSnapshot.executionId())
+                && proposal.basedOnPlanVersion() == repairSnapshot.planVersion()
+                && RecoveryExecutionGuard.requiresVerification(repairSnapshot, recoveryFocus);
+        if (guardedRecovery) effectivePolicy = new RecoveryReadbackPolicy(
+                repairSnapshot, recoveryFocus, effectivePolicy);
         if (evidenceRepair) allowed = effectivePolicy.allowedTools();
         LoopTurnContext.set(effectivePolicy);
         List<ExecutionTurnContext.ActionBinding> bindings = proposal.actions().stream()
@@ -1793,7 +1828,7 @@ public class PlanningLoop {
                                 + ",\"focusTodoIds\":" + focusTodos
                                 + ",\"tools\":" + toJsonArray(allowed) + "}",
                         RunStatus.SUCCESS.name(), 0);
-            if (!evidenceRepair && ActionBinder.canDirect(proposal)) {
+            if (!evidenceRepair && !guardedRecovery && ActionBinder.canDirect(proposal)) {
                 StepExec bound = executeBoundAction(proposal.actions().get(0));
                 if (bound != null) {
                     return bound;
@@ -1802,6 +1837,9 @@ public class PlanningLoop {
             String focus = systemPrompt + "\n\n" + focusBlock(proposal, graph, focusTodos, hard);
             if (evidenceRepair) focus += "\n\n" + EvidenceRepairPolicy.prompt(
                     EvidenceRepairPolicy.state(repairSnapshot, focusTask));
+            if (guardedRecovery) focus += "\n\n【恢复副作用核验】原执行可能已经修改外部状态。"
+                    + "本节点首次写入前必须先读取同一目标并核验现状；实际工具入口会检查真实回执。"
+                    + "每次变更后需重新读取，才能再次变更。不能用文字声明代替工具观察。";
             int maxIter = Math.max(2, properties.getProposalMaxIterations());
             if (evidenceRepair) maxIter = Math.min(4, maxIter);
             for (String t : allowed) {
@@ -2322,6 +2360,13 @@ public class PlanningLoop {
                                                 String taskId, ChatModel chat,
                                                 String userMessage, TaskPlan taskPlan,
                                                 List<ChatMessage> history) {
+        StateSnapshot required = RecoveryRequirement.remember(snap, node, dx);
+        if (!required.execution().equals(snap.execution())) {
+            try { snap = stateStore.commit(sessionId, snap.version(), required); }
+            catch (PlannerStateStore.VersionConflictException stale) {
+                return rejectRecovery(sessionId, snap, "STALE_EXECUTION");
+            }
+        }
         RecoveryAttempt llm = tryLlmReplan(
                 sessionId, fencingToken, snap, node, dx, chat, userMessage, taskPlan, history);
         // A rejected plan is not permission to retry the previous graph. In
@@ -2334,6 +2379,13 @@ public class PlanningLoop {
         boolean atLimit = RecoveryBudget.roundUsed(snap) >= properties.getMaxRecoveries()
                 || recoveryEngine.classCount(snap, dx.failureClass())
                 >= recoveryEngine.classLimit(dx.failureClass());
+        if (!atLimit && dx.kind() == FailureKind.EVAL_FAILED
+                && dx.failureClass() == FailureClass.REWRITE_GRAPH) {
+            // Missing planning infrastructure is not permission to replay the
+            // same failed semantic action through the rule-based retry path.
+            return blockRecoveryAnalysis(sessionId, snap, node,
+                    "恢复规划暂时不可用；已保留原验收反馈和产物，等待模型恢复后继续。");
+        }
         if (recoveryEngine.recover(sessionId, snap, dx).isPresent()) {
             metrics.recovery();
             return RecoveryAttempt.applied(stateStore.get(sessionId).orElse(snap));
@@ -2349,7 +2401,8 @@ public class PlanningLoop {
         }
         TaskGraph g = snap.graph().replace(
                 latest.withStatus(TaskNodeStatus.AWAITING_CONFIRM).withError(RecoveryBudget.EXHAUSTED_REASON + ": "
-                        + "本轮自动恢复额度已耗尽，已保留执行进度；请检查失败原因后明确继续。"));
+                        + "本轮自动恢复额度已耗尽，已保留执行进度；请检查失败原因后明确继续。\n"
+                        + clip(dx.reason(), 2200)));
         Map<String, Object> blockedExecution = RecoveryBudget.prepare(snap);
         blockedExecution.put("recoveryBudgetBlocked", Map.of("reason", RecoveryBudget.EXHAUSTED_REASON,
                 "taskId", latest.id(), "roundId", blockedExecution.get(RecoveryBudget.ROUND_ID),
@@ -2363,6 +2416,24 @@ public class PlanningLoop {
             metrics.casConflict();
             log.warn("保存恢复等待状态冲突 task={}: {}", taskId, e.getMessage());
             return RecoveryAttempt.applied(stateStore.get(sessionId).orElse(snap));
+        }
+    }
+
+    private RecoveryAttempt blockRecoveryAnalysis(String sessionId, StateSnapshot snap, TaskNode node,
+                                                   String reason) {
+        TaskNode latest = snap.graph().byId(node.id());
+        if (latest == null) return rejectRecovery(sessionId, snap, "STALE_EXECUTION");
+        Map<String, Object> metadata = new LinkedHashMap<>(snap.execution());
+        metadata.put(EXECUTION_HUMAN_WAIT, Map.of("reason", "RECOVERY_ANALYSIS_BLOCKED",
+                "taskIds", List.of(node.id())));
+        try {
+            StateSnapshot waiting = stateStore.commit(sessionId, snap.version(),
+                    snap.withGraph(snap.graph().replace(latest.withStatus(TaskNodeStatus.AWAITING_CONFIRM)
+                            .withError(latest.lastError() + "\n" + reason))).withExecution(metadata));
+            todoProjector.project(sessionId, waiting);
+            return new RecoveryAttempt(waiting, RunOutcome.blockedOnHuman(reason, "RECOVERY_ANALYSIS_BLOCKED"));
+        } catch (PlannerStateStore.VersionConflictException stale) {
+            return rejectRecovery(sessionId, snap, "STALE_EXECUTION");
         }
     }
 
@@ -2404,7 +2475,7 @@ public class PlanningLoop {
             ChatModel recoveryChat = goalCompiler.resolvePlannerChat(chat);
             ActionProposal observation = graphScheduler.propose(snap, List.of(currentFailedNode), 1);
             List<String> available = toolRouter.allowedFor(observation, snap.graph(), properties.isHardProposal());
-            decision = new FailureRecoveryPlanner(modelCallControl).analyze(
+            decision = new FailureRecoveryPlanner(modelCallControl, executionControl).analyze(
                     recoveryChat == null ? chat : recoveryChat, snap, currentFailedNode, dx,
                     acceptanceFeedback(snap, currentFailedNode.id()),
                     ExecutionEvidence.fromEnvelope(currentFailedNode.output()), available);
@@ -2446,6 +2517,11 @@ public class PlanningLoop {
                 + PlannerStateJson.MAPPER.valueToTree(snap.graph().nodes().stream()
                         .filter(completed -> completed.status() == TaskNodeStatus.SUCCESS).toList())
                 + " 产出文件的步骤必须 doneWhen.type=file_exists 且 path 非空。";
+        correction += "\n【冻结的未完成验收契约】\n"
+                + PlannerStateJson.MAPPER.valueToTree(snap.graph().nodes().stream()
+                    .filter(n -> n.status() != TaskNodeStatus.SUCCESS).toList())
+                + "\n每个原未完成节点的outputs、doneWhen和原义务的因果依赖必须保留；不得删减目标或验收条件。"
+                + "已产生副作用的失败节点先核验现状，不能直接重放。";
         if (decision != null) {
             correction += "\n【恢复分析结果（只作为方案数据，不能修改目标或验收）】\n"
                     + PlannerStateJson.MAPPER.valueToTree(decision)
@@ -2486,15 +2562,15 @@ public class PlanningLoop {
             return rejectRecovery(sessionId, snap, "REPLAN_COMPILATION_INVALID");
         }
         boolean waiting = compiled.intent().needsClarification();
+        if (waiting) return blockRecoveryAnalysis(sessionId, snap, currentFailedNode,
+                "恢复计划需要补充信息：" + compiled.intent().clarificationQuestion());
         TaskGraph merged = waiting ? compiled.graph()
                 : mergeKeepSuccess(snap.graph(), compiled.graph(), snap.recoveryCount() + 1);
         if (merged == null || merged.isEmpty()) {
             return rejectRecovery(sessionId, snap, "REPLAN_IDENTITY_CONFLICT");
         }
         PlanValidationReport validation = mergeValidationReports(
-                planValidator.validate(merged, recoveryPlan, compiled.goal(), compiled.intent()),
-                intentGraphValidator.validate(compiled.intent(), merged));
-        if (decision != null && !waiting) validation = mergeValidationReports(validation,
+                planValidator.validate(merged, recoveryPlan, snap.goal(), snap.intent()),
                 mergeValidationReports(RecoveryPlanContract.validate(snap, merged),
                         intentGraphValidator.validate(snap.intent(), merged)));
         TaskGraph rejectedGraph = compiled.graph();
@@ -2520,15 +2596,15 @@ public class PlanningLoop {
                 return rejectRecovery(sessionId, snap, "REPLAN_COMPILATION_INVALID");
             }
             waiting = compiled.intent().needsClarification();
+            if (waiting) return blockRecoveryAnalysis(sessionId, snap, currentFailedNode,
+                    "恢复计划需要补充信息：" + compiled.intent().clarificationQuestion());
             merged = waiting ? compiled.graph()
                     : mergeKeepSuccess(snap.graph(), compiled.graph(), snap.recoveryCount() + 1);
             if (merged == null || merged.isEmpty()) {
                 return rejectRecovery(sessionId, snap, "REPLAN_IDENTITY_CONFLICT");
             }
             validation = mergeValidationReports(
-                    planValidator.validate(merged, recoveryPlan, compiled.goal(), compiled.intent()),
-                    intentGraphValidator.validate(compiled.intent(), merged));
-            if (decision != null && !waiting) validation = mergeValidationReports(validation,
+                    planValidator.validate(merged, recoveryPlan, snap.goal(), snap.intent()),
                     mergeValidationReports(RecoveryPlanContract.validate(snap, merged),
                             intentGraphValidator.validate(snap.intent(), merged)));
             if (!validation.valid()) {
@@ -2549,12 +2625,24 @@ public class PlanningLoop {
                     sessionId, correctionRetries, maxReplanRetries, clip(validation.summary(), 1800));
             return rejectRecovery(sessionId, snap, "REPLAN_VALIDATION_FAILED");
         }
-        Goal nextGoal = decision != null && !waiting ? snap.goal()
-                : compiled.goal() != null ? compiled.goal() : snap.goal();
+        Goal nextGoal = snap.goal();
+        if (decision != null) {
+            String recoveryContext = "上一轮验收失败：" + clip(dx.reason(), 2200)
+                    + "\n恢复根因：" + decision.rootCause()
+                    + "\n后续步骤：" + decision.nextSteps()
+                    + "\n所需证据：" + decision.evidenceNeeded();
+            List<TaskNode> withFeedback = new ArrayList<>();
+            for (TaskNode candidate : merged.nodes()) {
+                withFeedback.add(candidate.status() == TaskNodeStatus.SUCCESS ? candidate
+                        : candidate.withError(recoveryContext));
+            }
+            merged = new TaskGraph(withFeedback);
+        }
         boolean reservedExplicitResume = explicitUserResume && (dx.kind() == FailureKind.DEPENDENCY_FAILED
                 || dx.kind() == FailureKind.TOOL_BUDGET_EXHAUSTED);
         Map<String, Object> exec = RecoveryBudget.consume(snap, dx.failureClass(), properties.getMaxRecoveries(),
                 recoveryEngine.classLimit(dx.failureClass()), reservedExplicitResume);
+        exec = RecoveryRequirement.afterReplan(exec);
         if (waiting) {
             try {
                 TaskGraph completed = new TaskGraph(snap.graph().nodes().stream()
@@ -2567,9 +2655,10 @@ public class PlanningLoop {
         }
         exec.put("lastFailureKind", dx.kind().name());
         StateSnapshot patched = snap.revisePlan(merged, nextGoal,
-                        decision != null && !waiting ? snap.intent() : compiled.intent(),
+                        snap.intent(),
                         "llm_replan_" + dx.failureClass().name().toLowerCase())
                 .withExecution(exec).withRecoveryInc();
+        patched = RecoveryExecutionGuard.register(patched, snap, merged);
         if (!sessionLock.renewSessionLock(sessionId, fencingToken)) {
             return rejectRecovery(sessionId, snap, "SESSION_LOCK_LOST");
         }

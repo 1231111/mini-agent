@@ -108,11 +108,14 @@ class AutonomousFailureRecoveryIntegrationTest {
         TaskNode accepted = new TaskNode("accepted", "已完成的前置核验", "research", List.of(),
                 List.of(), List.of("accepted-facts"), TaskNodeStatus.SUCCESS, 100,
                 DoneWhen.note(), "", "", 0, "accepted receipt")
+                .withOutput("accepted receipt", Map.of("accepted-facts", "accepted receipt"))
                 .withToolStatus(ToolStatus.SUCCESS);
         TaskNode replacement = new TaskNode("rp7_inspect", "按搜索命中区域完成源文件梳理", "file_read",
                 List.of("accepted"), List.of("accepted-facts"), List.of("source-facts"),
                 TaskNodeStatus.SUCCESS, 90, DoneWhen.note(), "", "", 0,
                 "search_code: setAnimationLoop\nread_file: matched region\n验收回执已提交")
+                .withOutput("search_code: setAnimationLoop\nread_file: matched region\n验收回执已提交",
+                        Map.of("source-facts", "search_code: setAnimationLoop\nread_file: matched region"))
                 .withToolStatus(ToolStatus.SUCCESS);
         StateSnapshot completed = new PlannerStateStore().init("s_completion", "exec_completion", goal,
                 new TaskGraph(List.of(accepted, replacement)), TaskIntent.fromGoal(goal));

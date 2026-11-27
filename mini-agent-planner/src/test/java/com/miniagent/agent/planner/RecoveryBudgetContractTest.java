@@ -5,6 +5,9 @@ import com.miniagent.agent.task.TaskPlan;
 import com.miniagent.agent.tool.CapabilityRegistry;
 import com.miniagent.agent.tool.ToolStatus;
 import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.model.chat.request.ChatRequest;
+import dev.langchain4j.model.chat.response.ChatResponse;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
@@ -147,10 +150,24 @@ class RecoveryBudgetContractTest {
         PlanningLoop loop = loop(store, properties, compiler, validator);
         FailureDiagnosis dx = new FailureDiagnosis(FailureClass.REWRITE_GRAPH, FailureKind.EVAL_FAILED,
                 "work", "", "missing evidence", "read missing evidence");
+        ChatModel recoveryModel = mock(ChatModel.class);
+        when(recoveryModel.chat(any(ChatRequest.class))).thenAnswer(invocation -> {
+            ChatRequest request = invocation.getArgument(0);
+            var data = PlannerStateJson.MAPPER.readTree(
+                    ((dev.langchain4j.data.message.UserMessage) request.messages().get(1)).singleText());
+            Map<String, Object> decision = PlannerStateJson.MAPPER.convertValue(data.path("identity"), Map.class);
+            decision.put("schemaVersion", 1);
+            decision.put("action", "REPLAN");
+            decision.put("rootCause", "The submitted evidence omits the required source facts.");
+            decision.put("nextSteps", List.of("Read the declared source and submit the missing facts."));
+            decision.put("evidenceNeeded", List.of("Source read receipt"));
+            return ChatResponse.builder().aiMessage(AiMessage.from(
+                    PlannerStateJson.MAPPER.writeValueAsString(decision))).build();
+        });
         try (var round = RecoveryBudget.bindRound("user-replan", true)) {
             base = normalize(store, base);
             Object attempt = ReflectionTestUtils.invokeMethod(loop, "tryLlmReplan", SESSION, "fence", base,
-                    base.graph().byId("work").withStatus(TaskNodeStatus.RUNNING), dx, mock(ChatModel.class), "continue",
+                    base.graph().byId("work").withStatus(TaskNodeStatus.RUNNING), dx, recoveryModel, "continue",
                     TaskPlan.of("complete report"), List.of(), false);
             assertThat(attempt).isNotNull();
             StateSnapshot replanned = store.get(SESSION).orElseThrow();
